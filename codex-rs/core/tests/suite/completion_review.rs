@@ -48,18 +48,10 @@ use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
 
 const CLASSIFICATION_REQUEST_MARKER: &str = "KD4_SOURCE_CLASSIFICATION_REQUEST_V1";
+const RELATIONSHIP_RESOLUTION_REQUEST_MARKER: &str =
+    "KD4_SOURCE_RELATIONSHIP_RESOLUTION_REQUEST_V1";
 const REVIEW_REQUEST_MARKER: &str = "KD4_COMPLETION_REVIEW_REQUEST_V2";
 const REPAIR_MARKER: &str = "<kd4_completion_repair>";
-const REVIEW_LENSES: [&str; 8] = [
-    "requirements_and_behavioral_compatibility",
-    "lifecycle_and_concurrency",
-    "persistence_filesystem_safety_rollback_and_atomicity",
-    "schema_protocol_and_generated_representations",
-    "security_and_trust_boundaries",
-    "platform_configuration_packaging_and_installation",
-    "pipeline_cache_snapshot_and_artifact_identity",
-    "validation_quality_and_changed_test_oracle_integrity",
-];
 
 fn completion_review_builder() -> TestCodexBuilder {
     completion_review_builder_with_role(true)
@@ -295,6 +287,7 @@ enum ReviewScenario {
 struct CompletionReviewProbe {
     total_requests: AtomicUsize,
     classification_requests: AtomicUsize,
+    relationship_resolution_requests: AtomicUsize,
     review_requests: AtomicUsize,
     rereview_requests: AtomicUsize,
     repair_requests: AtomicUsize,
@@ -336,6 +329,22 @@ impl Respond for CompletionReviewResponder {
             return sse_response(message_response(
                 &format!("classification-{request_index}"),
                 &format!("classification-message-{request_index}"),
+                &response.to_string(),
+            ));
+        }
+
+        if let Some(request_text) = strings
+            .iter()
+            .find(|text| text.contains(RELATIONSHIP_RESOLUTION_REQUEST_MARKER))
+        {
+            self.probe
+                .relationship_resolution_requests
+                .fetch_add(1, Ordering::SeqCst);
+            let input = tagged_json(request_text, "relationship_input");
+            let response = relationship_resolution_response(&input);
+            return sse_response(message_response(
+                &format!("relationship-resolution-{request_index}"),
+                &format!("relationship-resolution-message-{request_index}"),
                 &response.to_string(),
             ));
         }
@@ -550,6 +559,53 @@ fn classification_response(dossier: &Value, classify_as_context: bool) -> Value 
     json!({ "sources": sources })
 }
 
+fn relationship_resolution_response(input: &Value) -> Value {
+    let sources = input["sources"]
+        .as_array()
+        .expect("relationship resolution sources")
+        .iter()
+        .map(|source| {
+            let local = &source["local_classification"];
+            let source_relationship = match local["local_kind"].as_str() {
+                Some("relationship_only_context") => "superseded_context",
+                _ => "none",
+            };
+            let requirements = local["requirement_spans"]
+                .as_array()
+                .expect("relationship resolution requirement spans")
+                .iter()
+                .map(|source_span| {
+                    let source_span = json!({
+                        "kind": source_span["kind"],
+                        "start": source_span["start"],
+                        "end": source_span["end"],
+                        "reference": source_span
+                            .get("reference")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        "subreference": source_span
+                            .get("subreference")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    });
+                    json!({
+                        "source_span": source_span,
+                        "status": "active",
+                        "superseded_by_source_id": "",
+                        "superseded_by_span": empty_text_span(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "source_id": source["source_id"],
+                "source_relationship": source_relationship,
+                "requirements": requirements,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "sources": sources })
+}
+
 fn review_response(dossier: &Value, kind: ReviewResponseKind<'_>) -> String {
     let requirements = dossier["requirements"]
         .as_array()
@@ -558,63 +614,57 @@ fn review_response(dossier: &Value, kind: ReviewResponseKind<'_>) -> String {
         .iter()
         .find(|requirement| requirement["status"].as_str() == Some("active"))
         .and_then(|requirement| requirement["requirement_id"].as_str());
-    let sources = dossier["sources"]
+    let finding_lens = dossier["review_lenses"]
         .as_array()
-        .expect("review sources")
-        .iter()
-        .enumerate()
-        .map(|(index, source)| {
-            let source_id = source["source_id"].as_str().expect("source ID");
-            let mapping = &dossier["source_mappings"][source_id];
-            if matches!(kind, ReviewResponseKind::ManifestGap) && index == 0 {
-                return json!({
-                    "source_id": source_id,
-                    "result": "manifest_gap",
-                    "requirement_ids": mapping["requirement_ids"].as_array().cloned().unwrap_or_default(),
-                    "omitted_source_spans": [source_span(source)],
-                    "reason": "",
-                });
+        .and_then(|lenses| lenses.first())
+        .and_then(Value::as_str);
+    let manifest_gaps = if matches!(kind, ReviewResponseKind::ManifestGap) {
+        let source = dossier["sources"]
+            .as_array()
+            .and_then(|sources| sources.first())
+            .expect("review source");
+        vec![json!({
+            "source_id": source["source_id"],
+            "omitted_source_spans": [source_span(source)],
+        })]
+    } else {
+        Vec::new()
+    };
+    let mut unsatisfied_requirement_ids = Vec::new();
+    if matches!(kind, ReviewResponseKind::Finding(_)) {
+        unsatisfied_requirement_ids.push(
+            finding_requirement_id
+                .expect("active requirement")
+                .to_string(),
+        );
+    }
+    if matches!(kind, ReviewResponseKind::Unresolved) {
+        for finding in dossier["original_findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for requirement_id in finding["requirement_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if !unsatisfied_requirement_ids
+                    .iter()
+                    .any(|candidate| candidate == requirement_id)
+                {
+                    unsatisfied_requirement_ids.push(requirement_id.to_string());
+                }
             }
-            let mapping_kind = mapping["kind"].as_str().unwrap_or("non_requirement");
-            json!({
-                "source_id": source_id,
-                "result": mapping_kind,
-                "requirement_ids": mapping["requirement_ids"].as_array().cloned().unwrap_or_default(),
-                "omitted_source_spans": [],
-                "reason": if matches!(mapping_kind, "non_requirement" | "superseded_context") {
-                    mapping["reason"].as_str().unwrap_or("task-specific context classification")
-                } else {
-                    ""
-                },
-            })
-        })
-        .collect::<Vec<_>>();
-    let requirement_results = requirements
+        }
+    }
+    let unsatisfied_requirements = unsatisfied_requirement_ids
         .iter()
-        .map(|requirement| {
-            let is_finding = matches!(kind, ReviewResponseKind::Finding(_))
-                && requirement["requirement_id"].as_str() == finding_requirement_id;
+        .map(|requirement_id| {
             json!({
-                "requirement_id": requirement["requirement_id"],
-                "status": requirement["status"],
-                "satisfied": !is_finding,
-                "evidence": if is_finding {
-                    "the current candidate omits this active requirement"
-                } else {
-                    "owning code and focused evidence satisfy this manifest entry"
-                },
-            })
-        })
-        .collect::<Vec<_>>();
-    let lenses = REVIEW_LENSES
-        .iter()
-        .map(|lens| {
-            json!({
-                "lens": lens,
-                "status": "checked",
-                "surfaces": ["bounded completion-review fixture"],
-                "evidence": "the owning fixture and one-hop behavior were checked",
-                "reason": "",
+                "requirement_id": requirement_id,
+                "evidence": "the current candidate does not satisfy this active requirement",
             })
         })
         .collect::<Vec<_>>();
@@ -622,7 +672,7 @@ fn review_response(dossier: &Value, kind: ReviewResponseKind<'_>) -> String {
         ReviewResponseKind::Finding(summary) => vec![json!({
             "finding_local_ordinal": 1,
             "requirement_ids": [finding_requirement_id.expect("active requirement")],
-            "lens": REVIEW_LENSES[0],
+            "lens": finding_lens.expect("selected review lens"),
             "contract_surface": "completed.txt behavior",
             "severity": "high",
             "concrete_evidence": summary,
@@ -654,12 +704,11 @@ fn review_response(dossier: &Value, kind: ReviewResponseKind<'_>) -> String {
         })
         .collect::<Vec<_>>();
     json!({
-        "clean": matches!(kind, ReviewResponseKind::Clean),
-        "sources": sources,
-        "requirements": requirement_results,
-        "lenses": lenses,
+        "manifest_gaps": manifest_gaps,
+        "unsatisfied_requirements": unsatisfied_requirements,
+        "lens_observations": [],
         "findings": findings,
-        "original_finding_dispositions": dispositions,
+        "prior_finding_dispositions": dispositions,
     })
     .to_string()
 }
@@ -771,7 +820,9 @@ async fn clean_review_finishes_without_a_repair_continuation() -> Result<()> {
             .await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Passed)
+        Some(TaskCompletionStatus::Passed),
+        "unexpected completion gate: {:?}",
+        completion.completion
     );
     assert_no_additional_turn_complete(&test).await;
 
@@ -825,12 +876,20 @@ async fn manifest_gap_rebuilds_the_manifest_and_starts_a_fresh_initial_review() 
             .await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Passed)
+        Some(TaskCompletionStatus::Passed),
+        "unexpected completion gate: {:?}",
+        completion.completion
     );
     assert_no_additional_turn_complete(&test).await;
 
-    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 7);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 8);
     assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        probe
+            .relationship_resolution_requests
+            .load(Ordering::SeqCst),
+        1
+    );
     assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
     assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 0);
     assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 0);
@@ -874,7 +933,9 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
         submit_turn_and_capture_completion(&test, "Implement every stated requirement").await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Passed)
+        Some(TaskCompletionStatus::Passed),
+        "unexpected completion gate: {:?}",
+        completion.completion
     );
     assert_no_additional_turn_complete(&test).await;
 

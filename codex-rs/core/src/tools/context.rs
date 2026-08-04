@@ -295,6 +295,10 @@ impl ToolOutput for AbortedToolOutput {
         false
     }
 
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        Some(serde_json::json!({ "kind": "recoverable_cancellation" }))
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         match payload {
             ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {

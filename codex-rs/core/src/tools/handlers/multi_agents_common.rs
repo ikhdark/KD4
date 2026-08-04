@@ -28,7 +28,7 @@ use serde_json::Value as JsonValue;
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
-pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-5.6-sol";
+pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-5.6-terra";
 pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
@@ -243,7 +243,7 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
 /// Resolves role-locked model settings, explicit per-spawn overrides, and built-in defaults.
 ///
 /// Provider catalogs may qualify the built-in model slug (for example, Bedrock exposes
-/// `openai.gpt-5.6-sol`), so default resolution accepts a provider prefix while explicit model
+/// `openai.gpt-5.6-terra`), so default resolution accepts a provider prefix while explicit model
 /// overrides continue to require an exact advertised model name. Role-locked values take
 /// precedence; every unlocked reasoning effort defaults independently to `xhigh`.
 pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(

@@ -15,6 +15,7 @@ use tracing::instrument;
 use tracing::trace_span;
 
 use crate::function_tool::FunctionCallError;
+use crate::session::reasoning_governor::SamplingRequestSignalCollector;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::AbortedToolOutput;
@@ -44,6 +45,7 @@ pub(crate) struct ToolCallRuntime {
     step_context: Arc<StepContext>,
     tracker: SharedTurnDiffTracker,
     parallel_execution: Arc<RwLock<()>>,
+    sampling_request_signals: Option<SamplingRequestSignalCollector>,
 }
 
 impl ToolCallRuntime {
@@ -57,7 +59,16 @@ impl ToolCallRuntime {
             step_context,
             tracker,
             parallel_execution: Arc::new(RwLock::new(())),
+            sampling_request_signals: None,
         }
+    }
+
+    pub(crate) fn with_sampling_request_signals(
+        mut self,
+        collector: SamplingRequestSignalCollector,
+    ) -> Self {
+        self.sampling_request_signals = Some(collector);
+        self
     }
 
     pub(crate) fn create_diff_consumer(
@@ -75,14 +86,38 @@ impl ToolCallRuntime {
         call: ToolCall,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
+        let signal_ordinal = self
+            .sampling_request_signals
+            .as_ref()
+            .map(SamplingRequestSignalCollector::register_tool_call);
+        let signal_collector = self.sampling_request_signals.clone();
         let error_call = call.clone();
         let future =
             self.handle_tool_call_with_source(call, ToolCallSource::Direct, cancellation_token);
         async move {
             match future.await {
-                Ok(response) => Ok(response.into_response()),
-                Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
-                Err(other) => Ok(Self::failure_response(error_call, other)),
+                Ok(response) => {
+                    if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
+                        collector.record_result(
+                            ordinal,
+                            response.success_for_logging(),
+                            response.sampling_request_signal(),
+                        );
+                    }
+                    Ok(response.into_response())
+                }
+                Err(FunctionCallError::Fatal(message)) => {
+                    if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
+                        collector.record_failure(ordinal);
+                    }
+                    Err(CodexErr::Fatal(message))
+                }
+                Err(other) => {
+                    if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
+                        collector.record_failure(ordinal);
+                    }
+                    Ok(Self::failure_response(error_call, other))
+                }
             }
         }
         .in_current_span()

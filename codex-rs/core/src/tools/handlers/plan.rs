@@ -29,6 +29,7 @@ pub struct PlanHandler;
 
 pub struct PlanToolOutput {
     normalized_plan: Option<UpdatePlanArgs>,
+    governor_plan: UpdatePlanArgs,
 }
 
 const PLAN_UPDATED_MESSAGE: &str = "Plan updated";
@@ -98,6 +99,13 @@ impl ToolOutput for PlanToolOutput {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        Some(serde_json::json!({
+            "kind": "plan_update",
+            "plan": self.governor_plan,
+        }))
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
@@ -178,10 +186,13 @@ impl PlanHandler {
             .await;
         let normalized_plan = (args != requested_args).then(|| args.clone());
         session
-            .send_event(turn.as_ref(), EventMsg::PlanUpdate(args))
+            .send_event(turn.as_ref(), EventMsg::PlanUpdate(args.clone()))
             .await;
 
-        Ok(boxed_tool_output(PlanToolOutput { normalized_plan }))
+        Ok(boxed_tool_output(PlanToolOutput {
+            normalized_plan,
+            governor_plan: args,
+        }))
     }
 }
 

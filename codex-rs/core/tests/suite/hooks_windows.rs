@@ -108,8 +108,33 @@ fn read_pre_tool_use_hook_inputs(home: &Path) -> Result<Vec<Value>> {
         .collect()
 }
 
-#[tokio::test]
-async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution() -> Result<()> {
+#[test]
+fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution() -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    let handle = std::thread::Builder::new()
+        .name("pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_stack_size(TEST_STACK_SIZE_BYTES)
+                .enable_all()
+                .build()?;
+            runtime.block_on(
+                pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution_impl(),
+            )
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution thread panicked"
+        )),
+    }
+}
+
+async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution_impl() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -153,6 +178,7 @@ text(output.output);
         })
         .with_config(|config| {
             let _ = config.features.enable(Feature::CodeMode);
+            let _ = config.features.enable(Feature::UnifiedExec);
             trust_discovered_hooks(config);
         });
     let test = builder.build(&server).await?;
@@ -167,9 +193,19 @@ text(output.output);
     assert_eq!(requests.len(), 2);
     let output_item = requests[1].custom_tool_call_output(call_id);
     let output = code_mode_custom_tool_output_text(&output_item);
+    let hook_log = fs::read_to_string(test.codex_home_path().join("pre_tool_use_hook_log.jsonl"))
+        .unwrap_or_else(|error| format!("<hook log unavailable: {error}>"));
     assert!(
         output.contains("rewritten-result"),
-        "code mode should receive the rewritten command result"
+        concat!(
+            "code mode should receive the rewritten command result; ",
+            "output={:?}; original_marker_exists={}; ",
+            "rewritten_marker_exists={}; hook_log={}"
+        ),
+        output,
+        original_marker.exists(),
+        rewritten_marker.exists(),
+        hook_log,
     );
     assert!(
         !output.contains("original-result"),

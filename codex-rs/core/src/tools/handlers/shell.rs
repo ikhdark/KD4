@@ -29,6 +29,8 @@ use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_execution::WorkspaceMutationAcquireError;
+use crate::tools::command_execution::acquire_workspace_mutation_lease;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolPayload;
@@ -255,25 +257,32 @@ pub(super) async fn run_exec_like_with_exit_code(
                     "shell typed-agent liveness could not be reconciled: {error}"
                 ))
             })?;
-        let lease = store
-            .begin_workspace_mutation(
-                &repo_root,
-                WorkspaceMutationRequest {
-                    root_session_id,
-                    actor_id,
-                    kind,
-                    attempt_id: None,
-                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-                    contracts: Vec::new(),
-                    expected_manifest: Vec::new(),
-                },
-            )
-            .await
-            .map_err(|error| {
+        let request = WorkspaceMutationRequest {
+            root_session_id,
+            actor_id,
+            kind,
+            attempt_id: None,
+            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+            contracts: Vec::new(),
+            expected_manifest: Vec::new(),
+        };
+        let lease = acquire_workspace_mutation_lease(
+            store.as_ref(),
+            &repo_root,
+            &request,
+            &args.cancellation_token,
+        )
+        .await
+        .map_err(|error| match error {
+            WorkspaceMutationAcquireError::Cancelled => FunctionCallError::RespondToModel(
+                "shell command mutation-lease wait was cancelled".to_string(),
+            ),
+            WorkspaceMutationAcquireError::Store(error) => {
                 FunctionCallError::RespondToModel(format!(
                     "shell command could not acquire the repository-wide mutation lease: {error}"
                 ))
-            })?;
+            }
+        })?;
         workspace_mutation = Some((store, repo_root.clone(), lease, reservation));
     }
     let focused_validation_command = if typed_binding.is_some() && !inspection_command {

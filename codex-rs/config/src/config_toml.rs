@@ -65,6 +65,20 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
     LMSTUDIO_OSS_PROVIDER_ID,
 ];
 
+/// Per-logical-request reasoning effort overrides. Presence of this table
+/// enables deterministic phase tracking; omitted fields inherit the resolved
+/// turn effort.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningPhaseEfforts {
+    pub orient: Option<ReasoningEffort>,
+    pub inspect: Option<ReasoningEffort>,
+    pub implement: Option<ReasoningEffort>,
+    pub diagnose: Option<ReasoningEffort>,
+    pub verify: Option<ReasoningEffort>,
+    pub finalize: Option<ReasoningEffort>,
+}
+
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 
 const fn default_allow_login_shell() -> Option<bool> {
@@ -351,6 +365,7 @@ pub struct ConfigToml {
 
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
@@ -974,6 +989,53 @@ mod tests {
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables() {
+        let absent: ConfigToml = toml::from_str("").expect("absent config should deserialize");
+        assert_eq!(absent.reasoning_phase_efforts, None);
+
+        let empty: ConfigToml =
+            toml::from_str("[reasoning_phase_efforts]").expect("empty table should deserialize");
+        assert_eq!(
+            empty.reasoning_phase_efforts,
+            Some(ReasoningPhaseEfforts::default())
+        );
+
+        let partial: ConfigToml = toml::from_str(
+            r#"
+[reasoning_phase_efforts]
+inspect = "low"
+"#,
+        )
+        .expect("partial table should deserialize");
+        assert_eq!(
+            partial.reasoning_phase_efforts,
+            Some(ReasoningPhaseEfforts {
+                inspect: Some(ReasoningEffort::Low),
+                ..Default::default()
+            })
+        );
+
+        let full: ConfigToml = toml::from_str(
+            r#"
+[reasoning_phase_efforts]
+orient = "medium"
+inspect = "low"
+implement = "high"
+diagnose = "high"
+verify = "low"
+finalize = "low"
+"#,
+        )
+        .expect("full table should deserialize");
+        assert!(
+            full.reasoning_phase_efforts
+                .expect("table should be present")
+                .finalize
+                .is_some()
+        );
+    }
 
     #[test]
     fn forced_chatgpt_workspace_id_accepts_single_string() {

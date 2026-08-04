@@ -10,6 +10,7 @@ pub(crate) enum CommandPreflightIssueCode {
     ShellMismatch,
     WindowsLiteralPathRequired,
     DirectArgvPowerShellCmdlet,
+    GitStatusOptionalLocks,
     KnownFlagTypo,
     RgGlobPathSeparator,
     RgLiteralGlobPath,
@@ -102,6 +103,7 @@ impl CommandPreflightIssueCode {
             Self::ShellMismatch => "command_preflight_shell_mismatch",
             Self::WindowsLiteralPathRequired => "windows_literal_path_required",
             Self::DirectArgvPowerShellCmdlet => "direct_argv_powershell_cmdlet",
+            Self::GitStatusOptionalLocks => "git_status_optional_locks",
             Self::KnownFlagTypo => "known_flag_typo",
             Self::RgGlobPathSeparator => "rg_glob_path_separator",
             Self::RgLiteralGlobPath => "rg_literal_glob_path",
@@ -189,6 +191,23 @@ fn preflight_invocation_with_equivalent_repair_detailed(
 ) -> Result<CommandPreflightOutcome, CommandPreflightIssue> {
     let issue = match preflight_command_issue(command, shell_type) {
         Ok(()) => {
+            if let Some(repaired) = git_status_read_only_equivalent(invocation) {
+                let Some(repaired_command) = repaired.to_direct_argv() else {
+                    return Ok(CommandPreflightOutcome {
+                        invocation: invocation.clone(),
+                        repair_notice: None,
+                    });
+                };
+                preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
+                return Ok(CommandPreflightOutcome {
+                    repair_notice: Some(read_only_repair_notice(
+                        CommandPreflightIssueCode::GitStatusOptionalLocks,
+                        invocation,
+                        &repaired,
+                    )),
+                    invocation: repaired,
+                });
+            }
             return Ok(CommandPreflightOutcome {
                 invocation: invocation.clone(),
                 repair_notice: None,
@@ -232,16 +251,43 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     // reject it rather than chaining mechanical transformations.
     preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
 
-    let notice = format!(
-        "Command preflight applied one read-only equivalent repair ({}) before execution.\nOriginal: {}\nExecuted: {}",
-        issue.code.tool_error_kind(),
-        invocation.display_command(),
-        repaired.display_command()
-    );
+    let repair_notice = read_only_repair_notice(issue.code, invocation, &repaired);
     Ok(CommandPreflightOutcome {
         invocation: repaired,
-        repair_notice: Some(notice),
+        repair_notice: Some(repair_notice),
     })
+}
+
+fn git_status_read_only_equivalent(invocation: &CommandInvocation) -> Option<CommandInvocation> {
+    let CommandInvocation::Argv { program, args } = invocation else {
+        return None;
+    };
+    if !program_name(program).eq_ignore_ascii_case("git")
+        || args.first().map(String::as_str) != Some("status")
+    {
+        return None;
+    }
+
+    let mut repaired_args = Vec::with_capacity(args.len() + 1);
+    repaired_args.push("--no-optional-locks".to_string());
+    repaired_args.extend(args.iter().cloned());
+    Some(CommandInvocation::Argv {
+        program: program.clone(),
+        args: repaired_args,
+    })
+}
+
+fn read_only_repair_notice(
+    code: CommandPreflightIssueCode,
+    original: &CommandInvocation,
+    repaired: &CommandInvocation,
+) -> String {
+    format!(
+        "Command preflight applied one read-only equivalent repair ({}) before execution.\nOriginal: {}\nExecuted: {}",
+        code.tool_error_kind(),
+        original.display_command(),
+        repaired.display_command()
+    )
 }
 
 fn json_string(value: &str) -> String {

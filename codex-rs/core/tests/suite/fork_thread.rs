@@ -4,6 +4,7 @@ use codex_core::ForkSnapshot;
 use codex_core::NewThread;
 use codex_core::parse_turn_item;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
@@ -11,8 +12,11 @@ use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
@@ -150,78 +154,127 @@ async fn fork_thread_twice_drops_to_first_message() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fork_thread_from_history_does_not_require_source_rollout_path() {
-    skip_if_no_network!();
+#[test]
+fn fork_thread_from_history_does_not_require_source_rollout_path() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build fork-thread test runtime");
+    runtime.block_on(async {
+        skip_if_no_network!();
 
-    let server = MockServer::start().await;
-    let sse = sse(vec![ev_response_created("resp"), ev_completed("resp")]);
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(sse, "text/event-stream"),
+        let server = MockServer::start().await;
+        let initial_sse = sse(vec![
+            ev_response_created("resp-source"),
+            ev_reasoning_item("reason-fork", &["fork summary"], &["fork detail"]),
+            ev_assistant_message("msg-source", "source complete"),
+            ev_completed("resp-source"),
+        ]);
+        let forked_sse = sse(vec![
+            ev_response_created("resp-forked"),
+            ev_assistant_message("msg-forked", "fork complete"),
+            ev_completed("resp-forked"),
+        ]);
+        let request_log = mount_sse_sequence(&server, vec![initial_sse, forked_sse]).await;
+
+        let mut builder = test_codex();
+        let test = builder.build(&server).await.expect("create conversation");
+        let codex = test.codex.clone();
+        let thread_manager = test.thread_manager.clone();
+
+        codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "fork me from stored history".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await
+            .unwrap();
+        let _ = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+        let source_path = codex.rollout_path().expect("source rollout path");
+        let source_items = read_rollout_items(&source_path);
+        assert!(
+            contains_reasoning(&source_items, "reason-fork"),
+            "source rollout must retain the full reasoning record"
+        );
+        let NewThread {
+            thread: forked_thread,
+            ..
+        } = thread_manager
+            .fork_thread_from_history(
+                ForkSnapshot::Interrupted,
+                test.config.clone(),
+                InitialHistory::Resumed(ResumedHistory {
+                    conversation_id: test.session_configured.thread_id,
+                    history: Arc::new(source_items.clone()),
+                    rollout_path: None,
+                }),
+                /*thread_source*/ None,
+                /*parent_trace*/ None,
+                /*supports_openai_form_elicitation*/ false,
+            )
+            .await
+            .expect("fork from stored history");
+
+        let forked_path = forked_thread.rollout_path().expect("forked rollout path");
+        let forked_items = read_rollout_items(&forked_path);
+        assert!(
+            contains_reasoning(&forked_items, "reason-fork"),
+            "forked rollout must retain the full reasoning record"
+        );
+        let forked_item_values = forked_items
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect::<Vec<_>>();
+        let source_item_values = source_items
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            forked_item_values.starts_with(&source_item_values),
+            "forked history should start with the supplied source history"
+        );
+
+        forked_thread
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "continue the fork".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await
+            .unwrap();
+        let _ = wait_for_event(&forked_thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+        let requests = request_log.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].inputs_of_type("reasoning").is_empty(),
+            "the next forked request must project out reasoning from completed instruction groups"
+        );
+    });
+}
+
+fn contains_reasoning(items: &[RolloutItem], expected_id: &str) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::ResponseItem(ResponseItem::Reasoning { id: Some(id), .. })
+                if id.as_str() == expected_id
         )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let mut builder = test_codex();
-    let test = builder.build(&server).await.expect("create conversation");
-    let codex = test.codex.clone();
-    let thread_manager = test.thread_manager.clone();
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "fork me from stored history".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-    let _ = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let source_path = codex.rollout_path().expect("source rollout path");
-    let source_items = read_rollout_items(&source_path);
-    let NewThread {
-        thread: forked_thread,
-        ..
-    } = thread_manager
-        .fork_thread_from_history(
-            ForkSnapshot::Interrupted,
-            test.config.clone(),
-            InitialHistory::Resumed(ResumedHistory {
-                conversation_id: test.session_configured.thread_id,
-                history: Arc::new(source_items.clone()),
-                rollout_path: None,
-            }),
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
-        )
-        .await
-        .expect("fork from stored history");
-
-    let forked_path = forked_thread.rollout_path().expect("forked rollout path");
-    let forked_items = read_rollout_items(&forked_path);
-    let forked_items = forked_items
-        .iter()
-        .map(|item| serde_json::to_value(item).unwrap())
-        .collect::<Vec<_>>();
-    let source_items = source_items
-        .iter()
-        .map(|item| serde_json::to_value(item).unwrap())
-        .collect::<Vec<_>>();
-    assert!(
-        forked_items.starts_with(&source_items),
-        "forked history should start with the supplied source history"
-    );
+    })
 }
 
 fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {

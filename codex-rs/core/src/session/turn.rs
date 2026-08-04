@@ -50,6 +50,11 @@ use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
+use crate::session::reasoning_governor::SamplingReasoningGovernor;
+use crate::session::reasoning_governor::SamplingReasoningPhase;
+use crate::session::reasoning_governor::SamplingRequestPolicy;
+use crate::session::reasoning_governor::SamplingRequestSettledState;
+use crate::session::reasoning_governor::SamplingRequestSignalCollector;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -264,6 +269,8 @@ pub(crate) async fn run_turn(
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
         TurnDiffTracker::with_environment_display_roots(display_roots),
     ));
+    let mut reasoning_governor =
+        SamplingReasoningGovernor::new(turn_context.config.reasoning_phase_efforts.as_ref());
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -284,7 +291,12 @@ pub(crate) async fn run_turn(
             Vec::new()
         };
 
-        if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
+        let recorded_input =
+            run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await;
+        if recorded_input.accepted_user_input {
+            reasoning_governor.accepted_user_input();
+        }
+        if recorded_input.should_stop {
             break;
         }
 
@@ -301,6 +313,20 @@ pub(crate) async fn run_turn(
             Some(step_context) => step_context,
             None => sess.capture_step_context(Arc::clone(&turn_context)).await,
         };
+        let request_baselines = {
+            let tracker = turn_diff_tracker.lock().await;
+            reasoning_governor.baselines(
+                tracker.current_mutation_revision(),
+                tracker.validation_freshness_status(),
+                tracker.last_successful_validation_revision(),
+            )
+        };
+        let request_policy = reasoning_governor.resolve_policy(
+            step_context.turn.config.reasoning_phase_efforts.as_ref(),
+            step_context.turn.reasoning_effort.clone(),
+            &step_context.turn.model_info,
+        );
+        let request_signals = SamplingRequestSignalCollector::default();
         let sampling_request_result: CodexResult<_> = async {
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
@@ -343,6 +369,8 @@ pub(crate) async fn run_turn(
                 sampling_request_input,
                 &mut first_router,
                 &mut preparation_timing_guard,
+                request_policy,
+                request_signals.clone(),
                 cancellation_token.child_token(),
             )
             .await
@@ -353,7 +381,11 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    settled_state,
                 } = sampling_request_output;
+                let settled_state = settled_state
+                    .expect("settled sampling state is populated after concurrent tools drain");
+                reasoning_governor.settle(&request_baselines, &request_signals, &settled_state);
                 can_drain_pending_input = true;
                 let (has_pending_input, token_status) = async {
                     let has_pending_input =
@@ -433,6 +465,7 @@ pub(crate) async fn run_turn(
                         return Ok(None);
                     }
                     can_drain_pending_input = !model_needs_follow_up;
+                    reasoning_governor.host_retain();
                     continue;
                 }
 
@@ -462,6 +495,7 @@ pub(crate) async fn run_turn(
                         }
                     }
                     if observed_stop_outcome.workspace_changed {
+                        reasoning_governor.host_mutation();
                         trace!(
                             "Stop hook workspace mutation will be included in completion review"
                         );
@@ -477,6 +511,7 @@ pub(crate) async fn run_turn(
                             )
                             .await;
                             stop_hook_active = true;
+                            reasoning_governor.host_diagnose();
                             continue;
                         } else {
                             sess.send_event(
@@ -506,6 +541,7 @@ pub(crate) async fn run_turn(
                         report_completion_review_outcome(&sess, &turn_context, review_outcome)
                             .await;
                     if repair_injected {
+                        reasoning_governor.host_diagnose();
                         continue 'sampling_loop;
                     }
                     let correction_consumed = sess
@@ -527,6 +563,7 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                     } else if after_agent_outcome.workspace_changed {
+                        reasoning_governor.host_mutation();
                         if !matches!(
                             sess.services
                                 .task_evidence
@@ -560,6 +597,7 @@ pub(crate) async fn run_turn(
                                 .await;
                             }
                             if observed_stop_outcome.workspace_changed {
+                                reasoning_governor.host_mutation();
                                 trace!(
                                     "Stop hook workspace mutation will be included in refreshed completion review"
                                 );
@@ -575,6 +613,7 @@ pub(crate) async fn run_turn(
                                 )
                                 .await;
                                 stop_hook_active = true;
+                                reasoning_governor.host_diagnose();
                                 continue 'sampling_loop;
                             }
                             if stop_outcome.should_stop {
@@ -601,6 +640,7 @@ pub(crate) async fn run_turn(
                             )
                             .await;
                             if repair_injected {
+                                reasoning_governor.host_diagnose();
                                 continue 'sampling_loop;
                             }
                         }
@@ -706,6 +746,25 @@ pub(crate) async fn run_hooks_and_record_inputs(
     turn_context: &Arc<TurnContext>,
     input: &[TurnInput],
 ) -> bool {
+    run_hooks_and_record_inputs_detailed(sess, turn_context, input)
+        .await
+        .should_stop
+}
+
+struct RecordedInputOutcome {
+    should_stop: bool,
+    accepted_user_input: bool,
+}
+
+fn resets_reasoning_governor(input: &TurnInput) -> bool {
+    matches!(input, TurnInput::UserInput { content, .. } if !content.is_empty())
+}
+
+async fn run_hooks_and_record_inputs_detailed(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    input: &[TurnInput],
+) -> RecordedInputOutcome {
     let mut blocked_input = false;
     let mut accepted_user_input = false;
     for input_item in input {
@@ -714,7 +773,7 @@ pub(crate) async fn run_hooks_and_record_inputs(
             blocked_input = true;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
-            if matches!(input_item, TurnInput::UserInput { content, .. } if !content.is_empty()) {
+            if resets_reasoning_governor(input_item) {
                 accepted_user_input = true;
             }
             record_pending_input(
@@ -726,7 +785,10 @@ pub(crate) async fn run_hooks_and_record_inputs(
             .await;
         }
     }
-    blocked_input && !accepted_user_input
+    RecordedInputOutcome {
+        should_stop: blocked_input && !accepted_user_input,
+        accepted_user_input,
+    }
 }
 
 struct PendingTurnPlan {
@@ -1868,6 +1930,8 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     prebuilt_router: &mut Option<Arc<ToolRouter>>,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
+    request_policy: SamplingRequestPolicy,
+    request_signals: SamplingRequestSignalCollector,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
@@ -1892,7 +1956,8 @@ async fn run_sampling_request(
         Arc::clone(&sess),
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
-    );
+    )
+    .with_sampling_request_signals(request_signals);
     let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
         &sess,
         Arc::clone(&step_context),
@@ -1926,6 +1991,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             preparation_timing_guard,
+            &request_policy,
             cancellation_token.child_token(),
         )
         .await
@@ -2122,6 +2188,7 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    settled_state: Option<SamplingRequestSettledState>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2721,6 +2788,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
+    request_policy: &SamplingRequestPolicy,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     sess.ensure_rollout_budget_available()?;
@@ -2728,7 +2796,7 @@ async fn try_run_sampling_request(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
         sandbox_policy = &turn_context.sandbox_policy(),
-        effort = turn_context.reasoning_effort,
+        effort = request_policy.effort,
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
@@ -2765,7 +2833,7 @@ async fn try_run_sampling_request(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
-            turn_context.reasoning_effort.clone(),
+            request_policy.effort.clone(),
             turn_context.reasoning_summary,
             turn_context.config.service_tier.clone(),
             responses_metadata,
@@ -2788,7 +2856,16 @@ async fn try_run_sampling_request(
     let mut should_emit_turn_diff = false;
     let mut should_emit_token_count = false;
     let mut latest_models_etag = None;
-    let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
+    let reasoning_effort = request_policy
+        .effort
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "default".to_string());
+    let reasoning_phase = request_policy
+        .phase
+        .map(SamplingReasoningPhase::as_str)
+        .unwrap_or("disabled");
+    let reasoning_effort_source = request_policy.source.as_str();
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
@@ -2796,7 +2873,7 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
-    let outcome: CodexResult<SamplingRequestResult> = loop {
+    let mut outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -2804,6 +2881,8 @@ async fn try_run_sampling_request(
             tool_name = field::Empty,
             from = field::Empty,
             codex.request.reasoning_effort = %reasoning_effort,
+            codex.request.reasoning_phase = reasoning_phase,
+            codex.request.reasoning_effort_source = reasoning_effort_source,
             gen_ai.usage.input_tokens = field::Empty,
             gen_ai.usage.cache_read.input_tokens = field::Empty,
             gen_ai.usage.output_tokens = field::Empty,
@@ -2939,6 +3018,7 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        settled_state: None,
                     });
                 }
             }
@@ -3099,6 +3179,7 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    settled_state: None,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -3278,6 +3359,15 @@ async fn try_run_sampling_request(
 
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
+    }
+
+    if let Ok(result) = &mut outcome {
+        let tracker = turn_diff_tracker.lock().await;
+        result.settled_state = Some(SamplingRequestSettledState {
+            mutation_revision: tracker.current_mutation_revision(),
+            validation_status: tracker.validation_freshness_status(),
+            validation_revision: tracker.last_successful_validation_revision(),
+        });
     }
 
     if should_emit_turn_diff {

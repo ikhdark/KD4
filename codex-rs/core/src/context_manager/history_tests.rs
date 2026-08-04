@@ -9,6 +9,7 @@ use codex_extension_api::RenderedWorldStateFragment;
 use codex_extension_api::WorldStateSectionContribution;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
@@ -150,7 +151,7 @@ fn world_state_reconciles_matching_legacy_history_once() {
 
     let (fragments, rollout_item) = history.update_world_state(&world_state);
     assert_eq!(
-        vec!["\n\n<INSTRUCTIONS>\nunknown\n"],
+        vec!["# AGENTS.md instructions\n\n<INSTRUCTIONS>\nunknown\n</INSTRUCTIONS>"],
         fragments
             .into_iter()
             .map(|fragment| fragment.body())
@@ -312,6 +313,30 @@ fn custom_tool_call_output(call_id: &str, output: &str) -> ResponseItem {
     }
 }
 
+fn custom_tool_call(call_id: &str) -> ResponseItem {
+    ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: call_id.to_string(),
+        name: "test_tool".to_string(),
+        namespace: None,
+        input: "{}".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn agent_message(text: &str) -> ResponseItem {
+    ResponseItem::AgentMessage {
+        id: None,
+        author: "worker".to_string(),
+        recipient: "root".to_string(),
+        content: vec![AgentMessageInputContent::InputText {
+            text: text.to_string(),
+        }],
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
 fn reasoning_msg(text: &str) -> ResponseItem {
     ResponseItem::Reasoning {
         id: None,
@@ -334,6 +359,22 @@ fn reasoning_with_encrypted_content(len: usize) -> ResponseItem {
         }],
         content: None,
         encrypted_content: Some("a".repeat(len)),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn reasoning_with_all_fields(text: &str, encrypted_content: &str) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: Some(ResponseItemId::from_server(
+            "reasoning-all-fields".to_string(),
+        )),
+        summary: vec![ReasoningItemReasoningSummary::SummaryText {
+            text: format!("summary: {text}"),
+        }],
+        content: Some(vec![ReasoningItemContent::ReasoningText {
+            text: text.to_string(),
+        }]),
+        encrypted_content: Some(encrypted_content.to_string()),
         internal_chat_message_metadata_passthrough: None,
     }
 }
@@ -406,26 +447,124 @@ fn filters_non_api_messages() {
 }
 
 #[test]
-fn non_last_reasoning_tokens_return_zero_when_no_user_messages() {
-    let history =
-        create_history_with_items(vec![reasoning_with_encrypted_content(/*len*/ 800)]);
+fn for_prompt_preserves_reasoning_when_no_instruction_boundary_exists() {
+    let reasoning = reasoning_with_all_fields("private reasoning", "encrypted reasoning");
+    let history = create_history_with_items(vec![reasoning.clone(), assistant_msg("done")]);
 
-    assert_eq!(history.get_non_last_reasoning_items_tokens(), 0);
+    assert_eq!(
+        history.for_prompt(&default_input_modalities()),
+        vec![reasoning, assistant_msg("done")]
+    );
 }
 
 #[test]
-fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
+fn for_prompt_evicts_entire_reasoning_item_before_latest_boundary_without_mutating_raw_history() {
+    let resolved = reasoning_with_all_fields("private reasoning", "encrypted reasoning");
+    let boundary = user_input_text_msg("next instruction");
+    let history = create_history_with_items(vec![resolved.clone(), boundary.clone()]);
+    let raw_before = history.raw_items().to_vec();
+
+    assert_eq!(
+        history.clone().for_prompt(&default_input_modalities()),
+        vec![boundary]
+    );
+    assert_eq!(history.raw_items(), raw_before);
+    assert_eq!(
+        history.raw_items(),
+        &[resolved, user_input_text_msg("next instruction")]
+    );
+}
+
+#[test]
+fn for_prompt_keeps_current_group_reasoning_through_tool_output_until_next_boundary() {
+    let call = custom_tool_call("call-current");
+    let reasoning = reasoning_msg("current reasoning");
+    let output = custom_tool_call_output("call-current", "tool result");
+    let history = create_history_with_items(vec![call.clone(), reasoning.clone(), output.clone()]);
+
+    assert_eq!(
+        history.clone().for_prompt(&default_input_modalities()),
+        vec![call.clone(), reasoning.clone(), output.clone()]
+    );
+
+    let boundary = user_input_text_msg("new instruction");
+    let mut after_boundary = history;
+    after_boundary.record_items([&boundary], TruncationPolicy::Tokens(10_000));
+    assert_eq!(
+        after_boundary.for_prompt(&default_input_modalities()),
+        vec![call, output, boundary]
+    );
+}
+
+#[test]
+fn for_prompt_uses_all_instruction_boundary_kinds() {
+    for boundary in [
+        user_input_text_msg("user instruction"),
+        agent_message("agent instruction"),
+        inter_agent_assistant_msg("structured instruction"),
+    ] {
+        let history = create_history_with_items(vec![reasoning_msg("resolved"), boundary.clone()]);
+        assert_eq!(
+            history.for_prompt(&default_input_modalities()),
+            vec![boundary]
+        );
+    }
+}
+
+#[test]
+fn for_prompt_does_not_treat_contextual_user_or_legacy_assistant_text_as_boundaries() {
+    let contextual = crate::context::ContextualUserFragment::into(UserInstructions {
+        directory: None,
+        text: "context only".to_string(),
+    });
+    let legacy = assistant_msg(
+        "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue",
+    );
+    let reasoning = reasoning_msg("still active");
+    let history =
+        create_history_with_items(vec![reasoning.clone(), contextual.clone(), legacy.clone()]);
+
+    assert_eq!(
+        history.for_prompt(&default_input_modalities()),
+        vec![reasoning, contextual, legacy]
+    );
+}
+
+#[test]
+fn for_prompt_evicts_multiple_completed_groups_and_keeps_current_reasoning() {
+    let first_boundary = user_input_text_msg("first");
+    let second_boundary = user_input_text_msg("second");
+    let current = reasoning_msg("current");
     let history = create_history_with_items(vec![
-        reasoning_with_encrypted_content(/*len*/ 900),
-        user_msg("first"),
-        reasoning_with_encrypted_content(/*len*/ 1_000),
-        user_msg("second"),
-        reasoning_with_encrypted_content(/*len*/ 2_000),
+        reasoning_msg("before first"),
+        first_boundary.clone(),
+        reasoning_msg("before second"),
+        second_boundary.clone(),
+        current.clone(),
     ]);
-    // first: (900 * 0.75 - 650) / 4 = 6.25 tokens
-    // second: (1000 * 0.75 - 650) / 4 = 25 tokens
-    // first + second = 62.5
-    assert_eq!(history.get_non_last_reasoning_items_tokens(), 32);
+
+    assert_eq!(
+        history.for_prompt(&default_input_modalities()),
+        vec![first_boundary, second_boundary, current]
+    );
+}
+
+#[test]
+fn for_prompt_projects_before_normalizing_retained_call_output_pairs() {
+    let call = custom_tool_call("call-paired");
+    let boundary = user_input_text_msg("next instruction");
+    let output = custom_tool_call_output("call-paired", "tool result");
+    let history = create_history_with_items(vec![
+        reasoning_msg("resolved"),
+        call.clone(),
+        boundary.clone(),
+        output.clone(),
+    ]);
+
+    assert_eq!(
+        history.for_prompt(&default_input_modalities()),
+        vec![call, boundary, output]
+    );
 }
 
 #[test]
@@ -507,7 +646,7 @@ fn legacy_inter_agent_assistant_messages_are_not_turn_boundaries() {
 }
 
 #[test]
-fn total_token_usage_includes_all_items_after_last_model_generated_item() {
+fn total_token_usage_keeps_server_snapshot_plus_same_group_tool_tail_in_both_modes() {
     let mut history = create_history_with_items(vec![assistant_msg("already counted by API")]);
     history.update_token_info(
         &TokenUsage {
@@ -516,17 +655,122 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
         },
         /*model_context_window*/ None,
     );
-    let added_user = user_msg("new user message");
     let added_tool_output = custom_tool_call_output("tool-tail", "new tool output");
-    history.record_items(
-        [&added_user, &added_tool_output],
-        TruncationPolicy::Tokens(10_000),
+    history.record_items([&added_tool_output], TruncationPolicy::Tokens(10_000));
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+
+    for server_reasoning_included in [false, true] {
+        assert_eq!(
+            history.get_total_token_usage(server_reasoning_included, &base_instructions),
+            100 + estimate_item_token_count(&added_tool_output)
+        );
+    }
+}
+
+#[test]
+fn total_token_usage_recomputes_projected_history_when_local_tail_contains_boundary() {
+    let resolved_reasoning = reasoning_with_encrypted_content(/*len*/ 2_000);
+    let counted_response = assistant_msg("already counted by API");
+    let boundary = user_input_text_msg("new instruction");
+    let mut history =
+        create_history_with_items(vec![resolved_reasoning, counted_response, boundary]);
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 50_000,
+            ..Default::default()
+        },
+        /*model_context_window*/ None,
     );
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+    let expected = ContextManager::estimate_items_token_count_with_base_instructions(
+        history.raw_items(),
+        &base_instructions,
+    )
+    .unwrap();
+
+    for server_reasoning_included in [false, true] {
+        assert_eq!(
+            history.get_total_token_usage(server_reasoning_included, &base_instructions),
+            expected
+        );
+    }
+    assert!(expected < 50_000);
+}
+
+#[test]
+fn total_token_usage_recomputes_initial_projected_history_before_any_model_response() {
+    let boundary = user_input_text_msg("initial instruction");
+    let history = create_history_with_items(vec![boundary]);
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+    let expected = history
+        .estimate_token_count_with_base_instructions(&base_instructions)
+        .unwrap();
+
+    for server_reasoning_included in [false, true] {
+        assert_eq!(
+            history.get_total_token_usage(server_reasoning_included, &base_instructions),
+            expected
+        );
+    }
+}
+
+#[test]
+fn total_token_usage_refreshes_from_server_after_next_model_response() {
+    let boundary = user_input_text_msg("new instruction");
+    let mut history = create_history_with_items(vec![
+        reasoning_with_encrypted_content(/*len*/ 2_000),
+        assistant_msg("old response"),
+        boundary,
+    ]);
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 50_000,
+            ..Default::default()
+        },
+        /*model_context_window*/ None,
+    );
+    let fresh_response = assistant_msg("fresh response");
+    history.record_items([&fresh_response], TruncationPolicy::Tokens(10_000));
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 222,
+            ..Default::default()
+        },
+        /*model_context_window*/ None,
+    );
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+
+    for server_reasoning_included in [false, true] {
+        assert_eq!(
+            history.get_total_token_usage(server_reasoning_included, &base_instructions),
+            222
+        );
+    }
+}
+
+#[test]
+fn static_token_estimator_excludes_reasoning_before_latest_boundary() {
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+    let visible = vec![assistant_msg("response"), user_input_text_msg("next")];
+    let mut raw = vec![reasoning_with_encrypted_content(/*len*/ 4_000)];
+    raw.extend(visible.clone());
 
     assert_eq!(
-        history.get_total_token_usage(/*server_reasoning_included*/ true),
-        100 + estimate_item_token_count(&added_user)
-            + estimate_item_token_count(&added_tool_output)
+        ContextManager::estimate_items_token_count_with_base_instructions(&raw, &base_instructions),
+        ContextManager::estimate_items_token_count_with_base_instructions(
+            &visible,
+            &base_instructions
+        )
     );
 }
 

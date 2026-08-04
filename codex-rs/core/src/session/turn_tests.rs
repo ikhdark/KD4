@@ -16,6 +16,7 @@ use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ToolInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
+use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::models::PermissionProfile;
@@ -24,6 +25,7 @@ use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
@@ -36,6 +38,7 @@ use rmcp::model::Tool;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +47,29 @@ use wiremock::Mock;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+
+fn run_turn_multi_thread_test_with_stack<F, Fut, T>(test_name: &'static str, test: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("turn test runtime")
+                .block_on(test())
+        })
+        .expect("turn test thread")
+        .join()
+        .expect("turn test thread panicked")
+}
 
 struct RewriteAgentMessageContributor;
 
@@ -144,6 +170,34 @@ fn response_input_texts(items: &[ResponseItem]) -> Vec<&str> {
         }
     }
     texts
+}
+
+#[test]
+fn reasoning_governor_resets_only_for_non_empty_user_input() {
+    let user_input = TurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "new instruction".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
+    };
+    let empty_user_input = TurnInput::UserInput {
+        content: Vec::new(),
+        client_id: None,
+    };
+    let response_item = TurnInput::ResponseItem(assistant_output_text("context"));
+    let mailbox_item = TurnInput::InterAgentCommunication(InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("agent path"),
+        Vec::new(),
+        "mailbox context".to_string(),
+        true,
+    ));
+
+    assert!(resets_reasoning_governor(&user_input));
+    assert!(!resets_reasoning_governor(&empty_user_input));
+    assert!(!resets_reasoning_governor(&response_item));
+    assert!(!resets_reasoning_governor(&mailbox_item));
 }
 
 #[test]
@@ -458,8 +512,15 @@ async fn steering_applies_next_turn_settings_without_building_a_candidate_turn_c
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn initial_response_item_triggers_compaction_before_the_stream_request() -> Result<()> {
+#[test]
+fn initial_response_item_triggers_compaction_before_the_stream_request() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "initial_response_item_triggers_compaction_before_the_stream_request",
+        initial_response_item_triggers_compaction_before_the_stream_request_impl,
+    )
+}
+
+async fn initial_response_item_triggers_compaction_before_the_stream_request_impl() -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
     let request_log = responses::mount_sse_sequence(

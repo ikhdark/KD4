@@ -12,6 +12,7 @@
 - `.codex/README.md` documents workspace routing, `.codex/config.toml` owns
   optional repo-local runtime configuration, and `.codex/skills` owns fork-local
   skills and validation workflows.
+- "C:\Users\kuh\Desktop\LOCAL-KD" is the home for the fork-local
 
 ## Desktop app boundary
 
@@ -129,10 +130,10 @@ path that completes the request correctly.
   contract before broader validation.
 - Scripts: follow `scripts/AGENTS.md` and use the closest syntax, unit, dry-run,
   or policy test for the edited script.
-- Local publish: use the supported local publish and restart proof chain before
-  claiming that Codex Desktop is running the changed Rust behavior.
+- Do not publish, the user wil do that manually.
 - Regenerate owned artifacts through their documented generator; do not hand-edit
   generated locks or generated protocol/schema outputs.
 - Tooling success alone does not prove a behavior or runtime fix. Completion
   requires the focused failing test or approved final gate to pass, and
   desktop-visible changes also require the local publish/restart proof.
+`

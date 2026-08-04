@@ -488,6 +488,11 @@ async fn summarize_context_three_requests_and_instructions() {
 
     // SSE 1: assistant replies normally so it is recorded in history.
     let sse1 = sse(vec![
+        ev_reasoning_item(
+            "resolved-before-compact",
+            &["resolved compact summary"],
+            &["resolved compact plaintext"],
+        ),
         ev_assistant_message("m1", FIRST_REPLY),
         ev_completed("r1"),
     ]);
@@ -581,6 +586,12 @@ async fn summarize_context_three_requests_and_instructions() {
     assert!(
         has_compact_prompt,
         "compaction request should include the summarize trigger"
+    );
+    assert!(
+        !body2_str.contains("resolved-before-compact")
+            && !body2_str.contains("resolved compact summary")
+            && !body2_str.contains("resolved compact plaintext"),
+        "compaction request should exclude reasoning from the completed instruction group"
     );
     // The last item is the user message created from the injected input.
     let last2 = input2.last().unwrap();
@@ -4548,7 +4559,7 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
+async fn auto_compact_excludes_resolved_reasoning_from_active_usage() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -4576,11 +4587,11 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     let request_log = mount_sse_sequence(
         &server,
         vec![
-            // Turn 1: reasoning before last user (should count).
+            // Turn 1: reasoning is still active until the next user boundary.
             first_turn,
             // Turn 2: reasoning after last user (should be ignored for compaction).
             second_turn,
-            // Turn 3: next user turn after remote compaction.
+            // Turn 3: the new user boundary evicts both earlier reasoning items.
             third_turn,
         ],
     )
@@ -4646,16 +4657,9 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
         }
     }
 
-    let compact_requests = compact_mock.requests();
-    assert_eq!(
-        compact_requests.len(),
-        1,
-        "remote compaction should run once after the second turn"
-    );
-    assert_eq!(
-        compact_requests[0].path(),
-        "/v1/responses/compact",
-        "remote compaction should hit the compact endpoint"
+    assert!(
+        compact_mock.requests().is_empty(),
+        "resolved reasoning should not trigger remote compaction"
     );
 
     let requests = request_log.requests();
@@ -4664,25 +4668,20 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
         3,
         "conversation should include three user turns"
     );
-    let second_request_body = requests[1].body_json().to_string();
-    assert!(
-        !second_request_body.contains("REMOTE_COMPACT_SUMMARY"),
-        "second turn should not include compacted history"
-    );
     let third_request_body = requests[2].body_json().to_string();
     assert!(
-        third_request_body.contains("REMOTE_COMPACT_SUMMARY")
-            || third_request_body.contains(FINAL_REPLY),
-        "third turn should include compacted history"
+        !third_request_body.contains("REMOTE_COMPACT_SUMMARY"),
+        "third turn should not include compacted history"
     );
     assert!(
-        third_request_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
-        "third turn should include compaction summary item"
+        !third_request_body.contains("pre-reasoning")
+            && !third_request_body.contains("post-reasoning"),
+        "third turn should exclude resolved reasoning"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
+async fn auto_compact_excludes_resolved_reasoning_when_reasoning_header_clears() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -4762,11 +4761,9 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
         wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     }
 
-    let compact_requests = compact_mock.requests();
-    assert_eq!(
-        compact_requests.len(),
-        1,
-        "remote compaction should run once after the reasoning header clears"
+    assert!(
+        compact_mock.requests().is_empty(),
+        "resolved reasoning should not trigger compaction after the header clears"
     );
 }
 

@@ -21,6 +21,7 @@ pub use id::WakeEventId;
 pub use local::LocalAgentTaskStore;
 pub use model::*;
 pub use scope::RepoScope;
+pub use scope::normalize_repo_path;
 pub use scope::normalize_repo_scopes;
 pub use scope::repository_lineage_id;
 pub use scope::repository_workspace_id;

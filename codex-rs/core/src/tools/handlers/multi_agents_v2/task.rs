@@ -230,6 +230,14 @@ async fn handle_submit_agent_receipt(
             "{SUBMIT_AGENT_RECEIPT_TOOL}: the typed task store is unavailable"
         ))
     })?;
+    // A sealed receipt makes task completion visible to other turns. Ensure any
+    // command-level workspace mutation owned by this turn has terminated and
+    // released both its persisted lease and its local reservation first.
+    session
+        .services
+        .command_execution
+        .cancel_mutations_for_turn(&turn.sub_id)
+        .await;
     store
         .finalize_pending_mutations(binding.attempt_id)
         .await

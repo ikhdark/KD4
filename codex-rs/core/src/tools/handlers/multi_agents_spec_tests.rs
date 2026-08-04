@@ -71,8 +71,9 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
     assert!(!description.contains("max_concurrent_threads_per_session"));
     assert!(description.contains(&spawn_agent_default_guidance()));
     assert!(
-        description
-            .contains("Available model overrides (optional; `gpt-5.6-sol` is the spawn default):")
+        description.contains(
+            "Available model overrides (optional; `gpt-5.6-terra` is the spawn default):"
+        )
     );
     assert!(description.contains(
         "- `visible-model`: visible description Reasoning efforts: medium (catalog default). Service tiers: priority."
@@ -93,8 +94,37 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
             .get("fork_turns")
             .and_then(|schema| schema.description.as_deref())
             .is_some_and(|description| {
-                description.contains("Defaults to `none`.")
+                description.contains("typed assignments, omitted or `none` creates a lineage-preserving TaskCapsule fork")
+                    && description.contains(
+                        "legacy messages, omitted or `none` creates a fresh non-forked child",
+                    )
                     && description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE)
+            })
+    );
+    let assignment = properties
+        .get("assignment")
+        .expect("typed assignment schema");
+    let assignment_properties = assignment
+        .properties
+        .as_ref()
+        .expect("typed assignment properties");
+    let relevant_handles = assignment_properties
+        .get("relevant_handles")
+        .expect("relevant handle schema");
+    assert_eq!(
+        relevant_handles
+            .items
+            .as_ref()
+            .and_then(|schema| schema.any_of.as_ref())
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        assignment
+            .description
+            .as_deref()
+            .is_some_and(|description| {
+                description.contains("replaces the plaintext typed bootstrap message")
             })
     );
     assert!(!properties.contains_key("items"));

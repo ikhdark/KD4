@@ -100,6 +100,144 @@ fn text_input(text: &str) -> UserInput {
     }
 }
 
+fn local_requirement_fixture(requirement_spans: Vec<SourceSpan>) -> SourceLocalClassification {
+    SourceLocalClassification {
+        local_kind: SourceLocalClassificationKind::RequirementBearing,
+        local_semantic_cues: requirement_spans
+            .iter()
+            .cloned()
+            .map(|source_span| LocalSemanticCue {
+                kind: LocalSemanticCueKind::Assertion,
+                source_span: Some(source_span),
+            })
+            .collect(),
+        requirement_spans,
+        reason: "test fixture contains requirements".to_string(),
+    }
+}
+
+fn local_non_requirement_fixture(reason: &str) -> SourceLocalClassification {
+    SourceLocalClassification {
+        local_kind: SourceLocalClassificationKind::NonRequirement,
+        requirement_spans: Vec::new(),
+        local_semantic_cues: Vec::new(),
+        reason: reason.to_string(),
+    }
+}
+
+fn local_unavailable_fixture() -> SourceLocalClassification {
+    SourceLocalClassification {
+        local_kind: SourceLocalClassificationKind::UnavailableOrTruncated,
+        requirement_spans: Vec::new(),
+        local_semantic_cues: Vec::new(),
+        reason: "test fixture source is unavailable".to_string(),
+    }
+}
+
+fn source_materialization_fixture(
+    dossier: &CompletionReviewDossier,
+    explicit_locals: Vec<(String, SourceLocalClassification)>,
+    resolved_sources: Vec<ClassifiedSource>,
+) -> SourceMaterialization {
+    let mut local_classifications = dossier
+        .source_classification_cache
+        .iter()
+        .map(|(key, classification)| (key.clone(), classification.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (source_id, classification) in explicit_locals {
+        let source = dossier
+            .sources
+            .iter()
+            .find(|source| source.source_id == source_id)
+            .expect("explicit local source belongs to dossier");
+        local_classifications.insert(source_classification_cache_key(source), classification);
+    }
+    SourceMaterialization {
+        local_classifications,
+        resolved_sources,
+    }
+}
+
+fn active_gap_materialization_fixture(
+    dossier: &CompletionReviewDossier,
+    gaps: &[ManifestGapInput],
+) -> SourceMaterialization {
+    let local_classifications = source_local_classifications_with_manifest_gaps(dossier, gaps)
+        .expect("manifest gaps produce corrected local facts");
+    let resolved_sources = dossier
+        .sources
+        .iter()
+        .map(|source| {
+            let local = local_classifications
+                .get(&source_classification_cache_key(source))
+                .expect("corrected local facts cover every source");
+            let kind = match local.local_kind {
+                SourceLocalClassificationKind::RequirementBearing => {
+                    ClassifiedSourceKind::RequirementBearing
+                }
+                SourceLocalClassificationKind::NonRequirement => {
+                    ClassifiedSourceKind::NonRequirement
+                }
+                SourceLocalClassificationKind::RelationshipOnlyContext => {
+                    ClassifiedSourceKind::SupersededContext
+                }
+                SourceLocalClassificationKind::UnavailableOrTruncated => {
+                    ClassifiedSourceKind::UnavailableOrTruncated
+                }
+            };
+            ClassifiedSource {
+                source_id: source.source_id.clone(),
+                kind,
+                requirements: local
+                    .requirement_spans
+                    .iter()
+                    .cloned()
+                    .map(|source_span| ClassifiedRequirement {
+                        source_span,
+                        status: RequirementStatus::Active,
+                        superseded_by: None,
+                    })
+                    .collect(),
+                reason: matches!(
+                    local.local_kind,
+                    SourceLocalClassificationKind::NonRequirement
+                        | SourceLocalClassificationKind::RelationshipOnlyContext
+                )
+                .then(|| local.reason.clone()),
+            }
+        })
+        .collect();
+    SourceMaterialization {
+        local_classifications,
+        resolved_sources,
+    }
+}
+
+fn repair_instruction_fixture(
+    dossier: &CompletionReviewDossier,
+    findings: &[CompletionReviewFindingInput],
+) -> String {
+    let preview_findings = findings
+        .iter()
+        .map(|finding| CompletionReviewFindingReceipt {
+            finding_id: format!("preview/F{}", finding.local_ordinal),
+            requirement_ids: finding.requirement_ids.clone(),
+            lens: finding.lens.clone(),
+            contract_surface: finding.contract_surface.clone(),
+            severity: finding.severity.clone(),
+            evidence: finding.evidence.clone(),
+            smallest_correction: finding.smallest_correction.clone(),
+            proof_route: finding.proof_route.clone(),
+        })
+        .collect::<Vec<_>>();
+    let baseline = build_repair_baseline(dossier, &preview_findings).expect("repair baseline");
+    serde_json::json!({
+        "repair_baseline_hash": repair_baseline_hash(&baseline),
+        "declared_repair_scope": baseline.repair_scope,
+    })
+    .to_string()
+}
+
 async fn classified_requirement_fixture() -> (
     tempfile::TempDir,
     PathBuf,
@@ -116,7 +254,15 @@ async fn classified_requirement_fixture() -> (
             .await
     );
     let dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("unclassified dossier");
     let source = dossier.sources.first().expect("captured source");
@@ -124,22 +270,37 @@ async fn classified_requirement_fixture() -> (
         ledger
             .apply_source_classification(
                 &dossier,
-                vec![ClassifiedSource {
-                    source_id: source.source_id.clone(),
-                    kind: ClassifiedSourceKind::RequirementBearing,
-                    requirements: vec![ClassifiedRequirement {
-                        source_span: SourceSpan::Text { start: 0, end: 15 },
-                        status: RequirementStatus::Active,
-                        superseded_by: None,
+                source_materialization_fixture(
+                    &dossier,
+                    vec![(
+                        source.source_id.clone(),
+                        local_requirement_fixture(vec![SourceSpan::Text { start: 0, end: 15 }]),
+                    )],
+                    vec![ClassifiedSource {
+                        source_id: source.source_id.clone(),
+                        kind: ClassifiedSourceKind::RequirementBearing,
+                        requirements: vec![ClassifiedRequirement {
+                            source_span: SourceSpan::Text { start: 0, end: 15 },
+                            status: RequirementStatus::Active,
+                            superseded_by: None,
+                        }],
+                        reason: None,
                     }],
-                    reason: None,
-                }],
+                ),
             )
             .await,
         AtomicReviewTransition::Persisted(())
     ));
     let dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("classified dossier");
     (temp, repo, ledger, dossier)
@@ -2386,22 +2547,22 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
         .expect("document")
         .clone();
     let mut legacy = serde_json::to_value(document).expect("serialize");
-    legacy["schema_version"] = serde_json::json!(6);
+    legacy["schema_version"] = serde_json::json!(7);
     legacy["lifecycle"] = serde_json::json!({
         "phase": "ready",
         "outcome": "passed",
         "mutation_revision": 1,
         "accepted_evidence_revision": 1
     });
-    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v6 evidence");
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v7 evidence");
     tokio::fs::write(&evidence_path, &legacy_bytes)
         .await
-        .expect("write v6 evidence");
+        .expect("write v7 evidence");
     drop(ledger);
 
     assert!(matches!(
         load_existing_document(&evidence_path, &thread_id, &repo).await,
-        ExistingDocument::NewerSchema { schema_version: 6 }
+        ExistingDocument::NewerSchema { schema_version: 7 }
     ));
 
     let reloaded = TaskEvidenceLedger::load_or_new(
@@ -2414,7 +2575,7 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
     assert_eq!(
         tokio::fs::read(&evidence_path)
             .await
-            .expect("untouched v6 evidence"),
+            .expect("untouched v7 evidence"),
         legacy_bytes
     );
 
@@ -2869,7 +3030,15 @@ async fn local_user_source_capture_hashes_across_multiple_bounded_chunks() {
             .await
     );
     let dossier = ledger
-        .completion_review_dossier(None, &[], &[], &[], true, true)
+        .completion_review_dossier(
+            None,
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("completion review dossier");
     let source = dossier.sources.first().expect("captured image source");
@@ -2898,7 +3067,15 @@ async fn unavailable_local_image_is_preserved_as_an_unavailable_user_source() {
     );
 
     let dossier = ledger
-        .completion_review_dossier(None, &[], &[], &[], true, true)
+        .completion_review_dossier(
+            None,
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("completion review dossier");
     let source = dossier.sources.first().expect("captured image source");
@@ -2910,18 +3087,30 @@ async fn unavailable_local_image_is_preserved_as_an_unavailable_user_source() {
         ledger
             .apply_source_classification(
                 &dossier,
-                vec![ClassifiedSource {
-                    source_id: source.source_id.clone(),
-                    kind: ClassifiedSourceKind::UnavailableOrTruncated,
-                    requirements: Vec::new(),
-                    reason: None,
-                }],
+                source_materialization_fixture(
+                    &dossier,
+                    vec![(source.source_id.clone(), local_unavailable_fixture())],
+                    vec![ClassifiedSource {
+                        source_id: source.source_id.clone(),
+                        kind: ClassifiedSourceKind::UnavailableOrTruncated,
+                        requirements: Vec::new(),
+                        reason: None,
+                    }],
+                ),
             )
             .await,
         AtomicReviewTransition::Persisted(())
     ));
     let classified = ledger
-        .completion_review_dossier(None, &[], &[], &[], true, true)
+        .completion_review_dossier(
+            None,
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("classified completion review dossier");
     assert!(matches!(
@@ -2939,7 +3128,15 @@ async fn source_classification_rejects_supersession_cycles_before_persistence() 
             .await
     );
     let dossier = ledger
-        .completion_review_dossier(None, &[], &[], &[], true, true)
+        .completion_review_dossier(
+            None,
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("completion review dossier");
     let alpha = dossier
@@ -2961,28 +3158,41 @@ async fn source_classification_rejects_supersession_cycles_before_persistence() 
         source_span: SourceSpan::Text { start: 0, end: 4 },
     };
     let classifications = |beta_status, beta_superseded_by| {
-        vec![
-            ClassifiedSource {
-                source_id: alpha.source_id.clone(),
-                kind: ClassifiedSourceKind::RequirementBearing,
-                requirements: vec![ClassifiedRequirement {
-                    source_span: alpha_ref.source_span.clone(),
-                    status: RequirementStatus::Superseded,
-                    superseded_by: Some(beta_ref.clone()),
-                }],
-                reason: None,
-            },
-            ClassifiedSource {
-                source_id: beta.source_id.clone(),
-                kind: ClassifiedSourceKind::RequirementBearing,
-                requirements: vec![ClassifiedRequirement {
-                    source_span: beta_ref.source_span.clone(),
-                    status: beta_status,
-                    superseded_by: beta_superseded_by,
-                }],
-                reason: None,
-            },
-        ]
+        source_materialization_fixture(
+            &dossier,
+            vec![
+                (
+                    alpha.source_id.clone(),
+                    local_requirement_fixture(vec![alpha_ref.source_span.clone()]),
+                ),
+                (
+                    beta.source_id.clone(),
+                    local_requirement_fixture(vec![beta_ref.source_span.clone()]),
+                ),
+            ],
+            vec![
+                ClassifiedSource {
+                    source_id: alpha.source_id.clone(),
+                    kind: ClassifiedSourceKind::RequirementBearing,
+                    requirements: vec![ClassifiedRequirement {
+                        source_span: alpha_ref.source_span.clone(),
+                        status: RequirementStatus::Superseded,
+                        superseded_by: Some(beta_ref.clone()),
+                    }],
+                    reason: None,
+                },
+                ClassifiedSource {
+                    source_id: beta.source_id.clone(),
+                    kind: ClassifiedSourceKind::RequirementBearing,
+                    requirements: vec![ClassifiedRequirement {
+                        source_span: beta_ref.source_span.clone(),
+                        status: beta_status,
+                        superseded_by: beta_superseded_by,
+                    }],
+                    reason: None,
+                },
+            ],
+        )
     };
 
     assert_eq!(
@@ -3051,7 +3261,15 @@ async fn proof_accumulation_changes_dossier_but_not_implementation_identity() {
         )
         .await;
     let after_a = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("dossier after proof A");
     ledger
@@ -3067,7 +3285,15 @@ async fn proof_accumulation_changes_dossier_but_not_implementation_identity() {
         )
         .await;
     let after_b = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("dossier after proof B");
 
@@ -3114,7 +3340,15 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
         AtomicReviewTransition::Persisted(_)
     ));
     let review_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("review dossier");
     assert_eq!(
@@ -3148,7 +3382,15 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
         other => panic!("clean initial review did not persist: {other:?}"),
     };
     let closure_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("terminal dossier");
     assert_eq!(
@@ -3254,7 +3496,15 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
     )
     .await;
     let dossier = reloaded
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("reloaded dossier");
     assert!(reloaded.passed_completion_matches_dossier(&dossier).await);
@@ -3268,10 +3518,29 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
         AtomicReviewTransition::Persisted(_)
     ));
     let review_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("review dossier");
     let requirement_id = review_dossier.requirements[0].requirement_id.clone();
+    let findings = vec![CompletionReviewFindingInput {
+        local_ordinal: 1,
+        requirement_ids: vec![requirement_id],
+        lens: COMPLETION_REVIEW_LENSES[0].to_string(),
+        contract_surface: "bounded owner".to_string(),
+        severity: "high".to_string(),
+        evidence: "the active requirement is not met".to_string(),
+        smallest_correction: "implement the missing behavior".to_string(),
+        proof_route: "cargo test focused_case".to_string(),
+    }];
+    let repair_instruction = repair_instruction_fixture(&review_dossier, &findings);
     let initial_review = match ledger
         .record_completion_review_attempt_v2(
             &review_dossier,
@@ -3279,19 +3548,10 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
                 attempt_kind: CompletionReviewAttemptKind::InitialReview,
                 parent_review_id: review_dossier.cycle_parent_review_id.clone(),
                 superseded_review_id: None,
-                findings: vec![CompletionReviewFindingInput {
-                    local_ordinal: 1,
-                    requirement_ids: vec![requirement_id],
-                    lens: COMPLETION_REVIEW_LENSES[0].to_string(),
-                    contract_surface: "bounded owner".to_string(),
-                    severity: "high".to_string(),
-                    evidence: "the active requirement is not met".to_string(),
-                    smallest_correction: "implement the missing behavior".to_string(),
-                    proof_route: "cargo test focused_case".to_string(),
-                }],
+                findings,
                 dispositions: Vec::new(),
                 manifest_gaps: Vec::new(),
-                repair_instruction: Some("fix the complete finding set".to_string()),
+                repair_instruction: Some(repair_instruction),
                 repair_instruction_hash: None,
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: false,
@@ -3304,7 +3564,15 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
         other => panic!("initial finding review did not persist: {other:?}"),
     };
     let correction_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("correction dossier");
     assert!(matches!(
@@ -3331,7 +3599,15 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
         AtomicReviewTransition::Persisted(_)
     ));
     let rereview_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("rereview dossier");
     let failed_rereview = match ledger
@@ -3345,7 +3621,7 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
                 dispositions: Vec::new(),
                 manifest_gaps: Vec::new(),
                 repair_instruction: None,
-                repair_instruction_hash: None,
+                repair_instruction_hash: rereview_dossier.initial_repair_instruction_hash.clone(),
                 infrastructure_outcome: "timeout".to_string(),
                 review_clean: false,
                 terminal_outcome: Some("partial".to_string()),
@@ -3369,7 +3645,9 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
     let document = guard.as_ref().expect("reloaded v5 evidence");
     assert_eq!(
         document.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Partial)
+        Some(TaskCompletionStatus::Partial),
+        "reload risks: {:?}",
+        document.risks
     );
     let review = document
         .completion_review_v2
@@ -3399,7 +3677,15 @@ async fn last_second_mutation_invalidates_a_provisional_clean_review() {
         AtomicReviewTransition::Persisted(_)
     ));
     let review_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("review dossier");
     assert!(matches!(
@@ -3424,7 +3710,15 @@ async fn last_second_mutation_invalidates_a_provisional_clean_review() {
         AtomicReviewTransition::Persisted(_)
     ));
     let stale_terminal_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("provisional terminal dossier");
     let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo path");
@@ -3466,7 +3760,15 @@ async fn after_agent_reentry_requires_fresh_review_and_preserves_correction_use(
         AtomicReviewTransition::Persisted(_)
     ));
     let review_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("review dossier");
     assert!(matches!(
@@ -3527,7 +3829,15 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
             .await
     );
     let unclassified = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("unclassified dossier");
     let source = unclassified.sources.first().expect("captured source");
@@ -3535,22 +3845,37 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
         ledger
             .apply_source_classification(
                 &unclassified,
-                vec![ClassifiedSource {
-                    source_id: source.source_id.clone(),
-                    kind: ClassifiedSourceKind::RequirementBearing,
-                    requirements: vec![ClassifiedRequirement {
-                        source_span: SourceSpan::Text { start: 0, end: 15 },
-                        status: RequirementStatus::Active,
-                        superseded_by: None,
+                source_materialization_fixture(
+                    &unclassified,
+                    vec![(
+                        source.source_id.clone(),
+                        local_requirement_fixture(vec![SourceSpan::Text { start: 0, end: 15 }]),
+                    )],
+                    vec![ClassifiedSource {
+                        source_id: source.source_id.clone(),
+                        kind: ClassifiedSourceKind::RequirementBearing,
+                        requirements: vec![ClassifiedRequirement {
+                            source_span: SourceSpan::Text { start: 0, end: 15 },
+                            status: RequirementStatus::Active,
+                            superseded_by: None,
+                        }],
+                        reason: None,
                     }],
-                    reason: None,
-                }],
+                ),
             )
             .await,
         AtomicReviewTransition::Persisted(())
     ));
     let initial = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("initial dossier");
     assert!(matches!(
@@ -3558,11 +3883,24 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
         AtomicReviewTransition::Persisted(_)
     ));
     let gap_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("gap review dossier");
+    let manifest_gaps = vec![ManifestGapInput {
+        source_id: source.source_id.clone(),
+        omitted_spans: vec![SourceSpan::Text { start: 15, end: 24 }],
+    }];
+    let gap_materialization = active_gap_materialization_fixture(&gap_dossier, &manifest_gaps);
     let gap_review = match ledger
-        .record_completion_review_attempt_v2(
+        .record_completion_review_attempt_v2_with_materialization(
             &gap_dossier,
             CompletionReviewAttemptInput {
                 attempt_kind: CompletionReviewAttemptKind::InitialReview,
@@ -3570,16 +3908,14 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
                 superseded_review_id: None,
                 findings: Vec::new(),
                 dispositions: Vec::new(),
-                manifest_gaps: vec![ManifestGapInput {
-                    source_id: source.source_id.clone(),
-                    omitted_spans: vec![SourceSpan::Text { start: 15, end: 24 }],
-                }],
+                manifest_gaps,
                 repair_instruction: None,
                 repair_instruction_hash: None,
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: false,
                 terminal_outcome: None,
             },
+            gap_materialization,
         )
         .await
     {
@@ -3588,7 +3924,15 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
     };
 
     let replacement_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("replacement initial dossier");
     assert_eq!(
@@ -3638,7 +3982,15 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
     )
     .await;
     let reloaded_dossier = reloaded
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("reloaded replacement dossier");
     assert_eq!(
@@ -3675,7 +4027,15 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
             .await
     );
     let unclassified = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("unclassified dossier");
     let source_id = unclassified.sources[0].source_id.clone();
@@ -3683,22 +4043,37 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
         ledger
             .apply_source_classification(
                 &unclassified,
-                vec![ClassifiedSource {
-                    source_id: source_id.clone(),
-                    kind: ClassifiedSourceKind::RequirementBearing,
-                    requirements: vec![ClassifiedRequirement {
-                        source_span: SourceSpan::Text { start: 0, end: 15 },
-                        status: RequirementStatus::Active,
-                        superseded_by: None,
+                source_materialization_fixture(
+                    &unclassified,
+                    vec![(
+                        source_id.clone(),
+                        local_requirement_fixture(vec![SourceSpan::Text { start: 0, end: 15 }]),
+                    )],
+                    vec![ClassifiedSource {
+                        source_id: source_id.clone(),
+                        kind: ClassifiedSourceKind::RequirementBearing,
+                        requirements: vec![ClassifiedRequirement {
+                            source_span: SourceSpan::Text { start: 0, end: 15 },
+                            status: RequirementStatus::Active,
+                            superseded_by: None,
+                        }],
+                        reason: None,
                     }],
-                    reason: None,
-                }],
+                ),
             )
             .await,
         AtomicReviewTransition::Persisted(())
     ));
     let initial = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("initial dossier");
     let requirement_id = initial.requirements[0].requirement_id.clone();
@@ -3707,9 +4082,28 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
         AtomicReviewTransition::Persisted(_)
     ));
     let review_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("review dossier");
+    let findings = vec![CompletionReviewFindingInput {
+        local_ordinal: 1,
+        requirement_ids: vec![requirement_id],
+        lens: COMPLETION_REVIEW_LENSES[0].to_string(),
+        contract_surface: "bounded owner".to_string(),
+        severity: "high".to_string(),
+        evidence: "alpha needs a focused correction".to_string(),
+        smallest_correction: "correct alpha".to_string(),
+        proof_route: "cargo test alpha".to_string(),
+    }];
+    let repair_instruction = repair_instruction_fixture(&review_dossier, &findings);
     let initial_review = match ledger
         .record_completion_review_attempt_v2(
             &review_dossier,
@@ -3717,19 +4111,10 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
                 attempt_kind: CompletionReviewAttemptKind::InitialReview,
                 parent_review_id: review_dossier.cycle_parent_review_id.clone(),
                 superseded_review_id: None,
-                findings: vec![CompletionReviewFindingInput {
-                    local_ordinal: 1,
-                    requirement_ids: vec![requirement_id],
-                    lens: COMPLETION_REVIEW_LENSES[0].to_string(),
-                    contract_surface: "bounded owner".to_string(),
-                    severity: "high".to_string(),
-                    evidence: "alpha needs a focused correction".to_string(),
-                    smallest_correction: "correct alpha".to_string(),
-                    proof_route: "cargo test alpha".to_string(),
-                }],
+                findings,
                 dispositions: Vec::new(),
                 manifest_gaps: Vec::new(),
-                repair_instruction: Some("correct alpha and prove it".to_string()),
+                repair_instruction: Some(repair_instruction),
                 repair_instruction_hash: None,
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: false,
@@ -3742,7 +4127,15 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
         other => panic!("initial finding review did not persist: {other:?}"),
     };
     let correction_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("correction dossier");
     assert!(matches!(
@@ -3769,11 +4162,24 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
         AtomicReviewTransition::Persisted(_)
     ));
     let rereview_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("rereview dossier");
+    let manifest_gaps = vec![ManifestGapInput {
+        source_id,
+        omitted_spans: vec![SourceSpan::Text { start: 15, end: 24 }],
+    }];
+    let gap_materialization = active_gap_materialization_fixture(&rereview_dossier, &manifest_gaps);
     let gap_rereview = match ledger
-        .record_completion_review_attempt_v2(
+        .record_completion_review_attempt_v2_with_materialization(
             &rereview_dossier,
             CompletionReviewAttemptInput {
                 attempt_kind: CompletionReviewAttemptKind::Rereview,
@@ -3785,16 +4191,14 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
                     disposition: "resolved".to_string(),
                     evidence: "fresh proof resolves the original finding".to_string(),
                 }],
-                manifest_gaps: vec![ManifestGapInput {
-                    source_id,
-                    omitted_spans: vec![SourceSpan::Text { start: 15, end: 24 }],
-                }],
+                manifest_gaps,
                 repair_instruction: None,
-                repair_instruction_hash: None,
+                repair_instruction_hash: rereview_dossier.initial_repair_instruction_hash.clone(),
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: false,
                 terminal_outcome: None,
             },
+            gap_materialization,
         )
         .await
     {
@@ -3803,7 +4207,15 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
     };
 
     let replacement_dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("replacement dossier");
     assert!(replacement_dossier.correction_consumed);
@@ -3873,7 +4285,15 @@ async fn reclassification_cannot_erase_a_previously_mapped_requirement() {
             .await
     );
     let unclassified = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("unclassified dossier");
     let source_id = unclassified.sources[0].source_id.clone();
@@ -3881,22 +4301,37 @@ async fn reclassification_cannot_erase_a_previously_mapped_requirement() {
         ledger
             .apply_source_classification(
                 &unclassified,
-                vec![ClassifiedSource {
-                    source_id,
-                    kind: ClassifiedSourceKind::RequirementBearing,
-                    requirements: vec![ClassifiedRequirement {
-                        source_span: SourceSpan::Text { start: 0, end: 15 },
-                        status: RequirementStatus::Active,
-                        superseded_by: None,
+                source_materialization_fixture(
+                    &unclassified,
+                    vec![(
+                        source_id.clone(),
+                        local_requirement_fixture(vec![SourceSpan::Text { start: 0, end: 15 }]),
+                    )],
+                    vec![ClassifiedSource {
+                        source_id,
+                        kind: ClassifiedSourceKind::RequirementBearing,
+                        requirements: vec![ClassifiedRequirement {
+                            source_span: SourceSpan::Text { start: 0, end: 15 },
+                            status: RequirementStatus::Active,
+                            superseded_by: None,
+                        }],
+                        reason: None,
                     }],
-                    reason: None,
-                }],
+                ),
             )
             .await,
         AtomicReviewTransition::Persisted(())
     ));
     let classified = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("classified dossier");
     let prior_source = classified.sources[0].clone();
@@ -3907,7 +4342,15 @@ async fn reclassification_cannot_erase_a_previously_mapped_requirement() {
             .await
     );
     let dossier = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("reclassification dossier");
     let new_source = dossier
@@ -3926,15 +4369,22 @@ async fn reclassification_cannot_erase_a_previously_mapped_requirement() {
         ledger
             .apply_source_classification(
                 &dossier,
-                vec![
-                    ClassifiedSource {
-                        source_id: prior_source.source_id.clone(),
-                        kind: ClassifiedSourceKind::SupersededContext,
-                        requirements: Vec::new(),
-                        reason: Some("incorrectly treated as context".to_string()),
-                    },
-                    context.clone(),
-                ],
+                source_materialization_fixture(
+                    &dossier,
+                    vec![(
+                        new_source.source_id.clone(),
+                        local_non_requirement_fixture("background context only"),
+                    )],
+                    vec![
+                        ClassifiedSource {
+                            source_id: prior_source.source_id.clone(),
+                            kind: ClassifiedSourceKind::SupersededContext,
+                            requirements: Vec::new(),
+                            reason: Some("incorrectly treated as context".to_string()),
+                        },
+                        context.clone(),
+                    ],
+                ),
             )
             .await,
         AtomicReviewTransition::Failed
@@ -3944,25 +4394,40 @@ async fn reclassification_cannot_erase_a_previously_mapped_requirement() {
         ledger
             .apply_source_classification(
                 &dossier,
-                vec![
-                    ClassifiedSource {
-                        source_id: prior_source.source_id,
-                        kind: ClassifiedSourceKind::RequirementBearing,
-                        requirements: vec![ClassifiedRequirement {
-                            source_span: prior_requirement.source_span.clone(),
-                            status: RequirementStatus::Active,
-                            superseded_by: None,
-                        }],
-                        reason: None,
-                    },
-                    context,
-                ],
+                source_materialization_fixture(
+                    &dossier,
+                    vec![(
+                        new_source.source_id,
+                        local_non_requirement_fixture("background context only"),
+                    )],
+                    vec![
+                        ClassifiedSource {
+                            source_id: prior_source.source_id,
+                            kind: ClassifiedSourceKind::RequirementBearing,
+                            requirements: vec![ClassifiedRequirement {
+                                source_span: prior_requirement.source_span.clone(),
+                                status: RequirementStatus::Active,
+                                superseded_by: None,
+                            }],
+                            reason: None,
+                        },
+                        context,
+                    ],
+                ),
             )
             .await,
         AtomicReviewTransition::Persisted(())
     ));
     let refreshed = ledger
-        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
         .await
         .expect("refreshed dossier");
     assert_eq!(refreshed.requirements, vec![prior_requirement]);

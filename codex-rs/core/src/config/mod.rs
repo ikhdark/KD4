@@ -27,6 +27,7 @@ use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
 use codex_config::config_toml::ProjectConfig;
 use codex_config::config_toml::RealtimeAudioConfig;
 use codex_config::config_toml::RealtimeConfig;
+use codex_config::config_toml::ReasoningPhaseEfforts;
 use codex_config::config_toml::ThreadStoreToml;
 use codex_config::config_toml::validate_model_providers;
 use codex_config::loader::load_config_layers_state;
@@ -1027,6 +1028,10 @@ pub struct Config {
     /// Plan preset. The `none` value means "no reasoning" (not "inherit the
     /// global default").
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
+
+    /// Optional per-logical-request reasoning effort overrides. Table
+    /// presence enables the deterministic sampling governor.
+    pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
 
     /// Optional value to use for `reasoning.summary` when making a request
     /// using the Responses API. When unset, the model catalog default is used.
@@ -3987,6 +3992,7 @@ impl Config {
             guardian_policy_config,
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
+            reasoning_phase_efforts: cfg.reasoning_phase_efforts,
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_supports_reasoning_summaries: cfg.model_supports_reasoning_summaries,
             model_catalog,

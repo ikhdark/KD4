@@ -174,7 +174,7 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
 
 pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
     let Some((subcommand_idx, subcommand)) =
-        find_git_subcommand(command, &["log", "diff", "show", "branch"])
+        find_git_subcommand(command, &["log", "diff", "show", "branch", "status"])
     else {
         return false;
     };
@@ -192,11 +192,19 @@ pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
             git_subcommand_args_are_read_only(subcommand_args)
                 && git_branch_is_read_only(subcommand_args)
         }
+        "status" => git_status_disables_optional_locks(global_args),
         other => {
             debug_assert!(false, "unexpected git subcommand from matcher: {other}");
             false
         }
     }
+}
+
+// `git status` ordinarily refreshes the index and therefore needs mutation
+// authority. Git's global `--no-optional-locks` flag disables that refresh,
+// making status safe to run concurrently with another workspace writer.
+fn git_status_disables_optional_locks(global_args: &[String]) -> bool {
+    global_args.iter().any(|arg| arg == "--no-optional-locks")
 }
 
 // Treat `git branch` as safe only when the arguments clearly indicate
@@ -376,8 +384,15 @@ mod tests {
     }
 
     #[test]
-    fn git_status_is_not_safe_because_it_can_refresh_the_index() {
+    fn git_status_is_safe_only_when_optional_locks_are_disabled() {
         assert!(!is_safe_to_call_with_exec(&vec_str(&["git", "status"])));
+        assert!(is_safe_to_call_with_exec(&vec_str(&[
+            "git",
+            "--no-optional-locks",
+            "status",
+            "--short",
+            "--branch",
+        ])));
     }
 
     #[test]
@@ -650,6 +665,11 @@ mod tests {
             r"C:\Program Files\Git\cmd\git.exe",
             "status",
         ])));
+        assert!(is_known_safe_command(&vec_str(&[
+            r"C:\Program Files\Git\cmd\git.exe",
+            "--no-optional-locks",
+            "status",
+        ])));
     }
 
     #[test]
@@ -660,6 +680,11 @@ mod tests {
             "bash",
             "-lc",
             "git status"
+        ])));
+        assert!(is_known_safe_command(&vec_str(&[
+            "bash",
+            "-lc",
+            "git --no-optional-locks status"
         ])));
         assert!(is_known_safe_command(&vec_str(&[
             "bash",

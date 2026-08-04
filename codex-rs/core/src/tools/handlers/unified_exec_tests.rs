@@ -3,7 +3,11 @@ use super::exec_command::validate_and_consume_remote_shell;
 use super::*;
 use crate::shell::ShellType;
 use crate::shell::default_user_shell;
+use codex_agent_task_store::REPOSITORY_WIDE_PATH;
+use codex_agent_task_store::WorkspaceActorKind;
+use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_exec_server::Environment;
+use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::PermissionProfile;
 use codex_tools::ToolExecutor;
 use codex_tools::UnifiedExecShellMode;
@@ -407,6 +411,129 @@ async fn read_only_preflight_repair_executes_and_releases_process_id() {
         .unified_exec_manager
         .release_process_id(process_id)
         .await;
+}
+
+#[tokio::test]
+async fn git_status_bypasses_an_occupied_mutation_lease_but_other_commands_wait() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let coordinator = session.services.agent_control.task_coordinator().clone();
+    coordinator
+        .initialize_for_workspace_coordination(
+            session.services.state_db.clone(),
+            turn.config.sqlite_home.clone(),
+            turn.config.model_provider_id.clone(),
+            session.services.agent_control.session_id().to_string(),
+        )
+        .await
+        .expect("workspace coordination initializes");
+    let store = coordinator.store().expect("task store initializes");
+    #[allow(deprecated)]
+    let repo_root = get_git_repo_root(turn.cwd.as_path()).expect("test cwd is in a git repository");
+    let lease = store
+        .begin_workspace_mutation(
+            &repo_root,
+            WorkspaceMutationRequest {
+                root_session_id: "other-root".to_string(),
+                actor_id: "root:other-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("other root mutation lease starts");
+    let handler = ExecCommandHandler::default();
+
+    let status_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "git",
+            "args": ["status", "--short", "--branch"]
+        })
+        .to_string(),
+    };
+    let status_output = handler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "git-status-under-mutation-lease".to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: status_payload.clone(),
+        })
+        .await
+        .expect("repaired git status bypasses the occupied mutation lease");
+    assert!(
+        status_output.code_mode_result(&status_payload)["repair"]
+            .as_str()
+            .is_some_and(|repair| repair.contains("git_status_optional_locks"))
+    );
+
+    let rev_parse_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "git",
+            "args": ["rev-parse", "--show-toplevel"]
+        })
+        .to_string(),
+    };
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let waiting_command = tokio::spawn({
+        let cancellation = cancellation.clone();
+        let session = Arc::clone(&session);
+        let turn = Arc::clone(&turn);
+        async move {
+            handler
+                .handle(ToolInvocation {
+                    session,
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    turn,
+                    cancellation_token: cancellation,
+                    tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                    call_id: "git-rev-parse-under-mutation-lease".to_string(),
+                    tool_name: codex_tools::ToolName::plain("exec_command"),
+                    source: ToolCallSource::Direct,
+                    payload: rev_parse_payload,
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !waiting_command.is_finished(),
+        "a conservatively classified command must wait while the lease is occupied"
+    );
+    cancellation.cancel();
+    let wait_result = tokio::time::timeout(std::time::Duration::from_secs(2), waiting_command)
+        .await
+        .expect("cancelled lease waiter exits promptly")
+        .expect("lease waiter task succeeds");
+    let wait_error = match wait_result {
+        Ok(_) => panic!("cancelled lease waiter unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        wait_error
+            .to_string()
+            .contains("mutation-lease wait was cancelled")
+    );
+    assert!(
+        !wait_error
+            .to_string()
+            .contains("could not acquire the repository-wide mutation lease")
+    );
+
+    store
+        .finish_workspace_mutation(&repo_root, lease)
+        .await
+        .expect("other root mutation lease finishes");
 }
 
 #[tokio::test]

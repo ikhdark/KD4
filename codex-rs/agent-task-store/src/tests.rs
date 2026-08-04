@@ -1893,7 +1893,7 @@ async fn mutation_evidence_keeps_private_prewrite_snapshot() {
 }
 
 #[test]
-fn assignments_without_repository_identity_still_deserialize() {
+fn assignments_without_additive_identity_or_capsule_fields_still_deserialize() {
     let repo = TempDir::new().expect("repository tempdir");
     let assignment = worker_draft("root", "src")
         .normalize(repo.path())
@@ -1903,8 +1903,125 @@ fn assignments_without_repository_identity_still_deserialize() {
         .as_object_mut()
         .expect("assignment object")
         .remove("repository_id");
+    value
+        .as_object_mut()
+        .expect("assignment object")
+        .remove("task_capsule");
     let decoded: Assignment = serde_json::from_value(value).expect("legacy assignment decodes");
     assert!(decoded.repository_id.is_empty());
+    assert_eq!(decoded.task_capsule, None);
+}
+
+#[tokio::test]
+async fn task_capsule_attachment_is_canonical_and_one_time() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("capsule-root", "src"))
+        .await
+        .expect("worker assignment");
+    let capsule = TaskCapsuleV1 {
+        schema_version: 1,
+        assignment_id: assignment.assignment_id,
+        attempt_id: attempt.attempt_id,
+        role: assignment.role,
+        capability_profile: assignment.capability_profile,
+        requirements: assignment.acceptance_criteria.clone(),
+        objective: assignment.objective.clone(),
+        read_scope: assignment.read_scope.clone(),
+        write_scope: assignment.write_scope.clone(),
+        relevant_handles: vec![TaskCapsuleHandle::File {
+            path: "src/new.rs".to_string(),
+            existed: false,
+            content_hash: None,
+        }],
+        workspace_epoch: assignment.start_epoch,
+        workspace_manifest_hash: "manifest-sha256".to_string(),
+        prohibited_changes: assignment.prohibited_changes.clone(),
+        required_evidence: assignment.required_evidence.clone(),
+    };
+    let canonical = serde_json::to_string(&capsule).expect("capsule serializes canonically");
+
+    let attached = fixture
+        .store
+        .attach_task_capsule(
+            assignment.assignment_id,
+            attempt.attempt_id,
+            canonical.clone(),
+        )
+        .await
+        .expect("capsule attaches");
+    assert_eq!(attached.task_capsule.as_deref(), Some(canonical.as_str()));
+    assert_eq!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, None)
+            .await
+            .expect("task reloads")
+            .assignment
+            .task_capsule
+            .as_deref(),
+        Some(canonical.as_str())
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .attach_task_capsule(
+                assignment.assignment_id,
+                attempt.attempt_id,
+                canonical,
+            )
+            .await,
+        Err(StoreError::TaskCapsuleAlreadyAttached(id)) if id == assignment.assignment_id
+    ));
+}
+
+#[tokio::test]
+async fn task_capsule_attachment_rejects_noncanonical_or_mismatched_payloads() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("capsule-root", "src"))
+        .await
+        .expect("worker assignment");
+    let capsule = TaskCapsuleV1 {
+        schema_version: 1,
+        assignment_id: assignment.assignment_id,
+        attempt_id: attempt.attempt_id,
+        role: assignment.role,
+        capability_profile: assignment.capability_profile,
+        requirements: assignment.acceptance_criteria.clone(),
+        objective: assignment.objective.clone(),
+        read_scope: assignment.read_scope.clone(),
+        write_scope: assignment.write_scope.clone(),
+        relevant_handles: Vec::new(),
+        workspace_epoch: assignment.start_epoch,
+        workspace_manifest_hash: "manifest-sha256".to_string(),
+        prohibited_changes: assignment.prohibited_changes.clone(),
+        required_evidence: assignment.required_evidence.clone(),
+    };
+    let pretty = serde_json::to_string_pretty(&capsule).expect("capsule pretty serializes");
+    assert!(matches!(
+        fixture
+            .store
+            .attach_task_capsule(assignment.assignment_id, attempt.attempt_id, pretty)
+            .await,
+        Err(StoreError::InvalidTaskCapsule(_))
+    ));
+
+    let mut mismatched = capsule;
+    mismatched.attempt_id = AttemptId::new();
+    assert!(matches!(
+        fixture
+            .store
+            .attach_task_capsule(
+                assignment.assignment_id,
+                attempt.attempt_id,
+                serde_json::to_string(&mismatched).expect("mismatched capsule serializes"),
+            )
+            .await,
+        Err(StoreError::InvalidTaskCapsule(_))
+    ));
 }
 
 #[tokio::test]

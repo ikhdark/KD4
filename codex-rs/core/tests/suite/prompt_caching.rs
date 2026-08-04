@@ -12,17 +12,24 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::TempDirExt;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_metadata_from_json;
@@ -60,6 +67,21 @@ fn assert_eq_without_metadata(left: serde_json::Value, right: serde_json::Value)
         strip_metadata_from_json(left),
         strip_metadata_from_json(right)
     );
+}
+
+fn persisted_reasoning_items(path: &Path) -> Vec<ResponseItem> {
+    fs::read_to_string(path)
+        .expect("read rollout")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let rollout_line: RolloutLine = serde_json::from_str(line).expect("parse rollout line");
+            match rollout_line.item {
+                RolloutItem::ResponseItem(item @ ResponseItem::Reasoning { .. }) => Some(item),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn assert_default_env_context(text: &str, cwd: &str) {
@@ -1135,6 +1157,89 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
         expected_user_message_2,
     ]);
     assert_eq_without_metadata(body2["input"].clone(), expected_input_2);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolved_reasoning_is_evicted_after_next_instruction_but_persisted_in_rollout()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let plan_args = serde_json::json!({
+        "explanation": "reasoning projection integration test",
+        "plan": [{"step": "complete tool follow-up", "status": "in_progress"}],
+    })
+    .to_string();
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("response-1"),
+                ev_reasoning_item("reasoning-1", &["summary one"], &["plaintext one"]),
+                ev_function_call("plan-call", "update_plan", &plan_args),
+                ev_completed("response-1"),
+            ]),
+            sse(vec![
+                ev_response_created("response-2"),
+                ev_reasoning_item("reasoning-2", &["summary two"], &["plaintext two"]),
+                ev_assistant_message("message-2", "tool follow-up complete"),
+                ev_completed("response-2"),
+            ]),
+            sse(vec![
+                ev_response_created("response-3"),
+                ev_assistant_message("message-3", "new instruction complete"),
+                ev_completed("response-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    let test = test_codex().build(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    test.submit_turn("first instruction").await?;
+    test.submit_turn("second instruction").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].inputs_of_type("reasoning").is_empty());
+
+    let request_2_reasoning = requests[1].inputs_of_type("reasoning");
+    assert_eq!(request_2_reasoning.len(), 1);
+    assert_eq!(request_2_reasoning[0]["id"], "reasoning-1");
+    assert_eq!(request_2_reasoning[0]["summary"][0]["text"], "summary one");
+    assert_eq!(
+        request_2_reasoning[0]["content"][0]["text"],
+        "plaintext one"
+    );
+    assert!(request_2_reasoning[0]["encrypted_content"].is_string());
+    assert!(
+        requests[1]
+            .inputs_of_type("function_call_output")
+            .iter()
+            .any(|item| item["call_id"] == "plan-call")
+    );
+
+    assert!(requests[2].inputs_of_type("reasoning").is_empty());
+
+    test.codex.flush_rollout().await?;
+    let persisted_reasoning = persisted_reasoning_items(&rollout_path);
+    assert_eq!(persisted_reasoning.len(), 2);
+    for (item, expected_summary, expected_plaintext) in [
+        (&persisted_reasoning[0], "summary one", "plaintext one"),
+        (&persisted_reasoning[1], "summary two", "plaintext two"),
+    ] {
+        let item = serde_json::to_value(item)?;
+        assert_eq!(item["summary"][0]["text"], expected_summary);
+        assert_eq!(item["content"][0]["text"], expected_plaintext);
+        assert!(item["encrypted_content"].is_string());
+    }
 
     Ok(())
 }

@@ -209,6 +209,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
     let initial_messages = resumed
         .session_configured
         .initial_messages
+        .clone()
         .expect("expected initial messages to be present for resumed session");
     match initial_messages.as_slice() {
         [
@@ -232,6 +233,40 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
         }
         other => panic!("unexpected initial messages after resume: {other:#?}"),
     }
+
+    let resumed_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-resumed"),
+            ev_assistant_message("msg-resumed", "Completed resumed turn"),
+            ev_completed("resp-resumed"),
+        ]),
+    )
+    .await;
+    resumed
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Continue after resume".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&resumed.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        resumed_mock
+            .single_request()
+            .inputs_of_type("reasoning")
+            .is_empty(),
+        "the next resumed request must project out reasoning from completed instruction groups"
+    );
 
     Ok(())
 }

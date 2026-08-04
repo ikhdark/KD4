@@ -12,5 +12,5 @@ state, stage, commit, push, or publish. Report the integrated owner paths,
 dependency closure, focused validation, wiring evidence, and remaining risk to
 the coordinator.
 """
-model = "gpt-5.6-sol"
+
 model_reasoning_effort = "high"

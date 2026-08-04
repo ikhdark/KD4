@@ -214,6 +214,7 @@ mod input_queue;
 mod mcp;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
+pub(crate) mod reasoning_governor;
 mod review;
 mod rollout_budget;
 mod rollout_reconstruction;
@@ -1226,7 +1227,12 @@ impl Session {
 
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
-        state.get_total_token_usage(state.server_reasoning_included())
+        let base_instructions = BaseInstructions {
+            text: state.session_configuration.base_instructions.clone(),
+        };
+        state
+            .history
+            .get_total_token_usage(state.server_reasoning_included(), &base_instructions)
     }
 
     pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {

@@ -11,7 +11,15 @@ max_depth = 1
 
 [features.multi_agent_v2]
 enabled = true
-max_concurrent_threads_per_session = 6
+max_concurrent_threads_per_session = 3
+
+[reasoning_phase_efforts]
+orient = "medium"
+inspect = "low"
+implement = "high"
+diagnose = "high"
+verify = "low"
+finalize = "low"
 
 [agents.kd4_explorer]
 description = "Produces binding read-only KD4 implementation contracts for risky work."

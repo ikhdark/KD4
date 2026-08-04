@@ -120,6 +120,7 @@ fn completed_task_with_validation(
             workspace_strategy: WorkspaceStrategy::Shared,
             start_epoch: 0,
             relation: None,
+            task_capsule: None,
             created_at: now,
         },
         current_attempt: Attempt {

@@ -233,11 +233,6 @@ impl SessionState {
         self.history.set_token_usage_full(context_window);
     }
 
-    pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
-        self.history
-            .get_total_token_usage(server_reasoning_included)
-    }
-
     pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {
         self.server_reasoning_included = included;
     }

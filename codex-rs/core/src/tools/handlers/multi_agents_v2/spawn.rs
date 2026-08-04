@@ -7,27 +7,38 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
+use crate::context::ContextualUserFragment;
+use crate::context::TaskCapsuleFragment;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use codex_agent_task_store::AcceptanceCriterion;
 use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentTaskBindingDraft;
+use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::Assignment;
 use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AssignmentRelation;
 use codex_agent_task_store::Attempt;
+use codex_agent_task_store::RelevantHandle;
 use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::TaskActor;
+use codex_agent_task_store::TaskCapsuleHandle;
+use codex_agent_task_store::TaskCapsuleV1;
 use codex_agent_task_store::WorkspaceStrategy;
+use codex_agent_task_store::normalize_repo_path;
+use codex_context_fragments::ModelContextBudget;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::AgentPath;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -192,12 +203,23 @@ async fn handle_spawn_agent(
                 .await
                 .map_err(typed_task_store_error)?;
         }
+        let store = coordinator.store().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent: durable typed assignment store became unavailable".to_string(),
+            )
+        })?;
         let root_session_id = coordinator.root_session_id().ok_or_else(|| {
             FunctionCallError::RespondToModel(
                 "spawn_agent: durable typed assignments require persistent local session state"
                     .to_string(),
             )
         })?;
+        session
+            .services
+            .agent_control
+            .reconcile_live_typed_actor_heartbeats()
+            .await
+            .map_err(typed_task_store_error)?;
         let cwd = match turn.environments.primary() {
             Some(environment) => environment.cwd().to_abs_path().map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
@@ -236,12 +258,7 @@ async fn handle_spawn_agent(
         } else {
             main_repo_root
         };
-        session
-            .services
-            .agent_control
-            .reconcile_live_typed_actor_heartbeats()
-            .await
-            .map_err(typed_task_store_error)?;
+        let relevant_handles = assignment_args.relevant_handles.clone();
         let draft = assignment_args.into_draft(root_session_id, role);
         let (assignment, attempt) = match coordinator.create_assignment(&repo_root, draft).await {
             Ok(task) => task,
@@ -258,63 +275,130 @@ async fn handle_spawn_agent(
                 return Err(typed_task_store_error(error));
             }
         };
-        Some((assignment, attempt))
+        let task_capsule = if matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)) {
+            match construct_and_attach_task_capsule(
+                store.as_ref(),
+                &repo_root,
+                &assignment,
+                &attempt,
+                relevant_handles,
+            )
+            .await
+            {
+                Ok(payload) => Some(payload),
+                Err(error) => {
+                    if let Err(rollback_error) = store
+                        .abandon_agent_task(
+                            TaskActor::Root,
+                            assignment.assignment_id,
+                            format!("TaskCapsule construction failed before launch: {error}"),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            assignment_id = %assignment.assignment_id,
+                            %rollback_error,
+                            "failed to abandon typed assignment after TaskCapsule failure"
+                        );
+                    }
+                    coordinator
+                        .maybe_emit_terminal_metrics(
+                            assignment.assignment_id,
+                            &turn.session_telemetry,
+                        )
+                        .await;
+                    if let Some(workspace) = isolated_workspace.take()
+                        && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                    {
+                        tracing::warn!(
+                            path = %workspace.path.display(),
+                            %cleanup_error,
+                            "failed to clean isolated worktree after TaskCapsule failure"
+                        );
+                    }
+                    return Err(typed_task_store_error(error));
+                }
+            }
+        } else {
+            None
+        };
+        Some((assignment, attempt, task_capsule))
     } else {
         None
     };
-    let author = turn
-        .session_source
-        .get_agent_path()
-        .unwrap_or_else(AgentPath::root);
-    let communication = match typed_task.as_ref() {
-        Some((assignment, attempt)) => communication_from_plaintext_message(
-            author,
-            new_agent_path.clone(),
-            typed_assignment_message(assignment, attempt),
-        ),
-        None => communication_from_tool_message(
-            author,
-            new_agent_path.clone(),
-            legacy_message.ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "spawn_agent: either assignment or message is required".to_string(),
-                )
-            })?,
-        ),
+    let options = SpawnAgentOptions {
+        fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
+        fork_mode,
+        parent_thread_id: Some(session.thread_id),
+        environments: spawn_environments,
+        typed_task_binding: typed_task.as_ref().map(|(assignment, attempt, _)| {
+            AgentTaskBindingDraft {
+                assignment_id: assignment.assignment_id,
+                attempt_id: attempt.attempt_id,
+                agent_path: new_agent_path.to_string(),
+                task_name: args.task_name.clone(),
+                thread_id: None,
+            }
+        }),
+        agent_job_binding: None,
     };
-    let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
-    let spawned_agent = Box::pin(
-        session
-            .services
-            .agent_control
-            .spawn_agent_with_communication(
-                config,
-                communication,
-                context,
-                Some(spawn_source),
-                SpawnAgentOptions {
-                    fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
-                    fork_mode,
-                    parent_thread_id: Some(session.thread_id),
-                    environments: spawn_environments,
-                    typed_task_binding: typed_task.as_ref().map(|(assignment, attempt)| {
-                        AgentTaskBindingDraft {
-                            assignment_id: assignment.assignment_id,
-                            attempt_id: attempt.attempt_id,
-                            agent_path: new_agent_path.to_string(),
-                            task_name: args.task_name.clone(),
-                            thread_id: None,
-                        }
-                    }),
-                    agent_job_binding: None,
-                },
+    let spawned_agent = if let Some(canonical_payload) = typed_task
+        .as_ref()
+        .and_then(|(_, _, capsule)| capsule.as_ref())
+    {
+        Box::pin(
+            session
+                .services
+                .agent_control
+                .spawn_agent_with_task_capsule(
+                    config,
+                    canonical_payload.clone(),
+                    Some(spawn_source),
+                    options,
+                ),
+        )
+        .await
+    } else {
+        let author = turn
+            .session_source
+            .get_agent_path()
+            .unwrap_or_else(AgentPath::root);
+        let communication = match typed_task.as_ref() {
+            Some((assignment, attempt, _)) => communication_from_plaintext_message(
+                author,
+                new_agent_path.clone(),
+                typed_assignment_message(assignment, attempt),
             ),
-    )
-    .await;
+            None => communication_from_tool_message(
+                author,
+                new_agent_path.clone(),
+                legacy_message.ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "spawn_agent: either assignment or message is required".to_string(),
+                    )
+                })?,
+            ),
+        };
+        let context =
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
+        Box::pin(
+            session
+                .services
+                .agent_control
+                .spawn_agent_with_communication(
+                    config,
+                    communication,
+                    context,
+                    Some(spawn_source),
+                    options,
+                ),
+        )
+        .await
+    };
     let spawned_agent = match spawned_agent {
         Ok(spawned_agent) => spawned_agent,
         Err(error) => {
-            if let Some((assignment, _)) = typed_task.as_ref() {
+            if let Some((assignment, _, _)) = typed_task.as_ref() {
                 let coordinator = session.services.agent_control.task_coordinator();
                 if let Some(store) = coordinator.store() {
                     if let Err(rollback_error) = store
@@ -394,7 +478,7 @@ async fn handle_spawn_agent(
     let task_name = String::from(new_agent_path);
     let assignment_id = typed_task
         .as_ref()
-        .map(|(assignment, _)| assignment.assignment_id.to_string());
+        .map(|(assignment, _, _)| assignment.assignment_id.to_string());
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
@@ -736,15 +820,15 @@ impl SpawnAgentArgs {
                         .to_string(),
                 ));
             }
-            return Ok(None);
+            return Ok(Some(SpawnAgentForkMode::TaskCapsule));
         }
 
         let Some(fork_turns) = explicit_fork_turns else {
-            return Ok(None);
+            return Ok(typed_role.map(|_| SpawnAgentForkMode::TaskCapsule));
         };
 
         if fork_turns.eq_ignore_ascii_case("none") {
-            return Ok(None);
+            return Ok(typed_role.map(|_| SpawnAgentForkMode::TaskCapsule));
         }
         if fork_turns.eq_ignore_ascii_case("all") {
             return Ok(Some(SpawnAgentForkMode::FullHistory));
@@ -785,6 +869,8 @@ struct TypedAssignmentArgs {
     #[serde(default)]
     contract_claims: Vec<String>,
     #[serde(default)]
+    relevant_handles: Vec<RelevantHandle>,
+    #[serde(default)]
     workspace_strategy: WorkspaceStrategy,
     relation: Option<AssignmentRelation>,
 }
@@ -809,6 +895,158 @@ impl TypedAssignmentArgs {
             relation: self.relation,
         }
     }
+}
+
+async fn construct_and_attach_task_capsule(
+    store: &dyn AgentTaskStore,
+    repo_root: &Path,
+    assignment: &Assignment,
+    attempt: &Attempt,
+    handles: Vec<RelevantHandle>,
+) -> Result<String, StoreError> {
+    let scopes = assignment
+        .read_scope
+        .iter()
+        .chain(assignment.write_scope.iter())
+        .collect::<Vec<_>>();
+    let mut normalized_handles = Vec::with_capacity(handles.len());
+    let mut file_handles = HashSet::new();
+    let mut symbol_handles = HashSet::new();
+    let mut distinct_paths = BTreeMap::new();
+
+    for handle in handles {
+        let path = normalize_repo_path(repo_root, handle.path())?;
+        if !scopes.iter().any(|scope| scope.covers_path(&path)) {
+            return Err(StoreError::InvalidTaskCapsule(format!(
+                "relevant handle {path:?} is outside the assignment read/write scope"
+            )));
+        }
+        match std::fs::metadata(repo_root.join(&path)) {
+            Ok(metadata) if metadata.is_dir() => {
+                return Err(StoreError::InvalidTaskCapsule(format!(
+                    "relevant handle {path:?} resolves to a directory"
+                )));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(StoreError::InvalidTaskCapsule(format!(
+                    "relevant handle {path:?} is not a regular file"
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+
+        let path_key = if cfg!(windows) {
+            path.to_ascii_lowercase()
+        } else {
+            path.clone()
+        };
+        distinct_paths
+            .entry(path_key.clone())
+            .or_insert_with(|| path.clone());
+        match handle {
+            RelevantHandle::File { .. } => {
+                if !file_handles.insert(path_key) {
+                    return Err(StoreError::InvalidTaskCapsule(format!(
+                        "duplicate file handle for {path:?}"
+                    )));
+                }
+                normalized_handles.push(RelevantHandle::File { path });
+            }
+            RelevantHandle::Symbol { symbol, .. } => {
+                let symbol = symbol.trim().to_string();
+                if symbol.is_empty() {
+                    return Err(StoreError::InvalidTaskCapsule(format!(
+                        "symbol handle for {path:?} has an empty locator"
+                    )));
+                }
+                if !symbol_handles.insert((path_key, symbol.clone())) {
+                    return Err(StoreError::InvalidTaskCapsule(format!(
+                        "duplicate symbol handle for {path:?} and locator {symbol:?}"
+                    )));
+                }
+                normalized_handles.push(RelevantHandle::Symbol { path, symbol });
+            }
+        }
+    }
+
+    let revision = store
+        .capture_workspace_revision(repo_root, distinct_paths.into_values().collect())
+        .await?;
+    let entries = revision
+        .files
+        .iter()
+        .map(|entry| {
+            let key = if cfg!(windows) {
+                entry.path.to_ascii_lowercase()
+            } else {
+                entry.path.clone()
+            };
+            (key, entry)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let relevant_handles = normalized_handles
+        .into_iter()
+        .map(|handle| {
+            let key = if cfg!(windows) {
+                handle.path().to_ascii_lowercase()
+            } else {
+                handle.path().to_string()
+            };
+            let entry = entries.get(&key).ok_or_else(|| {
+                StoreError::InvalidTaskCapsule(format!(
+                    "workspace revision omitted relevant handle {:?}",
+                    handle.path()
+                ))
+            })?;
+            Ok(match handle {
+                RelevantHandle::File { path } => TaskCapsuleHandle::File {
+                    path,
+                    existed: entry.existed,
+                    content_hash: entry.content_hash.clone(),
+                },
+                RelevantHandle::Symbol { path, symbol } => TaskCapsuleHandle::Symbol {
+                    path,
+                    symbol,
+                    existed: entry.existed,
+                    content_hash: entry.content_hash.clone(),
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+
+    let capsule = TaskCapsuleV1 {
+        schema_version: 1,
+        assignment_id: assignment.assignment_id,
+        attempt_id: attempt.attempt_id,
+        role: assignment.role,
+        capability_profile: assignment.capability_profile,
+        requirements: assignment.acceptance_criteria.clone(),
+        objective: assignment.objective.clone(),
+        read_scope: assignment.read_scope.clone(),
+        write_scope: assignment.write_scope.clone(),
+        relevant_handles,
+        workspace_epoch: revision.epoch,
+        workspace_manifest_hash: revision.manifest_hash,
+        prohibited_changes: assignment.prohibited_changes.clone(),
+        required_evidence: assignment.required_evidence.clone(),
+    };
+    let canonical_payload = serde_json::to_string(&capsule)?;
+    let rendered = TaskCapsuleFragment::new(canonical_payload.clone()).render();
+    if !ModelContextBudget::default().try_take(&rendered) {
+        return Err(StoreError::InvalidTaskCapsule(
+            "canonical TaskCapsuleV1 exceeds the model context-size policy".to_string(),
+        ));
+    }
+    store
+        .attach_task_capsule(
+            assignment.assignment_id,
+            attempt.attempt_id,
+            canonical_payload.clone(),
+        )
+        .await?;
+    Ok(canonical_payload)
 }
 
 fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallError> {
@@ -903,6 +1141,7 @@ mod tests {
             required_evidence: Vec::new(),
             prohibited_changes: Vec::new(),
             contract_claims: Vec::new(),
+            relevant_handles: Vec::new(),
             workspace_strategy: WorkspaceStrategy::Auto,
             relation: None,
         }
@@ -933,6 +1172,54 @@ mod tests {
         let mut args = spawn_args();
         args.model = Some("child-model".to_string());
         assert!(matches!(args.fork_mode(None), Ok(None)));
+    }
+
+    #[test]
+    fn legacy_explicit_none_is_a_fresh_non_forked_child() {
+        let mut args = spawn_args();
+        args.fork_turns = Some("none".to_string());
+        assert!(matches!(args.fork_mode(None), Ok(None)));
+    }
+
+    #[test]
+    fn legacy_full_history_and_last_n_modes_are_unchanged() {
+        let mut args = spawn_args();
+        args.fork_turns = Some("all".to_string());
+        assert!(matches!(
+            args.fork_mode(None),
+            Ok(Some(SpawnAgentForkMode::FullHistory))
+        ));
+
+        args.fork_turns = Some("4".to_string());
+        assert!(matches!(
+            args.fork_mode(None),
+            Ok(Some(SpawnAgentForkMode::LastNTurns(4)))
+        ));
+    }
+
+    #[test]
+    fn typed_worker_omitted_fork_turns_selects_task_capsule() {
+        let mut args = spawn_args();
+        args.message = None;
+        args.assignment = Some(typed_assignment());
+        args.agent_type = Some("worker".to_string());
+        assert!(matches!(
+            args.fork_mode(Some(AgentRole::Worker)),
+            Ok(Some(SpawnAgentForkMode::TaskCapsule))
+        ));
+    }
+
+    #[test]
+    fn typed_worker_explicit_none_selects_task_capsule() {
+        let mut args = spawn_args();
+        args.message = None;
+        args.assignment = Some(typed_assignment());
+        args.agent_type = Some("worker".to_string());
+        args.fork_turns = Some("none".to_string());
+        assert!(matches!(
+            args.fork_mode(Some(AgentRole::Worker)),
+            Ok(Some(SpawnAgentForkMode::TaskCapsule))
+        ));
     }
 
     #[test]
@@ -1001,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_verifier_accepts_explicit_no_fork() {
+    fn typed_verifier_accepts_explicit_task_capsule_fork() {
         let mut args = spawn_args();
         args.message = None;
         args.assignment = Some(typed_assignment());
@@ -1009,7 +1296,7 @@ mod tests {
         args.fork_turns = Some("none".to_string());
         assert!(matches!(
             args.fork_mode(Some(AgentRole::Verifier)),
-            Ok(None)
+            Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }
 }

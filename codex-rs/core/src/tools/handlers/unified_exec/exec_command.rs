@@ -8,6 +8,8 @@ use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_execution::RunningWorkspaceMutation;
+use crate::tools::command_execution::WorkspaceMutationAcquireError;
+use crate::tools::command_execution::acquire_workspace_mutation_lease;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
@@ -244,25 +246,28 @@ async fn begin_unified_exec_workspace_mutation(
                 "exec_command typed-agent liveness could not be reconciled: {error}"
             ))
         })?;
-    let lease = store
-        .begin_workspace_mutation(
-            &repo_root,
-            WorkspaceMutationRequest {
-                root_session_id,
-                actor_id,
-                kind,
-                attempt_id: None,
-                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-                contracts: Vec::new(),
-                expected_manifest: Vec::new(),
-            },
-        )
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "exec_command could not acquire the repository-wide mutation lease: {error}"
-            ))
-        })?;
+    let request = WorkspaceMutationRequest {
+        root_session_id,
+        actor_id,
+        kind,
+        attempt_id: None,
+        paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+        contracts: Vec::new(),
+        expected_manifest: Vec::new(),
+    };
+    let lease =
+        acquire_workspace_mutation_lease(store.as_ref(), &repo_root, &request, &owner_cancelled)
+            .await
+            .map_err(|error| match error {
+                WorkspaceMutationAcquireError::Cancelled => FunctionCallError::RespondToModel(
+                    "exec_command mutation-lease wait was cancelled".to_string(),
+                ),
+                WorkspaceMutationAcquireError::Store(error) => {
+                    FunctionCallError::RespondToModel(format!(
+                        "exec_command could not acquire the repository-wide mutation lease: {error}"
+                    ))
+                }
+            })?;
     Ok(RunningWorkspaceMutation::new(
         store,
         repo_root,

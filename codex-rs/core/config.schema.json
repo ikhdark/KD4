@@ -2719,6 +2719,31 @@
       "minLength": 1,
       "type": "string"
     },
+    "ReasoningPhaseEfforts": {
+      "additionalProperties": false,
+      "description": "Per-logical-request reasoning effort overrides. Presence of this table enables deterministic phase tracking; omitted fields inherit the resolved turn effort.",
+      "properties": {
+        "diagnose": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "finalize": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "implement": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "inspect": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "orient": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "verify": {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      },
+      "type": "object"
+    },
     "ReasoningSummary": {
       "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process. See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries",
       "oneOf": [
@@ -5488,6 +5513,9 @@
       ],
       "default": null,
       "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
+    },
+    "reasoning_phase_efforts": {
+      "$ref": "#/definitions/ReasoningPhaseEfforts"
     },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",

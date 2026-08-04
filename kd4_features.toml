@@ -573,7 +573,7 @@ version = 2
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Host-enforced KD4 completion review with exact user-source, requirement, and risk-lens coverage, candidate-bound evidence, one automatic correction phase, and one independent rereview."
+summary = "Host-enforced KD4 completion review with sparse exception-only reviewer output, deterministic host-selected lenses, candidate-bound evidence, host-validated freshness, host-computed cleanliness, one automatic correction phase, and one independent rereview."
 upstream_equivalent = "none"
 config_keys = ["features.task_completion_reviewer"]
 
@@ -605,7 +605,7 @@ contains = "task_completion_reviewer = true"
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/tasks/completion_review_v2.rs"
-contains = "host_rejects_incomplete_duplicate_unknown_and_inconsistent_review_output"
+contains = "sparse_wire_contract_requires_all_five_arrays_and_rejects_legacy_fields"
 
 [[features]]
 id = "desktop-runtime-receipt"

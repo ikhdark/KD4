@@ -674,10 +674,18 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
 
 #[test]
 fn built_in_read_only_roles_resolve_embedded_config() {
-    for role_file in ["explorer.toml", "reviewer.toml", "verifier.toml"] {
+    let expected = built_in::config_file_contents(Path::new("explorer.toml"))
+        .expect("explorer should have an embedded config");
+    let parsed: TomlValue = toml::from_str(expected).expect("embedded config should be valid TOML");
+    assert_eq!(
+        parsed.get("sandbox_mode").and_then(TomlValue::as_str),
+        Some("read-only")
+    );
+
+    for role_file in ["reviewer.toml", "verifier.toml"] {
         assert_eq!(
             built_in::config_file_contents(Path::new(role_file)),
-            Some("sandbox_mode = \"read-only\"\n"),
+            Some(expected),
             "unexpected embedded config for {role_file}"
         );
     }

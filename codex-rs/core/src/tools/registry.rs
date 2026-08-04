@@ -179,6 +179,14 @@ pub(crate) struct AnyToolResult {
 }
 
 impl AnyToolResult {
+    pub(crate) fn success_for_logging(&self) -> bool {
+        self.result.success_for_logging()
+    }
+
+    pub(crate) fn sampling_request_signal(&self) -> Option<serde_json::Value> {
+        self.result.sampling_request_signal()
+    }
+
     pub(crate) fn into_response(self) -> ResponseInputItem {
         let Self {
             call_id,
@@ -209,6 +217,10 @@ impl ToolOutput for PostToolUseFeedbackOutput {
 
     fn success_for_logging(&self) -> bool {
         self.original.success_for_logging()
+    }
+
+    fn sampling_request_signal(&self) -> Option<Value> {
+        self.original.sampling_request_signal()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

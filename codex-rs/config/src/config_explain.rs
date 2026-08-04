@@ -79,6 +79,11 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Reasoning effort to use while in plan mode.",
     ),
     doc(
+        "reasoning_phase_efforts",
+        "Reasoning and output",
+        "Optional per-sampling-request effort overrides for orient, inspect, implement, diagnose, verify, and finalize phases.",
+    ),
+    doc(
         "model_reasoning_summary",
         "Reasoning and output",
         "Reasoning summary style: `auto`, `concise`, `detailed`, or `none`.",

@@ -19,6 +19,10 @@ pub enum StoreError {
     AttemptSealed(AttemptId),
     #[error("attempt {0} is not the active current attempt")]
     AttemptNotActive(AttemptId),
+    #[error("assignment {0} already has an immutable task capsule")]
+    TaskCapsuleAlreadyAttached(AssignmentId),
+    #[error("invalid task capsule: {0}")]
+    InvalidTaskCapsule(String),
     #[error("attempt {0} already has a sealed receipt")]
     ReceiptAlreadySealed(AttemptId),
     #[error("dependency validation failed: {blockers:?}")]

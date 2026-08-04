@@ -49,6 +49,14 @@ pub trait AgentTaskStore: Send + Sync {
         draft: AssignmentDraft,
     ) -> TaskStoreFuture<'a, (Assignment, Attempt)>;
 
+    /// Atomically attaches the one immutable, canonical TaskCapsule bootstrap snapshot.
+    fn attach_task_capsule(
+        &self,
+        assignment_id: AssignmentId,
+        attempt_id: AttemptId,
+        canonical_payload: String,
+    ) -> TaskStoreFuture<'_, Assignment>;
+
     fn get_agent_task(
         &self,
         assignment_id: AssignmentId,

@@ -15,6 +15,3 @@ state when no blocker is found, recommend the smallest coherent correction, and
 give the coordinator one focused command that would prove the item. Do not
 stage, commit, push, publish, or perform unrelated cleanup.
 """
-model = "gpt-5.6-sol"
-model_reasoning_effort = "high"
-

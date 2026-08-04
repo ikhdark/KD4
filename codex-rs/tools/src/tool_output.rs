@@ -18,6 +18,12 @@ pub trait ToolOutput: Send {
 
     fn success_for_logging(&self) -> bool;
 
+    /// Internal, request-local signal consumed by the normal sampling loop.
+    /// This is never serialized into the public protocol.
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        None
+    }
+
     /// Whether this output contains external context that should disable memory generation when
     /// `memories.disable_on_external_context` is enabled.
     fn contains_external_context(&self) -> bool {
@@ -62,6 +68,10 @@ where
 
     fn success_for_logging(&self) -> bool {
         (**self).success_for_logging()
+    }
+
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        (**self).sampling_request_signal()
     }
 
     fn contains_external_context(&self) -> bool {

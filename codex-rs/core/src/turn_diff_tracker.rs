@@ -104,6 +104,7 @@ pub struct TurnDiffTracker {
     unvalidated_paths: HashSet<TrackedPath>,
     unvalidated_unknown_mutation: bool,
     has_successful_validation: bool,
+    last_successful_validation_revision: Option<u64>,
     last_post_mutation_validation_status: ValidationFreshnessStatus,
     #[cfg(test)]
     rendered_diff_count: std::cell::Cell<usize>,
@@ -124,6 +125,7 @@ impl Default for TurnDiffTracker {
             unvalidated_paths: HashSet::new(),
             unvalidated_unknown_mutation: false,
             has_successful_validation: false,
+            last_successful_validation_revision: None,
             last_post_mutation_validation_status: ValidationFreshnessStatus::None,
             #[cfg(test)]
             rendered_diff_count: std::cell::Cell::new(0),
@@ -235,6 +237,11 @@ impl TurnDiffTracker {
             } else {
                 ValidationFreshnessStatus::PassedAfterLastMutation
             };
+            if self.last_post_mutation_validation_status
+                == ValidationFreshnessStatus::PassedAfterLastMutation
+            {
+                self.last_successful_validation_revision = Some(self.mutation_revision);
+            }
         }
     }
 
@@ -254,6 +261,10 @@ impl TurnDiffTracker {
         } else {
             ValidationFreshnessStatus::None
         }
+    }
+
+    pub(crate) fn last_successful_validation_revision(&self) -> Option<u64> {
+        self.last_successful_validation_revision
     }
 
     fn clear_covered_paths(&mut self, environment_id: &str, covered_paths: &[PathBuf]) {

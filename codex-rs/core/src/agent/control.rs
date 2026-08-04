@@ -114,6 +114,7 @@ mod spawn;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
+    TaskCapsule,
     FullHistory,
     LastNTurns(usize),
 }

@@ -122,6 +122,10 @@ async fn invoke_normalized_plan_update(
 fn unchanged_plan_output_remains_compact() {
     let output = PlanToolOutput {
         normalized_plan: None,
+        governor_plan: UpdatePlanArgs {
+            explanation: None,
+            plan: Vec::new(),
+        },
     };
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),

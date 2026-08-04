@@ -177,6 +177,7 @@ use opentelemetry_sdk::metrics::data::AggregatedMetrics;
 use opentelemetry_sdk::metrics::data::Metric;
 use opentelemetry_sdk::metrics::data::MetricData;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -219,6 +220,31 @@ impl StepContext {
 }
 
 mod guardian_tests;
+
+fn run_session_multi_thread_test_with_stack<F, Fut, T>(test_name: &'static str, test: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(TEST_STACK_SIZE_BYTES)
+                .enable_all()
+                .build()
+                .expect("build session test runtime")
+                .block_on(test())
+        })
+        .expect("spawn session test thread")
+        .join()
+        .expect("session test thread panicked")
+}
 
 struct InstructionsTestCase {
     slug: &'static str,
@@ -3024,8 +3050,15 @@ async fn session_permission_profile_rebinds_runtime_workspace_roots() -> anyhow:
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<()> {
+#[test]
+fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<()> {
+    run_session_multi_thread_test_with_stack(
+        "fork_startup_context_then_first_turn_diff_snapshot",
+        fork_startup_context_then_first_turn_diff_snapshot_impl,
+    )
+}
+
+async fn fork_startup_context_then_first_turn_diff_snapshot_impl() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     mount_sse_once(
         &server,

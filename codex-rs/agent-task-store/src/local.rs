@@ -65,6 +65,7 @@ use crate::RuntimeObservation;
 use crate::StoreError;
 use crate::StoreResult;
 use crate::TaskActor;
+use crate::TaskCapsuleV1;
 use crate::TaskStoreFuture;
 use crate::ValidationCall;
 use crate::ValidationEvidence;
@@ -376,6 +377,80 @@ impl LocalAgentTaskStore {
         Ok((assignment, attempt))
     }
 
+    async fn attach_task_capsule_impl(
+        &self,
+        assignment_id: AssignmentId,
+        attempt_id: AttemptId,
+        canonical_payload: String,
+    ) -> StoreResult<Assignment> {
+        let capsule: TaskCapsuleV1 = serde_json::from_str(&canonical_payload)
+            .map_err(|error| StoreError::InvalidTaskCapsule(error.to_string()))?;
+        if capsule.schema_version != 1 {
+            return Err(StoreError::InvalidTaskCapsule(format!(
+                "unsupported schema version {}",
+                capsule.schema_version
+            )));
+        }
+        if capsule.assignment_id != assignment_id || capsule.attempt_id != attempt_id {
+            return Err(StoreError::InvalidTaskCapsule(
+                "assignment or attempt identity does not match attachment target".to_string(),
+            ));
+        }
+        let rendered = serde_json::to_string(&capsule)?;
+        if rendered.as_bytes() != canonical_payload.as_bytes() {
+            return Err(StoreError::InvalidTaskCapsule(
+                "payload is not the canonical TaskCapsuleV1 serialization".to_string(),
+            ));
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        lock_assignment_tx(&mut transaction, assignment_id).await?;
+        let mut assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if attempt.attempt_id != attempt_id || attempt.state != AttemptState::Active {
+            return Err(StoreError::AttemptNotActive(attempt_id));
+        }
+        let capsule_path = task_capsule_path(&self.coordination_root, assignment_id);
+        if capsule_path.try_exists()? {
+            return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
+        }
+        if let Some(parent) = capsule_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary_path = capsule_path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => file,
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = file
+            .write_all(canonical_payload.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error.into());
+        }
+        drop(file);
+        if let Err(error) = std::fs::hard_link(&temporary_path, &capsule_path) {
+            let _ = std::fs::remove_file(&temporary_path);
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
+            }
+            return Err(error.into());
+        }
+        let _ = std::fs::remove_file(&temporary_path);
+        if let Err(error) = transaction.commit().await {
+            let _ = std::fs::remove_file(&capsule_path);
+            return Err(error.into());
+        }
+        assignment.task_capsule = Some(canonical_payload);
+        Ok(assignment)
+    }
+
     async fn get_agent_task_impl(
         &self,
         assignment_id: AssignmentId,
@@ -386,7 +461,7 @@ impl LocalAgentTaskStore {
             return Err(StoreError::InvalidObservationLimit(limit));
         }
         let mut transaction = self.pool.begin().await?;
-        let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        let mut assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         let current_attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         let receipt =
             sqlx::query_scalar::<_, String>("SELECT body_json FROM receipts WHERE attempt_id = ?")
@@ -523,6 +598,7 @@ impl LocalAgentTaskStore {
                     .then(|| "resolve pending gates before completion".to_string())
             });
         transaction.commit().await?;
+        hydrate_task_capsule(&self.coordination_root, &mut assignment)?;
         Ok(AgentTask {
             assignment,
             current_attempt,
@@ -2668,6 +2744,18 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         draft: AssignmentDraft,
     ) -> TaskStoreFuture<'a, (Assignment, Attempt)> {
         Box::pin(async move { self.create_assignment_impl(repo_root, draft).await })
+    }
+
+    fn attach_task_capsule(
+        &self,
+        assignment_id: AssignmentId,
+        attempt_id: AttemptId,
+        canonical_payload: String,
+    ) -> TaskStoreFuture<'_, Assignment> {
+        Box::pin(async move {
+            self.attach_task_capsule_impl(assignment_id, attempt_id, canonical_payload)
+                .await
+        })
     }
 
     fn get_agent_task(
@@ -5304,6 +5392,34 @@ fn isolation_handoff_from_row(
             .map(|value| decode(&value))
             .transpose()?,
     })
+}
+
+fn task_capsule_path(coordination_root: &Path, assignment_id: AssignmentId) -> PathBuf {
+    coordination_root
+        .join("task_capsules")
+        .join(format!("{assignment_id}.json"))
+}
+
+fn hydrate_task_capsule(coordination_root: &Path, assignment: &mut Assignment) -> StoreResult<()> {
+    let capsule_path = task_capsule_path(coordination_root, assignment.assignment_id);
+    let canonical_payload = match std::fs::read_to_string(capsule_path) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let capsule: TaskCapsuleV1 = serde_json::from_str(&canonical_payload)?;
+    if capsule.schema_version != 1 || capsule.assignment_id != assignment.assignment_id {
+        return Err(StoreError::CorruptData(
+            "persisted TaskCapsuleV1 identity or schema version is invalid".to_string(),
+        ));
+    }
+    if serde_json::to_string(&capsule)?.as_bytes() != canonical_payload.as_bytes() {
+        return Err(StoreError::CorruptData(
+            "persisted TaskCapsuleV1 payload is not canonical".to_string(),
+        ));
+    }
+    assignment.task_capsule = Some(canonical_payload);
+    Ok(())
 }
 
 fn private_snapshot_path(coordination_root: &Path, snapshot_name: &str) -> StoreResult<PathBuf> {

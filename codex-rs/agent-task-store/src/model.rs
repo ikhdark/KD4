@@ -202,6 +202,7 @@ impl AssignmentDraft {
             workspace_id: String::new(),
             start_epoch: 0,
             relation: self.relation,
+            task_capsule: None,
             created_at: Utc::now(),
         })
     }
@@ -236,7 +237,61 @@ pub struct Assignment {
     #[serde(default)]
     pub start_epoch: u64,
     pub relation: Option<AssignmentRelation>,
+    /// Immutable canonical `TaskCapsuleV1` JSON attached before the child is launched.
+    #[serde(default)]
+    pub task_capsule: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RelevantHandle {
+    File { path: String },
+    Symbol { path: String, symbol: String },
+}
+
+impl RelevantHandle {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::File { path } | Self::Symbol { path, .. } => path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskCapsuleHandle {
+    File {
+        path: String,
+        existed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_hash: Option<String>,
+    },
+    Symbol {
+        path: String,
+        symbol: String,
+        existed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_hash: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskCapsuleV1 {
+    pub schema_version: u8,
+    pub assignment_id: AssignmentId,
+    pub attempt_id: AttemptId,
+    pub role: AgentRole,
+    pub capability_profile: CapabilityProfile,
+    pub requirements: Vec<AcceptanceCriterion>,
+    pub objective: String,
+    pub read_scope: Vec<RepoScope>,
+    pub write_scope: Vec<RepoScope>,
+    pub relevant_handles: Vec<TaskCapsuleHandle>,
+    pub workspace_epoch: u64,
+    pub workspace_manifest_hash: String,
+    pub prohibited_changes: Vec<String>,
+    pub required_evidence: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

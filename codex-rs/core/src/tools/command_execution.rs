@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_agent_task_store::AgentTaskStore;
+use codex_agent_task_store::StoreError;
 use codex_agent_task_store::WorkspaceMutationLease;
+use codex_agent_task_store::WorkspaceMutationRequest;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
@@ -17,6 +19,8 @@ use crate::tools::command_output_artifact::RawOutputArtifact;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
 const MAX_CONSECUTIVE_FAILURES: u8 = 2;
+const WORKSPACE_MUTATION_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CommandAttemptKey {
@@ -148,6 +152,41 @@ pub(crate) struct WorkspaceMutationReservation {
     _guard: OwnedMutexGuard<()>,
 }
 
+#[derive(Debug)]
+pub(crate) enum WorkspaceMutationAcquireError {
+    Cancelled,
+    Store(StoreError),
+}
+
+pub(crate) async fn acquire_workspace_mutation_lease(
+    store: &dyn AgentTaskStore,
+    repo_root: &Path,
+    request: &WorkspaceMutationRequest,
+    cancellation: &CancellationToken,
+) -> Result<WorkspaceMutationLease, WorkspaceMutationAcquireError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(WorkspaceMutationAcquireError::Cancelled);
+        }
+
+        match store
+            .begin_workspace_mutation(repo_root, request.clone())
+            .await
+        {
+            Ok(lease) => return Ok(lease),
+            Err(StoreError::WorkspaceClaimConflict { .. }) => {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(WorkspaceMutationAcquireError::Cancelled);
+                    }
+                    _ = tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL) => {}
+                }
+            }
+            Err(error) => return Err(WorkspaceMutationAcquireError::Store(error)),
+        }
+    }
+}
+
 struct RunningWorkspaceMutationInner {
     store: Arc<dyn AgentTaskStore>,
     repo_root: PathBuf,
@@ -155,6 +194,7 @@ struct RunningWorkspaceMutationInner {
     stop: CancellationToken,
     lease_lost: CancellationToken,
     finalized: Arc<Mutex<bool>>,
+    finalization_complete: CancellationToken,
     reservation: Mutex<Option<WorkspaceMutationReservation>>,
     _heartbeat_task: AbortOnDropHandle<()>,
 }
@@ -237,6 +277,7 @@ impl RunningWorkspaceMutation {
                 stop,
                 lease_lost,
                 finalized: Arc::new(Mutex::new(false)),
+                finalization_complete: CancellationToken::new(),
                 reservation: Mutex::new(Some(reservation)),
                 _heartbeat_task: heartbeat_task,
             }),
@@ -265,7 +306,12 @@ impl RunningWorkspaceMutation {
         *finalized = true;
         self.inner.stop.cancel();
         self.inner.reservation.lock().await.take();
+        self.inner.finalization_complete.cancel();
         Ok(())
+    }
+
+    async fn wait_until_finalized(&self) {
+        self.inner.finalization_complete.cancelled().await;
     }
 }
 
@@ -396,14 +442,15 @@ impl CommandExecutionLedger {
             state
                 .running
                 .values()
-                .filter(|running| {
-                    running.owner_turn_id == turn_id && running.completed_exit_code.is_none()
-                })
+                .filter(|running| running.owner_turn_id == turn_id)
                 .filter_map(|running| running.workspace_mutation.clone())
                 .collect::<Vec<_>>()
         };
-        for mutation in mutations {
+        for mutation in &mutations {
             mutation.cancel_owner();
+        }
+        for mutation in mutations {
+            mutation.wait_until_finalized().await;
         }
     }
 
@@ -643,6 +690,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_mutation_lease_wait_is_serialized_and_cancellable() {
+        let codex_home = TempDir::new().expect("codex home tempdir");
+        let repo = TempDir::new().expect("repository tempdir");
+        let state =
+            StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+                .await
+                .expect("state runtime initializes");
+        let store = Arc::new(
+            LocalAgentTaskStore::initialize(&state)
+                .await
+                .expect("task store initializes"),
+        );
+        let owner_request = WorkspaceMutationRequest {
+            root_session_id: "owner-root".to_string(),
+            actor_id: "root:owner-root".to_string(),
+            kind: WorkspaceActorKind::Root,
+            attempt_id: None,
+            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+            contracts: Vec::new(),
+            expected_manifest: Vec::new(),
+        };
+        let waiter_request = WorkspaceMutationRequest {
+            root_session_id: "waiter-root".to_string(),
+            actor_id: "root:waiter-root".to_string(),
+            kind: WorkspaceActorKind::Root,
+            attempt_id: None,
+            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+            contracts: Vec::new(),
+            expected_manifest: Vec::new(),
+        };
+        let owner_lease = store
+            .begin_workspace_mutation(repo.path(), owner_request.clone())
+            .await
+            .expect("owner lease starts");
+        let waiter_store: Arc<dyn AgentTaskStore> = store.clone();
+        let waiter_repo = repo.path().to_path_buf();
+        let waiter_cancellation = CancellationToken::new();
+        let waiter = tokio::spawn({
+            let waiter_cancellation = waiter_cancellation.clone();
+            let waiter_request = waiter_request.clone();
+            async move {
+                acquire_workspace_mutation_lease(
+                    waiter_store.as_ref(),
+                    &waiter_repo,
+                    &waiter_request,
+                    &waiter_cancellation,
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL * 2).await;
+        assert!(
+            !waiter.is_finished(),
+            "a conflicting active lease must keep the waiter serialized"
+        );
+        store
+            .finish_workspace_mutation(repo.path(), owner_lease)
+            .await
+            .expect("owner lease finishes");
+        let waiter_lease = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter proceeds after the owner releases the lease")
+            .expect("waiter task succeeds")
+            .expect("waiter acquires the lease");
+        store
+            .finish_workspace_mutation(repo.path(), waiter_lease)
+            .await
+            .expect("waiter lease finishes");
+
+        let owner_lease = store
+            .begin_workspace_mutation(repo.path(), owner_request)
+            .await
+            .expect("replacement owner lease starts");
+        let waiter_store: Arc<dyn AgentTaskStore> = store.clone();
+        let waiter_repo = repo.path().to_path_buf();
+        let cancellation = CancellationToken::new();
+        let cancelled_waiter = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                acquire_workspace_mutation_lease(
+                    waiter_store.as_ref(),
+                    &waiter_repo,
+                    &waiter_request,
+                    &cancellation,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL * 2).await;
+        assert!(
+            !cancelled_waiter.is_finished(),
+            "a conflicting lease must not be bypassed"
+        );
+        cancellation.cancel();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), cancelled_waiter)
+            .await
+            .expect("cancelled waiter exits promptly")
+            .expect("cancelled waiter task succeeds")
+            .expect_err("cancelled waiter reports cancellation");
+        assert!(matches!(
+            cancelled,
+            WorkspaceMutationAcquireError::Cancelled
+        ));
+        store
+            .finish_workspace_mutation(repo.path(), owner_lease)
+            .await
+            .expect("replacement owner lease finishes");
+    }
+
+    #[tokio::test]
     async fn blocks_third_identical_attempt_after_two_failures() {
         let ledger = CommandExecutionLedger::default();
         let key = key("fails.exe");
@@ -793,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_turn_revokes_only_its_mutating_background_process() {
-        let (_codex_home, _repo, _store, ledger, mutation) =
+        let (_codex_home, repo, store, ledger, mutation) =
             running_workspace_mutation(CancellationToken::new()).await;
         let lease_lost = mutation.lease_lost_token();
         ledger
@@ -808,11 +966,51 @@ mod tests {
 
         ledger.cancel_mutations_for_turn("other-turn").await;
         assert!(!lease_lost.is_cancelled());
-        ledger.cancel_mutations_for_turn("owner-turn").await;
+        let cancellation = {
+            let ledger = Arc::clone(&ledger);
+            tokio::spawn(async move {
+                ledger.cancel_mutations_for_turn("owner-turn").await;
+            })
+        };
         tokio::time::timeout(std::time::Duration::from_secs(1), lease_lost.cancelled())
             .await
             .expect("terminal owner turn signals process termination");
+        assert!(
+            !cancellation.is_finished(),
+            "turn cancellation must wait for process exit and mutation finalization"
+        );
         assert!(ledger.mark_running_process_completed(42, -1).await);
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancellation)
+            .await
+            .expect("turn cancellation finishes after process exit")
+            .expect("turn cancellation task succeeds");
+
+        let replacement_reservation = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ledger.reserve_workspace_mutation(repo.path()),
+        )
+        .await
+        .expect("terminal completion releases the local mutation reservation");
+        let replacement = store
+            .begin_workspace_mutation(
+                repo.path(),
+                WorkspaceMutationRequest {
+                    root_session_id: "replacement-root".to_string(),
+                    actor_id: "root:replacement-root".to_string(),
+                    kind: WorkspaceActorKind::Root,
+                    attempt_id: None,
+                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                    contracts: Vec::new(),
+                    expected_manifest: Vec::new(),
+                },
+            )
+            .await
+            .expect("terminal completion releases the persisted mutation lease");
+        store
+            .finish_workspace_mutation(repo.path(), replacement)
+            .await
+            .expect("replacement mutation finishes");
+        drop(replacement_reservation);
     }
 
     #[test]

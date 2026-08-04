@@ -7,6 +7,61 @@ fn strings(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn repairs_direct_argv_git_status_to_disable_optional_locks() {
+    let invocation = CommandInvocation::Argv {
+        program: "git".to_string(),
+        args: strings(&["status", "--short", "--branch"]),
+    };
+
+    let outcome = preflight_invocation_with_equivalent_repair(
+        &invocation,
+        &invocation.to_direct_argv().expect("argv"),
+        None,
+    )
+    .expect("git status should receive a read-only equivalent repair");
+
+    assert_eq!(
+        outcome.invocation,
+        CommandInvocation::Argv {
+            program: "git".to_string(),
+            args: strings(&["--no-optional-locks", "status", "--short", "--branch"]),
+        }
+    );
+    assert!(
+        outcome
+            .repair_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("git_status_optional_locks"))
+    );
+}
+
+#[test]
+fn does_not_rewrite_git_status_scripts_or_unrelated_git_commands() {
+    let script = CommandInvocation::Script("git status".to_string());
+    let script_outcome = preflight_invocation_with_equivalent_repair(
+        &script,
+        &strings(&["bash", "-lc", "git status"]),
+        Some(ShellType::Bash),
+    )
+    .expect("git status script remains valid but potentially mutating");
+    assert_eq!(script_outcome.invocation, script);
+    assert!(!script_outcome.repaired());
+
+    let branch = CommandInvocation::Argv {
+        program: "git".to_string(),
+        args: strings(&["branch", "new-branch"]),
+    };
+    let branch_outcome = preflight_invocation_with_equivalent_repair(
+        &branch,
+        &branch.to_direct_argv().expect("argv"),
+        None,
+    )
+    .expect("git branch remains valid but potentially mutating");
+    assert_eq!(branch_outcome.invocation, branch);
+    assert!(!branch_outcome.repaired());
+}
+
+#[test]
 fn rejects_known_rg_flag_typo_for_direct_argv() {
     let issue = preflight_command_issue(
         &strings(&["rg", "--ignorecase", "TODO", "src"]),

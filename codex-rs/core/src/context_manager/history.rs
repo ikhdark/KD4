@@ -143,6 +143,7 @@ impl ContextManager {
     /// include `InputModality::Image`, images are stripped from messages and tool
     /// outputs.
     pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
+        evict_resolved_reasoning(Arc::make_mut(&mut self.items));
         self.normalize_history(input_modalities);
         Arc::unwrap_or_clone(self.items)
     }
@@ -191,8 +192,12 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
+        let last_instruction_boundary = items.iter().rposition(is_user_turn_boundary);
         let items_tokens = items
             .iter()
+            .enumerate()
+            .filter(|(index, item)| !is_resolved_reasoning(*index, item, last_instruction_boundary))
+            .map(|(_, item)| item)
             .map(estimate_item_token_count)
             .fold(0i64, i64::saturating_add);
 
@@ -311,28 +316,6 @@ impl ContextManager {
         );
     }
 
-    fn get_non_last_reasoning_items_tokens(&self) -> i64 {
-        // Get reasoning items excluding all the ones after the last instruction boundary.
-        let Some(last_user_index) = self.items.iter().rposition(is_user_turn_boundary) else {
-            return 0;
-        };
-
-        self.items
-            .iter()
-            .take(last_user_index)
-            .filter(|item| {
-                matches!(
-                    item,
-                    ResponseItem::Reasoning {
-                        encrypted_content: Some(_),
-                        ..
-                    }
-                )
-            })
-            .map(estimate_item_token_count)
-            .fold(0i64, i64::saturating_add)
-    }
-
     // These are local items added after the most recent model-emitted item.
     // They are not reflected in `last_token_usage.total_tokens`.
     fn items_after_last_model_generated_item(&self) -> &[ResponseItem] {
@@ -344,26 +327,44 @@ impl ContextManager {
         &self.items[start..]
     }
 
-    /// When true, the server already accounted for past reasoning tokens and
-    /// the client should not re-estimate them.
-    pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
+    /// Returns the active model-visible context estimate. The transport's reasoning-accounting
+    /// mode does not affect this projection: resolved reasoning is not sent in either mode.
+    pub(crate) fn get_total_token_usage(
+        &self,
+        _server_reasoning_included: bool,
+        base_instructions: &BaseInstructions,
+    ) -> i64 {
+        let items_after_last_model_generated = self.items_after_last_model_generated_item();
+        let local_tail_contains_instruction_boundary = self
+            .items
+            .iter()
+            .rposition(is_model_generated_item)
+            .map_or_else(
+                || self.items.iter().any(is_user_turn_boundary),
+                |last_model_generated| {
+                    self.items[last_model_generated.saturating_add(1)..]
+                        .iter()
+                        .any(is_user_turn_boundary)
+                },
+            );
+        if local_tail_contains_instruction_boundary {
+            return Self::estimate_items_token_count_with_base_instructions(
+                self.raw_items(),
+                base_instructions,
+            )
+            .unwrap_or(0);
+        }
+
         let last_tokens = self
             .token_info
             .as_ref()
             .map(|info| info.last_token_usage.total_tokens)
             .unwrap_or(0);
-        let items_after_last_model_generated_tokens = self
-            .items_after_last_model_generated_item()
+        let items_after_last_model_generated_tokens = items_after_last_model_generated
             .iter()
             .map(estimate_item_token_count)
             .fold(0i64, i64::saturating_add);
-        if server_reasoning_included {
-            last_tokens.saturating_add(items_after_last_model_generated_tokens)
-        } else {
-            last_tokens
-                .saturating_add(self.get_non_last_reasoning_items_tokens())
-                .saturating_add(items_after_last_model_generated_tokens)
-        }
+        last_tokens.saturating_add(items_after_last_model_generated_tokens)
     }
 
     pub(crate) fn estimated_tokens_after_last_model_generated_item(&self) -> i64 {
@@ -783,6 +784,25 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         | ResponseItem::AgentMessage { .. }
         | ResponseItem::Other => false,
     }
+}
+
+fn is_resolved_reasoning(
+    index: usize,
+    item: &ResponseItem,
+    last_instruction_boundary: Option<usize>,
+) -> bool {
+    last_instruction_boundary.is_some_and(|boundary| index < boundary)
+        && matches!(item, ResponseItem::Reasoning { .. })
+}
+
+fn evict_resolved_reasoning(items: &mut Vec<ResponseItem>) {
+    let last_instruction_boundary = items.iter().rposition(is_user_turn_boundary);
+    let mut index = 0usize;
+    items.retain(|item| {
+        let retain = !is_resolved_reasoning(index, item, last_instruction_boundary);
+        index = index.saturating_add(1);
+        retain
+    });
 }
 
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {

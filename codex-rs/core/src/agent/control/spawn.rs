@@ -1,5 +1,7 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
+use crate::context::ContextualUserFragment;
+use crate::context::TaskCapsuleFragment;
 use codex_extension_api::ExtensionDataInit;
 use tracing::Instrument;
 
@@ -19,6 +21,7 @@ struct SpawnAgentThreadInheritance {
 enum SpawnInitialInput {
     UserInput(Vec<UserInput>),
     InterAgentCommunication(InterAgentCommunication, AgentCommunicationContext),
+    TaskCapsule(String),
 }
 
 struct PendingSpawnCleanup {
@@ -253,6 +256,23 @@ impl AgentControl {
         Box::pin(self.spawn_agent_internal(
             config,
             SpawnInitialInput::InterAgentCommunication(communication, context),
+            session_source,
+            options,
+        ))
+        .await
+    }
+
+    /// Spawn a typed child whose sole bootstrap is the canonical TaskCapsule payload.
+    pub(crate) async fn spawn_agent_with_task_capsule(
+        &self,
+        config: Config,
+        canonical_payload: String,
+        session_source: Option<SessionSource>,
+        options: SpawnAgentOptions,
+    ) -> CodexResult<LiveAgent> {
+        Box::pin(self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::TaskCapsule(canonical_payload),
             session_source,
             options,
         ))
@@ -710,6 +730,7 @@ impl AgentControl {
             SpawnInitialInput::InterAgentCommunication(communication, _) => {
                 last_task_message_from_communication(communication)
             }
+            SpawnInitialInput::TaskCapsule(_) => Some("TaskCapsuleV1".to_string()),
         };
         #[cfg(test)]
         self.pause_before_initial_submission_for_test().await;
@@ -729,6 +750,19 @@ impl AgentControl {
                     &state,
                     communication,
                     context,
+                    execution_guard,
+                )
+                .await
+            }
+            SpawnInitialInput::TaskCapsule(canonical_payload) => {
+                let rendered = TaskCapsuleFragment::new(canonical_payload).render();
+                self.send_input_after_capacity_check(
+                    new_thread.thread_id,
+                    &state,
+                    vec![UserInput::Text {
+                        text: rendered,
+                        text_elements: Vec::new(),
+                    }],
                     execution_guard,
                 )
                 .await
@@ -890,6 +924,23 @@ impl AgentControl {
         };
 
         let parent_thread_id = *parent_thread_id;
+        if matches!(fork_mode, SpawnAgentForkMode::TaskCapsule) {
+            return state
+                .fork_thread_with_source(
+                    config.clone(),
+                    InitialHistory::Forked(Vec::new()),
+                    self.clone(),
+                    session_source,
+                    /*thread_source*/ Some(ThreadSource::Subagent),
+                    /*parent_thread_id*/ Some(parent_thread_id),
+                    /*forked_from_thread_id*/ Some(parent_thread_id),
+                    inherited_environments,
+                    inherited_exec_policy,
+                    options.environments.clone(),
+                    ExtensionDataInit::new(),
+                )
+                .await;
+        }
         let parent_thread = state.get_thread(parent_thread_id).await.ok();
         if let Some(parent_thread) = parent_thread.as_ref() {
             // `record_conversation_items` only queues persistence writes asynchronously.

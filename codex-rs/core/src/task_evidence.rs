@@ -32,8 +32,11 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 5;
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 6;
+const FROZEN_TASK_EVIDENCE_V5_SCHEMA_VERSION: u32 = 5;
 const FROZEN_TASK_EVIDENCE_V4_SCHEMA_VERSION: u32 = 4;
+pub(crate) const SOURCE_CLASSIFICATION_CONTRACT_VERSION: &str = "source-local-v1";
+pub(crate) const RELATIONSHIP_RESOLVER_CONTRACT_VERSION: &str = "relationship-v1";
 const TASK_EVIDENCE_COMPLETION_MODEL_VERSION: u32 = 3;
 const FILE_HASH_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_COMMAND_RECEIPTS: usize = 256;
@@ -51,6 +54,11 @@ const REQUIREMENT_MANIFEST_CANONICAL_FORMAT: &str = "KD4_REQUIREMENT_MANIFEST_CA
 const IMPLEMENTATION_IDENTITY_CANONICAL_FORMAT: &str = "KD4_IMPLEMENTATION_IDENTITY_CANONICAL_V1";
 const DOSSIER_SNAPSHOT_CANONICAL_FORMAT: &str = "KD4_DOSSIER_SNAPSHOT_CANONICAL_V1";
 const REPAIR_INSTRUCTION_CANONICAL_FORMAT: &str = "KD4_REPAIR_INSTRUCTION_CANONICAL_V1";
+const REPAIR_BASELINE_CANONICAL_FORMAT: &str = "KD4_REPAIR_BASELINE_CANONICAL_V1";
+const REPAIR_DELTA_CANONICAL_FORMAT: &str = "KD4_REPAIR_DELTA_CANONICAL_V1";
+const REREVIEW_AUDIT_CANONICAL_FORMAT: &str = "KD4_REREVIEW_AUDIT_CANONICAL_V1";
+const REPAIR_PATH_GRAMMAR_VERSION: u32 = 1;
+const REPAIR_RECURSIVE_WILDCARD_MAX_SEGMENTS: usize = 8;
 pub(crate) const COMPLETION_REVIEW_LENSES: [&str; 8] = [
     "requirements_and_behavioral_compatibility",
     "lifecycle_and_concurrency",
@@ -150,6 +158,8 @@ struct TaskEvidenceDocument {
     host_mutation_revision: u64,
     #[serde(default)]
     completion_review_v2: Option<CompletionReviewLedgerV2>,
+    #[serde(default, deserialize_with = "deserialize_source_classification_cache")]
+    source_classification_cache: Vec<SourceClassificationCacheEntry>,
     completion: Option<TaskCompletionGate>,
 }
 
@@ -202,7 +212,7 @@ pub(crate) struct UserSourceRecord {
     pub(crate) introduced_manifest_revision: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UserSourceKind {
     Text,
@@ -223,7 +233,218 @@ struct SourceMappingRevision {
     completion_epoch: u64,
     manifest_revision: u64,
     source_id: String,
+    #[serde(default)]
+    source_classification_contract_version: Option<String>,
+    #[serde(default)]
+    relationship_resolver_contract_version: Option<String>,
     mapping: SourceMapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct SourceClassificationCacheKey {
+    pub(crate) contract_version: String,
+    pub(crate) source_kind: UserSourceKind,
+    pub(crate) content_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceLocalClassificationKind {
+    RequirementBearing,
+    NonRequirement,
+    RelationshipOnlyContext,
+    UnavailableOrTruncated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalSemanticCueKind {
+    Assertion,
+    ReplacementIntent,
+    WithdrawalIntent,
+    RelationshipOnlyContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalSemanticCue {
+    pub(crate) kind: LocalSemanticCueKind,
+    pub(crate) source_span: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceLocalClassification {
+    pub(crate) local_kind: SourceLocalClassificationKind,
+    pub(crate) requirement_spans: Vec<SourceSpan>,
+    pub(crate) local_semantic_cues: Vec<LocalSemanticCue>,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceClassificationCacheEntry {
+    pub(crate) contract_version: String,
+    pub(crate) source_kind: UserSourceKind,
+    pub(crate) content_hash: String,
+    pub(crate) classification: SourceLocalClassification,
+}
+
+impl SourceClassificationCacheEntry {
+    pub(crate) fn key(&self) -> SourceClassificationCacheKey {
+        SourceClassificationCacheKey {
+            contract_version: self.contract_version.clone(),
+            source_kind: self.source_kind,
+            content_hash: self.content_hash.clone(),
+        }
+    }
+}
+
+fn deserialize_source_classification_cache<'de, D>(
+    deserializer: D,
+) -> Result<Vec<SourceClassificationCacheEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    let mut by_key =
+        BTreeMap::<SourceClassificationCacheKey, Option<SourceClassificationCacheEntry>>::new();
+    for value in values {
+        let Some(key) = source_classification_cache_key_from_value(&value) else {
+            continue;
+        };
+        let entry = serde_json::from_value::<SourceClassificationCacheEntry>(value)
+            .ok()
+            .filter(source_classification_cache_entry_is_valid);
+        match by_key.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                slot.insert(None);
+            }
+        }
+    }
+    Ok(by_key.into_values().flatten().collect())
+}
+
+fn source_classification_cache_key_from_value(
+    value: &Value,
+) -> Option<SourceClassificationCacheKey> {
+    let object = value.as_object()?;
+    let key = SourceClassificationCacheKey {
+        contract_version: object.get("contract_version")?.as_str()?.to_string(),
+        source_kind: serde_json::from_value(object.get("source_kind")?.clone()).ok()?,
+        content_hash: object.get("content_hash")?.as_str()?.to_string(),
+    };
+    source_classification_cache_key_is_valid(&key).then_some(key)
+}
+
+fn source_classification_cache_key_is_valid(key: &SourceClassificationCacheKey) -> bool {
+    !key.contract_version.trim().is_empty()
+        && key.content_hash.len() == 64
+        && key
+            .content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn cache_span_is_structurally_valid(source_kind: UserSourceKind, span: &SourceSpan) -> bool {
+    match (source_kind, span) {
+        (UserSourceKind::Text, SourceSpan::Text { start, end }) => start < end,
+        (UserSourceKind::Image, SourceSpan::Image { reference, .. }) => {
+            !reference.trim().is_empty()
+        }
+        (UserSourceKind::Attachment, SourceSpan::Attachment { reference, .. }) => {
+            !reference.trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn source_classification_cache_entry_is_valid(entry: &SourceClassificationCacheEntry) -> bool {
+    if !source_classification_cache_key_is_valid(&entry.key())
+        || entry.classification.reason.trim().is_empty()
+    {
+        return false;
+    }
+    let spans = &entry.classification.requirement_spans;
+    if spans
+        .iter()
+        .any(|span| !cache_span_is_structurally_valid(entry.source_kind, span))
+        || spans.windows(2).any(|pair| pair[0] >= pair[1])
+        || entry.classification.local_semantic_cues.iter().any(|cue| {
+            cue.source_span
+                .as_ref()
+                .is_some_and(|span| !cache_span_is_structurally_valid(entry.source_kind, span))
+        })
+        || entry
+            .classification
+            .local_semantic_cues
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return false;
+    }
+    matches!(
+        (entry.classification.local_kind, spans.is_empty()),
+        (SourceLocalClassificationKind::RequirementBearing, false)
+            | (SourceLocalClassificationKind::NonRequirement, true)
+            | (SourceLocalClassificationKind::RelationshipOnlyContext, true)
+            | (SourceLocalClassificationKind::UnavailableOrTruncated, true)
+    )
+}
+
+fn canonical_source_classification_cache(
+    entries: Vec<SourceClassificationCacheEntry>,
+) -> Vec<SourceClassificationCacheEntry> {
+    let mut by_key =
+        BTreeMap::<SourceClassificationCacheKey, Option<SourceClassificationCacheEntry>>::new();
+    for entry in entries {
+        let key = entry.key();
+        match by_key.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(source_classification_cache_entry_is_valid(&entry).then_some(entry));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                slot.insert(None);
+            }
+        }
+    }
+    by_key.into_values().flatten().collect()
+}
+
+pub(crate) fn source_classification_cache_key(
+    source: &UserSourceRecord,
+) -> SourceClassificationCacheKey {
+    SourceClassificationCacheKey {
+        contract_version: SOURCE_CLASSIFICATION_CONTRACT_VERSION.to_string(),
+        source_kind: source.source_kind,
+        content_hash: source.content_hash.clone(),
+    }
+}
+
+pub(crate) fn source_local_classification_is_valid_for_source(
+    source: &UserSourceRecord,
+    classification: &SourceLocalClassification,
+) -> bool {
+    let entry = SourceClassificationCacheEntry {
+        contract_version: SOURCE_CLASSIFICATION_CONTRACT_VERSION.to_string(),
+        source_kind: source.source_kind,
+        content_hash: source.content_hash.clone(),
+        classification: classification.clone(),
+    };
+    source_classification_cache_entry_is_valid(&entry)
+        && classification
+            .requirement_spans
+            .iter()
+            .chain(
+                classification
+                    .local_semantic_cues
+                    .iter()
+                    .filter_map(|cue| cue.source_span.as_ref()),
+            )
+            .all(|span| material_for_span(source, span).is_some())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +515,22 @@ pub(crate) struct ClassifiedSource {
     pub(crate) kind: ClassifiedSourceKind,
     pub(crate) requirements: Vec<ClassifiedRequirement>,
     pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceMaterialization {
+    /// Exactly one source-local projection for every unique current cache key.
+    pub(crate) local_classifications:
+        BTreeMap<SourceClassificationCacheKey, SourceLocalClassification>,
+    /// Exactly one occurrence-specific relationship result for every current source.
+    pub(crate) resolved_sources: Vec<ClassifiedSource>,
+}
+
+#[derive(Debug)]
+struct PreparedSourceMaterialization {
+    local_classifications: BTreeMap<SourceClassificationCacheKey, SourceLocalClassification>,
+    requirements: Vec<RequirementRecord>,
+    mappings: Vec<(String, SourceMapping)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +610,177 @@ pub(crate) struct CompletionReviewDispositionReceipt {
     pub(crate) evidence: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RereviewFallbackReason {
+    MissingBaseline,
+    InvalidBaselineHash,
+    InvalidRepairLineage,
+    UnsupportedPathGrammar,
+    InvalidPath,
+    AmbiguousWindowsCase,
+    SymlinkEscape,
+    PathOutsideScope,
+    SourceIdentityChanged,
+    RequirementManifestChanged,
+    PlanStructureChanged,
+    ContractSurfaceOutsideScope,
+    UnattributedMutation,
+    UnrepresentableEvidenceChange,
+    CommandLineageChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RereviewInputMode {
+    Delta,
+    FullFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StructuredContractSurface {
+    pub(crate) kind: String,
+    pub(crate) owner: String,
+    pub(crate) identifier: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum RepairPathScope {
+    ExactFile {
+        path: String,
+    },
+    DirectoryPrefix {
+        path: String,
+    },
+    GeneratedPattern {
+        grammar_version: u32,
+        pattern: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepairPathState {
+    pub(crate) path: String,
+    pub(crate) exists: bool,
+    pub(crate) content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BaselineCommandBinding {
+    pub(crate) sequence: u64,
+    pub(crate) receipt_id: String,
+    pub(crate) implementation_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepairScope {
+    pub(crate) path_grammar_version: u32,
+    pub(crate) paths: Vec<RepairPathScope>,
+    pub(crate) surfaces: Vec<StructuredContractSurface>,
+    pub(crate) affected_requirement_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepairBaseline {
+    pub(crate) path_states: Vec<RepairPathState>,
+    pub(crate) command_sequence_high_water_mark: u64,
+    pub(crate) command_bindings: Vec<BaselineCommandBinding>,
+    pub(crate) implementation_surfaces: Vec<StructuredContractSurface>,
+    pub(crate) repair_scope: RepairScope,
+    pub(crate) source_ledger_hash: String,
+    pub(crate) requirement_manifest_hash: String,
+    pub(crate) plan_structure_hash: String,
+    pub(crate) default_child_mutation_identities: Vec<String>,
+    pub(crate) typed_mutation_identities: Vec<String>,
+    pub(crate) external_evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RepairPathChangeKind {
+    Added,
+    Modified,
+    Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepairPathChange {
+    pub(crate) path: String,
+    pub(crate) change: RepairPathChangeKind,
+    pub(crate) before_exists: bool,
+    pub(crate) before_hash: Option<String>,
+    pub(crate) after_exists: bool,
+    pub(crate) after_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepairCommandDelta {
+    pub(crate) sequence: u64,
+    pub(crate) receipt_id: String,
+    pub(crate) command: String,
+    pub(crate) cwd: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) timed_out: bool,
+    pub(crate) implementation_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InvalidatedCommandReceipt {
+    pub(crate) sequence: u64,
+    pub(crate) receipt_id: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepairDelta {
+    pub(crate) original_findings: Vec<CompletionReviewFindingReceipt>,
+    pub(crate) required_disposition_finding_ids: Vec<String>,
+    pub(crate) repair_instruction_hash: String,
+    pub(crate) baseline_hash: String,
+    pub(crate) candidate_implementation_identity: String,
+    pub(crate) path_changes: Vec<RepairPathChange>,
+    pub(crate) new_command_receipts: Vec<RepairCommandDelta>,
+    pub(crate) invalidated_command_receipts: Vec<InvalidatedCommandReceipt>,
+    pub(crate) affected_requirement_ids: Vec<String>,
+    pub(crate) newly_realized_surfaces: Vec<StructuredContractSurface>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RereviewInput {
+    pub(crate) input_mode: RereviewInputMode,
+    pub(crate) baseline_hash: Option<String>,
+    pub(crate) delta_hash: Option<String>,
+    pub(crate) fallback_reasons: Vec<RereviewFallbackReason>,
+    pub(crate) repair_instruction_hash: String,
+    pub(crate) candidate_implementation_identity: String,
+    pub(crate) delta: Option<RepairDelta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentRepairSnapshot {
+    pub(crate) repository_root: String,
+    pub(crate) path_states: Vec<RepairPathState>,
+    pub(crate) command_receipts: Vec<RepairCommandDelta>,
+    pub(crate) plan_structure_hash: String,
+    pub(crate) declared_path_scopes: Vec<RepairPathScope>,
+    pub(crate) implementation_surfaces: Vec<StructuredContractSurface>,
+    pub(crate) default_child_mutation_identities: Vec<String>,
+    pub(crate) typed_mutation_identities: Vec<String>,
+    pub(crate) external_evidence_ids: Vec<String>,
+    pub(crate) containment_errors: Vec<RereviewFallbackReason>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CompletionReviewReceiptV2 {
     review_id: String,
@@ -390,6 +798,22 @@ struct CompletionReviewReceiptV2 {
     #[serde(default)]
     manifest_gaps: Vec<ManifestGapInput>,
     repair_instruction_hash: Option<String>,
+    #[serde(default)]
+    repair_baseline: Option<RepairBaseline>,
+    #[serde(default)]
+    baseline_hash: Option<String>,
+    #[serde(default)]
+    input_mode: Option<RereviewInputMode>,
+    #[serde(default)]
+    delta_hash: Option<String>,
+    #[serde(default)]
+    rereview_delta: Option<RepairDelta>,
+    #[serde(default)]
+    fallback_reasons: Vec<RereviewFallbackReason>,
+    #[serde(default)]
+    candidate_implementation_identity: Option<String>,
+    #[serde(default)]
+    rereview_audit_hash: Option<String>,
     infrastructure_outcome: String,
     review_clean: bool,
     terminal_outcome: Option<String>,
@@ -443,6 +867,10 @@ pub(crate) struct CompletionReviewDossier {
     pub(crate) manifest_revision: u64,
     pub(crate) sources: Vec<UserSourceRecord>,
     pub(crate) source_mappings: BTreeMap<String, SourceMapping>,
+    pub(crate) source_classification_cache:
+        BTreeMap<SourceClassificationCacheKey, SourceLocalClassification>,
+    pub(crate) source_classification_current: bool,
+    pub(crate) relationship_resolution_current: bool,
     pub(crate) mappings_classified: bool,
     pub(crate) source_capture_failed: bool,
     pub(crate) requirements: Vec<RequirementRecord>,
@@ -455,6 +883,7 @@ pub(crate) struct CompletionReviewDossier {
     pub(crate) evidence_gate: TaskCompletionGate,
     pub(crate) locally_obtainable_proof_routes: Vec<String>,
     pub(crate) reviewer_visible_evidence: Value,
+    pub(crate) review_lens_selection_facts: ReviewLensSelectionFacts,
     pub(crate) authoritative_input_errors: Vec<String>,
     pub(crate) typed_quiescent: bool,
     pub(crate) default_children_quiescent: bool,
@@ -469,6 +898,24 @@ pub(crate) struct CompletionReviewDossier {
     pub(crate) initial_repair_instruction_hash: Option<String>,
     pub(crate) original_findings: Vec<CompletionReviewFindingReceipt>,
     pub(crate) manifest_gap_reconstructed: bool,
+    pub(crate) current_repair_snapshot: CurrentRepairSnapshot,
+    pub(crate) initial_repair_baseline: Option<RepairBaseline>,
+    pub(crate) initial_repair_baseline_hash: Option<String>,
+    pub(crate) rereview_input: Option<RereviewInput>,
+}
+
+/// Validated structured facts that the completion-review host may use to select
+/// applicable review lenses. Free-form review material is intentionally absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReviewLensSelectionFacts {
+    pub(crate) risk_hints: Vec<String>,
+    pub(crate) task_mutation_paths: Vec<String>,
+    pub(crate) child_mutation_paths: Vec<String>,
+    pub(crate) plan_edit_paths: Vec<String>,
+    pub(crate) plan_runtime_paths: Vec<String>,
+    pub(crate) surface_roles: Vec<String>,
+    pub(crate) validation_asset_paths: Vec<String>,
+    pub(crate) generated_artifacts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -815,6 +1262,7 @@ impl TaskEvidenceLedger {
                 next_external_evidence_receipt_sequence: initial_receipt_sequence(),
                 host_mutation_revision: 0,
                 completion_review_v2: Some(new_completion_review_ledger(&thread_id_text)),
+                source_classification_cache: Vec::new(),
                 completion: None,
             }
         };
@@ -1191,6 +1639,8 @@ impl TaskEvidenceLedger {
                             completion_epoch: ledger.completion_epoch,
                             manifest_revision,
                             source_id,
+                            source_classification_contract_version: None,
+                            relationship_resolver_contract_version: None,
                             mapping,
                         });
                     }
@@ -1704,6 +2154,7 @@ impl TaskEvidenceLedger {
         candidate_completion: Option<&str>,
         typed_mutation_identities: &[String],
         typed_evidence: &[String],
+        authoritative_lens_facts: &ReviewLensSelectionFacts,
         authoritative_input_errors: &[String],
         typed_quiescent: bool,
         default_children_quiescent: bool,
@@ -1724,6 +2175,10 @@ impl TaskEvidenceLedger {
             manifest_revision,
             sources,
             source_mappings,
+            source_classification_cache,
+            source_classification_current,
+            relationship_resolution_current,
+            mappings_classified,
             requirements,
             user_source_ledger_hash,
             requirement_manifest_hash,
@@ -1734,6 +2189,7 @@ impl TaskEvidenceLedger {
             evidence_gate,
             locally_obtainable_proof_routes,
             reviewer_visible_evidence,
+            review_lens_selection_facts,
             correction_consumed,
             cycle_phase,
             active_cycle_id,
@@ -1744,6 +2200,9 @@ impl TaskEvidenceLedger {
             initial_repair_instruction_hash,
             original_findings,
             manifest_gap_reconstructed,
+            current_repair_snapshot,
+            initial_repair_baseline,
+            initial_repair_baseline_hash,
         ) = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
@@ -1755,7 +2214,41 @@ impl TaskEvidenceLedger {
                 .cloned()
                 .collect::<Vec<_>>();
             sources.sort_by_key(|source| (source.source_ordinal, source.content_ordinal));
-            let source_mappings = active_source_mappings(ledger);
+            let source_mapping_revisions = source_mapping_revisions_for(
+                ledger,
+                ledger.completion_epoch,
+                ledger.manifest_revision,
+            );
+            let source_mappings = source_mapping_revisions
+                .iter()
+                .map(|(source_id, revision)| (source_id.clone(), revision.mapping.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let source_classification_current = sources.iter().all(|source| {
+                source_mapping_revisions
+                    .get(&source.source_id)
+                    .is_some_and(|revision| {
+                        revision.source_classification_contract_version.as_deref()
+                            == Some(SOURCE_CLASSIFICATION_CONTRACT_VERSION)
+                            && !matches!(revision.mapping, SourceMapping::PendingClassification)
+                    })
+            });
+            let relationship_resolution_current = sources.iter().all(|source| {
+                source_mapping_revisions
+                    .get(&source.source_id)
+                    .is_some_and(|revision| {
+                        revision.relationship_resolver_contract_version.as_deref()
+                            == Some(RELATIONSHIP_RESOLVER_CONTRACT_VERSION)
+                            && !matches!(revision.mapping, SourceMapping::PendingClassification)
+                    })
+            });
+            let mappings_classified =
+                source_classification_current && relationship_resolution_current;
+            let source_classification_cache = document
+                .source_classification_cache
+                .iter()
+                .filter(|entry| entry.contract_version == SOURCE_CLASSIFICATION_CONTRACT_VERSION)
+                .map(|entry| (entry.key(), entry.classification.clone()))
+                .collect::<BTreeMap<_, _>>();
             let requirements = active_manifest(ledger)
                 .map(|manifest| manifest.requirements.clone())
                 .unwrap_or_default();
@@ -1767,6 +2260,62 @@ impl TaskEvidenceLedger {
             );
             let requirement_manifest_hash =
                 requirement_manifest_hash(ledger.manifest_revision, &requirements);
+            let mut review_lens_selection_facts = authoritative_lens_facts.clone();
+            review_lens_selection_facts.task_mutation_paths.extend(
+                document
+                    .latest_file_hashes
+                    .values()
+                    .map(|snapshot| snapshot.path.clone()),
+            );
+            review_lens_selection_facts.child_mutation_paths.extend(
+                ledger
+                    .attributed_workspace_events
+                    .iter()
+                    .flat_map(|event| event.paths.iter().cloned()),
+            );
+            review_lens_selection_facts.plan_edit_paths.extend(
+                document
+                    .plan
+                    .iter()
+                    .flat_map(|step| step.edit_paths.iter().cloned()),
+            );
+            review_lens_selection_facts.plan_runtime_paths.extend(
+                document
+                    .plan
+                    .iter()
+                    .flat_map(|step| step.runtime_paths.iter().cloned()),
+            );
+            review_lens_selection_facts.risk_hints.extend(
+                document
+                    .plan
+                    .iter()
+                    .flat_map(|step| step.risks.iter().cloned()),
+            );
+            review_lens_selection_facts.generated_artifacts.extend(
+                document
+                    .plan
+                    .iter()
+                    .flat_map(|step| step.generated_artifacts.iter().cloned()),
+            );
+            review_lens_selection_facts.generated_artifacts.extend(
+                document
+                    .generated_artifact_requirements
+                    .iter()
+                    .filter_map(|artifact| artifact.path.clone()),
+            );
+            for values in [
+                &mut review_lens_selection_facts.risk_hints,
+                &mut review_lens_selection_facts.task_mutation_paths,
+                &mut review_lens_selection_facts.child_mutation_paths,
+                &mut review_lens_selection_facts.plan_edit_paths,
+                &mut review_lens_selection_facts.plan_runtime_paths,
+                &mut review_lens_selection_facts.surface_roles,
+                &mut review_lens_selection_facts.validation_asset_paths,
+                &mut review_lens_selection_facts.generated_artifacts,
+            ] {
+                values.sort();
+                values.dedup();
+            }
             let mut typed_mutation_identities = typed_mutation_identities.to_vec();
             typed_mutation_identities.sort();
             typed_mutation_identities.dedup();
@@ -1921,6 +2470,8 @@ impl TaskEvidenceLedger {
                 &reviewer_visible_evidence,
             );
             let cycle = ledger.active_review_cycle.as_ref();
+            let current_repair_snapshot =
+                current_repair_snapshot(document, &typed_mutation_identities);
             let initial_receipt = cycle.and_then(|cycle| {
                 if matches!(
                     cycle.phase,
@@ -1952,6 +2503,10 @@ impl TaskEvidenceLedger {
                 ledger.manifest_revision,
                 sources,
                 source_mappings,
+                source_classification_cache,
+                source_classification_current,
+                relationship_resolution_current,
+                mappings_classified,
                 requirements,
                 user_source_ledger_hash,
                 requirement_manifest_hash,
@@ -1962,6 +2517,7 @@ impl TaskEvidenceLedger {
                 evidence_gate,
                 locally_obtainable_proof_routes,
                 reviewer_visible_evidence,
+                review_lens_selection_facts,
                 cycle.is_some_and(|cycle| cycle.correction_consumed),
                 cycle.map(|cycle| cycle.phase),
                 cycle.map(|cycle| cycle.cycle_id.clone()),
@@ -1974,13 +2530,21 @@ impl TaskEvidenceLedger {
                     .map(|receipt| receipt.findings.clone())
                     .unwrap_or_default(),
                 cycle.is_some_and(|cycle| cycle.manifest_gap_reconstructed),
+                current_repair_snapshot,
+                initial_receipt.and_then(|receipt| receipt.repair_baseline.clone()),
+                initial_receipt.and_then(|receipt| receipt.baseline_hash.clone()),
             )
         };
-        let mappings_classified = sources.iter().all(|source| {
-            source_mappings
-                .get(&source.source_id)
-                .is_some_and(|mapping| !matches!(mapping, SourceMapping::PendingClassification))
-        });
+        let rereview_input = build_rereview_input(
+            initial_repair_baseline.as_ref(),
+            initial_repair_baseline_hash.as_deref(),
+            initial_repair_instruction_hash.as_deref(),
+            &original_findings,
+            &current_repair_snapshot,
+            &implementation_identity_hash,
+            &user_source_ledger_hash,
+            &requirement_manifest_hash,
+        );
         Some(CompletionReviewDossier {
             document_revision,
             root_task_id,
@@ -1988,6 +2552,9 @@ impl TaskEvidenceLedger {
             manifest_revision,
             sources,
             source_mappings,
+            source_classification_cache,
+            source_classification_current,
+            relationship_resolution_current,
             mappings_classified,
             source_capture_failed,
             requirements,
@@ -2000,6 +2567,7 @@ impl TaskEvidenceLedger {
             evidence_gate,
             locally_obtainable_proof_routes,
             reviewer_visible_evidence,
+            review_lens_selection_facts,
             authoritative_input_errors,
             typed_quiescent,
             default_children_quiescent,
@@ -2014,6 +2582,10 @@ impl TaskEvidenceLedger {
             initial_repair_instruction_hash,
             original_findings,
             manifest_gap_reconstructed,
+            current_repair_snapshot,
+            initial_repair_baseline,
+            initial_repair_baseline_hash,
+            rereview_input,
         })
     }
 
@@ -2091,17 +2663,47 @@ impl TaskEvidenceLedger {
         dossier: &CompletionReviewDossier,
         input: CompletionReviewAttemptInput,
     ) -> AtomicReviewTransition<RecordedReviewAttempt> {
+        self.record_completion_review_attempt_v2_inner(dossier, input, None)
+            .await
+    }
+
+    pub(crate) async fn record_completion_review_attempt_v2_with_materialization(
+        &self,
+        dossier: &CompletionReviewDossier,
+        input: CompletionReviewAttemptInput,
+        materialization: SourceMaterialization,
+    ) -> AtomicReviewTransition<RecordedReviewAttempt> {
+        self.record_completion_review_attempt_v2_inner(dossier, input, Some(materialization))
+            .await
+    }
+
+    async fn record_completion_review_attempt_v2_inner(
+        &self,
+        dossier: &CompletionReviewDossier,
+        input: CompletionReviewAttemptInput,
+        gap_materialization: Option<SourceMaterialization>,
+    ) -> AtomicReviewTransition<RecordedReviewAttempt> {
         if input.attempt_kind == CompletionReviewAttemptKind::TerminalClosure {
             return AtomicReviewTransition::Failed;
         }
         let reconstruct_manifest = !input.manifest_gaps.is_empty();
-        let gap_additions = if reconstruct_manifest {
-            let Some(additions) = manifest_gap_additions(dossier, &input.manifest_gaps) else {
-                return AtomicReviewTransition::Failed;
-            };
-            Some(additions)
-        } else {
-            None
+        let prepared_gap_materialization = match (reconstruct_manifest, gap_materialization) {
+            (true, Some(materialization)) => {
+                let Some(prepared) = prepare_source_materialization(dossier, materialization)
+                else {
+                    return AtomicReviewTransition::Failed;
+                };
+                if !prepared_materialization_covers_manifest_gaps(
+                    dossier,
+                    &input.manifest_gaps,
+                    &prepared,
+                ) {
+                    return AtomicReviewTransition::Failed;
+                }
+                Some(prepared)
+            }
+            (false, None) => None,
+            _ => return AtomicReviewTransition::Failed,
         };
         let expected_ordinals = (1..=input.findings.len() as u32).collect::<Vec<_>>();
         let ordinals = input
@@ -2121,7 +2723,6 @@ impl TaskEvidenceLedger {
             || (reconstruct_manifest
                 && (input.review_clean
                     || input.repair_instruction.is_some()
-                    || input.repair_instruction_hash.is_some()
                     || input.infrastructure_outcome != "ok"
                     || input.terminal_outcome.is_some()))
             || input.infrastructure_outcome.trim().is_empty()
@@ -2159,11 +2760,11 @@ impl TaskEvidenceLedger {
                 .iter()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>();
-            finding.requirement_ids.is_empty()
-                || unique_requirement_ids.len() != finding.requirement_ids.len()
-                || !unique_requirement_ids
-                    .iter()
-                    .any(|requirement_id| active_requirement_ids.contains(requirement_id))
+            unique_requirement_ids.len() != finding.requirement_ids.len()
+                || (!unique_requirement_ids.is_empty()
+                    && !unique_requirement_ids
+                        .iter()
+                        .any(|requirement_id| active_requirement_ids.contains(requirement_id)))
                 || finding
                     .requirement_ids
                     .iter()
@@ -2191,8 +2792,9 @@ impl TaskEvidenceLedger {
         }) {
             return AtomicReviewTransition::Failed;
         }
-        let needs_correction =
-            input.repair_instruction.is_some() || input.repair_instruction_hash.is_some();
+        let needs_correction = input.repair_instruction.is_some()
+            || (input.attempt_kind == CompletionReviewAttemptKind::CorrectionEvidence
+                && input.repair_instruction_hash.is_some());
         {
             let guard = self.document.lock().await;
             let Some(document) = guard.as_ref() else {
@@ -2236,7 +2838,8 @@ impl TaskEvidenceLedger {
                         && cycle.correction_consumed
                         && input.superseded_review_id.is_none()
                         && input.parent_review_id == dossier.initial_review_id
-                        && !needs_correction
+                        && input.repair_instruction_hash == dossier.initial_repair_instruction_hash
+                        && input.repair_instruction.is_none()
                 }
                 CompletionReviewAttemptKind::TerminalClosure => false,
             };
@@ -2284,6 +2887,80 @@ impl TaskEvidenceLedger {
                 ))
             },
         );
+        let repair_baseline_metadata = if input.attempt_kind
+            == CompletionReviewAttemptKind::InitialReview
+            && input.repair_instruction.is_some()
+        {
+            let preview_findings = input
+                .findings
+                .iter()
+                .map(|finding| CompletionReviewFindingReceipt {
+                    finding_id: format!("preview/F{}", finding.local_ordinal),
+                    requirement_ids: finding.requirement_ids.clone(),
+                    lens: finding.lens.clone(),
+                    contract_surface: finding.contract_surface.clone(),
+                    severity: finding.severity.clone(),
+                    evidence: finding.evidence.clone(),
+                    smallest_correction: finding.smallest_correction.clone(),
+                    proof_route: finding.proof_route.clone(),
+                })
+                .collect::<Vec<_>>();
+            let Ok(baseline) = build_repair_baseline(dossier, &preview_findings) else {
+                return AtomicReviewTransition::Failed;
+            };
+            let baseline_hash = repair_baseline_hash(&baseline);
+            if !input
+                .repair_instruction
+                .as_deref()
+                .is_some_and(|instruction| {
+                    repair_instruction_matches_baseline(instruction, &baseline, &baseline_hash)
+                })
+            {
+                return AtomicReviewTransition::Failed;
+            }
+            Some((baseline, baseline_hash))
+        } else {
+            None
+        };
+        let rereview_metadata = if input.attempt_kind == CompletionReviewAttemptKind::Rereview {
+            let Some(rereview_input) = dossier.rereview_input.as_ref() else {
+                return AtomicReviewTransition::Failed;
+            };
+            if !validate_rereview_input(rereview_input, dossier) {
+                return AtomicReviewTransition::Failed;
+            }
+            Some(rereview_input.clone())
+        } else {
+            None
+        };
+        let persisted_repair_baseline = repair_baseline_metadata
+            .as_ref()
+            .map(|(baseline, _)| baseline.clone());
+        let persisted_baseline_hash = rereview_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.baseline_hash.clone())
+            .or_else(|| {
+                repair_baseline_metadata
+                    .as_ref()
+                    .map(|(_, hash)| hash.clone())
+            });
+        let persisted_input_mode = rereview_metadata
+            .as_ref()
+            .map(|metadata| metadata.input_mode);
+        let persisted_delta_hash = rereview_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.delta_hash.clone());
+        let persisted_rereview_delta = rereview_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.delta.clone());
+        let persisted_fallback_reasons = rereview_metadata
+            .as_ref()
+            .map(|metadata| metadata.fallback_reasons.clone())
+            .unwrap_or_default();
+        let persisted_candidate_identity = rereview_metadata
+            .as_ref()
+            .map(|metadata| metadata.candidate_implementation_identity.clone());
+        let persisted_rereview_audit_hash = rereview_metadata.as_ref().map(rereview_audit_hash);
         let attempt_kind = input.attempt_kind;
         let parent_review_id = input.parent_review_id.clone();
         let superseded_review_id = input.superseded_review_id.clone();
@@ -2296,7 +2973,58 @@ impl TaskEvidenceLedger {
             .evidence_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
+        {
+            let guard = self.document.lock().await;
+            let Some(document) = guard.as_ref() else {
+                return AtomicReviewTransition::Failed;
+            };
+            if document.revision != dossier.document_revision {
+                return AtomicReviewTransition::Superseded;
+            }
+            let Some(ledger) = document.completion_review_v2.as_ref() else {
+                return AtomicReviewTransition::Failed;
+            };
+            if !dossier_sources_are_current(ledger, &dossier.sources) {
+                return AtomicReviewTransition::Failed;
+            }
+        }
+        let mut gap_persistence = prepared_gap_materialization.map(|prepared| {
+            let PreparedSourceMaterialization {
+                local_classifications,
+                requirements,
+                mappings,
+            } = prepared;
+            let replacement_cache_keys = local_classifications
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let replacement_cache_entries = local_classifications
+                .into_iter()
+                .map(|(key, classification)| SourceClassificationCacheEntry {
+                    contract_version: key.contract_version,
+                    source_kind: key.source_kind,
+                    content_hash: key.content_hash,
+                    classification,
+                })
+                .collect::<Vec<_>>();
+            (
+                replacement_cache_keys,
+                replacement_cache_entries,
+                requirements,
+                mappings,
+            )
+        });
         self.atomic_review_update(dossier.document_revision, None, None, move |document| {
+            if let Some((replacement_cache_keys, replacement_cache_entries, _, _)) =
+                gap_persistence.as_mut()
+            {
+                document
+                    .source_classification_cache
+                    .retain(|entry| !replacement_cache_keys.contains(&entry.key()));
+                document
+                    .source_classification_cache
+                    .append(replacement_cache_entries);
+            }
             let Some(ledger) = document.completion_review_v2.as_mut() else {
                 unreachable!("V2 dossier requires a V2 ledger");
             };
@@ -2334,6 +3062,14 @@ impl TaskEvidenceLedger {
                 dispositions,
                 manifest_gaps: manifest_gaps.clone(),
                 repair_instruction_hash,
+                repair_baseline: persisted_repair_baseline,
+                baseline_hash: persisted_baseline_hash,
+                input_mode: persisted_input_mode,
+                delta_hash: persisted_delta_hash,
+                rereview_delta: persisted_rereview_delta,
+                fallback_reasons: persisted_fallback_reasons,
+                candidate_implementation_identity: persisted_candidate_identity,
+                rereview_audit_hash: persisted_rereview_audit_hash,
                 infrastructure_outcome,
                 review_clean,
                 terminal_outcome: None,
@@ -2360,6 +3096,14 @@ impl TaskEvidenceLedger {
                     dispositions: Vec::new(),
                     manifest_gaps: Vec::new(),
                     repair_instruction_hash: None,
+                    repair_baseline: None,
+                    baseline_hash: None,
+                    input_mode: None,
+                    delta_hash: None,
+                    rereview_delta: None,
+                    fallback_reasons: Vec::new(),
+                    candidate_implementation_identity: None,
+                    rereview_audit_hash: None,
                     infrastructure_outcome: "ok".to_string(),
                     review_clean: false,
                     terminal_outcome: Some(outcome.to_string()),
@@ -2368,43 +3112,21 @@ impl TaskEvidenceLedger {
                 terminal_review_id
             });
             if reconstruct_manifest {
-                let previous_mappings = active_source_mappings(ledger);
-                let mut requirements = active_manifest(ledger)
-                    .map(|manifest| manifest.requirements.clone())
-                    .unwrap_or_default();
-                requirements.extend(gap_additions.unwrap_or_default());
-                requirements.sort_by(|left, right| left.requirement_id.cmp(&right.requirement_id));
-                let requirement_ids_by_source = requirements.iter().fold(
-                    BTreeMap::<String, Vec<String>>::new(),
-                    |mut by_source, requirement| {
-                        by_source
-                            .entry(requirement.source_id.clone())
-                            .or_default()
-                            .push(requirement.requirement_id.clone());
-                        by_source
-                    },
-                );
+                let Some((_, _, requirements, mappings)) = gap_persistence.take() else {
+                    unreachable!("manifest-gap reconstruction requires a prepared materialization");
+                };
                 let new_revision = ledger.manifest_revision.saturating_add(1);
-                for source in ledger
-                    .source_records
-                    .values()
-                    .filter(|source| source.completion_epoch == ledger.completion_epoch)
-                {
-                    let mapping = match requirement_ids_by_source.get(&source.source_id) {
-                        Some(requirement_ids) => {
-                            let mut requirement_ids = requirement_ids.clone();
-                            requirement_ids.sort();
-                            SourceMapping::RequirementBearing { requirement_ids }
-                        }
-                        None => previous_mappings
-                            .get(&source.source_id)
-                            .cloned()
-                            .unwrap_or(SourceMapping::PendingClassification),
-                    };
+                for (source_id, mapping) in mappings {
                     ledger.mapping_revisions.push(SourceMappingRevision {
                         completion_epoch: ledger.completion_epoch,
                         manifest_revision: new_revision,
-                        source_id: source.source_id.clone(),
+                        source_id,
+                        source_classification_contract_version: Some(
+                            SOURCE_CLASSIFICATION_CONTRACT_VERSION.to_string(),
+                        ),
+                        relationship_resolver_contract_version: Some(
+                            RELATIONSHIP_RESOLVER_CONTRACT_VERSION.to_string(),
+                        ),
                         mapping,
                     });
                 }
@@ -2629,6 +3351,14 @@ impl TaskEvidenceLedger {
                         dispositions: Vec::new(),
                         manifest_gaps: Vec::new(),
                         repair_instruction_hash: None,
+                        repair_baseline: None,
+                        baseline_hash: None,
+                        input_mode: None,
+                        delta_hash: None,
+                        rereview_delta: None,
+                        fallback_reasons: Vec::new(),
+                        candidate_implementation_identity: None,
+                        rereview_audit_hash: None,
                         infrastructure_outcome: "ok".to_string(),
                         review_clean: true,
                         terminal_outcome: Some("passed".to_string()),
@@ -2852,6 +3582,14 @@ impl TaskEvidenceLedger {
                 dispositions: Vec::new(),
                 manifest_gaps: Vec::new(),
                 repair_instruction_hash: None,
+                repair_baseline: None,
+                baseline_hash: None,
+                input_mode: None,
+                delta_hash: None,
+                rereview_delta: None,
+                fallback_reasons: Vec::new(),
+                candidate_implementation_identity: None,
+                rereview_audit_hash: None,
                 infrastructure_outcome: format!("terminal_emission_failure:{reason}"),
                 review_clean: false,
                 terminal_outcome: Some("partial".to_string()),
@@ -2881,161 +3619,53 @@ impl TaskEvidenceLedger {
     pub(crate) async fn apply_source_classification(
         &self,
         dossier: &CompletionReviewDossier,
-        classifications: Vec<ClassifiedSource>,
+        materialization: SourceMaterialization,
     ) -> AtomicReviewTransition<()> {
-        let expected_ids = dossier
-            .sources
-            .iter()
-            .map(|source| source.source_id.clone())
+        let Some(prepared) = prepare_source_materialization(dossier, materialization) else {
+            return AtomicReviewTransition::Failed;
+        };
+        let PreparedSourceMaterialization {
+            local_classifications,
+            requirements,
+            mappings,
+        } = prepared;
+        {
+            let guard = self.document.lock().await;
+            let Some(document) = guard.as_ref() else {
+                return AtomicReviewTransition::Failed;
+            };
+            if document.revision != dossier.document_revision {
+                return AtomicReviewTransition::Superseded;
+            }
+            let Some(ledger) = document.completion_review_v2.as_ref() else {
+                return AtomicReviewTransition::Failed;
+            };
+            if !dossier_sources_are_current(ledger, &dossier.sources) {
+                return AtomicReviewTransition::Failed;
+            }
+        }
+        let replacement_cache_keys = local_classifications
+            .keys()
+            .cloned()
             .collect::<BTreeSet<_>>();
-        let returned_ids = classifications
-            .iter()
-            .map(|classification| classification.source_id.clone())
-            .collect::<BTreeSet<_>>();
-        if expected_ids.len() != classifications.len() || expected_ids != returned_ids {
-            return AtomicReviewTransition::Failed;
-        }
-        let sources = dossier
-            .sources
-            .iter()
-            .map(|source| (source.source_id.clone(), source.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut requirement_ids = BTreeMap::<ClassifiedRequirementRef, String>::new();
-        for classification in &classifications {
-            let Some(source) = sources.get(&classification.source_id) else {
-                return AtomicReviewTransition::Failed;
-            };
-            let valid_shape = match classification.kind {
-                ClassifiedSourceKind::RequirementBearing => !classification.requirements.is_empty(),
-                ClassifiedSourceKind::NonRequirement | ClassifiedSourceKind::SupersededContext => {
-                    classification.requirements.is_empty()
-                        && classification
-                            .reason
-                            .as_deref()
-                            .is_some_and(|reason| !reason.trim().is_empty())
-                }
-                ClassifiedSourceKind::UnavailableOrTruncated => {
-                    classification.requirements.is_empty()
-                }
-            };
-            if !valid_shape {
-                return AtomicReviewTransition::Failed;
-            }
-            for requirement in &classification.requirements {
-                if material_for_span(source, &requirement.source_span).is_none() {
-                    return AtomicReviewTransition::Failed;
-                }
-                let reference = ClassifiedRequirementRef {
-                    source_id: source.source_id.clone(),
-                    source_span: requirement.source_span.clone(),
-                };
-                let requirement_id = deterministic_requirement_id(source, &requirement.source_span);
-                if requirement_ids.insert(reference, requirement_id).is_some() {
-                    return AtomicReviewTransition::Failed;
-                }
-            }
-        }
-        if classifications.iter().any(|classification| {
-            classification
-                .requirements
-                .iter()
-                .any(|requirement| match requirement.status {
-                    RequirementStatus::Active | RequirementStatus::Withdrawn => {
-                        requirement.superseded_by.is_some()
-                    }
-                    RequirementStatus::Superseded => requirement
-                        .superseded_by
-                        .as_ref()
-                        .is_none_or(|reference| !requirement_ids.contains_key(reference)),
-                })
-        }) {
-            return AtomicReviewTransition::Failed;
-        }
-
-        let mut requirements = Vec::new();
-        let mut mappings = Vec::new();
-        for classification in classifications {
-            let Some(source) = sources.get(&classification.source_id) else {
-                return AtomicReviewTransition::Failed;
-            };
-            let mut mapped_requirement_ids = Vec::new();
-            for requirement in classification.requirements {
-                let reference = ClassifiedRequirementRef {
-                    source_id: source.source_id.clone(),
-                    source_span: requirement.source_span.clone(),
-                };
-                let Some(requirement_id) = requirement_ids.get(&reference).cloned() else {
-                    return AtomicReviewTransition::Failed;
-                };
-                let Some(exact_material) = material_for_span(source, &requirement.source_span)
-                else {
-                    return AtomicReviewTransition::Failed;
-                };
-                mapped_requirement_ids.push(requirement_id.clone());
-                requirements.push(RequirementRecord {
-                    requirement_id,
-                    source_id: source.source_id.clone(),
-                    source_content_hash: source.content_hash.clone(),
-                    exact_material,
-                    source_span: requirement.source_span,
-                    status: requirement.status,
-                    superseded_by: requirement
-                        .superseded_by
-                        .as_ref()
-                        .and_then(|reference| requirement_ids.get(reference))
-                        .cloned(),
-                });
-            }
-            mapped_requirement_ids.sort();
-            let mapping = match classification.kind {
-                ClassifiedSourceKind::RequirementBearing => SourceMapping::RequirementBearing {
-                    requirement_ids: mapped_requirement_ids,
-                },
-                ClassifiedSourceKind::NonRequirement => SourceMapping::NonRequirement {
-                    reason: classification.reason.unwrap_or_default(),
-                },
-                ClassifiedSourceKind::SupersededContext => SourceMapping::SupersededContext {
-                    reason: classification.reason.unwrap_or_default(),
-                },
-                ClassifiedSourceKind::UnavailableOrTruncated => {
-                    SourceMapping::UnavailableOrTruncated
-                }
-            };
-            mappings.push((source.source_id.clone(), mapping));
-        }
-        requirements.sort_by(|left, right| left.requirement_id.cmp(&right.requirement_id));
-        if !requirement_supersession_is_acyclic(&requirements) {
-            return AtomicReviewTransition::Failed;
-        }
-        let next_requirements = requirements
-            .iter()
-            .map(|requirement| (requirement.requirement_id.as_str(), requirement))
-            .collect::<BTreeMap<_, _>>();
-        for previous in &dossier.requirements {
-            let Some(next) = next_requirements.get(previous.requirement_id.as_str()) else {
-                return AtomicReviewTransition::Failed;
-            };
-            if next.source_id != previous.source_id
-                || next.source_content_hash != previous.source_content_hash
-                || next.source_span != previous.source_span
-                || next.exact_material != previous.exact_material
-                || match previous.status {
-                    RequirementStatus::Active => false,
-                    RequirementStatus::Superseded => {
-                        next.status != RequirementStatus::Superseded
-                            || next.superseded_by != previous.superseded_by
-                    }
-                    RequirementStatus::Withdrawn => {
-                        next.status != RequirementStatus::Withdrawn || next.superseded_by.is_some()
-                    }
-                }
-            {
-                return AtomicReviewTransition::Failed;
-            }
-        }
+        let replacement_cache_entries = local_classifications
+            .into_iter()
+            .map(|(key, classification)| SourceClassificationCacheEntry {
+                contract_version: key.contract_version,
+                source_kind: key.source_kind,
+                content_hash: key.content_hash,
+                classification,
+            })
+            .collect::<Vec<_>>();
         let classified_manifest_revision = dossier.manifest_revision.saturating_add(1);
         let manifest_hash = requirement_manifest_hash(classified_manifest_revision, &requirements);
         self.atomic_review_update(dossier.document_revision, None, None, move |document| {
+            document
+                .source_classification_cache
+                .retain(|entry| !replacement_cache_keys.contains(&entry.key()));
+            document
+                .source_classification_cache
+                .extend(replacement_cache_entries);
             let Some(ledger) = document.completion_review_v2.as_mut() else {
                 return;
             };
@@ -3048,6 +3678,12 @@ impl TaskEvidenceLedger {
                             completion_epoch: ledger.completion_epoch,
                             manifest_revision: classified_manifest_revision,
                             source_id,
+                            source_classification_contract_version: Some(
+                                SOURCE_CLASSIFICATION_CONTRACT_VERSION.to_string(),
+                            ),
+                            relationship_resolver_contract_version: Some(
+                                RELATIONSHIP_RESOLVER_CONTRACT_VERSION.to_string(),
+                            ),
                             mapping,
                         }),
                 );
@@ -3950,6 +4586,9 @@ impl TaskEvidenceLedger {
         let mut candidate = document.clone();
         let result = update(&mut candidate);
         candidate.schema_version = TASK_EVIDENCE_SCHEMA_VERSION;
+        candidate.source_classification_cache = canonical_source_classification_cache(
+            std::mem::take(&mut candidate.source_classification_cache),
+        );
         candidate.revision = candidate.revision.saturating_add(1);
         let bytes = match serde_json::to_vec_pretty(&candidate) {
             Ok(bytes) => bytes,
@@ -4135,7 +4774,7 @@ async fn file_backed_source_material(
     }
 }
 
-fn material_for_span(source: &UserSourceRecord, span: &SourceSpan) -> Option<String> {
+pub(crate) fn material_for_span(source: &UserSourceRecord, span: &SourceSpan) -> Option<String> {
     match (source.source_kind, span) {
         (UserSourceKind::Text, SourceSpan::Text { start, end })
             if start < end
@@ -4167,10 +4806,10 @@ fn material_for_span(source: &UserSourceRecord, span: &SourceSpan) -> Option<Str
     }
 }
 
-fn manifest_gap_additions(
+pub(crate) fn source_local_classifications_with_manifest_gaps(
     dossier: &CompletionReviewDossier,
     gaps: &[ManifestGapInput],
-) -> Option<Vec<RequirementRecord>> {
+) -> Option<BTreeMap<SourceClassificationCacheKey, SourceLocalClassification>> {
     if gaps.is_empty() {
         return None;
     }
@@ -4187,8 +4826,24 @@ fn manifest_gap_additions(
             source_span: requirement.source_span.clone(),
         })
         .collect::<BTreeSet<_>>();
+    let expected_keys = dossier
+        .sources
+        .iter()
+        .map(source_classification_cache_key)
+        .collect::<BTreeSet<_>>();
+    let mut corrected = expected_keys
+        .iter()
+        .map(|key| {
+            dossier
+                .source_classification_cache
+                .get(key)
+                .cloned()
+                .map(|classification| (key.clone(), classification))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()?;
     let mut seen = BTreeSet::new();
-    let mut additions = Vec::new();
+    const CORRECTION_REASON: &str =
+        "Validated immutable manifest gap establishes an omitted requirement span.";
     for gap in gaps {
         let source = sources.get(gap.source_id.as_str())?;
         if gap.omitted_spans.is_empty() {
@@ -4199,25 +4854,308 @@ fn manifest_gap_additions(
                 source_id: source.source_id.clone(),
                 source_span: span.clone(),
             };
-            let exact_material = material_for_span(source, span)?;
+            material_for_span(source, span)?;
             if existing.contains(&reference) || !seen.insert(reference) {
                 return None;
             }
-            additions.push(RequirementRecord {
-                requirement_id: deterministic_requirement_id(source, span),
+            let key = source_classification_cache_key(source);
+            let classification = corrected.get_mut(&key)?;
+            classification.local_kind = SourceLocalClassificationKind::RequirementBearing;
+            classification.requirement_spans.push(span.clone());
+            classification.requirement_spans.sort();
+            classification.requirement_spans.dedup();
+            classification.local_semantic_cues.push(LocalSemanticCue {
+                kind: LocalSemanticCueKind::Assertion,
+                source_span: Some(span.clone()),
+            });
+            classification.local_semantic_cues.sort();
+            classification.local_semantic_cues.dedup();
+            if !classification.reason.contains(CORRECTION_REASON) {
+                classification.reason =
+                    format!("{} {CORRECTION_REASON}", classification.reason.trim())
+                        .trim()
+                        .to_string();
+            }
+        }
+    }
+    if corrected.len() != expected_keys.len()
+        || dossier.sources.iter().any(|source| {
+            corrected
+                .get(&source_classification_cache_key(source))
+                .is_none_or(|classification| {
+                    !source_local_classification_is_valid_for_source(source, classification)
+                })
+        })
+    {
+        return None;
+    }
+    Some(corrected)
+}
+
+fn prepare_source_materialization(
+    dossier: &CompletionReviewDossier,
+    materialization: SourceMaterialization,
+) -> Option<PreparedSourceMaterialization> {
+    let SourceMaterialization {
+        local_classifications,
+        resolved_sources,
+    } = materialization;
+    let expected_keys = dossier
+        .sources
+        .iter()
+        .map(source_classification_cache_key)
+        .collect::<BTreeSet<_>>();
+    if local_classifications.len() != expected_keys.len()
+        || local_classifications
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected_keys
+        || resolved_sources.len() != dossier.sources.len()
+        || resolved_sources
+            .iter()
+            .zip(&dossier.sources)
+            .any(|(resolved, source)| resolved.source_id != source.source_id)
+    {
+        return None;
+    }
+
+    let sources = dossier
+        .sources
+        .iter()
+        .map(|source| (source.source_id.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let mut requirement_ids = BTreeMap::<ClassifiedRequirementRef, String>::new();
+    for (resolved, source) in resolved_sources.iter().zip(&dossier.sources) {
+        let local = local_classifications.get(&source_classification_cache_key(source))?;
+        if !source_local_classification_is_valid_for_source(source, local) {
+            return None;
+        }
+        let expected_kind = match local.local_kind {
+            SourceLocalClassificationKind::RequirementBearing => {
+                ClassifiedSourceKind::RequirementBearing
+            }
+            SourceLocalClassificationKind::NonRequirement => ClassifiedSourceKind::NonRequirement,
+            SourceLocalClassificationKind::RelationshipOnlyContext => {
+                ClassifiedSourceKind::SupersededContext
+            }
+            SourceLocalClassificationKind::UnavailableOrTruncated => {
+                ClassifiedSourceKind::UnavailableOrTruncated
+            }
+        };
+        let mut resolved_spans = resolved
+            .requirements
+            .iter()
+            .map(|requirement| requirement.source_span.clone())
+            .collect::<Vec<_>>();
+        resolved_spans.sort();
+        if resolved.kind != expected_kind
+            || resolved_spans != local.requirement_spans
+            || matches!(
+                local.local_kind,
+                SourceLocalClassificationKind::NonRequirement
+                    | SourceLocalClassificationKind::RelationshipOnlyContext
+            ) && resolved.reason.as_deref() != Some(local.reason.as_str())
+        {
+            return None;
+        }
+        for requirement in &resolved.requirements {
+            material_for_span(source, &requirement.source_span)?;
+            let reference = ClassifiedRequirementRef {
+                source_id: source.source_id.clone(),
+                source_span: requirement.source_span.clone(),
+            };
+            let requirement_id = deterministic_requirement_id(source, &requirement.source_span);
+            if requirement_ids.insert(reference, requirement_id).is_some() {
+                return None;
+            }
+        }
+    }
+    if resolved_sources.iter().any(|resolved| {
+        resolved
+            .requirements
+            .iter()
+            .any(|requirement| match requirement.status {
+                RequirementStatus::Active | RequirementStatus::Withdrawn => {
+                    requirement.superseded_by.is_some()
+                }
+                RequirementStatus::Superseded => requirement
+                    .superseded_by
+                    .as_ref()
+                    .is_none_or(|target| !requirement_ids.contains_key(target)),
+            })
+    }) {
+        return None;
+    }
+
+    let mut requirements = Vec::new();
+    let mut mappings = Vec::new();
+    for resolved in resolved_sources {
+        let source = sources.get(resolved.source_id.as_str())?;
+        let mut mapped_requirement_ids = Vec::new();
+        for requirement in resolved.requirements {
+            let reference = ClassifiedRequirementRef {
+                source_id: source.source_id.clone(),
+                source_span: requirement.source_span.clone(),
+            };
+            let requirement_id = requirement_ids.get(&reference)?.clone();
+            let exact_material = material_for_span(source, &requirement.source_span)?;
+            mapped_requirement_ids.push(requirement_id.clone());
+            requirements.push(RequirementRecord {
+                requirement_id,
                 source_id: source.source_id.clone(),
                 source_content_hash: source.content_hash.clone(),
                 exact_material,
-                source_span: span.clone(),
-                status: RequirementStatus::Active,
-                superseded_by: None,
+                source_span: requirement.source_span,
+                status: requirement.status,
+                superseded_by: requirement
+                    .superseded_by
+                    .as_ref()
+                    .and_then(|target| requirement_ids.get(target))
+                    .cloned(),
             });
         }
+        mapped_requirement_ids.sort();
+        let mapping = match resolved.kind {
+            ClassifiedSourceKind::RequirementBearing => SourceMapping::RequirementBearing {
+                requirement_ids: mapped_requirement_ids,
+            },
+            ClassifiedSourceKind::NonRequirement => SourceMapping::NonRequirement {
+                reason: resolved.reason.unwrap_or_default(),
+            },
+            ClassifiedSourceKind::SupersededContext => SourceMapping::SupersededContext {
+                reason: resolved.reason.unwrap_or_default(),
+            },
+            ClassifiedSourceKind::UnavailableOrTruncated => SourceMapping::UnavailableOrTruncated,
+        };
+        mappings.push((source.source_id.clone(), mapping));
     }
-    Some(additions)
+    requirements.sort_by(|left, right| left.requirement_id.cmp(&right.requirement_id));
+    if !requirement_supersession_is_acyclic(&requirements) {
+        return None;
+    }
+    let next_requirements = requirements
+        .iter()
+        .map(|requirement| (requirement.requirement_id.as_str(), requirement))
+        .collect::<BTreeMap<_, _>>();
+    for previous in &dossier.requirements {
+        let next = next_requirements.get(previous.requirement_id.as_str())?;
+        if next.source_id != previous.source_id
+            || next.source_content_hash != previous.source_content_hash
+            || next.source_span != previous.source_span
+            || next.exact_material != previous.exact_material
+            || dossier.relationship_resolution_current
+                && match previous.status {
+                    RequirementStatus::Active => false,
+                    RequirementStatus::Superseded => {
+                        next.status != RequirementStatus::Superseded
+                            || next.superseded_by != previous.superseded_by
+                    }
+                    RequirementStatus::Withdrawn => {
+                        next.status != RequirementStatus::Withdrawn || next.superseded_by.is_some()
+                    }
+                }
+        {
+            return None;
+        }
+    }
+    Some(PreparedSourceMaterialization {
+        local_classifications,
+        requirements,
+        mappings,
+    })
 }
 
-fn deterministic_requirement_id(source: &UserSourceRecord, span: &SourceSpan) -> String {
+fn prepared_materialization_covers_manifest_gaps(
+    dossier: &CompletionReviewDossier,
+    gaps: &[ManifestGapInput],
+    prepared: &PreparedSourceMaterialization,
+) -> bool {
+    if gaps.is_empty() {
+        return false;
+    }
+    let sources = dossier
+        .sources
+        .iter()
+        .map(|source| (source.source_id.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let existing = dossier
+        .requirements
+        .iter()
+        .map(|requirement| ClassifiedRequirementRef {
+            source_id: requirement.source_id.clone(),
+            source_span: requirement.source_span.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    let prepared_requirements = prepared
+        .requirements
+        .iter()
+        .map(|requirement| {
+            (
+                ClassifiedRequirementRef {
+                    source_id: requirement.source_id.clone(),
+                    source_span: requirement.source_span.clone(),
+                },
+                requirement,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+
+    gaps.iter().all(|gap| {
+        let Some(source) = sources.get(gap.source_id.as_str()) else {
+            return false;
+        };
+        let key = source_classification_cache_key(source);
+        let Some(local) = prepared.local_classifications.get(&key) else {
+            return false;
+        };
+        !gap.omitted_spans.is_empty()
+            && gap.omitted_spans.iter().all(|span| {
+                let reference = ClassifiedRequirementRef {
+                    source_id: source.source_id.clone(),
+                    source_span: span.clone(),
+                };
+                let Some(exact_material) = material_for_span(source, span) else {
+                    return false;
+                };
+                let Some(requirement) = prepared_requirements.get(&reference) else {
+                    return false;
+                };
+                !existing.contains(&reference)
+                    && seen.insert(reference)
+                    && local.local_kind == SourceLocalClassificationKind::RequirementBearing
+                    && local.requirement_spans.binary_search(span).is_ok()
+                    && requirement.requirement_id == deterministic_requirement_id(source, span)
+                    && requirement.source_content_hash == source.content_hash
+                    && requirement.exact_material == exact_material
+            })
+    })
+}
+
+fn dossier_sources_are_current(
+    ledger: &CompletionReviewLedgerV2,
+    expected_sources: &[UserSourceRecord],
+) -> bool {
+    let mut current_sources = ledger
+        .source_records
+        .values()
+        .filter(|source| source.completion_epoch == ledger.completion_epoch)
+        .cloned()
+        .collect::<Vec<_>>();
+    current_sources.sort_by_key(|source| (source.source_ordinal, source.content_ordinal));
+    current_sources == expected_sources
+        && current_sources.iter().all(|source| {
+            source.content_hash
+                == user_source_content_hash(
+                    source.source_kind,
+                    &source.exact_material,
+                    source.availability,
+                )
+        })
+}
+
+pub(crate) fn deterministic_requirement_id(source: &UserSourceRecord, span: &SourceSpan) -> String {
     format!(
         "REQ-{}",
         canonical_hash(
@@ -4268,11 +5206,11 @@ fn deterministic_source_id(
     )
 }
 
-fn source_mappings_for(
+fn source_mapping_revisions_for(
     ledger: &CompletionReviewLedgerV2,
     completion_epoch: u64,
     manifest_revision: u64,
-) -> BTreeMap<String, SourceMapping> {
+) -> BTreeMap<String, SourceMappingRevision> {
     ledger
         .mapping_revisions
         .iter()
@@ -4280,7 +5218,18 @@ fn source_mappings_for(
             mapping.completion_epoch == completion_epoch
                 && mapping.manifest_revision == manifest_revision
         })
-        .map(|mapping| (mapping.source_id.clone(), mapping.mapping.clone()))
+        .map(|mapping| (mapping.source_id.clone(), mapping.clone()))
+        .collect()
+}
+
+fn source_mappings_for(
+    ledger: &CompletionReviewLedgerV2,
+    completion_epoch: u64,
+    manifest_revision: u64,
+) -> BTreeMap<String, SourceMapping> {
+    source_mapping_revisions_for(ledger, completion_epoch, manifest_revision)
+        .into_iter()
+        .map(|(source_id, revision)| (source_id, revision.mapping))
         .collect()
 }
 
@@ -4393,6 +5342,736 @@ fn normalize_path_for_identity(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn canonical_repair_path(
+    path: &str,
+    allow_wildcards: bool,
+) -> Result<String, RereviewFallbackReason> {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.as_bytes().get(1) == Some(&b':')
+    {
+        return Err(RereviewFallbackReason::InvalidPath);
+    }
+    let mut segments = Vec::new();
+    for segment in normalized.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return Err(RereviewFallbackReason::InvalidPath),
+            _ if !allow_wildcards && segment.contains('*') => {
+                return Err(RereviewFallbackReason::InvalidPath);
+            }
+            _ => segments.push(segment),
+        }
+    }
+    if segments.is_empty() {
+        return Err(RereviewFallbackReason::InvalidPath);
+    }
+    let canonical = segments.join("/");
+    if cfg!(windows) {
+        if !canonical.is_ascii() {
+            return Err(RereviewFallbackReason::AmbiguousWindowsCase);
+        }
+        Ok(canonical.to_ascii_lowercase())
+    } else {
+        Ok(canonical)
+    }
+}
+
+fn generated_pattern_is_supported(pattern: &str, grammar_version: u32) -> bool {
+    if grammar_version != REPAIR_PATH_GRAMMAR_VERSION {
+        return false;
+    }
+    let Ok(pattern) = canonical_repair_path(pattern, true) else {
+        return false;
+    };
+    let mut recursive_wildcards = 0;
+    for segment in pattern.split('/') {
+        match segment {
+            "*" => {}
+            "**" => recursive_wildcards += 1,
+            literal if !literal.contains('*') && !literal.contains('?') => {}
+            _ => return false,
+        }
+    }
+    recursive_wildcards <= 1
+}
+
+fn generated_pattern_matches(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", tail)) => (0..=path.len().min(REPAIR_RECURSIVE_WILDCARD_MAX_SEGMENTS))
+            .any(|consumed| generated_pattern_matches(tail, &path[consumed..])),
+        Some((&"*", tail)) => path
+            .split_first()
+            .is_some_and(|(_, rest)| generated_pattern_matches(tail, rest)),
+        Some((literal, tail)) => path
+            .split_first()
+            .is_some_and(|(value, rest)| value == literal && generated_pattern_matches(tail, rest)),
+    }
+}
+
+fn repair_scope_matches(
+    scope: &RepairPathScope,
+    path: &str,
+) -> Result<bool, RereviewFallbackReason> {
+    let path = canonical_repair_path(path, false)?;
+    match scope {
+        RepairPathScope::ExactFile { path: expected } => {
+            Ok(canonical_repair_path(expected, false)? == path)
+        }
+        RepairPathScope::DirectoryPrefix { path: prefix } => {
+            let prefix = canonical_repair_path(prefix, false)?;
+            Ok(path == prefix || path.starts_with(&format!("{prefix}/")))
+        }
+        RepairPathScope::GeneratedPattern {
+            grammar_version,
+            pattern,
+        } => {
+            if !generated_pattern_is_supported(pattern, *grammar_version) {
+                return Err(RereviewFallbackReason::UnsupportedPathGrammar);
+            }
+            let pattern = canonical_repair_path(pattern, true)?;
+            Ok(generated_pattern_matches(
+                &pattern.split('/').collect::<Vec<_>>(),
+                &path.split('/').collect::<Vec<_>>(),
+            ))
+        }
+    }
+}
+
+fn path_resolves_within_repository(
+    repository_root: &str,
+    path: &str,
+) -> Result<(), RereviewFallbackReason> {
+    let canonical = canonical_repair_path(path, false)?;
+    let root = std::fs::canonicalize(repository_root)
+        .map_err(|_| RereviewFallbackReason::SymlinkEscape)?;
+    let candidate = root.join(canonical.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let mut existing = candidate.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or(RereviewFallbackReason::SymlinkEscape)?;
+    }
+    let resolved =
+        std::fs::canonicalize(existing).map_err(|_| RereviewFallbackReason::SymlinkEscape)?;
+    if !resolved.starts_with(&root) {
+        return Err(RereviewFallbackReason::SymlinkEscape);
+    }
+    Ok(())
+}
+
+fn plan_structure_hash(plan: &[EvidencePlanStep]) -> String {
+    let structural_steps = plan
+        .iter()
+        .map(|step| {
+            serde_json::json!({
+                "id": step.id,
+                "step": step.step,
+                "dependsOn": step.depends_on,
+                "acceptanceCriteria": step.acceptance_criteria,
+                "runtimePaths": step.runtime_paths,
+                "generatedArtifacts": step.generated_artifacts,
+                "risks": step.risks,
+                "requiresDesktopActivation": step.requires_desktop_activation,
+                "editPaths": step.edit_paths,
+            })
+        })
+        .collect::<Vec<_>>();
+    canonical_hash(
+        "KD4_PLAN_STRUCTURE_CANONICAL_V1",
+        &serde_json::json!({ "steps": structural_steps }),
+    )
+}
+
+fn path_scope_identifier(scope: &RepairPathScope) -> String {
+    match scope {
+        RepairPathScope::ExactFile { path } => format!("exact:{path}"),
+        RepairPathScope::DirectoryPrefix { path } => format!("prefix:{path}"),
+        RepairPathScope::GeneratedPattern {
+            grammar_version,
+            pattern,
+        } => format!("generated:v{grammar_version}:{pattern}"),
+    }
+}
+
+fn declared_repair_scopes(
+    plan: &[EvidencePlanStep],
+    paths: impl IntoIterator<Item = String>,
+) -> (Vec<RepairPathScope>, Vec<RereviewFallbackReason>) {
+    let mut scopes = Vec::new();
+    let mut errors = BTreeSet::new();
+    let candidates = paths.into_iter().chain(plan.iter().flat_map(|step| {
+        step.edit_paths
+            .iter()
+            .chain(step.runtime_paths.iter())
+            .chain(step.generated_artifacts.iter())
+            .cloned()
+    }));
+    for candidate in candidates {
+        let scope = if candidate.contains('*') {
+            match canonical_repair_path(&candidate, true) {
+                Ok(pattern)
+                    if generated_pattern_is_supported(&pattern, REPAIR_PATH_GRAMMAR_VERSION) =>
+                {
+                    RepairPathScope::GeneratedPattern {
+                        grammar_version: REPAIR_PATH_GRAMMAR_VERSION,
+                        pattern,
+                    }
+                }
+                Ok(_) => {
+                    errors.insert(RereviewFallbackReason::UnsupportedPathGrammar);
+                    continue;
+                }
+                Err(reason) => {
+                    errors.insert(reason);
+                    continue;
+                }
+            }
+        } else if candidate.ends_with('/') || candidate.ends_with('\\') {
+            match canonical_repair_path(&candidate, false) {
+                Ok(path) => RepairPathScope::DirectoryPrefix { path },
+                Err(reason) => {
+                    errors.insert(reason);
+                    continue;
+                }
+            }
+        } else {
+            match canonical_repair_path(&candidate, false) {
+                Ok(path) => RepairPathScope::ExactFile { path },
+                Err(reason) => {
+                    errors.insert(reason);
+                    continue;
+                }
+            }
+        };
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    scopes.sort_by_key(path_scope_identifier);
+    (scopes, errors.into_iter().collect())
+}
+
+fn receipt_sequence(id: &str, prefix: &str) -> Option<u64> {
+    id.strip_prefix(prefix)?.parse().ok()
+}
+
+fn current_repair_snapshot(
+    document: &TaskEvidenceDocument,
+    typed_mutation_identities: &[String],
+) -> CurrentRepairSnapshot {
+    let mut containment_errors = BTreeSet::new();
+    let mut path_states = Vec::new();
+    for snapshot in document
+        .latest_file_hashes
+        .values()
+        .chain(document.latest_generated_artifact_hashes.values())
+    {
+        match canonical_repair_path(&snapshot.path, false) {
+            Ok(path) => path_states.push(RepairPathState {
+                path,
+                exists: snapshot.exists,
+                content_hash: snapshot.sha1.clone(),
+            }),
+            Err(reason) => {
+                containment_errors.insert(reason);
+            }
+        }
+        if snapshot.read_error.is_some() {
+            containment_errors.insert(RereviewFallbackReason::UnrepresentableEvidenceChange);
+        }
+    }
+    path_states.sort_by(|left, right| left.path.cmp(&right.path));
+    path_states.dedup_by(|left, right| left.path == right.path);
+
+    let (declared_path_scopes, scope_errors) = declared_repair_scopes(
+        &document.plan,
+        path_states.iter().map(|state| state.path.clone()),
+    );
+    containment_errors.extend(scope_errors);
+    let implementation_surfaces = declared_path_scopes
+        .iter()
+        .map(|scope| StructuredContractSurface {
+            kind: "path_scope".to_string(),
+            owner: "task".to_string(),
+            identifier: path_scope_identifier(scope),
+        })
+        .collect::<Vec<_>>();
+
+    let mut command_receipts = document
+        .command_receipts
+        .iter()
+        .filter_map(|receipt| {
+            let sequence = receipt_sequence(&receipt.id, "command-")?;
+            Some(RepairCommandDelta {
+                sequence,
+                receipt_id: receipt.id.clone(),
+                command: receipt.command.join(" "),
+                cwd: normalize_path_for_identity(Path::new(&receipt.cwd)),
+                exit_code: Some(receipt.exit_code),
+                timed_out: receipt.timed_out,
+                implementation_identity: receipt.implementation_identity_hash.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if command_receipts.len() != document.command_receipts.len() {
+        containment_errors.insert(RereviewFallbackReason::CommandLineageChanged);
+    }
+    command_receipts.sort_by_key(|receipt| receipt.sequence);
+
+    let mut default_child_mutation_identities = document
+        .completion_review_v2
+        .as_ref()
+        .into_iter()
+        .flat_map(|ledger| ledger.attributed_workspace_events.iter())
+        .map(|event| {
+            serde_json::to_string(&serde_json::json!({
+                "workspaceId": event.workspace_id,
+                "epoch": event.epoch,
+                "actorId": event.actor_id,
+                "paths": event.paths,
+            }))
+            .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    default_child_mutation_identities.sort();
+    default_child_mutation_identities.dedup();
+
+    let mut typed_mutation_identities = typed_mutation_identities.to_vec();
+    typed_mutation_identities.sort();
+    typed_mutation_identities.dedup();
+    let mut external_evidence_ids = document
+        .external_evidence
+        .iter()
+        .filter(|receipt| receipt.task_epoch == document.evidence_epoch)
+        .map(|receipt| receipt.id.clone())
+        .collect::<Vec<_>>();
+    external_evidence_ids.sort();
+    external_evidence_ids.dedup();
+
+    CurrentRepairSnapshot {
+        repository_root: document.start.repository_root.clone(),
+        path_states,
+        command_receipts,
+        plan_structure_hash: plan_structure_hash(&document.plan),
+        declared_path_scopes,
+        implementation_surfaces,
+        default_child_mutation_identities,
+        typed_mutation_identities,
+        external_evidence_ids,
+        containment_errors: containment_errors.into_iter().collect(),
+    }
+}
+
+pub(crate) fn build_repair_baseline(
+    dossier: &CompletionReviewDossier,
+    findings: &[CompletionReviewFindingReceipt],
+) -> Result<RepairBaseline, RereviewFallbackReason> {
+    let active_requirement_ids = dossier
+        .requirements
+        .iter()
+        .filter(|requirement| requirement.status == RequirementStatus::Active)
+        .map(|requirement| requirement.requirement_id.clone())
+        .collect::<BTreeSet<_>>();
+    let affected_requirement_ids =
+        derive_affected_requirement_ids(&active_requirement_ids, findings)?;
+    if !dossier
+        .current_repair_snapshot
+        .containment_errors
+        .is_empty()
+    {
+        return Err(dossier.current_repair_snapshot.containment_errors[0].clone());
+    }
+    let command_bindings = dossier
+        .current_repair_snapshot
+        .command_receipts
+        .iter()
+        .map(|receipt| BaselineCommandBinding {
+            sequence: receipt.sequence,
+            receipt_id: receipt.receipt_id.clone(),
+            implementation_identity: receipt.implementation_identity.clone(),
+        })
+        .collect::<Vec<_>>();
+    let command_sequence_high_water_mark = command_bindings
+        .iter()
+        .map(|binding| binding.sequence)
+        .max()
+        .unwrap_or(0);
+    Ok(RepairBaseline {
+        path_states: dossier.current_repair_snapshot.path_states.clone(),
+        command_sequence_high_water_mark,
+        command_bindings,
+        implementation_surfaces: dossier
+            .current_repair_snapshot
+            .implementation_surfaces
+            .clone(),
+        repair_scope: RepairScope {
+            path_grammar_version: REPAIR_PATH_GRAMMAR_VERSION,
+            paths: dossier.current_repair_snapshot.declared_path_scopes.clone(),
+            surfaces: dossier
+                .current_repair_snapshot
+                .implementation_surfaces
+                .clone(),
+            affected_requirement_ids,
+        },
+        source_ledger_hash: dossier.user_source_ledger_hash.clone(),
+        requirement_manifest_hash: dossier.requirement_manifest_hash.clone(),
+        plan_structure_hash: dossier.current_repair_snapshot.plan_structure_hash.clone(),
+        default_child_mutation_identities: dossier
+            .current_repair_snapshot
+            .default_child_mutation_identities
+            .clone(),
+        typed_mutation_identities: dossier
+            .current_repair_snapshot
+            .typed_mutation_identities
+            .clone(),
+        external_evidence_ids: dossier
+            .current_repair_snapshot
+            .external_evidence_ids
+            .clone(),
+    })
+}
+
+fn derive_affected_requirement_ids(
+    active_requirement_ids: &BTreeSet<String>,
+    findings: &[CompletionReviewFindingReceipt],
+) -> Result<Vec<String>, RereviewFallbackReason> {
+    if findings.is_empty() {
+        return Ok(active_requirement_ids.iter().cloned().collect());
+    }
+    let referenced = findings
+        .iter()
+        .flat_map(|finding| finding.requirement_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if referenced.is_empty() || !referenced.is_subset(active_requirement_ids) {
+        return Err(RereviewFallbackReason::RequirementManifestChanged);
+    }
+    Ok(referenced.into_iter().collect())
+}
+
+fn mutation_paths_are_attributable(identity: &str, scopes: &[RepairPathScope]) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(identity) else {
+        return false;
+    };
+    let Some(paths) = value.get("paths").and_then(Value::as_array) else {
+        return false;
+    };
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            path.as_str().is_some_and(|path| {
+                scopes
+                    .iter()
+                    .any(|scope| repair_scope_matches(scope, path).unwrap_or(false))
+            })
+        })
+}
+
+fn build_rereview_input(
+    baseline: Option<&RepairBaseline>,
+    persisted_baseline_hash: Option<&str>,
+    repair_instruction_hash: Option<&str>,
+    original_findings: &[CompletionReviewFindingReceipt],
+    current: &CurrentRepairSnapshot,
+    candidate_implementation_identity: &str,
+    source_ledger_hash: &str,
+    requirement_manifest_hash: &str,
+) -> Option<RereviewInput> {
+    let repair_instruction_hash = repair_instruction_hash?.to_string();
+    let mut reasons = current
+        .containment_errors
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let Some(baseline) = baseline else {
+        reasons.insert(RereviewFallbackReason::MissingBaseline);
+        return Some(RereviewInput {
+            input_mode: RereviewInputMode::FullFallback,
+            baseline_hash: persisted_baseline_hash.map(str::to_string),
+            delta_hash: None,
+            fallback_reasons: reasons.into_iter().collect(),
+            repair_instruction_hash,
+            candidate_implementation_identity: candidate_implementation_identity.to_string(),
+            delta: None,
+        });
+    };
+    let computed_baseline_hash = repair_baseline_hash(baseline);
+    if persisted_baseline_hash != Some(computed_baseline_hash.as_str()) {
+        reasons.insert(RereviewFallbackReason::InvalidBaselineHash);
+    }
+    if baseline.repair_scope.path_grammar_version != REPAIR_PATH_GRAMMAR_VERSION {
+        reasons.insert(RereviewFallbackReason::UnsupportedPathGrammar);
+    }
+    if baseline.source_ledger_hash != source_ledger_hash {
+        reasons.insert(RereviewFallbackReason::SourceIdentityChanged);
+    }
+    if baseline.requirement_manifest_hash != requirement_manifest_hash {
+        reasons.insert(RereviewFallbackReason::RequirementManifestChanged);
+    }
+    if baseline.plan_structure_hash != current.plan_structure_hash {
+        reasons.insert(RereviewFallbackReason::PlanStructureChanged);
+    }
+
+    let before_paths = baseline
+        .path_states
+        .iter()
+        .map(|state| (state.path.as_str(), state))
+        .collect::<BTreeMap<_, _>>();
+    let after_paths = current
+        .path_states
+        .iter()
+        .map(|state| (state.path.as_str(), state))
+        .collect::<BTreeMap<_, _>>();
+    let all_paths = before_paths
+        .keys()
+        .chain(after_paths.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut path_changes = Vec::new();
+    for path in all_paths {
+        let before = before_paths.get(path).copied();
+        let after = after_paths.get(path).copied();
+        if before == after {
+            continue;
+        }
+        match baseline
+            .repair_scope
+            .paths
+            .iter()
+            .map(|scope| repair_scope_matches(scope, path))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(matches) if matches.iter().any(|matches| *matches) => {}
+            Ok(_) => {
+                reasons.insert(RereviewFallbackReason::PathOutsideScope);
+            }
+            Err(reason) => {
+                reasons.insert(reason);
+            }
+        }
+        if let Err(reason) = path_resolves_within_repository(&current.repository_root, path) {
+            reasons.insert(reason);
+        }
+        let before_exists = before.is_some_and(|state| state.exists);
+        let after_exists = after.is_some_and(|state| state.exists);
+        if !before_exists && !after_exists {
+            continue;
+        }
+        let before_hash = before.and_then(|state| state.content_hash.clone());
+        let after_hash = after.and_then(|state| state.content_hash.clone());
+        let change = match (before_exists, after_exists) {
+            (false, true) => RepairPathChangeKind::Added,
+            (true, false) => RepairPathChangeKind::Removed,
+            (true, true) => RepairPathChangeKind::Modified,
+            (false, false) => unreachable!(),
+        };
+        path_changes.push(RepairPathChange {
+            path: path.to_string(),
+            change,
+            before_exists,
+            before_hash,
+            after_exists,
+            after_hash,
+        });
+    }
+
+    let current_commands = current
+        .command_receipts
+        .iter()
+        .map(|receipt| (receipt.sequence, receipt))
+        .collect::<BTreeMap<_, _>>();
+    let mut invalidated_command_receipts = Vec::new();
+    for binding in &baseline.command_bindings {
+        let Some(current_receipt) = current_commands.get(&binding.sequence) else {
+            reasons.insert(RereviewFallbackReason::CommandLineageChanged);
+            continue;
+        };
+        if current_receipt.receipt_id != binding.receipt_id {
+            reasons.insert(RereviewFallbackReason::CommandLineageChanged);
+        }
+        if binding.implementation_identity.as_deref() != Some(candidate_implementation_identity) {
+            invalidated_command_receipts.push(InvalidatedCommandReceipt {
+                sequence: binding.sequence,
+                receipt_id: binding.receipt_id.clone(),
+                reason: "implementation_identity_binding_mismatch".to_string(),
+            });
+        }
+    }
+    let mut new_command_receipts = current
+        .command_receipts
+        .iter()
+        .filter(|receipt| receipt.sequence > baseline.command_sequence_high_water_mark)
+        .cloned()
+        .collect::<Vec<_>>();
+    new_command_receipts.sort_by_key(|receipt| receipt.sequence);
+
+    let baseline_children = baseline
+        .default_child_mutation_identities
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if current
+        .default_child_mutation_identities
+        .iter()
+        .filter(|identity| !baseline_children.contains(identity))
+        .any(|identity| !mutation_paths_are_attributable(identity, &baseline.repair_scope.paths))
+    {
+        reasons.insert(RereviewFallbackReason::UnattributedMutation);
+    }
+    let baseline_typed = baseline
+        .typed_mutation_identities
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if current
+        .typed_mutation_identities
+        .iter()
+        .filter(|identity| !baseline_typed.contains(identity))
+        .any(|identity| !mutation_paths_are_attributable(identity, &baseline.repair_scope.paths))
+    {
+        reasons.insert(RereviewFallbackReason::UnattributedMutation);
+    }
+    if baseline.external_evidence_ids != current.external_evidence_ids {
+        reasons.insert(RereviewFallbackReason::UnrepresentableEvidenceChange);
+    }
+
+    let permitted_surfaces = baseline
+        .repair_scope
+        .surfaces
+        .iter()
+        .collect::<BTreeSet<_>>();
+    let baseline_surfaces = baseline
+        .implementation_surfaces
+        .iter()
+        .collect::<BTreeSet<_>>();
+    let mut newly_realized_surfaces = current
+        .implementation_surfaces
+        .iter()
+        .filter(|surface| !baseline_surfaces.contains(surface))
+        .cloned()
+        .collect::<Vec<_>>();
+    newly_realized_surfaces.sort();
+    newly_realized_surfaces.dedup();
+    if newly_realized_surfaces
+        .iter()
+        .any(|surface| !permitted_surfaces.contains(surface))
+    {
+        reasons.insert(RereviewFallbackReason::ContractSurfaceOutsideScope);
+    }
+
+    if !reasons.is_empty() {
+        return Some(RereviewInput {
+            input_mode: RereviewInputMode::FullFallback,
+            baseline_hash: Some(computed_baseline_hash),
+            delta_hash: None,
+            fallback_reasons: reasons.into_iter().collect(),
+            repair_instruction_hash,
+            candidate_implementation_identity: candidate_implementation_identity.to_string(),
+            delta: None,
+        });
+    }
+    let delta = RepairDelta {
+        original_findings: original_findings.to_vec(),
+        required_disposition_finding_ids: original_findings
+            .iter()
+            .map(|finding| finding.finding_id.clone())
+            .collect(),
+        repair_instruction_hash: repair_instruction_hash.clone(),
+        baseline_hash: computed_baseline_hash.clone(),
+        candidate_implementation_identity: candidate_implementation_identity.to_string(),
+        path_changes,
+        new_command_receipts,
+        invalidated_command_receipts,
+        affected_requirement_ids: baseline.repair_scope.affected_requirement_ids.clone(),
+        newly_realized_surfaces,
+    };
+    Some(RereviewInput {
+        input_mode: RereviewInputMode::Delta,
+        baseline_hash: Some(computed_baseline_hash),
+        delta_hash: Some(repair_delta_hash(&delta)),
+        fallback_reasons: Vec::new(),
+        repair_instruction_hash,
+        candidate_implementation_identity: candidate_implementation_identity.to_string(),
+        delta: Some(delta),
+    })
+}
+
+pub(crate) fn repair_baseline_hash(baseline: &RepairBaseline) -> String {
+    canonical_hash(
+        REPAIR_BASELINE_CANONICAL_FORMAT,
+        &serde_json::to_value(baseline).unwrap_or(Value::Null),
+    )
+}
+
+pub(crate) fn repair_delta_hash(delta: &RepairDelta) -> String {
+    canonical_hash(
+        REPAIR_DELTA_CANONICAL_FORMAT,
+        &serde_json::to_value(delta).unwrap_or(Value::Null),
+    )
+}
+
+fn rereview_audit_hash(input: &RereviewInput) -> String {
+    canonical_hash(
+        REREVIEW_AUDIT_CANONICAL_FORMAT,
+        &serde_json::to_value(input).unwrap_or(Value::Null),
+    )
+}
+
+fn repair_instruction_matches_baseline(
+    instruction: &str,
+    baseline: &RepairBaseline,
+    baseline_hash: &str,
+) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(instruction) else {
+        return false;
+    };
+    value.get("repair_baseline_hash").and_then(Value::as_str) == Some(baseline_hash)
+        && value.get("declared_repair_scope")
+            == serde_json::to_value(&baseline.repair_scope).ok().as_ref()
+}
+
+fn validate_rereview_input(input: &RereviewInput, dossier: &CompletionReviewDossier) -> bool {
+    if input.repair_instruction_hash
+        != dossier
+            .initial_repair_instruction_hash
+            .as_deref()
+            .unwrap_or_default()
+        || input.candidate_implementation_identity != dossier.implementation_identity_hash
+    {
+        return false;
+    }
+    match input.input_mode {
+        RereviewInputMode::Delta => {
+            let (Some(baseline), Some(baseline_hash), Some(delta), Some(delta_hash)) = (
+                dossier.initial_repair_baseline.as_ref(),
+                input.baseline_hash.as_deref(),
+                input.delta.as_ref(),
+                input.delta_hash.as_deref(),
+            ) else {
+                return false;
+            };
+            input.fallback_reasons.is_empty()
+                && repair_baseline_hash(baseline) == baseline_hash
+                && repair_delta_hash(delta) == delta_hash
+                && delta.baseline_hash == baseline_hash
+                && delta.repair_instruction_hash == input.repair_instruction_hash
+                && delta.candidate_implementation_identity
+                    == input.candidate_implementation_identity
+                && validate_repair_delta_contents(delta, baseline, &dossier.original_findings)
+                    .is_ok()
+        }
+        RereviewInputMode::FullFallback => {
+            !input.fallback_reasons.is_empty()
+                && input
+                    .fallback_reasons
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                && input.delta_hash.is_none()
+                && input.delta.is_none()
+                && input.baseline_hash.as_deref() == dossier.initial_repair_baseline_hash.as_deref()
+        }
+    }
 }
 
 async fn persist_document_with_permit(
@@ -4704,6 +6383,16 @@ async fn load_existing_document_with_supported_version(
         };
     }
     let schema_version = schema_version as u32;
+    if schema_version == TASK_EVIDENCE_SCHEMA_VERSION
+        && !value
+            .get("source_classification_cache")
+            .is_some_and(Value::is_array)
+    {
+        return ExistingDocument::Rejected {
+            kind: "corrupt",
+            reason: "V6 requires an array source_classification_cache".to_string(),
+        };
+    }
     let legacy_completion_model = schema_version < TASK_EVIDENCE_COMPLETION_MODEL_VERSION
         || uses_retired_v3_completion_shape(schema_version, &value);
     let document = match serde_json::from_value::<TaskEvidenceDocument>(value) {
@@ -4728,18 +6417,51 @@ async fn load_existing_document_with_supported_version(
             reason: "repository root does not match the requested checkout".to_string(),
         };
     }
-    if schema_version == TASK_EVIDENCE_SCHEMA_VERSION
-        && let Err(reason) = validate_v5_completion_review(&document)
+    if matches!(
+        schema_version,
+        FROZEN_TASK_EVIDENCE_V5_SCHEMA_VERSION | TASK_EVIDENCE_SCHEMA_VERSION
+    ) && let Err(reason) = validate_v5_completion_review(&document)
     {
         return ExistingDocument::Rejected {
             kind: "corrupt",
             reason: format!("invalid V5 completion-review lineage: {reason}"),
         };
     }
+    if schema_version == TASK_EVIDENCE_SCHEMA_VERSION
+        && let Err(reason) = validate_v6_source_classification_state(&document)
+    {
+        return ExistingDocument::Rejected {
+            kind: "corrupt",
+            reason: format!("invalid V6 source-classification state: {reason}"),
+        };
+    }
     ExistingDocument::Loaded {
         document: Box::new(document),
         legacy_completion_model,
     }
+}
+
+fn validate_v6_source_classification_state(document: &TaskEvidenceDocument) -> Result<(), String> {
+    if document.source_classification_cache
+        != canonical_source_classification_cache(document.source_classification_cache.clone())
+    {
+        return Err("cache is not canonical, sorted, and unique".to_string());
+    }
+    let Some(ledger) = document.completion_review_v2.as_ref() else {
+        return Ok(());
+    };
+    for revision in &ledger.mapping_revisions {
+        match (
+            revision.source_classification_contract_version.as_deref(),
+            revision.relationship_resolver_contract_version.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(source_version), Some(resolver_version))
+                if !source_version.trim().is_empty() && !resolver_version.trim().is_empty() => {}
+            _ => return Err("mapping revision contract versions are incomplete".to_string()),
+        }
+    }
+    Ok(())
 }
 
 fn requirement_supersession_is_acyclic(requirements: &[RequirementRecord]) -> bool {
@@ -5084,6 +6806,373 @@ fn manifest_gap_supersession_is_valid(
         && superseded_revision < revision
 }
 
+fn is_strictly_sorted_unique<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn structured_surface_is_canonical(surface: &StructuredContractSurface) -> bool {
+    !surface.kind.trim().is_empty()
+        && surface.kind == surface.kind.trim()
+        && !surface.owner.trim().is_empty()
+        && surface.owner == surface.owner.trim()
+        && !surface.identifier.trim().is_empty()
+        && surface.identifier == surface.identifier.trim()
+}
+
+fn validate_persisted_repair_baseline(
+    baseline: &RepairBaseline,
+    initial_receipt: &CompletionReviewReceiptV2,
+    manifest: &RequirementManifestSnapshot,
+) -> Result<(), String> {
+    if baseline.source_ledger_hash != initial_receipt.user_source_ledger_hash
+        || baseline.requirement_manifest_hash != initial_receipt.requirement_manifest_hash
+        || baseline.plan_structure_hash.trim().is_empty()
+        || baseline.repair_scope.path_grammar_version != REPAIR_PATH_GRAMMAR_VERSION
+    {
+        return Err("repair baseline identity or grammar is invalid".to_string());
+    }
+
+    if baseline
+        .path_states
+        .windows(2)
+        .any(|pair| pair[0].path >= pair[1].path)
+        || baseline.path_states.iter().any(|state| {
+            canonical_repair_path(&state.path, false).as_deref() != Ok(state.path.as_str())
+                || state.exists != state.content_hash.is_some()
+                || state.content_hash.as_deref().is_some_and(str::is_empty)
+        })
+    {
+        return Err("repair baseline path states are not canonical".to_string());
+    }
+
+    let scope_ids = baseline
+        .repair_scope
+        .paths
+        .iter()
+        .map(path_scope_identifier)
+        .collect::<Vec<_>>();
+    if !is_strictly_sorted_unique(&scope_ids)
+        || baseline.repair_scope.paths.iter().any(|scope| match scope {
+            RepairPathScope::ExactFile { path } | RepairPathScope::DirectoryPrefix { path } => {
+                canonical_repair_path(path, false).as_deref() != Ok(path.as_str())
+            }
+            RepairPathScope::GeneratedPattern {
+                grammar_version,
+                pattern,
+            } => {
+                !generated_pattern_is_supported(pattern, *grammar_version)
+                    || canonical_repair_path(pattern, true).as_deref() != Ok(pattern.as_str())
+            }
+        })
+    {
+        return Err("repair baseline path scope is not canonical".to_string());
+    }
+
+    if !is_strictly_sorted_unique(&baseline.implementation_surfaces)
+        || !is_strictly_sorted_unique(&baseline.repair_scope.surfaces)
+        || baseline
+            .implementation_surfaces
+            .iter()
+            .chain(baseline.repair_scope.surfaces.iter())
+            .any(|surface| !structured_surface_is_canonical(surface))
+        || baseline
+            .implementation_surfaces
+            .iter()
+            .any(|surface| !baseline.repair_scope.surfaces.contains(surface))
+    {
+        return Err("repair baseline contract surfaces are not canonical".to_string());
+    }
+
+    if baseline
+        .command_bindings
+        .windows(2)
+        .any(|pair| pair[0].sequence >= pair[1].sequence)
+        || baseline
+            .command_bindings
+            .iter()
+            .any(|binding| binding.receipt_id.trim().is_empty())
+        || baseline
+            .command_bindings
+            .iter()
+            .map(|binding| binding.receipt_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != baseline.command_bindings.len()
+        || baseline.command_sequence_high_water_mark
+            != baseline
+                .command_bindings
+                .last()
+                .map(|binding| binding.sequence)
+                .unwrap_or(0)
+    {
+        return Err("repair baseline command sequence is not canonical".to_string());
+    }
+
+    for identities in [
+        &baseline.default_child_mutation_identities,
+        &baseline.typed_mutation_identities,
+        &baseline.external_evidence_ids,
+    ] {
+        if !is_strictly_sorted_unique(identities)
+            || identities.iter().any(|identity| identity.trim().is_empty())
+        {
+            return Err("repair baseline evidence identities are not canonical".to_string());
+        }
+    }
+
+    let active_requirement_ids = manifest
+        .requirements
+        .iter()
+        .filter(|requirement| requirement.status == RequirementStatus::Active)
+        .map(|requirement| requirement.requirement_id.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_affected =
+        derive_affected_requirement_ids(&active_requirement_ids, &initial_receipt.findings)
+            .map_err(|_| {
+                "repair baseline references an inactive or unknown requirement".to_string()
+            })?;
+    if baseline.repair_scope.affected_requirement_ids != expected_affected {
+        return Err("repair baseline affected requirements are invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_repair_delta_contents(
+    delta: &RepairDelta,
+    baseline: &RepairBaseline,
+    original_findings: &[CompletionReviewFindingReceipt],
+) -> Result<(), String> {
+    let expected_disposition_ids = original_findings
+        .iter()
+        .map(|finding| finding.finding_id.clone())
+        .collect::<Vec<_>>();
+    if delta.original_findings != original_findings
+        || delta.required_disposition_finding_ids != expected_disposition_ids
+        || delta.affected_requirement_ids != baseline.repair_scope.affected_requirement_ids
+    {
+        return Err("repair delta review obligations are invalid".to_string());
+    }
+
+    if delta
+        .path_changes
+        .windows(2)
+        .any(|pair| pair[0].path >= pair[1].path)
+        || delta.path_changes.iter().any(|change| {
+            canonical_repair_path(&change.path, false).as_deref() != Ok(change.path.as_str())
+                || !baseline
+                    .repair_scope
+                    .paths
+                    .iter()
+                    .any(|scope| repair_scope_matches(scope, &change.path) == Ok(true))
+                || change.before_exists != change.before_hash.is_some()
+                || change.after_exists != change.after_hash.is_some()
+                || match &change.change {
+                    RepairPathChangeKind::Added => change.before_exists || !change.after_exists,
+                    RepairPathChangeKind::Removed => !change.before_exists || change.after_exists,
+                    RepairPathChangeKind::Modified => {
+                        !change.before_exists
+                            || !change.after_exists
+                            || change.before_hash == change.after_hash
+                    }
+                }
+        })
+    {
+        return Err("repair delta path changes are not canonical".to_string());
+    }
+
+    if delta
+        .new_command_receipts
+        .windows(2)
+        .any(|pair| pair[0].sequence >= pair[1].sequence)
+        || delta.new_command_receipts.iter().any(|receipt| {
+            receipt.sequence <= baseline.command_sequence_high_water_mark
+                || receipt.receipt_id.trim().is_empty()
+        })
+        || delta
+            .new_command_receipts
+            .iter()
+            .map(|receipt| receipt.receipt_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != delta.new_command_receipts.len()
+    {
+        return Err("repair delta command receipts are not canonical".to_string());
+    }
+
+    if delta
+        .invalidated_command_receipts
+        .windows(2)
+        .any(|pair| pair[0].sequence >= pair[1].sequence)
+        || delta.invalidated_command_receipts.iter().any(|receipt| {
+            let Some(binding) = baseline
+                .command_bindings
+                .iter()
+                .find(|binding| binding.sequence == receipt.sequence)
+            else {
+                return true;
+            };
+            binding.receipt_id != receipt.receipt_id
+                || receipt.reason != "implementation_identity_binding_mismatch"
+                || binding.implementation_identity.as_deref()
+                    == Some(delta.candidate_implementation_identity.as_str())
+        })
+    {
+        return Err("repair delta command invalidations are invalid".to_string());
+    }
+
+    if !is_strictly_sorted_unique(&delta.newly_realized_surfaces)
+        || delta.newly_realized_surfaces.iter().any(|surface| {
+            !structured_surface_is_canonical(surface)
+                || baseline.implementation_surfaces.contains(surface)
+                || !baseline.repair_scope.surfaces.contains(surface)
+        })
+    {
+        return Err("repair delta contract surfaces are invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_rereview_audit_metadata(
+    receipt: &CompletionReviewReceiptV2,
+    parent: Option<&CompletionReviewReceiptV2>,
+    manifest: Option<&RequirementManifestSnapshot>,
+) -> Result<(), String> {
+    let has_audit_metadata = receipt.repair_baseline.is_some()
+        || receipt.baseline_hash.is_some()
+        || receipt.input_mode.is_some()
+        || receipt.delta_hash.is_some()
+        || receipt.rereview_delta.is_some()
+        || !receipt.fallback_reasons.is_empty()
+        || receipt.candidate_implementation_identity.is_some()
+        || receipt.rereview_audit_hash.is_some();
+
+    match receipt.attempt_kind {
+        CompletionReviewAttemptKind::InitialReview => {
+            if receipt.input_mode.is_some()
+                || receipt.delta_hash.is_some()
+                || receipt.rereview_delta.is_some()
+                || !receipt.fallback_reasons.is_empty()
+                || receipt.candidate_implementation_identity.is_some()
+                || receipt.rereview_audit_hash.is_some()
+            {
+                return Err("initial review contains rereview audit metadata".to_string());
+            }
+            match (
+                receipt.repair_instruction_hash.as_ref(),
+                receipt.repair_baseline.as_ref(),
+                receipt.baseline_hash.as_ref(),
+            ) {
+                (None, None, None) | (Some(_), None, None) => Ok(()),
+                (Some(_), Some(baseline), Some(baseline_hash)) => {
+                    let manifest = manifest.ok_or_else(|| {
+                        "repair baseline has no exact requirement manifest".to_string()
+                    })?;
+                    validate_persisted_repair_baseline(baseline, receipt, manifest)?;
+                    if repair_baseline_hash(baseline) != *baseline_hash {
+                        return Err("repair baseline hash is invalid".to_string());
+                    }
+                    Ok(())
+                }
+                _ => Err("initial review repair baseline metadata is incomplete".to_string()),
+            }
+        }
+        CompletionReviewAttemptKind::CorrectionEvidence
+        | CompletionReviewAttemptKind::TerminalClosure => {
+            if has_audit_metadata {
+                Err("non-review receipt contains repair-delta audit metadata".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        CompletionReviewAttemptKind::Rereview => {
+            if !has_audit_metadata {
+                return Ok(());
+            }
+            if receipt.repair_baseline.is_some() {
+                return Err("rereview duplicates the initial repair baseline".to_string());
+            }
+            let parent = parent
+                .filter(|parent| parent.attempt_kind == CompletionReviewAttemptKind::InitialReview)
+                .ok_or_else(|| "rereview audit metadata lacks its initial parent".to_string())?;
+            let input_mode = receipt
+                .input_mode
+                .ok_or_else(|| "rereview input mode is missing".to_string())?;
+            let candidate_identity = receipt
+                .candidate_implementation_identity
+                .as_ref()
+                .ok_or_else(|| "rereview candidate identity is missing".to_string())?;
+            let repair_instruction_hash = receipt
+                .repair_instruction_hash
+                .as_ref()
+                .ok_or_else(|| "rereview repair instruction hash is missing".to_string())?;
+            if candidate_identity != &receipt.implementation_identity_hash
+                || parent.repair_instruction_hash.as_ref() != Some(repair_instruction_hash)
+                || !is_strictly_sorted_unique(&receipt.fallback_reasons)
+            {
+                return Err("rereview audit lineage is invalid".to_string());
+            }
+
+            match input_mode {
+                RereviewInputMode::Delta => {
+                    let baseline = parent.repair_baseline.as_ref().ok_or_else(|| {
+                        "delta rereview parent has no repair baseline".to_string()
+                    })?;
+                    let parent_baseline_hash = parent
+                        .baseline_hash
+                        .as_ref()
+                        .ok_or_else(|| "delta rereview parent has no baseline hash".to_string())?;
+                    if receipt.baseline_hash.as_ref() != Some(parent_baseline_hash)
+                        || repair_baseline_hash(baseline) != *parent_baseline_hash
+                        || !receipt.fallback_reasons.is_empty()
+                    {
+                        return Err("delta rereview baseline binding is invalid".to_string());
+                    }
+                    let delta = receipt
+                        .rereview_delta
+                        .as_ref()
+                        .ok_or_else(|| "delta rereview payload is missing".to_string())?;
+                    let delta_hash = receipt
+                        .delta_hash
+                        .as_ref()
+                        .ok_or_else(|| "delta rereview hash is missing".to_string())?;
+                    if repair_delta_hash(delta) != *delta_hash
+                        || delta.baseline_hash != *parent_baseline_hash
+                        || delta.repair_instruction_hash != *repair_instruction_hash
+                        || delta.candidate_implementation_identity != *candidate_identity
+                    {
+                        return Err("delta rereview binding is invalid".to_string());
+                    }
+                    validate_repair_delta_contents(delta, baseline, &parent.findings)?;
+                }
+                RereviewInputMode::FullFallback => {
+                    if receipt.delta_hash.is_some()
+                        || receipt.rereview_delta.is_some()
+                        || receipt.fallback_reasons.is_empty()
+                        || receipt.baseline_hash != parent.baseline_hash
+                    {
+                        return Err("full-fallback rereview metadata is invalid".to_string());
+                    }
+                }
+            }
+
+            let input = RereviewInput {
+                input_mode,
+                baseline_hash: receipt.baseline_hash.clone(),
+                delta_hash: receipt.delta_hash.clone(),
+                fallback_reasons: receipt.fallback_reasons.clone(),
+                repair_instruction_hash: repair_instruction_hash.clone(),
+                candidate_implementation_identity: candidate_identity.clone(),
+                delta: receipt.rereview_delta.clone(),
+            };
+            let audit_hash = rereview_audit_hash(&input);
+            if receipt.rereview_audit_hash.as_ref() != Some(&audit_hash) {
+                return Err("rereview audit hash is invalid".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
 fn validate_v5_review_receipts(
     document: &TaskEvidenceDocument,
     ledger: &CompletionReviewLedgerV2,
@@ -5176,15 +7265,14 @@ fn validate_v5_review_receipts(
             .unwrap_or_default();
         for (index, finding) in receipt.findings.iter().enumerate() {
             if finding.finding_id != format!("{}/F{}", receipt.review_id, index + 1)
-                || finding.requirement_ids.is_empty()
                 || finding
                     .requirement_ids
                     .iter()
                     .any(|requirement_id| !valid_requirement_ids.contains(requirement_id.as_str()))
-                || !finding
-                    .requirement_ids
-                    .iter()
-                    .any(|requirement_id| active_requirement_ids.contains(requirement_id.as_str()))
+                || (!finding.requirement_ids.is_empty()
+                    && !finding.requirement_ids.iter().any(|requirement_id| {
+                        active_requirement_ids.contains(requirement_id.as_str())
+                    }))
                 || !COMPLETION_REVIEW_LENSES.contains(&finding.lens.as_str())
                 || finding.contract_surface.trim().is_empty()
                 || finding.severity.trim().is_empty()
@@ -5221,6 +7309,7 @@ fn validate_v5_review_receipts(
                 "manifest gap does not identify omitted immutable source material".to_string(),
             );
         }
+        validate_rereview_audit_metadata(receipt, parent, manifest)?;
         match receipt.attempt_kind {
             CompletionReviewAttemptKind::InitialReview => {
                 if !receipt.dispositions.is_empty()
@@ -5269,6 +7358,7 @@ fn validate_v5_review_receipts(
                 if correction.infrastructure_outcome != "ok"
                     || correction.terminal_outcome.is_some()
                     || correction.repair_instruction_hash != parent.repair_instruction_hash
+                    || receipt.repair_instruction_hash != parent.repair_instruction_hash
                     || !receipt_identity_matches(receipt, correction)
                 {
                     return Err("rereview is not bound to its correction evidence".to_string());
@@ -5305,7 +7395,6 @@ fn validate_v5_review_receipts(
                 } else if !receipt.findings.is_empty()
                     || !receipt.dispositions.is_empty()
                     || !receipt.manifest_gaps.is_empty()
-                    || receipt.repair_instruction_hash.is_some()
                     || receipt.review_clean
                     || receipt.terminal_outcome.is_some()
                     || superseded.is_some()
@@ -5679,6 +7768,13 @@ fn migrate_document_with_completion_model(
     {
         seed_migrated_v4_terminal_lineage(document);
     }
+    if source_schema_version <= FROZEN_TASK_EVIDENCE_V5_SCHEMA_VERSION {
+        document.source_classification_cache.clear();
+    } else {
+        document.source_classification_cache = canonical_source_classification_cache(
+            std::mem::take(&mut document.source_classification_cache),
+        );
+    }
     document.schema_version = TASK_EVIDENCE_SCHEMA_VERSION;
 }
 
@@ -5744,6 +7840,14 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
         dispositions: Vec::new(),
         manifest_gaps: Vec::new(),
         repair_instruction_hash: None,
+        repair_baseline: None,
+        baseline_hash: None,
+        input_mode: None,
+        delta_hash: None,
+        rereview_delta: None,
+        fallback_reasons: Vec::new(),
+        candidate_implementation_identity: None,
+        rereview_audit_hash: None,
         infrastructure_outcome: "migrated_v4_terminal".to_string(),
         review_clean: true,
         terminal_outcome,
@@ -6587,6 +8691,67 @@ mod tests {
         (temp, ledger)
     }
 
+    fn text_source(text: &str) -> UserInput {
+        UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }
+    }
+
+    async fn source_dossier(
+        ledger: &TaskEvidenceLedger,
+        candidate: Option<&str>,
+    ) -> CompletionReviewDossier {
+        ledger
+            .completion_review_dossier(
+                candidate,
+                &[],
+                &[],
+                &ReviewLensSelectionFacts::default(),
+                &[],
+                true,
+                true,
+            )
+            .await
+            .expect("completion review dossier")
+    }
+
+    fn text_local_classification(requirement_spans: Vec<SourceSpan>) -> SourceLocalClassification {
+        SourceLocalClassification {
+            local_kind: SourceLocalClassificationKind::RequirementBearing,
+            local_semantic_cues: requirement_spans
+                .iter()
+                .cloned()
+                .map(|source_span| LocalSemanticCue {
+                    kind: LocalSemanticCueKind::Assertion,
+                    source_span: Some(source_span),
+                })
+                .collect(),
+            requirement_spans,
+            reason: "immutable source contains requirements".to_string(),
+        }
+    }
+
+    fn resolved_requirement_source(
+        source: &UserSourceRecord,
+        requirement_spans: &[SourceSpan],
+    ) -> ClassifiedSource {
+        ClassifiedSource {
+            source_id: source.source_id.clone(),
+            kind: ClassifiedSourceKind::RequirementBearing,
+            requirements: requirement_spans
+                .iter()
+                .cloned()
+                .map(|source_span| ClassifiedRequirement {
+                    source_span,
+                    status: RequirementStatus::Active,
+                    superseded_by: None,
+                })
+                .collect(),
+            reason: None,
+        }
+    }
+
     fn plan(status: StepStatus) -> UpdatePlanArgs {
         UpdatePlanArgs {
             explanation: None,
@@ -6670,6 +8835,679 @@ mod tests {
                 .expect("document")
                 .revision,
             revision
+        );
+    }
+
+    fn repair_finding(id: &str, requirement_ids: &[&str]) -> CompletionReviewFindingReceipt {
+        CompletionReviewFindingReceipt {
+            finding_id: id.to_string(),
+            requirement_ids: requirement_ids.iter().map(|id| (*id).to_string()).collect(),
+            lens: "correctness".to_string(),
+            contract_surface: "task-evidence".to_string(),
+            severity: "blocking".to_string(),
+            evidence: "focused evidence".to_string(),
+            smallest_correction: "repair the bounded surface".to_string(),
+            proof_route: "focused test".to_string(),
+        }
+    }
+
+    fn repair_command(sequence: u64, identity: &str) -> RepairCommandDelta {
+        RepairCommandDelta {
+            sequence,
+            receipt_id: format!("command-{sequence}"),
+            command: format!("check-{sequence}"),
+            cwd: "repo".to_string(),
+            exit_code: Some(0),
+            timed_out: false,
+            implementation_identity: Some(identity.to_string()),
+        }
+    }
+
+    fn repair_surface(identifier: &str) -> StructuredContractSurface {
+        StructuredContractSurface {
+            kind: "rust_symbol".to_string(),
+            owner: "task_evidence".to_string(),
+            identifier: identifier.to_string(),
+        }
+    }
+
+    fn repair_baseline_fixture() -> RepairBaseline {
+        RepairBaseline {
+            path_states: vec![RepairPathState {
+                path: "src/lib.rs".to_string(),
+                exists: true,
+                content_hash: Some("before".to_string()),
+            }],
+            command_sequence_high_water_mark: 2,
+            command_bindings: vec![
+                BaselineCommandBinding {
+                    sequence: 1,
+                    receipt_id: "command-1".to_string(),
+                    implementation_identity: Some("before-identity".to_string()),
+                },
+                BaselineCommandBinding {
+                    sequence: 2,
+                    receipt_id: "command-2".to_string(),
+                    implementation_identity: Some("before-identity".to_string()),
+                },
+            ],
+            implementation_surfaces: vec![repair_surface("existing")],
+            repair_scope: RepairScope {
+                path_grammar_version: REPAIR_PATH_GRAMMAR_VERSION,
+                paths: vec![RepairPathScope::ExactFile {
+                    path: "src/lib.rs".to_string(),
+                }],
+                surfaces: vec![repair_surface("existing"), repair_surface("permitted-new")],
+                affected_requirement_ids: vec!["R1".to_string(), "R2".to_string()],
+            },
+            source_ledger_hash: "source".to_string(),
+            requirement_manifest_hash: "manifest".to_string(),
+            plan_structure_hash: "plan".to_string(),
+            default_child_mutation_identities: Vec::new(),
+            typed_mutation_identities: Vec::new(),
+            external_evidence_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn affected_requirements_are_deterministic_and_fail_closed() {
+        let active = ["R3", "R1", "R2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let findings = vec![
+            repair_finding("F1", &["R2", "R1", "R2"]),
+            repair_finding("F2", &["R1"]),
+        ];
+        assert_eq!(
+            derive_affected_requirement_ids(&active, &findings),
+            Ok(vec!["R1".to_string(), "R2".to_string()])
+        );
+        assert_eq!(
+            derive_affected_requirement_ids(&active, &[]),
+            Ok(vec!["R1".to_string(), "R2".to_string(), "R3".to_string()])
+        );
+        assert_eq!(
+            derive_affected_requirement_ids(&active, &[repair_finding("F3", &[])]),
+            Err(RereviewFallbackReason::RequirementManifestChanged)
+        );
+        assert_eq!(
+            derive_affected_requirement_ids(
+                &active,
+                &[repair_finding("F4", &["inactive-or-unknown"])]
+            ),
+            Err(RereviewFallbackReason::RequirementManifestChanged)
+        );
+    }
+
+    #[test]
+    fn repair_path_scope_uses_the_bounded_versioned_grammar() {
+        assert_eq!(
+            canonical_repair_path("src\\.\\lib.rs", false),
+            Ok("src/lib.rs".to_string())
+        );
+        for invalid in ["../src/lib.rs", "C:\\src\\lib.rs", "/src/lib.rs"] {
+            assert_eq!(
+                canonical_repair_path(invalid, false),
+                Err(RereviewFallbackReason::InvalidPath)
+            );
+        }
+
+        let exact = RepairPathScope::ExactFile {
+            path: "src/lib.rs".to_string(),
+        };
+        assert!(repair_scope_matches(&exact, "src/lib.rs").expect("exact scope"));
+        assert!(!repair_scope_matches(&exact, "src/lib.rs.bak").expect("exact boundary"));
+        let prefix = RepairPathScope::DirectoryPrefix {
+            path: "src".to_string(),
+        };
+        assert!(repair_scope_matches(&prefix, "src/nested/lib.rs").expect("prefix scope"));
+        assert!(!repair_scope_matches(&prefix, "src-other/lib.rs").expect("prefix boundary"));
+
+        let single = RepairPathScope::GeneratedPattern {
+            grammar_version: REPAIR_PATH_GRAMMAR_VERSION,
+            pattern: "generated/*/out.json".to_string(),
+        };
+        assert!(repair_scope_matches(&single, "generated/a/out.json").expect("wildcard"));
+        assert!(
+            !repair_scope_matches(&single, "generated/a/b/out.json").expect("bounded wildcard")
+        );
+        let recursive = RepairPathScope::GeneratedPattern {
+            grammar_version: REPAIR_PATH_GRAMMAR_VERSION,
+            pattern: "generated/**/out.json".to_string(),
+        };
+        assert!(
+            repair_scope_matches(&recursive, "generated/a/b/c/d/e/f/g/h/out.json")
+                .expect("bounded recursive wildcard")
+        );
+        assert!(
+            !repair_scope_matches(&recursive, "generated/a/b/c/d/e/f/g/h/i/out.json")
+                .expect("recursive wildcard limit")
+        );
+        for (version, pattern) in [
+            (REPAIR_PATH_GRAMMAR_VERSION + 1, "generated/*"),
+            (REPAIR_PATH_GRAMMAR_VERSION, "generated/file?.json"),
+            (REPAIR_PATH_GRAMMAR_VERSION, "generated/a*b.json"),
+            (REPAIR_PATH_GRAMMAR_VERSION, "generated/**/**/out.json"),
+        ] {
+            assert_eq!(
+                repair_scope_matches(
+                    &RepairPathScope::GeneratedPattern {
+                        grammar_version: version,
+                        pattern: pattern.to_string(),
+                    },
+                    "generated/file1.json"
+                ),
+                Err(RereviewFallbackReason::UnsupportedPathGrammar)
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                canonical_repair_path("SRC/Lib.rs", false),
+                Ok("src/lib.rs".to_string())
+            );
+            assert_eq!(
+                canonical_repair_path("src/é.rs", false),
+                Err(RereviewFallbackReason::AmbiguousWindowsCase)
+            );
+        }
+    }
+
+    #[test]
+    fn plan_status_is_non_structural_but_plan_contract_changes_are_structural() {
+        let original = EvidencePlanStep {
+            id: "implement".to_string(),
+            step: "Implement the runtime path".to_string(),
+            status: StepStatus::Implemented,
+            depends_on: vec!["design".to_string()],
+            acceptance_criteria: vec!["focused validation passes".to_string()],
+            runtime_paths: vec!["src/lib.rs".to_string()],
+            generated_artifacts: vec!["generated/schema.json".to_string()],
+            risks: vec!["protocol".to_string()],
+            requires_desktop_activation: false,
+            edit_paths: BTreeSet::from(["src/lib.rs".to_string()]),
+        };
+        let mut status_only = original.clone();
+        status_only.status = StepStatus::Passed;
+        assert_eq!(
+            plan_structure_hash(std::slice::from_ref(&original)),
+            plan_structure_hash(std::slice::from_ref(&status_only))
+        );
+
+        let mut changed_text = original.clone();
+        changed_text.step = "Change the runtime contract".to_string();
+        assert_ne!(
+            plan_structure_hash(std::slice::from_ref(&original)),
+            plan_structure_hash(std::slice::from_ref(&changed_text))
+        );
+        let mut changed_paths = original.clone();
+        changed_paths.edit_paths.insert("src/other.rs".to_string());
+        assert_ne!(
+            plan_structure_hash(std::slice::from_ref(&original)),
+            plan_structure_hash(std::slice::from_ref(&changed_paths))
+        );
+    }
+
+    #[test]
+    fn contained_delta_uses_sequence_bindings_and_permitted_surfaces_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("repo source directory");
+        std::fs::write(repo.join("src/lib.rs"), "after").expect("candidate source");
+        let baseline = repair_baseline_fixture();
+        let baseline_hash = repair_baseline_hash(&baseline);
+        let current = CurrentRepairSnapshot {
+            repository_root: repo.to_string_lossy().into_owned(),
+            path_states: vec![RepairPathState {
+                path: "src/lib.rs".to_string(),
+                exists: true,
+                content_hash: Some("after".to_string()),
+            }],
+            command_receipts: vec![
+                repair_command(3, "candidate"),
+                repair_command(1, "before-identity"),
+                repair_command(2, "before-identity"),
+            ],
+            plan_structure_hash: "plan".to_string(),
+            declared_path_scopes: baseline.repair_scope.paths.clone(),
+            implementation_surfaces: vec![
+                repair_surface("permitted-new"),
+                repair_surface("existing"),
+            ],
+            default_child_mutation_identities: vec![
+                serde_json::json!({ "paths": ["src/lib.rs"] }).to_string(),
+            ],
+            typed_mutation_identities: vec![
+                serde_json::json!({ "paths": ["src/lib.rs"] }).to_string(),
+            ],
+            external_evidence_ids: Vec::new(),
+            containment_errors: Vec::new(),
+        };
+        let original_findings = vec![repair_finding("F1", &["R1"])];
+        let input = build_rereview_input(
+            Some(&baseline),
+            Some(&baseline_hash),
+            Some("repair-hash"),
+            &original_findings,
+            &current,
+            "candidate",
+            "source",
+            "manifest",
+        )
+        .expect("rereview input");
+        assert_eq!(input.input_mode, RereviewInputMode::Delta);
+        assert!(input.fallback_reasons.is_empty());
+        let delta = input.delta.expect("contained delta");
+        assert_eq!(
+            delta
+                .new_command_receipts
+                .iter()
+                .map(|receipt| receipt.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(
+            delta
+                .invalidated_command_receipts
+                .iter()
+                .map(|receipt| receipt.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(delta.path_changes.len(), 1);
+        assert_eq!(
+            delta.newly_realized_surfaces,
+            vec![repair_surface("permitted-new")]
+        );
+        assert_eq!(input.delta_hash, Some(repair_delta_hash(&delta)));
+        assert!(validate_repair_delta_contents(&delta, &baseline, &original_findings).is_ok());
+        let mut tampered = delta;
+        tampered.affected_requirement_ids.push("R2".to_string());
+        assert!(validate_repair_delta_contents(&tampered, &baseline, &original_findings).is_err());
+    }
+
+    #[test]
+    fn full_fallback_collects_all_reasons_in_stable_enum_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("repo source directory");
+        let baseline = repair_baseline_fixture();
+        let current = CurrentRepairSnapshot {
+            repository_root: repo.to_string_lossy().into_owned(),
+            path_states: vec![RepairPathState {
+                path: "outside.rs".to_string(),
+                exists: true,
+                content_hash: Some("outside".to_string()),
+            }],
+            command_receipts: vec![
+                repair_command(1, "before-identity"),
+                repair_command(2, "before-identity"),
+            ],
+            plan_structure_hash: "changed-plan".to_string(),
+            declared_path_scopes: baseline.repair_scope.paths.clone(),
+            implementation_surfaces: vec![repair_surface("outside")],
+            default_child_mutation_identities: Vec::new(),
+            typed_mutation_identities: Vec::new(),
+            external_evidence_ids: vec!["new-evidence".to_string()],
+            containment_errors: vec![RereviewFallbackReason::UnrepresentableEvidenceChange],
+        };
+        let input = build_rereview_input(
+            Some(&baseline),
+            Some("wrong-baseline-hash"),
+            Some("repair-hash"),
+            &[repair_finding("F1", &["R1"])],
+            &current,
+            "candidate",
+            "changed-source",
+            "changed-manifest",
+        )
+        .expect("fallback input");
+        assert_eq!(input.input_mode, RereviewInputMode::FullFallback);
+        assert!(input.delta.is_none());
+        assert!(input.delta_hash.is_none());
+        assert_eq!(
+            input.fallback_reasons,
+            vec![
+                RereviewFallbackReason::InvalidBaselineHash,
+                RereviewFallbackReason::PathOutsideScope,
+                RereviewFallbackReason::SourceIdentityChanged,
+                RereviewFallbackReason::RequirementManifestChanged,
+                RereviewFallbackReason::PlanStructureChanged,
+                RereviewFallbackReason::ContractSurfaceOutsideScope,
+                RereviewFallbackReason::UnrepresentableEvidenceChange,
+            ]
+        );
+    }
+
+    #[test]
+    fn source_classification_cache_tolerates_bad_elements_and_invalidates_duplicate_keys() {
+        #[derive(Deserialize)]
+        struct CacheEnvelope {
+            #[serde(deserialize_with = "deserialize_source_classification_cache")]
+            source_classification_cache: Vec<SourceClassificationCacheEntry>,
+        }
+
+        let entry =
+            |content_hash: String, start: usize, end: usize| SourceClassificationCacheEntry {
+                contract_version: SOURCE_CLASSIFICATION_CONTRACT_VERSION.to_string(),
+                source_kind: UserSourceKind::Text,
+                content_hash,
+                classification: text_local_classification(vec![SourceSpan::Text { start, end }]),
+            };
+        let duplicate = entry("1".repeat(64), 0, 1);
+        let malformed_duplicate = entry("e".repeat(64), 0, 1);
+        let later = entry("f".repeat(64), 1, 2);
+        let earlier = entry("0".repeat(64), 0, 1);
+        let decoded: CacheEnvelope = serde_json::from_value(serde_json::json!({
+            "source_classification_cache": [
+                later,
+                {"not": "a cache entry"},
+                duplicate.clone(),
+                earlier,
+                duplicate,
+                malformed_duplicate,
+                {
+                    "contract_version": SOURCE_CLASSIFICATION_CONTRACT_VERSION,
+                    "source_kind": "text",
+                    "content_hash": "e".repeat(64),
+                    "classification": {"local_kind": "not_a_kind"}
+                },
+            ]
+        }))
+        .expect("tolerant cache envelope");
+
+        assert_eq!(decoded.source_classification_cache.len(), 2);
+        assert_eq!(
+            decoded
+                .source_classification_cache
+                .iter()
+                .map(|entry| entry.content_hash.clone())
+                .collect::<Vec<_>>(),
+            vec!["0".repeat(64), "f".repeat(64)]
+        );
+    }
+
+    #[test]
+    fn persisted_local_projection_contains_no_dossier_relative_fields() {
+        let entry = SourceClassificationCacheEntry {
+            contract_version: SOURCE_CLASSIFICATION_CONTRACT_VERSION.to_string(),
+            source_kind: UserSourceKind::Text,
+            content_hash: "a".repeat(64),
+            classification: text_local_classification(vec![SourceSpan::Text { start: 0, end: 9 }]),
+        };
+        let encoded = serde_json::to_string(&entry).expect("serialize cache entry");
+
+        for forbidden in [
+            "requirement_status",
+            "superseded_by",
+            "source_id",
+            "requirement_id",
+            "source_ordinal",
+            "completion_epoch",
+            "manifest_revision",
+        ] {
+            assert!(!encoded.contains(forbidden), "unexpected field {forbidden}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_source_occurrences_share_one_cache_entry_but_materialize_separately() {
+        let (_temp, ledger) = ledger_fixture().await;
+        let source = text_source("Use YAML.");
+        assert!(
+            ledger
+                .record_user_sources("message-1", &[source.clone()])
+                .await
+        );
+        assert!(ledger.record_user_sources("message-2", &[source]).await);
+        let dossier = source_dossier(&ledger, None).await;
+        assert_eq!(dossier.sources.len(), 2);
+        assert_eq!(
+            source_classification_cache_key(&dossier.sources[0]),
+            source_classification_cache_key(&dossier.sources[1])
+        );
+        let span = SourceSpan::Text { start: 0, end: 9 };
+        let key = source_classification_cache_key(&dossier.sources[0]);
+        let materialization = SourceMaterialization {
+            local_classifications: BTreeMap::from([(
+                key,
+                text_local_classification(vec![span.clone()]),
+            )]),
+            resolved_sources: dossier
+                .sources
+                .iter()
+                .map(|source| resolved_requirement_source(source, std::slice::from_ref(&span)))
+                .collect(),
+        };
+
+        assert_eq!(
+            ledger
+                .apply_source_classification(&dossier, materialization)
+                .await,
+            AtomicReviewTransition::Persisted(())
+        );
+        let refreshed = source_dossier(&ledger, None).await;
+        assert_eq!(refreshed.source_classification_cache.len(), 1);
+        assert_eq!(refreshed.requirements.len(), 2);
+        assert_ne!(
+            refreshed.requirements[0].requirement_id,
+            refreshed.requirements[1].requirement_id
+        );
+        assert!(refreshed.mappings_classified);
+    }
+
+    #[tokio::test]
+    async fn resolver_version_transition_can_change_status_without_rewriting_identity_or_history() {
+        let (_temp, ledger) = ledger_fixture().await;
+        assert!(
+            ledger
+                .record_user_sources("message-1", &[text_source("Use YAML.")])
+                .await
+        );
+        let dossier = source_dossier(&ledger, None).await;
+        let span = SourceSpan::Text { start: 0, end: 9 };
+        let key = source_classification_cache_key(&dossier.sources[0]);
+        let initial = SourceMaterialization {
+            local_classifications: BTreeMap::from([(
+                key.clone(),
+                text_local_classification(vec![span.clone()]),
+            )]),
+            resolved_sources: vec![resolved_requirement_source(
+                &dossier.sources[0],
+                std::slice::from_ref(&span),
+            )],
+        };
+        assert_eq!(
+            ledger.apply_source_classification(&dossier, initial).await,
+            AtomicReviewTransition::Persisted(())
+        );
+
+        let mut transition_dossier = source_dossier(&ledger, None).await;
+        let original_requirement = transition_dossier.requirements[0].clone();
+        let original_manifest_revision = transition_dossier.manifest_revision;
+        transition_dossier.relationship_resolution_current = false;
+        transition_dossier.mappings_classified = false;
+        let replacement = SourceMaterialization {
+            local_classifications: BTreeMap::from([(
+                key,
+                text_local_classification(vec![span.clone()]),
+            )]),
+            resolved_sources: vec![ClassifiedSource {
+                source_id: transition_dossier.sources[0].source_id.clone(),
+                kind: ClassifiedSourceKind::RequirementBearing,
+                requirements: vec![ClassifiedRequirement {
+                    source_span: span,
+                    status: RequirementStatus::Withdrawn,
+                    superseded_by: None,
+                }],
+                reason: None,
+            }],
+        };
+        assert_eq!(
+            ledger
+                .apply_source_classification(&transition_dossier, replacement)
+                .await,
+            AtomicReviewTransition::Persisted(())
+        );
+
+        let refreshed = source_dossier(&ledger, None).await;
+        assert_eq!(refreshed.manifest_revision, original_manifest_revision + 1);
+        assert_eq!(refreshed.requirements.len(), 1);
+        let rematerialized = &refreshed.requirements[0];
+        assert_eq!(
+            rematerialized.requirement_id,
+            original_requirement.requirement_id
+        );
+        assert_eq!(rematerialized.source_id, original_requirement.source_id);
+        assert_eq!(
+            rematerialized.source_content_hash,
+            original_requirement.source_content_hash
+        );
+        assert_eq!(rematerialized.source_span, original_requirement.source_span);
+        assert_eq!(
+            rematerialized.exact_material,
+            original_requirement.exact_material
+        );
+        assert_eq!(rematerialized.status, RequirementStatus::Withdrawn);
+        let guard = ledger.document.lock().await;
+        let history = &guard
+            .as_ref()
+            .expect("document")
+            .completion_review_v2
+            .as_ref()
+            .expect("completion review ledger")
+            .manifest_snapshots;
+        assert!(history.iter().any(|snapshot| {
+            snapshot.manifest_revision == original_manifest_revision
+                && snapshot.requirements == vec![original_requirement.clone()]
+        }));
+    }
+
+    #[tokio::test]
+    async fn non_authoring_materialization_failure_is_atomic() {
+        let (_temp, ledger) = ledger_fixture().await;
+        assert!(
+            ledger
+                .record_user_sources("message-1", &[text_source("Use YAML.")])
+                .await
+        );
+        let dossier = source_dossier(&ledger, None).await;
+        let span = SourceSpan::Text { start: 0, end: 9 };
+        let key = source_classification_cache_key(&dossier.sources[0]);
+        let mut resolved = resolved_requirement_source(&dossier.sources[0], &[]);
+        resolved.kind = ClassifiedSourceKind::RequirementBearing;
+        let invalid = SourceMaterialization {
+            local_classifications: BTreeMap::from([(key, text_local_classification(vec![span]))]),
+            resolved_sources: vec![resolved],
+        };
+
+        assert_eq!(
+            ledger.apply_source_classification(&dossier, invalid).await,
+            AtomicReviewTransition::Failed
+        );
+        let refreshed = source_dossier(&ledger, None).await;
+        assert_eq!(refreshed.document_revision, dossier.document_revision);
+        assert!(refreshed.source_classification_cache.is_empty());
+        assert!(refreshed.requirements.is_empty());
+        assert!(!refreshed.mappings_classified);
+    }
+
+    #[tokio::test]
+    async fn manifest_gap_correction_updates_cache_for_later_reconstruction() {
+        let (_temp, ledger) = ledger_fixture().await;
+        let material = "Use JSON. Encrypt it.";
+        assert!(
+            ledger
+                .record_user_sources("message-1", &[text_source(material)])
+                .await
+        );
+        let dossier = source_dossier(&ledger, None).await;
+        let first = SourceSpan::Text { start: 0, end: 9 };
+        let omitted = SourceSpan::Text {
+            start: 10,
+            end: material.len(),
+        };
+        let key = source_classification_cache_key(&dossier.sources[0]);
+        let initial = SourceMaterialization {
+            local_classifications: BTreeMap::from([(
+                key.clone(),
+                text_local_classification(vec![first.clone()]),
+            )]),
+            resolved_sources: vec![resolved_requirement_source(
+                &dossier.sources[0],
+                std::slice::from_ref(&first),
+            )],
+        };
+        assert_eq!(
+            ledger.apply_source_classification(&dossier, initial).await,
+            AtomicReviewTransition::Persisted(())
+        );
+
+        let classified = source_dossier(&ledger, None).await;
+        let gaps = vec![ManifestGapInput {
+            source_id: classified.sources[0].source_id.clone(),
+            omitted_spans: vec![omitted.clone()],
+        }];
+        let corrected = source_local_classifications_with_manifest_gaps(&classified, &gaps)
+            .expect("corrected local facts");
+        assert_eq!(
+            corrected
+                .get(&key)
+                .expect("corrected key")
+                .requirement_spans,
+            vec![first.clone(), omitted.clone()]
+        );
+        let replacement = SourceMaterialization {
+            local_classifications: corrected,
+            resolved_sources: vec![resolved_requirement_source(
+                &classified.sources[0],
+                &[first, omitted.clone()],
+            )],
+        };
+        assert_eq!(
+            ledger
+                .apply_source_classification(&classified, replacement)
+                .await,
+            AtomicReviewTransition::Persisted(())
+        );
+
+        let reconstructed = source_dossier(&ledger, None).await;
+        assert_eq!(reconstructed.requirements.len(), 2);
+        assert!(
+            reconstructed
+                .source_classification_cache
+                .get(&key)
+                .expect("persisted corrected cache entry")
+                .requirement_spans
+                .contains(&omitted)
+        );
+    }
+
+    #[test]
+    fn symlink_escape_is_uncontained() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&repo).expect("repo directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        std::fs::write(outside.join("file.rs"), "outside").expect("outside file");
+        let link = repo.join("link");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).expect("directory symlink");
+        #[cfg(windows)]
+        if let Err(err) = std::os::windows::fs::symlink_dir(&outside, &link) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("directory symlink: {err}");
+        }
+
+        assert_eq!(
+            path_resolves_within_repository(&repo.to_string_lossy(), "link/file.rs"),
+            Err(RereviewFallbackReason::SymlinkEscape)
         );
     }
 }

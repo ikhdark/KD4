@@ -147,7 +147,7 @@ pub fn normalize_repo_scopes(
     Ok(normalized)
 }
 
-pub(crate) fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<String> {
+pub fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<String> {
     let canonical_root = repository_identity(repo_root)?.canonical_root;
     let normalized = normalize_lexically(path)?;
     canonical_relative_identity(&canonical_root, &normalized)

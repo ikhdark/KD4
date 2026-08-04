@@ -689,7 +689,7 @@ fn spawn_agent_common_properties_v2(
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(format!(
-                "Optional number of turns to fork. Defaults to `none`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns.{full_history_override_guidance}"
+                "Optional fork mode. For typed assignments, omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; for legacy messages, omitted or `none` creates a fresh non-forked child. Use `all` or a positive integer string such as `3` for history-bearing forks.{full_history_override_guidance}"
             ))),
         ),
         (
@@ -763,6 +763,57 @@ fn typed_assignment_schema() -> JsonSchema {
         ]),
         Some(false.into()),
     );
+    let file_handle = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "kind".to_string(),
+                JsonSchema::string_enum(
+                    vec![json!("file")],
+                    Some("File handle variant.".to_string()),
+                ),
+            ),
+            (
+                "path".to_string(),
+                JsonSchema::string(Some(
+                    "Repository-relative existing file or missing intended file; directories are rejected."
+                        .to_string(),
+                )),
+            ),
+        ]),
+        Some(vec!["kind".to_string(), "path".to_string()]),
+        Some(false.into()),
+    );
+    let symbol_handle = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "kind".to_string(),
+                JsonSchema::string_enum(
+                    vec![json!("symbol")],
+                    Some("Symbol handle variant.".to_string()),
+                ),
+            ),
+            (
+                "path".to_string(),
+                JsonSchema::string(Some(
+                    "Repository-relative existing file or missing intended file; directories are rejected."
+                        .to_string(),
+                )),
+            ),
+            (
+                "symbol".to_string(),
+                JsonSchema::string(Some(
+                    "Stable compiler-neutral symbol locator; line spans are not accepted."
+                        .to_string(),
+                )),
+            ),
+        ]),
+        Some(vec![
+            "kind".to_string(),
+            "path".to_string(),
+            "symbol".to_string(),
+        ]),
+        Some(false.into()),
+    );
     let mut schema = JsonSchema::object(
         BTreeMap::from([
             (
@@ -826,6 +877,16 @@ fn typed_assignment_schema() -> JsonSchema {
                 ),
             ),
             (
+                "relevant_handles".to_string(),
+                JsonSchema::array(
+                    JsonSchema::any_of(vec![file_handle, symbol_handle], None),
+                    Some(
+                        "Explicit non-recursive file or symbol handles included in a typed TaskCapsule. Paths must be covered by read_scope or write_scope; duplicate handles are rejected."
+                            .to_string(),
+                    ),
+                ),
+            ),
+            (
                 "workspace_strategy".to_string(),
                 JsonSchema::string_enum(
                     vec![json!("auto"), json!("shared"), json!("isolated")],
@@ -846,7 +907,7 @@ fn typed_assignment_schema() -> JsonSchema {
         Some(false.into()),
     );
     schema.description = Some(
-        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit typed-capable agent_type (a built-in role or its configured kd4_ alias)."
+        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit typed-capable agent_type (a built-in role or its configured kd4_ alias). With omitted or `none` fork_turns, one structured TaskCapsule replaces the plaintext typed bootstrap message and is the sole initial task input."
             .to_string(),
     );
     schema
@@ -949,7 +1010,7 @@ The new agent's canonical task name will be provided to it along with the messag
 Use `assignment` for durable typed coordination or `message` for a legacy plain-text task; exactly one is required. Typed assignments require an explicit typed-capable `agent_type` (a built-in role or its configured `kd4_` alias) and return an `assignment_id`.
 
     {full_history_override_guidance}
-Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
+For typed assignments, omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. For legacy `message` spawning, omitted or `none` creates a fresh non-forked child. `fork_turns="all"` and positive integers retain history-bearing fork behavior."#
     );
 
     if let Some(usage_hint_text) = usage_hint_text {

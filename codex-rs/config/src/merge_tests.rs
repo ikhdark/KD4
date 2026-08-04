@@ -21,6 +21,30 @@ fn feature_config(key: &str, enabled: bool) -> TomlValue {
 }
 
 #[test]
+fn empty_higher_reasoning_phase_table_preserves_lower_entries() {
+    let mut base = parse_toml(
+        r#"
+[reasoning_phase_efforts]
+orient = "medium"
+inspect = "low"
+"#,
+    );
+    let overlay = parse_toml("[reasoning_phase_efforts]");
+
+    merge_toml_values(&mut base, &overlay);
+
+    let config: ConfigToml = base.try_into().expect("merged config should deserialize");
+    assert_eq!(
+        config.reasoning_phase_efforts,
+        Some(crate::config_toml::ReasoningPhaseEfforts {
+            orient: Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+            inspect: Some(codex_protocol::openai_models::ReasoningEffort::Low),
+            ..Default::default()
+        })
+    );
+}
+
+#[test]
 fn merge_toml_values_normalizes_legacy_key_from_base_layer() {
     let mut base = parse_toml(
         r#"
