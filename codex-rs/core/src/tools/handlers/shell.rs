@@ -202,6 +202,12 @@ pub(super) async fn run_exec_like_with_exit_code(
         && !inspection_command
         && !intercepted_apply_patch
     {
+        let reservation = args
+            .session
+            .services
+            .command_execution
+            .reserve_workspace_mutation(&repo_root)
+            .await;
         if coordinator.store().is_none() {
             coordinator
                 .initialize_for_workspace_coordination(
@@ -268,7 +274,7 @@ pub(super) async fn run_exec_like_with_exit_code(
                     "shell command could not acquire the repository-wide mutation lease: {error}"
                 ))
             })?;
-        workspace_mutation = Some((store, repo_root.clone(), lease));
+        workspace_mutation = Some((store, repo_root.clone(), lease, reservation));
     }
     let focused_validation_command = if typed_binding.is_some() && !inspection_command {
         let command_summary = focused_validation_command_summary(
@@ -497,52 +503,53 @@ pub(super) async fn run_exec_like_with_exit_code(
         }))
     });
     let workspace_heartbeat_stop = CancellationToken::new();
-    let workspace_heartbeat_task = workspace_mutation
-        .as_ref()
-        .map(|(store, repo_root, lease)| {
-            let store = store.clone();
-            let repo_root = repo_root.clone();
-            let lease_id = lease.lease_id.clone();
-            let actor_id = lease.actor_id.clone();
-            let workspace_heartbeat_stop = workspace_heartbeat_stop.clone();
-            let command_cancellation = args.cancellation_token.clone();
-            AbortOnDropHandle::new(tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = workspace_heartbeat_stop.cancelled() => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                            match store
-                                .heartbeat_workspace_mutation(
-                                    &repo_root,
-                                    lease_id.clone(),
-                                    actor_id.clone(),
-                                )
-                                .await
-                            {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    tracing::warn!(
-                                        %lease_id,
-                                        "workspace mutation lease expired before heartbeat"
-                                    );
-                                    command_cancellation.cancel();
-                                    break;
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        %lease_id,
-                                        "workspace mutation heartbeat failed"
-                                    );
-                                    command_cancellation.cancel();
-                                    break;
+    let workspace_heartbeat_task =
+        workspace_mutation
+            .as_ref()
+            .map(|(store, repo_root, lease, _reservation)| {
+                let store = store.clone();
+                let repo_root = repo_root.clone();
+                let lease_id = lease.lease_id.clone();
+                let actor_id = lease.actor_id.clone();
+                let workspace_heartbeat_stop = workspace_heartbeat_stop.clone();
+                let command_cancellation = args.cancellation_token.clone();
+                AbortOnDropHandle::new(tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = workspace_heartbeat_stop.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                                match store
+                                    .heartbeat_workspace_mutation(
+                                        &repo_root,
+                                        lease_id.clone(),
+                                        actor_id.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        tracing::warn!(
+                                            %lease_id,
+                                            "workspace mutation lease expired before heartbeat"
+                                        );
+                                        command_cancellation.cancel();
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            %lease_id,
+                                            "workspace mutation heartbeat failed"
+                                        );
+                                        command_cancellation.cancel();
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }))
-        });
+                }))
+            });
     let cancellation_token = args.cancellation_token.clone();
     let result = run_exec_like_with_exit_code_inner(args, focused_validation.is_some()).await;
     heartbeat_stop.cancel();
@@ -558,7 +565,7 @@ pub(super) async fn run_exec_like_with_exit_code(
         tracing::warn!(%error, "workspace mutation heartbeat task failed");
     }
     let workspace_record_result = match workspace_mutation {
-        Some((store, repo_root, lease)) => store
+        Some((store, repo_root, lease, _reservation)) => store
             .finish_workspace_mutation(&repo_root, lease)
             .await
             .map(|_| ())

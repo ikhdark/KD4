@@ -325,6 +325,35 @@ pub(crate) mod spawn_tool_spec {
 mod built_in {
     use super::*;
 
+    const READ_ONLY: &str = "sandbox_mode = \"read-only\"\n";
+    const READ_ONLY_WITH_ELEVATED_WINDOWS_SANDBOX: &str =
+        "sandbox_mode = \"read-only\"\n\n[windows]\nsandbox = \"elevated\"\n";
+
+    /// Keeps built-in read-only roles usable on Windows kernels where the legacy
+    /// restricted-token backend cannot safely enforce delete boundaries.
+    ///
+    /// The elevated backend still enforces the same read-only permission profile;
+    /// this only changes the Windows sandbox implementation selected for the child.
+    pub(super) fn read_only_config_file_contents_for_legacy_compatibility(
+        legacy_windows_sandbox_compatible: bool,
+    ) -> &'static str {
+        if legacy_windows_sandbox_compatible {
+            READ_ONLY
+        } else {
+            READ_ONLY_WITH_ELEVATED_WINDOWS_SANDBOX
+        }
+    }
+
+    fn read_only_config_file_contents() -> &'static str {
+        #[cfg(target_os = "windows")]
+        let legacy_windows_sandbox_compatible =
+            codex_windows_sandbox::legacy_restricted_token_enforces_delete_child();
+        #[cfg(not(target_os = "windows"))]
+        let legacy_windows_sandbox_compatible = true;
+
+        read_only_config_file_contents_for_legacy_compatibility(legacy_windows_sandbox_compatible)
+    }
+
     /// Returns the cached built-in role declarations defined in this module.
     pub(super) fn configs() -> &'static BTreeMap<String, AgentRoleConfig> {
         static CONFIG: LazyLock<BTreeMap<String, AgentRoleConfig>> = LazyLock::new(|| {
@@ -424,10 +453,11 @@ Rules:
 
     /// Resolves a built-in role `config_file` path to embedded content.
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
-        const READ_ONLY: &str = "sandbox_mode = \"read-only\"\n";
         const AWAITER: &str = include_str!("builtins/awaiter.toml");
         match path.to_str()? {
-            "explorer.toml" | "reviewer.toml" | "verifier.toml" => Some(READ_ONLY),
+            "explorer.toml" | "reviewer.toml" | "verifier.toml" => {
+                Some(read_only_config_file_contents())
+            }
             "awaiter.toml" => Some(AWAITER),
             _ => None,
         }

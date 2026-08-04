@@ -1878,10 +1878,17 @@ async fn run_sampling_request(
         Some(router) => router,
         None => built_tools(sess.as_ref(), step_context.as_ref(), &cancellation_token).await?,
     };
+    step_context
+        .set_tool_router(Arc::clone(&router))
+        .map_err(|_| {
+            CodexErr::Stream(
+                "sampling step tool router was already finalized".to_string(),
+                None,
+            )
+        })?;
     let base_instructions = sess.get_base_instructions().await;
 
     let tool_runtime = ToolCallRuntime::new(
-        Arc::clone(&router),
         Arc::clone(&sess),
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
@@ -1889,7 +1896,6 @@ async fn run_sampling_request(
     let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
         &sess,
         Arc::clone(&step_context),
-        Arc::clone(&router),
         Arc::clone(&turn_diff_tracker),
     );
     let max_retries = turn_context.provider.info().stream_max_retries();

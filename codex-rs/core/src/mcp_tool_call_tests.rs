@@ -205,8 +205,8 @@ fn runtime_for_sampled_mcp_tool(
         ToolRegistry::from_tools([handler]),
         Vec::new(),
     ));
+    let step_context = step_context.with_tool_router_for_test(router);
     ToolCallRuntime::new(
-        router,
         session,
         step_context,
         Arc::new(Mutex::new(TurnDiffTracker::new())),

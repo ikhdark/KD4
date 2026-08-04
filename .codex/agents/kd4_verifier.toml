@@ -13,5 +13,5 @@ wiring requirements, and any task-scope limitation to the coordinator. Do not
 modify source or shared harness state, or stage, commit, push, or publish.
 """
 model = "gpt-5.6-sol"
-model_reasoning_effort = "xhigh"
-default_permissions = ":read-only"
+model_reasoning_effort = "high"
+

@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::WorkspaceMutationLease;
 use tokio::sync::Mutex;
+use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -142,6 +144,10 @@ pub(crate) struct RunningWorkspaceMutation {
     inner: Arc<RunningWorkspaceMutationInner>,
 }
 
+pub(crate) struct WorkspaceMutationReservation {
+    _guard: OwnedMutexGuard<()>,
+}
+
 struct RunningWorkspaceMutationInner {
     store: Arc<dyn AgentTaskStore>,
     repo_root: PathBuf,
@@ -149,6 +155,7 @@ struct RunningWorkspaceMutationInner {
     stop: CancellationToken,
     lease_lost: CancellationToken,
     finalized: Arc<Mutex<bool>>,
+    reservation: Mutex<Option<WorkspaceMutationReservation>>,
     _heartbeat_task: AbortOnDropHandle<()>,
 }
 
@@ -168,6 +175,7 @@ impl RunningWorkspaceMutation {
         repo_root: PathBuf,
         lease: WorkspaceMutationLease,
         owner_cancelled: CancellationToken,
+        reservation: WorkspaceMutationReservation,
     ) -> Self {
         let stop = CancellationToken::new();
         let heartbeat_stop = stop.clone();
@@ -229,6 +237,7 @@ impl RunningWorkspaceMutation {
                 stop,
                 lease_lost,
                 finalized: Arc::new(Mutex::new(false)),
+                reservation: Mutex::new(Some(reservation)),
                 _heartbeat_task: heartbeat_task,
             }),
         }
@@ -255,6 +264,7 @@ impl RunningWorkspaceMutation {
             .map_err(|error| error.to_string())?;
         *finalized = true;
         self.inner.stop.cancel();
+        self.inner.reservation.lock().await.take();
         Ok(())
     }
 }
@@ -273,9 +283,27 @@ struct CommandExecutionState {
 #[derive(Default)]
 pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
+    workspace_mutation_gates: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 impl CommandExecutionLedger {
+    pub(crate) async fn reserve_workspace_mutation(
+        &self,
+        repo_root: &Path,
+    ) -> WorkspaceMutationReservation {
+        let gate = {
+            let mut gates = self.workspace_mutation_gates.lock().await;
+            Arc::clone(
+                gates
+                    .entry(repo_root.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        WorkspaceMutationReservation {
+            _guard: gate.lock_owned().await,
+        }
+    }
+
     pub(crate) async fn observe_repository_revision(
         &self,
         turn_id: &str,
@@ -532,6 +560,7 @@ mod tests {
         TempDir,
         TempDir,
         Arc<LocalAgentTaskStore>,
+        Arc<CommandExecutionLedger>,
         RunningWorkspaceMutation,
     ) {
         let codex_home = TempDir::new().expect("codex home tempdir");
@@ -545,6 +574,8 @@ mod tests {
                 .await
                 .expect("task store initializes"),
         );
+        let ledger = Arc::new(CommandExecutionLedger::default());
+        let reservation = ledger.reserve_workspace_mutation(repo.path()).await;
         let lease = store
             .begin_workspace_mutation(
                 repo.path(),
@@ -566,12 +597,49 @@ mod tests {
             repo.path().to_path_buf(),
             lease,
             owner_cancelled,
+            reservation,
         );
-        (codex_home, repo, store, running)
+        (codex_home, repo, store, ledger, running)
     }
 
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
+    }
+
+    #[tokio::test]
+    async fn workspace_mutation_reservations_serialize_per_repository() {
+        let ledger = Arc::new(CommandExecutionLedger::default());
+        let first_repo = TempDir::new().expect("first repository tempdir");
+        let second_repo = TempDir::new().expect("second repository tempdir");
+        let first = ledger.reserve_workspace_mutation(first_repo.path()).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiting_ledger = Arc::clone(&ledger);
+        let waiting_repo = first_repo.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).expect("waiter starts");
+            waiting_ledger
+                .reserve_workspace_mutation(&waiting_repo)
+                .await
+        });
+        started_rx.await.expect("waiter reports startup");
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a same-repository mutation reservation must wait"
+        );
+
+        let different_repo = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ledger.reserve_workspace_mutation(second_repo.path()),
+        )
+        .await
+        .expect("a different repository remains independent");
+        drop(different_repo);
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("same-repository waiter proceeds after release")
+            .expect("same-repository waiter task succeeds");
     }
 
     #[tokio::test]
@@ -659,9 +727,8 @@ mod tests {
 
     #[tokio::test]
     async fn background_completion_releases_mutation_before_poll() {
-        let (_codex_home, repo, store, mutation) =
+        let (_codex_home, repo, store, ledger, mutation) =
             running_workspace_mutation(CancellationToken::new()).await;
-        let ledger = CommandExecutionLedger::default();
         let command_key = key("background-success.exe");
         ledger
             .track_running_process(
@@ -678,6 +745,12 @@ mod tests {
             ledger.running_process(42).await.is_some(),
             "completed metadata remains available for a later poll"
         );
+        let _next_reservation = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ledger.reserve_workspace_mutation(repo.path()),
+        )
+        .await
+        .expect("background completion releases the same-repository reservation");
 
         let replacement = store
             .begin_workspace_mutation(
@@ -704,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn owner_cancellation_stops_heartbeat_and_signals_process_termination() {
         let owner_cancelled = CancellationToken::new();
-        let (_codex_home, _repo, _store, mutation) =
+        let (_codex_home, _repo, _store, _ledger, mutation) =
             running_workspace_mutation(owner_cancelled.clone()).await;
         let lease_lost = mutation.lease_lost_token();
 
@@ -720,10 +793,9 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_turn_revokes_only_its_mutating_background_process() {
-        let (_codex_home, _repo, _store, mutation) =
+        let (_codex_home, _repo, _store, ledger, mutation) =
             running_workspace_mutation(CancellationToken::new()).await;
         let lease_lost = mutation.lease_lost_token();
-        let ledger = CommandExecutionLedger::default();
         ledger
             .track_running_process(
                 42,

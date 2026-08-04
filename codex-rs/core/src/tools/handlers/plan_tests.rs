@@ -308,10 +308,10 @@ async fn cancellation_after_plan_commit_boundary_waits_for_durable_update() {
         ToolRegistry::from_tools([handler]),
         Vec::new(),
     ));
+    let step_context = StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router);
     let runtime = ToolCallRuntime::new(
-        router,
         session,
-        StepContext::for_test(Arc::clone(&turn)),
+        step_context,
         Arc::new(Mutex::new(TurnDiffTracker::new())),
     );
     let cancellation_token = CancellationToken::new();

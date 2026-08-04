@@ -229,6 +229,11 @@ async fn begin_unified_exec_workspace_mutation(
         WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
     };
     let repo_root = get_git_repo_root(command_cwd).unwrap_or_else(|| command_cwd.to_path_buf());
+    let reservation = session
+        .services
+        .command_execution
+        .reserve_workspace_mutation(&repo_root)
+        .await;
     session
         .services
         .agent_control
@@ -263,6 +268,7 @@ async fn begin_unified_exec_workspace_mutation(
         repo_root,
         lease,
         owner_cancelled,
+        reservation,
     ))
 }
 

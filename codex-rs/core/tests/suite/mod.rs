@@ -64,6 +64,8 @@ mod guardian_review;
 mod hooks;
 #[cfg(not(target_os = "windows"))]
 mod hooks_mcp;
+#[cfg(target_os = "windows")]
+mod hooks_windows;
 mod image_rollout;
 mod investigation_evidence_schema;
 mod items;

@@ -101,7 +101,53 @@ async fn apply_explorer_role_sets_read_only_permissions() {
         config.permissions.permission_profile(),
         &PermissionProfile::read_only()
     );
+    #[cfg(target_os = "windows")]
+    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
+        assert_eq!(
+            config.permissions.windows_sandbox_mode,
+            Some(codex_config::types::WindowsSandboxModeToml::Elevated)
+        );
+    }
     assert_eq!(session_flags_layer_count(&config), before_layers + 1);
+}
+
+#[test]
+fn read_only_role_config_keeps_existing_backend_when_legacy_windows_is_compatible() {
+    let config: TomlValue = toml::from_str(
+        built_in::read_only_config_file_contents_for_legacy_compatibility(
+            /*legacy_windows_sandbox_compatible*/ true,
+        ),
+    )
+    .expect("built-in read-only role config should parse");
+
+    assert_eq!(
+        config.get("sandbox_mode").and_then(TomlValue::as_str),
+        Some("read-only")
+    );
+    assert!(config.get("windows").is_none());
+}
+
+#[test]
+fn read_only_role_config_uses_elevated_windows_when_legacy_windows_is_incompatible() {
+    let config: TomlValue = toml::from_str(
+        built_in::read_only_config_file_contents_for_legacy_compatibility(
+            /*legacy_windows_sandbox_compatible*/ false,
+        ),
+    )
+    .expect("built-in read-only role config should parse");
+
+    assert_eq!(
+        config.get("sandbox_mode").and_then(TomlValue::as_str),
+        Some("read-only")
+    );
+    assert_eq!(
+        config
+            .get("windows")
+            .and_then(TomlValue::as_table)
+            .and_then(|windows| windows.get("sandbox"))
+            .and_then(TomlValue::as_str),
+        Some("elevated")
+    );
 }
 
 #[tokio::test]

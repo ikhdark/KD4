@@ -205,6 +205,17 @@ impl StepContext {
             /*loaded_agents_md*/ None,
         ))
     }
+
+    pub(crate) fn with_tool_router_for_test(
+        self: Arc<Self>,
+        tool_router: Arc<ToolRouter>,
+    ) -> Arc<Self> {
+        assert!(
+            self.set_tool_router(tool_router).is_ok(),
+            "test step context tool router should be unset"
+        );
+        self
+    }
 }
 
 mod guardian_tests;
@@ -691,8 +702,9 @@ fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> T
         },
         &Default::default(),
     ));
+    let step_context = step_context.with_tool_router_for_test(router);
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    ToolCallRuntime::new(router, session, step_context, tracker)
+    ToolCallRuntime::new(session, step_context, tracker)
 }
 
 fn make_connector(id: &str, name: &str) -> AppInfo {
