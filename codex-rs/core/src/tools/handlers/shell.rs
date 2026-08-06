@@ -199,18 +199,43 @@ pub(super) async fn run_exec_like_with_exit_code(
         codex_apply_patch::maybe_parse_apply_patch(&args.exec_params.command, &apply_patch_cwd),
         codex_apply_patch::MaybeApplyPatch::NotApplyPatch
     );
+    let focused_validation_admission = (!inspection_command).then(|| {
+        focused_validation_command_summary(
+            &args.safety_command,
+            &args.hook_command,
+            args.shell_type.is_none() && !args.is_powershell_script,
+            args.exec_params.cwd.as_path(),
+            repo_root.as_path(),
+            &args.exec_params.expiration,
+            args.exec_params
+                .sandbox_permissions
+                .requests_sandbox_override(),
+            args.additional_permissions.is_some(),
+            args.prefix_rule.is_some(),
+        )
+    });
+    let admitted_nonmutating_validation = focused_validation_admission
+        .as_ref()
+        .is_some_and(Result::is_ok);
     let mut workspace_mutation = None;
-    if typed_binding.is_none()
-        && !independent_review
-        && !inspection_command
-        && !intercepted_apply_patch
-    {
+    if requires_repository_wide_mutation_lease(
+        typed_binding.is_some(),
+        independent_review,
+        inspection_command,
+        intercepted_apply_patch,
+        admitted_nonmutating_validation,
+    ) {
         let reservation = args
             .session
             .services
             .command_execution
-            .reserve_workspace_mutation(&repo_root)
-            .await;
+            .reserve_workspace_mutation_until_cancelled(&repo_root, &args.cancellation_token)
+            .await
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "shell command mutation-reservation wait was cancelled".to_string(),
+                )
+            })?;
         if coordinator.store().is_none() {
             coordinator
                 .initialize_for_workspace_coordination(
@@ -292,24 +317,18 @@ pub(super) async fn run_exec_like_with_exit_code(
         ));
     }
     let focused_validation_command = if typed_binding.is_some() && !inspection_command {
-        let command_summary = focused_validation_command_summary(
-            &args.safety_command,
-            &args.hook_command,
-            args.shell_type.is_none() && !args.is_powershell_script,
-            args.exec_params.cwd.as_path(),
-            repo_root.as_path(),
-            &args.exec_params.expiration,
-            args.exec_params
-                .sandbox_permissions
-                .requests_sandbox_override(),
-            args.additional_permissions.is_some(),
-            args.prefix_rule.is_some(),
-        )
-        .map_err(|reason| {
-            FunctionCallError::RespondToModel(format!(
-                "typed assignment shell command is not admitted focused validation: {reason}"
-            ))
-        })?;
+        let command_summary = focused_validation_admission
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "typed assignment shell command validation admission was not evaluated"
+                        .to_string(),
+                )
+            })?
+            .map_err(|reason| {
+                FunctionCallError::RespondToModel(format!(
+                    "typed assignment shell command is not admitted focused validation: {reason}"
+                ))
+            })?;
         let resolved_executable = pin_focused_validation_executable(
             &mut args.exec_params.command,
             &args.safety_command,
@@ -815,6 +834,20 @@ fn focused_validation_command_summary(
         return Err("command summary is not the canonical direct-argv rendering".to_string());
     }
     Ok(canonical)
+}
+
+fn requires_repository_wide_mutation_lease(
+    typed_binding: bool,
+    independent_review: bool,
+    inspection_command: bool,
+    intercepted_apply_patch: bool,
+    admitted_nonmutating_validation: bool,
+) -> bool {
+    !typed_binding
+        && !independent_review
+        && !inspection_command
+        && !intercepted_apply_patch
+        && !admitted_nonmutating_validation
 }
 
 fn validate_focused_validation_argv(

@@ -204,20 +204,6 @@ impl ContextManager {
         Some(base_tokens.saturating_add(items_tokens))
     }
 
-    pub(crate) fn remove_first_item(&mut self) {
-        if !self.items.is_empty() {
-            // Remove the oldest item (front of the list). Items are ordered from
-            // oldest → newest, so index 0 is the first entry recorded.
-            let items = Arc::make_mut(&mut self.items);
-            let removed = items.remove(0);
-            // If the removed item participates in a call/output pair, also remove
-            // its corresponding counterpart to keep the invariants intact without
-            // running a full normalization pass.
-            normalize::remove_corresponding_for(items, &removed);
-            self.world_state_baseline = None;
-        }
-    }
-
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);

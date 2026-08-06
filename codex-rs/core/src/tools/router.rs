@@ -400,6 +400,7 @@ fn authorize_independent_review_tool_call(
         TypedToolClass::AgentCommunication
             | TypedToolClass::OwnTask
             | TypedToolClass::ReadSearch
+            | TypedToolClass::CodeModeControl
             | TypedToolClass::Diff
             | TypedToolClass::Shell
     ) || (class == TypedToolClass::DynamicExternal

@@ -54,7 +54,13 @@ struct ToolSearchQueryKey {
 #[derive(Clone)]
 struct ToolSearchCacheEntry {
     key: ToolSearchQueryKey,
+    result: ToolSearchResult,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ToolSearchResult {
     tools: Vec<LoadableToolSpec>,
+    omitted_result_count: usize,
 }
 
 struct ByteBudgetWriter {
@@ -215,35 +221,35 @@ impl ToolSearchHandler {
         };
 
         let limit = args.limit.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT);
-        let tools = self.search(&args.query, limit)?;
+        let result = self.search(&args.query, limit)?;
 
-        Ok(boxed_tool_output(ToolSearchOutput { tools }))
+        Ok(boxed_tool_output(ToolSearchOutput {
+            tools: result.tools,
+            omitted_result_count: result.omitted_result_count,
+        }))
     }
 }
 
 impl CoreToolRuntime for ToolSearchHandler {}
 
 impl ToolSearchHandler {
-    fn search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<LoadableToolSpec>, FunctionCallError> {
+    fn search(&self, query: &str, limit: usize) -> Result<ToolSearchResult, FunctionCallError> {
         let key = validate_tool_search_query(query, limit)?;
         if self.search_infos.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ToolSearchResult::default());
         }
 
-        if let Some(tools) = self.cached_search_result(&key) {
+        if let Some(result) = self.cached_search_result(&key) {
             tracing::trace!(
                 normalized_query_bytes = key.query.len(),
                 effective_limit = limit,
                 cache_hit = true,
-                output_tool_count = tools.len(),
-                output_source_count = loadable_tool_spec_diversity_count(&tools),
+                output_tool_count = result.tools.len(),
+                output_source_count = loadable_tool_spec_diversity_count(&result.tools),
+                omitted_result_count = result.omitted_result_count,
                 "tool search completed"
             );
-            return Ok(tools);
+            return Ok(result);
         }
 
         let exact_matches = self
@@ -278,7 +284,7 @@ impl ToolSearchHandler {
         let results = promote_exact_name_matches(exact_matches, candidates, limit);
         let result_count = results.len();
         let result_source_count = tool_search_info_diversity_count(results.iter().copied());
-        let tools =
+        let result =
             self.search_output_tools(results.iter().map(|search_info| &search_info.entry))?;
         tracing::trace!(
             normalized_query_bytes = key.query.len(),
@@ -290,20 +296,22 @@ impl ToolSearchHandler {
             candidate_source_count,
             result_count,
             result_source_count,
-            output_tool_count = tools.len(),
-            output_source_count = loadable_tool_spec_diversity_count(&tools),
+            output_tool_count = result.tools.len(),
+            output_source_count = loadable_tool_spec_diversity_count(&result.tools),
+            omitted_result_count = result.omitted_result_count,
             "tool search completed"
         );
-        self.cache_search_result(key, &tools);
-        Ok(tools)
+        self.cache_search_result(key, &result);
+        Ok(result)
     }
 
     fn search_output_tools<'a>(
         &self,
         results: impl IntoIterator<Item = &'a ToolSearchEntry>,
-    ) -> Result<Vec<LoadableToolSpec>, FunctionCallError> {
+    ) -> Result<ToolSearchResult, FunctionCallError> {
         let mut retained_results = Vec::new();
         let mut retained_tools = Vec::new();
+        let mut omitted_result_count = 0usize;
         for result in results {
             retained_results.push(result);
             let tools = coalesce_loadable_tool_specs(
@@ -313,25 +321,29 @@ impl ToolSearchHandler {
                 retained_tools = tools;
             } else {
                 retained_results.pop();
+                omitted_result_count = omitted_result_count.saturating_add(1);
             }
         }
-        Ok(retained_tools)
+        Ok(ToolSearchResult {
+            tools: retained_tools,
+            omitted_result_count,
+        })
     }
 
-    fn cached_search_result(&self, key: &ToolSearchQueryKey) -> Option<Vec<LoadableToolSpec>> {
+    fn cached_search_result(&self, key: &ToolSearchQueryKey) -> Option<ToolSearchResult> {
         let mut cache = self.result_cache();
         let index = cache.iter().position(|entry| &entry.key == key)?;
         let entry = cache.remove(index)?;
-        let tools = entry.tools.clone();
+        let result = entry.result.clone();
         cache.push_back(entry);
-        Some(tools)
+        Some(result)
     }
 
-    fn cache_search_result(&self, key: ToolSearchQueryKey, tools: &[LoadableToolSpec]) {
-        if !tool_search_cache_entry_fits_budget(&key, tools) {
+    fn cache_search_result(&self, key: ToolSearchQueryKey, result: &ToolSearchResult) {
+        if !tool_search_cache_entry_fits_budget(&key, &result.tools) {
             tracing::trace!(
                 normalized_query_bytes = key.query.len(),
-                output_tool_count = tools.len(),
+                output_tool_count = result.tools.len(),
                 cache_entry_byte_limit = MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES,
                 "skipped oversized tool search cache entry"
             );
@@ -344,7 +356,7 @@ impl ToolSearchHandler {
         }
         cache.push_back(ToolSearchCacheEntry {
             key,
-            tools: tools.to_vec(),
+            result: result.clone(),
         });
         while cache.len() > MAX_TOOL_SEARCH_RESULT_CACHE {
             cache.pop_front();
@@ -635,6 +647,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(limited, first);
+        assert_eq!(first.omitted_result_count, 0);
         assert_eq!(handler.result_cache_len(), 2);
     }
 
@@ -726,7 +739,8 @@ mod tests {
             .search("shared capability", 1)
             .expect("bounded search should succeed");
 
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.omitted_result_count, 0);
     }
 
     #[test]
@@ -742,8 +756,15 @@ mod tests {
             .search("calendar", TOOL_SEARCH_DEFAULT_LIMIT)
             .expect("oversized result should be bounded");
 
-        assert!(tools.is_empty());
+        assert!(tools.tools.is_empty());
+        assert_eq!(tools.omitted_result_count, 1);
         assert_eq!(handler.result_cache_len(), 1);
+
+        let cached = handler
+            .search("calendar", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("cached oversized result should remain explicitly incomplete");
+        assert!(cached.tools.is_empty());
+        assert_eq!(cached.omitted_result_count, 1);
     }
 
     #[test]
@@ -766,9 +787,10 @@ mod tests {
             .search_output_tools(results)
             .expect("search results should serialize within the budget");
 
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.omitted_result_count, 1);
         assert!(
-            serde_json::to_vec(&tools)
+            serde_json::to_vec(&tools.tools)
                 .expect("bounded search result should serialize")
                 .len()
                 <= MAX_TOOL_SEARCH_RESULT_BYTES
@@ -794,7 +816,8 @@ mod tests {
             .search_output_tools(results)
             .expect("later search result should fit within the budget");
 
-        assert_eq!(tools, vec![expected]);
+        assert_eq!(tools.tools, vec![expected]);
+        assert_eq!(tools.omitted_result_count, 1);
     }
 
     #[test]
@@ -848,7 +871,7 @@ mod tests {
             .expect("mixed search output should serialize");
 
         assert_eq!(
-            tools,
+            tools.tools,
             vec![
                 LoadableToolSpec::Namespace(ResponsesApiNamespace {
                     name: "mcp__calendar".to_string(),
@@ -961,6 +984,7 @@ mod tests {
             .search("shared capability", 3)
             .expect("search should return diverse results");
         let namespaces = tools
+            .tools
             .iter()
             .map(|tool| match tool {
                 LoadableToolSpec::Namespace(namespace) => namespace.name.as_str(),
@@ -982,6 +1006,7 @@ mod tests {
             .search("  TARGET_TOOL  ", 2)
             .expect("search should promote the exact normalized tool name");
         let namespaces = tools
+            .tools
             .iter()
             .map(|tool| match tool {
                 LoadableToolSpec::Namespace(namespace) => namespace.name.as_str(),
@@ -1030,6 +1055,7 @@ mod tests {
             .search("search", 3)
             .expect("exact-name search should preserve source diversity");
         let namespaces = tools
+            .tools
             .iter()
             .map(|tool| match tool {
                 LoadableToolSpec::Namespace(namespace) => namespace.name.as_str(),

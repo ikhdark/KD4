@@ -154,6 +154,7 @@ impl McpToolOutput {
 #[derive(Clone)]
 pub struct ToolSearchOutput {
     pub tools: Vec<LoadableToolSpec>,
+    pub omitted_result_count: usize,
 }
 
 impl ToolOutput for ToolSearchOutput {
@@ -177,7 +178,11 @@ impl ToolOutput for ToolSearchOutput {
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         ResponseInputItem::ToolSearchOutput {
             call_id: call_id.to_string(),
-            status: "completed".to_string(),
+            status: if self.omitted_result_count == 0 {
+                "completed".to_string()
+            } else {
+                "incomplete".to_string()
+            },
             execution: "client".to_string(),
             tools: self
                 .tools

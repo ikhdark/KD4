@@ -375,6 +375,7 @@ pub(crate) async fn begin_mutation(
     require_claim_authority_tx(
         &mut transaction,
         &repository.workspace_id,
+        &request.root_session_id,
         request.attempt_id,
         &paths,
         &request.contracts,
@@ -383,6 +384,7 @@ pub(crate) async fn begin_mutation(
     require_no_mutation_lease_overlap_tx(
         &mut transaction,
         &repository.workspace_id,
+        &request.root_session_id,
         &request.actor_id,
         &paths,
         &request.contracts,
@@ -1698,15 +1700,17 @@ async fn expire_finalization_fences_tx(
 async fn require_no_mutation_lease_overlap_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     workspace_id: &str,
+    root_session_id: &str,
     actor_id: &str,
     paths: &[String],
     contracts: &[String],
 ) -> StoreResult<()> {
     let rows = sqlx::query(
         "SELECT actor_id, paths_json, contracts_json FROM workspace_mutation_leases
-         WHERE workspace_id = ? AND state = 'active'",
+         WHERE workspace_id = ? AND root_session_id = ? AND state = 'active'",
     )
     .bind(workspace_id)
+    .bind(root_session_id)
     .fetch_all(&mut **transaction)
     .await?;
     let mut conflicts = Vec::new();
@@ -1750,6 +1754,7 @@ async fn require_no_mutation_lease_overlap_tx(
 async fn require_claim_authority_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     workspace_id: &str,
+    root_session_id: &str,
     attempt_id: Option<AttemptId>,
     paths: &[String],
     contracts: &[String],
@@ -1758,9 +1763,12 @@ async fn require_claim_authority_tx(
         "SELECT write_claims.assignment_id, write_claims.attempt_id, write_claims.scopes_json
          FROM write_claims
          JOIN assignment_repositories USING (assignment_id)
-         WHERE write_claims.active = 1 AND assignment_repositories.workspace_id = ?",
+         JOIN assignments USING (assignment_id)
+         WHERE write_claims.active = 1 AND assignment_repositories.workspace_id = ?
+           AND assignments.root_session_id = ?",
     )
     .bind(workspace_id)
+    .bind(root_session_id)
     .fetch_all(&mut **transaction)
     .await?;
     let mut own_scopes = Vec::new();
@@ -1791,10 +1799,15 @@ async fn require_claim_authority_tx(
         }
     }
     let rows = sqlx::query(
-        "SELECT contract_name, assignment_id, attempt_id FROM contract_claims
-         WHERE workspace_id = ? AND active = 1",
+        "SELECT contract_claims.contract_name, contract_claims.assignment_id,
+                contract_claims.attempt_id
+         FROM contract_claims
+         JOIN assignments USING (assignment_id)
+         WHERE contract_claims.workspace_id = ? AND contract_claims.active = 1
+           AND assignments.root_session_id = ?",
     )
     .bind(workspace_id)
+    .bind(root_session_id)
     .fetch_all(&mut **transaction)
     .await?;
     let untyped_actor = attempt_id.is_none();

@@ -157,6 +157,14 @@ fn tool_classification_separates_typed_authority() {
         ("search_source", TypedToolClass::ReadSearch),
         ("read_file_span", TypedToolClass::ReadSearch),
         ("read_tool_output", TypedToolClass::ReadSearch),
+        (
+            codex_code_mode::PUBLIC_TOOL_NAME,
+            TypedToolClass::CodeModeControl,
+        ),
+        (
+            codex_code_mode::WAIT_TOOL_NAME,
+            TypedToolClass::CodeModeControl,
+        ),
         ("git_diff", TypedToolClass::Diff),
         ("shell_command", TypedToolClass::Shell),
         ("exec_command", TypedToolClass::Shell),
@@ -203,6 +211,36 @@ fn namespaces_cannot_spoof_core_or_collaboration_tools() {
 }
 
 #[test]
+fn read_search_profile_can_enter_code_mode_without_gaining_write_access() {
+    let fixture = RepoFixture::new();
+    let assignment = fixture.assignment(CapabilityProfile::ReadSearch, Vec::new());
+
+    for name in [
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+    ] {
+        let class = classify_typed_tool(None, name, None);
+        assert_eq!(class, TypedToolClass::CodeModeControl);
+        assert!(
+            authorize_typed_tool(&assignment, fixture.path(), request(class)).is_ok(),
+            "read-search profiles must be able to use the code-mode {name} envelope"
+        );
+    }
+
+    let nested_read = classify_typed_tool(None, "read_file_span", None);
+    assert!(authorize_typed_tool(&assignment, fixture.path(), request(nested_read)).is_ok());
+
+    let nested_write = classify_typed_tool(None, "apply_patch", None);
+    assert!(matches!(
+        authorize_typed_tool(&assignment, fixture.path(), request(nested_write)),
+        Err(CapabilityPolicyError::ToolDenied {
+            profile: CapabilityProfile::ReadSearch,
+            class: TypedToolClass::StructuredEdit,
+        })
+    ));
+}
+
+#[test]
 fn profiles_receive_only_their_declared_tool_classes() {
     let fixture = RepoFixture::new();
     let profiles = [
@@ -218,6 +256,7 @@ fn profiles_receive_only_their_declared_tool_classes() {
             TypedToolClass::AgentCommunication,
             TypedToolClass::OwnTask,
             TypedToolClass::ReadSearch,
+            TypedToolClass::CodeModeControl,
         ] {
             assert!(authorize_typed_tool(&assignment, fixture.path(), request(class)).is_ok());
         }

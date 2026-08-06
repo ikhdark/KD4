@@ -3431,7 +3431,7 @@ async fn auto_compact_persists_rollout_entries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_compact_retries_after_context_window_error() {
+async fn manual_compact_context_window_error_does_not_retry_with_trimmed_history() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -3445,20 +3445,7 @@ async fn manual_compact_retries_after_context_window_error() {
         "context_length_exceeded",
         CONTEXT_LIMIT_MESSAGE,
     );
-    let compact_succeeds = sse(vec![
-        ev_assistant_message("m2", SUMMARY_TEXT),
-        ev_completed("r2"),
-    ]);
-
-    let request_log = mount_sse_sequence(
-        &server,
-        vec![
-            user_turn.clone(),
-            compact_failed.clone(),
-            compact_succeeds.clone(),
-        ],
-    )
-    .await;
+    let request_log = mount_sse_sequence(&server, vec![user_turn, compact_failed]).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -3486,56 +3473,24 @@ async fn manual_compact_retries_after_context_window_error() {
     wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.unwrap();
-    let warning_event = wait_for_event(codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
-    let EventMsg::Warning(WarningEvent { message }) = warning_event else {
-        panic!("expected warning event after compact retry");
-    };
-    assert_eq!(message, COMPACT_WARNING_MESSAGE);
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::Error(_))).await;
     wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "expected user turn and two compact attempts"
+        2,
+        "context-window failure must not trigger a lossy compact retry"
     );
 
     let compact_attempt = requests[1].body_json();
-    let retry_attempt = requests[2].body_json();
-
-    let compact_input = compact_attempt["input"]
-        .as_array()
-        .expect("compact attempt missing input array");
-    let retry_input = retry_attempt["input"]
-        .as_array()
-        .expect("retry attempt missing input array");
-    let compact_contains_prompt =
-        body_contains_text(&compact_attempt.to_string(), SUMMARIZATION_PROMPT);
-    let retry_contains_prompt =
-        body_contains_text(&retry_attempt.to_string(), SUMMARIZATION_PROMPT);
-    assert_eq!(
-        compact_contains_prompt, retry_contains_prompt,
-        "compact attempts should consistently include or omit the summarization prompt"
-    );
-    assert_eq!(
-        retry_input.len(),
-        compact_input.len().saturating_sub(1),
-        "retry should drop exactly one history item (before {} vs after {})",
-        compact_input.len(),
-        retry_input.len()
-    );
-    if let (Some(first_before), Some(first_after)) = (compact_input.first(), retry_input.first()) {
-        assert_ne!(
-            first_before, first_after,
-            "retry should drop the oldest conversation item"
-        );
-    } else {
-        panic!("expected non-empty compact inputs");
-    }
+    let compact_body = compact_attempt.to_string();
+    assert!(body_contains_text(&compact_body, "first turn"));
+    assert!(body_contains_text(&compact_body, SUMMARIZATION_PROMPT));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_compact_context_window_error_batches_history_repair() {
+async fn manual_compact_context_window_error_does_not_batch_delete_history() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -3549,13 +3504,7 @@ async fn manual_compact_context_window_error_batches_history_repair() {
         "context_length_exceeded",
         CONTEXT_LIMIT_MESSAGE,
     );
-    let compact_succeeds = sse(vec![
-        ev_assistant_message("m2", SUMMARY_TEXT),
-        ev_completed("r2"),
-    ]);
-
-    let request_log =
-        mount_sse_sequence(&server, vec![user_turn, compact_failed, compact_succeeds]).await;
+    let request_log = mount_sse_sequence(&server, vec![user_turn, compact_failed]).await;
 
     let model_provider = non_openai_model_provider(&server);
     let test = test_codex()
@@ -3586,37 +3535,27 @@ async fn manual_compact_context_window_error_batches_history_repair() {
     wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::Error(_))).await;
     wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "expected user turn and two compact attempts"
+        2,
+        "known context overage must not trigger a lossy compact retry"
     );
     let compact_attempt = requests[1].body_json();
-    let retry_attempt = requests[2].body_json();
     let compact_input = compact_attempt["input"]
         .as_array()
         .expect("compact attempt missing input array");
-    let retry_input = retry_attempt["input"]
-        .as_array()
-        .expect("retry attempt missing input array");
     assert!(
         compact_input.len() > 2,
-        "expected several history items before repair, got {}",
+        "expected several preserved history items, got {}",
         compact_input.len()
     );
-    assert!(
-        retry_input.len() < compact_input.len(),
-        "known context overage should remove one local history batch: {} -> {} items",
-        compact_input.len(),
-        retry_input.len()
-    );
-    assert!(
-        body_contains_text(&retry_attempt.to_string(), SUMMARIZATION_PROMPT),
-        "batch repair must preserve the synthesized compaction prompt"
-    );
+    let compact_body = compact_attempt.to_string();
+    assert!(body_contains_text(&compact_body, "first turn"));
+    assert!(body_contains_text(&compact_body, SUMMARIZATION_PROMPT));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

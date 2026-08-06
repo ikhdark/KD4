@@ -5015,10 +5015,11 @@ async fn workspace_mutation_claim_conflicts_tx(
     let rows = sqlx::query(
         "SELECT actor_id, paths_json, contracts_json
          FROM workspace_mutation_leases
-         WHERE workspace_id = ? AND state = 'active'
+         WHERE workspace_id = ? AND root_session_id = ? AND state = 'active'
            AND julianday(json_extract(expires_at, '$')) >= julianday(json_extract(?, '$'))",
     )
     .bind(&assignment.workspace_id)
+    .bind(&assignment.root_session_id)
     .bind(encode(&comparison_now())?)
     .fetch_all(&mut **transaction)
     .await?;

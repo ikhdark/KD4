@@ -26,6 +26,7 @@ pub(crate) enum TypedToolClass {
     OwnTask,
     RootTaskControl,
     ReadSearch,
+    CodeModeControl,
     Diff,
     Shell,
     StructuredEdit,
@@ -264,6 +265,15 @@ pub(crate) fn classify_typed_tool(
     ) {
         return TypedToolClass::ReadSearch;
     }
+    if matches_name(
+        name,
+        &[
+            codex_code_mode::PUBLIC_TOOL_NAME,
+            codex_code_mode::WAIT_TOOL_NAME,
+        ],
+    ) {
+        return TypedToolClass::CodeModeControl;
+    }
     if matches_name(name, &["git_diff"]) {
         return TypedToolClass::Diff;
     }
@@ -294,7 +304,10 @@ pub(crate) fn authorize_typed_tool(
     match request.class {
         TypedToolClass::AgentCommunication
         | TypedToolClass::OwnTask
-        | TypedToolClass::ReadSearch => Ok(empty_authorization()),
+        | TypedToolClass::ReadSearch
+        // Code mode is only a control envelope. Each nested call is routed back through this
+        // policy and authorized according to its actual tool class.
+        | TypedToolClass::CodeModeControl => Ok(empty_authorization()),
         TypedToolClass::RootTaskControl => Err(CapabilityPolicyError::RootTaskControlDenied),
         TypedToolClass::Diff if profile_allows_diff(profile) => Ok(empty_authorization()),
         TypedToolClass::Shell if profile_allows_shell(profile) => Ok(empty_authorization()),

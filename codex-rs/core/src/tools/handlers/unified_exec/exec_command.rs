@@ -234,8 +234,13 @@ async fn begin_unified_exec_workspace_mutation(
     let reservation = session
         .services
         .command_execution
-        .reserve_workspace_mutation(&repo_root)
-        .await;
+        .reserve_workspace_mutation_until_cancelled(&repo_root, &owner_cancelled)
+        .await
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "exec_command mutation-reservation wait was cancelled".to_string(),
+            )
+        })?;
     session
         .services
         .agent_control

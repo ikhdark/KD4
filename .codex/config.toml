@@ -14,9 +14,9 @@ enabled = true
 max_concurrent_threads_per_session = 3
 
 [reasoning_phase_efforts]
-orient = "xhigh"
-inspect = "max"
-implement = "max"
+orient = "high"
+inspect = "high"
+implement = "xhigh"
 diagnose = "high"
 verify = "medium"
-finalize = "medium"
+finalize = "low"

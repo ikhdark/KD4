@@ -1282,8 +1282,8 @@ async fn orphaned_owner_claims_release_after_the_liveness_window() {
             .begin_workspace_mutation(
                 expired_fixture.repo.path(),
                 WorkspaceMutationRequest {
-                    root_session_id: "competing-root".to_string(),
-                    actor_id: "root:competing-root".to_string(),
+                    root_session_id: "expired-owner-root".to_string(),
+                    actor_id: "root:expired-owner-root".to_string(),
                     kind: WorkspaceActorKind::Root,
                     attempt_id: None,
                     paths: vec![REPOSITORY_WIDE_PATH.to_string()],
@@ -1301,8 +1301,8 @@ async fn orphaned_owner_claims_release_after_the_liveness_window() {
         .begin_workspace_mutation(
             expired_fixture.repo.path(),
             WorkspaceMutationRequest {
-                root_session_id: "competing-root".to_string(),
-                actor_id: "root:competing-root".to_string(),
+                root_session_id: "expired-owner-root".to_string(),
+                actor_id: "root:expired-owner-root".to_string(),
                 kind: WorkspaceActorKind::Root,
                 attempt_id: None,
                 paths: vec![REPOSITORY_WIDE_PATH.to_string()],
@@ -1343,8 +1343,8 @@ async fn orphaned_owner_claims_release_after_the_liveness_window() {
         .begin_workspace_mutation(
             missing_fixture.repo.path(),
             WorkspaceMutationRequest {
-                root_session_id: "replacement-root".to_string(),
-                actor_id: "root:replacement-root".to_string(),
+                root_session_id: "missing-owner-root".to_string(),
+                actor_id: "root:missing-owner-root".to_string(),
                 kind: WorkspaceActorKind::Root,
                 attempt_id: None,
                 paths: vec![REPOSITORY_WIDE_PATH.to_string()],
@@ -2698,6 +2698,111 @@ async fn partial_supporting_reads_cannot_bypass_multi_file_cas() {
 }
 
 #[tokio::test]
+async fn workspace_mutation_coordination_is_scoped_to_root_session() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "before\n").expect("lib fixture");
+
+    let first_session_lease = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "first-root".to_string(),
+                actor_id: "root:first-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("first session mutation starts");
+
+    assert!(
+        matches!(
+            fixture
+                .store
+                .begin_workspace_mutation(
+                    fixture.repo.path(),
+                    WorkspaceMutationRequest {
+                        root_session_id: "first-root".to_string(),
+                        actor_id: "legacy:first-root".to_string(),
+                        kind: WorkspaceActorKind::Legacy,
+                        attempt_id: None,
+                        paths: vec!["src/lib.rs".to_string()],
+                        contracts: Vec::new(),
+                        expected_manifest: Vec::new(),
+                    },
+                )
+                .await,
+            Err(StoreError::WorkspaceClaimConflict { .. })
+        ),
+        "overlapping mutations in the same root session still conflict"
+    );
+
+    fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("second-root", "src/lib.rs"),
+        )
+        .await
+        .expect("another session's mutation does not block typed assignment claims");
+
+    assert!(
+        matches!(
+            fixture
+                .store
+                .begin_workspace_mutation(
+                    fixture.repo.path(),
+                    WorkspaceMutationRequest {
+                        root_session_id: "second-root".to_string(),
+                        actor_id: "root:second-root".to_string(),
+                        kind: WorkspaceActorKind::Root,
+                        attempt_id: None,
+                        paths: vec!["src/lib.rs".to_string()],
+                        contracts: Vec::new(),
+                        expected_manifest: Vec::new(),
+                    },
+                )
+                .await,
+            Err(StoreError::WorkspaceClaimConflict { .. })
+        ),
+        "typed claims still protect their own root session"
+    );
+
+    let third_session_lease = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "third-root".to_string(),
+                actor_id: "root:third-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["src/lib.rs".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("other sessions do not block overlapping workspace mutations");
+
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), third_session_lease)
+        .await
+        .expect("third session mutation finishes");
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), first_session_lease)
+        .await
+        .expect("first session mutation finishes");
+}
+
+#[tokio::test]
 async fn repository_wide_mutation_lease_blocks_claims_heartbeats_and_records_paths() {
     let fixture = Fixture::new().await;
     std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
@@ -3922,7 +4027,7 @@ async fn json_timestamp_comparisons_preserve_lease_liveness_and_fence_behavior()
         lease_now,
         lease_fixture.store.create_assignment(
             lease_fixture.repo.path(),
-            worker_draft("timestamp-lease-worker", "tracked.txt"),
+            worker_draft("timestamp-lease-root", "tracked.txt"),
         ),
     )
     .await;

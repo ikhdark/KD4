@@ -339,6 +339,7 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
             ),
             output_schema: None,
         })],
+        omitted_result_count: 0,
     }
     .to_response_item("search-1", &payload);
 
@@ -366,6 +367,29 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
                     }
                 })]
             );
+        }
+        other => panic!("expected ToolSearchOutput, got {other:?}"),
+    }
+}
+
+#[test]
+fn partial_tool_search_outputs_are_model_visible_as_incomplete() {
+    let payload = ToolPayload::ToolSearch {
+        arguments: SearchToolCallParams {
+            query: "calendar".to_string(),
+            limit: None,
+        },
+    };
+    let response = ToolSearchOutput {
+        tools: Vec::new(),
+        omitted_result_count: 1,
+    }
+    .to_response_item("search-partial", &payload);
+
+    match response {
+        ResponseInputItem::ToolSearchOutput { status, tools, .. } => {
+            assert_eq!(status, "incomplete");
+            assert!(tools.is_empty());
         }
         other => panic!("expected ToolSearchOutput, got {other:?}"),
     }

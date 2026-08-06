@@ -48,7 +48,6 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
-use tracing::error;
 
 use codex_model_provider_info::ModelProviderInfo;
 
@@ -263,100 +262,67 @@ async fn run_compact_task_inner_impl(
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
 
-    'history_version: loop {
-        // Preserve the mutable history so context-window recovery can remove items and rebuild.
-        let turn_input = history
-            .clone()
-            .for_prompt(&turn_context.model_info.input_modalities);
-        let turn_input_len = turn_input.len();
-        let prompt = Prompt {
-            input: turn_input,
-            base_instructions: base_instructions.clone(),
-            ..Default::default()
-        };
-        let mut retries = 0;
-        loop {
-            let attempt_result = drain_to_completed(
-                &sess,
-                turn_context.as_ref(),
-                &mut client_session,
-                &responses_metadata,
-                &prompt,
-            )
-            .await;
+    let turn_input = history
+        .clone()
+        .for_prompt(&turn_context.model_info.input_modalities);
+    let prompt = Prompt {
+        input: turn_input,
+        base_instructions: base_instructions.clone(),
+        ..Default::default()
+    };
+    let mut retries = 0;
+    loop {
+        let attempt_result = drain_to_completed(
+            &sess,
+            turn_context.as_ref(),
+            &mut client_session,
+            &responses_metadata,
+            &prompt,
+        )
+        .await;
 
-            match attempt_result {
-                Ok(()) => {
-                    break 'history_version;
-                }
-                Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
-                    return Err(err);
-                }
-                Err(e @ CodexErr::SessionBudgetExceeded) => {
+        match attempt_result {
+            Ok(()) => {
+                break;
+            }
+            Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
+                return Err(err);
+            }
+            Err(e @ CodexErr::SessionBudgetExceeded) => {
+                sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                sess.send_event(&turn_context, event).await;
+                return Err(e);
+            }
+            Err(e @ CodexErr::ContextWindowExceeded) => {
+                sess.set_total_tokens_full(turn_context.as_ref()).await;
+                sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                sess.send_event(&turn_context, event).await;
+                return Err(e);
+            }
+            Err(e) if !e.is_retryable() => {
+                sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                sess.send_event(&turn_context, event).await;
+                return Err(e);
+            }
+            Err(e) => {
+                if let Err(e) = handle_retryable_response_stream_error(
+                    &mut retries,
+                    max_retries,
+                    e,
+                    &mut client_session,
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    ResponsesStreamRequest::LocalCompaction,
+                )
+                .await
+                {
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                     sess.send_event(&turn_context, event).await;
                     return Err(e);
-                }
-                Err(e @ CodexErr::ContextWindowExceeded) => {
-                    let mut removed_history_items = 0usize;
-                    if let Some(context_window) = turn_context.model_context_window() {
-                        while history.raw_items().len() > 1
-                            && history
-                                .estimate_token_count_with_base_instructions(&base_instructions)
-                                .is_some_and(|estimated_tokens| estimated_tokens > context_window)
-                        {
-                            let history_len_before = history.raw_items().len();
-                            history.remove_first_item();
-                            removed_history_items = removed_history_items.saturating_add(
-                                history_len_before.saturating_sub(history.raw_items().len()),
-                            );
-                        }
-                    }
-                    if removed_history_items == 0 && turn_input_len > 1 {
-                        let history_len_before = history.raw_items().len();
-                        history.remove_first_item();
-                        removed_history_items =
-                            history_len_before.saturating_sub(history.raw_items().len());
-                    }
-                    if removed_history_items > 0 {
-                        // Trim from the beginning to preserve cache (prefix-based), keep recent
-                        // messages intact, and never remove the synthesized compaction prompt.
-                        error!(
-                            removed_history_items,
-                            "Context window exceeded while compacting; removed oldest history items before retry. Error: {e}"
-                        );
-                        continue 'history_version;
-                    }
-                    sess.set_total_tokens_full(turn_context.as_ref()).await;
-                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
-                    return Err(e);
-                }
-                Err(e) if !e.is_retryable() => {
-                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
-                    return Err(e);
-                }
-                Err(e) => {
-                    if let Err(e) = handle_retryable_response_stream_error(
-                        &mut retries,
-                        max_retries,
-                        e,
-                        &mut client_session,
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        ResponsesStreamRequest::LocalCompaction,
-                    )
-                    .await
-                    {
-                        sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                        let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                        sess.send_event(&turn_context, event).await;
-                        return Err(e);
-                    }
                 }
             }
         }

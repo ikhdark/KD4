@@ -1052,52 +1052,6 @@ fn estimate_token_count_with_base_instructions_uses_provided_text() {
 }
 
 #[test]
-fn remove_first_item_removes_matching_output_for_function_call() {
-    let items = vec![
-        ResponseItem::FunctionCall {
-            id: None,
-            name: "do_it".to_string(),
-            namespace: None,
-            arguments: "{}".to_string(),
-            call_id: "call-1".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let mut h = create_history_with_items(items);
-    h.remove_first_item();
-    assert_eq!(h.raw_items(), vec![]);
-}
-
-#[test]
-fn remove_first_item_removes_matching_call_for_output() {
-    let items = vec![
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-2".to_string(),
-            output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::FunctionCall {
-            id: None,
-            name: "do_it".to_string(),
-            namespace: None,
-            arguments: "{}".to_string(),
-            call_id: "call-2".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let mut h = create_history_with_items(items);
-    h.remove_first_item();
-    assert_eq!(h.raw_items(), vec![]);
-}
-
-#[test]
 fn replace_last_turn_images_replaces_tool_output_images() {
     let items = vec![
         user_input_text_msg("hi"),
@@ -1262,34 +1216,6 @@ fn replace_last_turn_images_does_not_touch_user_images() {
 
     assert!(!history.replace_last_turn_images("Invalid image"));
     assert_eq!(history.raw_items(), items);
-}
-
-#[test]
-fn remove_first_item_handles_local_shell_pair() {
-    let items = vec![
-        ResponseItem::LocalShellCall {
-            id: None,
-            call_id: Some("call-3".to_string()),
-            status: LocalShellStatus::Completed,
-            action: LocalShellAction::Exec(LocalShellExecAction {
-                command: vec!["echo".to_string(), "hi".to_string()],
-                timeout_ms: None,
-                working_directory: None,
-                env: None,
-                user: None,
-            }),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-3".to_string(),
-            output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let mut h = create_history_with_items(items);
-    h.remove_first_item();
-    assert_eq!(h.raw_items(), vec![]);
 }
 
 #[test]
@@ -1502,31 +1428,6 @@ fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_b
         ]
     );
     assert!(history.reference_context_item().is_none());
-}
-
-#[test]
-fn remove_first_item_handles_custom_tool_pair() {
-    let items = vec![
-        ResponseItem::CustomToolCall {
-            id: None,
-            status: None,
-            call_id: "tool-1".to_string(),
-            name: "my_tool".to_string(),
-            namespace: None,
-            input: "{}".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::CustomToolCallOutput {
-            id: None,
-            call_id: "tool-1".to_string(),
-            name: None,
-            output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let mut h = create_history_with_items(items);
-    h.remove_first_item();
-    assert_eq!(h.raw_items(), vec![]);
 }
 
 #[test]

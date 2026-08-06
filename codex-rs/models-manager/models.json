@@ -30,7 +30,7 @@
       "default_reasoning_summary": "none",
       "display_name": "GPT-5.6-Sol",
       "description": "Latest frontier agentic coding model.",
-      "default_reasoning_level": "low",
+      "default_reasoning_level": "high",
       "supported_reasoning_levels": [
         {
           "effort": "low",

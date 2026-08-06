@@ -404,20 +404,36 @@ pub(crate) struct CommandExecutionLedger {
 }
 
 impl CommandExecutionLedger {
+    async fn workspace_mutation_gate(&self, repo_root: &Path) -> Arc<Mutex<()>> {
+        let mut gates = self.workspace_mutation_gates.lock().await;
+        Arc::clone(
+            gates
+                .entry(repo_root.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) async fn reserve_workspace_mutation(
         &self,
         repo_root: &Path,
     ) -> WorkspaceMutationReservation {
-        let gate = {
-            let mut gates = self.workspace_mutation_gates.lock().await;
-            Arc::clone(
-                gates
-                    .entry(repo_root.to_path_buf())
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
-        };
+        let gate = self.workspace_mutation_gate(repo_root).await;
         WorkspaceMutationReservation {
             _guard: gate.lock_owned().await,
+        }
+    }
+
+    pub(crate) async fn reserve_workspace_mutation_until_cancelled(
+        &self,
+        repo_root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<WorkspaceMutationReservation> {
+        let gate = self.workspace_mutation_gate(repo_root).await;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            guard = gate.lock_owned() => Some(WorkspaceMutationReservation { _guard: guard }),
         }
     }
 
@@ -761,6 +777,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_mutation_reservation_wait_is_cancellable() {
+        let ledger = Arc::new(CommandExecutionLedger::default());
+        let repo = TempDir::new().expect("repository tempdir");
+        let first = ledger.reserve_workspace_mutation(repo.path()).await;
+        let cancellation = CancellationToken::new();
+        let waiting_ledger = Arc::clone(&ledger);
+        let waiting_repo = repo.path().to_path_buf();
+        let waiting_cancellation = cancellation.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_ledger
+                .reserve_workspace_mutation_until_cancelled(&waiting_repo, &waiting_cancellation)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "the reservation wait is exercised");
+        cancellation.cancel();
+        let reservation = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("cancellation promptly stops the reservation wait")
+            .expect("reservation waiter task succeeds");
+        assert!(
+            reservation.is_none(),
+            "cancelled wait acquires no reservation"
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
     async fn workspace_mutation_lease_wait_is_serialized_and_cancellable() {
         let codex_home = TempDir::new().expect("codex home tempdir");
         let repo = TempDir::new().expect("repository tempdir");
@@ -782,15 +827,7 @@ mod tests {
             contracts: Vec::new(),
             expected_manifest: Vec::new(),
         };
-        let waiter_request = WorkspaceMutationRequest {
-            root_session_id: "waiter-root".to_string(),
-            actor_id: "root:waiter-root".to_string(),
-            kind: WorkspaceActorKind::Root,
-            attempt_id: None,
-            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-            contracts: Vec::new(),
-            expected_manifest: Vec::new(),
-        };
+        let waiter_request = owner_request.clone();
         let owner_lease = store
             .begin_workspace_mutation(repo.path(), owner_request.clone())
             .await
