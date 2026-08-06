@@ -14,29 +14,9 @@ enabled = true
 max_concurrent_threads_per_session = 3
 
 [reasoning_phase_efforts]
-orient = "medium"
-inspect = "low"
-implement = "high"
+orient = "xhigh"
+inspect = "max"
+implement = "max"
 diagnose = "high"
-verify = "low"
-finalize = "low"
-
-[agents.kd4_explorer]
-description = "Produces binding read-only KD4 implementation contracts for risky work."
-config_file = "./agents/kd4_explorer.toml"
-
-[agents.kd4_worker]
-description = "Implements an architect-derived KD4 contract as its sole behavior owner."
-config_file = "./agents/kd4_worker.toml"
-
-[agents.kd4_verifier]
-description = "Read-only verification of completed KD4 changes against their typed contract."
-config_file = "./agents/kd4_verifier.toml"
-
-[agents.kd4_integrator]
-description = "Coordinates cross-cutting KD4 contracts and final integration."
-config_file = "./agents/kd4_integrator.toml"
-
-[agents.kd4_reviewer]
-description = "Read-only preflight reviewer for completed KD4 worker changes."
-config_file = "./agents/kd4_reviewer.toml"
+verify = "medium"
+finalize = "medium"

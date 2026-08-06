@@ -8,7 +8,7 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 retries = 1
 # Avoid saturating developer machines when Nextest is invoked directly.
 # NEXTEST_TEST_THREADS or --test-threads can opt into a different limit.
-test-threads = 16
+test-threads = 8
 
 [scripts.setup.windows-test-stack]
 command = ["python", "scripts/nextest_windows_stack.py"]
@@ -31,27 +31,27 @@ inherits = "local"
 retries = 0
 
 [test-groups.app_server_protocol_codegen]
-max-threads = 8
+max-threads = 1
 
 [test-groups.app_server_integration]
-max-threads = 8
+max-threads = 1
 
 # Higher concurrency causes integration test timeouts under resource contention
 # on common developer machines.
 [test-groups.app_server_integration_local]
-max-threads = 8
+max-threads = 1
 
 [test-groups.core_apply_patch_cli_integration]
-max-threads = 8
+max-threads = 1
 
 [test-groups.windows_sandbox_legacy_sessions]
-max-threads = 8
+max-threads = 1
 
 [test-groups.windows_process_heavy]
-max-threads = 8
+max-threads = 2
 
 [test-groups.windows_core]
-max-threads = 16
+max-threads = 4
 
 [[profile.default.overrides]]
 # Do not add new tests here

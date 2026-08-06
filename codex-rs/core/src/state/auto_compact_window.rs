@@ -77,6 +77,7 @@ impl AutoCompactWindow {
         self.ids.previous_window_id = Some(self.ids.window_id);
         self.ids.window_id = Uuid::now_v7();
         self.new_context_window_requested = false;
+        self.prefill_input_tokens = None;
         self.token_budget_reminder_delivered = false;
         (self.window_number, self.ids)
     }
@@ -221,6 +222,14 @@ mod tests {
             window.snapshot(),
             AutoCompactWindowSnapshot {
                 prefill_input_tokens: Some(120),
+            }
+        );
+
+        window.advance();
+        assert_eq!(
+            window.snapshot(),
+            AutoCompactWindowSnapshot {
+                prefill_input_tokens: None,
             }
         );
     }

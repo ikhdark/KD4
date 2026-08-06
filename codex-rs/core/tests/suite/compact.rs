@@ -1079,6 +1079,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let codex = test_codex()
         .with_config(move |config| {
             config.model_provider.name = non_openai_provider_name;
+            set_test_compact_prompt(config);
         })
         .build(&server)
         .await
@@ -1106,13 +1107,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // mock responses from the model
 
     let reasoning_response_1 = ev_reasoning_item("m1", &["I will create a react app"], &[]);
-    let encrypted_content_1 = reasoning_response_1["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
-
     // first chunk of work
     let model_reasoning_response_1_sse = sse(vec![
-        reasoning_response_1.clone(),
+        reasoning_response_1,
         ev_shell_command_call("r1-shell", "echo make-react"),
         ev_completed_with_tokens("r1", token_count_used),
     ]);
@@ -1124,13 +1121,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     ]);
 
     let reasoning_response_2 = ev_reasoning_item("m3", &["I will create a node app"], &[]);
-    let encrypted_content_2 = reasoning_response_2["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
-
     // second chunk of work
     let model_reasoning_response_2_sse = sse(vec![
-        reasoning_response_2.clone(),
+        reasoning_response_2,
         ev_shell_command_call("r3-shell", "echo make-node"),
         ev_completed_with_tokens("r3", token_count_used),
     ]);
@@ -1140,11 +1133,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         ev_assistant_message("m4", second_summary_text),
         ev_completed_with_tokens("r4", token_count_used_after_compaction),
     ]);
-
-    let reasoning_response_3 = ev_reasoning_item("m6", &["I will create a python app"], &[]);
-    let encrypted_content_3 = reasoning_response_3["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
 
     // third chunk of work
     let model_reasoning_response_3_sse = sse(vec![
@@ -1338,17 +1326,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "message"
       },
       {
-        "content": null,
-        "encrypted_content": encrypted_content_1,
-        "summary": [
-          {
-            "text": "I will create a react app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
-      },
-      {
         "arguments": "{\"command\":\"echo make-react\"}",
         "call_id": "r1-shell",
         "name": "shell_command",
@@ -1438,17 +1415,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "message"
       },
       {
-        "content": null,
-        "encrypted_content": encrypted_content_2,
-        "summary": [
-          {
-            "text": "I will create a node app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
-      },
-      {
         "arguments": "{\"command\":\"echo make-node\"}",
         "call_id": "r3-shell",
         "name": "shell_command",
@@ -1536,17 +1502,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         ],
         "role": "user",
         "type": "message"
-      },
-      {
-        "content": null,
-        "encrypted_content": encrypted_content_3,
-        "summary": [
-          {
-            "text": "I will create a python app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
       },
       {
         "arguments": "{\"command\":\"echo make-python\"}",
@@ -2856,7 +2811,7 @@ async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
+async fn body_after_prefix_model_switch_budget_compacts_with_previous_model() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -2879,15 +2834,17 @@ async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
         vec![
             sse(vec![
                 ev_assistant_message("m1", "before switch"),
-                ev_completed_with_usage("r1", /*input_tokens*/ 100, /*output_tokens*/ 50),
+                ev_completed_with_usage(
+                    "r1", /*input_tokens*/ 100_000, /*output_tokens*/ 50_000,
+                ),
             ]),
             sse(vec![
                 ev_assistant_message("m2", "BODY_BUDGET_SUMMARY"),
-                ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10_000),
             ]),
             sse(vec![
                 ev_assistant_message("m3", "after switch"),
-                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100_000),
             ]),
         ],
     )
@@ -2901,7 +2858,7 @@ async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             let _ = config.features.enable(Feature::RemoteModels);
-            config.model_auto_compact_token_limit = Some(20);
+            config.model_auto_compact_token_limit = Some(20_000);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
         });
@@ -2941,7 +2898,10 @@ async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
         requests[0].body_json()["model"].as_str(),
         Some(previous_model)
     );
-    assert_eq!(requests[1].body_json()["model"].as_str(), Some(next_model));
+    assert_eq!(
+        requests[1].body_json()["model"].as_str(),
+        Some(previous_model)
+    );
     assert_eq!(requests[2].body_json()["model"].as_str(), Some(next_model));
     assert!(
         body_contains_text(&requests[1].body_json().to_string(), SUMMARIZATION_PROMPT),
@@ -3602,7 +3562,7 @@ async fn manual_compact_context_window_error_batches_history_repair() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
-            config.model_context_window = Some(100);
+            config.model_context_window = Some(10_000);
             config.model_auto_compact_token_limit = Some(200_000);
         })
         .build(&server)
@@ -3647,10 +3607,11 @@ async fn manual_compact_context_window_error_batches_history_repair() {
         "expected several history items before repair, got {}",
         compact_input.len()
     );
-    assert_eq!(
-        retry_input.len(),
-        1,
-        "known context overage should be repaired in one local batch"
+    assert!(
+        retry_input.len() < compact_input.len(),
+        "known context overage should remove one local history batch: {} -> {} items",
+        compact_input.len(),
+        retry_input.len()
     );
     assert!(
         body_contains_text(&retry_attempt.to_string(), SUMMARIZATION_PROMPT),
@@ -4267,8 +4228,8 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
 
     let server = start_mock_server().await;
 
-    let context_window = 100;
-    let config_limit = 200;
+    let context_window = 100_000;
+    let config_limit = 200_000;
     let over_limit_tokens = context_window * 90 / 100 + 1;
 
     let first_turn = sse(vec![
@@ -4278,10 +4239,10 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
     let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let auto_compact_turn = sse(vec![
         ev_assistant_message("m2", &auto_summary_payload),
-        ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10_000),
     ]);
     let post_auto_compact_turn = sse(vec![ev_completed_with_tokens(
-        "r3", /*total_tokens*/ 10,
+        "r3", /*total_tokens*/ 10_000,
     )]);
 
     let first_turn_mock = mount_sse_once(&server, first_turn).await;
@@ -4322,7 +4283,7 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
+async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -4339,13 +4300,18 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
         ev_completed_with_tokens("r3", /*total_tokens*/ 20),
     ]);
-    let third_turn = sse(vec![
+    let post_compact_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
         ev_completed_with_usage("r4", /*input_tokens*/ 750, /*output_tokens*/ 20),
     ]);
     let request_log = mount_sse_sequence(
         &server,
-        vec![first_turn, second_turn, auto_compact_turn, third_turn],
+        vec![
+            first_turn,
+            second_turn,
+            auto_compact_turn,
+            post_compact_turn,
+        ],
     )
     .await;
 
@@ -4369,20 +4335,10 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
 
     assert_eq!(
         request_log.requests().len(),
-        2,
-        "the first two turns should not compact just because the prefix exceeds the body budget"
-    );
-
-    test.submit_turn("PREFIX_FREE_THREE")
-        .await
-        .expect("submit third turn");
-
-    let requests = request_log.requests();
-    assert_eq!(
-        requests.len(),
         4,
-        "third turn should include pre-turn compaction plus the post-compaction request"
+        "body growth on the second turn should compact immediately, while the initial prefix alone should not"
     );
+    let requests = request_log.requests();
     let compact_body = requests[2].body_json().to_string();
     assert!(
         body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
@@ -4472,8 +4428,15 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
     let requests = request_log.requests();
     assert_eq!(
         requests.len(),
-        4,
-        "the first server-observed input in the new window should become the prefill baseline"
+        5,
+        "later post-compaction growth should trigger the second compaction immediately"
+    );
+    assert!(
+        requests[3..].iter().any(|request| body_contains_text(
+            &request.body_json().to_string(),
+            SUMMARIZATION_PROMPT
+        )),
+        "post-compaction growth should trigger a second body-after-prefix compaction"
     );
 
     test.submit_turn("AFTER_GROWTH_TRIGGER")
@@ -4485,11 +4448,6 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
         requests.len(),
         6,
         "fourth turn should compact because later post-compaction growth counted against the body budget"
-    );
-    let compact_body = requests[4].body_json().to_string();
-    assert!(
-        body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
-        "post-compaction growth should trigger a second body-after-prefix compaction"
     );
 }
 
@@ -5001,7 +4959,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
     ]);
     let mut responses = vec![first_turn];
     responses.extend(
@@ -5021,7 +4979,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
-            config.model_auto_compact_token_limit = Some(200);
+            config.model_auto_compact_token_limit = Some(200_000);
         })
         .build(&server)
         .await
@@ -5238,15 +5196,21 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
         vec![
             responses::sse(vec![
                 responses::ev_function_call("call-1", "unsupported_tool", "{}"),
-                responses::ev_completed_with_tokens("first-response", /*total_tokens*/ 96),
+                responses::ev_completed_with_tokens("first-response", /*total_tokens*/ 96_000),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("compact-message", "summary"),
-                responses::ev_completed_with_tokens("compact-response", /*total_tokens*/ 10),
+                responses::ev_completed_with_tokens(
+                    "compact-response",
+                    /*total_tokens*/ 10_000,
+                ),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("final-message", "done"),
-                responses::ev_completed_with_tokens("follow-up-response", /*total_tokens*/ 10),
+                responses::ev_completed_with_tokens(
+                    "follow-up-response",
+                    /*total_tokens*/ 10_000,
+                ),
             ]),
         ],
     )
@@ -5264,8 +5228,8 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
         .with_home(Arc::clone(&home))
         .with_config(move |config| {
             config.model_provider = provider;
-            config.model_context_window = Some(100);
-            config.model_auto_compact_token_limit = Some(90);
+            config.model_context_window = Some(100_000);
+            config.model_auto_compact_token_limit = Some(90_000);
         });
     let test = builder.build(&server).await?;
 

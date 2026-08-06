@@ -808,9 +808,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             core_policy,
         ]
         rust_parent_bytes = rust_instruction_chain[1].stat().st_size
-        rust_chain_bytes = sum(
-            path.stat().st_size for path in rust_instruction_chain
-        )
+        rust_chain_bytes = sum(path.stat().st_size for path in rust_instruction_chain)
         rust_parent_text = rust_parent.read_text(encoding="utf-8")
         core_policy_text = core_policy.read_text(encoding="utf-8")
         source_map_text = source_map.read_text(encoding="utf-8")
@@ -826,21 +824,15 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             "the root + codex-rs + core automatic instruction chain is too large",
         )
         self.assertIn("[`../SOURCEMAP.md`](../SOURCEMAP.md)", rust_parent_text)
-        self.assertIn(
-            "[`../../SOURCEMAP.md`](../../SOURCEMAP.md)", core_policy_text
-        )
-        self.assertEqual(
-            (rust_parent.parent / "../SOURCEMAP.md").resolve(), source_map
-        )
+        self.assertIn("[`../../SOURCEMAP.md`](../../SOURCEMAP.md)", core_policy_text)
+        self.assertEqual((rust_parent.parent / "../SOURCEMAP.md").resolve(), source_map)
         self.assertEqual(
             (core_policy.parent / "../../SOURCEMAP.md").resolve(), source_map
         )
         self.assertIn("## Validation routes", source_map_text)
         self.assertIn("## Rust workflow reference", source_map_text)
         self.assertIn("just rust-build-doctor", source_map_text)
-        self.assertIn(
-            "Tool-search breadth changes must preserve", core_policy_text
-        )
+        self.assertIn("Tool-search breadth changes must preserve", core_policy_text)
         self.assertIn("core_test_support::responses", core_policy_text)
 
 

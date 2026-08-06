@@ -484,7 +484,7 @@ fn for_prompt_keeps_current_group_reasoning_through_tool_output_until_next_bound
 
     assert_eq!(
         history.clone().for_prompt(&default_input_modalities()),
-        vec![call.clone(), reasoning.clone(), output.clone()]
+        vec![call.clone(), reasoning, output.clone()]
     );
 
     let boundary = user_input_text_msg("new instruction");

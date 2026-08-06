@@ -1,15 +1,15 @@
 ---
 source: core/tests/suite/token_budget.rs
-assertion_line: 545
 expression: snapshot
 ---
 Scenario: New context window tool installs fresh full context before the next follow-up request.
 
 ## Final Follow-Up Request
-00:message/developer[3]:
+00:message/developer[4]:
     [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <SKILLS_INSTRUCTIONS>
-    [03] <context_window>\nThread id: <THREAD_ID>\nFirst context window id: <FIRST_WINDOW_ID>\nCurrent context window id: <WINDOW_ID>\nPrevious context window id: <FIRST_WINDOW_ID>\n</context_window>
+    [02] <skills_usage_instructions>\n## How to use skills\n- Use a skill when the user names it or the task clearly matches its description. Use the smallest applicable set, announce it briefly, and do not carry it into later turns unless it is mentioned again.\n- If multiple skills apply, state the order. If a named skill is absent or unreadable, say so briefly and continue with the safest fallback.\n- Before task actions, the main agent must read the selected `SKILL.md` completely, continuing through truncation or pagination. Do not delegate that reading or interpretation.\n- Resolve `rN/...` paths through the catalog's skill-roots table. Read `file` sources from the host, `environment resource` sources in their owning environment, `orchestrator resource` sources through `skills.list` and `skills.read`, and `custom resource` sources through their provider.\n- The main agent itself must read and interpret every task-required instruction or resource referenced by the selected `SKILL.md`, using the same access mechanism. Do not delegate that reading, summarizing, or interpretation. Resolve relative filesystem paths from the skill directory and reuse supplied scripts, templates, and assets when appropriate.\n- Progressive disclosure chooses relevant resources; it does not permit partial reading of a selected instruction file. Load only task-relevant supporting material, avoid deep reference-chasing, and select only the relevant variant when alternatives exist.\n- If a shell read is rejected as potentially mutating, retry with a dedicated read-only API or command. Required reads must succeed before acting; otherwise state the problem and use the safest fallback.\n</skills_usage_instructions>
+    [03] <SKILLS_INSTRUCTIONS>
+    [04] <context_window>\nThread id: <THREAD_ID>\nFirst context window id: <FIRST_WINDOW_ID>\nCurrent context window id: <WINDOW_ID>\nPrevious context window id: <FIRST_WINDOW_ID>\n</context_window>
 01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
 02:function_call/update_plan
 03:function_call_output:Plan updated

@@ -377,10 +377,7 @@ class StageNpmPackagesTests(unittest.TestCase):
         with mock.patch.object(
             stage.subprocess,
             "check_output",
-            return_value=(
-                "42\tx86_64-unknown-linux-musl\t1024\t"
-                f"sha256:{'a' * 64}\n"
-            ),
+            return_value=(f"42\tx86_64-unknown-linux-musl\t1024\tsha256:{'a' * 64}\n"),
         ) as check_output:
             first = stage.list_workflow_artifacts("12345", "local/fork")
             second = stage.list_workflow_artifacts("12345", "local/fork")
@@ -435,7 +432,9 @@ class StageNpmPackagesTests(unittest.TestCase):
     def test_selected_artifact_requires_authoritative_digest(self) -> None:
         artifact = stage.WorkflowArtifact("target", 10, 1, None)
         with (
-            mock.patch.object(stage, "list_workflow_artifacts", return_value=(artifact,)),
+            mock.patch.object(
+                stage, "list_workflow_artifacts", return_value=(artifact,)
+            ),
             mock.patch.object(stage, "codex_package_component", return_value="package"),
             self.assertRaisesRegex(RuntimeError, "no authoritative sha256"),
         ):
@@ -480,7 +479,9 @@ class StageNpmPackagesTests(unittest.TestCase):
             artifact_id = int(endpoint.split("/")[-2])
             output = kwargs["stdout"]
             output.write(archives_by_id[artifact_id])  # type: ignore[union-attr]
-            calls.append(next(item.name for item in artifacts if item.artifact_id == artifact_id))
+            calls.append(
+                next(item.name for item in artifacts if item.artifact_id == artifact_id)
+            )
             return mock.Mock(returncode=0)
 
         with mock.patch.object(stage.subprocess, "run", fake_run):
@@ -507,9 +508,7 @@ class StageNpmPackagesTests(unittest.TestCase):
         with zipfile.ZipFile(payload, "w") as archive:
             archive.writestr("new.txt", "new")
         archive_bytes = payload.getvalue()
-        replacement = stage.WorkflowArtifact(
-            "linux", len(archive_bytes), 2, "0" * 64
-        )
+        replacement = stage.WorkflowArtifact("linux", len(archive_bytes), 2, "0" * 64)
 
         def fake_run(_cmd: list[str], **kwargs: object) -> mock.Mock:
             kwargs["stdout"].write(archive_bytes)  # type: ignore[union-attr]
@@ -790,7 +789,9 @@ class StageNpmPackagesTests(unittest.TestCase):
         lock_path = self.root / "cache" / ".unsupported.lock"
         permanent = OSError(errno.ENOTSUP, "unsupported")
         with (
-            mock.patch.object(archives, "_acquire_file_lock", side_effect=permanent) as acquire,
+            mock.patch.object(
+                archives, "_acquire_file_lock", side_effect=permanent
+            ) as acquire,
             self.assertRaisesRegex(OSError, "unsupported"),
         ):
             with archives.exclusive_file_lock(

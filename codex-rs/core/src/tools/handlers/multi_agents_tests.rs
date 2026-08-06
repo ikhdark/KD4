@@ -29,6 +29,7 @@ use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -77,6 +78,26 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+struct RemoveFileOnDrop(Option<PathBuf>);
+
+impl RemoveFileOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
 
 fn invocation(
     session: Arc<crate::session::session::Session>,
@@ -395,7 +416,7 @@ async fn spawn_agent_uses_bedrock_qualified_default_model_and_reasoning() {
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID);
+    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID);
     assert_eq!(
         snapshot.reasoning_effort,
         Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
@@ -800,6 +821,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
     let repo_root = codex_git_utils::get_git_repo_root(child_config.cwd.as_path())
         .unwrap_or_else(|| child_config.cwd.to_path_buf());
     let risk_file = repo_root.join(&risk_path);
+    let mut risk_file_cleanup = RemoveFileOnDrop::new(risk_file.clone());
 
     let before_initial_submission = Arc::new(AgentControlTestBarrier::default());
     agent_control
@@ -971,24 +993,34 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         result["assignment_id"].as_str(),
         Some(assignment_id_text.as_str())
     );
-    let assignment_attempt_marker = format!(
-        "assignment_id={assignment_id} attempt_id={}",
-        binding.attempt_id
+    let task_capsule_input = manager
+        .captured_ops()
+        .into_iter()
+        .find_map(|(id, op)| match op {
+            Op::UserInput { items, .. } if id == child_thread_id => {
+                items.into_iter().find_map(|item| match item {
+                    UserInput::Text { text, .. }
+                        if text.starts_with("<task_capsule_v1>")
+                            && text.ends_with("</task_capsule_v1>") =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("typed assignment should use a TaskCapsule as its sole initial input");
+    let task_capsule_payload = task_capsule_input
+        .strip_prefix("<task_capsule_v1>")
+        .and_then(|text| text.strip_suffix("</task_capsule_v1>"))
+        .expect("TaskCapsule markers should enclose the canonical payload");
+    let task_capsule: serde_json::Value =
+        serde_json::from_str(task_capsule_payload).expect("TaskCapsule payload should be JSON");
+    assert_eq!(
+        task_capsule["assignment_id"].as_str(),
+        Some(assignment_id_text.as_str())
     );
-    assert!(manager.captured_ops().iter().any(|(id, op)| {
-        *id == child_thread_id
-            && matches!(
-                op,
-                Op::InterAgentCommunication { communication }
-                    if communication.author == AgentPath::root()
-                        && communication.recipient == agent_path
-                        && communication.other_recipients.is_empty()
-                        && communication.content.starts_with("You have a durable typed assignment.")
-                        && communication.content.contains(&assignment_attempt_marker)
-                        && communication.encrypted_content.is_none()
-                        && communication.trigger_turn
-            )
-    }), "typed assignment should be submitted as plaintext communication");
     let _ = agent_control
         .shutdown_live_agent(child_thread_id)
         .await
@@ -1030,6 +1062,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
     }));
 
     std::fs::remove_file(risk_file).expect("high-risk test file should be removed");
+    risk_file_cleanup.disarm();
 }
 
 #[tokio::test]

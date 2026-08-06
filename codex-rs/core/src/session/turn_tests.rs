@@ -51,7 +51,7 @@ use wiremock::matchers::path;
 fn run_turn_multi_thread_test_with_stack<F, Fut, T>(test_name: &'static str, test: F) -> T
 where
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = T> + Send + 'static,
+    Fut: Future<Output = T> + 'static,
     T: Send + 'static,
 {
     std::thread::Builder::new()
@@ -262,8 +262,15 @@ async fn extension_turn_input_contributors_share_one_hard_budget() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn streamed_item_with_empty_id_gets_a_generated_id() -> Result<()> {
+#[test]
+fn streamed_item_with_empty_id_gets_a_generated_id() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "streamed_item_with_empty_id_gets_a_generated_id",
+        streamed_item_with_empty_id_gets_a_generated_id_impl,
+    )
+}
+
+async fn streamed_item_with_empty_id_gets_a_generated_id_impl() -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
     let test = test_codex()
@@ -606,8 +613,15 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oversized_pending_input_compacts_once_when_committed_history_is_also_over_limit()
+#[test]
+fn oversized_pending_input_compacts_once_when_committed_history_is_also_over_limit() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "oversized_pending_input_compacts_once_when_committed_history_is_also_over_limit",
+        oversized_pending_input_compacts_once_when_committed_history_is_also_over_limit_impl,
+    )
+}
+
+async fn oversized_pending_input_compacts_once_when_committed_history_is_also_over_limit_impl()
 -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
@@ -655,8 +669,15 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot() -> Result<()> {
+#[test]
+fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot",
+        pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl,
+    )
+}
+
+async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() -> Result<()> {
     let command = match core_test_support::stdio_server_bin() {
         Ok(command) => command,
         Err(err) => {
@@ -821,9 +842,16 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot() -> Resu
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_response() -> Result<()>
-{
+#[test]
+fn stop_hook_continuation_preserves_finalization_warning_for_the_final_response() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "stop_hook_continuation_preserves_finalization_warning_for_the_final_response",
+        stop_hook_continuation_preserves_finalization_warning_for_the_final_response_impl,
+    )
+}
+
+async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_response_impl()
+-> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
     let response_log = responses::mount_sse_sequence(
@@ -917,8 +945,15 @@ async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_res
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn models_etag_refresh_does_not_block_stream_events_and_is_cancellable() -> Result<()> {
+#[test]
+fn models_etag_refresh_does_not_block_stream_events_and_is_cancellable() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "models_etag_refresh_does_not_block_stream_events_and_is_cancellable",
+        models_etag_refresh_does_not_block_stream_events_and_is_cancellable_impl,
+    )
+}
+
+async fn models_etag_refresh_does_not_block_stream_events_and_is_cancellable_impl() -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     const REFRESH_ETAG: &str = "\"phase-68-models-2\"";
 

@@ -514,7 +514,8 @@ async fn token_budget_reminder_emits_after_crossing_compaction_threshold() -> Re
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_completed_with_tokens("resp-1", /*total_tokens*/ 8_000),
+                ev_assistant_message("msg-1", "noted"),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 80_000),
             ]),
             sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
         ],
@@ -522,9 +523,10 @@ async fn token_budget_reminder_emits_after_crossing_compaction_threshold() -> Re
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(10_000);
+            config.model_context_window = Some(100_000);
+            config.model_auto_compact_token_limit = Some(90_000);
             config.token_budget = Some(TokenBudgetConfig {
-                reminder_threshold_tokens: Some(2_000),
+                reminder_threshold_tokens: Some(20_000),
                 ..TokenBudgetConfig::default()
             });
             config
@@ -542,14 +544,15 @@ async fn token_budget_reminder_emits_after_crossing_compaction_threshold() -> Re
     assert_eq!(requests.len(), 2);
     let initial_context = token_budget_contexts(&requests[0]);
     assert_eq!(initial_context.len(), 1);
-    let reminder = "Your context window is nearly exhausted (only 1000 tokens remaining) and will be automatically reset for you soon. Once reset, message items in current context window will be cleared in the new window, but notes and history items will be persistent across windows.";
+    let reminder = "Your context window is nearly exhausted (only 10000 tokens remaining) and will be automatically reset for you soon. Once reset, message items in current context window will be cleared in the new window, but notes and history items will be persistent across windows.";
+    let developer_texts = requests[1].message_input_texts("developer");
     assert_eq!(
-        requests[1]
-            .message_input_texts("developer")
-            .into_iter()
-            .filter(|text| text == reminder)
+        developer_texts
+            .iter()
+            .filter(|text| *text == reminder)
             .count(),
-        1
+        1,
+        "unexpected developer context: {developer_texts:#?}"
     );
     assert_eq!(token_budget_contexts(&requests[1]), initial_context);
 
@@ -566,11 +569,17 @@ async fn token_budget_reminder_uses_body_after_prefix_window() -> Result<()> {
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_completed_with_tokens("resp-1", /*total_tokens*/ 8_000),
+                ev_assistant_message("msg-1", "prefix established"),
+                ev_completed_with_usage(
+                    "resp-1", /*input_tokens*/ 80_000, /*output_tokens*/ 0,
+                ),
             ]),
             sse(vec![
                 ev_response_created("resp-2"),
-                ev_completed_with_tokens("resp-2", /*total_tokens*/ 8_600),
+                ev_assistant_message("msg-2", "body grew"),
+                ev_completed_with_usage(
+                    "resp-2", /*input_tokens*/ 86_000, /*output_tokens*/ 0,
+                ),
             ]),
             sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
         ],
@@ -578,12 +587,12 @@ async fn token_budget_reminder_uses_body_after_prefix_window() -> Result<()> {
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(10_000);
-            config.model_auto_compact_token_limit = Some(1_000);
+            config.model_context_window = Some(100_000);
+            config.model_auto_compact_token_limit = Some(10_000);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
             config.token_budget = Some(TokenBudgetConfig {
-                reminder_threshold_tokens: Some(600),
+                reminder_threshold_tokens: Some(6_000),
                 ..TokenBudgetConfig::default()
             });
             config
@@ -600,21 +609,22 @@ async fn token_budget_reminder_uses_body_after_prefix_window() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 3);
-    let reminder = "Your context window is nearly exhausted (only 400 tokens remaining) and will be automatically reset for you soon. Once reset, message items in current context window will be cleared in the new window, but notes and history items will be persistent across windows.";
+    let reminder = "Your context window is nearly exhausted (only 4000 tokens remaining) and will be automatically reset for you soon. Once reset, message items in current context window will be cleared in the new window, but notes and history items will be persistent across windows.";
+    let second_request_developer_texts = requests[1].message_input_texts("developer");
     assert!(
-        requests[1]
-            .message_input_texts("developer")
-            .into_iter()
-            .all(|text| text != reminder),
+        second_request_developer_texts
+            .iter()
+            .all(|text| text.as_str() != reminder),
         "first-window prefix should not count against the body-after-prefix reminder threshold"
     );
+    let third_request_developer_texts = requests[2].message_input_texts("developer");
     assert_eq!(
-        requests[2]
-            .message_input_texts("developer")
-            .into_iter()
-            .filter(|text| text == reminder)
+        third_request_developer_texts
+            .iter()
+            .filter(|text| *text == reminder)
             .count(),
-        1
+        1,
+        "unexpected developer context: {third_request_developer_texts:#?}"
     );
 
     Ok(())

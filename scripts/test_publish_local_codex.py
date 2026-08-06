@@ -121,16 +121,27 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
             SCRIPT.read_text(encoding="utf-8"),
         )
 
-    def test_publish_build_includes_cli_and_code_mode_host_packages(self) -> None:
+    def test_publish_build_includes_complete_windows_runtime_bundle(self) -> None:
         publish_script = publish_source_text()
 
         self.assertIn(
-            '$publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host")',
+            '$publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host", "-p", "codex-windows-sandbox")',
             publish_script,
         )
         self.assertIn("Get-BuiltCodeModeHostPath", publish_script)
+        self.assertIn("Get-BuiltWindowsSandboxSetupPath", publish_script)
+        self.assertIn("Get-BuiltCommandRunnerPath", publish_script)
         self.assertIn(
             'Join-Path $InstallDir "codex-code-mode-host.exe"', publish_script
+        )
+        self.assertIn('Join-Path $InstallDir "codex-resources"', publish_script)
+        self.assertIn(
+            'Join-Path $sandboxResourcesDir "codex-windows-sandbox-setup.exe"',
+            publish_script,
+        )
+        self.assertIn(
+            'Join-Path $sandboxResourcesDir "codex-command-runner.exe"',
+            publish_script,
         )
 
     def test_publish_script_uses_global_publish_mutex(self) -> None:
@@ -306,6 +317,7 @@ class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertEqual(result.stdout.strip(), "codex noisy 1.0")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -152,6 +152,77 @@ pub(crate) struct WorkspaceMutationReservation {
     _guard: OwnedMutexGuard<()>,
 }
 
+pub(crate) struct WorkspaceMutationGuard {
+    store: Arc<dyn AgentTaskStore>,
+    repo_root: PathBuf,
+    lease: WorkspaceMutationLease,
+    finalized: bool,
+    _reservation: WorkspaceMutationReservation,
+}
+
+impl WorkspaceMutationGuard {
+    pub(crate) fn new(
+        store: Arc<dyn AgentTaskStore>,
+        repo_root: PathBuf,
+        lease: WorkspaceMutationLease,
+        reservation: WorkspaceMutationReservation,
+    ) -> Self {
+        Self {
+            store,
+            repo_root,
+            lease,
+            finalized: false,
+            _reservation: reservation,
+        }
+    }
+
+    pub(crate) fn store(&self) -> Arc<dyn AgentTaskStore> {
+        Arc::clone(&self.store)
+    }
+
+    pub(crate) fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    pub(crate) fn lease(&self) -> &WorkspaceMutationLease {
+        &self.lease
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<(), StoreError> {
+        self.store
+            .finish_workspace_mutation(&self.repo_root, self.lease.clone())
+            .await?;
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for WorkspaceMutationGuard {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        let lease = self.lease.clone();
+        let store = Arc::clone(&self.store);
+        let repo_root = self.repo_root.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                lease_id = %lease.lease_id,
+                "cannot finalize a dropped workspace mutation without a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(error) = store.finish_workspace_mutation(&repo_root, lease).await {
+                tracing::error!(
+                    %error,
+                    "failed to finalize a dropped workspace mutation"
+                );
+            }
+        });
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum WorkspaceMutationAcquireError {
     Cancelled,
@@ -1011,6 +1082,77 @@ mod tests {
             .await
             .expect("replacement mutation finishes");
         drop(replacement_reservation);
+    }
+
+    #[tokio::test]
+    async fn dropped_workspace_mutation_guard_releases_lease_for_next_task() {
+        let codex_home = TempDir::new().expect("codex home tempdir");
+        let repo = TempDir::new().expect("repository tempdir");
+        let state =
+            StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+                .await
+                .expect("state runtime initializes");
+        let store = Arc::new(
+            LocalAgentTaskStore::initialize(&state)
+                .await
+                .expect("task store initializes"),
+        );
+        let ledger = Arc::new(CommandExecutionLedger::default());
+        let reservation = ledger.reserve_workspace_mutation(repo.path()).await;
+        let lease = store
+            .begin_workspace_mutation(
+                repo.path(),
+                WorkspaceMutationRequest {
+                    root_session_id: "completed-review-root".to_string(),
+                    actor_id: "root:completed-review-root".to_string(),
+                    kind: WorkspaceActorKind::Root,
+                    attempt_id: None,
+                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                    contracts: Vec::new(),
+                    expected_manifest: Vec::new(),
+                },
+            )
+            .await
+            .expect("completed review acquires mutation lease");
+        let trait_store: Arc<dyn AgentTaskStore> = store.clone();
+        drop(WorkspaceMutationGuard::new(
+            trait_store,
+            repo.path().to_path_buf(),
+            lease,
+            reservation,
+        ));
+
+        let _replacement_reservation = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ledger.reserve_workspace_mutation(repo.path()),
+        )
+        .await
+        .expect("dropped review releases its local mutation reservation");
+        let replacement_request = WorkspaceMutationRequest {
+            root_session_id: "bug-fix-root".to_string(),
+            actor_id: "root:bug-fix-root".to_string(),
+            kind: WorkspaceActorKind::Root,
+            attempt_id: None,
+            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+            contracts: Vec::new(),
+            expected_manifest: Vec::new(),
+        };
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_workspace_mutation_lease(
+                store.as_ref(),
+                repo.path(),
+                &replacement_request,
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("next task does not wait for the stale lease timeout")
+        .expect("next task acquires repository-wide mutation ownership");
+        store
+            .finish_workspace_mutation(repo.path(), replacement)
+            .await
+            .expect("replacement mutation finishes");
     }
 
     #[test]

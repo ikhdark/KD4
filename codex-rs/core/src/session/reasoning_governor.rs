@@ -305,11 +305,11 @@ impl SamplingReasoningGovernor {
             self.phase = SamplingReasoningPhase::Implement;
             return;
         }
-        if self.plan_revision > baselines.plan_revision {
-            if let Some(plan) = changed_plan.as_ref() {
-                self.phase = phase_for_plan(plan);
-                return;
-            }
+        if self.plan_revision > baselines.plan_revision
+            && let Some(plan) = changed_plan.as_ref()
+        {
+            self.phase = phase_for_plan(plan);
+            return;
         }
         let read_only_success = outcomes.iter().any(|outcome| {
             outcome.kind == SamplingToolOutcomeKind::Success && outcome.plan.is_none()

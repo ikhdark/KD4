@@ -132,13 +132,13 @@ class WorkflowPreflightTest(unittest.TestCase):
         ):
             self.resolve(contender, (active,))
 
-    def test_case_only_claim_aliases_overlap_on_case_insensitive_filesystems(self) -> None:
+    def test_case_only_claim_aliases_overlap_on_case_insensitive_filesystems(
+        self,
+    ) -> None:
         left = {"path": "src/Foo", "recursive": True}
         right = {"path": "src/foo/child.rs", "recursive": False}
         self.assertTrue(
-            workflow_preflight.claims_overlap(
-                left, right, case_insensitive=True
-            )
+            workflow_preflight.claims_overlap(left, right, case_insensitive=True)
         )
 
     def test_workspace_fingerprint_hashes_dirty_content_not_only_status_shape(

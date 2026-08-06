@@ -78,7 +78,6 @@ struct SourcePartition {
 
 #[derive(Clone, Debug)]
 pub(super) struct ClassificationPlan {
-    partitions: Vec<SourcePartition>,
     ranges: Vec<UnresolvedRange>,
     contexts: Vec<ImmutableContext>,
     locked: Vec<LockedRequirementIdentity>,
@@ -389,7 +388,7 @@ pub(super) fn plan_classification(
         partitions.push(partition);
     }
 
-    locked.sort_by(|left, right| locked_order_key(left).cmp(&locked_order_key(right)));
+    locked.sort_by_cached_key(locked_order_key);
     let (ranges, contexts) = build_ranges(dossier, &partitions, &locked)?;
     if ranges.is_empty() {
         return Some(ClassificationRoute::LocalOnly(merge_without_model(
@@ -401,7 +400,6 @@ pub(super) fn plan_classification(
         return Some(ClassificationRoute::V1);
     }
     Some(ClassificationRoute::V2(ClassificationPlan {
-        partitions,
         ranges,
         contexts,
         locked,
@@ -489,8 +487,7 @@ fn build_ranges(
             );
             let preceding = locked
                 .iter()
-                .filter(|entry| locked_order_key(entry) < current_key)
-                .next_back()
+                .rfind(|entry| locked_order_key(entry) < current_key)
                 .cloned();
             let following = locked
                 .iter()
@@ -536,7 +533,6 @@ fn build_ranges(
 #[derive(Clone, Debug)]
 struct Line<'a> {
     start: usize,
-    content_end: usize,
     end: usize,
     text: &'a str,
 }
@@ -555,7 +551,6 @@ fn lines_with_offsets(text: &str) -> Vec<Line<'_>> {
         };
         result.push(Line {
             start,
-            content_end,
             end,
             text: &text[start..content_end],
         });
@@ -567,7 +562,6 @@ fn lines_with_offsets(text: &str) -> Vec<Line<'_>> {
     if start < text.len() {
         result.push(Line {
             start,
-            content_end: text.len(),
             end: text.len(),
             text: &text[start..],
         });
@@ -1064,7 +1058,7 @@ pub(super) async fn build_v2_inputs(
     dossier: &CompletionReviewDossier,
     plan: &ClassificationPlan,
 ) -> Result<Vec<UserInput>, ReviewFailureCategory> {
-    let request = render_v2_request(dossier, plan);
+    let request = render_v2_request(dossier, plan)?;
     if approx_token_count(&request) > MAX_RENDERED_REQUEST_TOKENS {
         return Err(ReviewFailureCategory::OversizedRequest);
     }
@@ -1123,20 +1117,23 @@ pub(super) async fn build_v2_inputs(
     Ok(inputs)
 }
 
-fn render_v2_request(dossier: &CompletionReviewDossier, plan: &ClassificationPlan) -> String {
-    format!(
-        "{SOURCE_CLASSIFICATION_V2_MARKER}\n\nClassify every declared unresolved range exactly once. Immutable context and locked entries are read-only and non-returnable. Mint requirements only inside the referenced unresolved range. Return a source_disposition exactly once for each model-owned pending source that ends with no merged requirements, and never for a requirement-bearing or host-owned source. Return sparse locked_requirement_overlays only for status or superseded_by changes; copy every identity field exactly. UnavailableOrTruncated is host-owned and is not a permitted range result.\n\n<classification_v2_input>\n{}\n</classification_v2_input>",
-        serde_json::to_string_pretty(&json!({
-            "root_task_id": dossier.root_task_id,
-            "completion_epoch": dossier.completion_epoch,
-            "manifest_revision": dossier.manifest_revision,
-            "user_source_ledger_hash": dossier.user_source_ledger_hash,
-            "unresolved_ranges": plan.ranges,
-            "immutable_context": plan.contexts,
-            "locked_requirements": plan.locked,
-        }))
-        .expect("V2 classification input is serializable")
-    )
+fn render_v2_request(
+    dossier: &CompletionReviewDossier,
+    plan: &ClassificationPlan,
+) -> Result<String, ReviewFailureCategory> {
+    let input = serde_json::to_string_pretty(&json!({
+        "root_task_id": dossier.root_task_id,
+        "completion_epoch": dossier.completion_epoch,
+        "manifest_revision": dossier.manifest_revision,
+        "user_source_ledger_hash": dossier.user_source_ledger_hash,
+        "unresolved_ranges": plan.ranges,
+        "immutable_context": plan.contexts,
+        "locked_requirements": plan.locked,
+    }))
+    .map_err(|_| ReviewFailureCategory::InputUnavailable)?;
+    Ok(format!(
+        "{SOURCE_CLASSIFICATION_V2_MARKER}\n\nClassify every declared unresolved range exactly once. Immutable context and locked entries are read-only and non-returnable. Mint requirements only inside the referenced unresolved range. Return a source_disposition exactly once for each model-owned pending source that ends with no merged requirements, and never for a requirement-bearing or host-owned source. Return sparse locked_requirement_overlays only for status or superseded_by changes; copy every identity field exactly. UnavailableOrTruncated is host-owned and is not a permitted range result.\n\n<classification_v2_input>\n{input}\n</classification_v2_input>"
+    ))
 }
 
 pub(super) fn v2_schema() -> Value {
@@ -2232,7 +2229,10 @@ mod tests {
         let request_tokens = |material_len: usize| {
             let dossier = host_mixed_dossier(&"x".repeat(material_len));
             let plan = v2_plan(&dossier);
-            approx_token_count(&render_v2_request(&dossier, &plan))
+            approx_token_count(
+                &render_v2_request(&dossier, &plan)
+                    .expect("test V2 classification request should serialize"),
+            )
         };
         let mut fits = 1usize;
         let mut exceeds = MAX_RENDERED_REQUEST_TOKENS * 8;

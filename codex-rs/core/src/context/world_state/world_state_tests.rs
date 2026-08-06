@@ -224,7 +224,7 @@ fn missing_retained_fragment_is_rendered_again() {
             .into_iter()
             .map(|fragment| fragment.body())
             .collect::<Vec<_>>(),
-        vec!["current catalog"]
+        vec!["<extension_test>current catalog</extension_test>"]
     );
     assert!(
         world_state

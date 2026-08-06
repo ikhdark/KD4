@@ -821,9 +821,7 @@ def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
     if os.name == "nt":
         escaped_target = target_arg.replace('"', '\\"')
         quoted_target = (
-            f'"{escaped_target}"'
-            if re.search(r"\s", target_arg)
-            else target_arg
+            f'"{escaped_target}"' if re.search(r"\s", target_arg) else target_arg
         )
     else:
         quoted_target = shlex.quote(target_arg)

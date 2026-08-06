@@ -3,15 +3,17 @@ set -euo pipefail
 
 readonly -a ALL_PARAMETERS=(
   DryRun SkipBuild AutoSkipBuild NoSccache SkipPreflightCheck BuildOnly TestRun
-  Profile PrintBuiltCodexPath RepoRoot SourceExe SourceCodeModeHostExe InstallDir
-  BackupDir RunDoctor FastProof DoctorOnNoop FailOnStaleSourceBuild RuntimeProof
+  Profile PrintBuiltCodexPath RepoRoot SourceExe SourceCodeModeHostExe
+  SourceWindowsSandboxSetupExe SourceCommandRunnerExe InstallDir BackupDir
+  RunDoctor FastProof DoctorOnNoop FailOnStaleSourceBuild RuntimeProof
   AllowRustyV8Download RustyV8Archive ConfigureDesktopLocalCli RestartDesktop
   DesktopCliEnvironmentTarget LocalCodexHome LocalCodexSqliteHome
   AllowRunningTarget CloseRunningTargetTimeoutSeconds
 )
 readonly -a PATH_PARAMETERS=(
-  RepoRoot SourceExe SourceCodeModeHostExe InstallDir BackupDir RustyV8Archive
-  LocalCodexHome LocalCodexSqliteHome
+  RepoRoot SourceExe SourceCodeModeHostExe SourceWindowsSandboxSetupExe
+  SourceCommandRunnerExe InstallDir BackupDir RustyV8Archive LocalCodexHome
+  LocalCodexSqliteHome
 )
 
 main() {

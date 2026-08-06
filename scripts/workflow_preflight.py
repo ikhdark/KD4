@@ -389,9 +389,7 @@ def resolve_manifest(
         )
     for output in generated_outputs:
         if not any(
-            claim_covers(
-                claim, output, case_insensitive=repository_case_insensitive
-            )
+            claim_covers(claim, output, case_insensitive=repository_case_insensitive)
             for claim in path_claims
         ):
             raise PreflightError(f"generated output is outside path claims: {output}")
@@ -465,9 +463,7 @@ def resolve_manifest(
             (left["path"], right["path"])
             for left in path_claims
             for right in active_claims
-            if claims_overlap(
-                left, right, case_insensitive=compare_case_insensitively
-            )
+            if claims_overlap(left, right, case_insensitive=compare_case_insensitively)
         ]
         shared_contracts = sorted(
             set(contract_claims)
@@ -616,7 +612,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 now=now,
             )
             receipt_path = registry_receipt_path(root, assignment_id)
-            previous_receipt = receipt_path.read_bytes() if receipt_path.exists() else None
+            previous_receipt = (
+                receipt_path.read_bytes() if receipt_path.exists() else None
+            )
             write_atomic(receipt_path, resolved)
             try:
                 if args.output:

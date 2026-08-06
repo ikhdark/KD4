@@ -48,10 +48,15 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
     let server = MockServer::start().await;
     let model = "remote-auto-review-parent";
     let review_model = "remote-auto-review-reviewer";
+    let mut review_model_info = remote_model_with_auto_review_override(review_model, review_model);
+    review_model_info.auto_review_model_override = None;
     mount_models_once(
         &server,
         ModelsResponse {
-            models: vec![remote_model_with_auto_review_override(model, review_model)],
+            models: vec![
+                remote_model_with_auto_review_override(model, review_model),
+                review_model_info,
+            ],
         },
     )
     .await;
@@ -199,16 +204,28 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    let guardian_request = responses
-        .requests()
+    let requests = responses.requests();
+    let request_summaries = requests
+        .iter()
+        .map(|request| {
+            json!({
+                "model": request.body_json()["model"],
+                "instructions": request.instructions_text().lines().next(),
+                "contains_patch": request.body_contains_text("auto-review-model-override.txt"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let guardian_request = requests
         .into_iter()
         .find(|request| {
             request.body_contains_text("auto-review-model-override.txt")
                 && request
                     .instructions_text()
-                    .starts_with("You are judging one planned coding-agent action.")
+                    .starts_with("You are the Codex Guardian.")
         })
-        .expect("expected Guardian request for apply_patch");
+        .unwrap_or_else(|| {
+            panic!("expected Guardian request for apply_patch; captured {request_summaries:#?}")
+        });
     assert_eq!(
         guardian_request.body_json()["model"].as_str(),
         Some(review_model)

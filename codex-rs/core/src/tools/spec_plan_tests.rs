@@ -1521,9 +1521,8 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     };
     let spawn_agent_description = spawn_agent.description.as_str();
     assert!(!spawn_agent_description.contains("max_concurrent_threads_per_session"));
-    assert!(spawn_agent_description.contains(
-        "Note that passing `fork_turns=\"none\"` will not pass any surrounding context to the spawned subagent"
-    ));
+    assert!(spawn_agent_description.contains("lineage-preserving TaskCapsule fork"));
+    assert!(spawn_agent_description.contains("no parent conversation"));
 
     let v2_subagent = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);

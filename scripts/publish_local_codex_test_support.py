@@ -72,6 +72,20 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         )
         self.source_code_mode_host_bytes = b"codex-code-mode-host-test-fixture"
         self.source_code_mode_host.write_bytes(self.source_code_mode_host_bytes)
+        self.source_windows_sandbox_setup = (
+            Path(self.repo_temp.name) / "fixture-windows-sandbox-setup.exe"
+        )
+        self.source_windows_sandbox_setup_bytes = (
+            b"codex-windows-sandbox-setup-test-fixture"
+        )
+        self.source_windows_sandbox_setup.write_bytes(
+            self.source_windows_sandbox_setup_bytes
+        )
+        self.source_command_runner = (
+            Path(self.repo_temp.name) / "fixture-command-runner.exe"
+        )
+        self.source_command_runner_bytes = b"codex-command-runner-test-fixture"
+        self.source_command_runner.write_bytes(self.source_command_runner_bytes)
         self.repo_fixture_initialized = False
 
     def init_repo_fixture(self) -> None:
@@ -234,6 +248,8 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             "-SourceFingerprint $fingerprint "
             f"-SourceExe {ps_single_quote(source_exe)} "
             f"-SourceCodeModeHostExe {ps_single_quote(code_mode_host)} "
+            f"-SourceWindowsSandboxSetupExe {ps_single_quote(self.source_windows_sandbox_setup)} "
+            f"-SourceCommandRunnerExe {ps_single_quote(self.source_command_runner)} "
             f"-SourceNewestUtc ([DateTime]::Parse({ps_single_quote(source_newest)}, "
             "[Globalization.CultureInfo]::InvariantCulture, "
             "[Globalization.DateTimeStyles]::RoundtripKind))"
@@ -359,6 +375,17 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         if "-SourceCodeModeHostExe" not in publish_args:
             publish_args.extend(
                 ["-SourceCodeModeHostExe", str(self.source_code_mode_host)]
+            )
+        if "-SourceWindowsSandboxSetupExe" not in publish_args:
+            publish_args.extend(
+                [
+                    "-SourceWindowsSandboxSetupExe",
+                    str(self.source_windows_sandbox_setup),
+                ]
+            )
+        if "-SourceCommandRunnerExe" not in publish_args:
+            publish_args.extend(
+                ["-SourceCommandRunnerExe", str(self.source_command_runner)]
             )
         return subprocess.run(
             [

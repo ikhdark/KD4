@@ -85,6 +85,18 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
             self.assertEqual(
                 code_mode_host_target.read_bytes(), self.source_code_mode_host_bytes
             )
+            sandbox_resources = install_dir / "codex-resources"
+            windows_sandbox_setup_target = (
+                sandbox_resources / "codex-windows-sandbox-setup.exe"
+            )
+            command_runner_target = sandbox_resources / "codex-command-runner.exe"
+            self.assertEqual(
+                windows_sandbox_setup_target.read_bytes(),
+                self.source_windows_sandbox_setup_bytes,
+            )
+            self.assertEqual(
+                command_runner_target.read_bytes(), self.source_command_runner_bytes
+            )
             backups = sorted((install_dir / "backups").glob("codex-2*.exe"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), b"previous-codex")
@@ -111,6 +123,10 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
             self.assertIn("postPublishVerify: version ok", result.stdout)
             self.assertIn("codexPostPublishVerify: sha256 ok", result.stdout)
             self.assertIn("codeModeHostPostPublishVerify: sha256 ok", result.stdout)
+            self.assertIn(
+                "windowsSandboxSetupPostPublishVerify: sha256 ok", result.stdout
+            )
+            self.assertIn("commandRunnerPostPublishVerify: sha256 ok", result.stdout)
             self.assertRegex(
                 result.stdout,
                 r"targetBeforeVersion: <unavailable: [^\r\n]+>[\r\n]",
@@ -263,6 +279,10 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
                 str(fake_codex),
                 "-SourceCodeModeHostExe",
                 str(self.source_code_mode_host),
+                "-SourceWindowsSandboxSetupExe",
+                str(self.source_windows_sandbox_setup),
+                "-SourceCommandRunnerExe",
+                str(self.source_command_runner),
                 "-InstallDir",
                 str(install_dir),
                 "-ConfigureDesktopLocalCli",

@@ -3755,6 +3755,8 @@ async fn resume_correction(
     Ok(outcome)
 }
 
+// Persistence records each independently validated review component without an intermediate bag.
+#[allow(clippy::too_many_arguments)]
 async fn persist_validated_attempt(
     sess: &Session,
     dossier: &CompletionReviewDossier,

@@ -43,7 +43,7 @@ mod tests {
 
         assert_eq!(
             TaskCapsuleFragment::new(payload.clone()).render(),
-            format!("{TASK_CAPSULE_OPEN_TAG}\n{payload}\n{TASK_CAPSULE_CLOSE_TAG}")
+            format!("{TASK_CAPSULE_OPEN_TAG}{payload}{TASK_CAPSULE_CLOSE_TAG}")
         );
     }
 }

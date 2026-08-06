@@ -2149,6 +2149,8 @@ impl TaskEvidenceLedger {
         ))
     }
 
+    // These inputs are distinct evidence domains whose ordering is part of the review boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn completion_review_dossier(
         &self,
         candidate_completion: Option<&str>,
@@ -2905,20 +2907,10 @@ impl TaskEvidenceLedger {
                     proof_route: finding.proof_route.clone(),
                 })
                 .collect::<Vec<_>>();
-            let Ok(baseline) = build_repair_baseline(dossier, &preview_findings) else {
-                return AtomicReviewTransition::Failed;
-            };
-            let baseline_hash = repair_baseline_hash(&baseline);
-            if !input
-                .repair_instruction
-                .as_deref()
-                .is_some_and(|instruction| {
-                    repair_instruction_matches_baseline(instruction, &baseline, &baseline_hash)
-                })
-            {
-                return AtomicReviewTransition::Failed;
-            }
-            Some((baseline, baseline_hash))
+            bind_initial_repair_baseline_metadata(
+                build_repair_baseline(dossier, &preview_findings),
+                input.repair_instruction.as_deref(),
+            )
         } else {
             None
         };
@@ -5770,6 +5762,8 @@ fn mutation_paths_are_attributable(identity: &str, scopes: &[RepairPathScope]) -
         })
 }
 
+// Keep the baseline and current identity hashes explicit at this fail-closed boundary.
+#[allow(clippy::too_many_arguments)]
 fn build_rereview_input(
     baseline: Option<&RepairBaseline>,
     persisted_baseline_hash: Option<&str>,
@@ -6002,6 +5996,19 @@ pub(crate) fn repair_baseline_hash(baseline: &RepairBaseline) -> String {
         REPAIR_BASELINE_CANONICAL_FORMAT,
         &serde_json::to_value(baseline).unwrap_or(Value::Null),
     )
+}
+
+fn bind_initial_repair_baseline_metadata(
+    baseline: Result<RepairBaseline, RereviewFallbackReason>,
+    instruction: Option<&str>,
+) -> Option<(RepairBaseline, String)> {
+    let baseline = baseline.ok()?;
+    let baseline_hash = repair_baseline_hash(&baseline);
+    instruction
+        .is_some_and(|instruction| {
+            repair_instruction_matches_baseline(instruction, &baseline, &baseline_hash)
+        })
+        .then_some((baseline, baseline_hash))
 }
 
 pub(crate) fn repair_delta_hash(delta: &RepairDelta) -> String {
@@ -8910,6 +8917,34 @@ mod tests {
     }
 
     #[test]
+    fn repair_baseline_build_failure_omits_delta_metadata() {
+        assert_eq!(
+            bind_initial_repair_baseline_metadata(
+                Err(RereviewFallbackReason::RequirementManifestChanged),
+                Some("{}"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn repair_instruction_mismatch_omits_delta_metadata() {
+        let baseline = repair_baseline_fixture();
+        assert_eq!(
+            bind_initial_repair_baseline_metadata(Ok(baseline.clone()), Some("{}")),
+            None
+        );
+
+        let baseline_hash = repair_baseline_hash(&baseline);
+        let instruction = serde_json::json!({
+            "repair_baseline_hash": baseline_hash,
+            "declared_repair_scope": &baseline.repair_scope,
+        })
+        .to_string();
+        assert!(bind_initial_repair_baseline_metadata(Ok(baseline), Some(&instruction)).is_some());
+    }
+
+    #[test]
     fn affected_requirements_are_deterministic_and_fail_closed() {
         let active = ["R3", "R1", "R2"]
             .into_iter()
@@ -9258,7 +9293,7 @@ mod tests {
         let source = text_source("Use YAML.");
         assert!(
             ledger
-                .record_user_sources("message-1", &[source.clone()])
+                .record_user_sources("message-1", std::slice::from_ref(&source))
                 .await
         );
         assert!(ledger.record_user_sources("message-2", &[source]).await);

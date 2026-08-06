@@ -135,8 +135,12 @@ def invoke_helper(
     env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], float]:
     stdin = payload if isinstance(payload, str) else compact_json(payload)
-    payload_event = payload.get("hook_event_name") if isinstance(payload, dict) else None
-    expected_event = payload_event if payload_event in MANIFEST_EVENTS else "UserPromptSubmit"
+    payload_event = (
+        payload.get("hook_event_name") if isinstance(payload, dict) else None
+    )
+    expected_event = (
+        payload_event if payload_event in MANIFEST_EVENTS else "UserPromptSubmit"
+    )
     started = time.perf_counter()
     result = subprocess.run(
         [
@@ -174,12 +178,7 @@ class HookSandbox:
         for fast_helper in FAST_HELPERS:
             shutil.copy2(fast_helper, self.helper.parent / fast_helper.name)
         self.state = (
-            self.root
-            / ".codex"
-            / "harness"
-            / "runs"
-            / "task-continuity"
-            / "v1"
+            self.root / ".codex" / "harness" / "runs" / "task-continuity" / "v1"
         )
         self.transcript = self.root / "rollout.jsonl"
         self.transcript.write_text("", encoding="utf-8")
@@ -425,8 +424,7 @@ class LoopbackResponsesServer:
                     },
                 ]
                 payload = "".join(
-                    f"event: {event['type']}\n"
-                    f"data: {compact_json(event)}\n\n"
+                    f"event: {event['type']}\ndata: {compact_json(event)}\n\n"
                     for event in events
                 ).encode("utf-8")
                 self.send_response(200)
@@ -480,7 +478,9 @@ def run_installed_marker_smoke(codex: Path) -> dict[str, Any]:
             print(message, file=sys.stderr)
 
 
-def _run_installed_marker_smoke(codex: Path, cleanup_paths: list[Path]) -> dict[str, Any]:
+def _run_installed_marker_smoke(
+    codex: Path, cleanup_paths: list[Path]
+) -> dict[str, Any]:
     marker = f"KD4_SESSIONSTART_MARKER_{uuid.uuid4().hex}"
     capsule_path: Path | None = None
     marker_report: dict[str, Any] | None = None
@@ -547,13 +547,17 @@ def _run_installed_marker_smoke(codex: Path, cleanup_paths: list[Path]) -> dict[
         if not capsule_path.is_file():
             raise RuntimeError("trusted seed task did not create a continuity capsule")
         if any(marker.encode("utf-8") in body for body in server.requests):
-            raise RuntimeError("unique marker unexpectedly appeared before capsule injection")
+            raise RuntimeError(
+                "unique marker unexpectedly appeared before capsule injection"
+            )
 
         capsule = json.loads(capsule_path.read_text(encoding="utf-8"))
         capsule["task_label"] = "SessionStart marker smoke"
         capsule["last_user_request"] = marker
         capsule["last_assistant_result"] = None
-        temporary = capsule_path.with_name(f".{capsule_path.name}.{uuid.uuid4().hex}.tmp")
+        temporary = capsule_path.with_name(
+            f".{capsule_path.name}.{uuid.uuid4().hex}.tmp"
+        )
         cleanup_paths.append(temporary)
         temporary.write_text(compact_json(capsule), encoding="utf-8")
         os.replace(temporary, capsule_path)
@@ -614,7 +618,10 @@ def run_doctor() -> int:
         .get("enabledFeatures", [])
     )
     if "hooks" not in features or "error" in response:
-        print("installed binary does not expose the required hooks contract", file=sys.stderr)
+        print(
+            "installed binary does not expose the required hooks contract",
+            file=sys.stderr,
+        )
         return 2
 
     diagnoses, issues, hooks = classify_hooks_list(response)
@@ -692,9 +699,13 @@ def run_benchmark() -> int:
         for event in MANIFEST_EVENTS:
             session_id = sandbox.session_id()
             if event == "SessionStart":
-                seed, _ = sandbox.invoke(sandbox.payload("UserPromptSubmit", session_id))
+                seed, _ = sandbox.invoke(
+                    sandbox.payload("UserPromptSubmit", session_id)
+                )
                 if seed.stdout != "{}":
-                    raise RuntimeError("SessionStart benchmark seed emitted unexpected stdout")
+                    raise RuntimeError(
+                        "SessionStart benchmark seed emitted unexpected stdout"
+                    )
                 payload = sandbox.payload(
                     "SessionStart",
                     session_id,
@@ -703,7 +714,9 @@ def run_benchmark() -> int:
                 warm, _ = sandbox.invoke(payload)
                 expected = exact_injection(sandbox.capsule(session_id))
                 if warm.stdout != expected:
-                    raise RuntimeError("SessionStart benchmark warmup output was not exact")
+                    raise RuntimeError(
+                        "SessionStart benchmark warmup output was not exact"
+                    )
             else:
                 payload = sandbox.payload(event, session_id)
                 warm, _ = sandbox.invoke(payload)
@@ -764,9 +777,13 @@ class MarkerSmokeCleanupTest(unittest.TestCase):
                 return {"marker": "ok"}
 
             with patch.object(
-                sys.modules[__name__], "_run_installed_marker_smoke", side_effect=succeed
+                sys.modules[__name__],
+                "_run_installed_marker_smoke",
+                side_effect=succeed,
             ):
-                self.assertEqual(run_installed_marker_smoke(Path("codex")), {"marker": "ok"})
+                self.assertEqual(
+                    run_installed_marker_smoke(Path("codex")), {"marker": "ok"}
+                )
             self.assertFalse(capsule.exists())
             self.assertFalse(temporary.exists())
 
@@ -822,7 +839,9 @@ class TaskContinuityHookTest(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         result, _ = self.sandbox.invoke(payload)
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, exact_injection(self.sandbox.capsule(session_id)))
+        self.assertEqual(
+            result.stdout, exact_injection(self.sandbox.capsule(session_id))
+        )
         return result
 
     def test_manifest_has_exact_handlers_flags_paths_and_timeouts(self) -> None:
@@ -843,7 +862,9 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertEqual(handler["commandWindows"], PRODUCTION_COMMANDS[event])
             self.assertEqual(handler["timeout"], 5)
             self.assertNotIn("async", handler)
-            self.assertIn("-NoLogo -NoProfile -NonInteractive", handler["commandWindows"])
+            self.assertIn(
+                "-NoLogo -NoProfile -NonInteractive", handler["commandWindows"]
+            )
             self.assertIn(f'-File "{HELPER}"', handler["commandWindows"])
         self.assertTrue(HELPER.is_file())
         self.assertTrue(SLOW_HELPER.is_file())
@@ -898,9 +919,7 @@ if ($errors.Count -ne 0) {
             "Bearer abcdefghijklmnop"
         )
         self.invoke_empty(
-            self.sandbox.payload(
-                "UserPromptSubmit", session_id, prompt=prompt
-            )
+            self.sandbox.payload("UserPromptSubmit", session_id, prompt=prompt)
         )
         result = self.invoke_injection(
             self.sandbox.payload("SessionStart", session_id, source="resume"),
@@ -909,7 +928,9 @@ if ($errors.Count -ne 0) {
         self.assertNotIn("super-secret-value", result.stdout)
         self.assertNotIn("abcdefghijklmnop", result.stdout)
         self.assertIn("[REDACTED]", result.stdout)
-        self.assertLessEqual(len(recovery_context(self.sandbox.capsule(session_id)) or ""), 8000)
+        self.assertLessEqual(
+            len(recovery_context(self.sandbox.capsule(session_id)) or ""), 8000
+        )
 
     def test_schema_bounds_and_secret_redaction(self) -> None:
         session_id = self.sandbox.session_id()
@@ -962,7 +983,9 @@ if ($errors.Count -ne 0) {
             ("non-object JSON", "[]"),
             (
                 "unsupported event",
-                self.sandbox.payload("Stop", self.sandbox.session_id(), hook_event_name="Unknown"),
+                self.sandbox.payload(
+                    "Stop", self.sandbox.session_id(), hook_event_name="Unknown"
+                ),
             ),
             (
                 "unsafe session id",
@@ -971,7 +994,9 @@ if ($errors.Count -ne 0) {
             (
                 "redaction failure",
                 self.sandbox.payload(
-                    "UserPromptSubmit", self.sandbox.session_id(), prompt="bad\x00secret"
+                    "UserPromptSubmit",
+                    self.sandbox.session_id(),
+                    prompt="bad\x00secret",
                 ),
             ),
         ]
@@ -991,7 +1016,9 @@ if ($errors.Count -ne 0) {
         self.assertFalse(self.sandbox.capsule_path(session_id).exists())
         self.assertFalse(self.sandbox.state.exists())
 
-    def test_missing_transcript_git_failure_and_non_git_directory_fail_open(self) -> None:
+    def test_missing_transcript_git_failure_and_non_git_directory_fail_open(
+        self,
+    ) -> None:
         session_id = self.sandbox.session_id()
         missing = self.sandbox.root / "missing-rollout.jsonl"
         result = self.invoke_empty(
@@ -1050,7 +1077,9 @@ if ($errors.Count -ne 0) {
         result = self.invoke_empty(self.sandbox.payload("PreCompact", session_id))
         self.assertNotIn("Git state unavailable", result.stderr)
         repository = self.sandbox.capsule(session_id)["repository"]
-        self.assertEqual(normalize_path(repository["root"]), normalize_path(self.sandbox.root))
+        self.assertEqual(
+            normalize_path(repository["root"]), normalize_path(self.sandbox.root)
+        )
         self.assertGreaterEqual(len(repository["revision"]), 40)
         self.assertIsInstance(repository["dirty_summary"], str)
 
@@ -1058,9 +1087,7 @@ if ($errors.Count -ne 0) {
         corrupt_id = self.sandbox.session_id()
         self.sandbox.state.mkdir(parents=True)
         self.sandbox.capsule_path(corrupt_id).write_text("{not-json", encoding="utf-8")
-        result = self.invoke_empty(
-            self.sandbox.payload("UserPromptSubmit", corrupt_id)
-        )
+        result = self.invoke_empty(self.sandbox.payload("UserPromptSubmit", corrupt_id))
         self.assertIn("task-continuity:", result.stderr)
         self.assertEqual(
             self.sandbox.capsule_path(corrupt_id).read_text(encoding="utf-8"),
@@ -1122,7 +1149,9 @@ if ($errors.Count -ne 0) {
         )
         child_capsule = self.sandbox.capsule(child)
         self.assertEqual(child_capsule["predecessor_thread_id"], predecessor)
-        self.assertEqual(child_capsule["last_user_request"], "Preserve predecessor context")
+        self.assertEqual(
+            child_capsule["last_user_request"], "Preserve predecessor context"
+        )
         self.assertEqual(child_capsule["last_assistant_result"], "Predecessor result")
         self.assertEqual(predecessor_path.read_bytes(), predecessor_bytes)
         self.assertEqual(predecessor_path.stat().st_mtime_ns, predecessor_mtime)
@@ -1137,17 +1166,13 @@ if ($errors.Count -ne 0) {
         self.assertIsNone(new_capsule["last_user_request"])
 
         epoch_before = self.sandbox.capsule(child)["continuity_epoch"]
-        self.invoke_empty(
-            self.sandbox.payload("SessionStart", child, source="clear")
-        )
+        self.invoke_empty(self.sandbox.payload("SessionStart", child, source="clear"))
         cleared = self.sandbox.capsule(child)
         self.assertEqual(cleared["continuity_epoch"], epoch_before + 1)
         self.assertIsNone(cleared["last_user_request"])
         self.assertIsNone(cleared["last_assistant_result"])
         self.assertIsNone(cleared["predecessor_thread_id"])
-        self.invoke_empty(
-            self.sandbox.payload("SessionStart", child, source="resume")
-        )
+        self.invoke_empty(self.sandbox.payload("SessionStart", child, source="resume"))
 
     def test_pre_and_post_compaction_restore_ordering(self) -> None:
         session_id = self.sandbox.session_id()
@@ -1159,7 +1184,9 @@ if ($errors.Count -ne 0) {
         )
         self.assertIn("not post-compaction", result.stderr)
         self.invoke_empty(self.sandbox.payload("PostCompact", session_id))
-        self.assertEqual(self.sandbox.capsule(session_id)["compaction"]["phase"], "post")
+        self.assertEqual(
+            self.sandbox.capsule(session_id)["compaction"]["phase"], "post"
+        )
         self.invoke_injection(
             self.sandbox.payload("SessionStart", session_id, source="compact"),
             session_id,
@@ -1180,7 +1207,9 @@ if ($errors.Count -ne 0) {
         self.assertEqual(capsule_path.read_bytes(), before_bytes)
         self.assertEqual(capsule_path.stat().st_mtime_ns, before_mtime)
 
-    def test_concurrent_sessions_use_atomic_replacement_without_temp_files(self) -> None:
+    def test_concurrent_sessions_use_atomic_replacement_without_temp_files(
+        self,
+    ) -> None:
         session_ids = [self.sandbox.session_id() for _ in range(8)]
 
         def invoke(session_id: str) -> subprocess.CompletedProcess[str]:
@@ -1203,9 +1232,7 @@ if ($errors.Count -ne 0) {
         self.assertEqual(leftovers, [])
 
         first = session_ids[0]
-        self.invoke_empty(
-            self.sandbox.payload("PostCompact", first, trigger="auto")
-        )
+        self.invoke_empty(self.sandbox.payload("PostCompact", first, trigger="auto"))
         json.loads(self.sandbox.capsule_path(first).read_text(encoding="utf-8"))
         leftovers = [
             path.name
@@ -1214,7 +1241,9 @@ if ($errors.Count -ne 0) {
         ]
         self.assertEqual(leftovers, [])
 
-    def test_retention_runs_only_on_session_start_and_enforces_age_and_count(self) -> None:
+    def test_retention_runs_only_on_session_start_and_enforces_age_and_count(
+        self,
+    ) -> None:
         self.sandbox.state.mkdir(parents=True)
         old_ids = [self.sandbox.session_id(), self.sandbox.session_id()]
         for session_id in old_ids:
@@ -1229,11 +1258,15 @@ if ($errors.Count -ne 0) {
 
         current = self.sandbox.session_id()
         self.invoke_empty(self.sandbox.payload("UserPromptSubmit", current))
-        self.assertTrue(all(self.sandbox.capsule_path(value).exists() for value in old_ids))
+        self.assertTrue(
+            all(self.sandbox.capsule_path(value).exists() for value in old_ids)
+        )
         self.invoke_empty(
             self.sandbox.payload("SessionStart", current, source="startup")
         )
-        self.assertTrue(all(not self.sandbox.capsule_path(value).exists() for value in old_ids))
+        self.assertTrue(
+            all(not self.sandbox.capsule_path(value).exists() for value in old_ids)
+        )
         inactive = [
             path
             for path in self.sandbox.state.glob("*.json")

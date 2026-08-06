@@ -76,7 +76,7 @@ impl ToolCallRuntime {
         tool_name: &codex_tools::ToolName,
     ) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
         self.step_context
-            .tool_router()
+            .tool_router()?
             .create_diff_consumer(tool_name)
     }
 
@@ -130,7 +130,11 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
-        let router = self.step_context.tool_router();
+        let Some(router) = self.step_context.tool_router() else {
+            return Either::Left(std::future::ready(Err(FunctionCallError::Fatal(
+                "step tool router was not finalized before tool execution".to_string(),
+            ))));
+        };
         let supports_parallel = router.tool_supports_parallel(&call);
         let wait_for_runtime_cancellation = router.tool_waits_for_runtime_cancellation(&call);
         let router = Arc::clone(router);
@@ -190,7 +194,8 @@ impl ToolCallRuntime {
                     .await
             }));
 
-        async move {
+        Either::Right(
+            async move {
             let _tool_call_timing_guard = tool_call_timing_guard;
             tokio::select! {
                 res = &mut dispatch_handle => res.map_err(Self::tool_task_join_error)?,
@@ -233,7 +238,8 @@ impl ToolCallRuntime {
                 },
             }
         }
-        .in_current_span()
+            .in_current_span(),
+        )
     }
 }
 

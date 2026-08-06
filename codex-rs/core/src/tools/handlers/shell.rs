@@ -30,6 +30,7 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_execution::WorkspaceMutationAcquireError;
+use crate::tools::command_execution::WorkspaceMutationGuard;
 use crate::tools::command_execution::acquire_workspace_mutation_lease;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
@@ -283,7 +284,12 @@ pub(super) async fn run_exec_like_with_exit_code(
                 ))
             }
         })?;
-        workspace_mutation = Some((store, repo_root.clone(), lease, reservation));
+        workspace_mutation = Some(WorkspaceMutationGuard::new(
+            store,
+            repo_root.clone(),
+            lease,
+            reservation,
+        ));
     }
     let focused_validation_command = if typed_binding.is_some() && !inspection_command {
         let command_summary = focused_validation_command_summary(
@@ -512,53 +518,50 @@ pub(super) async fn run_exec_like_with_exit_code(
         }))
     });
     let workspace_heartbeat_stop = CancellationToken::new();
-    let workspace_heartbeat_task =
-        workspace_mutation
-            .as_ref()
-            .map(|(store, repo_root, lease, _reservation)| {
-                let store = store.clone();
-                let repo_root = repo_root.clone();
-                let lease_id = lease.lease_id.clone();
-                let actor_id = lease.actor_id.clone();
-                let workspace_heartbeat_stop = workspace_heartbeat_stop.clone();
-                let command_cancellation = args.cancellation_token.clone();
-                AbortOnDropHandle::new(tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = workspace_heartbeat_stop.cancelled() => break,
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                                match store
-                                    .heartbeat_workspace_mutation(
-                                        &repo_root,
-                                        lease_id.clone(),
-                                        actor_id.clone(),
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        tracing::warn!(
-                                            %lease_id,
-                                            "workspace mutation lease expired before heartbeat"
-                                        );
-                                        command_cancellation.cancel();
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            %error,
-                                            %lease_id,
-                                            "workspace mutation heartbeat failed"
-                                        );
-                                        command_cancellation.cancel();
-                                        break;
-                                    }
-                                }
+    let workspace_heartbeat_task = workspace_mutation.as_ref().map(|workspace_mutation| {
+        let store = workspace_mutation.store();
+        let repo_root = workspace_mutation.repo_root().to_path_buf();
+        let lease_id = workspace_mutation.lease().lease_id.clone();
+        let actor_id = workspace_mutation.lease().actor_id.clone();
+        let workspace_heartbeat_stop = workspace_heartbeat_stop.clone();
+        let command_cancellation = args.cancellation_token.clone();
+        AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = workspace_heartbeat_stop.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        match store
+                            .heartbeat_workspace_mutation(
+                                &repo_root,
+                                lease_id.clone(),
+                                actor_id.clone(),
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::warn!(
+                                    %lease_id,
+                                    "workspace mutation lease expired before heartbeat"
+                                );
+                                command_cancellation.cancel();
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    %lease_id,
+                                    "workspace mutation heartbeat failed"
+                                );
+                                command_cancellation.cancel();
+                                break;
                             }
                         }
                     }
-                }))
-            });
+                }
+            }
+        }))
+    });
     let cancellation_token = args.cancellation_token.clone();
     let result = run_exec_like_with_exit_code_inner(args, focused_validation.is_some()).await;
     heartbeat_stop.cancel();
@@ -574,15 +577,11 @@ pub(super) async fn run_exec_like_with_exit_code(
         tracing::warn!(%error, "workspace mutation heartbeat task failed");
     }
     let workspace_record_result = match workspace_mutation {
-        Some((store, repo_root, lease, _reservation)) => store
-            .finish_workspace_mutation(&repo_root, lease)
-            .await
-            .map(|_| ())
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "shell workspace mutation could not be finalized: {error}"
-                ))
-            }),
+        Some(workspace_mutation) => workspace_mutation.finish().await.map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "shell workspace mutation could not be finalized: {error}"
+            ))
+        }),
         None => Ok(()),
     };
     let Some(token) = focused_validation else {

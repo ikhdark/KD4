@@ -223,6 +223,7 @@ async fn responses_lite_uses_standalone_web_search_and_image_generation() -> Res
         .with_extensions(extensions)
         .with_model_info_override("gpt-5.4", |model_info| {
             model_info.use_responses_lite = true;
+            model_info.supports_search_tool = false;
             configure_image_capable_model(model_info);
         })
         .with_config(configure_responses_tools);
@@ -267,6 +268,7 @@ async fn responses_lite_exposes_standalone_tools_for_actor_authorized_provider()
         .with_extensions(extensions)
         .with_model_info_override("gpt-5.4", |model_info| {
             model_info.use_responses_lite = true;
+            model_info.supports_search_tool = false;
             configure_image_capable_model(model_info);
         })
         .with_config(|config| {

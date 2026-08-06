@@ -383,8 +383,6 @@ pub(crate) async fn run_turn(
                     last_agent_message: sampling_request_last_agent_message,
                     settled_state,
                 } = sampling_request_output;
-                let settled_state = settled_state
-                    .expect("settled sampling state is populated after concurrent tools drain");
                 reasoning_governor.settle(&request_baselines, &request_signals, &settled_state);
                 can_drain_pending_input = true;
                 let (has_pending_input, token_status) = async {
@@ -2188,7 +2186,13 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
-    settled_state: Option<SamplingRequestSettledState>,
+    settled_state: SamplingRequestSettledState,
+}
+
+#[derive(Debug)]
+struct UnsettledSamplingRequestResult {
+    needs_follow_up: bool,
+    last_agent_message: Option<String>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2873,7 +2877,7 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
-    let mut outcome: CodexResult<SamplingRequestResult> = loop {
+    let outcome: CodexResult<UnsettledSamplingRequestResult> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -3015,10 +3019,9 @@ async fn try_run_sampling_request(
                 needs_follow_up |= output_result.needs_follow_up;
                 // todo: remove before stabilizing multi-agent v2
                 if preempt_for_mailbox_mail && sess.input_queue.has_pending_mailbox_items().await {
-                    break Ok(SamplingRequestResult {
+                    break Ok(UnsettledSamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
-                        settled_state: None,
                     });
                 }
             }
@@ -3176,10 +3179,9 @@ async fn try_run_sampling_request(
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
                 }
-                break Ok(SamplingRequestResult {
+                break Ok(UnsettledSamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
-                    settled_state: None,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -3361,14 +3363,19 @@ async fn try_run_sampling_request(
         return Err(CodexErr::TurnAborted);
     }
 
-    if let Ok(result) = &mut outcome {
+    let settled_state = {
         let tracker = turn_diff_tracker.lock().await;
-        result.settled_state = Some(SamplingRequestSettledState {
+        SamplingRequestSettledState {
             mutation_revision: tracker.current_mutation_revision(),
             validation_status: tracker.validation_freshness_status(),
             validation_revision: tracker.last_successful_validation_revision(),
-        });
-    }
+        }
+    };
+    let outcome = outcome.map(|result| SamplingRequestResult {
+        needs_follow_up: result.needs_follow_up,
+        last_agent_message: result.last_agent_message,
+        settled_state,
+    });
 
     if should_emit_turn_diff {
         let unified_diff = {

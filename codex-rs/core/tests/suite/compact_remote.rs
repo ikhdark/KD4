@@ -1956,7 +1956,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.model_auto_compact_token_limit = Some(120);
+                config.model_auto_compact_token_limit = Some(120_000);
             }),
     )
     .await?;
@@ -3140,7 +3140,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
     let server = wiremock::MockServer::start().await;
     let realtime_server = start_remote_realtime_server().await;
     let mut builder = remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
-        config.model_auto_compact_token_limit = Some(200);
+        config.model_auto_compact_token_limit = Some(200_000);
     });
     let test = builder.build(&server).await?;
 
@@ -3149,15 +3149,15 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
         vec![
             responses::sse(vec![
                 responses::ev_assistant_message("setup", "REMOTE_SETUP_REPLY"),
-                responses::ev_completed_with_tokens("setup-response", /*total_tokens*/ 60),
+                responses::ev_completed_with_tokens("setup-response", /*total_tokens*/ 60_000),
             ]),
             responses::sse(vec![
                 responses::ev_function_call("call-remote-mid-turn", DUMMY_FUNCTION_NAME, "{}"),
-                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_MID_TURN_FINAL_REPLY"),
-                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80_000),
             ]),
         ],
     )
@@ -3596,7 +3596,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.model_auto_compact_token_limit = Some(200);
+                config.model_auto_compact_token_limit = Some(200_000);
             }),
     )
     .await?;
@@ -3606,7 +3606,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
         harness.server(),
         vec![responses::sse(vec![
             responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
-            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
         ])],
     )
     .await;
@@ -3625,7 +3625,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
         harness.server(),
         responses::sse(vec![
             responses::ev_assistant_message("m2", "REMOTE_POST_COMPACT_SHOULD_NOT_RUN"),
-            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
+            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80_000),
         ]),
     )
     .await;
@@ -3775,7 +3775,7 @@ async fn remote_mid_turn_compact_v1_sends_turn_state_over_http() -> Result<()> {
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.model_auto_compact_token_limit = Some(200);
+                config.model_auto_compact_token_limit = Some(200_000);
             }),
     )
     .await?;
@@ -3785,17 +3785,17 @@ async fn remote_mid_turn_compact_v1_sends_turn_state_over_http() -> Result<()> {
         vec![
             responses::sse_response(responses::sse(vec![
                 responses::ev_function_call("call-before-compact", DUMMY_FUNCTION_NAME, "{}"),
-                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
             ]))
             .insert_header(TURN_STATE_HEADER, "sampling-state"),
             responses::sse_response(responses::sse(vec![
                 responses::ev_function_call("call-after-compact", DUMMY_FUNCTION_NAME, "{}"),
-                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80_000),
             ]))
             .insert_header(TURN_STATE_HEADER, "continuation-state"),
             responses::sse_response(responses::sse(vec![
                 responses::ev_assistant_message("m1", "FINAL_REPLY"),
-                responses::ev_completed_with_tokens("r3", /*total_tokens*/ 80),
+                responses::ev_completed_with_tokens("r3", /*total_tokens*/ 80_000),
             ])),
         ],
     )
@@ -3859,7 +3859,7 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 let _ = config.features.enable(Feature::RemoteCompactionV2);
-                config.model_auto_compact_token_limit = Some(200);
+                config.model_auto_compact_token_limit = Some(200_000);
             }),
     )
     .await?;
@@ -3869,7 +3869,7 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
         vec![
             responses::sse_response(responses::sse(vec![
                 responses::ev_function_call("call-before-compact", DUMMY_FUNCTION_NAME, "{}"),
-                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
             ]))
             .insert_header(TURN_STATE_HEADER, "sampling-state"),
             responses::sse_response(responses::sse(vec![
@@ -3885,12 +3885,12 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
             .insert_header(TURN_STATE_HEADER, "compact-state"),
             responses::sse_response(responses::sse(vec![
                 responses::ev_function_call("call-after-compact", DUMMY_FUNCTION_NAME, "{}"),
-                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80_000),
             ]))
             .insert_header(TURN_STATE_HEADER, "continuation-state"),
             responses::sse_response(responses::sse(vec![
                 responses::ev_assistant_message("m1", "FINAL_REPLY"),
-                responses::ev_completed_with_tokens("r3", /*total_tokens*/ 80),
+                responses::ev_completed_with_tokens("r3", /*total_tokens*/ 80_000),
             ])),
         ],
     )
@@ -3960,7 +3960,7 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
                 "headers": {(TURN_STATE_HEADER): "sampling-state"},
             }),
             responses::ev_function_call("call-before-compact", DUMMY_FUNCTION_NAME, "{}"),
-            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
         ],
         vec![
             json!({
@@ -3982,11 +3982,11 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
                 "headers": {(TURN_STATE_HEADER): "continuation-state"},
             }),
             responses::ev_function_call("call-after-compact", DUMMY_FUNCTION_NAME, "{}"),
-            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
+            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80_000),
         ],
         vec![
             responses::ev_assistant_message("m1", "FINAL_REPLY"),
-            responses::ev_completed_with_tokens("r3", /*total_tokens*/ 80),
+            responses::ev_completed_with_tokens("r3", /*total_tokens*/ 80_000),
         ],
     ]])
     .await;
@@ -3994,7 +3994,7 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             let _ = config.features.enable(Feature::RemoteCompactionV2);
-            config.model_auto_compact_token_limit = Some(200);
+            config.model_auto_compact_token_limit = Some(200_000);
         });
     let test = builder.build_with_websocket_server(&server).await?;
 
@@ -4051,7 +4051,7 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.model_auto_compact_token_limit = Some(200);
+                config.model_auto_compact_token_limit = Some(200_000);
             }),
     )
     .await?;
@@ -4062,11 +4062,11 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
         vec![
             responses::sse(vec![
                 responses::ev_function_call("call-remote-mid-turn", DUMMY_FUNCTION_NAME, "{}"),
-                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_MID_TURN_FINAL_REPLY"),
-                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
+                responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80_000),
             ]),
         ],
     )
@@ -4124,7 +4124,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.model_auto_compact_token_limit = Some(200);
+                config.model_auto_compact_token_limit = Some(200_000);
             }),
     )
     .await?;
@@ -4134,7 +4134,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
         harness.server(),
         responses::sse(vec![
             responses::ev_function_call("call-remote-summary-only", DUMMY_FUNCTION_NAME, "{}"),
-            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
         ]),
     )
     .await;
@@ -4142,7 +4142,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
         harness.server(),
         responses::sse(vec![
             responses::ev_assistant_message("m2", "REMOTE_SUMMARY_ONLY_FINAL_REPLY"),
-            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
+            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80_000),
         ]),
     )
     .await;

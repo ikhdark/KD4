@@ -1177,13 +1177,13 @@ async fn resolved_reasoning_is_evicted_after_next_instruction_but_persisted_in_r
         vec![
             sse(vec![
                 ev_response_created("response-1"),
-                ev_reasoning_item("reasoning-1", &["summary one"], &["plaintext one"]),
+                ev_reasoning_item("rs_reasoning_1", &["summary one"], &["plaintext one"]),
                 ev_function_call("plan-call", "update_plan", &plan_args),
                 ev_completed("response-1"),
             ]),
             sse(vec![
                 ev_response_created("response-2"),
-                ev_reasoning_item("reasoning-2", &["summary two"], &["plaintext two"]),
+                ev_reasoning_item("rs_reasoning_2", &["summary two"], &["plaintext two"]),
                 ev_assistant_message("message-2", "tool follow-up complete"),
                 ev_completed("response-2"),
             ]),
@@ -1196,7 +1196,13 @@ async fn resolved_reasoning_is_evicted_after_next_instruction_but_persisted_in_r
     )
     .await;
 
-    let test = test_codex().build(&server).await?;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::ItemIds)
+            .expect("test config should allow item IDs");
+    });
+    let test = builder.build(&server).await?;
     let rollout_path = test
         .session_configured
         .rollout_path
@@ -1212,7 +1218,7 @@ async fn resolved_reasoning_is_evicted_after_next_instruction_but_persisted_in_r
 
     let request_2_reasoning = requests[1].inputs_of_type("reasoning");
     assert_eq!(request_2_reasoning.len(), 1);
-    assert_eq!(request_2_reasoning[0]["id"], "reasoning-1");
+    assert_eq!(request_2_reasoning[0]["id"], "rs_reasoning_1");
     assert_eq!(request_2_reasoning[0]["summary"][0]["text"], "summary one");
     assert_eq!(
         request_2_reasoning[0]["content"][0]["text"],

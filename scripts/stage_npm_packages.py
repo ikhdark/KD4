@@ -446,7 +446,9 @@ def ensure_source_matches_workflow(
     owned_roots = [path.resolve() for path in owned_paths]
     repo_root = repo_root.resolve()
     if any(path == repo_root for path in owned_roots):
-        raise ValueError("script-owned source-validation path cannot be the repository root")
+        raise ValueError(
+            "script-owned source-validation path cannot be the repository root"
+        )
     dirty_records = [
         paths
         for paths in dirty_records
@@ -508,7 +510,7 @@ def list_workflow_artifacts(
             f"repos/{github_repo}/actions/runs/{workflow_id}/artifacts",
             "--paginate",
             "--jq",
-            ".artifacts[] | [.id, .name, .size_in_bytes, (.digest // \"\")] | @tsv",
+            '.artifacts[] | [.id, .name, .size_in_bytes, (.digest // "")] | @tsv',
         ],
         cwd=REPO_ROOT,
         text=True,
@@ -843,7 +845,9 @@ def extract_artifact_zip(archive_path: Path, dest_dir: Path) -> None:
             mode = member.external_attr >> 16
             file_type = stat.S_IFMT(mode)
             if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
-                raise RuntimeError(f"workflow artifact contains a link or special file: {member.filename}")
+                raise RuntimeError(
+                    f"workflow artifact contains a link or special file: {member.filename}"
+                )
             destination = dest_dir.joinpath(*candidate.parts)
             if member.is_dir():
                 destination.mkdir(parents=True, exist_ok=True)

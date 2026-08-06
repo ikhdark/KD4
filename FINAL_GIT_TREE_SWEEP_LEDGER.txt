@@ -1,0 +1,121 @@
+FINAL GIT TREE SWEEP - PRE-PUSH REVIEW LEDGER
+Repository: C:\Users\kuh\Desktop\kd4
+Branch: main
+HEAD at sweep start: d40e3daa0cc2f027bf066336dcf2b0fd3794f9d5
+Origin merge-base: b43a6cd01f61a0b44ecd7f189a1a5006a3becc5a
+
+USER CONSTRAINTS
+[x] Review every in-scope file before changing source, tests, config, or docs.
+[x] Collect all confirmed candidates before fixing any candidate.
+[x] Compare plausible fixes and choose the best supported version.
+[x] Apply the selected fixes.
+[x] Re-run focused and proportionate broad validation.
+[x] Perform final status/diff/readiness review.
+
+ACCOUNTING
+[x] Baseline scope: Git tracked plus untracked, excluding ignored files.
+[x] Baseline count: 5,322 files (5,321 tracked plus the original ledger path).
+[x] Baseline readable bytes: 53,189,028.
+[x] Baseline manifest SHA-256: a671c96eabf1777778ebccc33e10fd525ce5ae6edbb86f6b9afa53c8b620d9a3.
+[x] Changed against origin/main: 76 files, about 15,012 insertions and 4,178 deletions.
+[x] Post-test byte sweep: 5,342 files; aggregate SHA-256 b7e31cd2d146ee0fccd817625296ebfcef932720a332e8f97ce9ef3ea3cfefba.
+    The 20 additional files were 18 generated .snap.new files and 2 temporary typed-risk test files.
+
+EVERY-FILE REVIEW GATE
+[x] Every baseline file was opened and byte-read.
+[x] Every file added by pre-fix tests was also opened and byte-read.
+[x] Repository instructions, source map, ownership routes, diffs, generated contracts,
+    encodings, structured formats, scripts, markers, TODOs, duplicates, large/empty files,
+    secrets-like strings, line endings, and final newlines were reviewed.
+[x] Structured parsing passed except three intentional JSONC files; exact Prettier check passed.
+[x] PowerShell (16), Python AST (177), JavaScript (6), and shell (23 via Git Bash) syntax passed.
+[x] No conflict markers, case-fold collisions, corrupt/missing Git objects, or newly added
+    TODO/FIXME/XXX/HACK/unimplemented/todo markers were found.
+[x] git diff --check against origin/main passed.
+
+FULL-FILE REVIEW GATE: COMPLETE
+No source, test, config, documentation, or snapshot fix was applied before this gate completed.
+
+COLLECTED CANDIDATES AND DISPOSITIONS
+C01 CONFIRMED - codex-rs/AGENTS.md was deleted although SOURCEMAP.md still routes to it.
+C02 CONFIRMED - root AGENTS.md has an incomplete LOCAL-KD bullet, lost the tested local-publish wording,
+    and ends with a stray backtick.
+C03 CONFIRMED - nine unchanged Python tooling files fail the repository Ruff format gate.
+C04 CONFIRMED - 18 codex-core snapshots are stale after intentional prompt/context changes; one is
+    additionally distorted by the test's unrealistically tiny compaction budget.
+C05 CONFIRMED - source_classification stores two unused fields.
+C06 CONFIRMED - source_classification has two clearer iterator/sort forms required by Clippy.
+C07 CONFIRMED - reasoning_governor has a collapsible nested conditional.
+C08 CONFIRMED - render_v2_request panics on serialization instead of propagating the review failure type.
+C09 CONFIRMED - sampling state is optional during streaming but guaranteed after drain; the current single
+    type loses that invariant and forces an expect at the consumer.
+C10 CONFIRMED - StepContext tool_router uses expect though setup absence can be represented safely.
+C11 CONFIRMED - three orchestration/test helpers exceed Clippy's argument-count heuristic.
+C12 CONFIRMED - typed-risk test artifacts leak on failed/panicking test paths.
+C13 ENVIRONMENT ONLY - PATH bash selects an unavailable WSL service; Git Bash proved shell syntax.
+C14 INTENTIONAL - nextest settings, Cargo jobs, and agent model inheritance are internally consistent.
+C15 NOT DEFECTS - reviewed duplicates, snapshot newline exceptions, fake test secrets, legacy TODOs,
+    and Windows working-tree line endings are intentional or harmless.
+
+FIX COMPARISONS AND SELECTED VERSIONS
+F01 Restore codex-rs/AGENTS.md exactly from origin; deleting/repointing loses unique Rust invariants.
+F02 Repair root AGENTS.md and restore the exact local-publish policy; do not weaken its policy test.
+F03 Run Ruff format only on the nine reported files; avoid manual edits and repository-wide churn.
+F04 Make compaction fixtures model realistic token usage and assert behavior without depending on a brittle
+    request index; accept snapshots only after focused behavior tests pass. Do not change production behavior
+    merely to preserve stale fixtures.
+F05 Remove ClassificationPlan.partitions and stored Line.content_end while retaining the local calculation.
+F06 Use sort_by_cached_key and rfind, avoiding repeated key computation.
+F07 Use a let-chain for the governor condition without changing behavior.
+F08 Return Result<String, ReviewFailureCategory> from render_v2_request and map serialization failure to
+    InputUnavailable, matching the adjacent renderer.
+F09 Split unsettled streaming state from settled result state, encoding the post-drain invariant in the type.
+F10 Make tool_router optional: diff setup skips when absent, dispatch returns Fatal, and normal dispatch keeps
+    synchronous-spawn semantics.
+F11 Add narrow documented too_many_arguments allowances to three helpers; parameter structs add no invariant.
+F12 Add a test-only exact-path drop guard and retain/disarm explicit success cleanup.
+F13 Do not change source for the WSL outage; retain Git Bash as direct syntax proof.
+
+PRE-FIX VALIDATION SUMMARY
+PASS: feature checks (22), CLI wrapper, JSONC Prettier, TypeScript SDK (44), Python SDK (143 pass,
+      38 skip), generated schema checks, agent-task-store (48), config (211), shell-command (209),
+      tools (86), Git integrity, and diff whitespace.
+FAIL: fmt-check (nine Python files), source-map-check (deleted Rust instructions), release tooling
+      (missing root policy), Clippy (four errors/seven warnings), and codex-core (18 snapshots).
+NOTE: the warm full core run executed 3,257 tests. Two typed-risk artifacts came from its failure path.
+
+FIX LOG
+[x] Restored codex-rs/AGENTS.md and repaired the root instruction/publish policy.
+[x] Applied Ruff formatting only to the nine files reported by the repository gate.
+[x] Removed unused classification state, selected cached sorting/reverse search, and simplified the governor
+    condition without changing its contract.
+[x] Propagated review-request serialization failures, encoded settled sampling state in the type, made the
+    tool router's absence explicit, added narrow helper lint allowances, and guarded typed-risk cleanup.
+[x] Cleared stale auto-compaction prefill state when the window advances and added direct regression coverage.
+[x] After the complete initial core run collected all 29 failures and 2 timeouts, updated stale expectations,
+    deterministic fixtures, and snapshots across the affected core test surfaces.
+[x] Compared the remaining compaction alternatives and selected realistic token fixtures plus order-independent
+    request assertions over production changes or index-specific expectations.
+
+VALIDATION LOG
+PASS: affected compaction, remote-compaction, pending-input, remote-environment, and token-budget group:
+      114/114 tests (nextest run 465e932d-19b0-45b0-b5af-20f75578431f).
+PASS: no pending insta snapshots; git diff --check; direct pinned-nightly cargo fmt --check.
+PASS: release tooling (102 pass, 3 skip) and KD4 feature checks (22 pass).
+PASS: non-Rust formatter gates, generated/schema checks, TypeScript SDK, Python SDK, source-map check,
+      Git integrity, and the previously completed workspace Clippy gate.
+PASS: the initial warm full core run reached all 3,257 tests (3,226 pass, 29 fail, 2 timeout); every collected
+      failing/timeout surface was subsequently addressed and included in passing focused validation.
+LIMITATION: a post-fix `just test -p codex-core` spent 900 seconds rebuilding Windows prerequisites and timed
+      out before tests began. Direct nextest and the final focused Clippy rerun were then blocked at link time
+      because this machine's Windows SDK lookup cannot find dbghelp.lib. These attempts produced no test or
+      lint failure, were not repeated, and are recorded as an environment limitation rather than a code fix.
+
+FINAL READINESS
+[x] Every in-scope file was reviewed before fixes began.
+[x] All discovered candidates were collected and classified before fixes began.
+[x] Selected fixes were compared against plausible alternatives before application.
+[x] All affected focused tests pass and no pending snapshot or whitespace error remains.
+[x] Final status reviewed; FINAL_GIT_TREE_SWEEP_LEDGER.txt and codex-rs/AGENTS.md remain untracked and must be
+    included when staging if they are intended for the push.
+[x] Nothing was staged, committed, pushed, or published by this review.

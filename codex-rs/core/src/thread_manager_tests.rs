@@ -32,11 +32,32 @@ use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
+use std::future::Future;
 use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn run_thread_manager_test_with_stack<F, Fut>(test_name: &'static str, test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("thread manager test runtime")
+                .block_on(test())
+        })
+        .expect("thread manager test thread")
+        .join()
+        .expect("thread manager test thread panicked");
+}
 
 struct FakeAgentGraphStore {
     root_thread_id: ThreadId,
@@ -800,8 +821,15 @@ async fn selected_capability_roots_round_trip_through_fork() {
     );
 }
 
-#[tokio::test]
-async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
+#[test]
+fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
+    run_thread_manager_test_with_stack(
+        "resume_and_fork_do_not_restore_thread_environments_from_rollout",
+        resume_and_fork_do_not_restore_thread_environments_from_rollout_impl,
+    );
+}
+
+async fn resume_and_fork_do_not_restore_thread_environments_from_rollout_impl() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -1337,8 +1365,15 @@ async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
     assert_eq!(calls.delete_thread, 1);
 }
 
-#[tokio::test]
-async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
+#[test]
+fn rollout_path_resume_and_fork_read_history_through_thread_store() {
+    run_thread_manager_test_with_stack(
+        "rollout_path_resume_and_fork_read_history_through_thread_store",
+        rollout_path_resume_and_fork_read_history_through_thread_store_impl,
+    );
+}
+
+async fn rollout_path_resume_and_fork_read_history_through_thread_store_impl() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();

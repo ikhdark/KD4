@@ -765,7 +765,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         chunk(ev_response_created("resp-1")),
         chunk(ev_function_call("call-1", "test_tool", "{}")),
         chunk(ev_completed_with_tokens(
-            "resp-1", /*total_tokens*/ 500,
+            "resp-1", /*total_tokens*/ 500_000,
         )),
     ];
 
@@ -774,7 +774,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         chunk(ev_message_item_done("msg-compact", "AUTO_COMPACT_SUMMARY")),
         chunk(ev_completed_with_tokens(
             "resp-compact",
-            /*total_tokens*/ 50,
+            /*total_tokens*/ 50_000,
         )),
     ];
 
@@ -785,7 +785,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         chunk(ev_message_item_done("msg-post-compact", "resumed old task")),
         chunk(ev_completed_with_tokens(
             "resp-post-compact",
-            /*total_tokens*/ 60,
+            /*total_tokens*/ 60_000,
         )),
     ];
 
@@ -797,7 +797,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         )),
         chunk(ev_completed_with_tokens(
             "resp-steered",
-            /*total_tokens*/ 70,
+            /*total_tokens*/ 70_000,
         )),
     ];
 
@@ -814,7 +814,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         .with_config(|config| {
             config.model_provider.name = "OpenAI (test)".to_string();
             config.model_provider.supports_websockets = false;
-            config.model_auto_compact_token_limit = Some(200);
+            config.model_auto_compact_token_limit = Some(200_000);
         })
         .build_with_streaming_server(&server)
         .await
@@ -864,7 +864,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
         gated_chunk(
             gate_first_completed_rx,
             vec![ev_completed_with_tokens(
-                "resp-1", /*total_tokens*/ 500,
+                "resp-1", /*total_tokens*/ 500_000,
             )],
         ),
     ];
@@ -874,7 +874,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
         chunk(ev_message_item_done("msg-compact", "AUTO_COMPACT_SUMMARY")),
         chunk(ev_completed_with_tokens(
             "resp-compact",
-            /*total_tokens*/ 50,
+            /*total_tokens*/ 50_000,
         )),
     ];
 
@@ -886,7 +886,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
         )),
         chunk(ev_completed_with_tokens(
             "resp-steered",
-            /*total_tokens*/ 70,
+            /*total_tokens*/ 70_000,
         )),
     ];
 
@@ -899,7 +899,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
         .with_config(|config| {
             config.model_provider.name = "OpenAI (test)".to_string();
             config.model_provider.supports_websockets = false;
-            config.model_auto_compact_token_limit = Some(200);
+            config.model_auto_compact_token_limit = Some(200_000);
         })
         .build_with_streaming_server(&server)
         .await
@@ -944,9 +944,9 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
     let (gate_first_completed_tx, gate_first_completed_rx) = oneshot::channel();
 
     let large_output_command = if cfg!(windows) {
-        "[Console]::Out.Write([string]::new([char]'0', 4000))"
+        "[Console]::Out.Write([string]::new([char]'0', 40000))"
     } else {
-        "printf '%04000d' 0"
+        "printf '%040000d' 0"
     };
     let large_output_args = json!({
         "command": large_output_command,
@@ -965,7 +965,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         gated_chunk(
             gate_first_completed_rx,
             vec![ev_completed_with_tokens(
-                "resp-1", /*total_tokens*/ 100,
+                "resp-1", /*total_tokens*/ 19_000,
             )],
         ),
     ];
@@ -975,7 +975,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         chunk(ev_message_item_done("msg-compact", "TOOL_OUTPUT_SUMMARY")),
         chunk(ev_completed_with_tokens(
             "resp-compact",
-            /*total_tokens*/ 50,
+            /*total_tokens*/ 5_000,
         )),
     ];
 
@@ -987,7 +987,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         )),
         chunk(ev_completed_with_tokens(
             "resp-post-compact",
-            /*total_tokens*/ 60,
+            /*total_tokens*/ 6_000,
         )),
     ];
 
@@ -999,7 +999,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         )),
         chunk(ev_completed_with_tokens(
             "resp-steered",
-            /*total_tokens*/ 70,
+            /*total_tokens*/ 7_000,
         )),
     ];
 
@@ -1016,7 +1016,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         .with_config(|config| {
             config.model_provider.name = "OpenAI (test)".to_string();
             config.model_provider.supports_websockets = false;
-            config.model_auto_compact_token_limit = Some(200);
+            config.model_auto_compact_token_limit = Some(20_000);
         })
         .build_with_streaming_server(&server)
         .await

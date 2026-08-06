@@ -207,9 +207,7 @@ impl SessionState {
     }
 
     pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        let window = self.auto_compact_window.advance();
-        self.auto_compact_window.clear_prefill();
-        window
+        self.auto_compact_window.advance()
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

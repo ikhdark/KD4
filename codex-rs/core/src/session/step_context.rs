@@ -58,10 +58,8 @@ impl StepContext {
         self.tool_router.set(tool_router)
     }
 
-    pub(crate) fn tool_router(&self) -> &Arc<ToolRouter> {
-        self.tool_router
-            .get()
-            .expect("step tool router must be finalized before tool execution")
+    pub(crate) fn tool_router(&self) -> Option<&Arc<ToolRouter>> {
+        self.tool_router.get()
     }
 
     #[cfg(test)]
