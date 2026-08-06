@@ -265,7 +265,12 @@ fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> Model
         "display_name": slug,
         "description": format!("{slug} description"),
         "default_reasoning_level": "medium",
-        "supported_reasoning_levels": [{"effort": "medium", "description": "medium"}],
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "low"},
+            {"effort": "medium", "description": "medium"},
+            {"effort": "high", "description": "high"},
+            {"effort": "xhigh", "description": "xhigh"}
+        ],
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
@@ -975,6 +980,7 @@ pub(super) fn app_server_turn(
         started_at: None,
         completed_at: None,
         duration_ms,
+        reasoning_policy_history: None,
     }
 }
 

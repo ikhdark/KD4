@@ -380,7 +380,7 @@ pub fn format_with_current_shell(command: &str) -> Vec<String> {
 
 pub fn format_with_current_shell_display(command: &str) -> String {
     let args = format_with_current_shell(command);
-    shlex::try_join(args.iter().map(String::as_str)).expect("serialize current shell command")
+    codex_app_server_protocol::command_display_string(&args)
 }
 
 pub fn format_with_current_shell_non_login(command: &str) -> Vec<String> {
@@ -390,8 +390,7 @@ pub fn format_with_current_shell_non_login(command: &str) -> Vec<String> {
 
 pub fn format_with_current_shell_display_non_login(command: &str) -> String {
     let args = format_with_current_shell_non_login(command);
-    shlex::try_join(args.iter().map(String::as_str))
-        .expect("serialize current shell command without login")
+    codex_app_server_protocol::command_display_string(&args)
 }
 
 pub fn stdio_server_bin() -> Result<String, CargoBinError> {

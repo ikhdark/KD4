@@ -601,7 +601,7 @@ async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
+async fn does_not_cancel_previous_login_server_without_matching_state() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
@@ -649,23 +649,21 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
         login_success_page: LoginSuccessPage::Local,
     };
 
-    let second_server = run_login_server(second_opts)?;
-    assert_eq!(second_server.actual_port, login_port);
+    let bind_error = match run_login_server(second_opts) {
+        Ok(_) => panic!("a login server with a different state must not cancel the active server"),
+        Err(err) => err,
+    };
+    assert_eq!(bind_error.kind(), io::ErrorKind::AddrInUse);
+
+    let client = reqwest::Client::new();
+    let cancel_url = format!("http://127.0.0.1:{login_port}/cancel?state=cancel_state");
+    let resp = client.get(cancel_url).send().await?;
+    assert!(resp.status().is_success());
 
     let cancel_result = first_server_task
         .await
         .expect("first login server task panicked")
-        .expect_err("login server should report cancellation");
+        .expect_err("first login server should report cancellation");
     assert_eq!(cancel_result.kind(), io::ErrorKind::Interrupted);
-
-    let client = reqwest::Client::new();
-    let cancel_url = format!("http://127.0.0.1:{login_port}/cancel");
-    let resp = client.get(cancel_url).send().await?;
-    assert!(resp.status().is_success());
-
-    second_server
-        .block_until_done()
-        .await
-        .expect_err("second login server should report cancellation");
     Ok(())
 }

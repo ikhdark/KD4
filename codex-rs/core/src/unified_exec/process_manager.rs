@@ -844,6 +844,9 @@ impl UnifiedExecProcessManager {
             deadline,
         )
         .await;
+        if !process_started_alive {
+            process.output_drained_notify().notified().await;
+        }
         drop(tool_execution_timing_guard);
         let wall_time = Instant::now().saturating_duration_since(start);
 
@@ -1673,6 +1676,9 @@ impl UnifiedExecProcessManager {
 
             if drained_chunks.is_empty() && drained_omitted_bytes == 0 && drained_lagged_chunks == 0
             {
+                let closed = output_closed_notify.notified();
+                tokio::pin!(closed);
+                closed.as_mut().enable();
                 exit_signal_received |= cancellation_token.is_cancelled();
                 if exit_signal_received && output_closed.load(std::sync::atomic::Ordering::Acquire)
                 {
@@ -1692,9 +1698,7 @@ impl UnifiedExecProcessManager {
                         break;
                     }
                     let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                    let closed = output_closed_notify.notified();
                     tokio::pin!(notified);
-                    tokio::pin!(closed);
                     tokio::select! {
                         _ = &mut notified => {}
                         _ = &mut closed => {}

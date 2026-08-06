@@ -156,39 +156,63 @@ impl Handler {
             }
         }
 
-        let statuses = if !initial_final_statuses.is_empty() {
-            initial_final_statuses
-        } else {
-            let mut futures = FuturesUnordered::new();
-            for (id, rx) in status_rxs.into_iter() {
-                let session = session.clone();
-                futures.push(wait_for_final_status(session, id, rx));
-            }
-            let mut results = Vec::new();
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-            loop {
-                match timeout_at(deadline, futures.next()).await {
-                    Ok(Some(Some(result))) => {
-                        results.push(result);
-                        break;
-                    }
-                    Ok(Some(None)) => continue,
-                    Ok(None) | Err(_) => break,
+        let statuses = match args.return_when {
+            WaitReturnWhen::First if !initial_final_statuses.is_empty() => initial_final_statuses,
+            WaitReturnWhen::First => {
+                let mut futures = FuturesUnordered::new();
+                for (id, rx) in status_rxs {
+                    let session = session.clone();
+                    futures.push(wait_for_final_status(session, id, rx));
                 }
-            }
-            if !results.is_empty() {
+                let mut results = Vec::new();
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
                 loop {
-                    match futures.next().now_or_never() {
-                        Some(Some(Some(result))) => results.push(result),
-                        Some(Some(None)) => continue,
-                        Some(None) | None => break,
+                    match timeout_at(deadline, futures.next()).await {
+                        Ok(Some(Some(result))) => {
+                            results.push(result);
+                            break;
+                        }
+                        Ok(Some(None)) => continue,
+                        Ok(None) | Err(_) => break,
                     }
                 }
+                if !results.is_empty() {
+                    loop {
+                        match futures.next().now_or_never() {
+                            Some(Some(Some(result))) => results.push(result),
+                            Some(Some(None)) => continue,
+                            Some(None) | None => break,
+                        }
+                    }
+                }
+                results
             }
-            results
+            WaitReturnWhen::All => {
+                let mut results = initial_final_statuses;
+                let mut futures = FuturesUnordered::new();
+                for (id, rx) in status_rxs {
+                    if results.iter().any(|(final_id, _)| *final_id == id) {
+                        continue;
+                    }
+                    let session = session.clone();
+                    futures.push(wait_for_final_status(session, id, rx));
+                }
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+                while results.len() < receiver_thread_ids.len() {
+                    match timeout_at(deadline, futures.next()).await {
+                        Ok(Some(Some(result))) => results.push(result),
+                        Ok(Some(None)) => continue,
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                results
+            }
         };
 
-        let timed_out = statuses.is_empty();
+        let timed_out = match args.return_when {
+            WaitReturnWhen::First => statuses.is_empty(),
+            WaitReturnWhen::All => statuses.len() < receiver_thread_ids.len(),
+        };
         let statuses_by_id = statuses.clone().into_iter().collect::<HashMap<_, _>>();
         let result = WaitAgentResult {
             status: statuses
@@ -267,6 +291,16 @@ struct WaitArgs {
     #[serde(default)]
     targets: Vec<String>,
     timeout_ms: Option<i64>,
+    #[serde(default)]
+    return_when: WaitReturnWhen,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WaitReturnWhen {
+    #[default]
+    First,
+    All,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]

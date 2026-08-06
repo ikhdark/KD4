@@ -52,7 +52,6 @@ use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::reasoning_governor::SamplingReasoningGovernor;
 use crate::session::reasoning_governor::SamplingReasoningPhase;
-use crate::session::reasoning_governor::SamplingRequestPolicy;
 use crate::session::reasoning_governor::SamplingRequestSettledState;
 use crate::session::reasoning_governor::SamplingRequestSignalCollector;
 use crate::session::session::Session;
@@ -79,6 +78,7 @@ use crate::tools::router::extension_tool_executors;
 use crate::tools::spec_plan::search_tool_enabled;
 use crate::tools::spec_plan::tool_suggest_enabled;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::turn_timing::ContinuationCause;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingGuard;
 use crate::turn_timing::record_turn_ttft_metric;
@@ -91,6 +91,7 @@ use codex_analytics::TrackEventsContext;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
+use codex_config::config_toml::AfterAgentPolicy;
 use codex_context_fragments::ModelContextBudget;
 use codex_context_fragments::RenderedContextFragment;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
@@ -117,6 +118,7 @@ use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::PlanDeltaEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
@@ -163,6 +165,22 @@ const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_tok
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
+fn ordinary_continuation_cause(
+    tool_result: bool,
+    server_end_turn_false: bool,
+    pending_input: bool,
+) -> Option<ContinuationCause> {
+    if tool_result {
+        Some(ContinuationCause::ToolResult)
+    } else if server_end_turn_false {
+        Some(ContinuationCause::ServerEndTurnFalse)
+    } else if pending_input {
+        Some(ContinuationCause::PendingInput)
+    } else {
+        None
+    }
+}
+
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -184,6 +202,7 @@ pub(crate) async fn run_turn(
     };
     let mut completion_review_state =
         crate::tasks::completion_review::CompletionReviewState::default();
+    let mut mutating_finalizer_ran = false;
     let mut preparation_timing_guard = Some(
         turn_context
             .turn_timing_state
@@ -264,6 +283,7 @@ pub(crate) async fn run_turn(
 
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
+    let mut pending_continuation_cause = None;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -321,11 +341,6 @@ pub(crate) async fn run_turn(
                 tracker.last_successful_validation_revision(),
             )
         };
-        let request_policy = reasoning_governor.resolve_policy(
-            step_context.turn.config.reasoning_phase_efforts.as_ref(),
-            step_context.turn.reasoning_effort.clone(),
-            &step_context.turn.model_info,
-        );
         let request_signals = SamplingRequestSignalCollector::default();
         let sampling_request_result: CodexResult<_> = async {
             super::time_reminder::maybe_record_current_time_reminder(
@@ -369,8 +384,10 @@ pub(crate) async fn run_turn(
                 sampling_request_input,
                 &mut first_router,
                 &mut preparation_timing_guard,
-                request_policy,
+                reasoning_governor.phase(),
+                reasoning_governor.trigger(),
                 request_signals.clone(),
+                &mut pending_continuation_cause,
                 cancellation_token.child_token(),
             )
             .await
@@ -382,6 +399,8 @@ pub(crate) async fn run_turn(
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                     settled_state,
+                    tool_result_continuation,
+                    server_end_turn_false,
                 } = sampling_request_output;
                 reasoning_governor.settle(&request_baselines, &request_signals, &settled_state);
                 can_drain_pending_input = true;
@@ -464,6 +483,7 @@ pub(crate) async fn run_turn(
                     }
                     can_drain_pending_input = !model_needs_follow_up;
                     reasoning_governor.host_retain();
+                    pending_continuation_cause = Some(ContinuationCause::Compaction);
                     continue;
                 }
 
@@ -510,6 +530,7 @@ pub(crate) async fn run_turn(
                             .await;
                             stop_hook_active = true;
                             reasoning_governor.host_diagnose();
+                            pending_continuation_cause = Some(ContinuationCause::StopHook);
                             continue;
                         } else {
                             sess.send_event(
@@ -524,6 +545,32 @@ pub(crate) async fn run_turn(
                     if stop_outcome.should_stop {
                         break;
                     }
+                    let mutating_finalizer_aborted = if matches!(
+                        turn_context.config.after_agent_policy,
+                        AfterAgentPolicy::MutatingFinalizer
+                    ) && !mutating_finalizer_ran
+                    {
+                        mutating_finalizer_ran = true;
+                        let after_agent_outcome = run_legacy_after_agent_hook(
+                            &sess,
+                            &turn_context,
+                            &sampling_request_input,
+                            last_agent_message.clone(),
+                        )
+                        .await;
+                        if let Some(reason) = after_agent_outcome.observation_error {
+                            record_completion_review_partial_reason(
+                                &sess,
+                                format!("AfterAgent completion observation failed: {reason}"),
+                            )
+                            .await;
+                        } else if after_agent_outcome.workspace_changed {
+                            reasoning_governor.host_mutation();
+                        }
+                        after_agent_outcome.aborted
+                    } else {
+                        false
+                    };
                     let review_outcome = Box::pin(
                         crate::tasks::completion_review::coordinate_completion_review(
                             &sess,
@@ -539,8 +586,22 @@ pub(crate) async fn run_turn(
                         report_completion_review_outcome(&sess, &turn_context, review_outcome)
                             .await;
                     if repair_injected {
+                        if mutating_finalizer_aborted {
+                            return Ok(None);
+                        }
                         reasoning_governor.host_diagnose();
+                        pending_continuation_cause =
+                            Some(ContinuationCause::CompletionReviewRepair);
                         continue 'sampling_loop;
+                    }
+                    if matches!(
+                        turn_context.config.after_agent_policy,
+                        AfterAgentPolicy::MutatingFinalizer
+                    ) {
+                        if mutating_finalizer_aborted {
+                            return Ok(None);
+                        }
+                        break;
                     }
                     let correction_consumed = sess
                         .services
@@ -612,6 +673,7 @@ pub(crate) async fn run_turn(
                                 .await;
                                 stop_hook_active = true;
                                 reasoning_governor.host_diagnose();
+                                pending_continuation_cause = Some(ContinuationCause::StopHook);
                                 continue 'sampling_loop;
                             }
                             if stop_outcome.should_stop {
@@ -639,6 +701,8 @@ pub(crate) async fn run_turn(
                             .await;
                             if repair_injected {
                                 reasoning_governor.host_diagnose();
+                                pending_continuation_cause =
+                                    Some(ContinuationCause::CompletionReviewRepair);
                                 continue 'sampling_loop;
                             }
                         }
@@ -648,6 +712,12 @@ pub(crate) async fn run_turn(
                     }
                     break;
                 }
+                pending_continuation_cause = ordinary_continuation_cause(
+                    tool_result_continuation,
+                    server_end_turn_false,
+                    has_pending_input,
+                );
+                debug_assert!(pending_continuation_cause.is_some());
                 continue;
             }
             Err(err @ CodexErr::TurnAborted) => {
@@ -660,6 +730,7 @@ pub(crate) async fn run_turn(
                         "Invalid image detected; sanitizing tool output to prevent poisoning",
                     );
                     if state.history.replace_last_turn_images("Invalid image") {
+                        pending_continuation_cause = Some(ContinuationCause::InvalidImageRecovery);
                         continue;
                     }
                 }
@@ -882,7 +953,12 @@ async fn build_pure_pending_turn_plan(
         sess.services
             .plugins_manager
             .plugins_for_config(&plugins_config_input),
-        build_extension_turn_input_items(sess, turn_context, &user_input, cancellation_token)
+        build_extension_turn_input_items(
+            sess,
+            step_context.as_ref(),
+            &user_input,
+            cancellation_token
+        )
     );
     let extension_injection_items = extension_injection_items?;
     // DAG edge P -> plugin mentions. Connector inventory C waits for P because
@@ -1447,10 +1523,11 @@ fn build_bounded_skill_context_items(
 )]
 async fn build_extension_turn_input_items(
     sess: &Arc<Session>,
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     user_input: &[UserInput],
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Vec<ResponseItem>> {
+    let turn_context = step_context.turn.as_ref();
     let contributors = sess.services.extensions.turn_input_contributors().to_vec();
     if contributors.is_empty() {
         return Ok(Vec::new());
@@ -1476,6 +1553,11 @@ async fn build_extension_turn_input_items(
         turn_id: turn_context.sub_id.to_string(),
         user_input: user_input.to_vec(),
         environments,
+        ready_selected_capability_roots: step_context
+            .selected_capability_roots
+            .iter()
+            .map(|root| root.selected_root().clone())
+            .collect(),
     };
 
     // Contributors are independent read-only DAG leaves. FuturesOrdered polls
@@ -1928,8 +2010,10 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     prebuilt_router: &mut Option<Arc<ToolRouter>>,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
-    request_policy: SamplingRequestPolicy,
+    reasoning_phase: Option<SamplingReasoningPhase>,
+    reasoning_trigger: codex_protocol::protocol::ReasoningPolicyTrigger,
     request_signals: SamplingRequestSignalCollector,
+    pending_continuation_cause: &mut Option<ContinuationCause>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
@@ -1989,7 +2073,9 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             preparation_timing_guard,
-            &request_policy,
+            reasoning_phase,
+            reasoning_trigger,
+            pending_continuation_cause,
             cancellation_token.child_token(),
         )
         .await
@@ -2187,12 +2273,16 @@ struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
     settled_state: SamplingRequestSettledState,
+    tool_result_continuation: bool,
+    server_end_turn_false: bool,
 }
 
 #[derive(Debug)]
 struct UnsettledSamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    tool_result_continuation: bool,
+    server_end_turn_false: bool,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2437,6 +2527,8 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::PlanDelta(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
+        | EventMsg::ReasoningPolicyUpdated(_)
+        | EventMsg::ReasoningPolicySummary(_)
         | EventMsg::CollabAgentSpawnBegin(_)
         | EventMsg::CollabAgentSpawnEnd(_)
         | EventMsg::CollabAgentInteractionBegin(_)
@@ -2792,15 +2884,23 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
-    request_policy: &SamplingRequestPolicy,
+    reasoning_phase: Option<SamplingReasoningPhase>,
+    reasoning_trigger: codex_protocol::protocol::ReasoningPolicyTrigger,
+    pending_continuation_cause: &mut Option<ContinuationCause>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     sess.ensure_rollout_budget_available()?;
+    let request_policy = crate::session::reasoning_governor::resolve_request_policy(
+        reasoning_phase,
+        turn_context.config.reasoning_phase_efforts.as_ref(),
+        turn_context.configured_reasoning_effort.clone(),
+        &turn_context.model_info,
+    );
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
         sandbox_policy = &turn_context.sandbox_policy(),
-        effort = request_policy.effort,
+        effort = request_policy.request_effort,
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
@@ -2810,6 +2910,9 @@ async fn try_run_sampling_request(
         turn_context.provider.info().name.as_str(),
     );
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
+    turn_context
+        .turn_timing_state
+        .consume_pending_continuation(pending_continuation_cause);
     let uses_sequential_cutoff_reasoning_summaries = turn_context
         .config
         .features
@@ -2832,12 +2935,24 @@ async fn try_run_sampling_request(
         "startup timing snapshot frozen at first model send"
     );
     client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
+    if let Some(recorder) = sess.active_reasoning_policy_recorder().await
+        && let Some(snapshot) = recorder.append(
+            &request_policy,
+            turn_context.model_info.slug.clone(),
+            reasoning_trigger,
+        )
+    {
+        sess.try_send_live_event(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::ReasoningPolicyUpdated(snapshot),
+        });
+    }
     let stream_result = client_session
         .stream(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
-            request_policy.effort.clone(),
+            request_policy.request_effort.clone(),
             turn_context.reasoning_summary,
             turn_context.config.service_tier.clone(),
             responses_metadata,
@@ -2851,6 +2966,8 @@ async fn try_run_sampling_request(
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
+    let mut tool_result_continuation = false;
+    let mut server_end_turn_false = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
@@ -2861,15 +2978,25 @@ async fn try_run_sampling_request(
     let mut should_emit_token_count = false;
     let mut latest_models_etag = None;
     let reasoning_effort = request_policy
-        .effort
+        .request_effort
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_else(|| "default".to_string());
     let reasoning_phase = request_policy
         .phase
-        .map(SamplingReasoningPhase::as_str)
+        .map(|phase| match phase {
+            SamplingReasoningPhase::Orient => "orient",
+            SamplingReasoningPhase::Inspect => "inspect",
+            SamplingReasoningPhase::Implement => "implement",
+            SamplingReasoningPhase::Verify => "verify",
+            SamplingReasoningPhase::Diagnose => "diagnose",
+            SamplingReasoningPhase::Finalize => "finalize",
+        })
         .unwrap_or("disabled");
-    let reasoning_effort_source = request_policy.source.as_str();
+    let reasoning_effort_source = match request_policy.source {
+        codex_protocol::protocol::ReasoningPolicySource::PhaseOverride => "phase_override",
+        codex_protocol::protocol::ReasoningPolicySource::TurnFallback => "turn_fallback",
+    };
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
@@ -2980,28 +3107,6 @@ async fn try_run_sampling_request(
                     cancellation_token: cancellation_token.child_token(),
                 };
 
-                let preempt_for_mailbox_mail = match &item {
-                    ResponseItem::Message { role, phase, .. } => {
-                        role == "assistant" && matches!(phase, Some(MessagePhase::Commentary))
-                    }
-                    ResponseItem::Reasoning { .. } => true,
-                    ResponseItem::AgentMessage { .. } => false,
-                    ResponseItem::AdditionalTools { .. }
-                    | ResponseItem::LocalShellCall { .. }
-                    | ResponseItem::FunctionCall { .. }
-                    | ResponseItem::ToolSearchCall { .. }
-                    | ResponseItem::FunctionCallOutput { .. }
-                    | ResponseItem::CustomToolCall { .. }
-                    | ResponseItem::CustomToolCallOutput { .. }
-                    | ResponseItem::ToolSearchOutput { .. }
-                    | ResponseItem::WebSearchCall { .. }
-                    | ResponseItem::ImageGenerationCall { .. }
-                    | ResponseItem::Compaction { .. }
-                    | ResponseItem::CompactionTrigger { .. }
-                    | ResponseItem::ContextCompaction { .. }
-                    | ResponseItem::Other => false,
-                };
-
                 let output_result =
                     match handle_output_item_done(&mut ctx, item, previously_streamed_item)
                         .instrument(handle_responses)
@@ -3017,13 +3122,7 @@ async fn try_run_sampling_request(
                     last_agent_message = Some(agent_message);
                 }
                 needs_follow_up |= output_result.needs_follow_up;
-                // todo: remove before stabilizing multi-agent v2
-                if preempt_for_mailbox_mail && sess.input_queue.has_pending_mailbox_items().await {
-                    break Ok(UnsettledSamplingRequestResult {
-                        needs_follow_up: true,
-                        last_agent_message,
-                    });
-                }
+                tool_result_continuation |= output_result.needs_follow_up;
             }
             ResponseEvent::OutputItemAdded(mut item) => {
                 if turn_context.item_ids_enabled() {
@@ -3178,10 +3277,13 @@ async fn try_run_sampling_request(
                 }
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
+                    server_end_turn_false = true;
                 }
                 break Ok(UnsettledSamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    tool_result_continuation,
+                    server_end_turn_false,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -3351,6 +3453,14 @@ async fn try_run_sampling_request(
     drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
     drop(tool_blocking_timing_guard);
 
+    // A tool result guarantees another request in this turn. A later assistant
+    // item in the same response must not defer already queued mailbox input.
+    if tool_result_continuation {
+        sess.input_queue
+            .accept_mailbox_delivery_for_current_turn(&sess.active_turn, &turn_context.sub_id)
+            .await;
+    }
+
     if should_emit_token_count {
         // A tool call such as request_user_input can intentionally pause the turn. Emit token
         // counts only after pending tools resolve so clients do not see progress events while the
@@ -3375,6 +3485,8 @@ async fn try_run_sampling_request(
         needs_follow_up: result.needs_follow_up,
         last_agent_message: result.last_agent_message,
         settled_state,
+        tool_result_continuation: result.tool_result_continuation,
+        server_end_turn_false: result.server_end_turn_false,
     });
 
     if should_emit_turn_diff {
@@ -3410,12 +3522,10 @@ async fn try_run_sampling_request(
     }
 
     if let Some(etag) = latest_models_etag {
-        let _ = sess
-            .services
+        sess.services
             .models_manager
-            .refresh_if_new_etag(etag, turn_context.config.http_client_factory())
-            .or_cancel(&cancellation_token)
-            .await;
+            .clone()
+            .notify_etag(etag, turn_context.config.http_client_factory());
     }
 
     outcome

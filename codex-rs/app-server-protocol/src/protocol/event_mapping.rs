@@ -18,6 +18,7 @@ use crate::protocol::v2::ReasoningSummaryTextDeltaNotification;
 use crate::protocol::v2::ReasoningTextDeltaNotification;
 use crate::protocol::v2::TerminalInteractionNotification;
 use crate::protocol::v2::ThreadItem;
+use crate::protocol::v2::TurnReasoningPolicyUpdatedNotification;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::protocol::EventMsg;
 use std::collections::HashMap;
@@ -35,6 +36,13 @@ pub fn item_event_to_server_notification(
     let thread_id = thread_id.to_string();
     let turn_id = turn_id.to_string();
     match msg {
+        EventMsg::ReasoningPolicyUpdated(snapshot) => {
+            ServerNotification::TurnReasoningPolicyUpdated(TurnReasoningPolicyUpdatedNotification {
+                thread_id,
+                turn_id,
+                snapshot,
+            })
+        }
         EventMsg::DynamicToolCallResponse(response) => {
             let status = if response.success {
                 DynamicToolCallStatus::Completed

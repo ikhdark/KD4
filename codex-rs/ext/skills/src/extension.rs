@@ -290,6 +290,24 @@ where
                 mcp_resources: session_store.get::<McpResourceClient>(),
             };
             let mut catalog = self.list_skills(query, &thread_state, false).await;
+            if !input.ready_selected_capability_roots.is_empty() {
+                catalog.extend(
+                    thread_state
+                        .estimate_executor_catalog_snapshot(
+                            &self.providers,
+                            SkillListQuery {
+                                turn_id: input.turn_id.clone(),
+                                executor_roots: input.ready_selected_capability_roots.clone(),
+                                host_snapshot: None,
+                                include_host_skills: false,
+                                include_bundled_skills: false,
+                                include_orchestrator_skills: false,
+                                mcp_resources: None,
+                            },
+                        )
+                        .await,
+                );
+            }
             if let Some(executor_skills) = turn_store.get::<ExecutorSkillsStepState>() {
                 catalog.extend(executor_skills.0.clone());
             }

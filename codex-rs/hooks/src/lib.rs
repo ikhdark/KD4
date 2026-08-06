@@ -66,6 +66,7 @@ pub use events::stop::StopRequest;
 pub use events::user_prompt_submit::UserPromptSubmitOutcome;
 pub use events::user_prompt_submit::UserPromptSubmitRequest;
 pub use legacy_notify::legacy_notify_json;
+pub use legacy_notify::mutating_finalizer_hook;
 pub use legacy_notify::notify_hook;
 pub use registry::HookListOutcome;
 pub use registry::Hooks;

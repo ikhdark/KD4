@@ -1,60 +1,135 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use codex_config::config_toml::ReasoningPhaseEfforts;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::ReasoningPolicyHistory;
+use codex_protocol::protocol::ReasoningPolicyPhase;
+use codex_protocol::protocol::ReasoningPolicySnapshot;
+use codex_protocol::protocol::ReasoningPolicySource;
+use codex_protocol::protocol::ReasoningPolicyTrigger;
 use serde_json::Value;
 
 use crate::turn_diff_tracker::ValidationFreshnessStatus;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SamplingReasoningPhase {
-    Orient,
-    Inspect,
-    Implement,
-    Diagnose,
-    Verify,
-    Finalize,
-}
-
-impl SamplingReasoningPhase {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Orient => "orient",
-            Self::Inspect => "inspect",
-            Self::Implement => "implement",
-            Self::Diagnose => "diagnose",
-            Self::Verify => "verify",
-            Self::Finalize => "finalize",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SamplingRequestPolicySource {
-    PhaseOverride,
-    TurnFallback,
-}
-
-impl SamplingRequestPolicySource {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::PhaseOverride => "phase_override",
-            Self::TurnFallback => "turn_fallback",
-        }
-    }
-}
+pub(crate) type SamplingReasoningPhase = ReasoningPolicyPhase;
+pub(crate) type SamplingRequestPolicySource = ReasoningPolicySource;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SamplingRequestPolicy {
     pub(crate) phase: Option<SamplingReasoningPhase>,
-    pub(crate) effort: Option<ReasoningEffort>,
+    pub(crate) configured_effort: Option<ReasoningEffort>,
+    pub(crate) effective_effort: Option<ReasoningEffort>,
+    pub(crate) request_effort: Option<ReasoningEffort>,
     pub(crate) source: SamplingRequestPolicySource,
+}
+
+#[derive(Default)]
+struct ReasoningPolicyRecorderState {
+    entries: VecDeque<ReasoningPolicySnapshot>,
+    total_entries: u64,
+    finalized: bool,
+}
+
+/// Records the exact resolved request policies. A single mutex makes deduplication,
+/// sequencing, and retention one atomic operation without burdening the turn stream.
+#[derive(Clone)]
+pub(crate) struct ReasoningPolicyRecorder {
+    enabled: bool,
+    state: Arc<Mutex<ReasoningPolicyRecorderState>>,
+}
+
+impl ReasoningPolicyRecorder {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            state: Arc::new(Mutex::new(ReasoningPolicyRecorderState::default())),
+        }
+    }
+
+    pub(crate) fn append(
+        &self,
+        policy: &SamplingRequestPolicy,
+        model: String,
+        trigger: ReasoningPolicyTrigger,
+    ) -> Option<ReasoningPolicySnapshot> {
+        if !self.enabled {
+            return None;
+        }
+        let phase = policy.phase?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.finalized {
+            return None;
+        }
+        let candidate = ReasoningPolicySnapshot {
+            sequence: state.total_entries.saturating_add(1),
+            timestamp: unix_timestamp_millis(),
+            phase,
+            configured_effort: policy.configured_effort.clone(),
+            effective_effort: policy.effective_effort.clone(),
+            request_effort: policy.request_effort.clone(),
+            source: policy.source,
+            model,
+            trigger,
+        };
+        if state.entries.back().is_some_and(|previous| {
+            previous.phase == candidate.phase
+                && previous.configured_effort == candidate.configured_effort
+                && previous.effective_effort == candidate.effective_effort
+                && previous.request_effort == candidate.request_effort
+                && previous.source == candidate.source
+                && previous.model == candidate.model
+                && previous.trigger == candidate.trigger
+        }) {
+            return None;
+        }
+        state.total_entries = candidate.sequence;
+        if state.entries.len() == 64 {
+            state.entries.pop_front();
+        }
+        state.entries.push_back(candidate.clone());
+        Some(candidate)
+    }
+
+    pub(crate) fn take_summary(&self, turn_id: String) -> Option<ReasoningPolicyHistory> {
+        if !self.enabled {
+            return None;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.finalized {
+            return None;
+        }
+        state.finalized = true;
+        Some(ReasoningPolicyHistory {
+            turn_id,
+            truncated: state.total_entries > state.entries.len() as u64,
+            total_entries: state.total_entries,
+            entries: state.entries.drain(..).collect(),
+        })
+    }
+}
+
+fn unix_timestamp_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +237,7 @@ impl SamplingRequestSignalCollector {
 pub(crate) struct SamplingReasoningGovernor {
     enabled: bool,
     phase: SamplingReasoningPhase,
+    trigger: ReasoningPolicyTrigger,
     plan: Option<UpdatePlanArgs>,
     plan_revision: u64,
 }
@@ -171,6 +247,7 @@ impl SamplingReasoningGovernor {
         Self {
             enabled: config.is_some(),
             phase: SamplingReasoningPhase::Orient,
+            trigger: ReasoningPolicyTrigger::UserInput,
             plan: None,
             plan_revision: 0,
         }
@@ -190,59 +267,59 @@ impl SamplingReasoningGovernor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_policy(
         &self,
         config: Option<&ReasoningPhaseEfforts>,
         turn_fallback: Option<ReasoningEffort>,
         model_info: &ModelInfo,
     ) -> SamplingRequestPolicy {
-        let Some(config) = config else {
-            return SamplingRequestPolicy {
-                phase: None,
-                effort: turn_fallback,
-                source: SamplingRequestPolicySource::TurnFallback,
-            };
-        };
-        let override_effort = match self.phase {
-            SamplingReasoningPhase::Orient => config.orient.clone(),
-            SamplingReasoningPhase::Inspect => config.inspect.clone(),
-            SamplingReasoningPhase::Implement => config.implement.clone(),
-            SamplingReasoningPhase::Diagnose => config.diagnose.clone(),
-            SamplingReasoningPhase::Verify => config.verify.clone(),
-            SamplingReasoningPhase::Finalize => config.finalize.clone(),
-        };
-        let source = if override_effort.is_some() {
-            SamplingRequestPolicySource::PhaseOverride
-        } else {
-            SamplingRequestPolicySource::TurnFallback
-        };
-        SamplingRequestPolicy {
-            phase: Some(self.phase),
-            effort: supported_effort(override_effort.or(turn_fallback), model_info),
-            source,
-        }
+        resolve_request_policy(
+            self.enabled.then_some(self.phase),
+            config,
+            turn_fallback,
+            model_info,
+        )
+    }
+
+    pub(crate) fn phase(&self) -> Option<SamplingReasoningPhase> {
+        self.enabled.then_some(self.phase)
+    }
+
+    pub(crate) fn trigger(&self) -> ReasoningPolicyTrigger {
+        self.trigger
     }
 
     pub(crate) fn accepted_user_input(&mut self) {
-        if self.enabled {
-            self.phase = SamplingReasoningPhase::Orient;
-        }
+        self.transition_to(
+            SamplingReasoningPhase::Orient,
+            ReasoningPolicyTrigger::UserInput,
+        );
     }
 
     pub(crate) fn host_diagnose(&mut self) {
-        if self.enabled {
-            self.phase = SamplingReasoningPhase::Diagnose;
-        }
+        self.transition_to(
+            SamplingReasoningPhase::Diagnose,
+            ReasoningPolicyTrigger::HostOverride,
+        );
     }
 
     pub(crate) fn host_mutation(&mut self) {
-        if self.enabled {
-            self.phase = SamplingReasoningPhase::Implement;
-        }
+        self.transition_to(
+            SamplingReasoningPhase::Implement,
+            ReasoningPolicyTrigger::WorkspaceMutation,
+        );
     }
 
     /// Records a host continuation that intentionally preserves the current phase.
     pub(crate) fn host_retain(&self) {}
+
+    fn transition_to(&mut self, phase: SamplingReasoningPhase, trigger: ReasoningPolicyTrigger) {
+        if self.enabled {
+            self.phase = phase;
+            self.trigger = trigger;
+        }
+    }
 
     pub(crate) fn settle(
         &mut self,
@@ -269,62 +346,138 @@ impl SamplingReasoningGovernor {
             self.plan = Some(plan.clone());
             self.plan_revision = self.plan_revision.saturating_add(1);
         }
-
-        let validation_failed = settled.validation_status != baselines.validation_status
+        if let Some(failure) = outcomes
+            .iter()
+            .filter(|outcome| outcome.kind != SamplingToolOutcomeKind::Success)
+            .min_by_key(|outcome| outcome.ordinal)
+        {
+            let trigger = match failure.kind {
+                SamplingToolOutcomeKind::Failure => ReasoningPolicyTrigger::ToolFailed,
+                SamplingToolOutcomeKind::Blocked => ReasoningPolicyTrigger::ToolBlocked,
+                SamplingToolOutcomeKind::Timeout => ReasoningPolicyTrigger::ToolTimedOut,
+                SamplingToolOutcomeKind::RecoverableCancellation => {
+                    ReasoningPolicyTrigger::ToolCancelled
+                }
+                SamplingToolOutcomeKind::Success => unreachable!("success is not a failure"),
+            };
+            self.transition_to(SamplingReasoningPhase::Diagnose, trigger);
+            return;
+        }
+        let validation_changed = settled.validation_status != baselines.validation_status;
+        if validation_changed
             && matches!(
                 settled.validation_status,
                 ValidationFreshnessStatus::FailedAfterLastMutation
                     | ValidationFreshnessStatus::TimedOut
-            );
-        if outcomes.iter().any(|outcome| {
-            matches!(
-                outcome.kind,
-                SamplingToolOutcomeKind::Failure
-                    | SamplingToolOutcomeKind::Blocked
-                    | SamplingToolOutcomeKind::Timeout
-                    | SamplingToolOutcomeKind::RecoverableCancellation
             )
-        }) || validation_failed
         {
-            self.phase = SamplingReasoningPhase::Diagnose;
+            self.transition_to(
+                SamplingReasoningPhase::Diagnose,
+                if settled.validation_status == ValidationFreshnessStatus::TimedOut {
+                    ReasoningPolicyTrigger::ValidationTimedOut
+                } else {
+                    ReasoningPolicyTrigger::ValidationFailed
+                },
+            );
             return;
         }
-
         let fresh_validation = settled.validation_revision != baselines.validation_revision
             && settled.validation_revision == Some(settled.mutation_revision)
             && settled.validation_status == ValidationFreshnessStatus::PassedAfterLastMutation;
         if fresh_validation {
-            self.phase = if self.plan.as_ref().is_some_and(plan_is_unfinished) {
-                SamplingReasoningPhase::Verify
-            } else {
-                SamplingReasoningPhase::Finalize
-            };
+            self.transition_to(
+                if self.plan.as_ref().is_some_and(plan_is_unfinished) {
+                    SamplingReasoningPhase::Verify
+                } else {
+                    SamplingReasoningPhase::Finalize
+                },
+                ReasoningPolicyTrigger::ValidationPassed,
+            );
             return;
         }
         if settled.mutation_revision > baselines.mutation_revision {
-            self.phase = SamplingReasoningPhase::Implement;
+            self.transition_to(
+                SamplingReasoningPhase::Implement,
+                ReasoningPolicyTrigger::WorkspaceMutation,
+            );
             return;
         }
         if self.plan_revision > baselines.plan_revision
             && let Some(plan) = changed_plan.as_ref()
         {
-            self.phase = phase_for_plan(plan);
+            self.transition_to(phase_for_plan(plan), ReasoningPolicyTrigger::PlanUpdated);
             return;
         }
-        let read_only_success = outcomes.iter().any(|outcome| {
+        if outcomes.iter().any(|outcome| {
             outcome.kind == SamplingToolOutcomeKind::Success && outcome.plan.is_none()
-        });
-        if read_only_success && self.phase != SamplingReasoningPhase::Diagnose {
-            self.phase = SamplingReasoningPhase::Inspect;
+        }) && self.phase != SamplingReasoningPhase::Diagnose
+        {
+            self.transition_to(
+                SamplingReasoningPhase::Inspect,
+                ReasoningPolicyTrigger::ReadOnlyToolSuccess,
+            );
         }
     }
+}
+
+pub(crate) fn resolve_request_policy(
+    phase: Option<SamplingReasoningPhase>,
+    config: Option<&ReasoningPhaseEfforts>,
+    turn_fallback: Option<ReasoningEffort>,
+    model_info: &ModelInfo,
+) -> SamplingRequestPolicy {
+    let (configured_effort, source) = match (config, phase) {
+        (Some(config), Some(phase)) => {
+            let override_effort = match phase {
+                SamplingReasoningPhase::Orient => config.orient.clone(),
+                SamplingReasoningPhase::Inspect => config.inspect.clone(),
+                SamplingReasoningPhase::Implement => config.implement.clone(),
+                SamplingReasoningPhase::Diagnose => config.diagnose.clone(),
+                SamplingReasoningPhase::Verify => config.verify.clone(),
+                SamplingReasoningPhase::Finalize => config.finalize.clone(),
+            };
+            let source = if override_effort.is_some() {
+                SamplingRequestPolicySource::PhaseOverride
+            } else {
+                SamplingRequestPolicySource::TurnFallback
+            };
+            (override_effort.or(turn_fallback), source)
+        }
+        _ => (turn_fallback, SamplingRequestPolicySource::TurnFallback),
+    };
+    let effective_effort = if config.is_some() && phase.is_some() {
+        supported_effort(configured_effort.clone(), model_info)
+    } else {
+        configured_effort
+            .clone()
+            .or_else(|| supported_effort(None, model_info))
+    };
+    SamplingRequestPolicy {
+        phase,
+        configured_effort,
+        request_effort: request_effort(effective_effort.clone()),
+        effective_effort,
+        source,
+    }
+}
+
+fn request_effort(effort: Option<ReasoningEffort>) -> Option<ReasoningEffort> {
+    effort.map(|effort| match effort {
+        ReasoningEffort::Ultra => ReasoningEffort::Max,
+        effort => effort,
+    })
 }
 
 fn supported_effort(
     selected: Option<ReasoningEffort>,
     model_info: &ModelInfo,
 ) -> Option<ReasoningEffort> {
-    let selected = selected?;
+    if !model_info.supports_reasoning_summaries {
+        return None;
+    }
+    let Some(selected) = selected else {
+        return model_info.default_reasoning_level.clone();
+    };
     if model_info
         .supported_reasoning_levels
         .iter()
@@ -332,11 +485,18 @@ fn supported_effort(
     {
         return Some(selected);
     }
-    let levels = &model_info.supported_reasoning_levels;
-    levels
-        .get(levels.len().saturating_sub(1) / 2)
+    model_info
+        .supported_reasoning_levels
+        .get(
+            model_info
+                .supported_reasoning_levels
+                .len()
+                .saturating_sub(1)
+                / 2,
+        )
         .map(|preset| preset.effort.clone())
         .or_else(|| model_info.default_reasoning_level.clone())
+        .or(Some(selected))
 }
 
 fn plan_is_unfinished(plan: &UpdatePlanArgs) -> bool {
@@ -496,6 +656,143 @@ mod tests {
     }
 
     #[test]
+    fn resolver_preserves_raw_configuration_and_normalizes_the_request_once() {
+        let ultra_only = model(&[ReasoningEffort::Ultra], ReasoningEffort::Ultra);
+        let config = ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        let policy = resolve_request_policy(
+            Some(SamplingReasoningPhase::Orient),
+            Some(&config),
+            Some(ReasoningEffort::Low),
+            &ultra_only,
+        );
+
+        assert_eq!(policy.configured_effort, Some(ReasoningEffort::High));
+        assert_eq!(policy.effective_effort, Some(ReasoningEffort::Ultra));
+        assert_eq!(policy.request_effort, Some(ReasoningEffort::Max));
+
+        let mut without_reasoning = ultra_only;
+        without_reasoning.supports_reasoning_summaries = false;
+        let no_reasoning = resolve_request_policy(
+            Some(SamplingReasoningPhase::Orient),
+            Some(&config),
+            Some(ReasoningEffort::Low),
+            &without_reasoning,
+        );
+        assert_eq!(no_reasoning.effective_effort, None);
+        assert_eq!(no_reasoning.request_effort, None);
+    }
+
+    #[test]
+    fn resolver_uses_model_default_when_effort_is_omitted() {
+        let default_high = model(&[ReasoningEffort::High], ReasoningEffort::High);
+
+        let policy = resolve_request_policy(None, None, None, &default_high);
+
+        assert_eq!(policy.configured_effort, None);
+        assert_eq!(policy.effective_effort, Some(ReasoningEffort::High));
+        assert_eq!(policy.request_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn recorder_deduplicates_bounds_history_and_finalizes_once() {
+        let model = model(&[ReasoningEffort::Medium], ReasoningEffort::Medium);
+        let policy = resolve_request_policy(
+            Some(SamplingReasoningPhase::Orient),
+            Some(&config()),
+            None,
+            &model,
+        );
+        let recorder = ReasoningPolicyRecorder::new(true);
+
+        assert!(
+            recorder
+                .append(
+                    &policy,
+                    "test-model".into(),
+                    ReasoningPolicyTrigger::UserInput
+                )
+                .is_some()
+        );
+        assert!(
+            recorder
+                .append(
+                    &policy,
+                    "test-model".into(),
+                    ReasoningPolicyTrigger::UserInput
+                )
+                .is_none()
+        );
+        for index in 0..64 {
+            let trigger = if index % 2 == 0 {
+                ReasoningPolicyTrigger::ReadOnlyToolSuccess
+            } else {
+                ReasoningPolicyTrigger::WorkspaceMutation
+            };
+            assert!(
+                recorder
+                    .append(&policy, "test-model".into(), trigger)
+                    .is_some()
+            );
+        }
+
+        let summary = recorder.take_summary("turn-1".into()).expect("summary");
+        assert_eq!(summary.total_entries, 65);
+        assert!(summary.truncated);
+        assert_eq!(summary.entries.len(), 64);
+        assert_eq!(summary.entries.first().map(|entry| entry.sequence), Some(2));
+        assert_eq!(summary.entries.last().map(|entry| entry.sequence), Some(65));
+        assert!(recorder.take_summary("turn-1".into()).is_none());
+    }
+
+    #[test]
+    fn earliest_failure_wins_and_validation_failure_is_a_fallback() {
+        let config = config();
+        let mut governor = SamplingReasoningGovernor::new(Some(&config));
+        let collector = SamplingRequestSignalCollector::default();
+        collector.push(SamplingToolOutcome {
+            ordinal: 2,
+            kind: SamplingToolOutcomeKind::Failure,
+            plan: None,
+        });
+        collector.push(SamplingToolOutcome {
+            ordinal: 1,
+            kind: SamplingToolOutcomeKind::Blocked,
+            plan: None,
+        });
+        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        governor.settle(
+            &baseline,
+            &collector,
+            &settled(
+                0,
+                ValidationFreshnessStatus::FailedAfterLastMutation,
+                Some(0),
+            ),
+        );
+        assert_eq!(governor.phase(), Some(SamplingReasoningPhase::Diagnose));
+        assert_eq!(governor.trigger(), ReasoningPolicyTrigger::ToolBlocked);
+
+        let mut validation_only = SamplingReasoningGovernor::new(Some(&config));
+        let baseline = validation_only.baselines(0, ValidationFreshnessStatus::None, None);
+        validation_only.settle(
+            &baseline,
+            &SamplingRequestSignalCollector::default(),
+            &settled(
+                0,
+                ValidationFreshnessStatus::FailedAfterLastMutation,
+                Some(0),
+            ),
+        );
+        assert_eq!(
+            validation_only.trigger(),
+            ReasoningPolicyTrigger::ValidationFailed
+        );
+    }
+
+    #[test]
     fn disabled_empty_partial_and_full_policies_have_expected_semantics() {
         let model = model(
             &[
@@ -510,7 +807,9 @@ mod tests {
             disabled.resolve_policy(None, Some(ReasoningEffort::High), &model),
             SamplingRequestPolicy {
                 phase: None,
-                effort: Some(ReasoningEffort::High),
+                configured_effort: Some(ReasoningEffort::High),
+                effective_effort: Some(ReasoningEffort::High),
+                request_effort: Some(ReasoningEffort::High),
                 source: SamplingRequestPolicySource::TurnFallback,
             }
         );
@@ -521,7 +820,9 @@ mod tests {
             governed.resolve_policy(Some(&empty_config), Some(ReasoningEffort::Medium), &model,),
             SamplingRequestPolicy {
                 phase: Some(SamplingReasoningPhase::Orient),
-                effort: Some(ReasoningEffort::Medium),
+                configured_effort: Some(ReasoningEffort::Medium),
+                effective_effort: Some(ReasoningEffort::Medium),
+                request_effort: Some(ReasoningEffort::Medium),
                 source: SamplingRequestPolicySource::TurnFallback,
             }
         );
@@ -539,7 +840,7 @@ mod tests {
         assert_eq!(
             governed
                 .resolve_policy(Some(&config()), Some(ReasoningEffort::Low), &model)
-                .effort,
+                .effective_effort,
             Some(ReasoningEffort::Medium)
         );
     }
@@ -554,17 +855,33 @@ mod tests {
         let medium_only = model(&[ReasoningEffort::Medium], ReasoningEffort::Medium);
         let policy =
             governor.resolve_policy(Some(&config), Some(ReasoningEffort::Low), &medium_only);
-        assert_eq!(policy.effort, Some(ReasoningEffort::Medium));
+        assert_eq!(policy.effective_effort, Some(ReasoningEffort::Medium));
         assert_eq!(policy.source, SamplingRequestPolicySource::PhaseOverride);
 
         let low_only = model(&[ReasoningEffort::Low], ReasoningEffort::Low);
-        assert_eq!(policy.effort, Some(ReasoningEffort::Medium));
+        assert_eq!(policy.effective_effort, Some(ReasoningEffort::Medium));
         assert_eq!(
             governor
                 .resolve_policy(Some(&config), Some(ReasoningEffort::Low), &low_only)
-                .effort,
+                .effective_effort,
             Some(ReasoningEffort::Low)
         );
+    }
+
+    #[test]
+    fn turn_fallback_reports_raw_effort_after_model_normalization() {
+        let ultra_only = model(&[ReasoningEffort::Ultra], ReasoningEffort::Ultra);
+
+        let policy = resolve_request_policy(
+            Some(SamplingReasoningPhase::Orient),
+            Some(&ReasoningPhaseEfforts::default()),
+            Some(ReasoningEffort::High),
+            &ultra_only,
+        );
+
+        assert_eq!(policy.configured_effort, Some(ReasoningEffort::High));
+        assert_eq!(policy.effective_effort, Some(ReasoningEffort::Ultra));
+        assert_eq!(policy.request_effort, Some(ReasoningEffort::Max));
     }
 
     #[test]
@@ -581,7 +898,9 @@ mod tests {
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
 
         assert_eq!(
-            governor.resolve_policy(Some(&config), None, &model).effort,
+            governor
+                .resolve_policy(Some(&config), None, &model)
+                .effective_effort,
             Some(ReasoningEffort::Medium)
         );
 
@@ -593,7 +912,9 @@ mod tests {
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Inspect);
         assert_eq!(
-            governor.resolve_policy(Some(&config), None, &model).effort,
+            governor
+                .resolve_policy(Some(&config), None, &model)
+                .effective_effort,
             Some(ReasoningEffort::Low)
         );
 
@@ -605,7 +926,9 @@ mod tests {
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
         assert_eq!(
-            governor.resolve_policy(Some(&config), None, &model).effort,
+            governor
+                .resolve_policy(Some(&config), None, &model)
+                .effective_effort,
             Some(ReasoningEffort::High)
         );
 
@@ -617,7 +940,9 @@ mod tests {
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
         assert_eq!(
-            governor.resolve_policy(Some(&config), None, &model).effort,
+            governor
+                .resolve_policy(Some(&config), None, &model)
+                .effective_effort,
             Some(ReasoningEffort::High)
         );
 
@@ -633,7 +958,9 @@ mod tests {
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Finalize);
         assert_eq!(
-            governor.resolve_policy(Some(&config), None, &model).effort,
+            governor
+                .resolve_policy(Some(&config), None, &model)
+                .effective_effort,
             Some(ReasoningEffort::Low)
         );
     }

@@ -23,6 +23,17 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
 const TIMING_SCHEMA_VERSION: u16 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContinuationCause {
+    Compaction,
+    ToolResult,
+    ServerEndTurnFalse,
+    PendingInput,
+    StopHook,
+    CompletionReviewRepair,
+    InvalidImageRecovery,
+}
+
 pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEvent) {
     let Some(duration) = turn_context
         .turn_timing_state
@@ -539,6 +550,13 @@ impl TurnTimingState {
         state.counters.model_retry_count = state.counters.model_retry_count.saturating_add(1);
     }
 
+    pub(crate) fn consume_pending_continuation(&self, pending: &mut Option<ContinuationCause>) {
+        if let Some(cause) = pending.take() {
+            let mut state = self.state();
+            state.legacy.record_continuation(cause);
+        }
+    }
+
     pub(crate) fn record_model_fallback(&self) {
         let mut state = self.state();
         state.counters.model_fallback_count = state.counters.model_fallback_count.saturating_add(1);
@@ -997,6 +1015,13 @@ struct LegacyProfileState {
     pending_idle_after_sampling_ns: u128,
     sampling_request_count: u32,
     sampling_retry_count: u32,
+    compaction: u32,
+    tool_result: u32,
+    server_end_turn_false: u32,
+    pending_input: u32,
+    stop_hook: u32,
+    completion_review_repair: u32,
+    invalid_image_recovery: u32,
 }
 
 impl LegacyProfileState {
@@ -1041,6 +1066,22 @@ impl LegacyProfileState {
         }
     }
 
+    fn record_continuation(&mut self, cause: ContinuationCause) {
+        if self.started_at_ns.is_none() {
+            return;
+        }
+        let counter = match cause {
+            ContinuationCause::Compaction => &mut self.compaction,
+            ContinuationCause::ToolResult => &mut self.tool_result,
+            ContinuationCause::ServerEndTurnFalse => &mut self.server_end_turn_false,
+            ContinuationCause::PendingInput => &mut self.pending_input,
+            ContinuationCause::StopHook => &mut self.stop_hook,
+            ContinuationCause::CompletionReviewRepair => &mut self.completion_review_repair,
+            ContinuationCause::InvalidImageRecovery => &mut self.invalid_image_recovery,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
     fn advance(&mut self, now_ns: u128) {
         let Some(previous_ns) = self.last_transition_ns.replace(now_ns) else {
             return;
@@ -1081,6 +1122,13 @@ impl LegacyProfileState {
             after_last_sampling_ms: u128_to_u64_ms(after_last_sampling_ns),
             sampling_request_count: self.sampling_request_count,
             sampling_retry_count: self.sampling_retry_count,
+            compaction: self.compaction,
+            tool_result: self.tool_result,
+            server_end_turn_false: self.server_end_turn_false,
+            pending_input: self.pending_input,
+            stop_hook: self.stop_hook,
+            completion_review_repair: self.completion_review_repair,
+            invalid_image_recovery: self.invalid_image_recovery,
         };
         let total_ms = self
             .started_at_ns

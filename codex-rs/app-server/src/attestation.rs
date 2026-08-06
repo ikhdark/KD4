@@ -42,6 +42,10 @@ impl std::fmt::Debug for AppServerAttestationProvider {
 }
 
 impl AttestationProvider for AppServerAttestationProvider {
+    fn supports_startup_requests(&self) -> bool {
+        false
+    }
+
     fn header_for_request(&self, context: AttestationContext) -> GenerateAttestationFuture<'_> {
         let Some(outgoing) = self.outgoing.upgrade() else {
             return Box::pin(async { None });

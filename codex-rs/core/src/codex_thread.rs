@@ -464,6 +464,9 @@ impl CodexThread {
     }
 
     async fn reserve_execution_guard(&self, op: &Op) -> CodexResult<Option<AgentExecutionGuard>> {
+        if self.session_source.is_internal() {
+            return Ok(None);
+        }
         self.codex
             .session
             .services

@@ -1273,6 +1273,74 @@ pub struct Event {
 
 /// Response event from the agent
 /// NOTE: Make sure none of these values have optional types, as it will mess up the extension code-gen.
+/// The exact request policy used for one model stream attempt. This is protocol
+/// state so rollout reconstruction and late-attaching clients observe the same
+/// decision as live consumers.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ReasoningPolicyPhase {
+    Orient,
+    Inspect,
+    Implement,
+    Verify,
+    Diagnose,
+    Finalize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ReasoningPolicySource {
+    PhaseOverride,
+    TurnFallback,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ReasoningPolicyTrigger {
+    UserInput,
+    ReadOnlyToolSuccess,
+    WorkspaceMutation,
+    ToolFailed,
+    ToolBlocked,
+    ToolTimedOut,
+    ToolCancelled,
+    ValidationPassed,
+    ValidationFailed,
+    ValidationTimedOut,
+    PlanUpdated,
+    HostOverride,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ReasoningPolicySnapshot {
+    pub sequence: u64,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: i64,
+    pub phase: ReasoningPolicyPhase,
+    pub configured_effort: Option<ReasoningEffortConfig>,
+    pub effective_effort: Option<ReasoningEffortConfig>,
+    pub request_effort: Option<ReasoningEffortConfig>,
+    pub source: ReasoningPolicySource,
+    pub model: String,
+    pub trigger: ReasoningPolicyTrigger,
+}
+
+/// Bounded, durable per-turn reasoning-policy history.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ReasoningPolicyHistory {
+    pub turn_id: String,
+    pub entries: Vec<ReasoningPolicySnapshot>,
+    pub total_entries: u64,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Display, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]
@@ -1331,6 +1399,12 @@ pub enum EventMsg {
     /// v1 wire format uses `task_complete`; accept `turn_complete` for v2 interop.
     #[serde(rename = "task_complete", alias = "turn_complete")]
     TurnComplete(TurnCompleteEvent),
+
+    /// Transient policy decision emitted immediately before a stream attempt.
+    ReasoningPolicyUpdated(ReasoningPolicySnapshot),
+
+    /// Durable, bounded policy history emitted before a terminal turn event.
+    ReasoningPolicySummary(ReasoningPolicyHistory),
 
     /// Usage update for the current session, including totals and last turn.
     /// Optional means unknown — UIs should not display when `None`.
@@ -1963,11 +2037,11 @@ pub struct TurnTiming {
     pub schema_version: u16,
     pub profile_valid: bool,
     pub classification_complete: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub started_at_unix_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub completed_at_unix_ms: Option<i64>,
     pub inclusive_duration_ns: u64,
     pub inclusive_duration_ms: u64,
@@ -2029,14 +2103,14 @@ pub struct TurnTimingLocal {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingMilestones {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub first_model_output_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub first_visible_output_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[serde(default)]
+    #[ts(type = "number | null")]
     pub first_agent_message_ms: Option<u64>,
 }
 

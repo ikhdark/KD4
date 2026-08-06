@@ -626,6 +626,59 @@ fn focused_validation_requires_repo_root_explicit_timeout_and_default_permission
 }
 
 #[test]
+fn independent_review_disables_login_shells() {
+    let reviewer = codex_protocol::protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+            parent_thread_id: codex_protocol::ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("reviewer".to_string()),
+        },
+    );
+
+    assert!(!ShellCommandHandler::effective_allow_login_shell(
+        &reviewer, true
+    ));
+    assert!(ShellCommandHandler::effective_allow_login_shell(
+        &codex_protocol::protocol::SessionSource::Cli,
+        true
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn independent_review_powershell_safety_args_disable_profiles() {
+    let Some(powershell) = try_find_powershell_executable_blocking() else {
+        return;
+    };
+    let reviewer = codex_protocol::protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+            parent_thread_id: codex_protocol::ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("reviewer".to_string()),
+        },
+    );
+    let use_login_shell = ShellCommandHandler::resolve_use_login_shell(
+        None,
+        ShellCommandHandler::effective_allow_login_shell(&reviewer, true),
+    )
+    .expect("independent reviewers should use a non-login shell");
+    let shell = Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path: powershell.to_path_buf(),
+    };
+    let safety_command =
+        CommandInvocation::PowerShellScript("Get-Content -LiteralPath Cargo.toml".to_string())
+            .to_safety_args(&shell, use_login_shell);
+
+    assert!(safety_command.iter().any(|arg| arg == "-NoProfile"));
+    assert!(is_known_safe_command(&safety_command));
+}
+
+#[test]
 fn repository_wide_coordination_skips_only_admitted_nonmutating_validation() {
     for command in [
         validation_argv("cargo", &["check", "-p", "codex-core"]),

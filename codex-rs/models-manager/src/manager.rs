@@ -16,6 +16,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::TryLockError;
@@ -198,11 +199,7 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Refresh models if the provided ETag differs from the cached ETag.
     ///
     /// Uses `Online` strategy to fetch latest models when ETags differ.
-    fn refresh_if_new_etag(
-        &self,
-        etag: String,
-        http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, ()>;
+    fn notify_etag(self: Arc<Self>, etag: String, http_client_factory: HttpClientFactory);
 }
 
 pub type ModelsManagerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -218,6 +215,22 @@ pub struct OpenAiModelsManager {
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
+    etag_refresh: Mutex<EtagRefreshState>,
+}
+
+#[derive(Debug, Default)]
+struct EtagRefreshState {
+    generation: u64,
+    active_etag: Option<String>,
+    pending: Option<EtagRefreshNotice>,
+    worker_running: bool,
+}
+
+#[derive(Debug)]
+struct EtagRefreshNotice {
+    generation: u64,
+    etag: String,
+    http_client_factory: HttpClientFactory,
 }
 
 /// Static model manager backed by an authoritative in-process catalog.
@@ -243,6 +256,7 @@ impl OpenAiModelsManager {
             cache_manager,
             endpoint_client,
             auth_manager,
+            etag_refresh: Mutex::new(EtagRefreshState::default()),
         }
     }
 }
@@ -286,16 +300,8 @@ impl ModelsManager for OpenAiModelsManager {
         builtin_collaboration_mode_presets()
     }
 
-    fn refresh_if_new_etag(
-        &self,
-        etag: String,
-        http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, ()> {
-        Box::pin(OpenAiModelsManager::refresh_if_new_etag(
-            self,
-            etag,
-            http_client_factory,
-        ))
+    fn notify_etag(self: Arc<Self>, etag: String, http_client_factory: HttpClientFactory) {
+        self.submit_etag_notice(etag, http_client_factory);
     }
 }
 
@@ -316,19 +322,95 @@ impl OpenAiModelsManager {
         }
     }
 
-    async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
-        let current_etag = self.get_etag().await;
-        if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
-            if let Err(err) = self.cache_manager.renew_cache_ttl().await {
-                error!("failed to renew cache TTL: {err}");
+    fn submit_etag_notice(self: Arc<Self>, etag: String, http_client_factory: HttpClientFactory) {
+        let should_start_worker = {
+            let mut state = self
+                .etag_refresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.active_etag.as_deref() == Some(etag.as_str())
+                || state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.etag == etag)
+            {
+                return;
             }
-            return;
+            state.generation = state.generation.saturating_add(1);
+            state.pending = Some(EtagRefreshNotice {
+                generation: state.generation,
+                etag,
+                http_client_factory,
+            });
+            if state.worker_running {
+                false
+            } else {
+                state.worker_running = true;
+                true
+            }
+        };
+        if should_start_worker {
+            tokio::spawn(async move { self.run_etag_refresh_worker().await });
         }
-        if let Err(err) = self
-            .refresh_available_models(RefreshStrategy::Online, &http_client_factory)
-            .await
-        {
-            error!("failed to refresh available models: {err}");
+    }
+
+    async fn run_etag_refresh_worker(self: Arc<Self>) {
+        loop {
+            let Some(notice) = ({
+                let mut state = self
+                    .etag_refresh
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let notice = state.pending.take();
+                if let Some(notice) = &notice {
+                    state.active_etag = Some(notice.etag.clone());
+                } else {
+                    state.active_etag = None;
+                    state.worker_running = false;
+                }
+                notice
+            }) else {
+                return;
+            };
+
+            if self.get_etag().await.as_deref() == Some(notice.etag.as_str()) {
+                if let Err(err) = self.cache_manager.renew_cache_ttl().await {
+                    error!("failed to renew cache TTL: {err}");
+                }
+            } else {
+                match self.fetch_models(&notice.http_client_factory).await {
+                    Ok((models, etag)) => {
+                        let merged_models = self.merged_remote_models(models.clone());
+                        let should_apply = {
+                            let (mut remote_models, mut current_etag) =
+                                tokio::join!(self.remote_models.write(), self.etag.write());
+                            let state = self
+                                .etag_refresh
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if state.generation == notice.generation {
+                                *remote_models = merged_models;
+                                *current_etag = etag.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_apply {
+                            self.cache_manager
+                                .persist_cache(&models, etag, crate::client_version_to_whole())
+                                .await;
+                        }
+                    }
+                    Err(err) => error!("failed to refresh available models: {err}"),
+                }
+            }
+
+            let mut state = self
+                .etag_refresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.active_etag = None;
         }
     }
 
@@ -375,16 +457,25 @@ impl OpenAiModelsManager {
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
         let client_version = crate::client_version_to_whole();
-        let (models, etag) = self
-            .endpoint_client
-            .list_models(&client_version, http_client_factory.clone())
-            .await?;
+        let (models, etag) = self.fetch_models(http_client_factory).await?;
         self.apply_remote_models(models.clone()).await;
         *self.etag.write().await = etag.clone();
         self.cache_manager
             .persist_cache(&models, etag, client_version)
             .await;
         Ok(())
+    }
+
+    async fn fetch_models(
+        &self,
+        http_client_factory: &HttpClientFactory,
+    ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+        self.endpoint_client
+            .list_models(
+                &crate::client_version_to_whole(),
+                http_client_factory.clone(),
+            )
+            .await
     }
 
     async fn should_refresh_models(&self) -> bool {
@@ -397,6 +488,10 @@ impl OpenAiModelsManager {
 
     /// Replace the cached remote models and rebuild the derived presets list.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
+        *self.remote_models.write().await = self.merged_remote_models(models);
+    }
+
+    fn merged_remote_models(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
         // Use the remote models list as the source of truth if it contains at least one
         // non-hidden model and the user is using ChatGPT auth.
         let should_use_remote_models_only = !models.is_empty()
@@ -409,8 +504,7 @@ impl OpenAiModelsManager {
                     .is_some_and(AuthMode::has_chatgpt_account)
             });
         if should_use_remote_models_only {
-            *self.remote_models.write().await = models;
-            return;
+            return models;
         }
 
         let mut existing_models = load_remote_models_from_file().unwrap_or_default();
@@ -424,7 +518,7 @@ impl OpenAiModelsManager {
                 existing_models.push(model);
             }
         }
-        *self.remote_models.write().await = existing_models;
+        existing_models
     }
 
     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
@@ -519,13 +613,7 @@ impl ModelsManager for StaticModelsManager {
         builtin_collaboration_mode_presets()
     }
 
-    fn refresh_if_new_etag(
-        &self,
-        _etag: String,
-        _http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, ()> {
-        Box::pin(async {})
-    }
+    fn notify_etag(self: Arc<Self>, _etag: String, _http_client_factory: HttpClientFactory) {}
 }
 
 fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {

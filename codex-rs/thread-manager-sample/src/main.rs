@@ -208,6 +208,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         include_environment_context: false,
         compact_prompt: None,
         notify: None,
+        after_agent_policy: Default::default(),
         tui_notifications: TuiNotificationSettings::default(),
         animations: true,
         show_tooltips: true,

@@ -179,6 +179,14 @@ fn filter_outgoing_message_for_connection(
         .experimental_api_enabled
         .load(Ordering::Acquire);
     match message {
+        // Client responses have already been serialized to JSON by this point, so
+        // capability-gated fields cannot be removed from their typed payloads.
+        // Keep the durable history intact and strip only its client-facing field
+        // for connections that did not opt into the experimental API.
+        OutgoingMessage::Response(mut response) if !experimental_api_enabled => {
+            strip_reasoning_policy_history(&mut response.result);
+            OutgoingMessage::Response(response)
+        }
         OutgoingMessage::Request(ServerRequest::CommandExecutionRequestApproval {
             request_id,
             mut params,
@@ -192,6 +200,23 @@ fn filter_outgoing_message_for_connection(
             })
         }
         _ => message,
+    }
+}
+
+fn strip_reasoning_policy_history(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("reasoningPolicyHistory");
+            for nested_value in object.values_mut() {
+                strip_reasoning_policy_history(nested_value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested_value in values {
+                strip_reasoning_policy_history(nested_value);
+            }
+        }
+        _ => {}
     }
 }
 

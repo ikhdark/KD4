@@ -791,6 +791,136 @@
       "minLength": 1,
       "type": "string"
     },
+    "ReasoningPolicyHistory": {
+      "description": "Bounded, durable per-turn reasoning-policy history.",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/definitions/ReasoningPolicySnapshot"
+          },
+          "type": "array"
+        },
+        "totalEntries": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entries",
+        "totalEntries",
+        "truncated",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "ReasoningPolicyPhase": {
+      "description": "Response event from the agent NOTE: Make sure none of these values have optional types, as it will mess up the extension code-gen. The exact request policy used for one model stream attempt. This is protocol state so rollout reconstruction and late-attaching clients observe the same decision as live consumers.",
+      "enum": [
+        "orient",
+        "inspect",
+        "implement",
+        "verify",
+        "diagnose",
+        "finalize"
+      ],
+      "type": "string"
+    },
+    "ReasoningPolicySnapshot": {
+      "properties": {
+        "configuredEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effectiveEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/definitions/ReasoningPolicyPhase"
+        },
+        "requestEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/definitions/ReasoningPolicySource"
+        },
+        "timestamp": {
+          "description": "Unix timestamp in milliseconds.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "trigger": {
+          "$ref": "#/definitions/ReasoningPolicyTrigger"
+        }
+      },
+      "required": [
+        "model",
+        "phase",
+        "sequence",
+        "source",
+        "timestamp",
+        "trigger"
+      ],
+      "type": "object"
+    },
+    "ReasoningPolicySource": {
+      "enum": [
+        "phase_override",
+        "turn_fallback"
+      ],
+      "type": "string"
+    },
+    "ReasoningPolicyTrigger": {
+      "enum": [
+        "user_input",
+        "read_only_tool_success",
+        "workspace_mutation",
+        "tool_failed",
+        "tool_blocked",
+        "tool_timed_out",
+        "tool_cancelled",
+        "validation_passed",
+        "validation_failed",
+        "validation_timed_out",
+        "plan_updated",
+        "host_override"
+      ],
+      "type": "string"
+    },
     "SandboxPolicy": {
       "oneOf": [
         {

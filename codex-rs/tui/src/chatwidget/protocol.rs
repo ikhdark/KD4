@@ -64,6 +64,7 @@ impl ChatWidget {
                     self.on_task_started();
                 }
             }
+            ServerNotification::TurnReasoningPolicyUpdated(_) => {}
             ServerNotification::TurnCompleted(notification) => {
                 self.handle_turn_completed_notification(notification, replay_kind);
             }

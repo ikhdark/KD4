@@ -21,6 +21,7 @@ use codex_config::ResidencyRequirement;
 use codex_config::SandboxModeRequirement;
 use codex_config::Sourced;
 use codex_config::ThreadConfigLoader;
+use codex_config::config_toml::AfterAgentPolicy;
 use codex_config::config_toml::ConfigLockfileToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
@@ -816,6 +817,9 @@ pub struct Config {
     ///
     /// If unset the feature is disabled.
     pub notify: Option<Vec<String>>,
+
+    /// Ordering policy for the AfterAgent hook at turn completion.
+    pub after_agent_policy: AfterAgentPolicy,
 
     /// TUI notification settings, including enabled events, delivery method, and focus condition.
     pub tui_notifications: TuiNotificationSettings,
@@ -3904,6 +3908,7 @@ impl Config {
             approvals_reviewer: constrained_approvals_reviewer.value(),
             enforce_residency: enforce_residency.value,
             notify: cfg.notify,
+            after_agent_policy: cfg.after_agent_policy,
             base_instructions,
             personality,
             developer_instructions,

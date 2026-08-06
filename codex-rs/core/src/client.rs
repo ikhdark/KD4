@@ -177,11 +177,25 @@ pub(crate) struct CompactConversationRequestSettings {
     pub(crate) service_tier: Option<String>,
 }
 
-fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffortConfig {
-    match effort {
-        ReasoningEffortConfig::Ultra => ReasoningEffortConfig::Max,
-        effort => effort,
-    }
+pub(crate) fn request_effort_for_model(
+    model_info: &ModelInfo,
+    effort: Option<ReasoningEffortConfig>,
+) -> Option<ReasoningEffortConfig> {
+    crate::session::reasoning_governor::resolve_request_policy(None, None, effort, model_info)
+        .request_effort
+}
+
+fn memory_summary_reasoning(
+    model_info: &ModelInfo,
+    effort: Option<ReasoningEffortConfig>,
+) -> Option<Reasoning> {
+    effort
+        .and_then(|effort| request_effort_for_model(model_info, Some(effort)))
+        .map(|effort| Reasoning {
+            effort: Some(effort),
+            summary: None,
+            context: None,
+        })
 }
 
 fn session_telemetry_for_request(
@@ -685,11 +699,12 @@ impl ModelClient {
             RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
             self.state.auth_env_telemetry.clone(),
         );
+        let request_effort = request_effort_for_model(model_info, settings.effort);
         let request = self.build_responses_request(
             &client_setup.api_provider,
             prompt,
             model_info,
-            settings.effort,
+            request_effort,
             settings.summary,
             settings.service_tier,
             responses_metadata,
@@ -826,13 +841,7 @@ impl ModelClient {
         let payload = ApiMemorySummarizeInput {
             model: model_info.slug.clone(),
             raw_memories,
-            reasoning: effort
-                .map(reasoning_effort_for_request)
-                .map(|effort| Reasoning {
-                    effort: Some(effort),
-                    summary: None,
-                    context: None,
-                }),
+            reasoning: memory_summary_reasoning(model_info, effort),
         };
 
         client
@@ -926,14 +935,16 @@ impl ModelClient {
 
     fn build_reasoning(
         model_info: &ModelInfo,
-        effort: Option<ReasoningEffortConfig>,
+        request_effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
     ) -> Option<Reasoning> {
         if model_info.supports_reasoning_summaries {
             Some(Reasoning {
-                effort: effort
-                    .or_else(|| model_info.default_reasoning_level.clone())
-                    .map(reasoning_effort_for_request),
+                // Sampling, compaction, and memory callers resolve their raw
+                // configured effort exactly once. In particular, do not feed an
+                // already-normalized request effort (such as ultra -> max) back
+                // through model capability normalization here.
+                effort: request_effort,
                 summary: if summary == ReasoningSummaryConfig::None {
                     None
                 } else {
@@ -1133,6 +1144,16 @@ impl ModelClient {
         }
 
         true
+    }
+
+    pub(crate) fn startup_websocket_enabled(&self) -> bool {
+        self.responses_websocket_enabled()
+            && (!self.state.include_attestation
+                || self
+                    .state
+                    .attestation_provider
+                    .as_ref()
+                    .is_none_or(|provider| provider.supports_startup_requests()))
     }
 
     /// Returns auth + provider configuration resolved from the current session auth state.

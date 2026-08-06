@@ -70,6 +70,19 @@ fn message_input_texts(body: &Value, role: &str) -> Vec<String> {
         .collect()
 }
 
+fn agent_message_input_texts(body: &Value) -> Vec<String> {
+    body.get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("agent_message"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_text"))
+        .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
 fn function_call_output_text<'a>(body: &'a Value, call_id: &str) -> Option<&'a str> {
     body.get("input")
         .and_then(Value::as_array)?
@@ -601,7 +614,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn queued_inter_agent_mail_triggers_follow_up_after_reasoning_item() {
+async fn queued_inter_agent_mail_waits_for_later_tool_call_after_reasoning_item() {
     let (gate_reasoning_done_tx, gate_reasoning_done_rx) = oneshot::channel();
 
     let first_chunks = vec![
@@ -612,9 +625,9 @@ async fn queued_inter_agent_mail_triggers_follow_up_after_reasoning_item() {
             vec![
                 ev_reasoning_item("reason-1", &["thinking"], &[]),
                 ev_function_call(
-                    "call-stale",
+                    "call-preserved",
                     "shell",
-                    r#"{"command":"echo stale tool call"}"#,
+                    r#"{"command":"echo preserved tool call"}"#,
                 ),
                 ev_message_item_added("msg-stale", ""),
                 ev_output_text_delta("stale final"),
@@ -640,13 +653,24 @@ async fn queued_inter_agent_mail_triggers_follow_up_after_reasoning_item() {
     wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
-    assert_two_responses_input_snapshot("pending_input_queued_mail_after_reasoning", &requests);
+    assert_eq!(requests.len(), 2);
+    let first: Value = from_slice(&requests[0]).expect("parse first request");
+    let second: Value = from_slice(&requests[1]).expect("parse second request");
+    assert!(function_call_output_text(&first, "call-preserved").is_none());
+    assert!(function_call_output_text(&second, "call-preserved").is_some());
+    assert_eq!(
+        agent_message_input_texts(&second)
+            .iter()
+            .filter(|text| text.contains("queued child update"))
+            .count(),
+        1
+    );
 
     server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn queued_inter_agent_mail_triggers_follow_up_after_commentary_message_item() {
+async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_message_item() {
     let (gate_message_done_tx, gate_message_done_rx) = oneshot::channel();
 
     let first_chunks = vec![
@@ -667,9 +691,9 @@ async fn queued_inter_agent_mail_triggers_follow_up_after_commentary_message_ite
                     }
                 }),
                 ev_function_call(
-                    "call-stale",
+                    "call-preserved",
                     "shell",
-                    r#"{"command":"echo stale tool call"}"#,
+                    r#"{"command":"echo preserved tool call"}"#,
                 ),
                 ev_message_item_added("msg-stale", ""),
                 ev_output_text_delta("stale final"),
@@ -704,7 +728,18 @@ async fn queued_inter_agent_mail_triggers_follow_up_after_commentary_message_ite
     wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
-    assert_two_responses_input_snapshot("pending_input_queued_mail_after_commentary", &requests);
+    assert_eq!(requests.len(), 2);
+    let first: Value = from_slice(&requests[0]).expect("parse first request");
+    let second: Value = from_slice(&requests[1]).expect("parse second request");
+    assert!(function_call_output_text(&first, "call-preserved").is_none());
+    assert!(function_call_output_text(&second, "call-preserved").is_some());
+    assert_eq!(
+        agent_message_input_texts(&second)
+            .iter()
+            .filter(|text| text.contains("queued child update"))
+            .count(),
+        1
+    );
 
     server.shutdown().await;
 }

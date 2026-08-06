@@ -663,7 +663,7 @@ async fn unified_exec_emits_exec_command_end_event() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unified_exec_emits_output_delta_for_exec_command() -> Result<()> {
+async fn unified_exec_short_lived_end_waits_for_trailing_output() -> Result<()> {
     // TODO(anp): Remove after unified-exec fixtures use target-native commands.
     skip_if_target_windows!(Ok(()), "uses a POSIX-only command fixture");
     skip_if_no_network!(Ok(()));
@@ -680,10 +680,10 @@ async fn unified_exec_emits_output_delta_for_exec_command() -> Result<()> {
     });
     let test = builder.build_with_auto_env(&server).await?;
 
-    let call_id = "uexec-delta-1";
+    let call_id = "uexec-short-lived-trailing-output";
     let args = json!({
-        "cmd": "printf 'HELLO-UEXEC'",
-        "yield_time_ms": 1000,
+        "cmd": "printf 'HEAD-UEXEC'; (sleep 0.05; printf 'TAIL-UEXEC') &",
+        "yield_time_ms": 10,
     });
 
     let responses = vec![
@@ -700,7 +700,12 @@ async fn unified_exec_emits_output_delta_for_exec_command() -> Result<()> {
     ];
     mount_sse_sequence(&server, responses).await;
 
-    submit_unified_exec_turn(&test, "emit delta", PermissionProfile::Disabled).await?;
+    submit_unified_exec_turn(
+        &test,
+        "wait for trailing short-lived output",
+        PermissionProfile::Disabled,
+    )
+    .await?;
 
     let event = wait_for_event_match(&test.codex, |msg| match msg {
         EventMsg::ExecCommandEnd(ev) if ev.call_id == call_id => Some(ev.clone()),
@@ -708,10 +713,10 @@ async fn unified_exec_emits_output_delta_for_exec_command() -> Result<()> {
     })
     .await;
 
-    let text = event.stdout;
+    let text = event.aggregated_output;
     assert!(
-        text.contains("HELLO-UEXEC"),
-        "delta chunk missing expected text: {text:?}",
+        text.contains("HEAD-UEXEC") && text.contains("TAIL-UEXEC"),
+        "end event was observable before trailing output drained: {text:?}",
     );
 
     wait_for_event(&test.codex, |event| {
@@ -774,7 +779,13 @@ async fn unified_exec_full_lifecycle_with_background_end_event() -> Result<()> {
     loop {
         let msg = wait_for_event(&test.codex, |_| true).await;
         match msg {
-            EventMsg::ExecCommandBegin(ev) if ev.call_id == call_id => begin_event = Some(ev),
+            EventMsg::ExecCommandBegin(ev) if ev.call_id == call_id => {
+                assert!(
+                    begin_event.is_none(),
+                    "expected a single ExecCommandBegin event for this call id"
+                );
+                begin_event = Some(ev);
+            }
             EventMsg::ExecCommandEnd(ev) if ev.call_id == call_id => {
                 assert!(
                     end_event.is_none(),

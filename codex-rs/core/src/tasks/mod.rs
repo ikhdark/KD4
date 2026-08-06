@@ -362,6 +362,7 @@ impl TerminalSchedule {
 struct TerminalFinalization {
     task: RunningTask,
     turn_state: Arc<tokio::sync::Mutex<TurnState>>,
+    reasoning_policy_recorder: Arc<crate::session::reasoning_governor::ReasoningPolicyRecorder>,
     coordinator: Arc<TurnTerminalCoordinator>,
     outcome: TurnTerminalOutcome,
     permit: Option<TurnTerminalPermit>,
@@ -644,13 +645,18 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let pending_items = self.input_queue.get_pending_input(&self.active_turn).await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
+            turn.reasoning_policy_recorder = Arc::new(
+                crate::session::reasoning_governor::ReasoningPolicyRecorder::new(
+                    turn_context.config.reasoning_phase_efforts.is_some(),
+                ),
+            );
             Arc::clone(&turn.turn_state)
         };
+        let pending_items = self.input_queue.get_pending_input(&self.active_turn).await;
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         self.input_queue
             .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
@@ -846,7 +852,7 @@ impl Session {
         outcome: TurnTerminalOutcome,
     ) -> BoxFuture<'a, TerminalSchedule> {
         Box::pin(async move {
-            let (task, turn_state, permit, coordinator) = {
+            let (task, turn_state, reasoning_policy_recorder, permit, coordinator) = {
                 let mut active = self.active_turn.lock().await;
                 let Some(active_turn) = active.as_mut() else {
                     return TerminalSchedule::NotFound;
@@ -872,6 +878,7 @@ impl Session {
                 (
                     task,
                     Arc::clone(&active_turn.turn_state),
+                    active_turn.reasoning_policy_recorder.clone(),
                     permit,
                     coordinator,
                 )
@@ -888,6 +895,7 @@ impl Session {
                 let mut finalization = TerminalFinalization {
                     task,
                     turn_state,
+                    reasoning_policy_recorder,
                     coordinator: finalizer_coordinator,
                     outcome,
                     permit: Some(permit),
@@ -1639,6 +1647,16 @@ impl Session {
                 timing: Some(timing),
             })
         };
+        if let Some(summary) = finalization
+            .reasoning_policy_recorder
+            .take_summary(turn_context.sub_id.clone())
+        {
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::ReasoningPolicySummary(summary),
+            )
+            .await;
+        }
         self.send_event(turn_context.as_ref(), event).await;
         if let Some(permit) = finalization.permit.as_ref() {
             permit.mark_terminal_event_dispatched();
@@ -1791,6 +1809,16 @@ impl Session {
                     timing: Some(timing),
                 })
             };
+            if let Some(summary) = finalization
+                .reasoning_policy_recorder
+                .take_summary(turn_context.sub_id.clone())
+            {
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::ReasoningPolicySummary(summary),
+                )
+                .await;
+            }
             self.send_event(turn_context.as_ref(), event).await;
             if let Some(permit) = finalization.permit.as_ref() {
                 permit.mark_terminal_event_dispatched();

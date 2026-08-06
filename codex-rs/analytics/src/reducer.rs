@@ -2642,6 +2642,13 @@ fn codex_turn_event_params(
         after_last_sampling_ms,
         sampling_request_count,
         sampling_retry_count,
+        compaction,
+        tool_result,
+        server_end_turn_false,
+        pending_input,
+        stop_hook,
+        completion_review_repair,
+        invalid_image_recovery,
     } = profile;
     let token_usage = turn_state.token_usage.clone();
     let codex_error = turn_state.codex_error.as_ref();
@@ -2711,6 +2718,13 @@ fn codex_turn_event_params(
         after_last_sampling_ms,
         sampling_request_count,
         sampling_retry_count,
+        compaction,
+        tool_result,
+        server_end_turn_false,
+        pending_input,
+        stop_hook,
+        completion_review_repair,
+        invalid_image_recovery,
         timing: turn_state.timing.clone(),
         duration_ms: completed.duration_ms,
         started_at,

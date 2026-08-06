@@ -605,7 +605,7 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
         .as_str()
         .expect("model slug should be present")
         .to_string();
-    entry["context_window"] = serde_json::Value::from(100);
+    entry["context_window"] = serde_json::Value::from(20_000);
     std::fs::write(&cache_path, serde_json::to_string_pretty(&cache)?)?;
     let config_path = codex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
@@ -654,19 +654,23 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
     )
     .await??;
 
-    let notification = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("warning"),
-    )
+    let expected_warning = "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
+    let warning = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("warning")
+                .await?;
+            let params = notification.params.expect("warning params");
+            let warning: WarningNotification =
+                serde_json::from_value(params).expect("deserialize warning notification");
+            if warning.message == expected_warning {
+                return Ok::<_, anyhow::Error>(warning);
+            }
+        }
+    })
     .await??;
-    let params = notification.params.expect("warning params");
-    let warning: WarningNotification =
-        serde_json::from_value(params).expect("deserialize warning notification");
     assert_eq!(warning.thread_id.as_deref(), Some(thread.id.as_str()));
-    assert_eq!(
-        warning.message,
-        "Exceeded skills context budget of 2%. All skill descriptions were removed and 7 additional skills were not included in the model-visible skills list."
-    );
+    assert_eq!(warning.message, expected_warning);
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -686,8 +690,12 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
         "expected outgoing request to include the skills section"
     );
     assert!(
-        !body_contains(request, "- alpha-skill:") && !body_contains(request, "- beta-skill:"),
-        "expected trimmed skills to be omitted from the outgoing request body"
+        body_contains(request, "- alpha-skill:") && body_contains(request, "- beta-skill:"),
+        "expected skills with shortened descriptions to remain in the outgoing request body"
+    );
+    assert!(
+        !body_contains(request, &"long skill description ".repeat(100)),
+        "expected oversized skill descriptions to be shortened in the outgoing request body"
     );
 
     Ok(())
@@ -1631,9 +1639,7 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
     let payload = request.body_json();
     assert_eq!(payload["model"].as_str(), Some("mock-model-collab"));
     let payload_text = payload.to_string();
-    assert!(payload_text.contains(
-        "Use the `request_user_input` tool only when it is listed in the available tools"
-    ));
+    assert!(payload_text.contains("Use `request_user_input` only when it is available"));
 
     Ok(())
 }
@@ -4671,6 +4677,9 @@ fn write_test_skill(codex_home: &Path, name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(
         skill_dir.join("SKILL.md"),
-        format!("---\nname: {name}\ndescription: {name} description\n---\n\n# Body\n"),
+        format!(
+            "---\nname: {name}\ndescription: {}\n---\n\n# Body\n",
+            "long skill description ".repeat(500)
+        ),
     )
 }

@@ -1,9 +1,13 @@
 use super::*;
+use crate::outgoing_message::OutgoingResponse;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ThreadRealtimeStartedNotification;
-use codex_protocol::protocol::RealtimeConversationVersion;
+use codex_app_server_protocol::TurnReasoningPolicyUpdatedNotification;
+use codex_protocol::protocol::ReasoningPolicyPhase;
+use codex_protocol::protocol::ReasoningPolicySnapshot;
+use codex_protocol::protocol::ReasoningPolicySource;
+use codex_protocol::protocol::ReasoningPolicyTrigger;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -14,11 +18,40 @@ fn absolute_path(path: &str) -> AbsolutePathBuf {
     AbsolutePathBuf::from_absolute_path(path).expect("absolute path")
 }
 
-fn thread_realtime_started_notification() -> ServerNotification {
-    ServerNotification::ThreadRealtimeStarted(ThreadRealtimeStartedNotification {
+fn reasoning_policy_updated_notification() -> ServerNotification {
+    ServerNotification::TurnReasoningPolicyUpdated(TurnReasoningPolicyUpdatedNotification {
         thread_id: "thread-1".to_string(),
-        realtime_session_id: None,
-        version: RealtimeConversationVersion::V1,
+        turn_id: "turn-1".to_string(),
+        snapshot: ReasoningPolicySnapshot {
+            sequence: 1,
+            timestamp: 1,
+            phase: ReasoningPolicyPhase::Orient,
+            configured_effort: None,
+            effective_effort: None,
+            request_effort: None,
+            source: ReasoningPolicySource::TurnFallback,
+            model: "gpt-5".to_string(),
+            trigger: ReasoningPolicyTrigger::UserInput,
+        },
+    })
+}
+
+fn response_with_reasoning_policy_history() -> OutgoingMessage {
+    OutgoingMessage::Response(OutgoingResponse {
+        id: RequestId::Integer(99),
+        result: json!({
+            "thread": {
+                "turns": [{
+                    "id": "turn-1",
+                    "reasoningPolicyHistory": {
+                        "turnId": "turn-1",
+                        "entries": [],
+                        "totalEntries": 0,
+                        "truncated": false
+                    }
+                }]
+            }
+        }),
     })
 }
 
@@ -217,11 +250,16 @@ async fn experimental_notifications_are_dropped_without_capability() {
         ),
     );
 
+    let notification = reasoning_policy_updated_notification();
+    assert_eq!(
+        notification.experimental_reason(),
+        Some("reasoningPolicyVisibility")
+    );
     route_outgoing_envelope(
         &mut connections,
         OutgoingEnvelope::ToConnection {
             connection_id,
-            message: OutgoingMessage::AppServerNotification(thread_realtime_started_notification()),
+            message: OutgoingMessage::AppServerNotification(notification),
             write_complete_tx: None,
         },
     )
@@ -254,7 +292,7 @@ async fn experimental_notifications_are_preserved_with_capability() {
         &mut connections,
         OutgoingEnvelope::ToConnection {
             connection_id,
-            message: OutgoingMessage::AppServerNotification(thread_realtime_started_notification()),
+            message: OutgoingMessage::AppServerNotification(reasoning_policy_updated_notification()),
             write_complete_tx: None,
         },
     )
@@ -264,10 +302,103 @@ async fn experimental_notifications_are_preserved_with_capability() {
         .recv()
         .await
         .expect("experimental notification should reach opted-in client");
-    assert!(matches!(
-        message.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ThreadRealtimeStarted(_))
-    ));
+    let OutgoingMessage::AppServerNotification(ServerNotification::TurnReasoningPolicyUpdated(
+        notification,
+    )) = message.message
+    else {
+        panic!("expected reasoning-policy notification");
+    };
+    assert_eq!(notification.thread_id, "thread-1");
+    assert_eq!(notification.turn_id, "turn-1");
+    assert_eq!(notification.snapshot.sequence, 1);
+    assert_eq!(notification.snapshot.phase, ReasoningPolicyPhase::Orient);
+    assert_eq!(
+        notification.snapshot.trigger,
+        ReasoningPolicyTrigger::UserInput
+    );
+}
+
+#[tokio::test]
+async fn reasoning_policy_history_is_omitted_without_capability() {
+    let connection_id = ConnectionId(15);
+    let (writer_tx, mut writer_rx) = mpsc::channel(1);
+    let mut connections = HashMap::new();
+    connections.insert(
+        connection_id,
+        OutboundConnectionState::new(
+            writer_tx,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(HashSet::new())),
+            /*disconnect_sender*/ None,
+        ),
+    );
+
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: response_with_reasoning_policy_history(),
+            write_complete_tx: None,
+        },
+    )
+    .await;
+
+    let message = writer_rx
+        .recv()
+        .await
+        .expect("response should be delivered");
+    let OutgoingMessage::Response(response) = message.message else {
+        panic!("expected response");
+    };
+    assert!(
+        response
+            .result
+            .pointer("/thread/turns/0/reasoningPolicyHistory")
+            .is_none(),
+        "history must be omitted for clients without the capability"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_policy_history_is_preserved_with_capability() {
+    let connection_id = ConnectionId(16);
+    let (writer_tx, mut writer_rx) = mpsc::channel(1);
+    let mut connections = HashMap::new();
+    connections.insert(
+        connection_id,
+        OutboundConnectionState::new(
+            writer_tx,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(RwLock::new(HashSet::new())),
+            /*disconnect_sender*/ None,
+        ),
+    );
+
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: response_with_reasoning_policy_history(),
+            write_complete_tx: None,
+        },
+    )
+    .await;
+
+    let message = writer_rx
+        .recv()
+        .await
+        .expect("response should be delivered");
+    let OutgoingMessage::Response(response) = message.message else {
+        panic!("expected response");
+    };
+    assert_eq!(
+        response
+            .result
+            .pointer("/thread/turns/0/reasoningPolicyHistory/turnId"),
+        Some(&json!("turn-1"))
+    );
 }
 
 #[tokio::test]

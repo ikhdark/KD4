@@ -16,6 +16,9 @@ pub(super) struct ThreadEventSnapshot {
 }
 
 #[derive(Debug, Clone)]
+// This mirrors the app-server event shape throughout buffering and replay;
+// boxing only notifications would add indirection at every routing boundary.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum ThreadBufferedEvent {
     Notification(ServerNotification),
     Request(ServerRequest),
@@ -391,6 +394,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            reasoning_policy_history: None,
         }
     }
 

@@ -11,6 +11,7 @@ use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
 use super::ClockSample;
+use super::ContinuationCause;
 use super::InteractiveWaitKind;
 use super::TimeSample;
 use super::TurnClock;
@@ -216,8 +217,76 @@ fn legacy_profile_projection_preserves_existing_phase_breakdown() {
             after_last_sampling_ms: 100,
             sampling_request_count: 2,
             sampling_retry_count: 1,
+            compaction: 0,
+            tool_result: 0,
+            server_end_turn_false: 0,
+            pending_input: 0,
+            stop_hook: 0,
+            completion_review_repair: 0,
+            invalid_image_recovery: 0,
         }
     );
+}
+
+#[test]
+fn continuation_counters_are_consumed_once_and_retries_are_not_recounted() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_sampling());
+
+    let causes = [
+        ContinuationCause::Compaction,
+        ContinuationCause::ToolResult,
+        ContinuationCause::ServerEndTurnFalse,
+        ContinuationCause::PendingInput,
+        ContinuationCause::StopHook,
+        ContinuationCause::CompletionReviewRepair,
+        ContinuationCause::InvalidImageRecovery,
+    ];
+    for cause in causes {
+        let mut pending = Some(cause);
+        let sampling = state.begin_sampling();
+        state.consume_pending_continuation(&mut pending);
+        drop(sampling);
+        assert_eq!(pending, None);
+    }
+    state.record_sampling_retry();
+    drop(state.begin_sampling());
+
+    let profile = state.complete_snapshot().legacy_profile;
+    assert_eq!(profile.compaction, 1);
+    assert_eq!(profile.tool_result, 1);
+    assert_eq!(profile.server_end_turn_false, 1);
+    assert_eq!(profile.pending_input, 1);
+    assert_eq!(profile.stop_hook, 1);
+    assert_eq!(profile.completion_review_repair, 1);
+    assert_eq!(profile.invalid_image_recovery, 1);
+    let continuation_sum = profile.compaction
+        + profile.tool_result
+        + profile.server_end_turn_false
+        + profile.pending_input
+        + profile.stop_hook
+        + profile.completion_review_repair
+        + profile.invalid_image_recovery;
+    assert_eq!(
+        continuation_sum + profile.sampling_retry_count,
+        profile.sampling_request_count.saturating_sub(1)
+    );
+}
+
+#[test]
+fn zero_requests_and_cancellation_before_request_do_not_count_continuations() {
+    let (_clock, state) = timing();
+    let pending = Some(ContinuationCause::PendingInput);
+    let profile = state.complete_snapshot().legacy_profile;
+    assert_eq!(profile.sampling_request_count, 0);
+    assert_eq!(profile.pending_input, 0);
+    assert_eq!(pending, Some(ContinuationCause::PendingInput));
+
+    state.mark_turn_started();
+    let profile = state.complete_snapshot().legacy_profile;
+    assert_eq!(profile.sampling_request_count, 0);
+    assert_eq!(profile.pending_input, 0);
 }
 
 #[test]

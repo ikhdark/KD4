@@ -642,6 +642,7 @@ impl TurnRequestProcessor {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            reasoning_policy_history: None,
         };
 
         Ok(TurnStartResponse { turn })
@@ -1231,6 +1232,7 @@ impl TurnRequestProcessor {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            reasoning_policy_history: None,
         }
     }
 

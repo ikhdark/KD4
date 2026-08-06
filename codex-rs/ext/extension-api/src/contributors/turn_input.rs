@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::user_input::UserInput;
 
 /// Host-owned turn environment summary visible to turn-input contributors.
@@ -22,4 +23,6 @@ pub struct TurnInputContext {
     pub user_input: Vec<UserInput>,
     /// Resolved turn environments, in host priority order.
     pub environments: Vec<TurnInputEnvironment>,
+    /// Selected capability roots that are ready in this step.
+    pub ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
 }

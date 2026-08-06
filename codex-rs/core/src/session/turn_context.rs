@@ -111,6 +111,9 @@ pub struct TurnContext {
     pub(crate) model_info: ModelInfo,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) provider: SharedModelProvider,
+    /// The raw per-turn setting before model capability normalization. Policy
+    /// telemetry reports this independently from the effective request effort.
+    pub(crate) configured_reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
     pub(crate) session_source: SessionSource,
@@ -271,6 +274,7 @@ impl TurnContext {
                 .clone()
                 .with_model(model.as_str(), model_info.slug.as_str()),
             provider: self.provider.clone(),
+            configured_reasoning_effort: self.configured_reasoning_effort.clone(),
             reasoning_effort,
             reasoning_summary: self.reasoning_summary,
             session_source: self.session_source.clone(),
@@ -500,7 +504,9 @@ impl Session {
         sub_id: String,
         skills_snapshot: HostSkillsSnapshot,
     ) -> TurnContext {
-        let reasoning_effort = session_configuration.collaboration_mode.reasoning_effort();
+        let configured_reasoning_effort =
+            session_configuration.collaboration_mode.reasoning_effort();
+        let reasoning_effort = configured_reasoning_effort.clone();
         let reasoning_summary = session_configuration
             .model_reasoning_summary
             .unwrap_or(model_info.default_reasoning_summary);
@@ -552,6 +558,7 @@ impl Session {
             model_info,
             session_telemetry: session_telemetry_for_context,
             provider: provider_for_context,
+            configured_reasoning_effort,
             reasoning_effort,
             reasoning_summary,
             session_source,

@@ -430,13 +430,30 @@ fn test_session_telemetry() -> SessionTelemetry {
 
 #[test]
 fn ultra_reasoning_uses_max_for_requests() {
-    assert_eq!(
-        (
-            super::reasoning_effort_for_request(ReasoningEffort::Ultra),
-            super::reasoning_effort_for_request(ReasoningEffort::High),
-        ),
-        (ReasoningEffort::Max, ReasoningEffort::High,)
-    );
+    let mut model: serde_json::Value = serde_json::to_value(test_model_info()).unwrap();
+    model["supports_reasoning_summaries"] = json!(true);
+    model["default_reasoning_level"] = json!("ultra");
+    model["supported_reasoning_levels"] = json!([{"effort": "ultra", "description": ""}]);
+    let model: ModelInfo = serde_json::from_value(model).unwrap();
+    let request_effort =
+        crate::client::request_effort_for_model(&model, Some(ReasoningEffort::Ultra));
+    let serialized = serde_json::to_value(ModelClient::build_reasoning(
+        &model,
+        request_effort,
+        codex_protocol::config_types::ReasoningSummary::None,
+    ))
+    .unwrap();
+    assert_eq!(serialized["effort"], json!("max"),);
+}
+
+#[test]
+fn omitted_memory_summary_effort_stays_omitted() {
+    let mut model: serde_json::Value = serde_json::to_value(test_model_info()).unwrap();
+    model["supports_reasoning_summaries"] = json!(true);
+    model["default_reasoning_level"] = json!("high");
+    let model: ModelInfo = serde_json::from_value(model).unwrap();
+
+    assert!(crate::client::memory_summary_reasoning(&model, None).is_none());
 }
 
 fn write_chatgpt_auth_json(codex_home: &std::path::Path) {

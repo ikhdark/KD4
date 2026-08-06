@@ -162,6 +162,15 @@ pub struct OrchestratorFeatureToml {
     pub enabled: Option<bool>,
 }
 
+/// Ordering policy for the AfterAgent hook at turn completion.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AfterAgentPolicy {
+    #[default]
+    Legacy,
+    MutatingFinalizer,
+}
+
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -228,6 +237,10 @@ pub struct ConfigToml {
     /// Optional external command to spawn for end-user notifications.
     #[serde(default)]
     pub notify: Option<Vec<String>>,
+
+    /// Ordering policy for the AfterAgent hook at turn completion.
+    #[serde(default)]
+    pub after_agent_policy: AfterAgentPolicy,
 
     /// System instructions.
     pub instructions: Option<String>,

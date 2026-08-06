@@ -13,7 +13,7 @@ import type { TurnTimingUnions } from "./TurnTimingUnions";
  * `exclusive` is the canonical elapsed-time partition. Values in `unions`
  * and `local` may overlap and must not be added to that partition.
  */
-export type TurnTiming = { schemaVersion: number, profileValid: boolean, classificationComplete: boolean, startedAtUnixMs?: number | null, completedAtUnixMs?: number | null, inclusiveDurationNs: bigint, inclusiveDurationMs: bigint,
+export type TurnTiming = { schemaVersion: number, profileValid: boolean, classificationComplete: boolean, startedAtUnixMs: number | null, completedAtUnixMs: number | null, inclusiveDurationNs: bigint, inclusiveDurationMs: bigint,
 /**
  * Inclusive duration minus only the interactive-only wait partition.
  */

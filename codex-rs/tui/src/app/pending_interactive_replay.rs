@@ -677,6 +677,7 @@ mod tests {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: Some(1),
+                reasoning_policy_history: None,
             },
             timing: None,
         })

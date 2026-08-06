@@ -161,6 +161,16 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
                 "description": "Look up a ticket status",
                 "strict": false,
                 "parameters": visible_schema,
+            }, {
+                "type": "function",
+                "name": "update_ticket",
+                "description": "Update a ticket",
+                "strict": false,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                },
             }],
         })
     );

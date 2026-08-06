@@ -40,6 +40,11 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+// Thread startup can spend more than ten seconds discovering the shell and
+// workspace state on Windows test hosts.
+#[cfg(windows)]
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]

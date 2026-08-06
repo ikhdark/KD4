@@ -29,6 +29,7 @@ use crate::types::HookResponse;
 #[derive(Default, Clone)]
 pub struct HooksConfig {
     pub legacy_notify_argv: Option<Vec<String>>,
+    pub mutating_finalizer: bool,
     pub feature_enabled: bool,
     pub bypass_hook_trust: bool,
     pub config_layer_stack: Option<ConfigLayerStack>,
@@ -61,7 +62,13 @@ impl Hooks {
         let after_agent = config
             .legacy_notify_argv
             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
-            .map(crate::notify_hook)
+            .map(|argv| {
+                if config.mutating_finalizer {
+                    crate::mutating_finalizer_hook(argv)
+                } else {
+                    crate::notify_hook(argv)
+                }
+            })
             .into_iter()
             .collect();
         let engine = ClaudeHooksEngine::new(

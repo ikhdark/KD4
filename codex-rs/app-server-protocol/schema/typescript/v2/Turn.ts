@@ -6,32 +6,25 @@ import type { TurnError } from "./TurnError";
 import type { TurnItemsView } from "./TurnItemsView";
 import type { TurnStatus } from "./TurnStatus";
 
-export type Turn = {
-/**
+export type Turn = {/**
  * Identifier for this turn. Codex-generated turn IDs are UUIDv7.
  */
-id: string,
-/**
+id: string, /**
  * Thread items currently included in this turn payload.
  */
-items: Array<ThreadItem>,
-/**
+items: Array<ThreadItem>, /**
  * Describes how much of `items` has been loaded for this turn.
  */
-itemsView: TurnItemsView, status: TurnStatus,
-/**
+itemsView: TurnItemsView, status: TurnStatus, /**
  * Only populated when the Turn's status is failed.
  */
-error: TurnError | null,
-/**
+error: TurnError | null, /**
  * Unix timestamp (in seconds) when the turn started.
  */
-startedAt: number | null,
-/**
+startedAt: number | null, /**
  * Unix timestamp (in seconds) when the turn completed.
  */
-completedAt: number | null,
-/**
+completedAt: number | null, /**
  * Duration between turn start and completion in milliseconds, if known.
  */
-durationMs: number | null, };
+durationMs: number | null};

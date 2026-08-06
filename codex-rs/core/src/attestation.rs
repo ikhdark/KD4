@@ -22,5 +22,11 @@ pub struct AttestationContext {
 /// Implementations own the policy for when attestation should be attempted and
 /// return the upstream `x-oai-attestation` header value when one should be sent.
 pub trait AttestationProvider: std::fmt::Debug + Send + Sync {
+    /// Whether this provider can generate attestation before its thread is fully attached to the
+    /// host. Providers that route generation through a thread subscriber must return `false`.
+    fn supports_startup_requests(&self) -> bool {
+        true
+    }
+
     fn header_for_request(&self, context: AttestationContext) -> GenerateAttestationFuture<'_>;
 }

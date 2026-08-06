@@ -402,6 +402,31 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
 }
 
 #[test]
+fn wait_agent_tool_v1_advertises_first_and_all() {
+    let ToolSpec::Namespace(namespace) = create_wait_agent_tool_v1(WaitAgentTimeoutOptions {
+        default_timeout_ms: 30_000,
+        min_timeout_ms: 10_000,
+        max_timeout_ms: 3_600_000,
+    }) else {
+        panic!("wait_agent v1 should be a namespace tool");
+    };
+    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool { parameters, .. })) =
+        namespace.tools.first()
+    else {
+        panic!("wait_agent should be a namespace function tool");
+    };
+    let return_when = parameters
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("return_when"))
+        .expect("return_when schema");
+    assert_eq!(
+        return_when.enum_values.as_ref(),
+        Some(&vec![json!("first"), json!("all")])
+    );
+}
+
+#[test]
 fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     let ToolSpec::Function(ResponsesApiTool {
         description,

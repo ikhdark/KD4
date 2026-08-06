@@ -15,6 +15,7 @@ use crate::protocol::v2::McpToolCallAppContext;
 use crate::protocol::v2::McpToolCallError;
 use crate::protocol::v2::McpToolCallResult;
 use crate::protocol::v2::McpToolCallStatus;
+use crate::protocol::v2::ReasoningPolicyHistory;
 use crate::protocol::v2::ThreadItem;
 use crate::protocol::v2::Turn;
 use crate::protocol::v2::TurnError as V2TurnError;
@@ -107,6 +108,7 @@ pub struct ThreadHistoryTurnChange {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub duration_ms: Option<i64>,
+    pub reasoning_policy_history: Option<ReasoningPolicyHistory>,
 }
 
 /// Incremental changes produced by opt-in `ThreadHistoryBuilder` handlers.
@@ -134,6 +136,7 @@ impl ThreadHistoryTurnChange {
             started_at: turn.started_at,
             completed_at: turn.completed_at,
             duration_ms: turn.duration_ms,
+            reasoning_policy_history: turn.reasoning_policy_history.clone(),
         }
     }
 
@@ -145,6 +148,7 @@ impl ThreadHistoryTurnChange {
             started_at: turn.started_at,
             completed_at: turn.completed_at,
             duration_ms: turn.duration_ms,
+            reasoning_policy_history: turn.reasoning_policy_history.clone(),
         }
     }
 }
@@ -388,6 +392,9 @@ impl ThreadHistoryBuilder {
             EventMsg::TurnAborted(payload) => self.handle_turn_aborted(payload),
             EventMsg::TurnStarted(payload) => self.handle_turn_started(payload),
             EventMsg::TurnComplete(payload) => self.handle_turn_complete(payload),
+            EventMsg::ReasoningPolicySummary(payload) => {
+                self.handle_reasoning_policy_summary(payload)
+            }
             _ => {}
         }
     }
@@ -1303,6 +1310,35 @@ impl ThreadHistoryBuilder {
         }
     }
 
+    fn handle_reasoning_policy_summary(&mut self, payload: &ReasoningPolicyHistory) {
+        if let Some(turn) = self
+            .current_turn
+            .as_mut()
+            .filter(|turn| turn.id == payload.turn_id)
+        {
+            turn.reasoning_policy_history = Some(payload.clone());
+            let changed_turn = ThreadHistoryTurnChange::from_pending_turn(turn);
+            self.record_changed_turn(changed_turn);
+            return;
+        }
+
+        if let Some(turn) = self
+            .turns
+            .iter_mut()
+            .find(|turn| turn.id == payload.turn_id)
+        {
+            turn.reasoning_policy_history = Some(payload.clone());
+            let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
+            self.record_changed_turn(changed_turn);
+            return;
+        }
+
+        warn!(
+            turn_id = %payload.turn_id,
+            "dropping reasoning policy summary for unknown turn id"
+        );
+    }
+
     /// Marks the current turn as containing a persisted compaction marker.
     ///
     /// This keeps compaction-only legacy turns from being dropped by
@@ -1363,6 +1399,7 @@ impl ThreadHistoryBuilder {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            reasoning_policy_history: None,
             opened_explicitly: false,
             saw_compaction: false,
             rollout_start_index: self.current_rollout_index,
@@ -1545,6 +1582,7 @@ struct PendingTurn {
     started_at: Option<i64>,
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
+    reasoning_policy_history: Option<ReasoningPolicyHistory>,
     /// True when this turn originated from an explicit `turn_started`/`turn_complete`
     /// boundary, so we preserve it even if it has no renderable items.
     opened_explicitly: bool,
@@ -1583,6 +1621,7 @@ impl From<PendingTurn> for Turn {
             started_at: value.started_at,
             completed_at: value.completed_at,
             duration_ms: value.duration_ms,
+            reasoning_policy_history: value.reasoning_policy_history,
         }
     }
 }
@@ -1598,6 +1637,7 @@ impl From<&PendingTurn> for Turn {
             started_at: value.started_at,
             completed_at: value.completed_at,
             duration_ms: value.duration_ms,
+            reasoning_policy_history: value.reasoning_policy_history.clone(),
         }
     }
 }
@@ -1653,6 +1693,15 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn reasoning_policy_history(turn_id: &str) -> ReasoningPolicyHistory {
+        ReasoningPolicyHistory {
+            turn_id: turn_id.to_string(),
+            entries: Vec::new(),
+            total_entries: 0,
+            truncated: false,
+        }
+    }
 
     #[test]
     fn builds_multiple_turns_with_reasoning_items() {
@@ -2295,6 +2344,7 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                reasoning_policy_history: None,
                 items_view: TurnItemsView::Full,
                 items: vec![
                     ThreadItem::UserMessage {
@@ -2559,6 +2609,142 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn attaches_reasoning_policy_summary_before_terminal_event() {
+        let history = reasoning_policy_history("turn-a");
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ReasoningPolicySummary(history.clone())),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+                error: None,
+                completion: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].reasoning_policy_history, Some(history));
+    }
+
+    #[test]
+    fn attaches_late_reasoning_policy_summary_by_explicit_turn_id() {
+        let history = reasoning_policy_history("turn-a");
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+                error: None,
+                completion: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-b".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ReasoningPolicySummary(history.clone())),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].reasoning_policy_history, Some(history));
+        assert_eq!(turns[1].reasoning_policy_history, None);
+    }
+
+    #[test]
+    fn ignores_reasoning_policy_summary_for_unknown_turn() {
+        let items = vec![RolloutItem::EventMsg(EventMsg::ReasoningPolicySummary(
+            reasoning_policy_history("missing-turn"),
+        ))];
+
+        assert!(build_turns_from_rollout_items(&items).is_empty());
+    }
+
+    #[test]
+    fn legacy_turn_without_reasoning_policy_summary_omits_history() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+                error: None,
+                completion: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].reasoning_policy_history, None);
+    }
+
+    #[test]
+    fn rollback_removes_turn_with_reasoning_policy_history() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ReasoningPolicySummary(reasoning_policy_history(
+                "turn-a",
+            ))),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+                error: None,
+                completion: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ];
+
+        assert!(build_turns_from_rollout_items(&items).is_empty());
     }
 
     #[test]
@@ -3681,6 +3867,7 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(10_000),
+                    reasoning_policy_history: None,
                 },
                 Turn {
                     id: "turn-b".into(),
@@ -3698,6 +3885,7 @@ mod tests {
                     started_at: Some(30),
                     completed_at: None,
                     duration_ms: None,
+                    reasoning_policy_history: None,
                 },
             ]
         );
@@ -3812,6 +4000,7 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                reasoning_policy_history: None,
                 items_view: TurnItemsView::Full,
                 items: Vec::new(),
             }]
@@ -4086,6 +4275,7 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                reasoning_policy_history: None,
                 items_view: TurnItemsView::Full,
                 items: vec![ThreadItem::UserMessage {
                     id: "item-1".into(),
@@ -4217,6 +4407,7 @@ mod tests {
                 started_at: Some(10),
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
+                reasoning_policy_history: None,
             }]
         );
     }
@@ -4381,6 +4572,7 @@ mod tests {
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
+                    reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
             }
@@ -4481,6 +4673,7 @@ mod tests {
                     started_at: Some(10),
                     completed_at: None,
                     duration_ms: None,
+                    reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
             }
@@ -4520,6 +4713,7 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(123),
+                    reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
             }
@@ -4563,6 +4757,7 @@ mod tests {
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
+                    reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
             }
@@ -4603,6 +4798,7 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(123),
+                    reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
             }

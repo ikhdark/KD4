@@ -21,6 +21,9 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use tempfile::tempdir;
+use tokio::sync::Semaphore;
+use tokio::time::Duration;
+use tokio::time::sleep;
 
 #[path = "model_info_overrides_tests.rs"]
 mod model_info_overrides_tests;
@@ -183,6 +186,217 @@ impl ModelsEndpointClient for TestModelsEndpoint {
             TestModelsEndpoint::list_models(self).await
         })
     }
+}
+
+#[derive(Debug)]
+enum ControlledResponse {
+    Models(Vec<ModelInfo>, Option<String>),
+    Failure,
+}
+
+#[derive(Debug)]
+struct ControlledModelsEndpoint {
+    responses: Mutex<VecDeque<ControlledResponse>>,
+    fetch_count: AtomicUsize,
+    release: Semaphore,
+}
+
+impl ControlledModelsEndpoint {
+    fn new(responses: Vec<ControlledResponse>) -> Arc<Self> {
+        Arc::new(Self {
+            responses: Mutex::new(responses.into()),
+            fetch_count: AtomicUsize::new(0),
+            release: Semaphore::new(0),
+        })
+    }
+
+    async fn wait_for_fetches(&self, expected: usize) {
+        for _ in 0..100 {
+            if self.fetch_count.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("expected {expected} model fetches");
+    }
+
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+impl ModelsEndpointClient for ControlledModelsEndpoint {
+    fn has_command_auth(&self) -> bool {
+        false
+    }
+
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { true })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _client_version: &'a str,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+        Box::pin(async move {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.release
+                .acquire()
+                .await
+                .expect("controlled endpoint should remain open")
+                .forget();
+            match self
+                .responses
+                .lock()
+                .expect("responses lock should not be poisoned")
+                .pop_front()
+                .expect("controlled response")
+            {
+                ControlledResponse::Models(models, etag) => Ok((models, etag)),
+                ControlledResponse::Failure => {
+                    Err(std::io::Error::other("controlled model failure").into())
+                }
+            }
+        })
+    }
+}
+
+async fn wait_for_etag_worker(manager: &OpenAiModelsManager) {
+    for _ in 0..100 {
+        if !manager
+            .etag_refresh
+            .lock()
+            .expect("ETag refresh lock should not be poisoned")
+            .worker_running
+        {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("ETag refresh worker did not finish");
+}
+
+#[tokio::test]
+async fn etag_notices_are_non_blocking_coalesced_and_latest_wins() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = ControlledModelsEndpoint::new(vec![
+        ControlledResponse::Models(
+            vec![remote_model("stale-etag-model", "Stale", 1)],
+            Some("etag-a".to_string()),
+        ),
+        ControlledResponse::Models(
+            vec![remote_model("latest-etag-model", "Latest", 1)],
+            Some("etag-b".to_string()),
+        ),
+    ]);
+    let manager = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+
+    Arc::clone(&manager).notify_etag("notice-a".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.wait_for_fetches(1).await;
+    Arc::clone(&manager).notify_etag("notice-a".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    Arc::clone(&manager).notify_etag("notice-b".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.release_one();
+    endpoint.wait_for_fetches(2).await;
+    assert!(
+        !manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "stale-etag-model")
+    );
+
+    endpoint.release_one();
+    wait_for_etag_worker(&manager).await;
+    let models = manager.get_remote_models().await;
+    assert!(models.iter().any(|model| model.slug == "latest-etag-model"));
+    assert!(!models.iter().any(|model| model.slug == "stale-etag-model"));
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn etag_refresh_failure_preserves_catalog_and_can_retry() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = ControlledModelsEndpoint::new(vec![
+        ControlledResponse::Failure,
+        ControlledResponse::Models(
+            vec![remote_model("retried-etag-model", "Retried", 1)],
+            Some("etag-retried".to_string()),
+        ),
+    ]);
+    let manager = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+    manager
+        .apply_remote_models(vec![remote_model("preserved-model", "Preserved", 1)])
+        .await;
+
+    Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.wait_for_fetches(1).await;
+    endpoint.release_one();
+    wait_for_etag_worker(&manager).await;
+    assert!(
+        manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "preserved-model")
+    );
+
+    Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.wait_for_fetches(2).await;
+    endpoint.release_one();
+    wait_for_etag_worker(&manager).await;
+    assert!(
+        manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "retried-etag-model")
+    );
+}
+
+#[tokio::test]
+async fn matching_etag_renews_ttl_without_fetching() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = ControlledModelsEndpoint::new(Vec::new());
+    let manager = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+    let cached = vec![remote_model("cached-etag-model", "Cached", 1)];
+    manager
+        .cache_manager
+        .persist_cache(
+            &cached,
+            Some("same-etag".to_string()),
+            crate::client_version_to_whole(),
+        )
+        .await;
+    manager
+        .cache_manager
+        .manipulate_cache_for_test(|fetched_at| {
+            *fetched_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        })
+        .await
+        .expect("age cache");
+    *manager.etag.write().await = Some("same-etag".to_string());
+
+    Arc::clone(&manager).notify_etag("same-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    wait_for_etag_worker(&manager).await;
+
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
+    assert!(
+        manager
+            .cache_manager
+            .load_fresh(&crate::client_version_to_whole())
+            .await
+            .is_some()
+    );
 }
 
 fn openai_manager_for_tests(

@@ -65,6 +65,7 @@ pub(crate) fn collect_explicit_skill_mentions(
             if let Some(entry) = catalog
                 .entries
                 .iter()
+                .rev()
                 .find(|entry| entry.enabled && entry.name == name)
             {
                 push_selected(entry, &mut seen, &mut selected);

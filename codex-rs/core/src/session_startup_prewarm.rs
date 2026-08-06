@@ -14,6 +14,8 @@ use crate::guardian::routes_approval_to_guardian;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::reasoning_governor::SamplingReasoningPhase;
+use crate::session::reasoning_governor::resolve_request_policy;
 use crate::session::session::Session;
 use crate::session::turn::build_prompt;
 use crate::session::turn::built_tools;
@@ -232,7 +234,7 @@ impl Session {
         if !crate::latency_switches::stage2_critical_path_enabled() {
             return;
         }
-        if !self.services.model_client.responses_websocket_enabled() {
+        if !self.services.model_client.startup_websocket_enabled() {
             let model_client = self.services.model_client.clone();
             tokio::spawn(async move {
                 if let Err(err) = model_client.prewarm_auth().await {
@@ -275,7 +277,7 @@ impl Session {
     }
 
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
-        if !self.services.model_client.responses_websocket_enabled() {
+        if !self.services.model_client.startup_websocket_enabled() {
             return;
         }
 
@@ -423,12 +425,24 @@ async fn schedule_startup_prewarm_inner(
     let _prewarm_request = session
         .startup_timing
         .begin_phase(StartupPhase::PrewarmRequest);
+    let reasoning_phase = startup_turn_context
+        .config
+        .reasoning_phase_efforts
+        .as_ref()
+        .map(|_| SamplingReasoningPhase::Orient);
+    let request_effort = resolve_request_policy(
+        reasoning_phase,
+        startup_turn_context.config.reasoning_phase_efforts.as_ref(),
+        startup_turn_context.reasoning_effort.clone(),
+        &startup_turn_context.model_info,
+    )
+    .request_effort;
     client_session
         .prewarm_websocket(
             &startup_prompt,
             &startup_turn_context.model_info,
             &startup_turn_context.session_telemetry,
-            startup_turn_context.reasoning_effort.clone(),
+            request_effort,
             startup_turn_context.reasoning_summary,
             startup_turn_context.config.service_tier.clone(),
             &responses_metadata,

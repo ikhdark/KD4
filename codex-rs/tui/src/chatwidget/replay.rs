@@ -22,6 +22,7 @@ impl ChatWidget {
                 started_at,
                 completed_at,
                 duration_ms,
+                reasoning_policy_history,
             } = turn;
             if matches!(status, TurnStatus::InProgress) {
                 self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
@@ -48,6 +49,7 @@ impl ChatWidget {
                             started_at,
                             completed_at,
                             duration_ms,
+                            reasoning_policy_history,
                         },
                         timing: None,
                     },

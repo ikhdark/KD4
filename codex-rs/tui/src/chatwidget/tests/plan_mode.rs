@@ -361,7 +361,7 @@ async fn reasoning_selection_in_plan_mode_matching_plan_effort_but_different_glo
     let _ = drain_insert_history(&mut rx);
     set_chatgpt_auth(&mut chat);
 
-    // Reproduce: Plan effective reasoning remains the preset (medium), but the
+    // Reproduce: Plan effective reasoning remains the supported preset (medium), but the
     // global default differs (high). Pressing Enter on the current Plan choice
     // should open the scope prompt rather than silently rewriting the global default.
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
@@ -821,6 +821,7 @@ async fn plan_implementation_popup_skips_replayed_turn_complete() {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            reasoning_policy_history: None,
         }],
         ReplayKind::ResumeInitialMessages,
     );
@@ -859,6 +860,7 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            reasoning_policy_history: None,
         }],
         ReplayKind::ResumeInitialMessages,
     );
@@ -1141,6 +1143,7 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                reasoning_policy_history: None,
             },
         }),
         /*replay_kind*/ None,
@@ -1187,6 +1190,7 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
+                reasoning_policy_history: None,
             },
             timing: None,
         }),

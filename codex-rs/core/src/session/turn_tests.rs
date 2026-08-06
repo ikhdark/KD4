@@ -158,6 +158,23 @@ fn assistant_output_text(text: &str) -> ResponseItem {
     }
 }
 
+#[test]
+fn ordinary_continuation_precedence_is_stable() {
+    assert_eq!(
+        ordinary_continuation_cause(true, true, true),
+        Some(ContinuationCause::ToolResult)
+    );
+    assert_eq!(
+        ordinary_continuation_cause(false, true, true),
+        Some(ContinuationCause::ServerEndTurnFalse)
+    );
+    assert_eq!(
+        ordinary_continuation_cause(false, false, true),
+        Some(ContinuationCause::PendingInput)
+    );
+    assert_eq!(ordinary_continuation_cause(false, false, false), None);
+}
+
 fn response_input_texts(items: &[ResponseItem]) -> Vec<&str> {
     let mut texts = Vec::new();
     for item in items {
@@ -242,9 +259,10 @@ async fn extension_turn_input_contributors_share_one_hard_budget() {
     }));
     session.services.extensions = Arc::new(builder.build());
     let session = Arc::new(session);
+    let step_context = StepContext::for_test(Arc::new(turn_context));
 
     let items =
-        build_extension_turn_input_items(&session, &turn_context, &[], &CancellationToken::new())
+        build_extension_turn_input_items(&session, &step_context, &[], &CancellationToken::new())
             .await
             .expect("turn-input contributors should render");
     let texts = response_input_texts(&items);

@@ -5808,6 +5808,7 @@ session_picker_view = "dense"
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                reasoning_policy_history: None,
             }],
         };
 
@@ -5865,6 +5866,7 @@ session_picker_view = "dense"
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                reasoning_policy_history: None,
             }],
         };
 
@@ -5926,6 +5928,7 @@ session_picker_view = "dense"
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                reasoning_policy_history: None,
             }],
         };
 

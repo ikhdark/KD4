@@ -1,10 +1,16 @@
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
+use codex_protocol::protocol::ReasoningPolicyHistory;
+use codex_protocol::protocol::ReasoningPolicyPhase;
+use codex_protocol::protocol::ReasoningPolicySnapshot;
+use codex_protocol::protocol::ReasoningPolicySource;
+use codex_protocol::protocol::ReasoningPolicyTrigger;
 use codex_protocol::protocol::SubAgentActivityEvent;
 use codex_protocol::protocol::SubAgentActivityKind;
 use pretty_assertions::assert_eq;
@@ -12,6 +18,7 @@ use serde_json::json;
 use std::time::Duration;
 
 use super::ToolRuntimeTraceEvent;
+use super::codex_turn_trace_event;
 use super::tool_runtime_trace_event;
 use crate::ExecutionStatus;
 
@@ -48,6 +55,44 @@ fn sub_agent_activity_is_a_terminal_tool_runtime_event() -> anyhow::Result<()> {
         })
     );
     Ok(())
+}
+
+#[test]
+fn reasoning_policy_events_are_omitted_from_turn_traces() {
+    let snapshot = ReasoningPolicySnapshot {
+        sequence: 1,
+        timestamp: 1,
+        phase: ReasoningPolicyPhase::Orient,
+        configured_effort: Some(ReasoningEffort::High),
+        effective_effort: Some(ReasoningEffort::High),
+        request_effort: Some(ReasoningEffort::High),
+        source: ReasoningPolicySource::TurnFallback,
+        model: "test-model".to_string(),
+        trigger: ReasoningPolicyTrigger::UserInput,
+    };
+    let thread_id = ThreadId::new().to_string();
+
+    assert!(
+        codex_turn_trace_event(
+            thread_id.clone(),
+            "turn-1",
+            &EventMsg::ReasoningPolicyUpdated(snapshot.clone()),
+        )
+        .is_none()
+    );
+    assert!(
+        codex_turn_trace_event(
+            thread_id,
+            "turn-1",
+            &EventMsg::ReasoningPolicySummary(ReasoningPolicyHistory {
+                turn_id: "turn-1".to_string(),
+                entries: vec![snapshot],
+                total_entries: 1,
+                truncated: false,
+            }),
+        )
+        .is_none()
+    );
 }
 
 #[test]

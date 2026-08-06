@@ -2044,6 +2044,16 @@ impl Session {
         }
     }
 
+    /// Offers a live-only event without waiting for a consumer or persisting it.
+    pub(crate) fn try_send_live_event(&self, event: Event) {
+        if let Some(status) = agent_status_from_event(&event.msg) {
+            self.agent_status.send_replace(status);
+        }
+        if let Err(err) = self.tx_event.try_send(event) {
+            debug!("dropping live event because channel is unavailable: {err}");
+        }
+    }
+
     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {
         self.send_event(
             turn_context,
@@ -2104,6 +2114,16 @@ impl Session {
             .and_then(|turn| turn.task.as_ref())
             .filter(|task| task.turn_context.sub_id == sub_id)
             .map(|task| Arc::clone(&task.turn_context))
+    }
+
+    pub(crate) async fn active_reasoning_policy_recorder(
+        &self,
+    ) -> Option<Arc<reasoning_governor::ReasoningPolicyRecorder>> {
+        self.active_turn
+            .lock()
+            .await
+            .as_ref()
+            .map(|turn| Arc::clone(&turn.reasoning_policy_recorder))
     }
 
     async fn active_turn_context_and_cancellation_token(
@@ -4360,6 +4380,10 @@ async fn build_hooks_for_config(
     let plugin_hook_load_warnings = plugin_outcome.effective_plugin_hook_warnings();
     Hooks::new(HooksConfig {
         legacy_notify_argv: config.notify.clone(),
+        mutating_finalizer: matches!(
+            config.after_agent_policy,
+            codex_config::config_toml::AfterAgentPolicy::MutatingFinalizer
+        ),
         feature_enabled: config.features.enabled(Feature::CodexHooks),
         bypass_hook_trust: config.bypass_hook_trust,
         config_layer_stack: Some(config.config_layer_stack.clone()),

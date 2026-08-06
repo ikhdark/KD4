@@ -69,6 +69,41 @@ pub fn notify_hook(argv: Vec<String>) -> Hook {
     }
 }
 
+pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
+    let argv = Arc::new(argv);
+    Hook {
+        name: "legacy_notify".to_string(),
+        func: Arc::new(move |payload: &HookPayload| {
+            let argv = Arc::clone(&argv);
+            Box::pin(async move {
+                let mut command = match command_from_argv(&argv) {
+                    Some(command) => command,
+                    None => return HookResult::Success,
+                };
+                if let Ok(notify_payload) = legacy_notify_json(payload) {
+                    command.arg(notify_payload);
+                }
+
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+
+                match command.status().await {
+                    Ok(status) if status.success() => HookResult::Success,
+                    Ok(status) => HookResult::FailedAbort(
+                        std::io::Error::other(format!(
+                            "mutating finalizer exited with status {status}"
+                        ))
+                        .into(),
+                    ),
+                    Err(err) => HookResult::FailedAbort(err.into()),
+                }
+            })
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;

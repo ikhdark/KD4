@@ -4900,16 +4900,14 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
         ev_assistant_message("m1", FIRST_REPLY),
         ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
     ]);
-    let mut responses = vec![first_turn];
-    responses.extend(
-        (0..5).map(|_| {
-            sse_failed(
-                "compact-failed",
-                "context_length_exceeded",
-                "Your input exceeds the context window of this model. Please adjust your input and try again.",
-            )
-        }),
-    );
+    let responses = vec![
+        first_turn,
+        sse_failed(
+            "compact-failed",
+            "context_length_exceeded",
+            "Your input exceeds the context window of this model. Please adjust your input and try again.",
+        ),
+    ];
     let request_log = mount_sse_sequence(&server, responses).await;
 
     let mut model_provider = non_openai_model_provider(&server);

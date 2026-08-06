@@ -168,6 +168,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     started_at: payload.started_at,
                     completed_at: None,
                     duration_ms: None,
+                    reasoning_policy_history: None,
                 });
                 turn.items.clear();
                 turn.items_view = TurnItemsView::NotLoaded;
@@ -850,6 +851,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         msg @ (EventMsg::AgentMessageContentDelta(_)
         | EventMsg::PlanDelta(_)
+        | EventMsg::ReasoningPolicyUpdated(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)) => {
@@ -1243,6 +1245,7 @@ async fn emit_turn_completed_with_status(
             started_at: turn_completion_metadata.started_at,
             completed_at: turn_completion_metadata.completed_at,
             duration_ms: turn_completion_metadata.duration_ms,
+            reasoning_policy_history: None,
         },
         completion: turn_completion_metadata.completion,
         timing: turn_completion_metadata.timing,

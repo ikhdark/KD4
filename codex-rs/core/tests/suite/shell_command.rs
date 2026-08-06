@@ -225,7 +225,7 @@ async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
     let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
     let call_id = "shell-command-timeout";
     let command = if cfg!(windows) {
-        "timeout /t 5"
+        "powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 5\""
     } else {
         "sleep 5"
     };
@@ -247,7 +247,7 @@ async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
         .replace('\r', "\n")
         .trim_end_matches('\n')
         .to_string();
-    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds(?:\nERROR: Input redirection is not supported, exiting the process immediately\.)?\n?$";
+    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds\n?$";
     assert_regex_match(expected_pattern, &normalized_output);
 
     Ok(())

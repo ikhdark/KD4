@@ -74,7 +74,9 @@ pub(crate) fn validate_independent_review_shell(
         );
     }
     if !inspection_command {
-        return Err("independent reviewers may run only shell commands proven read-only");
+        return Err(
+            "independent reviewers may run only shell commands proven read-only; on PowerShell, retry separate no-profile calls using one safelisted read-only cmdlet per script (for example Test-Path, Get-Command, or Get-ItemProperty), without assignments or script blocks",
+        );
     }
     Ok(())
 }

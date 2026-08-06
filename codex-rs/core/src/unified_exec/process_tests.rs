@@ -7,6 +7,7 @@ use super::async_watcher::omitted_output_marker;
 use super::async_watcher::resolve_aggregated_output;
 use super::async_watcher::start_streaming_output;
 use super::head_tail_buffer::HeadTailBuffer;
+use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
 use super::process_manager::PendingProcessRegistration;
 use crate::function_tool::FunctionCallError;
@@ -14,6 +15,8 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
+use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -577,6 +580,135 @@ async fn startup_output_reaches_initial_and_final_transcripts_once() {
         marker
     );
     assert_eq!(final_output.matches(&marker).count(), 1);
+}
+
+#[tokio::test]
+async fn closure_before_streaming_subscription_drains_lagged_split_utf8_output() {
+    let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
+    for _ in 0..64 {
+        process.publish_output_for_test(b"x".to_vec()).await;
+    }
+    process.publish_output_for_test(vec![0xc3]).await;
+    process.publish_output_for_test(vec![0xa9]).await;
+    process.terminate();
+
+    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let (session, turn) = make_session_and_context().await;
+    let context = UnifiedExecContext::new(
+        Arc::new(session),
+        Arc::new(turn),
+        "closure-before-subscription".to_string(),
+    );
+    let output_drained = process.output_drained_notify();
+    let drained = output_drained.notified();
+    tokio::pin!(drained);
+    drained.as_mut().enable();
+
+    start_streaming_output(&process, &context, Arc::clone(&transcript))
+        .expect("start output streaming");
+    tokio::time::timeout(Duration::from_secs(2), &mut drained)
+        .await
+        .expect("pre-observed closure should drain without hanging");
+
+    let final_output = resolve_aggregated_output(&transcript, String::new()).await;
+    assert!(final_output.contains("streaming receiver lagged by 2 chunk(s)"));
+    assert!(
+        final_output.contains('é'),
+        "final output lost the trailing UTF-8 character: {final_output:?}"
+    );
+}
+
+#[tokio::test]
+async fn closure_after_streaming_subscription_drains_trailing_split_utf8_once() {
+    let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
+    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let (session, turn) = make_session_and_context().await;
+    let context = UnifiedExecContext::new(
+        Arc::new(session),
+        Arc::new(turn),
+        "closure-after-subscription".to_string(),
+    );
+    let output_drained = process.output_drained_notify();
+    let drained = output_drained.notified();
+    tokio::pin!(drained);
+    drained.as_mut().enable();
+
+    start_streaming_output(&process, &context, Arc::clone(&transcript))
+        .expect("start output streaming");
+    tokio::task::yield_now().await;
+    process.publish_output_for_test(b"tail:".to_vec()).await;
+    process.publish_output_for_test(vec![0xc3]).await;
+    process.publish_output_for_test(vec![0xa9]).await;
+    process.terminate();
+
+    tokio::time::timeout(Duration::from_secs(2), &mut drained)
+        .await
+        .expect("post-subscription closure should drain without hanging");
+    let final_output = resolve_aggregated_output(&transcript, String::new()).await;
+    assert_eq!(final_output, "tail:é");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), output_drained.notified())
+            .await
+            .is_err(),
+        "output_drained should be signaled exactly once"
+    );
+}
+
+#[tokio::test]
+async fn local_output_artifact_is_flushed_and_unlocked_before_output_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = Arc::new(Mutex::new(
+        create_raw_output_artifact(temp.path(), "completion-barrier", b"").await,
+    ));
+    let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let output_handles = OutputHandles {
+        output_buffer,
+        output_notify,
+        output_closed: Arc::clone(&output_closed),
+        output_closed_notify: Arc::clone(&output_closed_notify),
+        cancellation_token: CancellationToken::new(),
+    };
+    let (output_tx, _output_rx) = tokio::sync::broadcast::channel(8);
+    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel(1);
+    let (stderr_tx, stderr_rx) = tokio::sync::mpsc::channel(1);
+    let closed = output_closed_notify.notified();
+    tokio::pin!(closed);
+    closed.as_mut().enable();
+
+    let output_task = UnifiedExecProcess::spawn_local_output_task(
+        stdout_rx,
+        stderr_rx,
+        output_handles,
+        output_tx,
+        Some(Arc::clone(&artifact)),
+    );
+    stdout_tx
+        .send(b"artifact-tail".to_vec())
+        .await
+        .expect("stdout remains open");
+    drop(stdout_tx);
+    drop(stderr_tx);
+
+    tokio::time::timeout(Duration::from_secs(2), &mut closed)
+        .await
+        .expect("local output should close");
+    assert!(output_closed.load(Ordering::Acquire));
+    let (path, handle) = match &*artifact.lock().await {
+        RawOutputArtifact::Stored { path, handle, .. } => (path.clone(), Arc::clone(handle)),
+        RawOutputArtifact::Failed { message, .. } => panic!("artifact failed: {message}"),
+    };
+    assert_eq!(
+        tokio::fs::read(path)
+            .await
+            .expect("read finalized artifact"),
+        b"artifact-tail"
+    );
+    handle.try_lock().expect("artifact should be unlocked");
+    handle.unlock().expect("release test artifact lock");
+    output_task.await.expect("local output task should finish");
 }
 
 #[tokio::test]

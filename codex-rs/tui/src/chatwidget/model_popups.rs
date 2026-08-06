@@ -292,10 +292,10 @@ impl ChatWidget {
             )
         } else if let Some(plan_mask) = collaboration_modes::plan_mask(self.model_catalog.as_ref())
         {
-            match plan_mask
-                .reasoning_effort
+            let built_in_effort = plan_mask.reasoning_effort.flatten();
+            match self
+                .normalize_reasoning_effort_for_current_model(built_in_effort)
                 .as_ref()
-                .and_then(|effort| effort.as_ref())
             {
                 Some(plan_effort) => format!(
                     "built-in Plan default ({})",

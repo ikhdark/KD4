@@ -235,13 +235,13 @@ impl UnifiedExecProcess {
         }
     }
 
-    fn finish_termination(&self) {
-        self.output_closed.store(true, Ordering::Release);
-        self.output_closed_notify.notify_waiters();
-        self.cancellation_token.cancel();
+    pub(super) fn finish_termination(&self) {
         if let Some(output_task) = &self.output_task {
             output_task.abort();
         }
+        self.output_closed.store(true, Ordering::Release);
+        self.output_closed_notify.notify_waiters();
+        self.cancellation_token.cancel();
     }
 
     pub(super) fn terminate(&self) {
@@ -491,9 +491,6 @@ impl UnifiedExecProcess {
                         let _ = state_tx.send_replace(
                             state.failed("exec-server process event stream closed".to_string()),
                         );
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
                         break;
                     }
                 };
@@ -527,9 +524,6 @@ impl UnifiedExecProcess {
                         Err(err) => {
                             let state = state_tx.borrow().clone();
                             let _ = state_tx.send_replace(state.failed(err.to_string()));
-                            output_closed.store(true, Ordering::Release);
-                            output_closed_notify.notify_waiters();
-                            cancellation_token.cancel();
                             break;
                         }
                     };
@@ -559,9 +553,6 @@ impl UnifiedExecProcess {
                     if let Some(message) = failure {
                         let state = state_tx.borrow().clone();
                         let _ = state_tx.send_replace(state.failed(message));
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
                         break;
                     }
                     if sandbox_denied || exited {
@@ -574,9 +565,6 @@ impl UnifiedExecProcess {
                         });
                     }
                     if closed {
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
                         break;
                     }
                     continue;
@@ -620,17 +608,11 @@ impl UnifiedExecProcess {
                         if seq <= last_seq {
                             continue;
                         }
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
                         break;
                     }
                     ExecProcessEvent::Failed(message) => {
                         let state = state_tx.borrow().clone();
                         let _ = state_tx.send_replace(state.failed(message));
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
                         break;
                     }
                 }
@@ -638,10 +620,13 @@ impl UnifiedExecProcess {
             if let Some(writer) = artifact_writer.as_mut() {
                 writer.finish(raw_output_artifact.as_ref()).await;
             }
+            output_closed.store(true, Ordering::Release);
+            output_closed_notify.notify_waiters();
+            cancellation_token.cancel();
         })
     }
 
-    fn spawn_local_output_task(
+    pub(super) fn spawn_local_output_task(
         mut stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         mut stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         output_handles: OutputHandles,
@@ -691,11 +676,11 @@ impl UnifiedExecProcess {
                     output_notify.notify_waiters();
                 }
             }
-            output_closed.store(true, Ordering::Release);
-            output_closed_notify.notify_waiters();
             if let Some(writer) = artifact_writer.as_mut() {
                 writer.finish(raw_output_artifact.as_ref()).await;
             }
+            output_closed.store(true, Ordering::Release);
+            output_closed_notify.notify_waiters();
         })
     }
 

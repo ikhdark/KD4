@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::sync::Mutex;
 use tokio::time::Duration;
@@ -42,7 +43,7 @@ const UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES: usize = 8192;
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
 /// boundaries.
 pub(crate) fn start_streaming_output(
-    process: &UnifiedExecProcess,
+    process: &Arc<UnifiedExecProcess>,
     context: &UnifiedExecContext,
     transcript: Arc<Mutex<HeadTailBuffer>>,
 ) -> Result<(), UnifiedExecError> {
@@ -51,8 +52,12 @@ pub(crate) fn start_streaming_output(
             "unified exec streaming output receiver was already taken".to_string(),
         ));
     };
+    let output_handles = process.output_handles();
+    let output_closed = output_handles.output_closed;
+    let output_closed_notify = output_handles.output_closed_notify;
+    let exit_token = output_handles.cancellation_token;
     let output_drained = process.output_drained_notify();
-    let exit_token = process.cancellation_token();
+    let process_ref = Arc::clone(process);
 
     let session_ref = Arc::clone(&context.session);
     let turn_ref = Arc::clone(&context.turn);
@@ -65,38 +70,30 @@ pub(crate) fn start_streaming_output(
         let mut emitted_deltas: usize = 0;
 
         let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
+        let output_closed_notification = output_closed_notify.notified();
+        tokio::pin!(output_closed_notification);
+        output_closed_notification.as_mut().enable();
+        let output_already_closed = output_closed.load(Ordering::Acquire);
 
-        loop {
-            tokio::select! {
-                _ = exit_token.cancelled(), if grace_sleep.is_none() => {
-                    let deadline = Instant::now() + TRAILING_OUTPUT_GRACE;
-                    grace_sleep.replace(Box::pin(tokio::time::sleep_until(deadline)));
-                }
+        if output_already_closed {
+            drain_queued_output(
+                &mut receiver,
+                &mut pending,
+                &transcript,
+                &call_id,
+                &session_ref,
+                &turn_ref,
+                &mut emitted_deltas,
+            )
+            .await;
+        } else {
+            loop {
+                tokio::select! {
+                        biased;
 
-                _ = async {
-                    if let Some(sleep) = grace_sleep.as_mut() {
-                        sleep.as_mut().await;
-                    }
-                }, if grace_sleep.is_some() => {
-                    flush_pending(
-                        &mut pending,
-                        &transcript,
-                        &call_id,
-                        &session_ref,
-                        &turn_ref,
-                        &mut emitted_deltas,
-                    ).await;
-                    output_drained.notify_one();
-                    break;
-                }
-
-                received = receiver.recv() => {
-                    let chunk = match received {
-                        Ok(chunk) => chunk,
-                        Err(RecvError::Lagged(skipped)) => {
-                            // A lag creates a gap in the byte stream, so an incomplete
-                            // code point cannot be completed by a later received chunk.
-                            flush_pending(
+                        _ = &mut output_closed_notification => {
+                            drain_queued_output(
+                                &mut receiver,
                                 &mut pending,
                                 &transcript,
                                 &call_id,
@@ -104,45 +101,75 @@ pub(crate) fn start_streaming_output(
                                 &turn_ref,
                                 &mut emitted_deltas,
                             ).await;
-                            {
-                                let mut guard = transcript.lock().await;
-                                guard.record_lagged_chunks(skipped);
-                            }
-                            emit_output_delta(
-                                &call_id,
-                                &session_ref,
-                                &turn_ref,
-                                &mut emitted_deltas,
-                                lagged_output_marker(skipped),
-                            ).await;
-                            continue;
-                        },
-                        Err(RecvError::Closed) => {
-                            flush_pending(
-                                &mut pending,
-                                &transcript,
-                                &call_id,
-                                &session_ref,
-                                &turn_ref,
-                                &mut emitted_deltas,
-                            ).await;
-                            output_drained.notify_one();
                             break;
                         }
-                    };
 
-                    process_chunk(
-                        &mut pending,
-                        &transcript,
-                        &call_id,
-                        &session_ref,
-                        &turn_ref,
-                        &mut emitted_deltas,
-                        chunk,
-                    ).await;
+                    _ = exit_token.cancelled(), if grace_sleep.is_none() => {
+                        let deadline = Instant::now() + TRAILING_OUTPUT_GRACE;
+                        grace_sleep.replace(Box::pin(tokio::time::sleep_until(deadline)));
+                    }
+
+                    _ = async {
+                        if let Some(sleep) = grace_sleep.as_mut() {
+                            sleep.as_mut().await;
+                        }
+                    }, if grace_sleep.is_some() => {
+                        process_ref.finish_termination();
+                        drain_queued_output(
+                            &mut receiver,
+                            &mut pending,
+                            &transcript,
+                            &call_id,
+                            &session_ref,
+                            &turn_ref,
+                            &mut emitted_deltas,
+                        ).await;
+                        break;
+                    }
+
+                    received = receiver.recv() => {
+                        let chunk = match received {
+                            Ok(chunk) => chunk,
+                            Err(RecvError::Lagged(skipped)) => {
+                                handle_lagged_output(
+                                    skipped,
+                                    &mut pending,
+                                    &transcript,
+                                    &call_id,
+                                    &session_ref,
+                                    &turn_ref,
+                                    &mut emitted_deltas,
+                                ).await;
+                                continue;
+                            },
+                            Err(RecvError::Closed) => {
+                                break;
+                            }
+                        };
+
+                        process_chunk(
+                            &mut pending,
+                            &transcript,
+                            &call_id,
+                            &session_ref,
+                            &turn_ref,
+                            &mut emitted_deltas,
+                            chunk,
+                        ).await;
+                    }
                 }
             }
         }
+        flush_pending(
+            &mut pending,
+            &transcript,
+            &call_id,
+            &session_ref,
+            &turn_ref,
+            &mut emitted_deltas,
+        )
+        .await;
+        output_drained.notify_one();
     });
     Ok(())
 }
@@ -194,6 +221,32 @@ pub(crate) fn spawn_exit_watcher(
             .mark_running_process_completed(process_id, exit_code)
             .await;
 
+        if let Some(mut finalized_artifact) = process.raw_output_artifact().await {
+            if let Some(message) = failure_message.as_ref() {
+                let separator = if matches!(
+                    finalized_artifact,
+                    crate::tools::command_output_artifact::RawOutputArtifact::Stored {
+                        bytes: 0,
+                        ..
+                    }
+                ) {
+                    ""
+                } else {
+                    "\n"
+                };
+                finalized_artifact = append_raw_output_artifact(
+                    &finalized_artifact,
+                    format!("{separator}{message}").as_bytes(),
+                )
+                .await;
+            }
+            session_ref
+                .services
+                .command_execution
+                .update_running_artifact(process_id, finalized_artifact)
+                .await;
+        }
+
         if let Some(message) = failure_message.as_ref() {
             emit_failed_exec_end_for_unified_exec(
                 Arc::clone(&session_ref),
@@ -236,33 +289,85 @@ pub(crate) fn spawn_exit_watcher(
                 .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
                 .await;
         }
+    });
+}
 
-        if let Some(mut finalized_artifact) = process.raw_output_artifact().await {
-            if let Some(message) = failure_message {
-                let separator = if matches!(
-                    finalized_artifact,
-                    crate::tools::command_output_artifact::RawOutputArtifact::Stored {
-                        bytes: 0,
-                        ..
-                    }
-                ) {
-                    ""
-                } else {
-                    "\n"
-                };
-                finalized_artifact = append_raw_output_artifact(
-                    &finalized_artifact,
-                    format!("{separator}{message}").as_bytes(),
+#[allow(clippy::too_many_arguments)]
+async fn drain_queued_output(
+    receiver: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
+    pending: &mut Vec<u8>,
+    transcript: &Arc<Mutex<HeadTailBuffer>>,
+    call_id: &str,
+    session_ref: &Arc<Session>,
+    turn_ref: &Arc<TurnContext>,
+    emitted_deltas: &mut usize,
+) {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    loop {
+        match receiver.try_recv() {
+            Ok(chunk) => {
+                process_chunk(
+                    pending,
+                    transcript,
+                    call_id,
+                    session_ref,
+                    turn_ref,
+                    emitted_deltas,
+                    chunk,
                 )
                 .await;
             }
-            session_ref
-                .services
-                .command_execution
-                .update_running_artifact(process_id, finalized_artifact)
+            Err(TryRecvError::Lagged(skipped)) => {
+                handle_lagged_output(
+                    skipped,
+                    pending,
+                    transcript,
+                    call_id,
+                    session_ref,
+                    turn_ref,
+                    emitted_deltas,
+                )
                 .await;
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
-    });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_lagged_output(
+    skipped: u64,
+    pending: &mut Vec<u8>,
+    transcript: &Arc<Mutex<HeadTailBuffer>>,
+    call_id: &str,
+    session_ref: &Arc<Session>,
+    turn_ref: &Arc<TurnContext>,
+    emitted_deltas: &mut usize,
+) {
+    // A lag creates a gap in the byte stream, so an incomplete code point cannot be completed by
+    // a later received chunk.
+    flush_pending(
+        pending,
+        transcript,
+        call_id,
+        session_ref,
+        turn_ref,
+        emitted_deltas,
+    )
+    .await;
+    {
+        let mut guard = transcript.lock().await;
+        guard.record_lagged_chunks(skipped);
+    }
+    emit_output_delta(
+        call_id,
+        session_ref,
+        turn_ref,
+        emitted_deltas,
+        lagged_output_marker(skipped),
+    )
+    .await;
 }
 
 async fn process_chunk(

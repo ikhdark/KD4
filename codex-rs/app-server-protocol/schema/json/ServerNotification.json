@@ -3102,6 +3102,136 @@
       "minLength": 1,
       "type": "string"
     },
+    "ReasoningPolicyHistory": {
+      "description": "Bounded, durable per-turn reasoning-policy history.",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/definitions/ReasoningPolicySnapshot"
+          },
+          "type": "array"
+        },
+        "totalEntries": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entries",
+        "totalEntries",
+        "truncated",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "ReasoningPolicyPhase": {
+      "description": "Response event from the agent NOTE: Make sure none of these values have optional types, as it will mess up the extension code-gen. The exact request policy used for one model stream attempt. This is protocol state so rollout reconstruction and late-attaching clients observe the same decision as live consumers.",
+      "enum": [
+        "orient",
+        "inspect",
+        "implement",
+        "verify",
+        "diagnose",
+        "finalize"
+      ],
+      "type": "string"
+    },
+    "ReasoningPolicySnapshot": {
+      "properties": {
+        "configuredEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effectiveEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/definitions/ReasoningPolicyPhase"
+        },
+        "requestEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/definitions/ReasoningPolicySource"
+        },
+        "timestamp": {
+          "description": "Unix timestamp in milliseconds.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "trigger": {
+          "$ref": "#/definitions/ReasoningPolicyTrigger"
+        }
+      },
+      "required": [
+        "model",
+        "phase",
+        "sequence",
+        "source",
+        "timestamp",
+        "trigger"
+      ],
+      "type": "object"
+    },
+    "ReasoningPolicySource": {
+      "enum": [
+        "phase_override",
+        "turn_fallback"
+      ],
+      "type": "string"
+    },
+    "ReasoningPolicyTrigger": {
+      "enum": [
+        "user_input",
+        "read_only_tool_success",
+        "workspace_mutation",
+        "tool_failed",
+        "tool_blocked",
+        "tool_timed_out",
+        "tool_cancelled",
+        "validation_passed",
+        "validation_failed",
+        "validation_timed_out",
+        "plan_updated",
+        "host_override"
+      ],
+      "type": "string"
+    },
     "ReasoningSummary": {
       "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process. See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries",
       "oneOf": [
@@ -5503,6 +5633,25 @@
       ],
       "type": "object"
     },
+    "TurnReasoningPolicyUpdatedNotification": {
+      "properties": {
+        "snapshot": {
+          "$ref": "#/definitions/ReasoningPolicySnapshot"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "snapshot",
+        "threadId",
+        "turnId"
+      ],
+      "type": "object"
+    },
     "TurnStartedNotification": {
       "properties": {
         "threadId": {
@@ -5534,6 +5683,7 @@
           "type": "boolean"
         },
         "completedAtUnixMs": {
+          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -5582,6 +5732,7 @@
           "type": "integer"
         },
         "startedAtUnixMs": {
+          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -5806,6 +5957,7 @@
     "TurnTimingMilestones": {
       "properties": {
         "firstAgentMessageMs": {
+          "default": null,
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -5814,6 +5966,7 @@
           ]
         },
         "firstModelOutputMs": {
+          "default": null,
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -5822,6 +5975,7 @@
           ]
         },
         "firstVisibleOutputMs": {
+          "default": null,
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -6483,6 +6637,26 @@
         "params"
       ],
       "title": "Turn/startedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "turn/reasoningPolicy/updated"
+          ],
+          "title": "Turn/reasoningPolicy/updatedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/TurnReasoningPolicyUpdatedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Turn/reasoningPolicy/updatedNotification",
       "type": "object"
     },
     {

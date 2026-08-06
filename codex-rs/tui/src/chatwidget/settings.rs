@@ -447,19 +447,57 @@ impl ChatWidget {
             return self.current_collaboration_mode.reasoning_effort();
         }
         let current_effort = self.current_collaboration_mode.reasoning_effort();
-        self.active_collaboration_mask
+        let selected = self
+            .active_collaboration_mask
             .as_ref()
             .and_then(|mask| mask.reasoning_effort.clone())
-            .unwrap_or(current_effort)
+            .unwrap_or(current_effort);
+        self.normalize_reasoning_effort_for_current_model(selected)
+    }
+
+    pub(super) fn normalize_reasoning_effort_for_current_model(
+        &self,
+        selected: Option<ReasoningEffortConfig>,
+    ) -> Option<ReasoningEffortConfig> {
+        let selected = selected?;
+        let Some(preset) = self
+            .model_catalog
+            .try_list_models()
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|model| model.model == self.current_model())
+            })
+        else {
+            return Some(selected);
+        };
+        let supported = preset
+            .supported_reasoning_efforts
+            .iter()
+            .map(|effort| effort.effort.clone())
+            .collect::<Vec<_>>();
+        if supported.contains(&selected) {
+            return Some(selected);
+        }
+        supported
+            .get(supported.len().saturating_sub(1) / 2)
+            .cloned()
+            .or(Some(preset.default_reasoning_effort))
     }
 
     pub(crate) fn effective_collaboration_mode(&self) -> CollaborationMode {
         if !self.collaboration_modes_enabled() {
             return self.current_collaboration_mode.clone();
         }
-        self.active_collaboration_mask.as_ref().map_or_else(
+        let mode = self.active_collaboration_mask.as_ref().map_or_else(
             || self.current_collaboration_mode.clone(),
             |mask| self.current_collaboration_mode.apply_mask(mask),
+        );
+        mode.with_updates(
+            /*model*/ None,
+            Some(self.effective_reasoning_effort()),
+            /*developer_instructions*/ None,
         )
     }
 

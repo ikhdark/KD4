@@ -349,7 +349,10 @@ fn independent_review_sources_include_automatic_and_kd4_reviewers() {
 fn independent_review_shell_policy_is_read_only_on_every_shell_route() {
     let reviewer = SessionSource::SubAgent(SubAgentSource::Review);
     assert!(validate_independent_review_shell(&reviewer, true, false, false).is_ok());
-    assert!(validate_independent_review_shell(&reviewer, false, false, false).is_err());
+    let err = validate_independent_review_shell(&reviewer, false, false, false)
+        .expect_err("reviewers must reject commands that are not proven read-only");
+    assert!(err.contains("Get-Command"));
+    assert!(err.contains("without assignments or script blocks"));
     assert!(validate_independent_review_shell(&reviewer, true, true, false).is_err());
     assert!(validate_independent_review_shell(&reviewer, true, false, true).is_err());
     assert!(validate_independent_review_stdin(&reviewer, "").is_ok());

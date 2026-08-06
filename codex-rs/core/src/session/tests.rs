@@ -4096,6 +4096,7 @@ async fn includes_timed_out_message() {
 #[tokio::test]
 async fn turn_context_with_model_updates_model_fields() {
     let (session, mut turn_context) = make_session_and_context().await;
+    turn_context.configured_reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     let updated = turn_context
         .with_model("gpt-5.4".to_string(), &session.services.models_manager)
@@ -4112,6 +4113,10 @@ async fn turn_context_with_model_updates_model_fields() {
     assert_eq!(updated.config.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(updated.collaboration_mode.model(), "gpt-5.4");
     assert_eq!(updated.model_info, expected_model_info);
+    assert_eq!(
+        updated.configured_reasoning_effort,
+        Some(ReasoningEffortConfig::Minimal)
+    );
     assert_eq!(
         updated.reasoning_effort,
         Some(ReasoningEffortConfig::Medium)

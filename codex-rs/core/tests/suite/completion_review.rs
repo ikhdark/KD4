@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
+use codex_config::config_toml::AfterAgentPolicy;
 use codex_config::types::Personality;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
@@ -209,6 +210,7 @@ if ($null -ne $receipt) {
         $result = 'reviewed'
     }
 }
+
 Set-Content -LiteralPath (Join-Path $PSScriptRoot 'after-agent-order.txt') -Value $result
 "#,
             )
@@ -231,6 +233,55 @@ Set-Content -LiteralPath (Join-Path $PSScriptRoot 'after-agent-order.txt') -Valu
             config.notify = Some(vec!["sh".to_string(), script.display().to_string()]);
         }
         assert_eq!(marker.file_name().and_then(|name| name.to_str()), Some("after-agent-order.txt"));
+    })
+}
+
+fn completion_review_builder_with_mutating_finalizer(abort: bool) -> TestCodexBuilder {
+    completion_review_builder().with_config(move |config| {
+        config.after_agent_policy = AfterAgentPolicy::MutatingFinalizer;
+        let workspace = config.cwd.display().to_string();
+        if cfg!(windows) {
+            let script = config.codex_home.join("mutating-finalizer.ps1");
+            let exit = if abort { "exit 7" } else { "" };
+            fs::write(
+                &script,
+                format!(
+                    r#"param([string]$Workspace, [string]$Payload)
+$countPath = Join-Path $PSScriptRoot 'mutating-finalizer-count.txt'
+$count = 0
+if (Test-Path -LiteralPath $countPath) {{ $count = [int](Get-Content -LiteralPath $countPath -Raw) }}
+Set-Content -LiteralPath $countPath -Value ($count + 1)
+Set-Content -LiteralPath (Join-Path $Workspace 'finalizer.txt') -Value 'finalized'
+{exit}
+"#
+                ),
+            )
+            .expect("write mutating finalizer");
+            config.notify = Some(vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+                workspace,
+            ]);
+        } else {
+            let script = config.codex_home.join("mutating-finalizer.sh");
+            let exit = if abort { "exit 7" } else { "" };
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\ncount_path=\"$(dirname \"$0\")/mutating-finalizer-count.txt\"\ncount=0\nif [ -f \"$count_path\" ]; then count=$(cat \"$count_path\"); fi\nprintf '%s\\n' \"$((count + 1))\" > \"$count_path\"\nprintf finalized > \"$1/finalizer.txt\"\n{exit}\n"
+                ),
+            )
+            .expect("write mutating finalizer");
+            config.notify = Some(vec![
+                "sh".to_string(),
+                script.display().to_string(),
+                workspace,
+            ]);
+        }
     })
 }
 
@@ -1291,6 +1342,149 @@ async fn reviewer_finishes_before_legacy_after_agent_hook() -> Result<()> {
         sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(fs::read_to_string(marker)?.trim(), "reviewed");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_finalizer_runs_before_clean_completion_review() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let probe = mount_completion_review_sequence(
+        &server,
+        vec![
+            plan_response("plan-start", "plan-start-call", "in_progress"),
+            patch_response(
+                "initial-patch",
+                "initial-patch-call",
+                "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
+            ),
+            plan_response("plan-pass", "plan-pass-call", "passed"),
+            message_response("candidate", "candidate-message", "implementation complete"),
+        ],
+        ReviewScenario::Clean,
+    )
+    .await;
+    let mut builder = completion_review_builder_with_mutating_finalizer(false);
+    let test = builder.build(&server).await?;
+
+    let completion =
+        submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
+    assert_eq!(
+        completion.completion.as_ref().map(|gate| gate.status),
+        Some(TaskCompletionStatus::Passed),
+        "unexpected completion gate: {:?}",
+        completion.completion
+    );
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read_to_string(test.home.path().join("mutating-finalizer-count.txt"))?.trim(),
+        "1"
+    );
+    assert!(test.workspace_path("finalizer.txt").is_file());
+    assert!(
+        probe
+            .request_payloads
+            .lock()
+            .expect("request payloads")
+            .iter()
+            .any(|payload| payload.contains(REVIEW_REQUEST_MARKER)
+                && payload.contains("finalizer.txt"))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_finalizer_does_not_rerun_during_review_repair() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let probe = mount_completion_review_sequence(
+        &server,
+        vec![
+            plan_response("plan-start", "plan-start-call", "in_progress"),
+            patch_response(
+                "initial-patch",
+                "initial-patch-call",
+                "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
+            ),
+            plan_response("plan-pass", "plan-pass-call", "passed"),
+            message_response("candidate", "candidate-message", "implementation complete"),
+            patch_response(
+                "repair-patch",
+                "repair-patch-call",
+                "*** Begin Patch\n*** Update File: completed.txt\n@@\n-done\n+done after repair\n*** End Patch",
+            ),
+            plan_response("repair-plan-pass", "repair-plan-pass-call", "passed"),
+            message_response("repaired", "repaired-message", "repair complete"),
+        ],
+        ReviewScenario::FindingThenClean {
+            summary: "repair required".to_string(),
+        },
+    )
+    .await;
+    let mut builder = completion_review_builder_with_mutating_finalizer(false);
+    let test = builder.build(&server).await?;
+
+    let completion =
+        submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
+    assert_eq!(
+        completion.completion.as_ref().map(|gate| gate.status),
+        Some(TaskCompletionStatus::Passed)
+    );
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(test.home.path().join("mutating-finalizer-count.txt"))?.trim(),
+        "1"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_finalizer_abort_is_returned_after_reviewing_its_mutation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let probe = mount_completion_review_sequence(
+        &server,
+        vec![
+            plan_response("plan-start", "plan-start-call", "in_progress"),
+            patch_response(
+                "initial-patch",
+                "initial-patch-call",
+                "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
+            ),
+            plan_response("plan-pass", "plan-pass-call", "passed"),
+            message_response("candidate", "candidate-message", "implementation complete"),
+        ],
+        ReviewScenario::Clean,
+    )
+    .await;
+    let mut builder = completion_review_builder_with_mutating_finalizer(true);
+    let test = builder.build(&server).await?;
+
+    let completion =
+        submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
+    let gate = completion.completion.as_ref().expect("completion gate");
+    assert_eq!(gate.status, TaskCompletionStatus::Partial);
+    assert!(
+        gate.reasons
+            .iter()
+            .any(|reason| reason == "the reviewed candidate changed during terminal finalization"),
+        "unexpected completion gate: {:?}",
+        completion.completion
+    );
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read_to_string(test.home.path().join("mutating-finalizer-count.txt"))?.trim(),
+        "1"
+    );
+    assert!(
+        probe
+            .request_payloads
+            .lock()
+            .expect("request payloads")
+            .iter()
+            .any(|payload| payload.contains(REVIEW_REQUEST_MARKER)
+                && payload.contains("finalizer.txt"))
+    );
     Ok(())
 }
 

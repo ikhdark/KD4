@@ -114,6 +114,8 @@ pub async fn migrate_personality_if_needed(
 pub type RequestResult = std::result::Result<JsonRpcResult, JSONRPCErrorError>;
 
 #[derive(Debug, Clone)]
+// Keep the client event API aligned across remote and in-process transports.
+#[allow(clippy::large_enum_variant)]
 pub enum AppServerEvent {
     Lagged { skipped: usize },
     ServerNotification(ServerNotification),
@@ -1224,6 +1226,7 @@ mod tests {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: Some(1),
+                reasoning_policy_history: None,
             },
         })
     }
@@ -2243,6 +2246,7 @@ mod tests {
                             started_at: None,
                             completed_at: Some(0),
                             duration_ms: None,
+                            reasoning_policy_history: None,
                         },
                     }
                 )

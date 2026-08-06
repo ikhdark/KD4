@@ -4719,6 +4719,86 @@ async fn wait_agent_returns_final_status_without_timeout() {
 }
 
 #[tokio::test]
+async fn wait_agent_all_waits_for_every_unique_target_and_includes_initial_finals() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let config = turn.config.as_ref().clone();
+    let first = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start first thread");
+    let second = manager
+        .start_thread(config)
+        .await
+        .expect("start second thread");
+    let mut first_status = manager
+        .agent_control()
+        .subscribe_status(first.thread_id)
+        .await
+        .expect("subscribe to first");
+    first
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown first");
+    timeout(Duration::from_secs(1), first_status.changed())
+        .await
+        .expect("first final status should arrive")
+        .expect("first status channel should remain open");
+
+    let missing = ThreadId::new();
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "targets": [
+                first.thread_id.to_string(),
+                first.thread_id.to_string(),
+                second.thread_id.to_string(),
+                missing.to_string()
+            ],
+            "timeout_ms": 10_000,
+            "return_when": "all"
+        })),
+    );
+    let handler = WaitAgentHandler::default();
+    let mut waiting = Box::pin(handler.handle(invocation));
+    assert!(
+        timeout(Duration::from_millis(50), &mut waiting)
+            .await
+            .is_err(),
+        "all mode must not return while a unique target is still running"
+    );
+    second
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown second");
+
+    let output = timeout(Duration::from_secs(1), &mut waiting)
+        .await
+        .expect("all wait should finish")
+        .expect("wait_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        wait::WaitAgentResult {
+            status: HashMap::from([
+                (first.thread_id.to_string(), AgentStatus::Shutdown),
+                (second.thread_id.to_string(), AgentStatus::Shutdown),
+                (missing.to_string(), AgentStatus::NotFound),
+            ]),
+            timed_out: false,
+        }
+    );
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
 async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();

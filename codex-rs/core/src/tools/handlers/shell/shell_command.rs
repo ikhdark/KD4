@@ -3,6 +3,7 @@ use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
+use crate::agent::task_capabilities::is_independent_review_source;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
@@ -58,6 +59,13 @@ pub(crate) struct ShellCommandHandlerOptions {
 }
 
 impl ShellCommandHandler {
+    pub(super) fn effective_allow_login_shell(
+        session_source: &codex_protocol::protocol::SessionSource,
+        allow_login_shell: bool,
+    ) -> bool {
+        allow_login_shell && !is_independent_review_source(session_source)
+    }
+
     pub(crate) fn new(options: ShellCommandHandlerOptions) -> Self {
         let backend = match options.backend_config {
             ShellCommandBackendConfig::Classic => ShellCommandBackend::Classic,
@@ -210,8 +218,11 @@ impl ShellCommandHandler {
             params.script_body.as_deref(),
         )?;
         let prefix_rule = params.prefix_rule.clone();
-        let use_login_shell =
-            Self::resolve_use_login_shell(params.login, turn.config.permissions.allow_login_shell)?;
+        let allow_login_shell = Self::effective_allow_login_shell(
+            &turn.session_source,
+            turn.config.permissions.allow_login_shell,
+        );
+        let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
         let session_shell = session.user_shell();
         let original_safety_shell = resolve_command_shell(
             &original_invocation,
@@ -259,7 +270,7 @@ impl ShellCommandHandler {
             turn.as_ref(),
             &turn_environment,
             cwd,
-            turn.config.permissions.allow_login_shell,
+            allow_login_shell,
         )?;
         let sandbox_context = format!(
             "requested={:?};additional={:?};approval={:?};profile={:?};windows={:?};private_desktop={}",

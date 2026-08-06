@@ -1105,6 +1105,16 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
                 options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
             ))),
         ),
+        (
+            "return_when".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("first"), json!("all")],
+                Some(
+                    "Return after the first target finishes or after all targets finish. Defaults to `first`."
+                        .to_string(),
+                ),
+            ),
+        ),
     ]);
 
     JsonSchema::object(

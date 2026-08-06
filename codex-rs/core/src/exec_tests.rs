@@ -10,6 +10,9 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context as TaskContext;
 use std::task::Poll;
 use std::time::Duration;
@@ -20,6 +23,42 @@ use tokio::time::timeout;
 
 struct ChunkedReader {
     chunks: VecDeque<Vec<u8>>,
+}
+
+struct PrefixThenPendingReader {
+    prefix: Option<Vec<u8>>,
+    prefix_read: Arc<tokio::sync::Notify>,
+}
+
+impl AsyncRead for PrefixThenPendingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(prefix) = self.prefix.take() {
+            buf.put_slice(&prefix);
+            self.prefix_read.notify_one();
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn byte_stream_output(text: impl Into<Vec<u8>>) -> StreamOutput<Vec<u8>> {
+    StreamOutput {
+        text: text.into(),
+        truncated_after_lines: None,
+    }
 }
 
 impl ChunkedReader {
@@ -478,6 +517,131 @@ async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_p
     assert!(!output.timed_out);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn output_drain_readers_complete_normally_before_shared_deadline() -> Result<()> {
+    let stdout = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stdout")) });
+    let stderr = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stderr")) });
+
+    let (stdout, stderr) = await_output_until_deadline(
+        stdout,
+        stderr,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await?;
+
+    assert_eq!(stdout.text, b"stdout");
+    assert_eq!(stderr.text, b"stderr");
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_drain_preserves_completed_reader_and_aborts_unfinished_reader() -> Result<()> {
+    let aborted = Arc::new(AtomicBool::new(false));
+    let stdout = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stdout")) });
+    let stderr = tokio::spawn({
+        let aborted = Arc::clone(&aborted);
+        async move {
+            let _drop_flag = DropFlag(aborted);
+            std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await
+        }
+    });
+
+    let (stdout, stderr) = await_output_until_deadline(
+        stdout,
+        stderr,
+        tokio::time::Instant::now() + Duration::from_millis(100),
+    )
+    .await?;
+    tokio::task::yield_now().await;
+
+    assert_eq!(stdout.text, b"stdout");
+    assert!(stderr.text.is_empty());
+    assert!(aborted.load(Ordering::Acquire));
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_drain_readers_share_one_deadline_window() -> Result<()> {
+    let stdout =
+        tokio::spawn(async { std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await });
+    let stderr =
+        tokio::spawn(async { std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await });
+    let started_at = tokio::time::Instant::now();
+
+    let (stdout, stderr) =
+        await_output_until_deadline(stdout, stderr, started_at + Duration::from_millis(500))
+            .await?;
+
+    assert!(stdout.text.is_empty());
+    assert!(stderr.text.is_empty());
+    assert!(started_at.elapsed() < Duration::from_millis(800));
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_drain_timeout_discards_captured_prefix() -> Result<()> {
+    let prefix_read = Arc::new(tokio::sync::Notify::new());
+    let stdout = tokio::spawn(read_output(
+        PrefixThenPendingReader {
+            prefix: Some(b"discarded prefix".to_vec()),
+            prefix_read: Arc::clone(&prefix_read),
+        },
+        None,
+        false,
+        None,
+    ));
+    prefix_read.notified().await;
+    let stderr = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stderr")) });
+
+    let (stdout, stderr) = await_output_until_deadline(
+        stdout,
+        stderr,
+        tokio::time::Instant::now() + Duration::from_millis(100),
+    )
+    .await?;
+
+    assert!(stdout.text.is_empty());
+    assert_eq!(stderr.text, b"stderr");
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_drain_simultaneous_failures_return_stdout_error_first() {
+    let stdout =
+        tokio::spawn(async { Err::<StreamOutput<Vec<u8>>, _>(io::Error::other("stdout failure")) });
+    let stderr =
+        tokio::spawn(async { Err::<StreamOutput<Vec<u8>>, _>(io::Error::other("stderr failure")) });
+
+    let error = await_output_until_deadline(
+        stdout,
+        stderr,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .expect_err("both output readers should fail");
+
+    assert_eq!(error.to_string(), "stdout failure");
+}
+
+#[tokio::test]
+async fn output_drain_stdout_join_error_precedes_stderr_io_error() {
+    let stdout =
+        tokio::spawn(async { std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await });
+    stdout.abort();
+    let stderr =
+        tokio::spawn(async { Err::<StreamOutput<Vec<u8>>, _>(io::Error::other("stderr failure")) });
+
+    let error = await_output_until_deadline(
+        stdout,
+        stderr,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .expect_err("both output readers should fail");
+
+    assert!(error.to_string().contains("cancelled"));
 }
 
 #[tokio::test]

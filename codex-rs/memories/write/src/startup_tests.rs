@@ -65,7 +65,11 @@ async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
 async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
-    let db = init_state_db(&home).await?;
+    let test = build_test_codex(&server, home.clone()).await?;
+    let db = test
+        .codex
+        .state_db()
+        .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory startup test"))?;
     let memory_root = home.path().join("memories");
 
     let now = chrono::Utc::now();
@@ -113,7 +117,6 @@ async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::
     )
     .await;
 
-    let test = build_test_codex(&server, home.clone()).await?;
     trigger_memories_startup(&test).await;
 
     let request = wait_for_single_request(&phase2).await;
@@ -153,7 +156,11 @@ async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::
 async fn memories_startup_phase2_prunes_old_extension_resources() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
-    let db = init_state_db(&home).await?;
+    let test = build_test_codex(&server, home.clone()).await?;
+    let db = test
+        .codex
+        .state_db()
+        .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory startup test"))?;
     let now = chrono::Utc::now();
     let _thread_id = seed_stage1_output(
         db.as_ref(),
@@ -194,7 +201,6 @@ async fn memories_startup_phase2_prunes_old_extension_resources() -> anyhow::Res
     )
     .await;
 
-    let test = build_test_codex(&server, home.clone()).await?;
     trigger_memories_startup(&test).await;
 
     let request = wait_for_single_request(&phase2).await;
@@ -224,7 +230,11 @@ async fn memories_startup_phase2_prunes_old_extension_resources_without_stage1_i
 -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
-    let db = init_state_db(&home).await?;
+    let test = build_test_codex(&server, home.clone()).await?;
+    let db = test
+        .codex
+        .state_db()
+        .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory startup test"))?;
     db.memories()
         .enqueue_global_consolidation(/*input_watermark*/ 1)
         .await?;
@@ -254,7 +264,6 @@ async fn memories_startup_phase2_prunes_old_extension_resources_without_stage1_i
     )
     .await;
 
-    let test = build_test_codex(&server, home.clone()).await?;
     trigger_memories_startup(&test).await;
 
     let request = wait_for_single_request(&phase2).await;
@@ -572,13 +581,6 @@ async fn build_test_codex_with_memories_config(
         })
         .build(server)
         .await
-}
-
-async fn init_state_db(home: &Arc<TempDir>) -> anyhow::Result<Arc<codex_state::StateRuntime>> {
-    let db =
-        codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
-    db.mark_backfill_complete(/*last_watermark*/ None).await?;
-    Ok(db)
 }
 
 async fn trigger_memories_startup(test: &TestCodex) {

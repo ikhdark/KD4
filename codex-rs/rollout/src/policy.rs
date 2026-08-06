@@ -97,6 +97,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::TurnAborted(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::TurnComplete(_)
+        | EventMsg::ReasoningPolicySummary(_)
         | EventMsg::ThreadSettingsApplied(_) => true,
 
         // Only persist these legacy events when the thread's history mode is Legacy.
@@ -116,6 +117,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
 
         // Transient, non-durable events.
         EventMsg::Error(_)
+        | EventMsg::ReasoningPolicyUpdated(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::ViewImageToolCall(_)
@@ -172,5 +174,52 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabWaitingBegin(_)
         | EventMsg::CollabCloseBegin(_)
         | EventMsg::CollabResumeBegin(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_persist_event_msg;
+    use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ReasoningPolicyHistory;
+    use codex_protocol::protocol::ReasoningPolicyPhase;
+    use codex_protocol::protocol::ReasoningPolicySnapshot;
+    use codex_protocol::protocol::ReasoningPolicySource;
+    use codex_protocol::protocol::ReasoningPolicyTrigger;
+    use codex_protocol::protocol::ThreadHistoryMode;
+
+    fn snapshot() -> ReasoningPolicySnapshot {
+        ReasoningPolicySnapshot {
+            sequence: 1,
+            timestamp: 1,
+            phase: ReasoningPolicyPhase::Orient,
+            configured_effort: Some(ReasoningEffort::High),
+            effective_effort: Some(ReasoningEffort::High),
+            request_effort: Some(ReasoningEffort::High),
+            source: ReasoningPolicySource::TurnFallback,
+            model: "test-model".to_string(),
+            trigger: ReasoningPolicyTrigger::UserInput,
+        }
+    }
+
+    #[test]
+    fn reasoning_policy_live_updates_are_transient_and_summaries_are_durable() {
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            let snapshot = snapshot();
+            assert!(!should_persist_event_msg(
+                &EventMsg::ReasoningPolicyUpdated(snapshot.clone()),
+                history_mode
+            ));
+            assert!(should_persist_event_msg(
+                &EventMsg::ReasoningPolicySummary(ReasoningPolicyHistory {
+                    turn_id: "turn-1".to_string(),
+                    entries: vec![snapshot],
+                    total_entries: 1,
+                    truncated: false,
+                }),
+                history_mode
+            ));
+        }
     }
 }

@@ -348,6 +348,7 @@ fn sample_turn_start_response(turn_id: &str) -> ClientResponsePayload {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            reasoning_policy_history: None,
         },
     })
 }
@@ -364,6 +365,7 @@ fn sample_turn_started_notification(thread_id: &str, turn_id: &str) -> ServerNot
             started_at: Some(455),
             completed_at: None,
             duration_ms: None,
+            reasoning_policy_history: None,
         },
     })
 }
@@ -404,6 +406,7 @@ fn sample_turn_completed_notification(
             started_at: None,
             completed_at: Some(456),
             duration_ms: Some(1234),
+            reasoning_policy_history: None,
         },
         timing: None,
     })
@@ -443,6 +446,13 @@ fn sample_turn_profile() -> TurnProfile {
         after_last_sampling_ms: 134,
         sampling_request_count: 2,
         sampling_retry_count: 1,
+        compaction: 0,
+        tool_result: 0,
+        server_end_turn_false: 0,
+        pending_input: 0,
+        stop_hook: 0,
+        completion_review_repair: 0,
+        invalid_image_recovery: 0,
     }
 }
 
@@ -3937,6 +3947,13 @@ fn turn_event_serializes_expected_shape() {
             after_last_sampling_ms: 134,
             sampling_request_count: 2,
             sampling_retry_count: 1,
+            compaction: 0,
+            tool_result: 0,
+            server_end_turn_false: 0,
+            pending_input: 0,
+            stop_hook: 0,
+            completion_review_repair: 0,
+            invalid_image_recovery: 0,
             timing: None,
             duration_ms: Some(1234),
             started_at: Some(455),
@@ -4010,6 +4027,13 @@ fn turn_event_serializes_expected_shape() {
                 "after_last_sampling_ms": 134,
                 "sampling_request_count": 2,
                 "sampling_retry_count": 1,
+                "compaction": 0,
+                "tool_result": 0,
+                "server_end_turn_false": 0,
+                "pending_input": 0,
+                "stop_hook": 0,
+                "completion_review_repair": 0,
+                "invalid_image_recovery": 0,
                 "duration_ms": 1234,
                 "started_at": 455,
                 "completed_at": 456

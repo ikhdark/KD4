@@ -5,32 +5,50 @@ use codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
 use codex_protocol::openai_models::ApprovalMessages;
 use pretty_assertions::assert_eq;
 
-const REQUIRED_PROMPT_RULE_ANCHORS: &[(&str, &str)] = &[
+const REQUIRED_PROMPT_RULE_ANCHORS: &[(&str, &[&str])] = &[
     (
         "nearest sufficient completion",
-        "nearest sufficient completion point",
+        &["nearest sufficient completion point"],
     ),
-    ("user-work protection", "first protect user work"),
+    (
+        "user-work protection",
+        &[
+            "first protect user work",
+            "Existing and newly observed changes belong to the user",
+        ],
+    ),
     (
         "patch success is not validation",
-        "Patch success means the patch applied",
+        &[
+            "Patch success means the patch applied",
+            "Patch success proves only that the patch applied",
+        ],
     ),
-    ("concurrent edit convergence", "Concurrent Edit Convergence"),
+    (
+        "concurrent edit convergence",
+        &["Concurrent Edit Convergence", "concurrent changes"],
+    ),
     (
         "implementation self-repair",
-        "implementation self-repair is mandatory",
+        &[
+            "implementation self-repair is mandatory",
+            "Implementation self-repair is required",
+        ],
     ),
     (
         "scoped nearest-sufficient validation",
-        "nearest sufficient tests or checks",
+        &[
+            "nearest sufficient tests or checks",
+            "nearest sufficient validation",
+        ],
     ),
 ];
 
 fn assert_prompt_rules(label: &str, prompt: &str) {
-    for (rule, anchor) in REQUIRED_PROMPT_RULE_ANCHORS {
+    for (rule, anchors) in REQUIRED_PROMPT_RULE_ANCHORS {
         assert!(
-            prompt.contains(anchor),
-            "{label} should include {rule} rule anchor: {anchor}"
+            anchors.iter().any(|anchor| prompt.contains(anchor)),
+            "{label} should include {rule} rule anchor: {anchors:?}"
         );
     }
 }

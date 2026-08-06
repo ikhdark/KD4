@@ -3,6 +3,7 @@ use super::ThreadItem;
 use super::ThreadStatus;
 use super::TurnStatus;
 use codex_experimental_api_macros::ExperimentalApi;
+pub use codex_protocol::protocol::ReasoningPolicyHistory;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource as CoreSubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
@@ -225,7 +226,7 @@ pub struct Thread {
     pub turns: Vec<Turn>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct Turn {
@@ -248,6 +249,11 @@ pub struct Turn {
     /// Duration between turn start and completion in milliseconds, if known.
     #[ts(type = "number | null")]
     pub duration_ms: Option<i64>,
+    /// Bounded reasoning-policy snapshots recorded for this turn.
+    #[experimental("reasoningPolicyVisibility")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reasoning_policy_history: Option<ReasoningPolicyHistory>,
 }
 
 #[derive(Default, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]

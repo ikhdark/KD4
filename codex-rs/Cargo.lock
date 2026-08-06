@@ -2001,6 +2001,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "app_test_support",
+ "async-channel",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -4822,6 +4823,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "base64 0.22.1",
+ "codex-app-server-protocol",
  "codex-arg0",
  "codex-config",
  "codex-core",
@@ -4846,7 +4848,6 @@ dependencies = [
  "regex-lite",
  "reqwest 0.12.28",
  "serde_json",
- "shlex",
  "similar",
  "tempfile",
  "tokio",

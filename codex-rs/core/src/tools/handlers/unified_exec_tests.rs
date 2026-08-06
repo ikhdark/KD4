@@ -429,15 +429,18 @@ async fn git_status_bypasses_an_occupied_mutation_lease_but_other_commands_wait(
         .await
         .expect("workspace coordination initializes");
     let store = coordinator.store().expect("task store initializes");
+    let root_session_id = coordinator
+        .root_session_id()
+        .expect("root task identity initializes");
     #[allow(deprecated)]
     let repo_root = get_git_repo_root(turn.cwd.as_path()).expect("test cwd is in a git repository");
     let lease = store
         .begin_workspace_mutation(
             &repo_root,
             WorkspaceMutationRequest {
-                root_session_id: "other-root".to_string(),
-                actor_id: "root:other-root".to_string(),
-                kind: WorkspaceActorKind::Root,
+                root_session_id: root_session_id.clone(),
+                actor_id: format!("legacy:{root_session_id}"),
+                kind: WorkspaceActorKind::Legacy,
                 attempt_id: None,
                 paths: vec![REPOSITORY_WIDE_PATH.to_string()],
                 contracts: Vec::new(),
@@ -445,7 +448,7 @@ async fn git_status_bypasses_an_occupied_mutation_lease_but_other_commands_wait(
             },
         )
         .await
-        .expect("other root mutation lease starts");
+        .expect("other actor mutation lease starts");
     let handler = ExecCommandHandler::default();
 
     let status_payload = ToolPayload::Function {
@@ -533,7 +536,7 @@ async fn git_status_bypasses_an_occupied_mutation_lease_but_other_commands_wait(
     store
         .finish_workspace_mutation(&repo_root, lease)
         .await
-        .expect("other root mutation lease finishes");
+        .expect("other actor mutation lease finishes");
 }
 
 #[tokio::test]

@@ -109,7 +109,9 @@ impl Handler {
                 ))
             })?;
         let coordinator = session.services.agent_control.task_coordinator();
-        if coordinator.store().is_none() {
+        // Already-pending input does not need durable task-store state. Avoid
+        // delaying immediate mailbox or steering delivery on store startup.
+        if pending_activity.is_none() && coordinator.store().is_none() {
             coordinator
                 .initialize_for_workspace_coordination(
                     session.services.state_db.clone(),

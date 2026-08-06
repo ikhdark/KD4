@@ -4118,7 +4118,26 @@ impl TaskEvidenceLedger {
                             document.latest_file_hashes.get(path) != Some(state)
                         });
                     if has_unrepresented_mutation {
-                        invalidate_for_mutation(document);
+                        let only_after_agent_mutations_are_unrepresented = accepted
+                            .iter()
+                            .filter(|event| {
+                                event.paths.iter().any(|path| {
+                                    path == codex_agent_task_store::REPOSITORY_WIDE_PATH
+                                        || snapshots.get(path).is_some_and(|state| {
+                                            document.latest_file_hashes.get(path) != Some(state)
+                                        })
+                                })
+                            })
+                            .all(|event| {
+                                event.contracts.iter().any(|contract| {
+                                    contract == "kd4-completion-review-afteragent"
+                                })
+                            });
+                        if only_after_agent_mutations_are_unrepresented {
+                            invalidate_for_after_agent_mutation(document);
+                        } else {
+                            invalidate_for_mutation(document);
+                        }
                     }
                     let Some(ledger) = document.completion_review_v2.as_mut() else {
                         return;
@@ -8452,6 +8471,21 @@ fn invalidate_for_mutation(document: &mut TaskEvidenceDocument) {
     for step in &mut document.plan {
         if step.status == StepStatus::Passed {
             step.status = StepStatus::Implemented;
+        }
+    }
+}
+
+fn invalidate_for_after_agent_mutation(document: &mut TaskEvidenceDocument) {
+    let passed_step_ids = document
+        .plan
+        .iter()
+        .filter(|step| step.status == StepStatus::Passed)
+        .map(|step| step.id.clone())
+        .collect::<BTreeSet<_>>();
+    invalidate_for_mutation(document);
+    for step in &mut document.plan {
+        if passed_step_ids.contains(&step.id) && step.status == StepStatus::Implemented {
+            step.status = StepStatus::Passed;
         }
     }
 }

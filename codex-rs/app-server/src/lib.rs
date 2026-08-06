@@ -148,13 +148,19 @@ fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoade
     }
 }
 
-async fn install_config_loaders_from_config(config_manager: &ConfigManager, config: &Config) {
+async fn install_config_loaders_from_config(
+    config_manager: &ConfigManager,
+    config: &Config,
+) -> Arc<AuthManager> {
     let discovered_thread_config_loader = configured_thread_config_loader(config);
     config_manager.replace_thread_config_loader(Arc::clone(&discovered_thread_config_loader));
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
-    config_manager
-        .replace_cloud_config_bundle_loader(auth_manager, config.chatgpt_base_url.clone());
+    config_manager.replace_cloud_config_bundle_loader(
+        Arc::clone(&auth_manager),
+        config.chatgpt_base_url.clone(),
+    );
+    auth_manager
 }
 
 /// Control-plane messages from the processor/transport side to the outbound router task.
@@ -513,7 +519,7 @@ pub async fn run_main_with_transport_options(
         .await
     {
         Ok(config) => {
-            install_config_loaders_from_config(&config_manager, &config).await;
+            let _ = install_config_loaders_from_config(&config_manager, &config).await;
         }
         Err(err) => {
             warn!(
@@ -526,13 +532,13 @@ pub async fn run_main_with_transport_options(
             // permanently on the bootstrap no-op loaders.
         }
     };
-    let (mut config, should_run_personality_migration) = match config_manager
+    let (mut config, should_run_personality_migration, auth_manager) = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
         Ok(config) => {
-            install_config_loaders_from_config(&config_manager, &config).await;
-            (config, true)
+            let auth_manager = install_config_loaders_from_config(&config_manager, &config).await;
+            (config, true, auth_manager)
         }
         Err(err) => {
             if strict_config {
@@ -547,8 +553,9 @@ pub async fn run_main_with_transport_options(
                     format!("error loading default config after config error: {e}"),
                 )
             })?;
-            install_config_loaders_from_config(&config_manager, &default_config).await;
-            (default_config, false)
+            let auth_manager =
+                install_config_loaders_from_config(&config_manager, &default_config).await;
+            (default_config, false, auth_manager)
         }
     };
 
@@ -766,9 +773,6 @@ pub async fn run_main_with_transport_options(
         AppServerTransport::Off => {}
     }
     drop(unix_socket_startup_lock);
-
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
 
     let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
         && remote_control_explicitly_requested

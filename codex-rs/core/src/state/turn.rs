@@ -25,6 +25,7 @@ use tokio::sync::oneshot;
 use crate::agent::control::AgentExecutionGuard;
 use crate::agent::control::CompletionActivityPermit;
 use crate::session::TurnInputQueue;
+use crate::session::reasoning_governor::ReasoningPolicyRecorder;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -36,6 +37,7 @@ pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
     pub(crate) terminal: Option<Arc<TurnTerminalCoordinator>>,
+    pub(crate) reasoning_policy_recorder: Arc<ReasoningPolicyRecorder>,
 }
 
 /// Whether mailbox deliveries should still be folded into the current turn.
@@ -65,6 +67,7 @@ impl Default for ActiveTurn {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
             terminal: None,
+            reasoning_policy_recorder: Arc::new(ReasoningPolicyRecorder::new(false)),
         }
     }
 }

@@ -903,6 +903,13 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) after_last_sampling_ms: u64,
     pub(crate) sampling_request_count: u32,
     pub(crate) sampling_retry_count: u32,
+    pub(crate) compaction: u32,
+    pub(crate) tool_result: u32,
+    pub(crate) server_end_turn_false: u32,
+    pub(crate) pending_input: u32,
+    pub(crate) stop_hook: u32,
+    pub(crate) completion_review_repair: u32,
+    pub(crate) invalid_image_recovery: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) timing: Option<TurnTiming>,
     pub(crate) duration_ms: Option<u64>,

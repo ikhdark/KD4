@@ -267,11 +267,9 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
             .iter()
             .all(|text| !text.contains("ignored-plugin:ignored"))
     );
-    assert!(
-        developer_messages
-            .iter()
-            .any(|text| text.contains("do not treat `skill://` identifiers as filesystem paths"))
-    );
+    assert!(developer_messages.iter().any(|text| {
+        text.contains("`orchestrator resource` sources through `skills.list` and `skills.read`")
+    }));
     let skill_fragments = first_request
         .message_input_texts("user")
         .into_iter()

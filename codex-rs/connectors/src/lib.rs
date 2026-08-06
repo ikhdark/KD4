@@ -16,6 +16,7 @@ pub mod filter;
 pub mod merge;
 pub mod metadata;
 mod plugin_config;
+mod runtime_projection;
 mod snapshot;
 
 pub use app_info::AppBranding;
@@ -31,6 +32,10 @@ pub use app_tool_policy::apps_config_from_layer_stack;
 pub use directory_cache::ConnectorDirectoryCacheContext;
 pub use plugin_config::parse_plugin_app_config;
 pub use plugin_config::parse_plugin_app_config_value;
+pub use runtime_projection::ConnectorRuntimeTool;
+pub use runtime_projection::InstalledConnectorRuntime;
+pub use runtime_projection::connector_tool_is_synthetic;
+pub use runtime_projection::installed_connector_runtime;
 pub use snapshot::ConnectorSnapshot;
 pub use snapshot::PluginConnectorSource;
 

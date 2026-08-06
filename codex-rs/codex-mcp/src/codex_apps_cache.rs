@@ -142,6 +142,16 @@ impl CodexAppsToolsCacheContext {
 }
 
 impl CodexAppsToolsCache {
+    /// Returns the latest shared Codex Apps tools without starting or refreshing
+    /// an MCP connection. A new cache entry may be seeded from disk.
+    pub fn current_tools(
+        &self,
+        codex_home: PathBuf,
+        auth_key: CodexAppsToolsCacheKey,
+    ) -> Option<Vec<ToolInfo>> {
+        self.context(codex_home, auth_key).current_tools()
+    }
+
     pub(crate) fn context(
         &self,
         codex_home: PathBuf,

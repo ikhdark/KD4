@@ -243,6 +243,8 @@ pub struct InProcessStartArgs {
 /// [`Lagged`](Self::Lagged) is a transport health marker, not an application
 /// event — it signals that the consumer fell behind and some events were dropped.
 #[derive(Debug, Clone)]
+// Keep the public in-process event shape aligned with the typed transport API.
+#[allow(clippy::large_enum_variant)]
 pub enum InProcessServerEvent {
     /// Server request that requires client response/rejection.
     ServerRequest(ServerRequest),

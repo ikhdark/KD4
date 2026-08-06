@@ -159,6 +159,8 @@ pub(crate) fn is_safe_powershell_words(words: &[String]) -> bool {
         "resolve-path" | "rvpa" => true,
         "select-object" | "select" => true,
         "get-item" => true,
+        "get-command" | "gcm" => true,
+        "get-itemproperty" | "gp" => true,
 
         "git" => is_safe_git_command(words),
 
@@ -254,6 +256,45 @@ mod tests {
                 "-Command".to_string(),
                 "Get-ChildItem".to_string(),
             ]));
+        }
+    }
+
+    #[test]
+    fn allows_reviewer_verification_cmdlets_but_not_registry_mutation() {
+        let Some(powershell) = windows_powershell_path() else {
+            return;
+        };
+
+        for script in [
+            "Get-Command kds",
+            r"Get-ItemProperty -Path HKCU:\Environment -Name Path",
+        ] {
+            assert!(
+                is_safe_command_windows(&vec_str(&[
+                    powershell.as_str(),
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ])),
+                "expected reviewer inspection command to be safe: {script}"
+            );
+        }
+
+        for script in [
+            r"Set-ItemProperty -Path HKCU:\Environment -Name Path -Value bad",
+            r"Remove-ItemProperty -Path HKCU:\Environment -Name Path",
+        ] {
+            assert!(
+                !is_safe_command_windows(&vec_str(&[
+                    powershell.as_str(),
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ])),
+                "expected registry mutation command to remain unsafe: {script}"
+            );
         }
     }
 
