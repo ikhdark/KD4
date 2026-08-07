@@ -101,7 +101,11 @@ async fn directly_exposes_effective_tool_sets_when_search_is_unavailable() {
     let mcp_tools = numbered_mcp_tools(/*count*/ 2);
 
     let exposure = build_mcp_tool_exposure(
-        &mcp_tools, /*connectors*/ None, &config, /*search_tool_enabled*/ false,
+        &mcp_tools,
+        /*connectors*/ None,
+        &config,
+        /*search_tool_enabled*/ false,
+        &HashSet::new(),
     );
 
     assert_eq!(tool_names(&exposure.direct_tools), tool_names(&mcp_tools));
@@ -177,6 +181,7 @@ async fn excludes_tools_hidden_from_model_exposure() {
         Some(connectors.as_slice()),
         &config,
         /*search_tool_enabled*/ false,
+        &HashSet::new(),
     );
 
     assert_eq!(
@@ -228,6 +233,7 @@ enabled = true
         Some(connectors.as_slice()),
         &config,
         /*search_tool_enabled*/ false,
+        &HashSet::new(),
     );
 
     assert_eq!(
@@ -243,7 +249,11 @@ async fn defers_effective_tool_sets_when_search_is_available() {
     let mcp_tools = numbered_mcp_tools(/*count*/ 2);
 
     let exposure = build_mcp_tool_exposure(
-        &mcp_tools, /*connectors*/ None, &config, /*search_tool_enabled*/ true,
+        &mcp_tools,
+        /*connectors*/ None,
+        &config,
+        /*search_tool_enabled*/ true,
+        &HashSet::new(),
     );
 
     assert!(exposure.direct_tools.is_empty());
@@ -252,6 +262,50 @@ async fn defers_effective_tool_sets_when_search_is_available() {
         .as_ref()
         .expect("MCP tools should be discoverable through tool_search");
     assert_eq!(tool_names(deferred_tools), tool_names(&mcp_tools));
+}
+
+#[tokio::test]
+async fn directly_exposes_tools_required_by_enabled_plugin_skills() {
+    let config = test_config().await;
+    let skill_tool = make_mcp_tool(
+        "skill-plugin",
+        "skill_tool",
+        "mcp__skill_plugin",
+        "skill_tool",
+        /*connector_id*/ None,
+        /*connector_name*/ None,
+    );
+    let deferred_tool = make_mcp_tool(
+        "other-plugin",
+        "other_tool",
+        "mcp__other_plugin",
+        "other_tool",
+        /*connector_id*/ None,
+        /*connector_name*/ None,
+    );
+    let mcp_tools = vec![skill_tool.clone(), deferred_tool.clone()];
+
+    let exposure = build_mcp_tool_exposure(
+        &mcp_tools,
+        /*connectors*/ None,
+        &config,
+        /*search_tool_enabled*/ true,
+        &HashSet::from(["skill-plugin"]),
+    );
+
+    assert_eq!(
+        tool_names(&exposure.direct_tools),
+        tool_names(&[skill_tool])
+    );
+    assert_eq!(
+        tool_names(
+            exposure
+                .deferred_tools
+                .as_deref()
+                .expect("unrelated MCP tools should remain discoverable through tool_search")
+        ),
+        tool_names(&[deferred_tool])
+    );
 }
 
 #[tokio::test]
@@ -282,6 +336,7 @@ async fn defers_apps_and_non_app_mcp_tools() {
         Some(connectors.as_slice()),
         &config,
         /*search_tool_enabled*/ true,
+        &HashSet::new(),
     );
 
     assert!(exposure.direct_tools.is_empty());

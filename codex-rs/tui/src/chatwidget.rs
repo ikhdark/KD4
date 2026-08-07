@@ -349,6 +349,7 @@ mod input_flow;
 mod input_restore;
 mod input_submission;
 mod interrupts;
+mod local_path_context;
 use self::interrupts::InterruptManager;
 mod keymap_picker;
 mod mcp_startup;
@@ -1322,7 +1323,8 @@ impl ChatWidget {
                     }
                     UserInput::Text { .. }
                     | UserInput::Image { .. }
-                    | UserInput::LocalImage { .. } => None,
+                    | UserInput::LocalImage { .. }
+                    | UserInput::LocalPath { .. } => None,
                 })
                 .collect();
             mention_bindings.sort_by_key(|binding| {

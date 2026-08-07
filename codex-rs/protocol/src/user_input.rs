@@ -39,6 +39,12 @@ pub enum UserInput {
         detail: Option<ImageDetail>,
     },
 
+    /// A local file or directory whose bounded contents were captured by the client.
+    LocalPath {
+        path: std::path::PathBuf,
+        content: String,
+    },
+
     /// Skill selected by the user (name + path to SKILL.md).
     Skill {
         name: String,

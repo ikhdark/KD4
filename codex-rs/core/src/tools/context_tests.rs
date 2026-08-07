@@ -601,6 +601,10 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     };
 
     let response = output.response_text();
+    assert!(
+        codex_utils_output_truncation::approx_token_count(&response)
+            <= output.model_output_max_tokens()
+    );
     assert!(response.contains("Shell output summary:"));
     assert!(response.contains("error: exact retained failure marker 450"));
     assert!(!response.contains("ordinary-0300"));

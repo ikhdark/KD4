@@ -31,6 +31,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_output_limits;
 use codex_utils_output_truncation::truncate_text;
+use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use codex_utils_output_truncation::truncate_text_with_output_limit;
 pub use router::ToolRouter;
 use shell_output_summary::ShellOutputSummaryOptions;
@@ -91,6 +92,10 @@ pub fn format_exec_output_for_model(
     exec_output: &ExecToolCallOutput,
     truncation_policy: TruncationPolicy,
 ) -> String {
+    let token_ceiling = match &truncation_policy {
+        TruncationPolicy::Tokens(tokens) => Some(*tokens),
+        TruncationPolicy::Bytes(_) => None,
+    };
     // round to 1 decimal place
     let duration_seconds = ((exec_output.duration.as_secs_f32()) * 10.0).round() / 10.0;
 
@@ -122,7 +127,10 @@ pub fn format_exec_output_for_model(
     sections.push("Output:".to_string());
     sections.push(formatted_output);
 
-    sections.join("\n")
+    let rendered = sections.join("\n");
+    token_ceiling
+        .map(|max_tokens| truncate_text_to_token_ceiling(&rendered, max_tokens))
+        .unwrap_or(rendered)
 }
 
 pub(crate) fn project_exec_output_for_model_with_budget(
@@ -164,8 +172,9 @@ pub(crate) fn project_exec_output_for_model_with_budget(
     sections.push("Output:".to_string());
     sections.push(truncated.text);
 
+    let rendered = sections.join("\n");
     FormattedExecOutput {
-        text: sections.join("\n"),
+        text: truncate_text_to_token_ceiling(&rendered, limits.applied_limit),
         reduced: summarized.is_some() || truncated.was_truncated,
     }
 }

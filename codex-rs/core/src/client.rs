@@ -336,6 +336,8 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    /// Whether the stream currently handled by this session used the WebSocket transport.
+    last_stream_was_websocket: bool,
     turn_timing: Option<Arc<TurnTimingState>>,
     /// Turn state for sticky routing.
     ///
@@ -621,6 +623,7 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            last_stream_was_websocket: false,
             turn_timing: None,
             turn_state: Arc::new(OnceLock::new()),
         }
@@ -2180,6 +2183,7 @@ impl ModelClientSession {
         match wire_api {
             WireApi::Responses => {
                 if self.client.responses_websocket_enabled() {
+                    self.last_stream_was_websocket = true;
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -2203,6 +2207,7 @@ impl ModelClientSession {
                     }
                 }
 
+                self.last_stream_was_websocket = false;
                 self.stream_responses_api(
                     prompt,
                     model_info,
@@ -2223,15 +2228,19 @@ impl ModelClientSession {
     /// This is used after exhausting the provider retry budget, to force subsequent requests onto
     /// the HTTP transport.
     ///
-    /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
+    /// Returns `true` when the failed stream should be retried over HTTP. This includes a concurrent
+    /// session having already activated the shared fallback while this session still had an
+    /// in-flight WebSocket stream.
     pub(crate) fn try_switch_fallback_transport(
         &mut self,
         session_telemetry: &SessionTelemetry,
         _model_info: &ModelInfo,
     ) -> bool {
+        let failed_stream_was_websocket = self.last_stream_was_websocket;
         let activated = self.client.force_http_fallback(session_telemetry);
         self.websocket_session = WebsocketSession::default();
-        activated
+        self.last_stream_was_websocket = false;
+        activated || failed_stream_was_websocket
     }
 }
 

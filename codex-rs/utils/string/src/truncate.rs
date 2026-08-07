@@ -17,16 +17,30 @@ pub fn truncate_middle_with_token_budget(s: &str, max_tokens: usize) -> (String,
         return (String::new(), None);
     }
 
-    if max_tokens > 0 && s.len() <= approx_bytes_for_tokens(max_tokens) {
+    let total_token_count = approx_token_count(s);
+    if max_tokens == 0 {
+        let total_tokens = u64::try_from(total_token_count).unwrap_or(u64::MAX);
+        return (String::new(), Some(total_tokens));
+    }
+    if total_token_count <= max_tokens {
         return (s.to_string(), None);
     }
 
-    let truncated = truncate_with_byte_estimate(
-        s,
-        approx_bytes_for_tokens(max_tokens),
-        /*use_tokens*/ true,
-    );
-    let total_tokens = u64::try_from(approx_token_count(s)).unwrap_or(u64::MAX);
+    let proportional_bytes = if total_token_count == 0 {
+        0
+    } else {
+        s.len()
+            .saturating_mul(max_tokens)
+            .checked_div(total_token_count)
+            .unwrap_or(0)
+    };
+    let mut content_bytes = proportional_bytes.min(approx_bytes_for_tokens(max_tokens));
+    let mut truncated = truncate_with_byte_estimate(s, content_bytes, /*use_tokens*/ true);
+    while content_bytes > 0 && approx_token_count(&truncated) > max_tokens {
+        content_bytes = content_bytes.saturating_sub(1);
+        truncated = truncate_with_byte_estimate(s, content_bytes, /*use_tokens*/ true);
+    }
+    let total_tokens = u64::try_from(total_token_count).unwrap_or(u64::MAX);
 
     if truncated == s {
         (truncated, None)
@@ -69,8 +83,33 @@ fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> S
 }
 
 pub fn approx_token_count(text: &str) -> usize {
-    let len = text.len();
-    len.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1)) / APPROX_BYTES_PER_TOKEN
+    let byte_estimate = text
+        .len()
+        .saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
+        / APPROX_BYTES_PER_TOKEN;
+    let mut lexical_estimate = 0usize;
+    let mut word_bytes = 0usize;
+
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            word_bytes = word_bytes.saturating_add(ch.len_utf8());
+            continue;
+        }
+        lexical_estimate = lexical_estimate.saturating_add(
+            word_bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
+                / APPROX_BYTES_PER_TOKEN,
+        );
+        word_bytes = 0;
+        if !ch.is_whitespace() {
+            lexical_estimate = lexical_estimate.saturating_add(1);
+        }
+    }
+    lexical_estimate = lexical_estimate.saturating_add(
+        word_bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
+            / APPROX_BYTES_PER_TOKEN,
+    );
+
+    byte_estimate.max(lexical_estimate)
 }
 
 pub fn approx_bytes_for_tokens(tokens: usize) -> usize {

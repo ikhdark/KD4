@@ -1,145 +1,91 @@
-WORKTREE REVIEW — FINALIZED FROZEN LEDGER
-Generated for the worktree state frozen on 2026-08-06 (America/Chicago).
+WORKTREE REVIEW LEDGER
+Repository: C:\Users\kuh\Desktop\kd4
+Baseline frozen: 2026-08-06 (America/Chicago)
+Scope: complete staged, unstaged, untracked, renamed, deleted, type-changed, and submodule worktree inventory
 
-BASELINE
-- Git porcelain inventory: 100 required paths.
-- Tracked unstaged modifications: 93.
-- Untracked paths: 7.
-- Staged changes, deletions, renames, type changes, and submodule changes: none.
-- Ignored files are excluded.
-- Diff size at freeze: 3,815 insertions and 590 deletions across the 93 tracked paths.
-- Every current file was read completely by a bounded full-content pass; every tracked diff and every complete untracked file was inspected. No NUL bytes or conflict markers were found.
-- Generated/provenance review: Cargo.lock contains the matching extension-api dependency edge; core/config.schema.json corresponds to the MultiAgentV2ConfigToml source change and passed the documented generator check.
+BASELINE INVENTORY
+- 57 primary paths: 56 modified, 1 untracked.
+- No staged paths, renames, deletions, type changes, or submodule changes.
+- Review used semantic diffs with end-of-line whitespace ignored, complete current-file reads, owning manifests/instructions, callers, generated contracts, and focused test routes.
 
-FINDINGS AND FINAL DISPOSITIONS
-F001 REPAIRED — app-list notification deduplication held last_notified_apps across an awaited bounded-channel send. Snapshot claim/update now completes under the mutex and notification delivery begins only after the guard is dropped. The app-list integration test passes and workspace Clippy's await-holding-lock policy is clean.
-F002 REPAIRED — codex-rs/memories/write/src/phase1.rs did not handle the new RolloutItem::ToolManifest variant, causing E0004. Tool manifests are now classified as metadata-only during memory extraction; the app-list dependency build, broad Clippy, and dead-code matrix compile this consumer successfully.
-F003 REPAIRED — codex-rs/features/src/tests.rs omitted the new MultiAgentV2ConfigToml::allow_full_history_forks field. The TOML fixture and expected value now exercise it; the focused feature-config test and broad Clippy pass.
-F004 REPAIRED — codex-rs/core/src/tools/handlers/source.rs introduced two nested conditional/error branches rejected by the workspace Clippy policy. Equivalent let-chain conditions preserve fail-open behavior; the focused coordination test and broad Clippy pass.
-F005 REPAIRED — all-target Clippy found a test module before production items in code_mode/execute_handler.rs and a redundant clone in completion_review_v2.rs. The module now follows production items and the final-use ID is consumed directly; focused tests and broad Clippy pass.
-F006 REPAIRED — final diff hygiene found two trailing spaces in AGENTS.md. Both were removed and git diff --check passes.
+CONFIRMED FINDINGS (PRE-REPAIR)
+F001 [HIGH] P037 builds one model-visible compaction checkpoint with a 16,000-token body budget and does not charge its wrapper. This exceeds the core invariant that no individual model-visible item may exceed 10,000 approximate tokens. Required repair: cap the complete rendered checkpoint and add a boundary regression test.
+F002 [HIGH] P045/P047/P057 allow a LocalPath payload of up to 64 KiB to become one model-visible InputText item without a per-item token ceiling; app-server input can reach the same central conversion. Required repair: enforce the 10,000-token ceiling in the shared protocol projection and test punctuation-heavy oversized content.
+F003 [MEDIUM] P053 first caps a body to the applied token limit and then prepends its truncation warning, so the returned formatted model projection exceeds the advertised applied limit. Core shell, exec, context, and registry consumers also append response metadata or a JSON envelope after applying the body limit. Required repair: cap complete rendered projections, not only their bodies, and add regression coverage.
+F004 [LOW] P055/P056 document that token-budget truncation returns at most max_tokens, but a zero budget returns a non-empty truncation marker. Required repair: return an empty string at zero while preserving the original-token-count signal and update the regression test.
+F005 [MEDIUM] P031/P046 change the additional-context contract from BTreeMap to insertion-ordered IndexMap, but core and app-server integration-test consumers still construct BTreeMap values. This prevents affected test targets from compiling. Required repair: migrate the consumer fixtures to IndexMap and prove the test targets build.
+F006 [MEDIUM] P026 adds LocalPath to the app-server UserInput union, but two app-server thread-read test helpers exhaustively match the old variants and omit LocalPath. This prevents the app-server test target from compiling. Required repair: classify LocalPath as non-text in both helpers and prove the test target builds.
 
-POSSIBLE-BUG DISPOSITIONS
-P001 REJECTED — awaiting notify_etag at turn completion is intentional catalog-coherence behavior: the manager coalesces notices, exposes an idle notification without lost-wakeup races, and tests require the latest catalog/default to be visible after the await. The focused model-manager tests passed.
-P002 REJECTED — rollout token-count coalescing deliberately retains the latest count and flushes it at turn boundaries or shutdown. The recorder tests cover duplicate replacement and boundary ordering; this is not dead code.
-P003 REJECTED — bounded fail-open handling for typed source reads is confined to read/search calls. Mutating, shell, diff, and structured-edit classes retain fail-closed coordination, while source reads remain repository-confined or exact loaded-skill reads.
-P004 REJECTED AFTER ANALYSIS — exact projection-ceiling tests, typed-output preservation coverage, workspace Clippy, cargo-shear, and the dead-code matrix are clean. No lost typed/non-text path, recursive artifact projection, or unused implementation was found.
+PRIMARY PATH REVIEW (each frozen path appears exactly once)
+P001 | codex-rs/Cargo.lock | CLEAN | Workspace dependency resolution matches manifest feature additions; no hand-edit signature found.
+P002 | codex-rs/Cargo.toml | CLEAN | Shared indexmap/schemars/ts-rs feature wiring is coherent with ordered additional-context serialization.
+P003 | codex-rs/app-server-protocol/Cargo.toml | CLEAN | indexmap dependency supports the protocol type change.
+P004 | codex-rs/app-server-protocol/schema/json/ClientRequest.json | CLEAN | Generated LocalPath request variant matches source protocol.
+P005 | codex-rs/app-server-protocol/schema/json/ServerNotification.json | CLEAN | Generated notification contract is consistent.
+P006 | codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json | CLEAN | Aggregate generated schema carries LocalPath consistently.
+P007 | codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json | CLEAN | V2 aggregate generated schema carries LocalPath consistently.
+P008 | codex-rs/app-server-protocol/schema/json/v2/ItemCompletedNotification.json | CLEAN | Generated UserInput union includes LocalPath.
+P009 | codex-rs/app-server-protocol/schema/json/v2/ItemStartedNotification.json | CLEAN | Generated UserInput union includes LocalPath.
+P010 | codex-rs/app-server-protocol/schema/json/v2/ReviewStartResponse.json | CLEAN | Generated thread contract is consistent.
+P011 | codex-rs/app-server-protocol/schema/json/v2/ThreadForkResponse.json | CLEAN | Generated thread contract is consistent.
+P012 | codex-rs/app-server-protocol/schema/json/v2/ThreadListResponse.json | CLEAN | Generated thread contract is consistent.
+P013 | codex-rs/app-server-protocol/schema/json/v2/ThreadMetadataUpdateResponse.json | CLEAN | Generated thread contract is consistent.
+P014 | codex-rs/app-server-protocol/schema/json/v2/ThreadReadResponse.json | CLEAN | Generated thread contract is consistent.
+P015 | codex-rs/app-server-protocol/schema/json/v2/ThreadResumeResponse.json | CLEAN | Generated thread contract is consistent.
+P016 | codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackResponse.json | CLEAN | Generated thread contract is consistent.
+P017 | codex-rs/app-server-protocol/schema/json/v2/ThreadStartResponse.json | CLEAN | Generated thread contract is consistent.
+P018 | codex-rs/app-server-protocol/schema/json/v2/ThreadStartedNotification.json | CLEAN | Generated notification contract is consistent.
+P019 | codex-rs/app-server-protocol/schema/json/v2/ThreadUnarchiveResponse.json | CLEAN | Generated thread contract is consistent.
+P020 | codex-rs/app-server-protocol/schema/json/v2/TurnCompletedNotification.json | CLEAN | Generated UserInput union includes LocalPath.
+P021 | codex-rs/app-server-protocol/schema/json/v2/TurnStartParams.json | CLEAN | Generated LocalPath request variant matches source protocol.
+P022 | codex-rs/app-server-protocol/schema/json/v2/TurnStartResponse.json | CLEAN | Generated thread contract is consistent.
+P023 | codex-rs/app-server-protocol/schema/json/v2/TurnStartedNotification.json | CLEAN | Generated UserInput union includes LocalPath.
+P024 | codex-rs/app-server-protocol/schema/json/v2/TurnSteerParams.json | CLEAN | Generated LocalPath request variant matches source protocol.
+P025 | codex-rs/app-server-protocol/schema/typescript/v2/UserInput.ts | CLEAN | Generated discriminated union includes { type: "localPath", path, content }.
+P026 | codex-rs/app-server-protocol/src/protocol/v2/turn.rs | FINDING F006 | Ordered additional_context and LocalPath conversion preserve client order and request shape, but two exhaustive app-server test helpers were not updated for LocalPath.
+P027 | codex-rs/app-server/Cargo.toml | CLEAN | indexmap dependency is used by request processing.
+P028 | codex-rs/app-server/src/request_processors.rs | CLEAN | Additional-context validation limits count, per-entry chars, and aggregate chars with stable ordering.
+P029 | codex-rs/app-server/src/request_processors/turn_processor.rs | CLEAN | Turn/steer LocalPath conversion and ordered additional context are wired end to end; central projection ceiling is tracked as F002.
+P030 | codex-rs/app-server/src/request_processors/turn_processor_tests.rs | CLEAN | Coverage exercises LocalPath forwarding, limits, duplicate replacement, and order.
+P031 | codex-rs/context-fragments/src/additional_context.rs | FINDING F005 | IndexMap replacement preserves insertion order and last-value semantics, but core and app-server integration-test consumers were not fully migrated.
+P032 | codex-rs/core/src/client.rs | CLEAN | WebSocket fallback state records the transport used by the failed stream, preventing concurrent HTTP failures from triggering a switch.
+P033 | codex-rs/core/src/client_tests.rs | CLEAN | Regression coverage distinguishes failed WebSocket streams from concurrent HTTP fallback streams.
+P034 | codex-rs/core/src/codex_thread.rs | CLEAN | Token-budget compaction dispatch uses the normal lifecycle and retained-evidence path.
+P035 | codex-rs/core/src/compact_remote.rs | CLEAN | Remote compaction retains authoritative tool evidence and rewrites oversized output before context reuse.
+P036 | codex-rs/core/src/compact_remote_tests.rs | CLEAN | Coverage verifies tool artifact retention and oversized-output rewriting.
+P037 | codex-rs/core/src/compact_token_budget.rs | FINDING F001 | Evidence checkpoint exceeds the per-item model token ceiling.
+P038 | codex-rs/core/src/mcp_tool_exposure.rs | CLEAN | Active enabled-plugin MCP servers are exposed directly while unrelated deferred servers remain searchable.
+P039 | codex-rs/core/src/mcp_tool_exposure_test.rs | CLEAN | Exposure tests cover active plugin, unrelated plugin, and search-disabled behavior.
+P040 | codex-rs/core/src/session/mod.rs | CLEAN | New-context transition persists compaction state and retained evidence through the existing session history route.
+P041 | codex-rs/core/src/session/turn.rs | CLEAN | Turn input applies ordered additional-context updates without reordering duplicates.
+P042 | codex-rs/core/src/session/turn_tests.rs | CLEAN | Coverage verifies replacement order and unchanged-entry behavior.
+P043 | codex-rs/core/src/state/additional_context.rs | CLEAN | State caps entry count, per-entry size, aggregate size, preserves roles, and emits deterministic omission markers.
+P044 | codex-rs/protocol/Cargo.toml | CLEAN | indexmap and codex-utils-string dependencies support ordered serialization and shared projection repair.
+P045 | codex-rs/protocol/src/models.rs | FINDING F002 | Shared LocalPath-to-InputText projection has no per-item token ceiling.
+P046 | codex-rs/protocol/src/protocol.rs | CLEAN | Ordered additional_context is represented consistently in turn input.
+P047 | codex-rs/protocol/src/user_input.rs | FINDING F002 | LocalPath is a single content-bearing input whose central projection requires a ceiling.
+P048 | codex-rs/rollout/src/recorder.rs | CLEAN | Append-lock scan suppresses duplicate session metadata and re-persisted manifests under concurrent resume.
+P049 | codex-rs/rollout/src/recorder_tests.rs | CLEAN | Recorder regressions cover existing session metadata and persisted manifests.
+P050 | codex-rs/tui/src/chatwidget.rs | CLEAN | Local path enrichment is invoked from submission and surfaced through the widget without changing displayed user text.
+P051 | codex-rs/tui/src/chatwidget/input_submission.rs | CLEAN | Submission adds captured LocalPath inputs after original text while preserving image handling.
+P052 | codex-rs/tui/src/chatwidget/user_messages.rs | CLEAN | Display/history extraction ignores hidden LocalPath payloads and preserves visible user content.
+P053 | codex-rs/utils/output-truncation/src/lib.rs | FINDING F003 | Warning formatting occurs after the exact body ceiling.
+P054 | codex-rs/utils/output-truncation/src/truncate_tests.rs | CLEAN | Existing coverage exercises conservative token estimates and head/middle/tail retention; F003 needs an additional formatted-ceiling assertion.
+P055 | codex-rs/utils/string/src/truncate.rs | FINDING F004 | Zero-token truncation violates its own maximum-output contract.
+P056 | codex-rs/utils/string/src/truncate/tests.rs | FINDING F004 | Current zero-budget expectation codifies the contract violation.
+P057 | codex-rs/tui/src/chatwidget/local_path_context.rs | FINDING F002 | A selected file may contribute 64 KiB to one LocalPath model item; shared protocol enforcement is required.
 
-PRIMARY PATH ENTRIES (exactly one per frozen path)
-P001 | .codex/config.toml | CLEAN | Local verification reasoning effort only; no runtime contract drift.
-P002 | AGENTS.md | REPAIRED F006 | Validation wording is unchanged; two trailing spaces were removed.
-P003 | codex-rs/.cargo/config.toml | CLEAN | Local compiler fanout reduced; build semantics preserved.
-P004 | codex-rs/.config/nextest.toml | CLEAN | Concurrency/timeouts relaxed consistently for Windows-heavy tests.
-P005 | codex-rs/Cargo.lock | CLEAN GENERATED | Cargo-owned edge matches extension-api manifest.
-P006 | codex-rs/agent-task-store/src/local.rs | CLEAN | SQLite busy timeout and automatic wake cursor implementation are wired to the trait and migration.
-P007 | codex-rs/agent-task-store/src/store.rs | CLEAN | Automatic cursor trait contract is implemented by the local store.
-P008 | codex-rs/agent-task-store/src/tests.rs | CLEAN | Covers writer contention and consumer-scoped cursor CAS behavior.
-P009 | codex-rs/app-server-protocol/src/protocol/thread_history.rs | CLEAN | New non-visible tool manifest rollout variant is ignored by history materialization.
-P010 | codex-rs/app-server/README.md | CLEAN | Documents cross-request app-list deduplication behavior.
-P011 | codex-rs/app-server/src/request_processors/apps_processor.rs | REPAIRED F001 | Snapshot dedupe completes under the mutex; notification send is awaited after releasing it.
-P012 | codex-rs/app-server/tests/suite/v2/app_list.rs | CLEAN | Repeated unchanged request behavior is covered; F001 lock discipline is additionally enforced by the workspace await-holding-lock Clippy policy.
-P013 | codex-rs/code-mode-protocol/src/description.rs | CLEAN | Output ceilings and batching guidance match runtime constants.
-P014 | codex-rs/core-skills/src/render.rs | CLEAN METADATA | Worktree hash equals index hash; no substantive diff.
-P015 | codex-rs/core/config.schema.json | CLEAN GENERATED | Matches config source; documented freshness check passed.
-P016 | codex-rs/core/src/agent/control/spawn.rs | CLEAN | Bounded fork token estimation handles compacted histories and excludes tool manifests.
-P017 | codex-rs/core/src/agent/control_tests.rs | CLEAN | Fork limit and rollout matching coverage updated.
-P018 | codex-rs/core/src/compact.rs | CLEAN | Startup envelopes are stripped and user/task-state budgets are hard bounded.
-P019 | codex-rs/core/src/compact_remote_v2.rs | CLEAN | Retained budget and persisted compact representation align with reconstruction.
-P020 | codex-rs/core/src/compact_remote_v2_attempt.rs | CLEAN | Retry contract update is narrow and wired.
-P021 | codex-rs/core/src/compact_tests.rs | CLEAN | Covers startup stripping, warning filtering, and token ceilings.
-P022 | codex-rs/core/src/config/config_tests.rs | CLEAN | New 60-second wait floor cases align with schema and resolver.
-P023 | codex-rs/core/src/config/mod.rs | CLEAN | Full-history escape hatch and wait defaults are fully resolved.
-P024 | codex-rs/core/src/context/contextual_user_message.rs | CLEAN | Startup and legacy-warning fragment classifications use registered exact matchers.
-P025 | codex-rs/core/src/context/mod.rs | CLEAN | New fragment helpers are exported only crate-locally.
-P026 | codex-rs/core/src/event_mapping.rs | CLEAN | Raw user-content parser preserves images while bypassing contextual-message suppression for compaction.
-P027 | codex-rs/core/src/responses_retry.rs | CLEAN | Retry delay ceiling and first-retry notification are covered.
-P028 | codex-rs/core/src/session/mod.rs | CLEAN | Contributor polling shares a five-second deadline and preserves registration order.
-P029 | codex-rs/core/src/session/reasoning_governor.rs | CLEAN | Read-only successes no longer demote sticky implement/diagnose/verify/finalize phases.
-P030 | codex-rs/core/src/session/review.rs | CLEAN | Review turn initializes new turn-scoped deferred-tool state.
-P031 | codex-rs/core/src/session/rollout_reconstruction.rs | CLEAN | Tool manifests are non-history metadata and compaction reconstruction remains wired.
-P032 | codex-rs/core/src/session/tests.rs | CLEAN | Persistence and contributor timeout expectations updated.
-P033 | codex-rs/core/src/session/turn.rs | CLEAN | Planning estimates include schemas, compaction order is stabilized, manifests persist, and ETag refresh is awaited intentionally.
-P034 | codex-rs/core/src/session/turn_context.rs | CLEAN | Deferred-tool activation is explicitly turn-scoped and shared only by derived step contexts.
-P035 | codex-rs/core/src/session/turn_tests.rs | CLEAN | Foreign PathUri, compaction ordering, contributor polling, and schema-budget coverage added.
-P036 | codex-rs/core/src/session/world_state.rs | CLEAN | Concurrent world-state contribution preserves order and uses the shared deadline.
-P037 | codex-rs/core/src/task_evidence.rs | CLEAN | Rereview correction state is reset for continued repair cycles.
-P038 | codex-rs/core/src/tasks/completion_review_v2.rs | REPAIRED F005 | Review bypasses remain removed; the final-use finding ID is consumed without a redundant clone.
-P039 | codex-rs/core/src/tasks/mod.rs | CLEAN | Non-passed completion gates no longer repeat a misleading candidate completion message.
-P040 | codex-rs/core/src/tools/code_mode/execute_handler.rs | REPAIRED F005 | Deferred nested tools remain activation-gated; tests now follow production items.
-P041 | codex-rs/core/src/tools/command_output_artifact.rs | CLEAN | Retention truncation is surfaced and read limit matches the advertised 16 KiB cap.
-P042 | codex-rs/core/src/tools/context.rs | CLEAN | Producer metadata covers MCP/function/patch/abort/exec outputs without parsing rendered envelopes.
-P043 | codex-rs/core/src/tools/handlers/multi_agents/close_agent.rs | CLEAN | Typed projection metadata wired.
-P044 | codex-rs/core/src/tools/handlers/multi_agents/resume_agent.rs | CLEAN | Typed projection metadata wired.
-P045 | codex-rs/core/src/tools/handlers/multi_agents/send_input.rs | CLEAN | Typed projection metadata wired.
-P046 | codex-rs/core/src/tools/handlers/multi_agents/spawn.rs | CLEAN | Typed projection metadata wired.
-P047 | codex-rs/core/src/tools/handlers/multi_agents/wait.rs | CLEAN | Polling floor and omission guidance align with one-minute defaults.
-P048 | codex-rs/core/src/tools/handlers/multi_agents_common.rs | CLEAN | Shared projection helper and child-model context limits are wired.
-P049 | codex-rs/core/src/tools/handlers/multi_agents_spec.rs | CLEAN | Spawn/wait schemas match bounded history and timeout behavior.
-P050 | codex-rs/core/src/tools/handlers/multi_agents_tests.rs | CLEAN | Timeout behavior and projection-related expectations updated.
-P051 | codex-rs/core/src/tools/handlers/multi_agents_v2/interrupt_agent.rs | CLEAN | Typed projection metadata wired.
-P052 | codex-rs/core/src/tools/handlers/multi_agents_v2/list_agents.rs | CLEAN | Typed projection metadata wired.
-P053 | codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs | CLEAN | Full history is opt-in, bounded turns are enforced, and output projection is wired.
-P054 | codex-rs/core/src/tools/handlers/multi_agents_v2/task.rs | CLEAN | Task outputs consistently opt into typed projection.
-P055 | codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs | CLEAN | Durable automatic cursor initialization/CAS is consumer scoped.
-P056 | codex-rs/core/src/tools/handlers/read_tool_output.rs | CLEAN | Handler validates the 16 KiB ceiling before artifact I/O.
-P057 | codex-rs/core/src/tools/handlers/read_tool_output_spec.rs | CLEAN | Schema matches handler limits.
-P058 | codex-rs/core/src/tools/handlers/source.rs | REPAIRED F004 | Exact enabled skill reads and bounded best-effort coordination remain confined; let-chain branches satisfy Clippy.
-P059 | codex-rs/core/src/tools/handlers/source_spec.rs | CLEAN | Advertised skill-path exception matches exact runtime selection.
-P060 | codex-rs/core/src/tools/handlers/source_tests.rs | CLEAN | Loaded/unloaded external path and coordination timeout coverage added.
-P061 | codex-rs/core/src/tools/handlers/tool_search.rs | CLEAN | Exact-match recovery remains budgeted and activates only returned definitions.
-P062 | codex-rs/core/src/tools/parallel.rs | CLEAN | Tool result construction follows the new projection field contract.
-P063 | codex-rs/core/src/tools/registry.rs | CLEAN P004 | Common projection spills only truncated outputs and excludes recursive artifact reads.
-P064 | codex-rs/core/src/tools/registry_tests.rs | CLEAN P004 | Existing typed post-hook behavior remains explicit.
-P065 | codex-rs/core/src/tools/router.rs | CLEAN | Deferred activation enforcement, manifest hashing, warnings, and bounded read coordination are wired.
-P066 | codex-rs/core/src/tools/shell_output_summary.rs | CLEAN | Critical errors and tail status outrank warning floods.
-P067 | codex-rs/core/src/tools/shell_output_summary_tests.rs | CLEAN | Warning-flood regression coverage added.
-P068 | codex-rs/core/src/tools/spec_plan.rs | CLEAN | Deferred code-mode specs and extension-name collision warnings are routed.
-P069 | codex-rs/core/src/tools/spec_plan_tests.rs | CLEAN | Duplicate-name warning and deferred exposure coverage added.
-P070 | codex-rs/core/tests/common/test_codex.rs | CLEAN | Test builder can select a session source without changing production behavior.
-P071 | codex-rs/core/tests/suite/completion_review.rs | CLEAN | Continued corrections and removed bypasses have integration coverage.
-P072 | codex-rs/core/tests/suite/websocket_fallback.rs | CLEAN | First websocket retry is now observably reported.
-P073 | codex-rs/ext/extension-api/Cargo.toml | CLEAN | PathUri dependency matches the public contributor type.
-P074 | codex-rs/ext/extension-api/src/contributors/turn_input.rs | CLEAN | Foreign environment cwd values are preserved as PathUri.
-P075 | codex-rs/features/src/feature_configs.rs | CLEAN | Config/schema ranges and escape hatch source are aligned.
-P076 | codex-rs/models-manager/src/lib.rs | CLEAN | Bundled GPT-5.6 prompt override is applied after catalog parsing.
-P077 | codex-rs/models-manager/src/manager.rs | CLEAN P001 | Remote/cache catalogs apply the prompt override and ETag waiter avoids lost wakeups.
-P078 | codex-rs/models-manager/src/manager_tests.rs | CLEAN | Coalescing, failure retry, TTL renewal, and awaited visibility are covered.
-P079 | codex-rs/protocol/src/protocol.rs | CLEAN | ToolManifest is a typed persisted rollout variant with serde/schema/TS derives.
-P080 | codex-rs/rollout/src/list.rs | CLEAN | Manifest metadata is excluded from conversation summaries.
-P081 | codex-rs/rollout/src/metadata.rs | CLEAN | Manifest metadata does not alter thread metadata.
-P082 | codex-rs/rollout/src/persistence_metrics.rs | CLEAN | New persisted variant has an explicit metric label.
-P083 | codex-rs/rollout/src/policy.rs | CLEAN | Tool manifests are explicitly persisted.
-P084 | codex-rs/rollout/src/recorder.rs | CLEAN P002 | Manifest hashes deduplicate across resume; token counts coalesce at boundaries/shutdown.
-P085 | codex-rs/rollout/src/recorder_tests.rs | CLEAN | Manifest dedupe, malformed historical lines, and token-count ordering covered.
-P086 | codex-rs/rollout/src/search.rs | CLEAN | Tool manifests are excluded from searchable conversation text.
-P087 | codex-rs/state/src/extract.rs | CLEAN | Tool manifests are metadata-neutral in extraction and sync filtering.
-P088 | codex-rs/state/src/runtime/threads.rs | CLEAN | Memory-mode extraction ignores manifests.
-P089 | codex-rs/thread-store/src/thread_metadata_sync.rs | CLEAN | Incremental metadata sync ignores manifests.
-P090 | codex-rs/tools/src/lib.rs | CLEAN | Projection types are re-exported from the owning crate.
-P091 | codex-rs/tools/src/tool_output.rs | CLEAN P004 | Typed projection metadata preserves outcome and essential state fields.
-P092 | codex-rs/utils/output-truncation/src/lib.rs | CLEAN | New hard ceilings and exact-ceiling helper are internally consistent.
-P093 | codex-rs/utils/output-truncation/src/truncate_tests.rs | CLEAN | Adaptive and exact token ceilings covered.
-P094 | codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs | CLEAN | Full/provision setup marker transaction acquires the named mutex; read-only refresh paths remain unaffected.
-P095 | codex-rs/agent-task-store/migrations/0013_automatic_wake_cursors.sql | CLEAN | Composite consumer key and nullable initial cursor match implementation.
-P096 | codex-rs/core/src/responses_retry_tests.rs | CLEAN | Requested retry delay ceiling coverage added.
-P097 | codex-rs/models-manager/prompts/gpt-5.6.md | CLEAN | Compact family prompt remains below the enforced 10K-character contract.
-P098 | codex-rs/models-manager/src/prompt_overrides.rs | CLEAN | Overrides only the declared GPT-5.6 family and preserves approval messages.
-P099 | codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_mutex.rs | CLEAN | Named mutex handles abandoned ownership and closes/releases via RAII.
-P100 | codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_mutex_tests.rs | CLEAN | Cross-thread exclusion and release behavior covered.
-
-FINAL VALIDATION
-- Focused nextest: app-list update/dedupe 1/1; agent wake cursor 1/1; model-manager ETag 3/3; rollout manifest/token-count persistence 1/1; output-truncation projection ceilings 3/3; selected core behavior matrix 9/9; feature-config deserialization 1/1; final repaired core rerun 3/3. All passed.
-- Config schema freshness: just config-schema-check passed, including 2/2 schema protocol tests.
-- Formatting: cargo fmt --all -- --check passed (stable rustfmt emitted only its existing imports_granularity warning).
-- Clippy: cargo clippy --workspace --all-targets --keep-going -- -D warnings passed after F003-F005 repairs.
-- Dependency analysis: just cargo-shear passed with no issues.
-- Dead code: just rust-dead-code-matrix passed across the workspace and all targets with -Ddead_code.
-- All-features limitation: cargo clippy --workspace --all-targets --all-features --keep-going could not complete because rusty_v8 v149.2.0's upstream Windows archive URL returned HTTP 404. The source findings emitted before that blocker were repaired; the full default-feature workspace/all-target pass is green.
-- Diff hygiene and ledger shape: git diff --check passed; the frozen ledger contains exactly 100 ordered primary IDs and 100 unique primary paths.
-
-REPAIR INDEX (PRIMARY PATHS AND DIRECTLY AFFECTED CONSUMERS)
-- codex-rs/memories/write/src/phase1.rs | F002 | Added ToolManifest to the metadata-only filter arm; validated by dependency builds, Clippy, and dead-code analysis.
-- codex-rs/features/src/tests.rs | F003 | Added allow_full_history_forks to the TOML fixture and expected struct value; focused test and Clippy pass.
-- codex-rs/core/src/tools/handlers/source.rs | F004 | Collapsed two nested conditional/error branches into equivalent let-chain conditions; focused test and Clippy pass.
-- codex-rs/core/src/tools/code_mode/execute_handler.rs | F005 | Moved the test module after all production items; focused test and Clippy pass.
-- codex-rs/core/src/tasks/completion_review_v2.rs | F005 | Removed the redundant finding-ID clone by consuming the value at its final use; focused test and Clippy pass.
+REPAIR AND VALIDATION STATUS
+- Initial ledger was written and reread in full before source repair; all 57 frozen primary paths remain represented exactly once.
+- F001 repaired: the complete compaction evidence checkpoint is capped at 10,000 approximate tokens; punctuation-heavy boundary coverage passes.
+- F002 repaired: shared LocalPath-to-model conversion caps the complete tagged item at 10,000 approximate tokens; punctuation-heavy protocol coverage passes.
+- F003 repaired: formatted truncation plus shell, exec, context, and registry response assembly cap complete rendered projections; output-truncation and focused core boundary coverage pass.
+- F004 repaired: a zero token budget now returns no text while retaining the original token count; focused string coverage passes.
+- F005 repaired in dependent consumers codex-rs/core/tests/suite/additional_context.rs and codex-rs/app-server/tests/suite/v2/turn_start.rs by migrating fixtures to IndexMap; codex-core compilation and focused app-server runtime coverage pass.
+- F006 repaired in codex-rs/app-server/tests/suite/v2/thread_read.rs by classifying LocalPath as non-text in both exhaustive test helpers; workspace Clippy compilation and focused thread-read runtime coverage pass.
+- Repair-only dependent paths inspected and changed after the frozen inventory: codex-rs/core/src/tools/mod.rs, codex-rs/core/src/tools/tools_tests.rs, codex-rs/core/src/tools/context.rs, codex-rs/core/src/tools/context_tests.rs, codex-rs/core/src/tools/registry.rs, codex-rs/core/src/tools/registry_tests.rs, codex-rs/core/tests/suite/additional_context.rs, codex-rs/app-server/tests/suite/v2/turn_start.rs, and codex-rs/app-server/tests/suite/v2/thread_read.rs.
+- Formatting gate passes. Focused tests passed for codex-utils-string, codex-utils-output-truncation (24 tests), codex-protocol LocalPath projection, codex-core compaction evidence, complete shell projection, registry envelope projection, artifact-backed exec response, ordered app-server additional context, and thread-read pagination.
+- The first keep-going Clippy pass exposed F005/F006 app-server test compile failures; after repair, the keep-going workspace Clippy rerun passes.
+- App-server schema freshness passes (2 generated-fixture tests); cargo-shear reports no issues; rust-dead-code-matrix passes.
+- All required post-repair gates are complete. No task-relevant candidate remains unresolved.
+- No publish, install, restart, stage, commit, push, or deployment is authorized.

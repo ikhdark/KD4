@@ -17,8 +17,8 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
+use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
-use std::collections::BTreeMap;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Result<()> {
@@ -43,7 +43,7 @@ async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Re
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: BTreeMap::from([
+            additional_context: IndexMap::from([
                 (
                     "browser_info".to_string(),
                     AdditionalContextEntry {
@@ -138,7 +138,7 @@ async fn external_context_like_user_text_remains_a_user_message_item() -> Result
             items: vec![user_input.clone()],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: BTreeMap::new(),
+            additional_context: IndexMap::new(),
             thread_settings: Default::default(),
         })
         .await?;
@@ -186,7 +186,7 @@ async fn additional_context_trust_controls_message_role() -> Result<()> {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: BTreeMap::from([
+            additional_context: IndexMap::from([
                 (
                     "browser_info".to_string(),
                     AdditionalContextEntry {
@@ -250,7 +250,7 @@ async fn additional_context_is_deduplicated_between_turns_while_retained() -> Re
         .with_config(|config| config.include_environment_context = false)
         .build(&server)
         .await?;
-    let additional_context = BTreeMap::from([(
+    let additional_context = IndexMap::from([(
         "browser_info".to_string(),
         AdditionalContextEntry {
             value: "same tab".to_string(),
@@ -344,7 +344,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: BTreeMap::from([
+            additional_context: IndexMap::from([
                 (
                     "automation_info".to_string(),
                     AdditionalContextEntry {
@@ -376,7 +376,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: BTreeMap::from([
+            additional_context: IndexMap::from([
                 (
                     "automation_info".to_string(),
                     AdditionalContextEntry {
@@ -408,7 +408,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: BTreeMap::from([
+            additional_context: IndexMap::from([
                 (
                     "automation_info".to_string(),
                     AdditionalContextEntry {
@@ -503,7 +503,7 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: BTreeMap::from([
+            additional_context: IndexMap::from([
                 (
                     "automation_info".to_string(),
                     AdditionalContextEntry {

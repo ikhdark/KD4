@@ -1006,17 +1006,27 @@ impl RolloutRecorder {
     }
 
     async fn existing_manifest_hashes(path: &Path) -> std::io::Result<HashSet<String>> {
+        let (_, hashes) = Self::existing_rollout_state(path).await?;
+        Ok(hashes)
+    }
+
+    async fn existing_rollout_state(path: &Path) -> std::io::Result<(bool, HashSet<String>)> {
+        let mut has_session_meta = false;
         let mut hashes = HashSet::new();
         let mut reader = compression::open_rollout_line_reader(path).await?;
         while let Some(line) = reader.next_line().await? {
             let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
                 continue;
             };
-            if let RolloutItem::ToolManifest(manifest) = rollout_line.item {
-                hashes.insert(manifest.hash);
+            match rollout_line.item {
+                RolloutItem::SessionMeta(_) => has_session_meta = true,
+                RolloutItem::ToolManifest(manifest) => {
+                    hashes.insert(manifest.hash);
+                }
+                _ => {}
             }
         }
-        Ok(hashes)
+        Ok((has_session_meta, hashes))
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
@@ -1780,8 +1790,29 @@ impl RolloutWriterState {
         let file = tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
             .await
             .map_err(IoError::other)??;
+        // Multiple recorders for the same newly-created thread can be initialized before any of
+        // them materializes the rollout. Re-check under the append lock so a later writer does not
+        // append another canonical session_meta or an already-persisted manifest.
+        let existing_rollout_state = if self.meta.is_some() && file.file.metadata()?.len() > 0 {
+            Some(RolloutRecorder::existing_rollout_state(&file.path).await?)
+        } else {
+            None
+        };
         self.writer = Some(file.into_jsonl_writer());
         self.deferred_log_file_info = None;
+        if let Some((has_session_meta, manifest_hashes)) = existing_rollout_state {
+            if has_session_meta {
+                self.meta = None;
+            }
+            self.pending_items.retain(|item| {
+                !matches!(
+                    item,
+                    RolloutItem::ToolManifest(manifest)
+                        if manifest_hashes.contains(&manifest.hash)
+                )
+            });
+            self.persisted_manifest_hashes.extend(manifest_hashes);
+        }
         Ok(())
     }
 

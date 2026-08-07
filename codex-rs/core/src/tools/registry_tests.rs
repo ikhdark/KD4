@@ -2,6 +2,27 @@ use super::*;
 use crate::session::step_context::StepContext;
 use pretty_assertions::assert_eq;
 
+#[test]
+fn complete_projection_envelope_respects_applied_limit() {
+    let envelope = serde_json::json!({
+        "outcome": "success",
+        "artifact_id": "artifact-123",
+        "output": "",
+        "preserved_content": [],
+        "next_action": "read the retained artifact",
+    });
+    let output = "!".repeat(8_000);
+
+    let (projected, rendered) =
+        serialize_projection_envelope_with_limit(envelope, &output, 64).expect("projection");
+
+    assert!(approx_token_count(&rendered) <= 64);
+    assert_eq!(
+        serde_json::from_str::<Value>(&rendered).expect("valid JSON projection"),
+        projected
+    );
+}
+
 struct TestHandler {
     tool_name: codex_tools::ToolName,
 }

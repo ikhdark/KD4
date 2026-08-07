@@ -120,7 +120,7 @@ pub fn truncate_text_with_output_limit(
     content: &str,
     limits: OutputLimitResolution,
 ) -> TruncatedTextOutput {
-    let text = truncate_text(content, TruncationPolicy::Tokens(limits.applied_limit));
+    let text = truncate_text_to_token_ceiling(content, limits.applied_limit);
     let was_truncated = text != content;
     TruncatedTextOutput {
         text,
@@ -138,6 +138,44 @@ pub fn truncate_text_to_token_ceiling(content: &str, max_tokens: usize) -> Strin
         return content.to_string();
     }
 
+    const BEFORE_MIDDLE: &str = "\n[omitted before retained middle]\n";
+    const AFTER_MIDDLE: &str = "\n[omitted after retained middle]\n";
+    let marker_tokens = approx_token_count(BEFORE_MIDDLE) + approx_token_count(AFTER_MIDDLE);
+    if max_tokens <= marker_tokens {
+        return truncate_middle_to_token_ceiling(content, max_tokens);
+    }
+
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut retained_chars = approx_bytes_for_tokens(max_tokens)
+        .min(chars.len().saturating_mul(3) / 4)
+        .max(3);
+    loop {
+        let head_chars = retained_chars.saturating_mul(2) / 5;
+        let middle_chars = retained_chars / 5;
+        let tail_chars = retained_chars.saturating_sub(head_chars + middle_chars);
+        let middle_start = chars.len().saturating_sub(middle_chars) / 2;
+        let tail_start = chars.len().saturating_sub(tail_chars);
+
+        let mut candidate = String::with_capacity(retained_chars + 128);
+        candidate.extend(&chars[..head_chars]);
+        candidate.push_str(BEFORE_MIDDLE);
+        candidate.extend(&chars[middle_start..middle_start + middle_chars]);
+        candidate.push_str(AFTER_MIDDLE);
+        candidate.extend(&chars[tail_start..]);
+
+        let actual_tokens = approx_token_count(&candidate);
+        if actual_tokens <= max_tokens {
+            return candidate;
+        }
+        let next_retained = retained_chars.saturating_sub((actual_tokens - max_tokens).max(1));
+        if next_retained < 3 {
+            return truncate_middle_to_token_ceiling(content, max_tokens);
+        }
+        retained_chars = next_retained;
+    }
+}
+
+fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> String {
     let mut truncation_budget = max_tokens;
     loop {
         let truncated = truncate_text(content, TruncationPolicy::Tokens(truncation_budget));
@@ -159,12 +197,13 @@ pub fn formatted_truncate_text_with_output_limit(
 ) -> TruncatedTextOutput {
     let mut truncated = truncate_text_with_output_limit(content, limits);
     if truncated.was_truncated {
-        truncated.text = format!(
+        let formatted = format!(
             "Warning: truncated output (original token count: {})\nTotal output lines: {}\n\n{}",
             approx_token_count(content),
             content.lines().count(),
             truncated.text
         );
+        truncated.text = truncate_text_to_token_ceiling(&formatted, limits.applied_limit);
     }
     truncated
 }

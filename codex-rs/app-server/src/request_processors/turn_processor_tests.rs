@@ -10,7 +10,7 @@ fn additional_context_entry(value: impl Into<String>) -> AdditionalContextEntry 
 #[test]
 fn map_additional_context_rejects_oversized_source_identifier() {
     let source = "s".repeat(MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES + 1);
-    let additional_context = HashMap::from([(source, additional_context_entry("value"))]);
+    let additional_context = IndexMap::from([(source, additional_context_entry("value"))]);
 
     let error = map_additional_context(Some(additional_context))
         .expect_err("oversized additional-context source should be rejected");
@@ -71,5 +71,20 @@ fn map_additional_context_rejects_aggregate_rendered_size() {
         )),
         "unexpected error: {}",
         error.message
+    );
+}
+
+#[test]
+fn map_additional_context_preserves_client_order() {
+    let additional_context = IndexMap::from([
+        ("dependency".to_string(), additional_context_entry("first")),
+        ("consumer".to_string(), additional_context_entry("second")),
+    ]);
+
+    let mapped = map_additional_context(Some(additional_context)).expect("context should map");
+
+    assert_eq!(
+        mapped.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["dependency", "consumer"]
     );
 }

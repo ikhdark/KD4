@@ -3,7 +3,7 @@ use codex_utils_string::approx_tokens_from_byte_count;
 
 use crate::ContextualUserFragment;
 
-const MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS: usize = 1_000;
+const MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS: usize = 4_000;
 const MAX_ADDITIONAL_CONTEXT_SOURCE_LABEL_BYTES: usize = 1_536;
 const SOURCE_LABEL_TRUNCATION_MARKER: &str = "…source truncated…";
 const APPLICATION_CONTEXT_KIND: &str = "application";

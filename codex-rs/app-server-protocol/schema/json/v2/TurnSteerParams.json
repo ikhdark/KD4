@@ -168,6 +168,30 @@
         },
         {
           "properties": {
+            "content": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "localPath"
+              ],
+              "title": "LocalPathUserInputType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "path",
+            "type"
+          ],
+          "title": "LocalPathUserInput",
+          "type": "object"
+        },
+        {
+          "properties": {
             "name": {
               "type": "string"
             },

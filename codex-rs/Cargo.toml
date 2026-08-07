@@ -334,7 +334,7 @@ icu_provider = { version = "2.1", features = ["sync"] }
 ignore = "0.4.23"
 image = { version = "^0.25.9", default-features = false }
 include_dir = "0.7.4"
-indexmap = "2.12.0"
+indexmap = { version = "2.12.0", features = ["serde"] }
 insta = "1.46.3"
 inventory = "0.3.19"
 itertools = "0.14.0"
@@ -389,7 +389,7 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1.14.0"
-schemars = "0.8.22"
+schemars = { version = "0.8.22", features = ["indexmap2"] }
 seccompiler = "0.5.0"
 semver = "1.0"
 sentry = "0.46.0"
@@ -450,7 +450,7 @@ tonic = { version = "0.14.3", default-features = false, features = ["channel", "
 tonic-prost = "0.14.3"
 tree-sitter = "0.25.10"
 tree-sitter-bash = "0.25"
-ts-rs = "11"
+ts-rs = { version = "11", features = ["indexmap-impl"] }
 tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }
 uds_windows = "1.1.0"
 unicode-casefold = "0.2.0"

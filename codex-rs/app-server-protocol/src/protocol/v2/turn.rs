@@ -20,6 +20,7 @@ use codex_protocol::user_input::TextElement as CoreTextElement;
 use codex_protocol::user_input::UserInput as CoreUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
+use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -87,7 +88,7 @@ pub struct TurnStartParams {
     /// Optional client-provided context fragments keyed by an opaque source identifier.
     #[experimental("turn/start.additionalContext")]
     #[ts(optional = nullable)]
-    pub additional_context: Option<HashMap<String, AdditionalContextEntry>>,
+    pub additional_context: Option<IndexMap<String, AdditionalContextEntry>>,
     /// Optional environments for this turn and subsequent turns.
     ///
     /// Omitted uses the thread sticky environments. Empty disables
@@ -191,7 +192,7 @@ pub struct TurnSteerParams {
     /// Optional client-provided context fragments keyed by an opaque source identifier.
     #[experimental("turn/steer.additionalContext")]
     #[ts(optional = nullable)]
-    pub additional_context: Option<HashMap<String, AdditionalContextEntry>>,
+    pub additional_context: Option<IndexMap<String, AdditionalContextEntry>>,
     /// Required active turn id precondition. The request fails when it does not
     /// match the currently active turn.
     pub expected_turn_id: String,
@@ -309,6 +310,10 @@ pub enum UserInput {
         detail: Option<ImageDetail>,
         path: PathBuf,
     },
+    LocalPath {
+        path: PathBuf,
+        content: String,
+    },
     Skill {
         name: String,
         path: PathBuf,
@@ -334,6 +339,7 @@ impl UserInput {
                 detail,
             },
             UserInput::LocalImage { path, detail } => CoreUserInput::LocalImage { path, detail },
+            UserInput::LocalPath { path, content } => CoreUserInput::LocalPath { path, content },
             UserInput::Skill { name, path } => CoreUserInput::Skill { name, path },
             UserInput::Mention { name, path } => CoreUserInput::Mention { name, path },
         }
@@ -355,6 +361,7 @@ impl From<CoreUserInput> for UserInput {
                 detail,
             },
             CoreUserInput::LocalImage { path, detail } => UserInput::LocalImage { path, detail },
+            CoreUserInput::LocalPath { path, content } => UserInput::LocalPath { path, content },
             CoreUserInput::Skill { name, path } => UserInput::Skill { name, path },
             CoreUserInput::Mention { name, path } => UserInput::Mention { name, path },
             _ => unreachable!("unsupported user input variant"),
@@ -366,6 +373,7 @@ impl UserInput {
     pub fn text_char_count(&self) -> usize {
         match self {
             UserInput::Text { text, .. } => text.chars().count(),
+            UserInput::LocalPath { content, .. } => content.chars().count(),
             UserInput::Image { .. }
             | UserInput::LocalImage { .. }
             | UserInput::Skill { .. }

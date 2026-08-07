@@ -3,7 +3,7 @@
 //! Uses a SQ (Submission Queue) / EQ (Event Queue) pattern to asynchronously communicate
 //! between user and agent.
 
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Mul;
@@ -561,7 +561,7 @@ pub enum Op {
         /// Optional turn-scoped Responses API `client_metadata`.
         responsesapi_client_metadata: Option<HashMap<String, String>>,
         /// Client-supplied context fragments keyed by an opaque source identifier.
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
+        additional_context: IndexMap<String, AdditionalContextEntry>,
 
         /// Persistent thread-settings overrides to apply before the input.
         thread_settings: ThreadSettingsOverrides,

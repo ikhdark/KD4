@@ -1,3 +1,4 @@
+use super::approx_token_count;
 use super::split_string;
 use super::truncate_middle_chars;
 use super::truncate_middle_with_token_budget;
@@ -97,16 +98,28 @@ fn truncate_with_token_budget_returns_original_when_under_limit() {
 fn truncate_with_token_budget_reports_truncation_at_zero_limit() {
     let s = "abcdef";
     let (out, original) = truncate_middle_with_token_budget(s, /*max_tokens*/ 0);
-    assert_eq!(out, "…2 tokens truncated…");
+    assert_eq!(out, "");
     assert_eq!(original, Some(2));
 }
 
 #[test]
 fn truncate_middle_tokens_handles_utf8_content() {
     let s = "😀😀😀😀😀😀😀😀😀😀\nsecond line with text\n";
-    let (out, tokens) = truncate_middle_with_token_budget(s, /*max_tokens*/ 8);
-    assert_eq!(out, "😀😀😀😀…8 tokens truncated… line with text\n");
+    let (out, tokens) = truncate_middle_with_token_budget(s, /*max_tokens*/ 12);
+    assert!(out.starts_with("😀"));
+    assert!(out.ends_with("text\n"));
+    assert!(approx_token_count(&out) <= 12);
     assert_eq!(tokens, Some(16));
+}
+
+#[test]
+fn token_estimate_is_conservative_for_punctuation_heavy_code() {
+    let json = r#"{"a":[1,2,3],"b":{"c":true}}"#;
+
+    assert!(approx_token_count(json) > json.len().div_ceil(4));
+    let (out, original) = truncate_middle_with_token_budget(json, 10);
+    assert!(original.is_some());
+    assert!(approx_token_count(&out) <= 10);
 }
 
 #[test]

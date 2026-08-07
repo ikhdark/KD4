@@ -82,6 +82,7 @@ use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
 use core_test_support::skip_if_wine_exec;
+use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -370,7 +371,7 @@ async fn turn_start_additional_context_flows_to_model_input() -> Result<()> {
                 text: "inspect tab".to_string(),
                 text_elements: Vec::new(),
             }],
-            additional_context: Some(HashMap::from([(
+            additional_context: Some(IndexMap::from([(
                 "custom_source".to_string(),
                 AdditionalContextEntry {
                     value: "source value".to_string(),

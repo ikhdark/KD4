@@ -115,6 +115,44 @@ fn test_model_client_with_thread_id(
     )
 }
 
+fn websocket_test_model_client() -> ModelClient {
+    let mut provider =
+        create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+    provider.supports_websockets = true;
+    ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
+}
+
+#[test]
+fn websocket_stream_retries_when_another_session_already_activated_http_fallback() {
+    let client = websocket_test_model_client();
+    let telemetry = test_session_telemetry();
+    let model_info = test_model_info();
+    let mut first_session = client.new_session();
+    let mut concurrent_session = client.new_session();
+    first_session.last_stream_was_websocket = true;
+    concurrent_session.last_stream_was_websocket = true;
+
+    assert!(first_session.try_switch_fallback_transport(&telemetry, &model_info));
+    assert!(concurrent_session.try_switch_fallback_transport(&telemetry, &model_info));
+    assert!(!concurrent_session.last_stream_was_websocket);
+    assert!(!concurrent_session.try_switch_fallback_transport(&telemetry, &model_info));
+}
+
 fn history_test_item(text: &str, turn_id: Option<&str>) -> ResponseItem {
     ResponseItem::Message {
         id: None,

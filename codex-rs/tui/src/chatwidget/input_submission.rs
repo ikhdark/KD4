@@ -175,6 +175,10 @@ impl ChatWidget {
             });
         }
 
+        for (path, content) in local_path_context::collect(&text, self.config.cwd.as_path()) {
+            items.push(UserInput::LocalPath { path, content });
+        }
+
         if !text.is_empty() {
             items.push(UserInput::Text {
                 text: text.clone(),

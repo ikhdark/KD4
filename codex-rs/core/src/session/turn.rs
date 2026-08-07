@@ -2326,11 +2326,27 @@ pub(crate) async fn built_tools(
             .instrument(trace_span!("built_tools.load_discoverable_tools"))
             .await
         };
+    let enabled_skill_plugin_ids = turn_context
+        .turn_skills
+        .snapshot
+        .outcome()
+        .skills_with_enabled()
+        .filter_map(|(skill, enabled)| enabled.then_some(skill.plugin_id.as_deref()).flatten())
+        .collect::<HashSet<_>>();
+    let direct_mcp_server_names = loaded_plugins
+        .plugins()
+        .iter()
+        .filter(|plugin| {
+            plugin.is_active() && enabled_skill_plugin_ids.contains(plugin.config_name.as_str())
+        })
+        .flat_map(|plugin| plugin.mcp_servers.keys().map(String::as_str))
+        .collect::<HashSet<_>>();
     let mcp_tool_exposure = build_mcp_tool_exposure(
         all_mcp_tools,
         connectors.as_deref(),
         &turn_context.config,
         search_tool_enabled(turn_context),
+        &direct_mcp_server_names,
     );
     let mcp_tools = has_mcp_servers.then_some(mcp_tool_exposure.direct_tools);
     let deferred_mcp_tools = mcp_tool_exposure.deferred_tools;

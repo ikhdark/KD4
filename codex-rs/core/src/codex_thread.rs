@@ -48,8 +48,8 @@ use codex_thread_store::ThreadStoreResult;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
+use indexmap::IndexMap;
 use rmcp::model::ReadResourceRequestParams;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -314,7 +314,7 @@ impl CodexThread {
     pub async fn steer_input(
         &self,
         input: Vec<UserInput>,
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
+        additional_context: IndexMap<String, AdditionalContextEntry>,
         expected_turn_id: Option<&str>,
         client_user_message_id: Option<String>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,

@@ -28,6 +28,7 @@ globset = { workspace = true }
 icu_decimal = { workspace = true }
 icu_locale_core = { workspace = true }
 icu_provider = { workspace = true, features = ["sync"] }
+indexmap = { workspace = true }
 quick-xml = { workspace = true, features = ["serialize"] }
 reqwest = { workspace = true }
 schemars = { workspace = true }

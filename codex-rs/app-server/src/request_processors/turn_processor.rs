@@ -6,17 +6,18 @@ use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use indexmap::IndexMap;
 
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
 
 const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
-const MAX_ADDITIONAL_CONTEXT_ENTRIES: usize = 16;
+const MAX_ADDITIONAL_CONTEXT_ENTRIES: usize = 64;
 const MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES: usize = 256;
-const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 32 * 1_024;
-// Context fragments cap each escaped value at approximately 1,000 tokens.
-const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 4_000;
+const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 128 * 1_024;
+// Context fragments cap each escaped value at approximately 4,000 tokens.
+const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 16 * 1_024;
 const ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES: usize = 96;
 
 fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
@@ -88,8 +89,8 @@ pub(crate) struct TurnRequestProcessor {
 }
 
 fn map_additional_context(
-    additional_context: Option<HashMap<String, AdditionalContextEntry>>,
-) -> Result<BTreeMap<String, CoreAdditionalContextEntry>, JSONRPCErrorError> {
+    additional_context: Option<IndexMap<String, AdditionalContextEntry>>,
+) -> Result<IndexMap<String, CoreAdditionalContextEntry>, JSONRPCErrorError> {
     let additional_context = additional_context.unwrap_or_default();
     if additional_context.len() > MAX_ADDITIONAL_CONTEXT_ENTRIES {
         return Err(invalid_request(format!(
@@ -510,7 +511,7 @@ impl TurnRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: TurnStartParams,
-        additional_context: BTreeMap<String, CoreAdditionalContextEntry>,
+        additional_context: IndexMap<String, CoreAdditionalContextEntry>,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
@@ -930,7 +931,7 @@ impl TurnRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: TurnSteerParams,
-        additional_context: BTreeMap<String, CoreAdditionalContextEntry>,
+        additional_context: IndexMap<String, CoreAdditionalContextEntry>,
     ) -> Result<TurnSteerResponse, JSONRPCErrorError> {
         let (_, thread) = self
             .load_thread(&params.thread_id)

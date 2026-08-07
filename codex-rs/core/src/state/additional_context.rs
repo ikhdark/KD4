@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::context::AdditionalContextDeveloperFragment;
 use crate::context::AdditionalContextUserFragment;
 use crate::context::ContextualUserFragment;
@@ -8,23 +6,24 @@ use codex_context_fragments::RenderedContextFragment;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind;
+use indexmap::IndexMap;
+
+const ADDITIONAL_CONTEXT_AGGREGATE_TOKEN_BUDGET: usize = 40_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AdditionalContextStore {
-    values: BTreeMap<String, AdditionalContextEntry>,
+    values: IndexMap<String, AdditionalContextEntry>,
 }
 
 impl AdditionalContextStore {
     pub(crate) fn merge(
         &mut self,
-        values: BTreeMap<String, AdditionalContextEntry>,
+        values: IndexMap<String, AdditionalContextEntry>,
     ) -> Vec<ResponseInputItem> {
-        let mut budget = ModelContextBudget::default();
-        let mut next_values = BTreeMap::new();
+        let mut budget = ModelContextBudget::new(ADDITIONAL_CONTEXT_AGGREGATE_TOKEN_BUDGET);
         let mut fragments = Vec::new();
-        for (key, entry) in values {
-            if self.values.get(&key) == Some(&entry) {
-                next_values.insert(key, entry);
+        for (key, entry) in &values {
+            if self.values.get(key) == Some(entry) {
                 continue;
             }
 
@@ -41,14 +40,27 @@ impl AdditionalContextStore {
                 }
             };
             if budget.try_take(&rendered) {
-                next_values.insert(key, entry);
                 fragments
                     .push(RenderedContextFragment::new(role, rendered).into_response_input_item());
-            } else if let Some(previous) = self.values.get(&key) {
-                next_values.insert(key, previous.clone());
+            } else {
+                let omission_role = if matches!(
+                    self.values.get(key),
+                    Some(previous) if previous.kind == AdditionalContextKind::Application
+                ) {
+                    "developer"
+                } else {
+                    role
+                };
+                let omission = format!(
+                    r#"<additional_context_omitted source={key:?} reason="aggregate budget exceeded" previous_value_obsolete="true" />"#
+                );
+                fragments.push(
+                    RenderedContextFragment::new(omission_role, omission)
+                        .into_response_input_item(),
+                );
             }
         }
-        self.values = next_values;
+        self.values = values;
         fragments
     }
 }
@@ -59,38 +71,80 @@ mod tests {
     use codex_protocol::models::ContentItem;
 
     #[test]
-    fn aggregate_budget_retries_an_omitted_entry_on_the_next_merge() {
-        // Individual additional-context values are capped before the aggregate
-        // budget is applied, so use enough maximum-sized entries to overflow the
-        // shared budget without relying on pre-render input length.
-        let values = (0..10)
+    fn preserves_source_insertion_order() {
+        let values = IndexMap::from([
+            (
+                "z-first".to_string(),
+                AdditionalContextEntry {
+                    value: "first".to_string(),
+                    kind: AdditionalContextKind::Application,
+                },
+            ),
+            (
+                "a-second".to_string(),
+                AdditionalContextEntry {
+                    value: "second".to_string(),
+                    kind: AdditionalContextKind::Application,
+                },
+            ),
+        ]);
+        let mut store = AdditionalContextStore::default();
+
+        let fragments = store.merge(values);
+
+        assert!(input_text(&fragments[0]).contains("z-first"));
+        assert!(input_text(&fragments[1]).contains("a-second"));
+    }
+
+    #[test]
+    fn over_budget_updates_state_instead_of_restoring_stale_values() {
+        let mut store = AdditionalContextStore::default();
+        store.merge(IndexMap::from([(
+            "target".to_string(),
+            AdditionalContextEntry {
+                value: "old".to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        )]));
+
+        let mut values = (0..12)
             .map(|index| {
                 (
                     format!("source-{index:02}"),
                     AdditionalContextEntry {
-                        value: "a".repeat(4_000),
+                        value: "a".repeat(20_000),
                         kind: AdditionalContextKind::Application,
                     },
                 )
             })
-            .collect::<BTreeMap<_, _>>();
-        let value_count = values.len();
-        let mut store = AdditionalContextStore::default();
-
-        let first = store.merge(values.clone());
-        let second = store.merge(values.clone());
-        let third = store.merge(values);
-
-        assert!(!first.is_empty());
-        assert!(first.len() < value_count);
-        assert!(input_text(&first[0]).contains("source-00"));
-        assert_eq!(first.len() + second.len(), value_count);
-        assert!(
-            second
-                .iter()
-                .any(|item| input_text(item).contains("source-09"))
+            .collect::<IndexMap<_, _>>();
+        values.insert(
+            "target".to_string(),
+            AdditionalContextEntry {
+                value: "new".to_string(),
+                kind: AdditionalContextKind::Untrusted,
+            },
         );
-        assert!(third.is_empty());
+
+        let fragments = store.merge(values.clone());
+
+        assert!(
+            fragments
+                .iter()
+                .any(|item| input_text(item).contains("previous_value_obsolete=\"true\""))
+        );
+        assert!(fragments.iter().any(|item| matches!(
+            item,
+            ResponseInputItem::Message { role, content, .. }
+                if role == "developer"
+                    && content.iter().any(|content| matches!(
+                        content,
+                        ContentItem::InputText { text }
+                            if text.contains("previous_value_obsolete=\"true\"")
+                    ))
+        )));
+        assert_eq!(store.values.get("target"), values.get("target"));
+        assert!(store.merge(values).is_empty());
     }
 
     fn input_text(item: &ResponseInputItem) -> &str {

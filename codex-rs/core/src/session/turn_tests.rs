@@ -33,10 +33,10 @@ use codex_utils_path_uri::PathUri;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::test_codex::test_codex;
+use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
 use rmcp::model::Tool;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
@@ -691,7 +691,7 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
             items: Vec::new(),
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: BTreeMap::from([(
+            additional_context: IndexMap::from([(
                 "phase-68-large-initial-response-item".to_string(),
                 AdditionalContextEntry {
                     value: "large model-visible response context ".repeat(128),

@@ -1,5 +1,5 @@
+use indexmap::IndexMap;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -829,7 +829,7 @@ impl Codex {
     pub async fn steer_input(
         &self,
         input: Vec<UserInput>,
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
+        additional_context: IndexMap<String, AdditionalContextEntry>,
         expected_turn_id: Option<&str>,
         client_user_message_id: Option<String>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
@@ -3734,20 +3734,44 @@ impl Session {
         state.take_new_context_window_request()
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_new_context_window(
         &self,
         turn_context: &TurnContext,
         world_state: Arc<WorldState>,
+    ) -> u64 {
+        self.start_new_context_window_inner(turn_context, world_state, Vec::new(), false)
+            .await
+    }
+
+    pub(crate) async fn start_new_context_window_with_retained_evidence(
+        &self,
+        turn_context: &TurnContext,
+        world_state: Arc<WorldState>,
+        retained_evidence: Vec<ResponseItem>,
+    ) -> u64 {
+        self.start_new_context_window_inner(turn_context, world_state, retained_evidence, true)
+            .await
+    }
+
+    async fn start_new_context_window_inner(
+        &self,
+        turn_context: &TurnContext,
+        world_state: Arc<WorldState>,
+        retained_evidence: Vec<ResponseItem>,
+        persist_replacement_history: bool,
     ) -> u64 {
         let window = {
             let mut state = self.state.lock().await;
             state.start_new_context_window()
         };
         let (window_number, window_ids) = window;
-        let (context_items, world_state_baseline) = self
+        let (mut context_items, world_state_baseline) = self
             .build_initial_context_with_world_state_and_snapshot(turn_context, world_state.as_ref())
             .await;
+        context_items.extend(retained_evidence);
         let turn_context_item = turn_context.to_turn_context_item();
+        let replacement_history = persist_replacement_history.then(|| context_items.clone());
         self.replace_compacted_history(
             turn_context,
             context_items,
@@ -3755,7 +3779,7 @@ impl Session {
             Some(world_state_baseline),
             CompactedItem {
                 message: String::new(),
-                replacement_history: None,
+                replacement_history,
                 window_number: Some(window_number),
                 first_window_id: Some(window_ids.first_window_id.to_string()),
                 previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
@@ -4231,7 +4255,7 @@ impl Session {
     pub async fn steer_input(
         &self,
         input: Vec<UserInput>,
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
+        additional_context: IndexMap<String, AdditionalContextEntry>,
         expected_turn_id: Option<&str>,
         client_user_message_id: Option<String>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,

@@ -30,6 +30,7 @@ use codex_utils_output_truncation::classify_diagnostic;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_projected_output_limits;
+use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -605,6 +606,8 @@ impl ExecCommandToolOutput {
     }
 
     fn response_text(&self) -> String {
+        let raw_output = String::from_utf8_lossy(&self.raw_output);
+        let max_tokens = self.model_output_limits(raw_output.as_ref()).applied_limit;
         let mut sections = Vec::new();
 
         if !self.chunk_id.is_empty() {
@@ -637,7 +640,7 @@ impl ExecCommandToolOutput {
         sections.push("Output:".to_string());
         sections.push(self.output_with_reduction_notice(self.projected_model_output()));
 
-        sections.join("\n")
+        truncate_text_to_token_ceiling(&sections.join("\n"), max_tokens)
     }
 }
 

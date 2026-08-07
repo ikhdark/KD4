@@ -672,6 +672,71 @@ fn writer_state_deduplicates_manifests_and_coalesces_token_counts() {
 }
 
 #[tokio::test]
+async fn deferred_writer_reuses_existing_session_metadata_and_manifests() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::now_v7();
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let rollout_path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+    let persisted_manifest = RolloutLine {
+        timestamp: "2025-01-03T12:00:01Z".to_string(),
+        item: RolloutItem::ToolManifest(ToolManifestItem {
+            hash: "persisted".to_string(),
+            manifest: serde_json::json!({"hash": "persisted"}),
+        }),
+    };
+    let mut file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
+    writeln!(file, "{}", serde_json::to_string(&persisted_manifest)?)?;
+    drop(file);
+
+    let mut state = RolloutWriterState::new(
+        /*writer*/ None,
+        Some(LogFileInfo {
+            path: rollout_path.clone(),
+            conversation_id: thread_id,
+            timestamp: OffsetDateTime::now_utc(),
+        }),
+        Some(SessionMeta {
+            session_id: SessionId::from(thread_id),
+            id: thread_id,
+            ..SessionMeta::default()
+        }),
+        home.path().to_path_buf(),
+        rollout_path.clone(),
+        HashSet::new(),
+    );
+    let manifest = |hash: &str| {
+        RolloutItem::ToolManifest(ToolManifestItem {
+            hash: hash.to_string(),
+            manifest: serde_json::json!({"hash": hash}),
+        })
+    };
+    state.add_items(vec![manifest("persisted"), manifest("changed")]);
+
+    state.flush().await?;
+
+    let lines = fs::read_to_string(&rollout_path)?
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| matches!(line.item, RolloutItem::SessionMeta(_)))
+            .count(),
+        1
+    );
+    let manifest_hashes = lines
+        .iter()
+        .filter_map(|line| match &line.item {
+            RolloutItem::ToolManifest(manifest) => Some(manifest.hash.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(manifest_hashes, vec!["persisted", "changed"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn existing_manifest_hashes_skips_malformed_lines() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let rollout_path = home.path().join("rollout.jsonl");

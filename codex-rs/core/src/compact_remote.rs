@@ -342,6 +342,8 @@ pub(crate) async fn process_compacted_history(
 /// - `user`-role warnings that parse as `TurnItem::UserMessage` and compaction-generated summary
 ///   messages. Legacy warning fragments are filtered by `parse_turn_item` before they reach this
 ///   check.
+/// - tool calls and outputs, because bounded outputs can contain opaque artifact IDs used to
+///   recover exact omitted ranges after compaction.
 pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
     match item {
         ResponseItem::Message { role, .. } if role == "developer" => false,
@@ -356,9 +358,7 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         ResponseItem::AgentMessage { .. } => true,
         ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
         ResponseItem::CompactionTrigger { .. } => false,
-        ResponseItem::AdditionalTools { .. }
-        | ResponseItem::Reasoning { .. }
-        | ResponseItem::LocalShellCall { .. }
+        ResponseItem::LocalShellCall { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::ToolSearchCall { .. }
         | ResponseItem::FunctionCallOutput { .. }
@@ -366,7 +366,9 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::WebSearchCall { .. }
-        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::ImageGenerationCall { .. } => true,
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::Reasoning { .. }
         | ResponseItem::Other => false,
     }
 }

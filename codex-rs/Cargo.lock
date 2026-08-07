@@ -2063,6 +2063,7 @@ dependencies = [
  "flate2",
  "futures",
  "hmac 0.12.1",
+ "indexmap 2.14.0",
  "opentelemetry",
  "opentelemetry_sdk",
  "pretty_assertions",
@@ -2151,6 +2152,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
  "codex-utils-path-uri",
+ "indexmap 2.14.0",
  "inventory",
  "pretty_assertions",
  "rmcp",
@@ -3797,6 +3799,7 @@ dependencies = [
  "icu_decimal",
  "icu_locale_core",
  "icu_provider",
+ "indexmap 2.14.0",
  "landlock",
  "pretty_assertions",
  "quick-xml 0.41.0",
@@ -12097,6 +12100,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
 dependencies = [
  "dyn-clone",
+ "indexmap 2.14.0",
  "schemars_derive 0.8.22",
  "serde",
  "serde_json",
@@ -14309,6 +14313,7 @@ version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4994acea2522cd2b3b85c1d9529a55991e3ad5e25cdcd3de9d505972c4379424"
 dependencies = [
+ "indexmap 2.14.0",
  "serde_json",
  "thiserror 2.0.18",
  "ts-rs-macros",

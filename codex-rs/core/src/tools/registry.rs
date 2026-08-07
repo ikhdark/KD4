@@ -42,6 +42,7 @@ use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_projected_output_limits;
+use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tracing::instrument;
@@ -895,7 +896,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         "original_lines": spillable_text.lines().count(),
         "approx_original_tokens": approx_token_count(&spillable_text),
         "applied_token_limit": applied_token_limit,
-        "output": projected_text,
+        "output": "",
         "artifact_id": artifact_id,
         "retained_artifact_bytes": retained_artifact_bytes,
         "artifact_retention_limit_hit": retention_limit_hit,
@@ -903,11 +904,53 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         "preserved_content": preserved_content,
         "next_action": "Use read_tool_output with artifact_id and a narrow line range for exact expansion.",
     });
-    let rendered = serde_json::to_string(&envelope).ok()?;
+    let (envelope, rendered) =
+        serialize_projection_envelope_with_limit(envelope, &projected_text, applied_token_limit)?;
     Some(ModelToolProjection {
         response: replace_response_text(original_response, rendered),
         code_mode: envelope,
     })
+}
+
+fn serialize_projection_envelope_with_limit(
+    mut envelope: Value,
+    output: &str,
+    token_limit: usize,
+) -> Option<(Value, String)> {
+    // A JSON value cannot represent zero tokens. Keep that degenerate request to
+    // the smallest valid JSON value while enforcing every positive limit exactly.
+    let effective_limit = token_limit.max(1);
+    let mut output_limit = effective_limit;
+    loop {
+        envelope["output"] = Value::String(truncate_text_to_token_ceiling(output, output_limit));
+        let rendered = serde_json::to_string(&envelope).ok()?;
+        let rendered_tokens = approx_token_count(&rendered);
+        if rendered_tokens <= effective_limit {
+            return Some((envelope, rendered));
+        }
+        if output_limit == 0 {
+            break;
+        }
+        output_limit = output_limit
+            .saturating_sub((rendered_tokens - effective_limit).max(1))
+            .min(output_limit - 1);
+    }
+
+    // Exceptionally large metadata (for example an inline image) can exceed the
+    // limit without any text body. Retain the artifact locator when it fits, then
+    // fall back to the smallest valid JSON projection.
+    let artifact_id = envelope.get("artifact_id").cloned().unwrap_or(Value::Null);
+    for fallback in [
+        serde_json::json!({ "artifact_id": artifact_id }),
+        serde_json::json!({}),
+        Value::Null,
+    ] {
+        let rendered = serde_json::to_string(&fallback).ok()?;
+        if approx_token_count(&rendered) <= effective_limit {
+            return Some((fallback, rendered));
+        }
+    }
+    None
 }
 
 fn replace_response_text(mut response: ResponseInputItem, rendered: String) -> ResponseInputItem {

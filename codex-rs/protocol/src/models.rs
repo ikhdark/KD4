@@ -24,6 +24,7 @@ use crate::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_image::ImageProcessingError;
 use codex_utils_path_uri::PathUri;
+use codex_utils_string::truncate_middle_with_token_budget;
 use schemars::JsonSchema;
 
 use crate::ResponseItemId;
@@ -1739,6 +1740,13 @@ impl From<Vec<UserInput>> for ResponseInputItem {
     }
 }
 
+const LOCAL_PATH_CONTEXT_TOKEN_BUDGET: usize = 10_000;
+
+fn render_local_path_context(path: &Path, content: &str) -> String {
+    let rendered = format!("<local_path_context path={path:?}>\n{content}\n</local_path_context>");
+    truncate_middle_with_token_budget(&rendered, LOCAL_PATH_CONTEXT_TOKEN_BUDGET).0
+}
+
 impl ResponseInputItem {
     pub fn from_user_input(
         items: Vec<UserInput>,
@@ -1783,6 +1791,11 @@ impl ResponseInputItem {
                             },
                             Err(err) => vec![local_image_error_placeholder(&path, err)],
                         }
+                    }
+                    UserInput::LocalPath { path, content } => {
+                        vec![ContentItem::InputText {
+                            text: render_local_path_context(&path, &content),
+                        }]
                     }
                     UserInput::Skill { .. } | UserInput::Mention { .. } => Vec::new(), // Tool bodies are injected later in core
                 })
@@ -2260,6 +2273,24 @@ mod tests {
                 internal_chat_message_metadata_passthrough: None,
             }
         );
+    }
+
+    #[test]
+    fn local_path_context_respects_model_item_ceiling() {
+        let item = ResponseInputItem::from(vec![UserInput::LocalPath {
+            path: std::path::PathBuf::from("large-context.txt"),
+            content: "{}[](),".repeat(20_000),
+        }]);
+        let ResponseInputItem::Message { content, .. } = item else {
+            panic!("expected user message");
+        };
+        let ContentItem::InputText { text } = &content[0] else {
+            panic!("expected local path text");
+        };
+
+        assert!(codex_utils_string::approx_token_count(text) <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET);
+        assert!(text.starts_with("<local_path_context"));
+        assert!(text.ends_with("</local_path_context>"));
     }
 
     #[test]

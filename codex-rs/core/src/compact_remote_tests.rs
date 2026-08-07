@@ -40,6 +40,20 @@ fn custom_tool_call_output(id: &str, call_id: &str, output: &str) -> ResponseIte
     }
 }
 
+#[test]
+fn remote_compaction_keeps_tool_outputs_with_recovery_references() {
+    let artifact_reference = "[output truncated; exact output retained as artifact 019fd974-843a-7601-8624-dc36cd5cc3cd]";
+
+    assert!(should_keep_compacted_history_item(&function_call_output(
+        "output-1",
+        "call-1",
+        artifact_reference,
+    )));
+    assert!(should_keep_compacted_history_item(
+        &custom_tool_call_output("output-2", "call-2", artifact_reference,)
+    ));
+}
+
 #[tokio::test]
 async fn trim_function_call_history_rewrites_contiguous_trailing_outputs_in_one_pass() {
     let (_session, mut turn_context) = make_session_and_context().await;

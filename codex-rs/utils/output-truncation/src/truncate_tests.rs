@@ -9,6 +9,7 @@ use crate::approx_token_count;
 use crate::approx_tokens_from_byte_count_i64;
 use crate::formatted_truncate_text;
 use crate::formatted_truncate_text_content_items_with_policy;
+use crate::formatted_truncate_text_with_output_limit;
 use crate::resolve_output_limits;
 use crate::resolve_projected_output_limits;
 use crate::truncate_function_output_items_with_policy;
@@ -34,7 +35,7 @@ fn truncate_tokens_less_than_placeholder_returns_placeholder() {
     let content = "example output";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 4)\nTotal output lines: 1\n\nex…3 tokens truncated…ut",
+        "Warning: truncated output (original token count: 4)\nTotal output lines: 1\n\n…4 tokens truncated…",
         formatted_truncate_text(content, TruncationPolicy::Tokens(1)),
     );
 }
@@ -64,7 +65,7 @@ fn truncate_tokens_over_limit_returns_truncated() {
     let content = "this is an example of a long output that should be truncated";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 15)\nTotal output lines: 1\n\nthis is an…10 tokens truncated… truncated",
+        "Warning: truncated output (original token count: 17)\nTotal output lines: 1\n\n…15 tokens truncated…",
         formatted_truncate_text(content, TruncationPolicy::Tokens(5)),
     );
 }
@@ -74,7 +75,7 @@ fn truncate_bytes_over_limit_returns_truncated() {
     let content = "this is an example of a long output that should be truncated";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 15)\nTotal output lines: 1\n\nthis is an exam…30 chars truncated…ld be truncated",
+        "Warning: truncated output (original token count: 17)\nTotal output lines: 1\n\nthis is an exam…30 chars truncated…ld be truncated",
         formatted_truncate_text(content, TruncationPolicy::Bytes(30)),
     );
 }
@@ -85,7 +86,7 @@ fn truncate_bytes_reports_original_line_count_when_truncated() {
         "this is an example of a long output that should be truncated\nalso some other line";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 21)\nTotal output lines: 2\n\nthis is an exam…51 chars truncated…some other line",
+        "Warning: truncated output (original token count: 22)\nTotal output lines: 2\n\nthis is an exam…51 chars truncated…some other line",
         formatted_truncate_text(content, TruncationPolicy::Bytes(30)),
     );
 }
@@ -96,7 +97,7 @@ fn truncate_tokens_reports_original_line_count_when_truncated() {
         "this is an example of a long output that should be truncated\nalso some other line";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 21)\nTotal output lines: 2\n\nthis is an example o…11 tokens truncated…also some other line",
+        "Warning: truncated output (original token count: 22)\nTotal output lines: 2\n\nthis …18 tokens truncated… line",
         formatted_truncate_text(content, TruncationPolicy::Tokens(10)),
     );
 }
@@ -332,7 +333,7 @@ fn formatted_truncate_text_content_items_with_policy_merges_all_text_for_token_b
     assert_eq!(
         output,
         vec![FunctionCallOutputContentItem::InputText {
-            text: "Warning: truncated output (original token count: 5)\nTotal output lines: 2\n\nabcd…3 tokens truncated…mnop".to_string(),
+            text: "Warning: truncated output (original token count: 5)\nTotal output lines: 2\n\n…5 tokens truncated…".to_string(),
         }]
     );
     assert_eq!(original_token_count, Some(5));
@@ -486,10 +487,37 @@ fn output_limit_truncation_reports_whether_text_was_reduced() {
 }
 
 #[test]
+fn formatted_output_respects_the_complete_projection_ceiling() {
+    let limits =
+        resolve_output_limits(Some(32), OutputOutcome::Success, Some("echo ok"), "ok", 100);
+
+    let truncated = formatted_truncate_text_with_output_limit(&"x".repeat(4_000), limits);
+
+    assert!(truncated.was_truncated);
+    assert!(approx_token_count(&truncated.text) <= limits.applied_limit);
+}
+
+#[test]
 fn exact_token_ceiling_includes_the_truncation_marker() {
     let truncated = truncate_text_to_token_ceiling(&"abcd ".repeat(10_000), 32);
 
     assert!(approx_token_count(&truncated) <= 32);
+}
+
+#[test]
+fn token_ceiling_retains_head_middle_and_tail_evidence() {
+    let content = format!(
+        "HEAD_EVIDENCE\n{}MIDDLE_EVIDENCE\n{}TAIL_EVIDENCE",
+        "before\n".repeat(1_000),
+        "afterx\n".repeat(1_000)
+    );
+
+    let truncated = truncate_text_to_token_ceiling(&content, 256);
+
+    assert!(truncated.contains("HEAD_EVIDENCE"));
+    assert!(truncated.contains("MIDDLE_EVIDENCE"));
+    assert!(truncated.contains("TAIL_EVIDENCE"));
+    assert!(approx_token_count(&truncated) <= 256);
 }
 
 #[test]

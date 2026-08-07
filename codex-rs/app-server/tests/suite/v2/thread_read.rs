@@ -1592,6 +1592,7 @@ fn turn_user_texts(turns: &[codex_app_server_protocol::Turn]) -> Vec<&str> {
                 UserInput::Text { text, .. } => Some(text.as_str()),
                 UserInput::Image { .. }
                 | UserInput::LocalImage { .. }
+                | UserInput::LocalPath { .. }
                 | UserInput::Skill { .. }
                 | UserInput::Mention { .. } => None,
             },
@@ -1608,6 +1609,7 @@ fn thread_item_user_texts(items: &[ThreadItem]) -> Vec<&str> {
                 UserInput::Text { text, .. } => Some(text.as_str()),
                 UserInput::Image { .. }
                 | UserInput::LocalImage { .. }
+                | UserInput::LocalPath { .. }
                 | UserInput::Skill { .. }
                 | UserInput::Mention { .. } => None,
             },
