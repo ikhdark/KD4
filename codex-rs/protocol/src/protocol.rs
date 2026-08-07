@@ -2849,6 +2849,7 @@ impl InitialHistory {
             .find_map(|item| match item {
                 RolloutItem::TurnContext(turn_context) => Some(turn_context),
                 RolloutItem::SessionMeta(_)
+                | RolloutItem::ToolManifest(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -3185,6 +3186,7 @@ fn multi_agent_version_from_items(
         items.iter().rev().find_map(|item| match item {
             RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
             RolloutItem::SessionMeta(_)
+            | RolloutItem::ToolManifest(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -3342,6 +3344,7 @@ impl<'de> Deserialize<'de> for SessionMetaLine {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
+    ToolManifest(ToolManifestItem),
     ResponseItem(ResponseItem),
     /// Legacy delivery item reconstructed as a model-visible `agent_message`.
     InterAgentCommunication(InterAgentCommunication),
@@ -3353,6 +3356,14 @@ pub enum RolloutItem {
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
     EventMsg(EventMsg),
+}
+
+/// Canonical tool surface used for a model request. The hash is computed from
+/// the recursively key-sorted manifest value.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+pub struct ToolManifestItem {
+    pub hash: String,
+    pub manifest: Value,
 }
 
 /// Persisted comparison state used to resume model-visible world-state diffing.

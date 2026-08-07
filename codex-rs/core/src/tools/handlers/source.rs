@@ -43,12 +43,16 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::warn;
 
 const SOURCE_TOOL_MAX_RENDERED_BYTES: usize = 8 * 1024;
+const SOURCE_COORDINATION_MAX_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -257,6 +261,21 @@ async fn handle_read_file_span(
     let line_count = args.line_count.unwrap_or(SOURCE_READ_DEFAULT_LINES);
     validate_read_file_span_bounds(start_line, line_count)
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+    if let Some((skill_path, bytes)) = read_loaded_skill_bytes(&invocation, &args.path).await? {
+        let file_len = bytes.len();
+        if file_len > SOURCE_SEARCH_MAX_FILE_BYTES {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "source file `{}` is too large ({} bytes, max {})",
+                args.path, file_len, SOURCE_SEARCH_MAX_FILE_BYTES
+            )));
+        }
+        let output = read_file_span_from_bytes(skill_path, bytes, start_line, line_count)
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+        return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+            render_read_output(&output),
+            Some(true),
+        )));
+    }
     let source_context = local_source_context(&invocation, args.environment_id.as_deref()).await?;
     let path = resolve_confined_path(&source_context, &args.path, "source file").await?;
     let metadata = source_context
@@ -295,7 +314,64 @@ async fn handle_read_file_span(
     )))
 }
 
+async fn read_loaded_skill_bytes(
+    invocation: &ToolInvocation,
+    requested_path: &str,
+) -> Result<Option<(String, Vec<u8>)>, FunctionCallError> {
+    let Ok(requested_path) = AbsolutePathBuf::try_from(requested_path) else {
+        return Ok(None);
+    };
+    let snapshot = &invocation.step_context.turn.turn_skills.snapshot;
+    let outcome = snapshot.outcome();
+    let Some(skill) = outcome
+        .skills
+        .iter()
+        .find(|skill| outcome.is_skill_enabled(skill) && skill.path_to_skills_md == requested_path)
+    else {
+        return Ok(None);
+    };
+    let contents = snapshot.read_skill_text(skill).await.map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "unable to read loaded skill `{}`: {err}",
+            skill.path_to_skills_md.display()
+        ))
+    })?;
+    let display_path = skill.path_to_skills_md.to_string_lossy().replace('\\', "/");
+    Ok(Some((display_path, contents.into_bytes())))
+}
+
 async fn record_supporting_source_reads(
+    invocation: &ToolInvocation,
+    source_context: &LocalSourceContext,
+    entries: Vec<WorkspaceManifestEntry>,
+) -> Result<(), FunctionCallError> {
+    await_supporting_read_coordination(
+        SOURCE_COORDINATION_MAX_WAIT,
+        record_supporting_source_reads_inner(invocation, source_context, entries),
+    )
+    .await
+}
+
+async fn await_supporting_read_coordination<F>(
+    max_wait: Duration,
+    coordination: F,
+) -> Result<(), FunctionCallError>
+where
+    F: Future<Output = Result<(), FunctionCallError>>,
+{
+    match tokio::time::timeout(max_wait, coordination).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                max_wait_ms = max_wait.as_millis(),
+                "source read coordination exceeded its time budget; returning confined read output"
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn record_supporting_source_reads_inner(
     invocation: &ToolInvocation,
     source_context: &LocalSourceContext,
     entries: Vec<WorkspaceManifestEntry>,
@@ -304,8 +380,8 @@ async fn record_supporting_source_reads(
         return Ok(());
     }
     let coordinator = invocation.session.services.agent_control.task_coordinator();
-    if coordinator.store().is_none() {
-        coordinator
+    if coordinator.store().is_none()
+        && let Err(error) = coordinator
             .initialize_for_workspace_coordination(
                 invocation.session.services.state_db.clone(),
                 invocation.step_context.turn.config.sqlite_home.clone(),
@@ -323,23 +399,22 @@ async fn record_supporting_source_reads(
                     .to_string(),
             )
             .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "read_file_span: supporting-read coordination could not initialize: {error}"
-                ))
-            })?;
+    {
+        warn!(
+            %error,
+            "source tool completed without initializing supporting-read coordination"
+        );
+        return Ok(());
     }
     let binding = coordinator.binding_for_source(&invocation.step_context.turn.session_source);
-    let store = coordinator.store().ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "read_file_span: supporting-read task store is unavailable".to_string(),
-        )
-    })?;
-    let root_session_id = coordinator.root_session_id().ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "read_file_span: durable root task identity is unavailable".to_string(),
-        )
-    })?;
+    let Some(store) = coordinator.store() else {
+        warn!("source tool completed without an available supporting-read task store");
+        return Ok(());
+    };
+    let Some(root_session_id) = coordinator.root_session_id() else {
+        warn!("source tool completed without a durable root task identity");
+        return Ok(());
+    };
     let agent_path = invocation
         .step_context
         .turn
@@ -365,22 +440,26 @@ async fn record_supporting_source_reads(
     } else {
         (format!("root:{root_session_id}"), WorkspaceActorKind::Root)
     };
-    if let Some(binding) = binding.as_ref()
-        && !coordinator
-            .heartbeat_typed_actor_binding(binding)
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "read_file_span: typed reader heartbeat failed: {error}"
-                ))
-            })?
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "read_file_span: the bound typed assignment attempt is no longer active".to_string(),
-        ));
+    if let Some(binding) = binding.as_ref() {
+        match coordinator.heartbeat_typed_actor_binding(binding).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(FunctionCallError::RespondToModel(
+                    "read_file_span: the bound typed assignment attempt is no longer active"
+                        .to_string(),
+                ));
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    "source tool completed without persisting the typed reader heartbeat"
+                );
+                return Ok(());
+            }
+        }
     }
-    if kind != WorkspaceActorKind::Typed {
-        store
+    if kind != WorkspaceActorKind::Typed
+        && let Err(error) = store
             .register_workspace_actor(
                 source_context.repo_root_abs.as_path(),
                 WorkspaceActorRegistration {
@@ -393,20 +472,22 @@ async fn record_supporting_source_reads(
                 },
             )
             .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "read_file_span: durable reader identity could not be registered: {error}"
-                ))
-            })?;
+    {
+        warn!(
+            %error,
+            "source tool completed without registering its durable reader identity"
+        );
+        return Ok(());
     }
-    store
+    if let Err(error) = store
         .record_supporting_read_entries(source_context.repo_root_abs.as_path(), actor_id, entries)
         .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "read_file_span: supporting-read manifest could not be persisted: {error}"
-            ))
-        })?;
+    {
+        warn!(
+            %error,
+            "source tool completed without persisting its supporting-read manifest"
+        );
+    }
     Ok(())
 }
 

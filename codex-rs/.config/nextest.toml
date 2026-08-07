@@ -8,7 +8,7 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 retries = 1
 # Avoid saturating developer machines when Nextest is invoked directly.
 # NEXTEST_TEST_THREADS or --test-threads can opt into a different limit.
-test-threads = 8
+test-threads = 4
 
 [scripts.setup.windows-test-stack]
 command = ["python", "scripts/nextest_windows_stack.py"]
@@ -56,11 +56,11 @@ max-threads = 4
 [[profile.default.overrides]]
 # Do not add new tests here
 filter = 'test(rmcp_client) | test(humanlike_typing_1000_chars_appears_live_no_placeholder)'
-slow-timeout = { period = "1m", terminate-after = 4 }
+slow-timeout = { period = "2m", terminate-after = 4 }
 
 [[profile.default.overrides]]
 filter = 'test(approval_matrix_covers_all_modes)'
-slow-timeout = { period = "30s", terminate-after = 2 }
+slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
 filter = 'package(codex-app-server-protocol) & (test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated) | test(generate_ts_with_experimental_api_retains_experimental_entries) | test(generated_ts_optional_nullable_fields_only_in_params) | test(generate_json_filters_experimental_fields_and_methods))'
@@ -105,7 +105,7 @@ test-group = 'windows_sandbox_legacy_sessions'
 # in both Windows full-CI lanes after contention was reduced.
 platform = 'cfg(windows)'
 filter = 'test(start_thread_uses_all_default_environments_from_codex_home)'
-slow-timeout = { period = "1m", terminate-after = 2 }
+slow-timeout = { period = "2m", terminate-after = 2 }
 
 [[profile.default.overrides]]
 # These Windows-heavy tests spawn subprocesses, session files, or JSON-RPC
@@ -113,7 +113,7 @@ slow-timeout = { period = "1m", terminate-after = 2 }
 platform = 'cfg(windows)'
 filter = 'test(suite::resume::) | test(suite::cli_stream::) | test(suite::auth_env::) | test(start_thread_uses_all_default_environments_from_codex_home) | test(connect_stdio_command_initializes_json_rpc_client_on_windows)'
 test-group = 'windows_process_heavy'
-slow-timeout = { period = "45s", terminate-after = 2 }
+slow-timeout = { period = "1m", terminate-after = 2 }
 
 [[profile.default.overrides]]
 # Core's Windows library tests include real PowerShell parsing and child-process

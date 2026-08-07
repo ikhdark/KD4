@@ -1754,10 +1754,14 @@
     "MultiAgentV2ConfigToml": {
       "additionalProperties": false,
       "properties": {
+        "allow_full_history_forks": {
+          "description": "Allows the high-token-cost `fork_turns = \"all\"` mode. Disabled by default.",
+          "type": "boolean"
+        },
         "default_wait_timeout_ms": {
           "format": "int64",
           "maximum": 3600000.0,
-          "minimum": 0.0,
+          "minimum": 60000.0,
           "type": "integer"
         },
         "enabled": {
@@ -1774,13 +1778,13 @@
         "max_wait_timeout_ms": {
           "format": "int64",
           "maximum": 3600000.0,
-          "minimum": 0.0,
+          "minimum": 60000.0,
           "type": "integer"
         },
         "min_wait_timeout_ms": {
           "format": "int64",
           "maximum": 3600000.0,
-          "minimum": 0.0,
+          "minimum": 60000.0,
           "type": "integer"
         },
         "multi_agent_mode_hint_text": {

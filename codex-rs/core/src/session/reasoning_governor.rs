@@ -410,12 +410,16 @@ impl SamplingReasoningGovernor {
         }
         if outcomes.iter().any(|outcome| {
             outcome.kind == SamplingToolOutcomeKind::Success && outcome.plan.is_none()
-        }) && self.phase != SamplingReasoningPhase::Diagnose
-        {
-            self.transition_to(
-                SamplingReasoningPhase::Inspect,
-                ReasoningPolicyTrigger::ReadOnlyToolSuccess,
-            );
+        }) {
+            let next_phase = match self.phase {
+                SamplingReasoningPhase::Orient => SamplingReasoningPhase::Inspect,
+                SamplingReasoningPhase::Inspect => SamplingReasoningPhase::Inspect,
+                SamplingReasoningPhase::Implement => SamplingReasoningPhase::Implement,
+                SamplingReasoningPhase::Diagnose => SamplingReasoningPhase::Diagnose,
+                SamplingReasoningPhase::Verify => SamplingReasoningPhase::Verify,
+                SamplingReasoningPhase::Finalize => SamplingReasoningPhase::Finalize,
+            };
+            self.transition_to(next_phase, ReasoningPolicyTrigger::ReadOnlyToolSuccess);
         }
     }
 }
@@ -624,6 +628,26 @@ mod tests {
             ordinal: 0,
             kind: outcome,
             plan: None,
+        });
+        collector
+    }
+
+    fn collector_with_read_and(outcome: SamplingToolOutcomeKind) -> SamplingRequestSignalCollector {
+        let collector = collector_with(SamplingToolOutcomeKind::Success);
+        collector.push(SamplingToolOutcome {
+            ordinal: 1,
+            kind: outcome,
+            plan: None,
+        });
+        collector
+    }
+
+    fn collector_with_read_and_plan(plan: UpdatePlanArgs) -> SamplingRequestSignalCollector {
+        let collector = collector_with(SamplingToolOutcomeKind::Success);
+        collector.push(SamplingToolOutcome {
+            ordinal: 1,
+            kind: SamplingToolOutcomeKind::Success,
+            plan: Some(plan),
         });
         collector
     }
@@ -966,6 +990,82 @@ mod tests {
     }
 
     #[test]
+    fn read_success_retains_sticky_phases_and_selects_their_explicit_effort() {
+        let config = config();
+        let model = model(
+            &[
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ],
+            ReasoningEffort::Medium,
+        );
+        let cases = [
+            (
+                SamplingReasoningPhase::Orient,
+                SamplingReasoningPhase::Inspect,
+                config.inspect.clone(),
+            ),
+            (
+                SamplingReasoningPhase::Inspect,
+                SamplingReasoningPhase::Inspect,
+                config.inspect.clone(),
+            ),
+            (
+                SamplingReasoningPhase::Implement,
+                SamplingReasoningPhase::Implement,
+                config.implement.clone(),
+            ),
+            (
+                SamplingReasoningPhase::Diagnose,
+                SamplingReasoningPhase::Diagnose,
+                config.diagnose.clone(),
+            ),
+            (
+                SamplingReasoningPhase::Verify,
+                SamplingReasoningPhase::Verify,
+                config.verify.clone(),
+            ),
+            (
+                SamplingReasoningPhase::Finalize,
+                SamplingReasoningPhase::Finalize,
+                config.finalize.clone(),
+            ),
+        ];
+
+        for (starting_phase, resulting_phase, expected_configured_effort) in cases {
+            let mut governor = SamplingReasoningGovernor::new(Some(&config));
+            governor.phase = starting_phase;
+            let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+            governor.settle(
+                &baseline,
+                &collector_with(SamplingToolOutcomeKind::Success),
+                &settled(0, ValidationFreshnessStatus::None, None),
+            );
+
+            assert_eq!(
+                governor.phase, resulting_phase,
+                "starting at {starting_phase:?}"
+            );
+            assert_eq!(
+                governor.trigger(),
+                ReasoningPolicyTrigger::ReadOnlyToolSuccess,
+                "starting at {starting_phase:?}"
+            );
+            let policy = governor.resolve_policy(Some(&config), None, &model);
+            assert_eq!(
+                policy.configured_effort, expected_configured_effort,
+                "starting at {starting_phase:?}"
+            );
+            assert_eq!(
+                policy.source,
+                SamplingRequestPolicySource::PhaseOverride,
+                "starting at {starting_phase:?}"
+            );
+        }
+    }
+
+    #[test]
     fn plan_precedence_and_terminal_statuses_are_normalized() {
         assert_eq!(
             phase_for_plan(&plan(&[StepStatus::Blocked, StepStatus::Implemented])),
@@ -994,20 +1094,71 @@ mod tests {
     }
 
     #[test]
-    fn failure_dominates_concurrent_mutation_and_validation() {
+    fn tool_failures_dominate_a_competing_read() {
         let config = config();
-        let mut governor = SamplingReasoningGovernor::new(Some(&config));
-        let baselines = governor.baselines(1, ValidationFreshnessStatus::None, None);
-        governor.settle(
-            &baselines,
-            &collector_with(SamplingToolOutcomeKind::Failure),
-            &settled(
-                2,
-                ValidationFreshnessStatus::PassedAfterLastMutation,
-                Some(2),
+        let cases = [
+            (
+                SamplingToolOutcomeKind::Failure,
+                ReasoningPolicyTrigger::ToolFailed,
             ),
-        );
-        assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
+            (
+                SamplingToolOutcomeKind::Blocked,
+                ReasoningPolicyTrigger::ToolBlocked,
+            ),
+            (
+                SamplingToolOutcomeKind::Timeout,
+                ReasoningPolicyTrigger::ToolTimedOut,
+            ),
+            (
+                SamplingToolOutcomeKind::RecoverableCancellation,
+                ReasoningPolicyTrigger::ToolCancelled,
+            ),
+        ];
+
+        for (outcome, expected_trigger) in cases {
+            let mut governor = SamplingReasoningGovernor::new(Some(&config));
+            governor.phase = SamplingReasoningPhase::Finalize;
+            let baselines = governor.baselines(1, ValidationFreshnessStatus::None, None);
+            governor.settle(
+                &baselines,
+                &collector_with_read_and(outcome),
+                &settled(
+                    2,
+                    ValidationFreshnessStatus::PassedAfterLastMutation,
+                    Some(2),
+                ),
+            );
+            assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
+            assert_eq!(governor.trigger(), expected_trigger);
+        }
+    }
+
+    #[test]
+    fn changed_validation_dominates_a_competing_read() {
+        let config = config();
+        let cases = [
+            (
+                ValidationFreshnessStatus::FailedAfterLastMutation,
+                ReasoningPolicyTrigger::ValidationFailed,
+            ),
+            (
+                ValidationFreshnessStatus::TimedOut,
+                ReasoningPolicyTrigger::ValidationTimedOut,
+            ),
+        ];
+
+        for (validation_status, expected_trigger) in cases {
+            let mut governor = SamplingReasoningGovernor::new(Some(&config));
+            governor.phase = SamplingReasoningPhase::Finalize;
+            let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+            governor.settle(
+                &baselines,
+                &collector_with(SamplingToolOutcomeKind::Success),
+                &settled(0, validation_status, Some(0)),
+            );
+            assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
+            assert_eq!(governor.trigger(), expected_trigger);
+        }
     }
 
     #[test]
@@ -1025,6 +1176,7 @@ mod tests {
             ),
         );
         assert_eq!(no_plan.phase, SamplingReasoningPhase::Finalize);
+        assert_eq!(no_plan.trigger(), ReasoningPolicyTrigger::ValidationPassed);
 
         let mut active_plan = SamplingReasoningGovernor::new(Some(&config));
         settle_plan(&mut active_plan, plan(&[StepStatus::InProgress]));
@@ -1039,6 +1191,10 @@ mod tests {
             ),
         );
         assert_eq!(active_plan.phase, SamplingReasoningPhase::Verify);
+        assert_eq!(
+            active_plan.trigger(),
+            ReasoningPolicyTrigger::ValidationPassed
+        );
     }
 
     #[test]
@@ -1056,6 +1212,7 @@ mod tests {
             ),
         );
         assert_eq!(stale.phase, SamplingReasoningPhase::Implement);
+        assert_eq!(stale.trigger(), ReasoningPolicyTrigger::WorkspaceMutation);
 
         let mut fresh = SamplingReasoningGovernor::new(Some(&config));
         let baseline = fresh.baselines(1, ValidationFreshnessStatus::None, None);
@@ -1069,6 +1226,7 @@ mod tests {
             ),
         );
         assert_eq!(fresh.phase, SamplingReasoningPhase::Finalize);
+        assert_eq!(fresh.trigger(), ReasoningPolicyTrigger::ValidationPassed);
     }
 
     #[test]
@@ -1079,19 +1237,39 @@ mod tests {
         governor.phase = SamplingReasoningPhase::Finalize;
         let baseline = governor.baselines(
             4,
-            ValidationFreshnessStatus::PassedAfterLastMutation,
+            ValidationFreshnessStatus::FailedAfterLastMutation,
             Some(4),
         );
         governor.settle(
             &baseline,
-            &SamplingRequestSignalCollector::default(),
+            &collector_with(SamplingToolOutcomeKind::Success),
             &settled(
                 4,
-                ValidationFreshnessStatus::PassedAfterLastMutation,
+                ValidationFreshnessStatus::FailedAfterLastMutation,
                 Some(4),
             ),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Finalize);
+        assert_eq!(
+            governor.trigger(),
+            ReasoningPolicyTrigger::ReadOnlyToolSuccess
+        );
+    }
+
+    #[test]
+    fn changed_plan_dominates_a_competing_read() {
+        let config = config();
+        let mut governor = SamplingReasoningGovernor::new(Some(&config));
+        governor.phase = SamplingReasoningPhase::Finalize;
+        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        governor.settle(
+            &baseline,
+            &collector_with_read_and_plan(plan(&[StepStatus::InProgress])),
+            &settled(0, ValidationFreshnessStatus::None, None),
+        );
+
+        assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
+        assert_eq!(governor.trigger(), ReasoningPolicyTrigger::PlanUpdated);
     }
 
     #[test]
@@ -1193,13 +1371,35 @@ mod tests {
     fn user_and_host_continuations_follow_declared_precedence() {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
+
+        for starting_phase in [
+            SamplingReasoningPhase::Diagnose,
+            SamplingReasoningPhase::Verify,
+            SamplingReasoningPhase::Finalize,
+        ] {
+            governor.phase = starting_phase;
+            governor.host_mutation();
+            assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
+            assert_eq!(
+                governor.trigger(),
+                ReasoningPolicyTrigger::WorkspaceMutation
+            );
+        }
+
+        for starting_phase in [
+            SamplingReasoningPhase::Inspect,
+            SamplingReasoningPhase::Implement,
+            SamplingReasoningPhase::Diagnose,
+            SamplingReasoningPhase::Verify,
+            SamplingReasoningPhase::Finalize,
+        ] {
+            governor.phase = starting_phase;
+            governor.accepted_user_input();
+            assert_eq!(governor.phase, SamplingReasoningPhase::Orient);
+            assert_eq!(governor.trigger(), ReasoningPolicyTrigger::UserInput);
+        }
+
         governor.host_diagnose();
-        governor.accepted_user_input();
-        assert_eq!(governor.phase, SamplingReasoningPhase::Orient);
-        governor.host_mutation();
-        assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
-        governor.host_diagnose();
-        assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
         governor.host_retain();
         assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
 

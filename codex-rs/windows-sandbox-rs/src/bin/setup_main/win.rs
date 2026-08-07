@@ -1,5 +1,6 @@
 mod firewall;
 mod read_acl_mutex;
+mod setup_mutex;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -79,6 +80,7 @@ use sandbox_users::provision_sandbox_users;
 use sandbox_users::resolve_sandbox_users_group_sid;
 use sandbox_users::resolve_sid;
 use sandbox_users::sid_bytes_to_psid;
+use setup_mutex::acquire_setup_mutex;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Payload {
@@ -493,6 +495,10 @@ fn real_main() -> Result<()> {
 
 fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
     let writes_setup_marker = !payload.refresh_only && payload.mode != SetupMode::ReadAclsOnly;
+    // A missing or temporarily invalid marker can cause several callers to launch full setup at
+    // once. Keep marker preparation, user provisioning, and marker commit in one cross-process
+    // transaction so the protected marker is never removed or recreated concurrently.
+    let _setup_guard = writes_setup_marker.then(acquire_setup_mutex).transpose()?;
     if writes_setup_marker {
         prepare_setup_marker(&payload.codex_home, &payload.real_user)?;
     }

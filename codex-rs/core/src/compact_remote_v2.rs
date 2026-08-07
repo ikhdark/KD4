@@ -37,13 +37,14 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
-use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
+use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::StreamExt;
 
 #[path = "compact_remote_v2_attempt.rs"]
@@ -51,9 +52,7 @@ mod attempt;
 use attempt::RemoteCompactV2Attempt;
 use attempt::run_remote_compact_v2_attempt;
 
-// Mirror the current /responses/compact retained-message default while the
-// server-side path remains the reference implementation.
-const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
+const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 4_000;
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
@@ -300,7 +299,7 @@ async fn run_remote_compact_task_inner_impl(
     };
     let compacted_item = CompactedItem {
         message: String::new(),
-        replacement_history: Some(new_history.clone()),
+        replacement_history: None,
         window_number: Some(new_window_number),
         first_window_id: Some(new_window_ids.first_window_id.to_string()),
         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
@@ -481,12 +480,55 @@ fn build_v2_compacted_history(
         prompt_input,
         RETAINED_MESSAGE_TOKEN_BUDGET,
     );
+    enforce_retained_message_token_ceiling(&mut retained, RETAINED_MESSAGE_TOKEN_BUDGET);
     let retained_image_count = retained
         .iter()
         .map(retained_input_image_count)
         .sum::<usize>();
     retained.push(compaction_output);
     (retained, retained_image_count)
+}
+
+fn enforce_retained_message_token_ceiling(items: &mut Vec<ResponseItem>, max_tokens: usize) {
+    let total_tokens = items.iter().map(message_text_token_count).sum::<usize>();
+    let mut excess = total_tokens.saturating_sub(max_tokens);
+    if excess == 0 {
+        return;
+    }
+
+    for item in items.iter_mut() {
+        let ResponseItem::Message { content, .. } = item else {
+            continue;
+        };
+        for content_item in content.iter_mut() {
+            let text = match content_item {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => text,
+                ContentItem::InputImage { .. } => continue,
+            };
+            if excess == 0 {
+                break;
+            }
+
+            let previous_tokens = approx_token_count(text);
+            let target_tokens = previous_tokens.saturating_sub(excess);
+            *text = truncate_text_to_token_ceiling(text, target_tokens);
+            let removed_tokens = previous_tokens.saturating_sub(approx_token_count(text));
+            excess = excess.saturating_sub(removed_tokens);
+        }
+        content.retain(|item| {
+            !matches!(
+                item,
+                ContentItem::InputText { text } | ContentItem::OutputText { text }
+                    if text.is_empty()
+            )
+        });
+        if excess == 0 {
+            break;
+        }
+    }
+    items.retain(
+        |item| !matches!(item, ResponseItem::Message { content, .. } if content.is_empty()),
+    );
 }
 
 fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
@@ -881,6 +923,29 @@ mod tests {
         let (history, _) = build_v2_compacted_history(input, output.clone());
 
         assert_eq!(history, vec![old, new, output]);
+    }
+
+    #[test]
+    fn build_v2_compacted_history_enforces_retained_message_budget() {
+        let input = vec![message(
+            "user",
+            &"retained ".repeat(RETAINED_MESSAGE_TOKEN_BUDGET * 4),
+            /*phase*/ None,
+        )];
+        let output = ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "new".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+
+        let (history, _) = build_v2_compacted_history(input, output);
+        let retained_tokens = history
+            .iter()
+            .take(history.len().saturating_sub(1))
+            .map(message_text_token_count)
+            .sum::<usize>();
+
+        assert!(retained_tokens <= RETAINED_MESSAGE_TOKEN_BUDGET);
     }
 
     #[test]

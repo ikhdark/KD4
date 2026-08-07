@@ -1,3 +1,4 @@
+use super::EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
 use super::session::Session;
 use super::step_context::StepContext;
 use crate::connectors;
@@ -7,6 +8,8 @@ use crate::context::world_state::EnvironmentsState;
 use crate::context::world_state::PluginsInstructionsState;
 use crate::context::world_state::WorldState;
 use codex_extension_api::WorldStateContributionInput;
+use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 
 impl Session {
     #[tracing::instrument(name = "world_state.build", level = "info", skip_all)]
@@ -78,7 +81,17 @@ impl Session {
             .iter()
             .map(|root| root.selected_root().clone())
             .collect::<Vec<_>>();
-        for contributor in self.services.extensions.context_contributors() {
+        // World-state contributors are independent. Poll them concurrently while preserving
+        // registration order, and do not let an optional contributor block the model request.
+        let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
+        let mut pending = FuturesOrdered::new();
+        for (contributor_index, contributor) in self
+            .services
+            .extensions
+            .context_contributors()
+            .iter()
+            .enumerate()
+        {
             let input = WorldStateContributionInput {
                 thread_id: self.thread_id(),
                 turn_id: turn_context.sub_id.as_str(),
@@ -88,11 +101,27 @@ impl Session {
                 thread_store: &self.services.thread_extension_data,
                 turn_store: turn_context.extension_data.as_ref(),
             };
-            let sections = if estimate {
-                contributor.estimate_world_state(input).await
+            let contribution = if estimate {
+                contributor.estimate_world_state(input)
             } else {
-                contributor.contribute_world_state(input).await
+                contributor.contribute_world_state(input)
             };
+            pending.push_back(async move {
+                match tokio::time::timeout_at(deadline, contribution).await {
+                    Ok(sections) => sections,
+                    Err(_) => {
+                        tracing::warn!(
+                            contributor_index,
+                            scope = "world_state",
+                            timeout = ?EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT,
+                            "extension context contributor timed out; omitting its sections"
+                        );
+                        Vec::new()
+                    }
+                }
+            });
+        }
+        while let Some(sections) = pending.next().await {
             for section in sections {
                 world_state.add_extension_section(section);
             }

@@ -17,7 +17,7 @@ const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and manag
 const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
     "Service tier override for the new agent. Omit unless explicitly requested.";
 const SPAWN_AGENT_V1_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_context=true`) do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides; keep `fork_context` false or omit it when using those fields.";
-const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides; set `fork_turns` to `none` or a positive integer when using those fields.";
+const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) are disabled by default and do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides when enabled; set `fork_turns` to `none` or an integer from 1 through 5 when using those fields.";
 const MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION: usize = 5;
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
@@ -689,7 +689,7 @@ fn spawn_agent_common_properties_v2(
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(format!(
-                "Optional fork mode. For typed assignments, omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; for legacy messages, omitted or `none` creates a fresh non-forked child. Use `all` or a positive integer string such as `3` for history-bearing forks.{full_history_override_guidance}"
+                "Optional fork mode. For typed assignments, omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; for legacy messages, omitted or `none` creates a fresh non-forked child. Use an integer string from 1 through 5 for a history-bearing fork. Full history (`all`) is disabled by default.{full_history_override_guidance}"
             ))),
         ),
         (
@@ -1010,7 +1010,7 @@ The new agent's canonical task name will be provided to it along with the messag
 Use `assignment` for durable typed coordination or `message` for a legacy plain-text task; exactly one is required. Typed assignments require an explicit typed-capable `agent_type` (a built-in role or its configured `kd4_` alias) and return an `assignment_id`.
 
     {full_history_override_guidance}
-For typed assignments, omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. For legacy `message` spawning, omitted or `none` creates a fresh non-forked child. `fork_turns="all"` and positive integers retain history-bearing fork behavior."#
+For typed assignments, omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. For legacy `message` spawning, omitted or `none` creates a fresh non-forked child. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#
     );
 
     if let Some(usage_hint_text) = usage_hint_text {
@@ -1101,7 +1101,7 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema::number(Some(format!(
-                "Timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
+                "Timeout in milliseconds. Omit for the normal wait; completed targets return immediately. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
                 options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
             ))),
         ),
@@ -1129,7 +1129,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema::number(Some(format!(
-                "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
+                "Timeout in milliseconds. Omit for the normal wait. Use list_agents or get_agent_task for an immediate status snapshot. Defaults to {}, min {}, max {}.",
                 options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
             ))),
         ),

@@ -20,12 +20,16 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
+use codex_tools::ToolOutputDiagnosticClass;
+use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputProjectionMetadata;
 use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::classify_diagnostic;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
-use codex_utils_output_truncation::resolve_output_limits;
+use codex_utils_output_truncation::resolve_projected_output_limits;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -94,6 +98,12 @@ impl ToolOutput for McpToolOutput {
 
     fn success_for_logging(&self) -> bool {
         self.result.success()
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        serde_json::to_value(&self.result).ok().map(|value| {
+            ToolOutputProjectionMetadata::from_json(&value, self.result.success(), None)
+        })
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
@@ -239,6 +249,28 @@ impl ToolOutput for FunctionToolOutput {
         self.success.unwrap_or(true)
     }
 
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        Some(ToolOutputProjectionMetadata {
+            outcome: if self.success.unwrap_or(true) {
+                ToolOutputOutcome::Success
+            } else {
+                ToolOutputOutcome::Failure
+            },
+            diagnostic_class: ToolOutputDiagnosticClass::Normal,
+            spillable_text: self
+                .body
+                .iter()
+                .filter_map(|item| match item {
+                    FunctionCallOutputContentItem::InputText { text } => Some(text.clone()),
+                    FunctionCallOutputContentItem::InputImage { .. }
+                    | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+                })
+                .collect(),
+            essential_inline: serde_json::json!({ "success": self.success }),
+            requested_limit: None,
+        })
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         function_tool_response(call_id, payload, self.body.clone(), self.success)
     }
@@ -265,6 +297,16 @@ impl ToolOutput for ApplyPatchToolOutput {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        Some(ToolOutputProjectionMetadata {
+            outcome: ToolOutputOutcome::Success,
+            diagnostic_class: ToolOutputDiagnosticClass::Normal,
+            spillable_text: vec![self.text.clone()],
+            essential_inline: JsonValue::Object(serde_json::Map::new()),
+            requested_limit: None,
+        })
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -298,6 +340,16 @@ impl ToolOutput for AbortedToolOutput {
 
     fn success_for_logging(&self) -> bool {
         false
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        Some(ToolOutputProjectionMetadata {
+            outcome: ToolOutputOutcome::Failure,
+            diagnostic_class: ToolOutputDiagnosticClass::Normal,
+            spillable_text: vec![self.message.clone()],
+            essential_inline: serde_json::json!({ "state": "aborted" }),
+            requested_limit: None,
+        })
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
@@ -348,6 +400,54 @@ impl ToolOutput for ExecCommandToolOutput {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        let raw_output = String::from_utf8_lossy(&self.raw_output).to_string();
+        let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) = self
+            .raw_output_artifact
+            .as_ref()
+            .map_or((None, None, None), |artifact| {
+                let (id, bytes, error) = artifact.model_projection();
+                (id.map(|id| id.to_string()), bytes, error)
+            });
+        let raw_output_artifact_retention_limit_hit = self
+            .raw_output_artifact
+            .as_ref()
+            .is_some_and(RawOutputArtifact::retention_limit_hit);
+        let outcome = if self.process_id.is_some() {
+            ToolOutputOutcome::TimedOut
+        } else if self.exit_code.is_some_and(|code| code != 0) {
+            ToolOutputOutcome::Failure
+        } else {
+            ToolOutputOutcome::Success
+        };
+        Some(ToolOutputProjectionMetadata {
+            outcome,
+            diagnostic_class: match classify_diagnostic(self.hook_command.as_deref(), &raw_output) {
+                codex_utils_output_truncation::OutputDiagnosticClass::Normal => {
+                    ToolOutputDiagnosticClass::Normal
+                }
+                codex_utils_output_truncation::OutputDiagnosticClass::HighSignal => {
+                    ToolOutputDiagnosticClass::HighSignal
+                }
+            },
+            // Unified exec has already sent the exact raw bytes through the
+            // existing artifact path. Project its current model text here so
+            // the common boundary does not create a duplicate raw artifact.
+            spillable_text: vec![self.response_text()],
+            essential_inline: serde_json::json!({
+                "chunk_id": &self.chunk_id,
+                "exit_code": self.exit_code,
+                "session_id": self.process_id,
+                "original_token_count": self.original_token_count,
+                "raw_output_artifact_id": raw_output_artifact_id,
+                "raw_output_artifact_bytes": raw_output_artifact_bytes,
+                "raw_output_artifact_error": raw_output_artifact_error,
+                "raw_output_artifact_retention_limit_hit": raw_output_artifact_retention_limit_hit,
+            }),
+            requested_limit: self.max_output_tokens,
+        })
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -439,11 +539,10 @@ impl ToolOutput for ExecCommandToolOutput {
 
 impl ExecCommandToolOutput {
     fn model_output_limits(&self, raw_output: &str) -> OutputLimitResolution {
-        resolve_output_limits(
+        resolve_projected_output_limits(
             self.max_output_tokens,
             OutputOutcome::from_exit_status(self.exit_code, self.process_id.is_some()),
-            self.hook_command.as_deref(),
-            raw_output,
+            classify_diagnostic(self.hook_command.as_deref(), raw_output),
             self.truncation_policy.token_budget(),
         )
     }

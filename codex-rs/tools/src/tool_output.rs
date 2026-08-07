@@ -12,6 +12,36 @@ const TELEMETRY_PREVIEW_MAX_BYTES: usize = 2 * 1024;
 const TELEMETRY_PREVIEW_MAX_LINES: usize = 64;
 const TELEMETRY_PREVIEW_TRUNCATION_NOTICE: &str = "[... telemetry preview truncated ...]";
 
+/// Typed result state used by model-output projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolOutputOutcome {
+    Success,
+    Failure,
+    TimedOut,
+}
+
+/// Producer-supplied diagnostic classification used by model-output projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolOutputDiagnosticClass {
+    Normal,
+    HighSignal,
+}
+
+/// Typed inputs for reducing a textual model projection.
+///
+/// `spillable_text` is producer text that may be represented by an opaque
+/// artifact. `essential_inline` contains control/state data that must remain
+/// visible. The dispatcher must consume these fields directly and never infer
+/// them by parsing a rendered response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolOutputProjectionMetadata {
+    pub outcome: ToolOutputOutcome,
+    pub diagnostic_class: ToolOutputDiagnosticClass,
+    pub spillable_text: Vec<String>,
+    pub essential_inline: JsonValue,
+    pub requested_limit: Option<usize>,
+}
+
 /// Model-facing output contract returned by executable tool runtimes.
 pub trait ToolOutput: Send {
     fn log_preview(&self) -> String;
@@ -28,6 +58,12 @@ pub trait ToolOutput: Send {
     /// `memories.disable_on_external_context` is enabled.
     fn contains_external_context(&self) -> bool {
         false
+    }
+
+    /// Returns typed projection inputs for textual output, if this output may
+    /// be reduced for a direct or code-mode model consumer.
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        None
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
@@ -76,6 +112,10 @@ where
 
     fn contains_external_context(&self) -> bool {
         (**self).contains_external_context()
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        (**self).projection_metadata()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -129,6 +169,74 @@ impl JsonToolOutput {
     }
 }
 
+impl ToolOutputProjectionMetadata {
+    pub fn from_json(value: &JsonValue, success: bool, requested_limit: Option<usize>) -> Self {
+        Self {
+            outcome: if success {
+                ToolOutputOutcome::Success
+            } else {
+                ToolOutputOutcome::Failure
+            },
+            diagnostic_class: ToolOutputDiagnosticClass::Normal,
+            spillable_text: vec![value.to_string()],
+            essential_inline: essential_json_fields(value),
+            requested_limit,
+        }
+    }
+}
+
+fn essential_json_fields(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(object) => JsonValue::Object(
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    let nested = essential_json_fields(value);
+                    (is_essential_key(key) || !is_empty_projection(&nested)).then(|| {
+                        (
+                            key.clone(),
+                            if is_essential_key(key) {
+                                value.clone()
+                            } else {
+                                nested
+                            },
+                        )
+                    })
+                })
+                .collect(),
+        ),
+        JsonValue::Array(values) => JsonValue::Array(
+            values
+                .iter()
+                .map(essential_json_fields)
+                .filter(|value| !is_empty_projection(value))
+                .collect(),
+        ),
+        _ => JsonValue::Null,
+    }
+}
+
+fn is_empty_projection(value: &JsonValue) -> bool {
+    matches!(value, JsonValue::Null)
+        || matches!(value, JsonValue::Object(object) if object.is_empty())
+        || matches!(value, JsonValue::Array(values) if values.is_empty())
+}
+
+fn is_essential_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "id"
+        || key.ends_with("_id")
+        || key.ends_with("id")
+        || key.contains("cursor")
+        || key.contains("status")
+        || key.contains("state")
+        || key.contains("gate")
+        || key.contains("next_action")
+        || key.contains("nextrequiredaction")
+        || key == "action"
+        || key == "outcome"
+}
+
 impl ToolOutput for JsonToolOutput {
     fn log_preview(&self) -> String {
         telemetry_preview(&self.value.to_string())
@@ -140,6 +248,14 @@ impl ToolOutput for JsonToolOutput {
 
     fn contains_external_context(&self) -> bool {
         self.contains_external_context
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        Some(ToolOutputProjectionMetadata::from_json(
+            &self.value,
+            self.success.unwrap_or(true),
+            None,
+        ))
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

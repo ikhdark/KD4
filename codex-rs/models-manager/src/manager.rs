@@ -18,6 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::sync::TryLockError;
 use tracing::Instrument as _;
@@ -198,8 +199,13 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
 
     /// Refresh models if the provided ETag differs from the cached ETag.
     ///
-    /// Uses `Online` strategy to fetch latest models when ETags differ.
-    fn notify_etag(self: Arc<Self>, etag: String, http_client_factory: HttpClientFactory);
+    /// Uses `Online` strategy to fetch latest models when ETags differ and resolves when the
+    /// coalescing refresh worker reaches idle.
+    fn notify_etag(
+        self: Arc<Self>,
+        etag: String,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'static, ()>;
 }
 
 pub type ModelsManagerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -216,6 +222,7 @@ pub struct OpenAiModelsManager {
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
     etag_refresh: Mutex<EtagRefreshState>,
+    etag_refresh_idle: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -257,6 +264,7 @@ impl OpenAiModelsManager {
             endpoint_client,
             auth_manager,
             etag_refresh: Mutex::new(EtagRefreshState::default()),
+            etag_refresh_idle: Notify::new(),
         }
     }
 }
@@ -300,8 +308,13 @@ impl ModelsManager for OpenAiModelsManager {
         builtin_collaboration_mode_presets()
     }
 
-    fn notify_etag(self: Arc<Self>, etag: String, http_client_factory: HttpClientFactory) {
-        self.submit_etag_notice(etag, http_client_factory);
+    fn notify_etag(
+        self: Arc<Self>,
+        etag: String,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'static, ()> {
+        Arc::clone(&self).submit_etag_notice(etag, http_client_factory);
+        Box::pin(async move { self.wait_for_etag_refresh().await })
     }
 }
 
@@ -354,9 +367,28 @@ impl OpenAiModelsManager {
         }
     }
 
+    async fn wait_for_etag_refresh(&self) {
+        loop {
+            let idle = self.etag_refresh_idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+
+            let worker_running = self
+                .etag_refresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .worker_running;
+            if !worker_running {
+                return;
+            }
+
+            idle.await;
+        }
+    }
+
     async fn run_etag_refresh_worker(self: Arc<Self>) {
         loop {
-            let Some(notice) = ({
+            let notice = {
                 let mut state = self
                     .etag_refresh
                     .lock()
@@ -369,7 +401,9 @@ impl OpenAiModelsManager {
                     state.worker_running = false;
                 }
                 notice
-            }) else {
+            };
+            let Some(notice) = notice else {
+                self.etag_refresh_idle.notify_waiters();
                 return;
             };
 
@@ -503,22 +537,24 @@ impl OpenAiModelsManager {
                     .auth_mode()
                     .is_some_and(AuthMode::has_chatgpt_account)
             });
-        if should_use_remote_models_only {
-            return models;
-        }
-
-        let mut existing_models = load_remote_models_from_file().unwrap_or_default();
-        for model in models {
-            if let Some(existing_index) = existing_models
-                .iter()
-                .position(|existing| existing.slug == model.slug)
-            {
-                existing_models[existing_index] = model;
-            } else {
-                existing_models.push(model);
+        let mut merged_models = if should_use_remote_models_only {
+            models
+        } else {
+            let mut existing_models = load_remote_models_from_file().unwrap_or_default();
+            for model in models {
+                if let Some(existing_index) = existing_models
+                    .iter()
+                    .position(|existing| existing.slug == model.slug)
+                {
+                    existing_models[existing_index] = model;
+                } else {
+                    existing_models.push(model);
+                }
             }
-        }
-        existing_models
+            existing_models
+        };
+        crate::prompt_overrides::apply_gpt_5_6_prompt(&mut merged_models);
+        merged_models
     }
 
     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
@@ -613,7 +649,13 @@ impl ModelsManager for StaticModelsManager {
         builtin_collaboration_mode_presets()
     }
 
-    fn notify_etag(self: Arc<Self>, _etag: String, _http_client_factory: HttpClientFactory) {}
+    fn notify_etag(
+        self: Arc<Self>,
+        _etag: String,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'static, ()> {
+        Box::pin(async {})
+    }
 }
 
 fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {

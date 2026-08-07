@@ -11,6 +11,9 @@ use bm25::Language;
 use bm25::SearchEngine;
 use bm25::SearchEngineBuilder;
 use codex_tools::LoadableToolSpec;
+use codex_tools::ResponsesApiNamespace;
+use codex_tools::ResponsesApiNamespaceTool;
+use codex_tools::ResponsesApiTool;
 use codex_tools::TOOL_SEARCH_DEFAULT_LIMIT;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
 use codex_tools::ToolName;
@@ -209,7 +212,7 @@ impl ToolSearchHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation { payload, turn, .. } = invocation;
 
         let args = match payload {
             ToolPayload::ToolSearch { arguments } => arguments,
@@ -222,11 +225,27 @@ impl ToolSearchHandler {
 
         let limit = args.limit.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT);
         let result = self.search(&args.query, limit)?;
+        turn.activate_deferred_tools(result.tools.iter().flat_map(loadable_tool_names));
 
         Ok(boxed_tool_output(ToolSearchOutput {
             tools: result.tools,
             omitted_result_count: result.omitted_result_count,
         }))
+    }
+}
+
+fn loadable_tool_names(spec: &LoadableToolSpec) -> Vec<ToolName> {
+    match spec {
+        LoadableToolSpec::Function(tool) => vec![ToolName::plain(tool.name.clone())],
+        LoadableToolSpec::Namespace(namespace) => namespace
+            .tools
+            .iter()
+            .map(|tool| match tool {
+                codex_tools::ResponsesApiNamespaceTool::Function(tool) => {
+                    ToolName::namespaced(namespace.name.clone(), tool.name.clone())
+                }
+            })
+            .collect(),
     }
 }
 
@@ -284,8 +303,10 @@ impl ToolSearchHandler {
         let results = promote_exact_name_matches(exact_matches, candidates, limit);
         let result_count = results.len();
         let result_source_count = tool_search_info_diversity_count(results.iter().copied());
-        let result =
-            self.search_output_tools(results.iter().map(|search_info| &search_info.entry))?;
+        let result = self.search_output_tools(
+            results.iter().map(|search_info| &search_info.entry),
+            Some(&key.query),
+        )?;
         tracing::trace!(
             normalized_query_bytes = key.query.len(),
             effective_limit = limit,
@@ -308,19 +329,52 @@ impl ToolSearchHandler {
     fn search_output_tools<'a>(
         &self,
         results: impl IntoIterator<Item = &'a ToolSearchEntry>,
+        exact_query: Option<&str>,
     ) -> Result<ToolSearchResult, FunctionCallError> {
-        let mut retained_results = Vec::new();
+        let mut retained_outputs = Vec::new();
         let mut retained_tools = Vec::new();
         let mut omitted_result_count = 0usize;
         for result in results {
-            retained_results.push(result);
             let tools = coalesce_loadable_tool_specs(
-                retained_results.iter().map(|entry| entry.output.clone()),
+                retained_outputs
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(result.output.clone())),
             );
             if tool_search_result_fits_budget(&tools) {
+                retained_outputs.push(result.output.clone());
                 retained_tools = tools;
+            } else if let Some(recovery) =
+                exact_query.and_then(|query| compact_exact_match_recovery(&result.output, query))
+            {
+                let tools = coalesce_loadable_tool_specs(
+                    retained_outputs
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(recovery.clone())),
+                );
+                if tool_search_result_fits_budget(&tools) {
+                    retained_outputs.push(recovery);
+                    retained_tools = tools;
+                } else if let Some(minimal_recovery) = exact_query
+                    .and_then(|query| minimal_exact_match_recovery(&result.output, query))
+                {
+                    let tools = coalesce_loadable_tool_specs(
+                        retained_outputs
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(minimal_recovery.clone())),
+                    );
+                    if tool_search_result_fits_budget(&tools) {
+                        retained_outputs.push(minimal_recovery);
+                        retained_tools = tools;
+                    } else {
+                        omitted_result_count = omitted_result_count.saturating_add(1);
+                    }
+                } else {
+                    omitted_result_count = omitted_result_count.saturating_add(1);
+                }
             } else {
-                retained_results.pop();
                 omitted_result_count = omitted_result_count.saturating_add(1);
             }
         }
@@ -373,6 +427,181 @@ impl ToolSearchHandler {
     #[cfg(test)]
     fn result_cache_len(&self) -> usize {
         self.result_cache().len()
+    }
+}
+
+fn compact_exact_match_recovery(
+    output: &LoadableToolSpec,
+    exact_query: &str,
+) -> Option<LoadableToolSpec> {
+    match output {
+        LoadableToolSpec::Function(tool)
+            if normalize_tool_search_query(&tool.name) == exact_query =>
+        {
+            Some(LoadableToolSpec::Function(compact_recovery_tool(
+                tool, &tool.name,
+            )))
+        }
+        LoadableToolSpec::Namespace(namespace) => {
+            let tools = namespace
+                .tools
+                .iter()
+                .filter_map(|tool| match tool {
+                    ResponsesApiNamespaceTool::Function(tool)
+                        if normalize_tool_search_query(&tool.name) == exact_query =>
+                    {
+                        Some(ResponsesApiNamespaceTool::Function(compact_recovery_tool(
+                            tool,
+                            &format!("{}.{}", namespace.name, tool.name),
+                        )))
+                    }
+                    ResponsesApiNamespaceTool::Function(_) => None,
+                })
+                .collect::<Vec<_>>();
+            (!tools.is_empty()).then(|| {
+                LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                    name: namespace.name.clone(),
+                    description: format!(
+                        "Compact recovery for an exact tool match in `{}`; the full schema exceeded the tool-search response budget.",
+                        namespace.name
+                    ),
+                    tools,
+                })
+            })
+        }
+        LoadableToolSpec::Function(_) => None,
+    }
+}
+
+fn compact_recovery_tool(tool: &ResponsesApiTool, qualified_name: &str) -> ResponsesApiTool {
+    ResponsesApiTool {
+        name: tool.name.clone(),
+        description: format!(
+            "Compact exact-match definition for `{qualified_name}`; verbose schema details were removed to fit the tool-search response budget."
+        ),
+        strict: false,
+        defer_loading: Some(true),
+        parameters: compact_recovery_schema(&tool.parameters, 0),
+        output_schema: None,
+    }
+}
+
+fn compact_recovery_schema(
+    schema: &codex_tools::JsonSchema,
+    depth: usize,
+) -> codex_tools::JsonSchema {
+    const MAX_RECOVERY_SCHEMA_DEPTH: usize = 4;
+
+    let enum_values = schema.enum_values.as_ref().and_then(|values| {
+        (values.len() <= 16
+            && serde_json::to_vec(values).is_ok_and(|serialized| serialized.len() <= 1_024))
+        .then(|| values.clone())
+    });
+    if depth >= MAX_RECOVERY_SCHEMA_DEPTH {
+        return codex_tools::JsonSchema {
+            schema_type: schema.schema_type.clone(),
+            enum_values,
+            ..Default::default()
+        };
+    }
+
+    codex_tools::JsonSchema {
+        schema_type: schema.schema_type.clone(),
+        encrypted: schema.encrypted,
+        enum_values,
+        items: schema
+            .items
+            .as_ref()
+            .map(|item| Box::new(compact_recovery_schema(item, depth + 1))),
+        properties: schema.properties.as_ref().map(|properties| {
+            properties
+                .iter()
+                .map(|(name, property)| {
+                    (name.clone(), compact_recovery_schema(property, depth + 1))
+                })
+                .collect()
+        }),
+        required: schema.required.clone(),
+        additional_properties: schema.properties.as_ref().map(|_| true.into()),
+        any_of: schema.any_of.as_ref().map(|variants| {
+            variants
+                .iter()
+                .map(|variant| compact_recovery_schema(variant, depth + 1))
+                .collect()
+        }),
+        one_of: schema.one_of.as_ref().map(|variants| {
+            variants
+                .iter()
+                .map(|variant| compact_recovery_schema(variant, depth + 1))
+                .collect()
+        }),
+        all_of: schema.all_of.as_ref().map(|variants| {
+            variants
+                .iter()
+                .map(|variant| compact_recovery_schema(variant, depth + 1))
+                .collect()
+        }),
+        ..Default::default()
+    }
+}
+
+fn minimal_exact_match_recovery(
+    output: &LoadableToolSpec,
+    exact_query: &str,
+) -> Option<LoadableToolSpec> {
+    match output {
+        LoadableToolSpec::Function(tool)
+            if normalize_tool_search_query(&tool.name) == exact_query =>
+        {
+            Some(LoadableToolSpec::Function(minimal_recovery_tool(
+                tool, &tool.name,
+            )))
+        }
+        LoadableToolSpec::Namespace(namespace) => {
+            let tools = namespace
+                .tools
+                .iter()
+                .filter_map(|tool| match tool {
+                    ResponsesApiNamespaceTool::Function(tool)
+                        if normalize_tool_search_query(&tool.name) == exact_query =>
+                    {
+                        Some(ResponsesApiNamespaceTool::Function(minimal_recovery_tool(
+                            tool,
+                            &format!("{}.{}", namespace.name, tool.name),
+                        )))
+                    }
+                    ResponsesApiNamespaceTool::Function(_) => None,
+                })
+                .collect::<Vec<_>>();
+            (!tools.is_empty()).then(|| {
+                LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                    name: namespace.name.clone(),
+                    description: format!(
+                        "Minimal recovery for an exact tool match in `{}`; the compact schema still exceeded the tool-search response budget.",
+                        namespace.name
+                    ),
+                    tools,
+                })
+            })
+        }
+        LoadableToolSpec::Function(_) => None,
+    }
+}
+
+fn minimal_recovery_tool(tool: &ResponsesApiTool, qualified_name: &str) -> ResponsesApiTool {
+    ResponsesApiTool {
+        name: tool.name.clone(),
+        description: format!(
+            "The schema for `{qualified_name}` exceeded the tool-search response budget even after compaction. Call this tool with an object containing the arguments required by the task."
+        ),
+        strict: false,
+        defer_loading: Some(true),
+        parameters: codex_tools::JsonSchema::object(
+            Default::default(),
+            /*required*/ None,
+            Some(true.into()),
+        ),
+        output_schema: None,
     }
 }
 
@@ -744,27 +973,59 @@ mod tests {
     }
 
     #[test]
-    fn search_omits_a_definition_that_exceeds_the_result_budget() {
+    fn exact_name_search_recovers_a_definition_that_exceeds_the_result_budget() {
         let mut search_info = search_info("calendar", None, "calendar", "create_event");
         let LoadableToolSpec::Namespace(namespace) = &mut search_info.entry.output else {
             panic!("test search info should be a namespace");
         };
         namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
+        let [ResponsesApiNamespaceTool::Function(source_tool)] = namespace.tools.as_mut_slice()
+        else {
+            panic!("test search info should contain one function");
+        };
+        source_tool.parameters = codex_tools::JsonSchema::object(
+            std::collections::BTreeMap::from([(
+                "title".to_string(),
+                codex_tools::JsonSchema::string(Some("Event title".to_string())),
+            )]),
+            Some(vec!["title".to_string()]),
+            Some(false.into()),
+        );
         let handler = ToolSearchHandler::new(vec![search_info]);
 
         let tools = handler
-            .search("calendar", TOOL_SEARCH_DEFAULT_LIMIT)
-            .expect("oversized result should be bounded");
+            .search("create_event", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("exact-name oversized result should recover within the budget");
 
-        assert!(tools.tools.is_empty());
-        assert_eq!(tools.omitted_result_count, 1);
+        let [LoadableToolSpec::Namespace(namespace)] = tools.tools.as_slice() else {
+            panic!("exact-name recovery should retain the matching namespace");
+        };
+        let [ResponsesApiNamespaceTool::Function(tool)] = namespace.tools.as_slice() else {
+            panic!("exact-name recovery should retain only the matching function");
+        };
+        assert_eq!(tool.name, "create_event");
+        assert!(tool.description.contains("verbose schema details"));
+        assert!(
+            tool.parameters
+                .properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key("title"))
+        );
+        assert_eq!(tool.parameters.required, Some(vec!["title".to_string()]));
+        assert_eq!(tool.parameters.additional_properties, Some(true.into()));
+        assert_eq!(tools.omitted_result_count, 0);
+        assert!(
+            serde_json::to_vec(&tools.tools)
+                .expect("recovered result should serialize")
+                .len()
+                <= MAX_TOOL_SEARCH_RESULT_BYTES
+        );
         assert_eq!(handler.result_cache_len(), 1);
 
         let cached = handler
-            .search("calendar", TOOL_SEARCH_DEFAULT_LIMIT)
-            .expect("cached oversized result should remain explicitly incomplete");
-        assert!(cached.tools.is_empty());
-        assert_eq!(cached.omitted_result_count, 1);
+            .search("create_event", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("cached exact-name recovery should succeed");
+        assert_eq!(cached, tools);
     }
 
     #[test]
@@ -784,7 +1045,7 @@ mod tests {
         ];
 
         let tools = handler
-            .search_output_tools(results)
+            .search_output_tools(results, None)
             .expect("search results should serialize within the budget");
 
         assert_eq!(tools.tools.len(), 1);
@@ -813,7 +1074,7 @@ mod tests {
         ];
 
         let tools = handler
-            .search_output_tools(results)
+            .search_output_tools(results, None)
             .expect("later search result should fit within the budget");
 
         assert_eq!(tools.tools, vec![expected]);
@@ -867,7 +1128,7 @@ mod tests {
         ];
 
         let tools = handler
-            .search_output_tools(results)
+            .search_output_tools(results, None)
             .expect("mixed search output should serialize");
 
         assert_eq!(

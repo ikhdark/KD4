@@ -2899,9 +2899,10 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
     else {
         panic!("expected resumed rollout history");
     };
-    let persisted_replacement_history = resumed.history.iter().rev().find_map(|item| match item {
-        RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
+    let persisted_compaction = resumed.history.iter().rev().find_map(|item| match item {
+        RolloutItem::Compacted(compacted) => Some(compacted),
         RolloutItem::SessionMeta(_)
+        | RolloutItem::ToolManifest(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -2909,9 +2910,11 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
         | RolloutItem::WorldState(_)
         | RolloutItem::EventMsg(_) => None,
     });
-    assert_eq!(
-        persisted_replacement_history.map(Vec::as_slice),
-        Some(live_history.raw_items())
+    assert!(persisted_compaction.is_some());
+    assert!(
+        persisted_compaction
+            .and_then(|compacted| compacted.replacement_history.as_ref())
+            .is_none()
     );
 }
 
@@ -2961,6 +2964,7 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
     let persisted_item_id = resumed.history.iter().find_map(|item| match item {
         RolloutItem::ResponseItem(response_item) => response_item.id(),
         RolloutItem::SessionMeta(_)
+        | RolloutItem::ToolManifest(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
@@ -8477,6 +8481,8 @@ struct ConcurrentContextTestContributor {
     gate: Arc<Semaphore>,
     waits_for_later_contributor: bool,
 }
+struct StalledTurnContextTestContributor;
+struct ReadyTurnContextTestContributor;
 
 impl ConcurrentContextTestContributor {
     fn contribute<'a>(
@@ -8512,6 +8518,28 @@ impl codex_extension_api::ContextContributor for ConcurrentContextTestContributo
         _input: codex_extension_api::TurnContextContributionInput<'a>,
     ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
         self.contribute(self.turn_text)
+    }
+}
+
+impl codex_extension_api::ContextContributor for StalledTurnContextTestContributor {
+    fn contribute_turn_context<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnContextContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+impl codex_extension_api::ContextContributor for ReadyTurnContextTestContributor {
+    fn contribute_turn_context<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnContextContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        Box::pin(async {
+            vec![codex_extension_api::PromptFragment::developer_policy(
+                "ready turn context",
+            )]
+        })
     }
 }
 
@@ -8746,6 +8774,27 @@ async fn turn_context_refresh_polls_contributors_concurrently_and_applies_in_ord
     assert_eq!(
         contributed_texts,
         vec!["concurrent turn first", "concurrent turn second"]
+    );
+}
+
+#[tokio::test]
+async fn turn_context_refresh_omits_stalled_contributors_after_shared_deadline() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(StalledTurnContextTestContributor));
+    builder.prompt_contributor(Arc::new(ReadyTurnContextTestContributor));
+    session.services.extensions = Arc::new(builder.build());
+
+    let context_items = timeout(
+        EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT + Duration::from_secs(1),
+        session.build_turn_context_contribution_items(&turn_context, false),
+    )
+    .await
+    .expect("stalled context contributors should be bounded by the shared deadline");
+
+    assert_eq!(
+        developer_input_texts(&context_items),
+        vec!["ready turn context"]
     );
 }
 

@@ -85,7 +85,7 @@ pub(crate) fn create_read_file_span_tool(options: SourceToolOptions) -> ToolSpec
         (
             "path".to_string(),
             JsonSchema::string(Some(
-                "Repo-relative source file path. Paths outside the repository are rejected."
+                "Repo-relative source file path, or the absolute SKILL.md path of a loaded installed skill. Other paths outside the repository are rejected."
                     .to_string(),
             )),
         ),
@@ -104,7 +104,7 @@ pub(crate) fn create_read_file_span_tool(options: SourceToolOptions) -> ToolSpec
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_FILE_SPAN_TOOL_NAME.to_string(),
-        description: "Read a bounded source-file span confined to the current repository. This tool supports local environments only. Output includes an explicit repo-relative 1-based line-span evidence citation."
+        description: "Read a bounded file span from the current repository or an exact loaded installed-skill path. Repository reads support local environments only. Output includes an explicit 1-based line-span evidence citation."
             .to_string(),
         strict: false,
         defer_loading: None,

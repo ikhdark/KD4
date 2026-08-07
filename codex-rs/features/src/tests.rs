@@ -751,6 +751,7 @@ multi_agent_mode_hint_text = "Custom mode guidance."
 tool_namespace = "agents"
 hide_spawn_agent_metadata = true
 non_code_mode_only = true
+allow_full_history_forks = true
 "#,
     )
     .expect("features table should deserialize");
@@ -775,6 +776,7 @@ non_code_mode_only = true
             tool_namespace: Some("agents".to_string()),
             hide_spawn_agent_metadata: Some(true),
             non_code_mode_only: Some(true),
+            allow_full_history_forks: Some(true),
         }))
     );
 }

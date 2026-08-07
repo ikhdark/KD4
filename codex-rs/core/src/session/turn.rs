@@ -48,6 +48,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::handle_retryable_response_stream_error;
+use crate::session::EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::reasoning_governor::SamplingReasoningGovernor;
@@ -930,15 +931,18 @@ async fn build_pure_pending_turn_plan(
                 history_items: &history_items,
             }),
         };
+        let pending_token_estimate =
+            estimate_pending_tokens(input, &[], &context_update_items, first_router.as_ref());
+        let warnings = first_router.planning_warnings().to_vec();
         return Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
             identity,
             step_context,
             first_router,
             injection_items: Vec::new(),
             explicitly_enabled_connectors: HashSet::new(),
-            pending_token_estimate: estimate_pending_tokens(input, &[], &context_update_items),
+            pending_token_estimate,
             mcp_dependency_effect: None,
-            warnings: Vec::new(),
+            warnings,
             skill_plan: PlannedSkillInjections::default(),
             tracking,
             mentioned_apps: Vec::new(),
@@ -1088,6 +1092,7 @@ async fn build_pure_pending_turn_plan(
         return Ok(PendingTurnPlanBuild::Stale);
     }
     let mut warnings = planned_mcp.warnings;
+    warnings.extend(first_router.planning_warnings().iter().cloned());
     warnings.extend(skill_plan.injections.warnings.iter().cloned());
     let identity = PlanningSnapshotIdentity {
         generation,
@@ -1103,15 +1108,17 @@ async fn build_pure_pending_turn_plan(
             history_items: &history_items,
         }),
     };
+    let pending_token_estimate = estimate_pending_tokens(
+        input,
+        &injection_items,
+        &context_update_items,
+        first_router.as_ref(),
+    );
     Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
         identity,
         step_context,
         first_router,
-        pending_token_estimate: estimate_pending_tokens(
-            input,
-            &injection_items,
-            &context_update_items,
-        ),
+        pending_token_estimate,
         injection_items,
         explicitly_enabled_connectors,
         mcp_dependency_effect: planned_mcp.effect,
@@ -1154,6 +1161,32 @@ async fn stabilize_pending_turn_plan(
             return Err(CodexErr::TurnAborted);
         }
 
+        // Existing-history compaction does not depend on the pending input. Run it before
+        // constructing the expensive pure plan so a guaranteed compaction does not poll every
+        // optional contributor and then immediately throw that work away.
+        let compaction_timing_guard = turn_context
+            .turn_timing_state
+            .begin_local_phase(TurnLocalPhase::Compaction);
+        let history_compaction = run_history_pre_sampling_compact(
+            sess,
+            turn_context,
+            client_session,
+            check_previous_model_compaction,
+        )
+        .await?;
+        drop(compaction_timing_guard);
+        check_previous_model_compaction = false;
+        if let Some(reason) = history_compaction.reason {
+            if reason == PreSamplingCompactionReason::CommittedHistoryLimit {
+                // A second pre-turn compaction cannot reduce pending input because that input is
+                // deliberately not persisted until the stabilized plan is applied.
+                incoming_precompaction_completed = true;
+            }
+            client_session.invalidate_incremental_history("compaction");
+            sess.services.bump_planning_generation();
+            continue;
+        }
+
         let completed_inventory_effects = fixed_point
             .completed_inventory_effects()
             .map(|(id, effect)| (id.to_string(), effect.expected_inventory_keys.clone()))
@@ -1183,21 +1216,17 @@ async fn stabilize_pending_turn_plan(
         let compaction_timing_guard = turn_context
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::Compaction);
-        let compaction_reason = run_pre_sampling_compact(
+        let compaction_reason = run_pending_input_pre_sampling_compact(
             sess,
             turn_context,
             client_session,
-            check_previous_model_compaction,
             plan.pending_token_estimate,
+            history_compaction.tokens_until_compaction,
             !incoming_precompaction_completed,
         )
         .await?;
         drop(compaction_timing_guard);
-        check_previous_model_compaction = false;
-        if matches!(
-            compaction_reason,
-            Some(PreSamplingCompactionReason::PendingInputLimit)
-        ) {
+        if compaction_reason.is_some() {
             incoming_precompaction_completed = true;
         }
         if compaction_reason.is_some() {
@@ -1459,7 +1488,7 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         serde_json::to_vec(injection_items),
         serde_json::to_vec(context_update_items),
         serde_json::to_vec(user_input),
-        serde_json::to_vec(&router.model_visible_specs()),
+        serde_json::to_vec(&router.tool_manifest(step_context.turn.as_ref())),
         serde_json::to_vec(history_items),
     ]
     .into_iter()
@@ -1475,6 +1504,7 @@ fn estimate_pending_tokens(
     input: &[TurnInput],
     injection_items: &[ResponseItem],
     context_update_items: &[ResponseItem],
+    router: &ToolRouter,
 ) -> i64 {
     let input_bytes = input.iter().fold(0usize, |bytes, item| {
         let item_bytes = match item {
@@ -1496,6 +1526,11 @@ fn estimate_pending_tokens(
         )
         .saturating_add(
             serde_json::to_vec(context_update_items)
+                .map(|value| value.len())
+                .unwrap_or_default(),
+        )
+        .saturating_add(
+            serde_json::to_vec(&router.model_visible_specs())
                 .map(|value| value.len())
                 .unwrap_or_default(),
         );
@@ -1538,14 +1573,10 @@ async fn build_extension_turn_input_items(
         .turn_environments
         .iter()
         .enumerate()
-        .filter_map(|(index, environment)| {
-            // TODO(anp): Migrate extension turn-input environments to PathUri so foreign cwd
-            // values are not omitted from extension context.
-            Some(TurnInputEnvironment {
-                environment_id: environment.environment_id.clone(),
-                cwd: environment.cwd().to_abs_path().ok()?.into_path_buf(),
-                is_primary: index == 0,
-            })
+        .map(|(index, environment)| TurnInputEnvironment {
+            environment_id: environment.environment_id.clone(),
+            cwd: environment.cwd().clone(),
+            is_primary: index == 0,
         })
         .collect::<Vec<_>>();
 
@@ -1563,21 +1594,33 @@ async fn build_extension_turn_input_items(
     // Contributors are independent read-only DAG leaves. FuturesOrdered polls
     // them concurrently while preserving registration order in the result.
     let mut pending = FuturesOrdered::new();
+    let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
     let session_extension_data = &sess.services.session_extension_data;
     let thread_extension_data = &sess.services.thread_extension_data;
     let turn_extension_data = turn_context.extension_data.as_ref();
-    for contributor in contributors {
+    for (contributor_index, contributor) in contributors.into_iter().enumerate() {
         let input = input.clone();
         pending.push_back(async move {
-            contributor
+            let contribution = contributor
                 .contribute(
                     input,
                     session_extension_data,
                     thread_extension_data,
                     turn_extension_data,
                 )
-                .or_cancel(cancellation_token)
-                .await
+                .or_cancel(cancellation_token);
+            match tokio::time::timeout_at(deadline, contribution).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        contributor_index,
+                        scope = "turn_input",
+                        timeout = ?EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT,
+                        "extension turn-input contributor timed out; omitting its fragments"
+                    );
+                    Ok(Vec::new())
+                }
+            }
         });
     }
     let mut items = Vec::new();
@@ -1661,37 +1704,31 @@ enum PreSamplingCompactionReason {
     PendingInputLimit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistoryPreSamplingCompaction {
+    reason: Option<PreSamplingCompactionReason>,
+    tokens_until_compaction: Option<i64>,
+}
+
 #[instrument(level = "trace", skip_all)]
-async fn run_pre_sampling_compact(
+async fn run_history_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     check_previous_model: bool,
-    pending_token_estimate: i64,
-    allow_pending_input_compaction: bool,
-) -> CodexResult<Option<PreSamplingCompactionReason>> {
+) -> CodexResult<HistoryPreSamplingCompaction> {
     if check_previous_model
         && maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?
     {
-        return Ok(Some(PreSamplingCompactionReason::PreviousModel));
+        return Ok(HistoryPreSamplingCompaction {
+            reason: Some(PreSamplingCompactionReason::PreviousModel),
+            tokens_until_compaction: None,
+        });
     }
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
-    // Include the pure plan's incoming user/plugin/skill contribution. This
-    // closes the old gap where pre-turn compaction considered only committed history.
-    let incoming_reaches_limit = allow_pending_input_compaction
-        && token_status
-            .tokens_until_compaction
-            .is_some_and(|remaining| pending_token_estimate >= remaining);
-    let compaction_reason = if incoming_reaches_limit {
-        Some(PreSamplingCompactionReason::PendingInputLimit)
-    } else if token_status.token_limit_reached {
-        Some(PreSamplingCompactionReason::CommittedHistoryLimit)
-    } else {
-        None
-    };
-    if let Some(compaction_reason) = compaction_reason {
+    if token_status.token_limit_reached {
         // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
         run_auto_compact(
@@ -1704,9 +1741,47 @@ async fn run_pre_sampling_compact(
             CompactionPhase::PreTurn,
         )
         .await?;
-        return Ok(Some(compaction_reason));
+        return Ok(HistoryPreSamplingCompaction {
+            reason: Some(PreSamplingCompactionReason::CommittedHistoryLimit),
+            tokens_until_compaction: None,
+        });
     }
-    Ok(None)
+    Ok(HistoryPreSamplingCompaction {
+        reason: None,
+        tokens_until_compaction: token_status.tokens_until_compaction,
+    })
+}
+
+#[instrument(level = "trace", skip_all)]
+async fn run_pending_input_pre_sampling_compact(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    client_session: &mut ModelClientSession,
+    pending_token_estimate: i64,
+    tokens_until_compaction: Option<i64>,
+    allow_pending_input_compaction: bool,
+) -> CodexResult<Option<PreSamplingCompactionReason>> {
+    // Include the pure plan's incoming user/plugin/skill contribution. This
+    // closes the old gap where pre-turn compaction considered only committed history.
+    let incoming_reaches_limit = allow_pending_input_compaction
+        && tokens_until_compaction.is_some_and(|remaining| pending_token_estimate >= remaining);
+    if !incoming_reaches_limit {
+        return Ok(None);
+    }
+
+    // Pre-turn compaction runs before run_turn creates the normal sampling step.
+    let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
+    run_auto_compact(
+        sess,
+        step_context,
+        /*fallback_step_context*/ None,
+        client_session,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ContextLimit,
+        CompactionPhase::PreTurn,
+    )
+    .await?;
+    Ok(Some(PreSamplingCompactionReason::PendingInputLimit))
 }
 
 /// Returns true only when both turns declare compaction compatibility hashes and they differ.
@@ -2033,6 +2108,10 @@ async fn run_sampling_request(
             )
         })?;
     let base_instructions = sess.get_base_instructions().await;
+    sess.persist_rollout_items(&[codex_protocol::protocol::RolloutItem::ToolManifest(
+        router.tool_manifest(turn_context.as_ref()),
+    )])
+    .await;
 
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&sess),
@@ -3525,7 +3604,8 @@ async fn try_run_sampling_request(
         sess.services
             .models_manager
             .clone()
-            .notify_etag(etag, turn_context.config.http_client_factory());
+            .notify_etag(etag, turn_context.config.http_client_factory())
+            .await;
     }
 
     outcome

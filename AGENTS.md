@@ -133,6 +133,8 @@ path that completes the request correctly.
   do that manually.
 - Regenerate owned artifacts through their documented generator; do not hand-edit
   generated locks or generated protocol/schema outputs.
+- Prefer targeted tests by default. During iteration, validate only the specific behavior or module being changed.
+  Avoid full crate/workspace test runs, only do those when asked.
 - Tooling success alone does not prove a behavior or runtime fix. Completion
   requires the focused failing test or approved final gate to pass, and
   desktop-visible changes also require the local publish/restart proof.

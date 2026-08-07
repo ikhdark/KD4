@@ -185,6 +185,7 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         ) => false,
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => false,
+        RolloutItem::ToolManifest(_) => false,
         // Full-history forks preserve the cached prompt prefix and can keep diffing
         // from the parent's durable baseline. Truncated forks drop part of that prompt,
         // so they must rebuild context on their first child turn.
@@ -891,6 +892,50 @@ impl AgentControl {
         }
     }
 
+    pub(super) fn estimate_forked_rollout_tokens(items: &[RolloutItem]) -> i64 {
+        let mut active_history = Vec::new();
+        for item in items {
+            match item {
+                RolloutItem::ResponseItem(response_item) => {
+                    active_history.push(response_item.clone());
+                }
+                RolloutItem::InterAgentCommunication(communication) => {
+                    active_history.push(communication.to_model_input_item());
+                }
+                RolloutItem::Compacted(compacted) => {
+                    if let Some(replacement_history) = &compacted.replacement_history {
+                        active_history.clone_from(replacement_history);
+                    } else {
+                        let user_messages = crate::compact::collect_user_messages(&active_history);
+                        active_history = crate::compact::build_compacted_history(
+                            Vec::new(),
+                            &user_messages,
+                            &compacted.message,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        active_history
+            .iter()
+            .map(crate::context_manager::estimate_item_token_count)
+            .fold(0_i64, i64::saturating_add)
+    }
+
+    pub(super) fn validate_forked_rollout_token_limit(
+        items: &[RolloutItem],
+        limit: i64,
+    ) -> CodexResult<()> {
+        let estimated_tokens = Self::estimate_forked_rollout_tokens(items);
+        if estimated_tokens >= limit {
+            return Err(CodexErr::InvalidRequest(format!(
+                "selected fork history is approximately {estimated_tokens} tokens, which meets or exceeds the child token limit of {limit}; use fork_turns=\"none\" or fewer turns"
+            )));
+        }
+        Ok(())
+    }
+
     async fn spawn_forked_thread(
         &self,
         state: &Arc<ThreadManagerState>,
@@ -1043,6 +1088,13 @@ impl AgentControl {
                 ])
         {
             forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
+        }
+        if matches!(fork_mode, SpawnAgentForkMode::LastNTurns(_))
+            && let Some(limit) = config
+                .model_auto_compact_token_limit
+                .or(config.model_context_window)
+        {
+            Self::validate_forked_rollout_token_limit(&forked_rollout_items, limit)?;
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);

@@ -262,23 +262,8 @@ impl ModelsEndpointClient for ControlledModelsEndpoint {
     }
 }
 
-async fn wait_for_etag_worker(manager: &OpenAiModelsManager) {
-    for _ in 0..100 {
-        if !manager
-            .etag_refresh
-            .lock()
-            .expect("ETag refresh lock should not be poisoned")
-            .worker_running
-        {
-            return;
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-    panic!("ETag refresh worker did not finish");
-}
-
 #[tokio::test]
-async fn etag_notices_are_non_blocking_coalesced_and_latest_wins() {
+async fn etag_notices_are_non_blocking_coalesced_latest_wins_and_are_waitable() {
     let codex_home = tempdir().expect("temp dir");
     let endpoint = ControlledModelsEndpoint::new(vec![
         ControlledResponse::Models(
@@ -295,10 +280,13 @@ async fn etag_notices_are_non_blocking_coalesced_and_latest_wins() {
         endpoint.clone(),
     ));
 
-    Arc::clone(&manager).notify_etag("notice-a".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    let _first_refresh =
+        Arc::clone(&manager).notify_etag("notice-a".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
     endpoint.wait_for_fetches(1).await;
-    Arc::clone(&manager).notify_etag("notice-a".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
-    Arc::clone(&manager).notify_etag("notice-b".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    let _duplicate_refresh =
+        Arc::clone(&manager).notify_etag("notice-a".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    let latest_refresh =
+        Arc::clone(&manager).notify_etag("notice-b".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
     endpoint.release_one();
     endpoint.wait_for_fetches(2).await;
     assert!(
@@ -310,11 +298,22 @@ async fn etag_notices_are_non_blocking_coalesced_and_latest_wins() {
     );
 
     endpoint.release_one();
-    wait_for_etag_worker(&manager).await;
+    latest_refresh.await;
     let models = manager.get_remote_models().await;
     assert!(models.iter().any(|model| model.slug == "latest-etag-model"));
     assert!(!models.iter().any(|model| model.slug == "stale-etag-model"));
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        manager
+            .get_default_model(
+                &None,
+                false,
+                RefreshStrategy::Offline,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await,
+        "latest-etag-model"
+    );
 }
 
 #[tokio::test]
@@ -335,10 +334,11 @@ async fn etag_refresh_failure_preserves_catalog_and_can_retry() {
         .apply_remote_models(vec![remote_model("preserved-model", "Preserved", 1)])
         .await;
 
-    Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    let failed_refresh =
+        Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
     endpoint.wait_for_fetches(1).await;
     endpoint.release_one();
-    wait_for_etag_worker(&manager).await;
+    failed_refresh.await;
     assert!(
         manager
             .get_remote_models()
@@ -347,10 +347,11 @@ async fn etag_refresh_failure_preserves_catalog_and_can_retry() {
             .any(|model| model.slug == "preserved-model")
     );
 
-    Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    let retry_refresh =
+        Arc::clone(&manager).notify_etag("notice".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
     endpoint.wait_for_fetches(2).await;
     endpoint.release_one();
-    wait_for_etag_worker(&manager).await;
+    retry_refresh.await;
     assert!(
         manager
             .get_remote_models()
@@ -386,8 +387,9 @@ async fn matching_etag_renews_ttl_without_fetching() {
         .expect("age cache");
     *manager.etag.write().await = Some("same-etag".to_string());
 
-    Arc::clone(&manager).notify_etag("same-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
-    wait_for_etag_worker(&manager).await;
+    Arc::clone(&manager)
+        .notify_etag("same-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
 
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
     assert!(

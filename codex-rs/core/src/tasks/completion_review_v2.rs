@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codex_features::Feature;
-use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -2656,9 +2655,6 @@ pub(crate) async fn coordinate_completion_review(
         return Err(CodexErr::TurnAborted);
     }
     if state.phase == TurnReviewPhase::Terminal
-        || turn_context.session_source.is_non_root_agent()
-        || turn_context.collaboration_mode.mode != ModeKind::Default
-        || turn_context.final_output_json_schema.is_some()
         || !sess.services.task_evidence.allows_kd4_completion()
     {
         return Ok(CompletionReviewCoordinatorOutcome::default());
@@ -3616,34 +3612,6 @@ async fn run_contract_review(
         });
     }
 
-    if matches!(kind, ReviewerRequestKind::Rereview) || dossier.correction_consumed {
-        let _ = persist_validated_attempt(
-            sess,
-            &dossier,
-            attempt_kind,
-            parent_review_id,
-            validated,
-            None,
-            Some("partial"),
-            None,
-            gap_reconstructed,
-            lens_observation_advisories,
-        )
-        .await;
-        state.phase = TurnReviewPhase::Terminal;
-        return Ok(CompletionReviewCoordinatorOutcome {
-            partial_reasons: vec![
-                if matches!(kind, ReviewerRequestKind::Rereview) {
-                    "completion rereview did not establish a clean, fully evidenced candidate"
-                } else {
-                    "completion review found a repairable defect after the automatic correction was consumed"
-                }
-                .to_string(),
-            ],
-            ..Default::default()
-        });
-    }
-
     let Some(preview_review_id) = sess
         .services
         .task_evidence
@@ -3654,7 +3622,19 @@ async fn run_contract_review(
         return Ok(partial_outcome(ReviewFailureCategory::Persistence));
     };
     let preview_findings = preview_finding_receipts(&preview_review_id, &validated.findings);
-    let Some((repair_item, repair_payload)) = build_repair_item(&dossier, &preview_findings) else {
+    let continuing_after_consumed_correction =
+        matches!(kind, ReviewerRequestKind::Rereview) || dossier.correction_consumed;
+    let repair_findings = if matches!(kind, ReviewerRequestKind::Rereview) {
+        followup_repair_findings(&dossier, &preview_findings, &validated.dispositions)
+    } else {
+        preview_findings.clone()
+    };
+    let repair = if continuing_after_consumed_correction {
+        build_followup_repair_item(&dossier, &repair_findings)
+    } else {
+        build_repair_item(&dossier, &preview_findings)
+    };
+    let Some((repair_item, repair_payload)) = repair else {
         let _ = persist_validated_attempt(
             sess,
             &dossier,
@@ -3671,13 +3651,14 @@ async fn run_contract_review(
         state.phase = TurnReviewPhase::Terminal;
         return Ok(partial_outcome(ReviewFailureCategory::OversizedRequest));
     };
+    let repair_instruction = (!continuing_after_consumed_correction).then_some(repair_payload);
     let recorded = match persist_validated_attempt(
         sess,
         &dossier,
         attempt_kind,
         parent_review_id,
         validated,
-        Some(repair_payload.clone()),
+        repair_instruction,
         None,
         None,
         gap_reconstructed,
@@ -3912,6 +3893,40 @@ fn preview_finding_receipts(
         .collect()
 }
 
+fn followup_repair_findings(
+    dossier: &CompletionReviewDossier,
+    new_findings: &[CompletionReviewFindingReceipt],
+    dispositions: &[CompletionReviewDispositionReceipt],
+) -> Vec<CompletionReviewFindingReceipt> {
+    let unresolved_finding_ids = dispositions
+        .iter()
+        .filter(|disposition| {
+            !matches!(
+                disposition.disposition.as_str(),
+                "resolved" | "rebuttal_accepted"
+            )
+        })
+        .map(|disposition| disposition.finding_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut findings = dossier
+        .original_findings
+        .iter()
+        .filter(|finding| unresolved_finding_ids.contains(finding.finding_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut finding_ids = findings
+        .iter()
+        .map(|finding| finding.finding_id.clone())
+        .collect::<BTreeSet<_>>();
+    findings.extend(
+        new_findings
+            .iter()
+            .filter(|finding| finding_ids.insert(finding.finding_id.clone()))
+            .cloned(),
+    );
+    findings
+}
+
 fn build_repair_item(
     dossier: &CompletionReviewDossier,
     findings: &[CompletionReviewFindingReceipt],
@@ -3945,6 +3960,39 @@ fn build_repair_item(
         ],
         "evidence_gate": dossier.evidence_gate,
         "reviewer_visible_evidence": dossier.reviewer_visible_evidence,
+    }))
+    .ok()?;
+    let item = ContextualUserFragment::into(CompletionReviewRepair::new(payload.clone()));
+    if approx_token_count(&serde_json::to_string(&item).ok()?) > MAX_RENDERED_REQUEST_TOKENS {
+        return None;
+    }
+    Some((item, payload))
+}
+
+fn build_followup_repair_item(
+    dossier: &CompletionReviewDossier,
+    findings: &[CompletionReviewFindingReceipt],
+) -> Option<(codex_protocol::models::ResponseItem, String)> {
+    if findings.is_empty() && dossier.locally_obtainable_proof_routes.is_empty() {
+        return None;
+    }
+    let payload = serde_json::to_string_pretty(&json!({
+        "contract": "KD4_COMPLETION_CORRECTION_CONTINUATION_V2",
+        "root_task_id": dossier.root_task_id,
+        "completion_epoch": dossier.completion_epoch,
+        "manifest_revision": dossier.manifest_revision,
+        "implementation_identity": dossier.implementation_identity_hash,
+        "reviewed_dossier_snapshot_id": dossier.dossier_snapshot_id,
+        "complete_finding_set": findings,
+        "applicable_proof_routes": dossier.locally_obtainable_proof_routes,
+        "preserved_invariants": [
+            "Do not alter immutable user sources or the active requirement manifest.",
+            "Do not alter original finding contents or IDs.",
+            "Do not change evidence-gate rules or broaden the accepted scope.",
+            "Continue correcting every listed defect, then rerun focused proof before claiming completion."
+        ],
+        "evidence_gate_status": dossier.evidence_gate.status,
+        "evidence_gate_reasons": dossier.evidence_gate.reasons,
     }))
     .ok()?;
     let item = ContextualUserFragment::into(CompletionReviewRepair::new(payload.clone()));
@@ -4772,6 +4820,70 @@ mod tests {
             json!(["run the focused generated-artifact proof and record its receipt"])
         );
         assert_eq!(payload["complete_finding_set"], json!([]));
+    }
+
+    #[test]
+    fn followup_correction_does_not_repeat_oversized_reviewer_evidence() {
+        let mut dossier = dossier();
+        dossier.reviewer_visible_evidence =
+            json!({"oversized": "x".repeat(MAX_RENDERED_REQUEST_TOKENS * 8)});
+        let finding = CompletionReviewFindingReceipt {
+            finding_id: "review-2/F1".to_string(),
+            requirement_ids: vec!["requirement-1".to_string()],
+            lens: REVIEW_LENSES[0].to_string(),
+            contract_surface: "completion coordinator".to_string(),
+            severity: "high".to_string(),
+            evidence: "the defect remains".to_string(),
+            smallest_correction: "finish the missing behavior".to_string(),
+            proof_route: "run the focused regression".to_string(),
+        };
+
+        assert!(build_repair_item(&dossier, std::slice::from_ref(&finding)).is_none());
+        let (_, payload) =
+            build_followup_repair_item(&dossier, &[finding]).expect("bounded followup correction");
+        assert!(!payload.contains("reviewer_visible_evidence"));
+        assert!(payload.contains("the defect remains"));
+    }
+
+    #[test]
+    fn followup_correction_carries_only_unresolved_original_findings() {
+        let mut dossier = dossier();
+        let resolved = CompletionReviewFindingReceipt {
+            finding_id: "review-1/F1".to_string(),
+            requirement_ids: vec!["requirement-1".to_string()],
+            lens: REVIEW_LENSES[0].to_string(),
+            contract_surface: "resolved surface".to_string(),
+            severity: "high".to_string(),
+            evidence: "resolved evidence".to_string(),
+            smallest_correction: "resolved correction".to_string(),
+            proof_route: "resolved proof".to_string(),
+        };
+        let unresolved = CompletionReviewFindingReceipt {
+            finding_id: "review-1/F2".to_string(),
+            contract_surface: "unresolved surface".to_string(),
+            evidence: "unresolved evidence".to_string(),
+            smallest_correction: "unresolved correction".to_string(),
+            proof_route: "unresolved proof".to_string(),
+            ..resolved.clone()
+        };
+        dossier.original_findings = vec![resolved.clone(), unresolved.clone()];
+        let dispositions = vec![
+            CompletionReviewDispositionReceipt {
+                finding_id: resolved.finding_id,
+                disposition: "resolved".to_string(),
+                evidence: "focused proof passed".to_string(),
+            },
+            CompletionReviewDispositionReceipt {
+                finding_id: unresolved.finding_id.clone(),
+                disposition: "still_present".to_string(),
+                evidence: "focused proof still fails".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            followup_repair_findings(&dossier, &[], &dispositions),
+            vec![unresolved]
+        );
     }
 
     #[test]

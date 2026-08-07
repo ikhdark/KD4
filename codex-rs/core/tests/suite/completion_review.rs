@@ -19,6 +19,8 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -327,8 +329,13 @@ fn message_response(response_id: &str, message_id: &str, text: &str) -> String {
 #[derive(Clone)]
 enum ReviewScenario {
     Clean,
-    FindingThenClean { summary: String },
-    FindingThenUnresolved { summary: String },
+    FindingThenClean {
+        summary: String,
+    },
+    FindingThenUnresolvedThenClean {
+        summary: String,
+        unresolved_rereviews: usize,
+    },
     Malformed,
     Oversized,
     ManifestGap,
@@ -423,11 +430,16 @@ impl Respond for CompletionReviewResponder {
                         review_response(&dossier, ReviewResponseKind::Clean)
                     }
                 }
-                ReviewScenario::FindingThenUnresolved { summary } => {
+                ReviewScenario::FindingThenUnresolvedThenClean {
+                    summary,
+                    unresolved_rereviews,
+                } => {
                     if review_index == 0 {
                         review_response(&dossier, ReviewResponseKind::Finding(summary.as_str()))
-                    } else {
+                    } else if review_index <= *unresolved_rereviews {
                         review_response(&dossier, ReviewResponseKind::Unresolved)
+                    } else {
+                        review_response(&dossier, ReviewResponseKind::Clean)
                     }
                 }
                 ReviewScenario::ManifestGap => {
@@ -1054,7 +1066,7 @@ async fn nonpassed_evidence_triggers_repair_even_when_review_is_clean() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unresolved_rereview_is_partial_without_a_second_correction() -> Result<()> {
+async fn unresolved_rereview_injects_another_correction_until_clean() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let finding = "reviewer-specific omitted requirement";
@@ -1070,9 +1082,30 @@ async fn unresolved_rereview_is_partial_without_a_second_correction() -> Result<
             message_response("candidate", "candidate-message", "implementation complete"),
             plan_response("repair-plan-pass", "repair-plan-pass-call", "passed"),
             message_response("repaired", "repaired-message", "combined repair complete"),
+            patch_response(
+                "second-repair-patch",
+                "second-repair-patch-call",
+                "*** Begin Patch\n*** Add File: second-repair.txt\n+done\n*** End Patch",
+            ),
+            plan_response(
+                "second-repair-plan-pass",
+                "second-repair-plan-pass-call",
+                "passed",
+            ),
+            message_response(
+                "second-repaired",
+                "second-repaired-message",
+                "second combined repair complete",
+            ),
+            message_response(
+                "third-repaired",
+                "third-repaired-message",
+                "third combined repair complete",
+            ),
         ],
-        ReviewScenario::FindingThenUnresolved {
+        ReviewScenario::FindingThenUnresolvedThenClean {
             summary: finding.to_string(),
+            unresolved_rereviews: 2,
         },
     )
     .await;
@@ -1086,11 +1119,17 @@ async fn unresolved_rereview_is_partial_without_a_second_correction() -> Result<
     .await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Partial)
+        Some(TaskCompletionStatus::Passed),
+        "reviews={}, rereviews={}, repairs={}, total_requests={}, gate={:?}",
+        probe.review_requests.load(Ordering::SeqCst),
+        probe.rereview_requests.load(Ordering::SeqCst),
+        probe.repair_requests.load(Ordering::SeqCst),
+        probe.total_requests.load(Ordering::SeqCst),
+        completion.completion,
     );
-    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
-    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 4);
+    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 3);
+    assert!(probe.repair_requests.load(Ordering::SeqCst) >= 6);
     assert!(
         probe
             .repair_payloads
@@ -1126,8 +1165,16 @@ async fn malformed_reviewer_output_is_partial_and_never_blocked() -> Result<()> 
 
     let completion =
         submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
-    let gate = completion.completion.expect("completion report");
+    let gate = completion.completion.as_ref().expect("completion report");
     assert_eq!(gate.status, TaskCompletionStatus::Partial);
+    assert!(
+        completion
+            .last_agent_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("Task completion is partial:")),
+        "non-passed completion repeated the candidate claim: {:?}",
+        completion.last_agent_message
+    );
     assert!(
         gate.reasons
             .iter()
@@ -1582,10 +1629,10 @@ async fn non_kd4_repository_skips_review() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn plan_mode_skips_review() -> Result<()> {
+async fn plan_mode_does_not_bypass_review() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -1597,6 +1644,7 @@ async fn plan_mode_skips_review() -> Result<()> {
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
         ],
+        ReviewScenario::Clean,
     )
     .await;
     let mut builder = completion_review_builder();
@@ -1609,17 +1657,15 @@ async fn plan_mode_skips_review() -> Result<()> {
         None,
     )
     .await?;
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 4);
-    assert_eq!(reviewer_request_count(&requests), 0);
+    assert!(probe.review_requests.load(Ordering::SeqCst) >= 1);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn structured_output_turn_skips_review() -> Result<()> {
+async fn structured_output_turn_does_not_bypass_review() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -1631,6 +1677,7 @@ async fn structured_output_turn_skips_review() -> Result<()> {
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "{}"),
         ],
+        ReviewScenario::Clean,
     )
     .await;
     let mut builder = completion_review_builder();
@@ -1647,8 +1694,35 @@ async fn structured_output_turn_skips_review() -> Result<()> {
         })),
     )
     .await?;
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 4);
-    assert_eq!(reviewer_request_count(&requests), 0);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_root_agent_does_not_bypass_review() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let probe = mount_completion_review_sequence(
+        &server,
+        vec![
+            plan_response("plan-start", "plan-start-call", "in_progress"),
+            patch_response(
+                "initial-patch",
+                "initial-patch-call",
+                "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
+            ),
+            plan_response("plan-pass", "plan-pass-call", "passed"),
+            message_response("candidate", "candidate-message", "implementation complete"),
+        ],
+        ReviewScenario::Clean,
+    )
+    .await;
+    let mut builder = completion_review_builder().with_session_source(SessionSource::SubAgent(
+        SubAgentSource::Other("completion-review-test".to_string()),
+    ));
+    let test = builder.build(&server).await?;
+
+    submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     Ok(())
 }

@@ -173,6 +173,20 @@ pub trait AgentTaskStore: Send + Sync {
         after_event_id: Option<WakeEventId>,
     ) -> TaskStoreFuture<'_, WakeRead>;
 
+    fn automatic_wake_cursor(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+    ) -> TaskStoreFuture<'_, Option<WakeEventId>>;
+
+    fn compare_and_swap_automatic_wake_cursor(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+        expected: Option<WakeEventId>,
+        next: WakeEventId,
+    ) -> TaskStoreFuture<'_, bool>;
+
     fn reserve_stalled_nudge(
         &self,
         assignment_id: AssignmentId,

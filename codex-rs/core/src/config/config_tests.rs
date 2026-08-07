@@ -10592,15 +10592,17 @@ default_wait_timeout_ms = 0
 "#,
     )?;
 
-    let config = ConfigBuilder::without_managed_config_for_tests()
+    let err = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
-        .await?;
-
-    assert_eq!(config.multi_agent_v2.min_wait_timeout_ms, 0);
-    assert_eq!(config.multi_agent_v2.max_wait_timeout_ms, 0);
-    assert_eq!(config.multi_agent_v2.default_wait_timeout_ms, 0);
+        .await
+        .expect_err("wait timeout values below the floor should be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        err.to_string(),
+        "features.multi_agent_v2.min_wait_timeout_ms must be at least 60000"
+    );
 
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),
@@ -10620,7 +10622,7 @@ min_wait_timeout_ms = -1
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(
         err.to_string(),
-        "features.multi_agent_v2.min_wait_timeout_ms must be at least 0"
+        "features.multi_agent_v2.min_wait_timeout_ms must be at least 60000"
     );
 
     std::fs::write(
@@ -10662,7 +10664,7 @@ max_wait_timeout_ms = -1
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(
         err.to_string(),
-        "features.multi_agent_v2.max_wait_timeout_ms must be at least 0"
+        "features.multi_agent_v2.max_wait_timeout_ms must be at least 60000"
     );
 
     std::fs::write(
@@ -10704,15 +10706,15 @@ default_wait_timeout_ms = -1
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(
         err.to_string(),
-        "features.multi_agent_v2.default_wait_timeout_ms must be at least 0"
+        "features.multi_agent_v2.default_wait_timeout_ms must be at least 60000"
     );
 
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),
         r#"[features.multi_agent_v2]
 enabled = true
-min_wait_timeout_ms = 1000
-max_wait_timeout_ms = 500
+min_wait_timeout_ms = 120000
+max_wait_timeout_ms = 60000
 "#,
     )?;
 
@@ -10733,9 +10735,9 @@ max_wait_timeout_ms = 500
         codex_home.path().join(CONFIG_TOML_FILE),
         r#"[features.multi_agent_v2]
 enabled = true
-min_wait_timeout_ms = 1000
-max_wait_timeout_ms = 2000
-default_wait_timeout_ms = 500
+min_wait_timeout_ms = 120000
+max_wait_timeout_ms = 180000
+default_wait_timeout_ms = 60000
 "#,
     )?;
 
@@ -10756,9 +10758,9 @@ default_wait_timeout_ms = 500
         codex_home.path().join(CONFIG_TOML_FILE),
         r#"[features.multi_agent_v2]
 enabled = true
-min_wait_timeout_ms = 1000
-max_wait_timeout_ms = 2000
-default_wait_timeout_ms = 2500
+min_wait_timeout_ms = 60000
+max_wait_timeout_ms = 120000
+default_wait_timeout_ms = 180000
 "#,
     )?;
 

@@ -225,9 +225,9 @@ pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 /// permits up to two concurrently resident child agents.
 pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 3;
 
-pub(crate) const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
+pub(crate) const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 60_000;
 pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 60 * 60 * 1000;
-pub(crate) const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
+pub(crate) const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 60_000;
 const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = r#"You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
 At the start of your turn, you are the active agent.
@@ -345,7 +345,8 @@ fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency
     )
 }
 
-pub(crate) const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 0;
+pub(crate) const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 =
+    DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 pub(crate) const HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS: i64 =
     DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_AGENT_MAX_DEPTH: i32 = 1;
@@ -1243,6 +1244,7 @@ pub struct MultiAgentV2Config {
     pub tool_namespace: Option<String>,
     pub hide_spawn_agent_metadata: bool,
     pub non_code_mode_only: bool,
+    pub allow_full_history_forks: bool,
 }
 
 impl MultiAgentV2Config {
@@ -1265,6 +1267,7 @@ impl MultiAgentV2Config {
             tool_namespace: Some(DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE.to_string()),
             hide_spawn_agent_metadata: true,
             non_code_mode_only: true,
+            allow_full_history_forks: false,
         }
     }
 }
@@ -2622,6 +2625,9 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
         .and_then(|config| config.tool_namespace.as_ref())
         .cloned()
         .or(default.tool_namespace);
+    let allow_full_history_forks = base
+        .and_then(|config| config.allow_full_history_forks)
+        .unwrap_or(default.allow_full_history_forks);
     let tool_namespace = match tool_namespace.as_deref() {
         Some(LEGACY_MULTI_AGENT_V2_TOOL_NAMESPACE) => {
             Some(DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE.to_string())
@@ -2647,6 +2653,7 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
         tool_namespace,
         hide_spawn_agent_metadata,
         non_code_mode_only,
+        allow_full_history_forks,
     }
 }
 

@@ -49,6 +49,22 @@ pub(crate) fn summarize_shell_output_for_model(
         .command_text
         .is_some_and(looks_like_validation_command);
     let selected = selected_line_indexes(&lines, failed, validation);
+    let critical_signals = critical_signal_indexes(&lines);
+    let mut critical_context = BTreeSet::new();
+    add_context_ranges(
+        lines.len(),
+        critical_signals.iter().copied(),
+        &mut critical_context,
+    );
+    let tail_count = if failed || validation {
+        FAILURE_TAIL_LINES
+    } else {
+        SUCCESS_TAIL_LINES
+    };
+    let tail_start = lines.len().saturating_sub(tail_count);
+    let tail_indexes = (tail_start..lines.len()).collect::<BTreeSet<_>>();
+    let mut priority_indexes = critical_context.clone();
+    priority_indexes.extend(tail_indexes.iter().copied());
     let retained_shape = if validation {
         "failure-focused lines, final status lines, tail"
     } else if failed {
@@ -69,10 +85,19 @@ pub(crate) fn summarize_shell_output_for_model(
     builder.push_line("");
     builder.push_line("Selected output lines:");
 
+    // Emit exact failure signals, their context, and the final status tail
+    // before advisory ranges. A source-ordered warning flood could otherwise
+    // consume the bounded summary before either actionable region.
+    let ordered = critical_signals
+        .iter()
+        .copied()
+        .chain(critical_context.difference(&critical_signals).copied())
+        .chain(tail_indexes.difference(&critical_context).copied())
+        .chain(selected.difference(&priority_indexes).copied());
     let mut previous = None;
-    for index in selected {
+    for index in ordered {
         if let Some(previous_index) = previous
-            && index > previous_index + 1
+            && index != previous_index + 1
         {
             builder.push_line("...");
         }
@@ -118,14 +143,33 @@ fn add_tail(lines: &[&str], selected: &mut BTreeSet<usize>, count: usize) {
 }
 
 fn add_focus_ranges(lines: &[&str], selected: &mut BTreeSet<usize>) {
-    for index in lines
+    let critical = critical_signal_indexes(lines);
+    add_context_ranges(lines.len(), critical.iter().copied(), selected);
+    let remaining = MAX_FOCUS_MATCHES.saturating_sub(critical.len());
+    let advisory = lines
         .iter()
         .enumerate()
-        .filter_map(|(index, line)| is_failure_signal(line).then_some(index))
+        .filter_map(|(index, line)| is_advisory_signal(line).then_some(index));
+    add_context_ranges(lines.len(), advisory.take(remaining), selected);
+}
+
+fn critical_signal_indexes(lines: &[&str]) -> BTreeSet<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| is_critical_failure_signal(line).then_some(index))
         .take(MAX_FOCUS_MATCHES)
-    {
+        .collect()
+}
+
+fn add_context_ranges(
+    line_count: usize,
+    indexes: impl Iterator<Item = usize>,
+    selected: &mut BTreeSet<usize>,
+) {
+    for index in indexes {
         let start = index.saturating_sub(FOCUS_CONTEXT_LINES);
-        let end = (index + FOCUS_CONTEXT_LINES + 1).min(lines.len());
+        let end = (index + FOCUS_CONTEXT_LINES + 1).min(line_count);
         for selected_index in start..end {
             selected.insert(selected_index);
         }
@@ -143,7 +187,7 @@ fn add_status_lines(lines: &[&str], selected: &mut BTreeSet<usize>) {
     }
 }
 
-fn is_failure_signal(line: &str) -> bool {
+fn is_critical_failure_signal(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("error")
         || lower.contains("failed")
@@ -152,9 +196,13 @@ fn is_failure_signal(line: &str) -> bool {
         || lower.contains("thread ")
         || lower.contains("expected")
         || lower.contains("actual")
-        || lower.contains("warning")
-        || lower.contains("warning[")
         || lower.contains("error[")
+}
+
+fn is_advisory_signal(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("warning")
+        || lower.contains("warning[")
         || lower.trim_start().starts_with("-->")
         || lower.trim_start().starts_with("note:")
         || lower.trim_start().starts_with("help:")

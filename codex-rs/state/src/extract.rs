@@ -24,7 +24,7 @@ pub fn apply_rollout_item(
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
-        RolloutItem::Compacted(_) => {}
+        RolloutItem::Compacted(_) | RolloutItem::ToolManifest(_) => {}
         RolloutItem::WorldState(_) => {}
     }
     if metadata.model_provider.is_empty() {
@@ -49,6 +49,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        | RolloutItem::ToolManifest(_)
         | RolloutItem::WorldState(_) => false,
     }
 }

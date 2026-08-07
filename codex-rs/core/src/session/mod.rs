@@ -7,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -248,6 +249,9 @@ use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
 use self::turn_context::TurnSkillsContext;
+
+pub(super) const EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
@@ -3216,8 +3220,15 @@ impl Session {
     async fn poll_thread_context_contributors(&self, estimate: bool) -> Vec<PromptFragment> {
         // Poll contributors concurrently, but yield their fragments in registration order.
         let mut pending = FuturesOrdered::new();
-        for contributor in self.services.extensions.context_contributors() {
-            pending.push_back(if estimate {
+        let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
+        for (contributor_index, contributor) in self
+            .services
+            .extensions
+            .context_contributors()
+            .iter()
+            .enumerate()
+        {
+            let contribution = if estimate {
                 contributor.estimate_thread_context(
                     &self.services.session_extension_data,
                     &self.services.thread_extension_data,
@@ -3227,6 +3238,20 @@ impl Session {
                     &self.services.session_extension_data,
                     &self.services.thread_extension_data,
                 )
+            };
+            pending.push_back(async move {
+                match tokio::time::timeout_at(deadline, contribution).await {
+                    Ok(fragments) => fragments,
+                    Err(_) => {
+                        warn!(
+                            contributor_index,
+                            scope = "thread",
+                            timeout = ?EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT,
+                            "extension context contributor timed out; omitting its fragments"
+                        );
+                        Vec::new()
+                    }
+                }
             });
         }
 
@@ -3244,7 +3269,14 @@ impl Session {
     ) -> Vec<PromptFragment> {
         // Poll contributors concurrently, but yield their fragments in registration order.
         let mut pending = FuturesOrdered::new();
-        for contributor in self.services.extensions.context_contributors() {
+        let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
+        for (contributor_index, contributor) in self
+            .services
+            .extensions
+            .context_contributors()
+            .iter()
+            .enumerate()
+        {
             let input = TurnContextContributionInput {
                 thread_id: self.thread_id(),
                 turn_id: turn_context.sub_id.as_str(),
@@ -3253,10 +3285,24 @@ impl Session {
                 turn_store: turn_context.extension_data.as_ref(),
                 model_context_window: turn_context.model_context_window(),
             };
-            pending.push_back(if estimate {
+            let contribution = if estimate {
                 contributor.estimate_turn_context(input)
             } else {
                 contributor.contribute_turn_context(input)
+            };
+            pending.push_back(async move {
+                match tokio::time::timeout_at(deadline, contribution).await {
+                    Ok(fragments) => fragments,
+                    Err(_) => {
+                        warn!(
+                            contributor_index,
+                            scope = "turn",
+                            timeout = ?EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT,
+                            "extension context contributor timed out; omitting its fragments"
+                        );
+                        Vec::new()
+                    }
+                }
             });
         }
 

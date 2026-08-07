@@ -110,7 +110,10 @@ async fn handle_spawn_agent(
         .as_ref()
         .map(|_| parse_typed_role(args.agent_type.as_deref()))
         .transpose()?;
-    let fork_mode = args.fork_mode(typed_role)?;
+    let fork_mode = args.fork_mode(
+        typed_role,
+        turn.config.multi_agent_v2.allow_full_history_forks,
+    )?;
     let role_name = args
         .agent_type
         .as_deref()
@@ -798,6 +801,7 @@ impl SpawnAgentArgs {
     fn fork_mode(
         &self,
         typed_role: Option<AgentRole>,
+        allow_full_history_forks: bool,
     ) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
         if self.fork_context.is_some() {
             return Err(FunctionCallError::RespondToModel(
@@ -831,18 +835,29 @@ impl SpawnAgentArgs {
             return Ok(typed_role.map(|_| SpawnAgentForkMode::TaskCapsule));
         }
         if fork_turns.eq_ignore_ascii_case("all") {
-            return Ok(Some(SpawnAgentForkMode::FullHistory));
+            if allow_full_history_forks {
+                return Ok(Some(SpawnAgentForkMode::FullHistory));
+            }
+            return Err(FunctionCallError::RespondToModel(
+                "fork_turns=\"all\" is disabled. Use `none` or an integer from 1 through 5."
+                    .to_string(),
+            ));
         }
 
         let last_n_turns = fork_turns.parse::<usize>().map_err(|_| {
             FunctionCallError::RespondToModel(
-                "fork_turns must be `none`, `all`, or a positive integer string".to_string(),
+                "fork_turns must be `none` or an integer from 1 through 5".to_string(),
             )
         })?;
         if last_n_turns == 0 {
             return Err(FunctionCallError::RespondToModel(
-                "fork_turns must be `none`, `all`, or a positive integer string".to_string(),
+                "fork_turns must be `none` or an integer from 1 through 5".to_string(),
             ));
+        }
+        if last_n_turns > 5 {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "requested {last_n_turns} fork turns exceeds configured limit 5; use `none` or an integer from 1 through 5"
+            )));
         }
 
         Ok(Some(SpawnAgentForkMode::LastNTurns(last_n_turns)))
@@ -1113,6 +1128,10 @@ impl ToolOutput for SpawnAgentResult {
         true
     }
 
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         tool_output_response_item(call_id, payload, self, Some(true), "spawn_agent")
     }
@@ -1164,36 +1183,54 @@ mod tests {
     #[test]
     fn untyped_spawn_without_overrides_defaults_to_no_history() {
         let args = spawn_args();
-        assert!(matches!(args.fork_mode(None), Ok(None)));
+        assert!(matches!(args.fork_mode(None, false), Ok(None)));
     }
 
     #[test]
     fn untyped_spawn_with_model_override_defaults_to_no_history() {
         let mut args = spawn_args();
         args.model = Some("child-model".to_string());
-        assert!(matches!(args.fork_mode(None), Ok(None)));
+        assert!(matches!(args.fork_mode(None, false), Ok(None)));
     }
 
     #[test]
     fn legacy_explicit_none_is_a_fresh_non_forked_child() {
         let mut args = spawn_args();
         args.fork_turns = Some("none".to_string());
-        assert!(matches!(args.fork_mode(None), Ok(None)));
+        assert!(matches!(args.fork_mode(None, false), Ok(None)));
     }
 
     #[test]
-    fn legacy_full_history_and_last_n_modes_are_unchanged() {
+    fn full_history_requires_opt_in_and_last_n_is_bounded() {
         let mut args = spawn_args();
         args.fork_turns = Some("all".to_string());
         assert!(matches!(
-            args.fork_mode(None),
+            args.fork_mode(None, false),
+            Err(FunctionCallError::RespondToModel(message)) if message.contains("is disabled")
+        ));
+        assert!(matches!(
+            args.fork_mode(None, true),
             Ok(Some(SpawnAgentForkMode::FullHistory))
         ));
 
-        args.fork_turns = Some("4".to_string());
+        args.fork_turns = Some("1".to_string());
         assert!(matches!(
-            args.fork_mode(None),
-            Ok(Some(SpawnAgentForkMode::LastNTurns(4)))
+            args.fork_mode(None, false),
+            Ok(Some(SpawnAgentForkMode::LastNTurns(1)))
+        ));
+        args.fork_turns = Some("5".to_string());
+        assert!(matches!(
+            args.fork_mode(None, false),
+            Ok(Some(SpawnAgentForkMode::LastNTurns(5)))
+        ));
+        args.fork_turns = Some("6".to_string());
+        assert!(matches!(
+            args.fork_mode(None, false),
+            Err(FunctionCallError::RespondToModel(message))
+                if message.contains("requested 6 fork turns")
+                    && message.contains("configured limit 5")
+                    && message.contains("none")
+                    && message.contains("1 through 5")
         ));
     }
 
@@ -1204,7 +1241,7 @@ mod tests {
         args.assignment = Some(typed_assignment());
         args.agent_type = Some("worker".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Worker)),
+            args.fork_mode(Some(AgentRole::Worker), false),
             Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }
@@ -1217,7 +1254,7 @@ mod tests {
         args.agent_type = Some("worker".to_string());
         args.fork_turns = Some("none".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Worker)),
+            args.fork_mode(Some(AgentRole::Worker), false),
             Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }
@@ -1230,7 +1267,7 @@ mod tests {
         args.agent_type = Some("worker".to_string());
         args.fork_turns = Some("3".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Worker)),
+            args.fork_mode(Some(AgentRole::Worker), false),
             Ok(Some(SpawnAgentForkMode::LastNTurns(3)))
         ));
     }
@@ -1244,7 +1281,7 @@ mod tests {
         args.fork_turns = Some("all".to_string());
         let typed_role = parse_typed_role(args.agent_type.as_deref()).expect("typed role");
         let fork_mode = args
-            .fork_mode(Some(typed_role))
+            .fork_mode(Some(typed_role), true)
             .expect("explicit fork mode");
         assert!(matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)));
         assert!(
@@ -1265,7 +1302,7 @@ mod tests {
         args.agent_type = Some("reviewer".to_string());
         args.fork_turns = Some("all".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Reviewer)),
+            args.fork_mode(Some(AgentRole::Reviewer), false),
             Err(FunctionCallError::RespondToModel(message))
                 if message.contains("require fork_turns=\"none\"")
         ));
@@ -1295,7 +1332,7 @@ mod tests {
         args.agent_type = Some("verifier".to_string());
         args.fork_turns = Some("none".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Verifier)),
+            args.fork_mode(Some(AgentRole::Verifier), false),
             Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }

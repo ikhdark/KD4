@@ -23,19 +23,26 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ToolManifestItem;
 use codex_tools::DiscoverableTool;
 use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
+use tracing::warn;
 
 pub use crate::tools::context::ToolCallSource;
+
+const READ_COORDINATION_MAX_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall {
@@ -53,6 +60,7 @@ pub(crate) enum ToolCallBuildError {
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Vec<ToolSpec>,
+    planning_warnings: Vec<String>,
     proven_read_only_external_tools: HashSet<ToolName>,
 }
 
@@ -91,16 +99,65 @@ impl ToolRouter {
         router
     }
 
+    #[cfg(test)]
     pub(crate) fn from_parts(registry: ToolRegistry, model_visible_specs: Vec<ToolSpec>) -> Self {
+        Self::from_parts_with_warnings(registry, model_visible_specs, Vec::new())
+    }
+
+    pub(crate) fn from_parts_with_warnings(
+        registry: ToolRegistry,
+        model_visible_specs: Vec<ToolSpec>,
+        planning_warnings: Vec<String>,
+    ) -> Self {
         Self {
             registry,
             model_visible_specs,
+            planning_warnings,
             proven_read_only_external_tools: HashSet::new(),
         }
     }
 
     pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
         self.model_visible_specs.clone()
+    }
+
+    pub(crate) fn tool_manifest(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+    ) -> ToolManifestItem {
+        let registered = self
+            .registry
+            .manifest_entries()
+            .into_iter()
+            .map(|(name, exposure, spec)| {
+                let exposure_name = match exposure {
+                    crate::tools::registry::ToolExposure::Direct => "direct",
+                    crate::tools::registry::ToolExposure::Deferred => "deferred",
+                    crate::tools::registry::ToolExposure::DirectModelOnly => "direct_model_only",
+                    crate::tools::registry::ToolExposure::Hidden => "hidden",
+                };
+                serde_json::json!({
+                    "name": name.to_string(),
+                    "exposure": exposure_name,
+                    "activated": exposure != crate::tools::registry::ToolExposure::Deferred
+                        || turn.deferred_tool_is_activated(&name),
+                    "spec": spec,
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = canonicalize_json(serde_json::json!({
+            "model_visible": self.model_visible_specs,
+            "registered": registered,
+        }));
+        let encoded = serde_json::to_vec(&manifest).unwrap_or_default();
+        ToolManifestItem {
+            hash: format!("{:x}", Sha256::digest(encoded)),
+            manifest,
+        }
+    }
+
+    pub(crate) fn planning_warnings(&self) -> &[String] {
+        &self.planning_warnings
     }
 
     #[cfg(test)]
@@ -247,6 +304,17 @@ impl ToolRouter {
         source: ToolCallSource,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        if self.registry.tool_exposure(&call.tool_name)
+            == Some(crate::tools::registry::ToolExposure::Deferred)
+            && !step_context
+                .turn
+                .deferred_tool_is_activated(&call.tool_name)
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "tool `{}` is deferred; select it with tool_search during this turn before calling it",
+                call.tool_name
+            )));
+        }
         let external_mutation_intent = if self
             .proven_read_only_external_tools
             .contains(&call.tool_name)
@@ -305,6 +373,25 @@ impl ToolRouter {
         self.registry
             .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
             .await
+    }
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut entries = values.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
     }
 }
 
@@ -425,15 +512,64 @@ async fn authorize_bound_typed_tool_call(
     let Some(binding) = coordinator.binding_for_source(&step_context.turn.session_source) else {
         return Ok(());
     };
-    let task = coordinator
-        .get_agent_task(binding.assignment_id, Some(0))
+    let collaboration_namespace = step_context
+        .turn
+        .provider
+        .capabilities()
+        .namespace_tools
+        .then_some(
+            step_context
+                .turn
+                .config
+                .multi_agent_v2
+                .tool_namespace
+                .as_deref(),
+        )
+        .flatten();
+    let class = classify_typed_tool(
+        call.tool_name.namespace.as_deref(),
+        &call.tool_name.name,
+        collaboration_namespace,
+    );
+    let task_result = if class == TypedToolClass::ReadSearch {
+        match tokio::time::timeout(
+            READ_COORDINATION_MAX_WAIT,
+            coordinator.get_agent_task(binding.assignment_id, Some(0)),
+        )
         .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    assignment_id = %binding.assignment_id,
+                    max_wait_ms = READ_COORDINATION_MAX_WAIT.as_millis(),
+                    "typed task lookup exceeded its time budget; allowing confined read/search"
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        coordinator
+            .get_agent_task(binding.assignment_id, Some(0))
+            .await
+    };
+    let task = match task_result {
+        Ok(task) => task,
+        Err(error) if class == TypedToolClass::ReadSearch => {
+            warn!(
+                %error,
+                tool_name = %call.tool_name.name,
+                "allowing confined typed read/search while assignment state is unavailable"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(FunctionCallError::RespondToModel(format!(
                 "{}: typed assignment state is unavailable: {error}",
                 call.tool_name.name
-            ))
-        })?;
+            )));
+        }
+    };
     if task.current_attempt.attempt_id != binding.attempt_id
         || task.current_attempt.state != AttemptState::Active
     {
@@ -457,25 +593,6 @@ async fn authorize_bound_typed_tool_call(
         None => step_context.turn.config.cwd.to_path_buf(),
     };
     let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-    let collaboration_namespace = step_context
-        .turn
-        .provider
-        .capabilities()
-        .namespace_tools
-        .then_some(
-            step_context
-                .turn
-                .config
-                .multi_agent_v2
-                .tool_namespace
-                .as_deref(),
-        )
-        .flatten();
-    let class = classify_typed_tool(
-        call.tool_name.namespace.as_deref(),
-        &call.tool_name.name,
-        collaboration_namespace,
-    );
     let authorization = authorize_typed_tool(
         &task.assignment,
         &repo_root,
@@ -500,15 +617,43 @@ async fn authorize_bound_typed_tool_call(
             )));
         }
     }
-    let heartbeated = coordinator
-        .heartbeat_typed_actor_binding(&binding)
+    let heartbeat_result = if class == TypedToolClass::ReadSearch {
+        match tokio::time::timeout(
+            READ_COORDINATION_MAX_WAIT,
+            coordinator.heartbeat_typed_actor_binding(&binding),
+        )
         .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    assignment_id = %binding.assignment_id,
+                    max_wait_ms = READ_COORDINATION_MAX_WAIT.as_millis(),
+                    "typed task heartbeat exceeded its time budget; allowing confined read/search"
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        coordinator.heartbeat_typed_actor_binding(&binding).await
+    };
+    let heartbeated = match heartbeat_result {
+        Ok(heartbeated) => heartbeated,
+        Err(error) if class == TypedToolClass::ReadSearch => {
+            warn!(
+                %error,
+                tool_name = %call.tool_name.name,
+                "allowing confined typed read/search without persisting its heartbeat"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(FunctionCallError::RespondToModel(format!(
                 "{}: typed assignment heartbeat failed: {error}",
                 call.tool_name.name
-            ))
-        })?;
+            )));
+        }
+    };
     if !heartbeated {
         return Err(FunctionCallError::RespondToModel(format!(
             "{}: the bound typed assignment attempt is no longer active",

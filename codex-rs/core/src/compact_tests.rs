@@ -239,7 +239,7 @@ fn compacted_history_preserves_mixed_and_image_only_user_requirements() {
 }
 
 #[test]
-fn collect_user_messages_filters_session_prefix_entries() {
+fn compaction_strips_tagged_startup_entries_but_retains_untagged_legacy_text() {
     let items = vec![
         ResponseItem::Message {
             id: None,
@@ -259,7 +259,7 @@ do things
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: "<ENVIRONMENT_CONTEXT>cwd=/tmp</ENVIRONMENT_CONTEXT>".to_string(),
+                text: "legacy environment_context: cwd=/tmp".to_string(),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
@@ -275,9 +275,16 @@ do things
         },
     ];
 
-    let collected = collect_user_messages(&items);
+    let compactable = strip_compaction_startup_envelopes(items);
+    let collected = collect_user_messages(&compactable);
 
-    assert_eq!(vec![compacted_user_message("real user message")], collected);
+    assert_eq!(
+        vec![
+            compacted_user_message("legacy environment_context: cwd=/tmp"),
+            compacted_user_message("real user message"),
+        ],
+        collected
+    );
 }
 
 #[test]
@@ -341,6 +348,31 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
         other => panic!("unexpected item in history: {other:?}"),
     };
     assert_eq!(summary_text, "SUMMARY");
+}
+
+#[test]
+fn local_compaction_enforces_user_intent_and_task_state_budgets() {
+    let user_messages = vec![compacted_user_message(&"user intent ".repeat(8_000))];
+    let history = build_compacted_history(
+        Vec::new(),
+        &user_messages,
+        &bounded_task_state_summary(&"active requirement ".repeat(8_000)),
+    );
+
+    let user_text = match &history[0] {
+        ResponseItem::Message { content, .. } => content_items_to_text(content).unwrap_or_default(),
+        other => panic!("expected user intent message, got {other:?}"),
+    };
+    let task_state = match history.last() {
+        Some(ResponseItem::Message { content, .. }) => {
+            content_items_to_text(content).unwrap_or_default()
+        }
+        other => panic!("expected task-state message, got {other:?}"),
+    };
+
+    assert!(approx_token_count(&user_text) <= COMPACT_USER_MESSAGE_MAX_TOKENS);
+    assert!(approx_token_count(&task_state) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    assert!(task_state.starts_with(SUMMARY_PREFIX));
 }
 
 #[test]

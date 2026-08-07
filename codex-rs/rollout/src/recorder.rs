@@ -60,6 +60,7 @@ use crate::state_db;
 use crate::state_db::StateDbHandle;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -759,70 +760,80 @@ impl RolloutRecorder {
         config: &impl RolloutConfigView,
         params: RolloutRecorderParams,
     ) -> std::io::Result<Self> {
-        let (writer, deferred_log_file_info, rollout_path, meta) = match params {
-            RolloutRecorderParams::Create {
-                session_id,
-                conversation_id,
-                forked_from_id,
-                parent_thread_id,
-                source,
-                thread_source,
-                originator,
-                base_instructions,
-                dynamic_tools,
-                selected_capability_roots,
-                multi_agent_version,
-                history_mode,
-                initial_window_id,
-            } => {
-                let log_file_info = precompute_log_file_info(config, conversation_id)?;
-                let path = log_file_info.path.clone();
-                let thread_id = log_file_info.conversation_id;
-                let started_at = log_file_info.timestamp;
-
-                let timestamp_format: &[FormatItem] = format_description!(
-                    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-                );
-                let timestamp = started_at
-                    .to_offset(time::UtcOffset::UTC)
-                    .format(timestamp_format)
-                    .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
-
-                let session_meta = SessionMeta {
+        let (writer, deferred_log_file_info, rollout_path, meta, persisted_manifest_hashes) =
+            match params {
+                RolloutRecorderParams::Create {
                     session_id,
-                    id: thread_id,
+                    conversation_id,
                     forked_from_id,
                     parent_thread_id,
-                    timestamp,
-                    cwd: config.cwd().to_path_buf(),
-                    originator,
-                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                    agent_nickname: source.get_nickname(),
-                    agent_role: source.get_agent_role(),
-                    agent_path: source.get_agent_path().map(Into::into),
-                    source: *source,
+                    source,
                     thread_source,
-                    model_provider: Some(config.model_provider_id().to_string()),
-                    base_instructions: Some(base_instructions),
-                    dynamic_tools: if dynamic_tools.is_empty() {
-                        None
-                    } else {
-                        Some(dynamic_tools)
-                    },
+                    originator,
+                    base_instructions,
+                    dynamic_tools,
                     selected_capability_roots,
-                    memory_mode: (!config.generate_memories()).then_some("disabled".to_string()),
-                    history_mode,
                     multi_agent_version,
-                    context_window: initial_window_id.map(SessionContextWindow::new),
-                };
+                    history_mode,
+                    initial_window_id,
+                } => {
+                    let log_file_info = precompute_log_file_info(config, conversation_id)?;
+                    let path = log_file_info.path.clone();
+                    let thread_id = log_file_info.conversation_id;
+                    let started_at = log_file_info.timestamp;
 
-                (None, Some(log_file_info), path, Some(session_meta))
-            }
-            RolloutRecorderParams::Resume { path } => {
-                let (path, writer) = open_rollout_for_append(path.as_path()).await?;
-                (Some(writer), None, path, None)
-            }
-        };
+                    let timestamp_format: &[FormatItem] = format_description!(
+                        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+                    );
+                    let timestamp = started_at
+                        .to_offset(time::UtcOffset::UTC)
+                        .format(timestamp_format)
+                        .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+
+                    let session_meta = SessionMeta {
+                        session_id,
+                        id: thread_id,
+                        forked_from_id,
+                        parent_thread_id,
+                        timestamp,
+                        cwd: config.cwd().to_path_buf(),
+                        originator,
+                        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                        agent_nickname: source.get_nickname(),
+                        agent_role: source.get_agent_role(),
+                        agent_path: source.get_agent_path().map(Into::into),
+                        source: *source,
+                        thread_source,
+                        model_provider: Some(config.model_provider_id().to_string()),
+                        base_instructions: Some(base_instructions),
+                        dynamic_tools: if dynamic_tools.is_empty() {
+                            None
+                        } else {
+                            Some(dynamic_tools)
+                        },
+                        selected_capability_roots,
+                        memory_mode: (!config.generate_memories())
+                            .then_some("disabled".to_string()),
+                        history_mode,
+                        multi_agent_version,
+                        context_window: initial_window_id.map(SessionContextWindow::new),
+                    };
+
+                    (
+                        None,
+                        Some(log_file_info),
+                        path,
+                        Some(session_meta),
+                        HashSet::new(),
+                    )
+                }
+                RolloutRecorderParams::Resume { path } => {
+                    let persisted_manifest_hashes =
+                        Self::existing_manifest_hashes(path.as_path()).await?;
+                    let (path, writer) = open_rollout_for_append(path.as_path()).await?;
+                    (Some(writer), None, path, None, persisted_manifest_hashes)
+                }
+            };
 
         // Clone the cwd for the spawned task to collect git info asynchronously
         let cwd = config.cwd().to_path_buf();
@@ -845,6 +856,7 @@ impl RolloutRecorder {
                 meta,
                 cwd,
                 rollout_path_for_spawn.clone(),
+                persisted_manifest_hashes,
             )
             .await;
             if let Err(err) = result {
@@ -991,6 +1003,20 @@ impl RolloutRecorder {
             parse_errors,
         );
         Ok((items, thread_id, parse_errors))
+    }
+
+    async fn existing_manifest_hashes(path: &Path) -> std::io::Result<HashSet<String>> {
+        let mut hashes = HashSet::new();
+        let mut reader = compression::open_rollout_line_reader(path).await?;
+        while let Some(line) = reader.next_line().await? {
+            let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
+                continue;
+            };
+            if let RolloutItem::ToolManifest(manifest) = rollout_line.item {
+                hashes.insert(manifest.hash);
+            }
+        }
+        Ok(hashes)
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
@@ -1583,6 +1609,8 @@ struct RolloutWriterState {
     rollout_path: PathBuf,
     last_logged_error: Option<String>,
     retry_blocked_error: Option<String>,
+    persisted_manifest_hashes: HashSet<String>,
+    pending_token_count: Option<RolloutItem>,
 }
 
 impl RolloutWriterState {
@@ -1592,6 +1620,7 @@ impl RolloutWriterState {
         meta: Option<SessionMeta>,
         cwd: PathBuf,
         rollout_path: PathBuf,
+        persisted_manifest_hashes: HashSet<String>,
     ) -> Self {
         Self {
             writer,
@@ -1602,11 +1631,36 @@ impl RolloutWriterState {
             rollout_path,
             last_logged_error: None,
             retry_blocked_error: None,
+            persisted_manifest_hashes,
+            pending_token_count: None,
         }
     }
 
     fn add_items(&mut self, items: Vec<RolloutItem>) {
-        self.pending_items.extend(items);
+        for item in items {
+            match item {
+                // The recorder owns the single canonical metadata slot. Inherited history must
+                // never append another session_meta record.
+                RolloutItem::SessionMeta(_) => {}
+                RolloutItem::ToolManifest(manifest) => {
+                    if self.persisted_manifest_hashes.insert(manifest.hash.clone()) {
+                        self.pending_items.push(RolloutItem::ToolManifest(manifest));
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::TokenCount(_)) => {
+                    self.pending_token_count = Some(item);
+                }
+                RolloutItem::EventMsg(
+                    EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::TurnStarted(_),
+                ) => {
+                    if let Some(token_count) = self.pending_token_count.take() {
+                        self.pending_items.push(token_count);
+                    }
+                    self.pending_items.push(item);
+                }
+                item => self.pending_items.push(item),
+            }
+        }
     }
 
     async fn flush_if_materialized(&mut self) {
@@ -1630,6 +1684,9 @@ impl RolloutWriterState {
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
+        if let Some(token_count) = self.pending_token_count.take() {
+            self.pending_items.push(token_count);
+        }
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
@@ -1779,9 +1836,16 @@ async fn rollout_writer(
     meta: Option<SessionMeta>,
     cwd: PathBuf,
     rollout_path: PathBuf,
+    persisted_manifest_hashes: HashSet<String>,
 ) -> std::io::Result<()> {
-    let mut state =
-        RolloutWriterState::new(writer, deferred_log_file_info, meta, cwd, rollout_path);
+    let mut state = RolloutWriterState::new(
+        writer,
+        deferred_log_file_info,
+        meta,
+        cwd,
+        rollout_path,
+        persisted_manifest_hashes,
+    );
 
     // Process rollout commands
     while let Some(cmd) = rx.recv().await {
@@ -2128,6 +2192,7 @@ async fn resume_candidate_matches_cwd(
     if let Some(latest_turn_context_cwd) = items.iter().rev().find_map(|item| match item {
         RolloutItem::TurnContext(turn_context) => Some(&turn_context.cwd),
         RolloutItem::SessionMeta(_)
+        | RolloutItem::ToolManifest(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }

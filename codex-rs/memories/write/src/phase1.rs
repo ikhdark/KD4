@@ -412,6 +412,7 @@ mod job {
                     Some(communication.to_model_input_item())
                 }
                 RolloutItem::SessionMeta(_)
+                | RolloutItem::ToolManifest(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)

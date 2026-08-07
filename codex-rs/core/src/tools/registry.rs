@@ -13,6 +13,7 @@ use crate::memory_usage::emit_metric_for_tool_read;
 use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
 use crate::session::turn_context::TurnContext;
+use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -25,13 +26,22 @@ use crate::tools::lifecycle::notify_tool_start;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::util::error_or_panic;
 use codex_extension_api::ToolCallOutcome;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::EventMsg;
 use codex_rollout::state_db;
 use codex_tools::ToolName;
+use codex_tools::ToolOutputDiagnosticClass;
+use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
+use codex_utils_output_truncation::OutputDiagnosticClass;
+use codex_utils_output_truncation::OutputOutcome;
+use codex_utils_output_truncation::approx_token_count;
+use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
+use codex_utils_output_truncation::resolve_projected_output_limits;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tracing::instrument;
@@ -176,6 +186,12 @@ pub(crate) struct AnyToolResult {
     pub(crate) payload: ToolPayload,
     pub(crate) result: Box<dyn ToolOutput>,
     pub(crate) post_tool_use_payload: Option<PostToolUsePayload>,
+    pub(crate) model_projection: Option<ModelToolProjection>,
+}
+
+pub(crate) struct ModelToolProjection {
+    response: ResponseInputItem,
+    code_mode: Value,
 }
 
 impl AnyToolResult {
@@ -188,6 +204,9 @@ impl AnyToolResult {
     }
 
     pub(crate) fn into_response(self) -> ResponseInputItem {
+        if let Some(projection) = self.model_projection {
+            return projection.response;
+        }
         let Self {
             call_id,
             payload,
@@ -198,6 +217,9 @@ impl AnyToolResult {
     }
 
     pub(crate) fn code_mode_result(self) -> serde_json::Value {
+        if let Some(projection) = self.model_projection {
+            return projection.code_mode;
+        }
         let Self {
             payload, result, ..
         } = self;
@@ -397,9 +419,18 @@ impl ToolRegistry {
         names
     }
 
-    #[cfg(test)]
     pub(crate) fn tool_exposure(&self, name: &ToolName) -> Option<ToolExposure> {
         self.tools.get(name).map(|tool| tool.exposure())
+    }
+
+    pub(crate) fn manifest_entries(&self) -> Vec<(ToolName, ToolExposure, ToolSpec)> {
+        let mut entries = self
+            .tools
+            .iter()
+            .map(|(name, tool)| (name.clone(), tool.exposure(), tool.spec()))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
     }
 
     pub(crate) fn create_diff_consumer(
@@ -689,6 +720,11 @@ impl ToolRegistry {
                     &result.payload,
                     result.result.as_ref(),
                 );
+                let projection_input = prepare_model_projection(&invocation, &result);
+                result.model_projection = match projection_input {
+                    Some(input) => project_model_output(input).await,
+                    None => None,
+                };
                 Ok(result)
             }
             Err(err) => {
@@ -737,7 +773,176 @@ async fn handle_any_tool(
         payload: invocation.payload,
         result: output,
         post_tool_use_payload,
+        model_projection: None,
     })
+}
+
+struct ModelProjectionInput {
+    spillable_text: String,
+    outcome: ToolOutputOutcome,
+    essential_inline: Value,
+    applied_token_limit: usize,
+    projected_text: String,
+    original_response: ResponseInputItem,
+    preserved_content: Vec<Value>,
+    codex_home: std::path::PathBuf,
+    thread_id: String,
+}
+
+fn prepare_model_projection(
+    invocation: &ToolInvocation,
+    result: &AnyToolResult,
+) -> Option<ModelProjectionInput> {
+    // Exact artifact reads are already bounded and must never recursively spill.
+    if invocation.tool_name.name == "read_tool_output" {
+        return None;
+    }
+
+    let metadata = result.result.projection_metadata()?;
+    if metadata.spillable_text.is_empty() {
+        return None;
+    }
+    let spillable_text = metadata.spillable_text.join("\n");
+    let outcome = match metadata.outcome {
+        ToolOutputOutcome::Success => OutputOutcome::Success,
+        ToolOutputOutcome::Failure => OutputOutcome::Failure,
+        ToolOutputOutcome::TimedOut => OutputOutcome::TimedOut,
+    };
+    let diagnostic_class = match metadata.diagnostic_class {
+        ToolOutputDiagnosticClass::Normal => OutputDiagnosticClass::Normal,
+        ToolOutputDiagnosticClass::HighSignal => OutputDiagnosticClass::HighSignal,
+    };
+    let limits = resolve_projected_output_limits(
+        metadata.requested_limit,
+        outcome,
+        diagnostic_class,
+        usize::MAX,
+    );
+    let projected = formatted_truncate_text_with_output_limit(&spillable_text, limits);
+    if !projected.was_truncated {
+        return None;
+    }
+
+    let original_response = result
+        .result
+        .to_response_item(&result.call_id, &result.payload);
+    let preserved_content = preserved_non_text_content(&original_response);
+    Some(ModelProjectionInput {
+        spillable_text,
+        outcome: metadata.outcome,
+        essential_inline: metadata.essential_inline,
+        applied_token_limit: limits.applied_limit,
+        projected_text: projected.text,
+        original_response,
+        preserved_content,
+        codex_home: invocation.turn.config.codex_home.to_path_buf(),
+        thread_id: invocation.session.thread_id.to_string(),
+    })
+}
+
+async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolProjection> {
+    let ModelProjectionInput {
+        spillable_text,
+        outcome,
+        essential_inline,
+        applied_token_limit,
+        projected_text,
+        original_response,
+        preserved_content,
+        codex_home,
+        thread_id,
+    } = input;
+    let existing_artifact_id = essential_inline
+        .get("raw_output_artifact_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let (artifact_id, retained_artifact_bytes, artifact_error, retention_limit_hit) =
+        if let Some(artifact_id) = existing_artifact_id {
+            (
+                Some(artifact_id),
+                essential_inline
+                    .get("raw_output_artifact_bytes")
+                    .and_then(Value::as_u64),
+                essential_inline
+                    .get("raw_output_artifact_error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                essential_inline
+                    .get("raw_output_artifact_retention_limit_hit")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            )
+        } else {
+            let artifact =
+                create_raw_output_artifact(&codex_home, &thread_id, spillable_text.as_bytes())
+                    .await;
+            let (id, bytes, error) = artifact.model_projection();
+            (
+                id.map(|id| id.to_string()),
+                bytes,
+                error,
+                artifact.retention_limit_hit(),
+            )
+        };
+    let envelope = serde_json::json!({
+        "outcome": match outcome {
+            ToolOutputOutcome::Success => "success",
+            ToolOutputOutcome::Failure => "failure",
+            ToolOutputOutcome::TimedOut => "timeout",
+        },
+        "essential": essential_inline,
+        "original_bytes": spillable_text.len(),
+        "original_lines": spillable_text.lines().count(),
+        "approx_original_tokens": approx_token_count(&spillable_text),
+        "applied_token_limit": applied_token_limit,
+        "output": projected_text,
+        "artifact_id": artifact_id,
+        "retained_artifact_bytes": retained_artifact_bytes,
+        "artifact_retention_limit_hit": retention_limit_hit,
+        "artifact_error": artifact_error,
+        "preserved_content": preserved_content,
+        "next_action": "Use read_tool_output with artifact_id and a narrow line range for exact expansion.",
+    });
+    let rendered = serde_json::to_string(&envelope).ok()?;
+    Some(ModelToolProjection {
+        response: replace_response_text(original_response, rendered),
+        code_mode: envelope,
+    })
+}
+
+fn replace_response_text(mut response: ResponseInputItem, rendered: String) -> ResponseInputItem {
+    let output = match &mut response {
+        ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. } => output,
+        _ => return response,
+    };
+    match &mut output.body {
+        FunctionCallOutputBody::Text(text) => *text = rendered,
+        FunctionCallOutputBody::ContentItems(items) => {
+            items.retain(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. }));
+            items.insert(
+                0,
+                FunctionCallOutputContentItem::InputText { text: rendered },
+            );
+        }
+    }
+    response
+}
+
+fn preserved_non_text_content(response: &ResponseInputItem) -> Vec<Value> {
+    let output = match response {
+        ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. } => output,
+        _ => return Vec::new(),
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. }))
+        .filter_map(|item| serde_json::to_value(item).ok())
+        .collect()
 }
 
 fn function_hook_tool_name(invocation: &ToolInvocation) -> HookToolName {

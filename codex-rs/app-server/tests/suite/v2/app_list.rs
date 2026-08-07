@@ -817,6 +817,32 @@ async fn list_apps_emits_updates_and_returns_after_both_lists_load() -> Result<(
     assert_eq!(response_data, expected_merged);
     assert!(next_cursor.is_none());
 
+    let repeated_request_id = mcp
+        .send_apps_list_request(AppsListParams {
+            limit: None,
+            cursor: None,
+            thread_id: None,
+            force_refetch: false,
+        })
+        .await?;
+    let repeated_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(repeated_request_id)),
+    )
+    .await??;
+    let AppsListResponse {
+        data: repeated_data,
+        next_cursor: repeated_next_cursor,
+    } = to_response(repeated_response)?;
+    assert_eq!(repeated_data, expected_merged);
+    assert!(repeated_next_cursor.is_none());
+    assert!(
+        !mcp.pending_notification_methods()
+            .iter()
+            .any(|method| method == "app/list/updated"),
+        "unchanged repeated app/list request emitted another app/list/updated notification"
+    );
+
     server_handle.abort();
     let _ = server_handle.await;
     Ok(())

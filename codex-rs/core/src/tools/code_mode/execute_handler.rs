@@ -7,6 +7,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use std::collections::HashSet;
 
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
@@ -15,14 +16,20 @@ use super::is_exec_tool_name;
 
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
-    nested_tool_specs: Vec<ToolSpec>,
+    direct_nested_tool_specs: Vec<ToolSpec>,
+    deferred_nested_tool_specs: Vec<ToolSpec>,
 }
 
 impl CodeModeExecuteHandler {
-    pub(crate) fn new(spec: ToolSpec, nested_tool_specs: Vec<ToolSpec>) -> Self {
+    pub(crate) fn new(
+        spec: ToolSpec,
+        direct_nested_tool_specs: Vec<ToolSpec>,
+        deferred_nested_tool_specs: Vec<ToolSpec>,
+    ) -> Self {
         Self {
             spec,
-            nested_tool_specs,
+            direct_nested_tool_specs,
+            deferred_nested_tool_specs,
         }
     }
 
@@ -36,8 +43,14 @@ impl CodeModeExecuteHandler {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
         let exec = ExecContext { session, turn };
-        let enabled_tools =
-            codex_tools::collect_code_mode_tool_definitions(&self.nested_tool_specs);
+        let activated = exec.turn.activated_deferred_tools();
+        let mut nested_tool_specs = self.direct_nested_tool_specs.clone();
+        nested_tool_specs.extend(
+            self.deferred_nested_tool_specs
+                .iter()
+                .filter_map(|spec| filter_deferred_spec(spec, &activated)),
+        );
+        let enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
         let started_at = std::time::Instant::now();
         let started_cell = exec
             .session
@@ -92,6 +105,30 @@ impl CodeModeExecuteHandler {
     }
 }
 
+fn filter_deferred_spec(spec: &ToolSpec, activated: &HashSet<ToolName>) -> Option<ToolSpec> {
+    match spec {
+        ToolSpec::Namespace(namespace) => {
+            let mut namespace = namespace.clone();
+            let namespace_name = namespace.name.clone();
+            namespace.tools.retain(|tool| match tool {
+                codex_tools::ResponsesApiNamespaceTool::Function(tool) => activated.contains(
+                    &ToolName::namespaced(namespace_name.clone(), tool.name.clone()),
+                ),
+            });
+            (!namespace.tools.is_empty()).then_some(ToolSpec::Namespace(namespace))
+        }
+        ToolSpec::Function(tool) => activated
+            .contains(&ToolName::plain(tool.name.clone()))
+            .then(|| spec.clone()),
+        ToolSpec::Freeform(tool) => activated
+            .contains(&ToolName::plain(tool.name.clone()))
+            .then(|| spec.clone()),
+        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => activated
+            .contains(&ToolName::plain(spec.name()))
+            .then(|| spec.clone()),
+    }
+}
+
 impl ToolExecutor<ToolInvocation> for CodeModeExecuteHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(PUBLIC_TOOL_NAME)
@@ -135,5 +172,60 @@ impl CodeModeExecuteHandler {
 impl CoreToolRuntime for CodeModeExecuteHandler {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Custom { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_tools::JsonSchema;
+    use codex_tools::ResponsesApiNamespace;
+    use codex_tools::ResponsesApiNamespaceTool;
+    use codex_tools::ResponsesApiTool;
+    use std::collections::BTreeMap;
+
+    fn function(name: &str) -> ResponsesApiTool {
+        ResponsesApiTool {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::object(BTreeMap::new(), Some(Vec::new()), Some(false.into())),
+            output_schema: None,
+        }
+    }
+
+    #[test]
+    fn deferred_namespace_exposes_only_current_turn_activations() {
+        let spec = ToolSpec::Namespace(ResponsesApiNamespace {
+            name: "example".to_string(),
+            description: "example tools".to_string(),
+            tools: vec![
+                ResponsesApiNamespaceTool::Function(function("first")),
+                ResponsesApiNamespaceTool::Function(function("second")),
+            ],
+        });
+
+        assert_eq!(filter_deferred_spec(&spec, &HashSet::new()), None);
+
+        let activated = HashSet::from([ToolName::namespaced("example", "second")]);
+        let ToolSpec::Namespace(filtered) =
+            filter_deferred_spec(&spec, &activated).expect("selected namespace tool")
+        else {
+            panic!("expected namespace tool");
+        };
+        assert_eq!(filtered.tools.len(), 1);
+        let ResponsesApiNamespaceTool::Function(tool) = &filtered.tools[0];
+        assert_eq!(tool.name, "second");
+    }
+
+    #[test]
+    fn deferred_plain_tool_requires_current_turn_activation() {
+        let spec = ToolSpec::Function(function("inspect"));
+        assert_eq!(filter_deferred_spec(&spec, &HashSet::new()), None);
+        assert_eq!(
+            filter_deferred_spec(&spec, &HashSet::from([ToolName::plain("inspect")])),
+            Some(spec)
+        );
     }
 }

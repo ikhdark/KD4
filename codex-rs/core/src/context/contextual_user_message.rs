@@ -69,6 +69,13 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &TASK_CAPSULE_REGISTRATION,
 ];
 
+static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
+    &USER_INSTRUCTIONS_REGISTRATION,
+    &ENVIRONMENT_CONTEXT_REGISTRATION,
+    &SKILL_INSTRUCTIONS_REGISTRATION,
+    &RECOMMENDED_PLUGINS_REGISTRATION,
+];
+
 fn is_standard_contextual_user_text(text: &str) -> bool {
     CONTEXTUAL_USER_FRAGMENTS
         .iter()
@@ -80,6 +87,28 @@ pub(crate) fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
         return false;
     };
     parse_hook_prompt_fragment(text).is_some() || is_standard_contextual_user_text(text)
+}
+
+pub(crate) fn is_startup_contextual_user_fragment(content_item: &ContentItem) -> bool {
+    let ContentItem::InputText { text } = content_item else {
+        return false;
+    };
+    STARTUP_CONTEXTUAL_USER_FRAGMENTS
+        .iter()
+        .any(|fragment| fragment.matches_text(text))
+}
+
+pub(crate) fn is_legacy_compaction_warning_fragment(content_item: &ContentItem) -> bool {
+    let ContentItem::InputText { text } = content_item else {
+        return false;
+    };
+    [
+        &LEGACY_UNIFIED_EXEC_PROCESS_LIMIT_WARNING_REGISTRATION as &dyn FragmentRegistration,
+        &LEGACY_APPLY_PATCH_EXEC_COMMAND_WARNING_REGISTRATION,
+        &LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION,
+    ]
+    .iter()
+    .any(|fragment| fragment.matches_text(text))
 }
 
 pub(crate) fn parse_visible_hook_prompt_message(

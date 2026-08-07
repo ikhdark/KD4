@@ -11,6 +11,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use tracing::warn;
 
+const MAX_RESPONSE_STREAM_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
     Sampling,
@@ -50,35 +52,32 @@ pub(crate) async fn handle_retryable_response_stream_error(
     if *retries < max_retries {
         *retries += 1;
         let retry_count = *retries;
-        let delay = match &err {
-            CodexErr::Stream(_, requested_delay) => {
-                requested_delay.unwrap_or_else(|| backoff(retry_count))
-            }
-            _ => backoff(retry_count),
-        };
+        let delay = response_stream_retry_delay(&err, retry_count);
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
-        // In release builds, hide the first websocket retry notification to reduce noisy
-        // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
-        let report_error = retry_count > 1
-            || cfg!(debug_assertions)
-            || !sess.services.model_client.responses_websocket_enabled();
-        if report_error {
-            // Surface retry information to any UI/front-end so the user understands what is
-            // happening instead of staring at a seemingly frozen screen.
-            sess.notify_stream_error(
-                turn_context,
-                format!("Reconnecting... {retry_count}/{max_retries}"),
-                err,
-            )
-            .await;
-        }
+        // Surface retry information from the first attempt so a reconnect never looks frozen.
+        sess.notify_stream_error(
+            turn_context,
+            format!("Reconnecting... {retry_count}/{max_retries}"),
+            err,
+        )
+        .await;
         let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
         tokio::time::sleep(delay).await;
         return Ok(());
     }
 
     Err(err)
+}
+
+fn response_stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {
+    let requested_or_backoff = match err {
+        CodexErr::Stream(_, requested_delay) => {
+            requested_delay.unwrap_or_else(|| backoff(retry_count))
+        }
+        _ => backoff(retry_count),
+    };
+    requested_or_backoff.min(MAX_RESPONSE_STREAM_RETRY_DELAY)
 }
 
 fn log_retry(
@@ -115,3 +114,7 @@ fn log_retry(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "responses_retry_tests.rs"]
+mod tests;

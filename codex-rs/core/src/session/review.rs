@@ -143,6 +143,7 @@ pub(super) async fn spawn_review_thread(
         cwd: parent_turn_context.cwd.clone(),
         final_output_json_schema: None,
         dynamic_tools: parent_turn_context.dynamic_tools.clone(),
+        activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
         turn_metadata_state,
         extension_data,
         turn_skills: TurnSkillsContext::new(parent_turn_context.turn_skills.snapshot.clone()),

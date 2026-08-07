@@ -3123,10 +3123,6 @@ impl TaskEvidenceLedger {
                     });
                 }
                 let manifest_hash = requirement_manifest_hash(new_revision, &requirements);
-                let correction_consumed = ledger
-                    .active_review_cycle
-                    .as_ref()
-                    .is_some_and(|cycle| cycle.correction_consumed);
                 let parent_terminal_review_id = ledger
                     .active_review_cycle
                     .as_ref()
@@ -3144,7 +3140,7 @@ impl TaskEvidenceLedger {
                     parent_terminal_review_id,
                     superseded_review_id: Some(review_id.clone()),
                     phase: CompletionReviewCyclePhase::InitialReviewPending,
-                    correction_consumed,
+                    correction_consumed: false,
                     manifest_gap_reconstructed: true,
                     accepted_review_id: None,
                     accepted_dossier_snapshot_id: None,
@@ -3188,7 +3184,8 @@ impl TaskEvidenceLedger {
                             cycle.phase = if review_clean {
                                 CompletionReviewCyclePhase::ProvisionalClean
                             } else {
-                                CompletionReviewCyclePhase::TerminalPartial
+                                cycle.correction_consumed = false;
+                                CompletionReviewCyclePhase::CorrectionPending
                             };
                         }
                         CompletionReviewAttemptKind::TerminalClosure => unreachable!(),

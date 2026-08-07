@@ -89,14 +89,14 @@ impl Handler {
             });
         }
 
-        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
-        let timeout_ms = match timeout_ms {
-            ms if ms <= 0 => {
+        let timeout_ms = match args.timeout_ms {
+            Some(ms) if ms < MIN_WAIT_TIMEOUT_MS => {
                 return Err(FunctionCallError::RespondToModel(
-                    "timeout_ms must be greater than zero".to_owned(),
+                    "Omit timeout_ms for the normal wait. wait_agent returns immediately when a target has already completed.".to_owned(),
                 ));
             }
-            ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+            Some(ms) => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+            None => DEFAULT_WAIT_TIMEOUT_MS,
         };
 
         session
@@ -316,6 +316,10 @@ impl ToolOutput for WaitAgentResult {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

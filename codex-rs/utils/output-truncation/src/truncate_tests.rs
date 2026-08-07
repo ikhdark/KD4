@@ -1,6 +1,7 @@
 use crate::DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS;
 use crate::DEFAULT_FAILURE_OUTPUT_TOKENS;
 use crate::DEFAULT_SUCCESS_OUTPUT_TOKENS;
+use crate::OutputDiagnosticClass;
 use crate::OutputLimitResolution;
 use crate::OutputOutcome;
 use crate::TruncationPolicy;
@@ -9,8 +10,10 @@ use crate::approx_tokens_from_byte_count_i64;
 use crate::formatted_truncate_text;
 use crate::formatted_truncate_text_content_items_with_policy;
 use crate::resolve_output_limits;
+use crate::resolve_projected_output_limits;
 use crate::truncate_function_output_items_with_policy;
 use crate::truncate_text;
+use crate::truncate_text_to_token_ceiling;
 use crate::truncate_text_with_output_limit;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -416,6 +419,60 @@ fn adaptive_output_limits_resolve_defaults_override_and_hard_ceiling() {
 }
 
 #[test]
+fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
+    assert_eq!(
+        resolve_projected_output_limits(
+            None,
+            OutputOutcome::Success,
+            OutputDiagnosticClass::Normal,
+            usize::MAX,
+        )
+        .applied_limit,
+        1_000
+    );
+    assert_eq!(
+        resolve_projected_output_limits(
+            None,
+            OutputOutcome::Failure,
+            OutputDiagnosticClass::Normal,
+            usize::MAX,
+        )
+        .applied_limit,
+        2_000
+    );
+    assert_eq!(
+        resolve_projected_output_limits(
+            None,
+            OutputOutcome::TimedOut,
+            OutputDiagnosticClass::Normal,
+            usize::MAX,
+        )
+        .applied_limit,
+        2_000
+    );
+    assert_eq!(
+        resolve_projected_output_limits(
+            Some(250),
+            OutputOutcome::Failure,
+            OutputDiagnosticClass::HighSignal,
+            usize::MAX,
+        )
+        .applied_limit,
+        250
+    );
+    assert_eq!(
+        resolve_projected_output_limits(
+            Some(20_000),
+            OutputOutcome::Failure,
+            OutputDiagnosticClass::HighSignal,
+            4_000,
+        )
+        .applied_limit,
+        4_000
+    );
+}
+
+#[test]
 fn output_limit_truncation_reports_whether_text_was_reduced() {
     let limits = resolve_output_limits(Some(5), OutputOutcome::Success, Some("echo ok"), "ok", 20);
 
@@ -426,4 +483,16 @@ fn output_limit_truncation_reports_whether_text_was_reduced() {
     let truncated = truncate_text_with_output_limit(&"x".repeat(400), limits);
     assert!(truncated.was_truncated);
     assert_ne!(truncated.text, "x".repeat(400));
+}
+
+#[test]
+fn exact_token_ceiling_includes_the_truncation_marker() {
+    let truncated = truncate_text_to_token_ceiling(&"abcd ".repeat(10_000), 32);
+
+    assert!(approx_token_count(&truncated) <= 32);
+}
+
+#[test]
+fn exact_token_ceiling_zero_returns_no_text() {
+    assert_eq!(truncate_text_to_token_ceiling("content", 0), "");
 }

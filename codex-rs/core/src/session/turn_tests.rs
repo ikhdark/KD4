@@ -29,6 +29,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_utils_path_uri::PathUri;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::test_codex::test_codex;
@@ -41,6 +42,8 @@ use std::fs;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use wiremock::Mock;
@@ -75,6 +78,12 @@ struct RewriteAgentMessageContributor;
 
 struct TurnInputBudgetContributor {
     text: String,
+}
+
+struct EnvironmentEchoContributor;
+
+struct CountingTurnInputContributor {
+    poll_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -143,6 +152,51 @@ impl TurnInputContributor for TurnInputBudgetContributor {
                 )) as Box<dyn codex_extension_api::ContextualUserFragment + Send>,
             ]
         })
+    }
+}
+
+impl TurnInputContributor for EnvironmentEchoContributor {
+    fn contribute<'a>(
+        &'a self,
+        input: TurnInputContext,
+        _session_store: &'a ExtensionData,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        Vec<Box<dyn codex_extension_api::ContextualUserFragment + Send>>,
+    > {
+        Box::pin(async move {
+            let environment = input
+                .environments
+                .first()
+                .expect("primary turn environment should reach contributors");
+            vec![
+                Box::new(codex_context_fragments::RenderedContextFragment::new(
+                    "user",
+                    format!(
+                        "extension-environment:{}:{}:{}",
+                        environment.environment_id, environment.cwd, environment.is_primary
+                    ),
+                )) as Box<dyn codex_extension_api::ContextualUserFragment + Send>,
+            ]
+        })
+    }
+}
+
+impl TurnInputContributor for CountingTurnInputContributor {
+    fn contribute<'a>(
+        &'a self,
+        _input: TurnInputContext,
+        _session_store: &'a ExtensionData,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        Vec<Box<dyn codex_extension_api::ContextualUserFragment + Send>>,
+    > {
+        self.poll_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Vec::new() })
     }
 }
 
@@ -277,6 +331,44 @@ async fn extension_turn_input_contributors_share_one_hard_budget() {
         texts
             .iter()
             .all(|text| !text.contains("turn-input-budget-second"))
+    );
+}
+
+#[tokio::test]
+async fn extension_turn_input_contributors_receive_foreign_environment_uris() {
+    #[cfg(unix)]
+    let foreign_cwd = PathUri::parse("file:///C:/workspace").expect("Windows cwd URI");
+    #[cfg(windows)]
+    let foreign_cwd = PathUri::parse("file:///usr/local/project").expect("POSIX cwd URI");
+    assert!(
+        foreign_cwd.to_abs_path().is_err(),
+        "test cwd must be foreign to the host"
+    );
+
+    let (mut session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+    let environment = turn_context.environments.turn_environments[0].clone();
+    turn_context.environments.turn_environments[0] =
+        crate::session::turn_context::TurnEnvironment::new(
+            "remote".to_string(),
+            environment.environment,
+            foreign_cwd.clone(),
+            environment.shell,
+        );
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_input_contributor(Arc::new(EnvironmentEchoContributor));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let step_context = StepContext::for_test(Arc::new(turn_context));
+
+    let items =
+        build_extension_turn_input_items(&session, &step_context, &[], &CancellationToken::new())
+            .await
+            .expect("foreign environment should render through extension context");
+    let texts = response_input_texts(&items);
+
+    assert_eq!(
+        texts,
+        vec![format!("extension-environment:remote:{foreign_cwd}:true")]
     );
 }
 
@@ -665,17 +757,25 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
     )
     .await;
     let provider = non_openai_model_provider(&server);
-    let mut builder = test_codex().with_config(move |config| {
-        config.model_provider = provider;
-        config.model_context_window = Some(10_000);
-        config.model_auto_compact_token_limit = Some(100);
-        config.model_provider.request_max_retries = Some(0);
-        config.model_provider.stream_max_retries = Some(0);
-        let _ = config.features.disable(Feature::RemoteCompactionV2);
-    });
+    let pending_plan_builds = Arc::new(AtomicUsize::new(0));
+    let mut extension_builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    extension_builder.turn_input_contributor(Arc::new(CountingTurnInputContributor {
+        poll_count: Arc::clone(&pending_plan_builds),
+    }));
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extension_builder.build()))
+        .with_config(move |config| {
+            config.model_provider = provider;
+            config.model_context_window = Some(10_000);
+            config.model_auto_compact_token_limit = Some(100);
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("seed committed history").await?;
+    pending_plan_builds.store(0, Ordering::SeqCst);
     test.submit_turn(&"oversized pending payload ".repeat(128))
         .await?;
 
@@ -683,6 +783,11 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
         request_log.requests().len(),
         3,
         "the second turn should compact once, then sample instead of repeatedly compacting the same pending payload"
+    );
+    assert_eq!(
+        pending_plan_builds.load(Ordering::SeqCst),
+        1,
+        "committed history should compact before the pending plan is built"
     );
     Ok(())
 }
@@ -823,7 +928,8 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() ->
         panic!("stable test inputs should produce a ready pending-turn plan");
     };
     assert!(
-        plan.pending_token_estimate > estimate_pending_tokens(&input, &[], &[]),
+        plan.pending_token_estimate
+            > estimate_pending_tokens(&input, &[], &[], plan.first_router.as_ref()),
         "first-turn planning must account for full context before compaction"
     );
     assert!(plan.step_context.turn.apps_enabled());
@@ -858,6 +964,43 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() ->
         "the advertised router must be built from the seeded StepContext inventory; expected namespace {SNAPSHOT_TOOL_NAMESPACE:?}, got {router_tool_names:?}"
     );
     Ok(())
+}
+
+#[test]
+fn pending_token_estimate_includes_model_visible_tool_schemas() {
+    let empty_registry = crate::tools::registry::ToolRegistry::from_tools(std::iter::empty::<
+        Arc<dyn crate::tools::registry::CoreToolRuntime>,
+    >());
+    let empty_router = ToolRouter::from_parts(empty_registry, Vec::new());
+    let schema_description = "schema context ".repeat(1024);
+    let schema_registry = crate::tools::registry::ToolRegistry::from_tools(std::iter::empty::<
+        Arc<dyn crate::tools::registry::CoreToolRuntime>,
+    >());
+    let schema_router = ToolRouter::from_parts(
+        schema_registry,
+        vec![codex_tools::ToolSpec::Function(
+            codex_tools::ResponsesApiTool {
+                name: "large_schema_tool".to_string(),
+                description: schema_description,
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::object(
+                    Default::default(),
+                    None,
+                    Some(false.into()),
+                ),
+                output_schema: None,
+            },
+        )],
+    );
+
+    let baseline = estimate_pending_tokens(&[], &[], &[], &empty_router);
+    let with_schema = estimate_pending_tokens(&[], &[], &[], &schema_router);
+
+    assert!(
+        with_schema > baseline + 3_000,
+        "model-visible schema bytes must materially increase pre-turn context estimation"
+    );
 }
 
 #[test]

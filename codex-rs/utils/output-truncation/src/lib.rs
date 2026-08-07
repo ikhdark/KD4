@@ -9,15 +9,25 @@ use codex_utils_string::truncate_middle_with_token_budget;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 
-pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 4_000;
-pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 8_000;
-pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
+/// Model-projection ceilings. Callers may request less, but never more.
+pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 1_000;
+pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 2_000;
+pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputOutcome {
     Success,
     Failure,
     TimedOut,
+}
+
+/// Classification supplied by the producing tool before model projection.
+///
+/// A shared projector can choose a ceiling without inspecting rendered output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDiagnosticClass {
+    Normal,
+    HighSignal,
 }
 
 impl OutputOutcome {
@@ -49,7 +59,7 @@ pub struct TruncatedTextOutput {
 pub fn adaptive_output_budget_description() -> String {
     format!(
         "Defaults adaptively to {DEFAULT_SUCCESS_OUTPUT_TOKENS} tokens for success, \
-         {DEFAULT_FAILURE_OUTPUT_TOKENS} for failure/timeout, and up to \
+         {DEFAULT_FAILURE_OUTPUT_TOKENS} for failure/timeout, and \
          {DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS} for high-signal diagnostics"
     )
 }
@@ -61,13 +71,30 @@ pub fn resolve_output_limits(
     output_text: &str,
     hard_limit: usize,
 ) -> OutputLimitResolution {
-    let default_limit = if is_high_signal_diagnostic(command_text, output_text) {
-        DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS
-    } else {
-        match outcome {
+    resolve_projected_output_limits(
+        requested_limit,
+        outcome,
+        classify_diagnostic(command_text, output_text),
+        hard_limit,
+    )
+}
+
+/// Resolves a model-visible projection using producer-supplied metadata.
+///
+/// This intentionally does not inspect output text. Text classification, if a
+/// producer needs it, belongs at the producer boundary before rendering.
+pub fn resolve_projected_output_limits(
+    requested_limit: Option<usize>,
+    outcome: OutputOutcome,
+    diagnostic_class: OutputDiagnosticClass,
+    hard_limit: usize,
+) -> OutputLimitResolution {
+    let default_limit = match diagnostic_class {
+        OutputDiagnosticClass::HighSignal => DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
+        OutputDiagnosticClass::Normal => match outcome {
             OutputOutcome::Success => DEFAULT_SUCCESS_OUTPUT_TOKENS,
             OutputOutcome::Failure | OutputOutcome::TimedOut => DEFAULT_FAILURE_OUTPUT_TOKENS,
-        }
+        },
     };
 
     OutputLimitResolution {
@@ -75,6 +102,17 @@ pub fn resolve_output_limits(
         default_limit,
         hard_limit,
         applied_limit: requested_limit.unwrap_or(default_limit).min(hard_limit),
+    }
+}
+
+/// Classifies raw producer output for tools that do not have a stronger native
+/// diagnostic signal. Model projection consumes the resulting enum rather than
+/// parsing a rendered response.
+pub fn classify_diagnostic(command_text: Option<&str>, output_text: &str) -> OutputDiagnosticClass {
+    if is_high_signal_diagnostic(command_text, output_text) {
+        OutputDiagnosticClass::HighSignal
+    } else {
+        OutputDiagnosticClass::Normal
     }
 }
 
@@ -87,6 +125,31 @@ pub fn truncate_text_with_output_limit(
     TruncatedTextOutput {
         text,
         was_truncated,
+    }
+}
+
+/// Truncates text while ensuring the returned value itself does not exceed the
+/// requested approximate-token ceiling, including any truncation marker.
+pub fn truncate_text_to_token_ceiling(content: &str, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+    if approx_token_count(content) <= max_tokens {
+        return content.to_string();
+    }
+
+    let mut truncation_budget = max_tokens;
+    loop {
+        let truncated = truncate_text(content, TruncationPolicy::Tokens(truncation_budget));
+        let actual_tokens = approx_token_count(&truncated);
+        if actual_tokens <= max_tokens {
+            return truncated;
+        }
+        let next_budget = truncation_budget.saturating_sub((actual_tokens - max_tokens).max(1));
+        if next_budget == 0 {
+            return String::new();
+        }
+        truncation_budget = next_budget;
     }
 }
 

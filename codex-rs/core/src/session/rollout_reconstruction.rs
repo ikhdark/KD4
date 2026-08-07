@@ -363,6 +363,7 @@ impl Session {
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::SessionMeta(_)
+                | RolloutItem::ToolManifest(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             }
 
@@ -464,6 +465,7 @@ impl Session {
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::ToolManifest(_)
                 | RolloutItem::SessionMeta(_) => {}
             }
         }
@@ -507,6 +509,7 @@ impl Session {
                     }
                 }
                 RolloutItem::SessionMeta(_)
+                | RolloutItem::ToolManifest(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }

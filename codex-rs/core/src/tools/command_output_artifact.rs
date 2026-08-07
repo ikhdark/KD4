@@ -377,6 +377,16 @@ impl RawOutputArtifact {
             Self::Failed { .. } => None,
         }
     }
+
+    pub(crate) fn retention_limit_hit(&self) -> bool {
+        matches!(
+            self,
+            Self::Stored {
+                truncated: true,
+                ..
+            }
+        )
+    }
 }
 
 pub(crate) async fn create_raw_output_artifact(
@@ -990,9 +1000,9 @@ fn validate_read_range(
             "requested line span must not exceed 2000 lines".to_string(),
         ));
     }
-    if max_bytes == 0 || max_bytes > 65_536 {
+    if max_bytes == 0 || max_bytes > 16_384 {
         return Err(ReadToolOutputError::InvalidRange(
-            "max_bytes must be between 1 and 65536".to_string(),
+            "max_bytes must be between 1 and 16384".to_string(),
         ));
     }
     Ok(())

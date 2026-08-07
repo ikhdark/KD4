@@ -5,6 +5,7 @@ use super::run_remote_compaction_request_v2;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
+use crate::compact::strip_compaction_startup_envelopes;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
@@ -67,6 +68,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         .is_enabled()
         .then(|| history.raw_items().to_vec());
     let mut input = history.for_prompt(&turn_context.model_info.input_modalities);
+    input = strip_compaction_startup_envelopes(input);
     let tool_router = built_tools(
         sess.as_ref(),
         step_context.as_ref(),

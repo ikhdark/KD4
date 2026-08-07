@@ -1004,7 +1004,7 @@ impl Session {
             }
         }
 
-        let (last_agent_message, abort_reason) = match &finalization.outcome {
+        let (mut last_agent_message, abort_reason) = match &finalization.outcome {
             TurnTerminalOutcome::Completed { last_agent_message } => {
                 (last_agent_message.clone(), None)
             }
@@ -1627,6 +1627,29 @@ impl Session {
             && completion
                 .as_ref()
                 .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed);
+        if abort_reason.is_none()
+            && let Some(gate) = completion
+                .as_ref()
+                .filter(|gate| gate.status != TaskCompletionStatus::Passed)
+        {
+            last_agent_message = if turn_context.final_output_json_schema.is_some() {
+                None
+            } else {
+                let status = match gate.status {
+                    TaskCompletionStatus::Partial => "partial",
+                    TaskCompletionStatus::Blocked => "blocked",
+                    TaskCompletionStatus::Passed => {
+                        unreachable!("passed gates were filtered above")
+                    }
+                };
+                let explanation = if gate.reasons.is_empty() {
+                    "the completion gate did not establish successful completion".to_string()
+                } else {
+                    gate.reasons.join("; ")
+                };
+                Some(format!("Task completion is {status}: {explanation}"))
+            };
+        }
         let event = if let Some(reason) = abort_reason.as_ref() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),

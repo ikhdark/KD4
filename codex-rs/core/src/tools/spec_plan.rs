@@ -115,6 +115,7 @@ type PlannedRuntime = Arc<dyn CoreToolRuntime>;
 struct PlannedTools {
     runtimes: Vec<PlannedRuntime>,
     hosted_specs: Vec<ToolSpec>,
+    warnings: Vec<String>,
 }
 
 impl PlannedTools {
@@ -172,9 +173,9 @@ pub(crate) fn build_tool_router(
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> ToolRouter {
-    let (model_visible_specs, registry) =
+    let (model_visible_specs, registry, warnings) =
         build_tool_specs_and_registry(step_context, params, tool_search_handler_cache);
-    ToolRouter::from_parts(registry, model_visible_specs)
+    ToolRouter::from_parts_with_warnings(registry, model_visible_specs, warnings)
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -182,7 +183,7 @@ fn build_tool_specs_and_registry(
     step_context: &StepContext,
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
-) -> (Vec<ToolSpec>, ToolRegistry) {
+) -> (Vec<ToolSpec>, ToolRegistry, Vec<String>) {
     let turn_context = step_context.turn.as_ref();
     let ToolRouterParams {
         mcp_tools,
@@ -261,10 +262,11 @@ fn apply_direct_model_only_namespace_overrides(
 fn build_model_visible_specs_and_registry(
     turn_context: &TurnContext,
     planned_tools: PlannedTools,
-) -> (Vec<ToolSpec>, ToolRegistry) {
+) -> (Vec<ToolSpec>, ToolRegistry, Vec<String>) {
     let PlannedTools {
         runtimes,
         hosted_specs,
+        warnings,
     } = planned_tools;
     let mut specs = Vec::new();
     let mut seen_tool_names = HashSet::new();
@@ -295,7 +297,7 @@ fn build_model_visible_specs_and_registry(
         })
         .collect();
 
-    (model_visible_specs, registry)
+    (model_visible_specs, registry, warnings)
 }
 
 fn spec_for_model_request(
@@ -487,6 +489,7 @@ fn build_code_mode_executors(
     }
 
     let mut code_mode_nested_tool_specs = Vec::new();
+    let mut deferred_code_mode_nested_tool_specs = Vec::new();
     let mut exec_prompt_tool_specs = Vec::new();
     let mut deferred_exec_prompt_tool_specs = Vec::new();
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
@@ -510,10 +513,11 @@ fn build_code_mode_executors(
             if deferred_tools_guidance_enabled {
                 deferred_exec_prompt_tool_specs.push(spec.clone());
             }
+            deferred_code_mode_nested_tool_specs.push(spec);
         } else {
             exec_prompt_tool_specs.push(spec.clone());
+            code_mode_nested_tool_specs.push(spec);
         }
-        code_mode_nested_tool_specs.push(spec);
     }
 
     let namespace_descriptions = code_mode_namespace_descriptions(&exec_prompt_tool_specs);
@@ -533,6 +537,7 @@ fn build_code_mode_executors(
                 tool_mode == ToolMode::CodeModeOnly,
             ),
             code_mode_nested_tool_specs,
+            deferred_code_mode_nested_tool_specs,
         )),
         Arc::new(CodeModeWaitHandler),
     ]
@@ -1143,7 +1148,11 @@ fn append_extension_tool_executors(
             continue;
         }
         if !reserved_tool_names.insert(tool_name.clone()) {
-            warn!("Skipping extension tool `{tool_name}`: tool already registered");
+            let warning = format!(
+                "Extension tool `{tool_name}` was not loaded because that name is already registered. Rename or disable the conflicting extension tool."
+            );
+            warn!("{warning}");
+            planned_tools.warnings.push(warning);
             continue;
         }
         planned_tools.add(ExtensionToolAdapter::new(executor));

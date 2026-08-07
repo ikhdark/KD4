@@ -4174,7 +4174,7 @@ async fn resume_agent_rejects_when_depth_limit_exceeded() {
 }
 
 #[tokio::test]
-async fn wait_agent_rejects_non_positive_timeout() {
+async fn wait_agent_rejects_timeout_below_floor_with_v1_guidance() {
     let (session, turn) = make_session_and_context().await;
     let invocation = invocation(
         Arc::new(session),
@@ -4190,7 +4190,9 @@ async fn wait_agent_rejects_non_positive_timeout() {
     };
     assert_eq!(
         err,
-        FunctionCallError::RespondToModel("timeout_ms must be greater than zero".to_string())
+        FunctionCallError::RespondToModel(
+            "Omit timeout_ms for the normal wait. wait_agent returns immediately when a target has already completed.".to_string()
+        )
     );
 }
 
@@ -4346,7 +4348,9 @@ async fn multi_agent_v2_wait_agent_rejects_timeout_below_configured_min() {
     };
     assert_eq!(
         err,
-        FunctionCallError::RespondToModel("timeout_ms must be at least 50".to_string())
+        FunctionCallError::RespondToModel(
+            "Omit timeout_ms for the normal wait. Use list_agents or get_agent_task for an immediate status snapshot.".to_string()
+        )
     );
 }
 
@@ -4629,41 +4633,27 @@ async fn wait_agent_times_out_when_status_is_not_final() {
 }
 
 #[tokio::test]
-async fn wait_agent_clamps_short_timeouts_to_minimum() {
-    let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
-    let config = turn.config.as_ref().clone();
-    let thread = manager
-        .start_thread(config.clone())
-        .await
-        .expect("start thread");
-    let agent_id = thread.thread_id;
+async fn wait_agent_rejects_short_timeouts_instead_of_clamping() {
+    let (session, turn) = make_session_and_context().await;
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
         "wait_agent",
         function_payload(json!({
-            "targets": [agent_id.to_string()],
+            "targets": [ThreadId::new().to_string()],
             "timeout_ms": 10
         })),
     );
 
-    let early = timeout(
-        Duration::from_millis(50),
-        WaitAgentHandler::default().handle(invocation),
-    )
-    .await;
-    assert!(
-        early.is_err(),
-        "wait_agent should not return before the minimum timeout clamp"
+    let Err(err) = WaitAgentHandler::default().handle(invocation).await else {
+        panic!("short timeout should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "Omit timeout_ms for the normal wait. wait_agent returns immediately when a target has already completed.".to_string()
+        )
     );
-
-    let _ = thread
-        .thread
-        .submit(Op::Shutdown {})
-        .await
-        .expect("shutdown should submit");
 }
 
 #[tokio::test]

@@ -1850,7 +1850,7 @@ When `threadId` is provided, app feature gating (`Feature::Apps`) is evaluated u
 
 `app/list` returns after both accessible apps and directory apps are loaded. Set `forceRefetch: true` to bypass app caches and fetch fresh data from sources. Cache entries are only replaced when those refetches succeed.
 
-The server also emits `app/list/updated` notifications whenever either source (accessible apps or directory apps) finishes loading. Each notification includes the latest merged app list.
+The server also emits `app/list/updated` notifications whenever either source (accessible apps or directory apps) finishes loading and changes the latest merged app list. Ordinary requests suppress duplicate snapshots across requests; force-refetch requests retain their cached-to-refreshed update sequence. Each notification includes the latest merged app list.
 
 ```json
 {

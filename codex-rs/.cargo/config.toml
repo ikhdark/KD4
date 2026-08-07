@@ -1,7 +1,7 @@
 [build]
 # Bound compiler fanout so local Cargo commands do not saturate the host.
 # CARGO_BUILD_JOBS or Cargo's -j/--jobs flag can opt into a different limit.
-jobs = 24
+jobs = 8
 # sccache is the shared compiler cache for local builds. Avoid keeping a second,
 # much larger incremental cache unless CARGO_INCREMENTAL explicitly opts back in.
 incremental = false

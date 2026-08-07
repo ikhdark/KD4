@@ -64,6 +64,109 @@ async fn coordination_pool(fixture: &Fixture) -> sqlx::SqlitePool {
         .expect("coordination database opens")
 }
 
+#[tokio::test]
+async fn workspace_actor_registration_waits_for_transient_writer_contention() {
+    let fixture = Fixture::new().await;
+    assert_eq!(
+        fixture
+            .store
+            .configured_busy_timeout_millis()
+            .await
+            .expect("busy timeout reads"),
+        30_000,
+    );
+    let blocker_pool = coordination_pool(&fixture).await;
+    let mut blocker = blocker_pool
+        .acquire()
+        .await
+        .expect("coordination connection opens");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *blocker)
+        .await
+        .expect("writer lock is acquired");
+
+    let registration = fixture.store.register_workspace_actor(
+        fixture.repo.path(),
+        WorkspaceActorRegistration {
+            root_session_id: "contended-root".to_string(),
+            actor_id: "contended-reader".to_string(),
+            kind: WorkspaceActorKind::Root,
+            assignment_id: None,
+            attempt_id: None,
+            strategy: WorkspaceStrategy::Shared,
+        },
+    );
+    tokio::pin!(registration);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut registration)
+            .await
+            .is_err(),
+        "actor registration should wait while another connection owns the writer lock"
+    );
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut *blocker)
+        .await
+        .expect("writer lock is released");
+    tokio::time::timeout(std::time::Duration::from_secs(1), registration)
+        .await
+        .expect("registration resumes promptly after the writer lock is released")
+        .expect("registration survives transient writer contention");
+    drop(blocker);
+    blocker_pool.close().await;
+}
+
+#[tokio::test]
+async fn workspace_mutation_admission_waits_for_transient_writer_contention() {
+    let fixture = Fixture::new().await;
+    let blocker_pool = coordination_pool(&fixture).await;
+    let mut blocker = blocker_pool
+        .acquire()
+        .await
+        .expect("coordination connection opens");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *blocker)
+        .await
+        .expect("writer lock is acquired");
+
+    let mutation = fixture.store.begin_workspace_mutation(
+        fixture.repo.path(),
+        WorkspaceMutationRequest {
+            root_session_id: "contended-mutation-root".to_string(),
+            actor_id: "root:contended-mutation-root".to_string(),
+            kind: WorkspaceActorKind::Root,
+            attempt_id: None,
+            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+            contracts: Vec::new(),
+            expected_manifest: Vec::new(),
+        },
+    );
+    tokio::pin!(mutation);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut mutation)
+            .await
+            .is_err(),
+        "mutation admission should wait while another connection owns the writer lock"
+    );
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut *blocker)
+        .await
+        .expect("writer lock is released");
+    let lease = tokio::time::timeout(std::time::Duration::from_secs(1), mutation)
+        .await
+        .expect("mutation admission resumes promptly after the writer lock is released")
+        .expect("mutation admission survives transient writer contention");
+    drop(blocker);
+    blocker_pool.close().await;
+
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), lease)
+        .await
+        .expect("contended mutation lease releases");
+}
+
 async fn expire_workspace_actor_leases(fixture: &Fixture, attempt_ids: &[AttemptId]) {
     let database_path = fixture
         .state
@@ -1681,6 +1784,80 @@ async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
     }
     assert_eq!(retained_events, MAX_WAKE_EVENTS_PER_ROOT);
     assert_eq!(retained_ids.len(), MAX_WAKE_EVENTS_PER_ROOT);
+}
+
+#[tokio::test]
+async fn automatic_wake_cursor_is_consumer_scoped_bounded_and_compare_and_swap() {
+    let fixture = Fixture::new().await;
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("cursor-root", "src"))
+        .await
+        .expect("assignment");
+    for index in 0..260 {
+        fixture
+            .store
+            .append_observation(
+                attempt.attempt_id,
+                ObservationKind::Reading,
+                format!("cursor observation {index}"),
+                None,
+            )
+            .await
+            .expect("observation appends");
+    }
+
+    let consumer_a = fixture
+        .store
+        .automatic_wake_cursor("cursor-root".to_string(), "/root/a".to_string())
+        .await
+        .expect("automatic cursor initializes");
+    let bounded = fixture
+        .store
+        .read_wake_events("cursor-root".to_string(), consumer_a)
+        .await
+        .expect("bounded snapshot reads");
+    assert_eq!(bounded.updated_agents.len(), MAX_WAKE_EVENTS_PER_READ);
+    let next = bounded.latest_event_id.expect("bounded snapshot watermark");
+    assert!(
+        fixture
+            .store
+            .compare_and_swap_automatic_wake_cursor(
+                "cursor-root".to_string(),
+                "/root/a".to_string(),
+                consumer_a,
+                next,
+            )
+            .await
+            .expect("cursor advances")
+    );
+    assert!(
+        !fixture
+            .store
+            .compare_and_swap_automatic_wake_cursor(
+                "cursor-root".to_string(),
+                "/root/a".to_string(),
+                consumer_a,
+                next,
+            )
+            .await
+            .expect("stale cursor loses")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .automatic_wake_cursor("cursor-root".to_string(), "/root/a".to_string())
+            .await
+            .expect("advanced cursor reads"),
+        Some(next)
+    );
+
+    let consumer_b = fixture
+        .store
+        .automatic_wake_cursor("cursor-root".to_string(), "/root/b".to_string())
+        .await
+        .expect("second consumer initializes independently");
+    assert_eq!(consumer_b, consumer_a);
 }
 
 #[tokio::test]

@@ -62,6 +62,7 @@ async fn handle_read_tool_output(
             "failed to parse read_tool_output arguments: {err}"
         ))
     })?;
+    let max_bytes = resolved_max_bytes(args.max_bytes)?;
     let (start_line, end_line) = resolved_line_range(&args)?;
     let output = read_tool_output_artifact(
         invocation.turn.config.codex_home.as_path(),
@@ -69,7 +70,7 @@ async fn handle_read_tool_output(
         &args.artifact_id,
         start_line,
         end_line,
-        args.max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
+        max_bytes,
     )
     .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
@@ -93,6 +94,18 @@ fn resolved_line_range(args: &ReadToolOutputArgs) -> Result<(usize, usize), Func
     Ok((start_line, end_line))
 }
 
+fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallError> {
+    match max_bytes {
+        Some(max_bytes) if max_bytes == 0 || max_bytes > DEFAULT_MAX_BYTES => {
+            Err(FunctionCallError::RespondToModel(format!(
+                "max_bytes must be between 1 and {DEFAULT_MAX_BYTES}"
+            )))
+        }
+        Some(max_bytes) => Ok(max_bytes),
+        None => Ok(DEFAULT_MAX_BYTES),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +119,21 @@ mod tests {
             max_bytes: None,
         };
         assert_eq!(resolved_line_range(&args).unwrap(), (17, 216));
+    }
+
+    #[test]
+    fn max_bytes_is_hard_limited_to_sixteen_kibibytes() {
+        assert_eq!(resolved_max_bytes(None).unwrap(), 16_384);
+        assert_eq!(resolved_max_bytes(Some(1)).unwrap(), 1);
+        assert_eq!(resolved_max_bytes(Some(16_384)).unwrap(), 16_384);
+        for invalid in [0, 16_385, usize::MAX] {
+            let error = resolved_max_bytes(Some(invalid)).unwrap_err();
+            assert_eq!(
+                error,
+                FunctionCallError::RespondToModel(
+                    "max_bytes must be between 1 and 16384".to_string()
+                )
+            );
+        }
     }
 }

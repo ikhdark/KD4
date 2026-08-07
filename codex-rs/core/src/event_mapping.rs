@@ -88,6 +88,10 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
         return None;
     }
 
+    Some(parse_user_message_content(message))
+}
+
+pub(crate) fn parse_user_message_content(message: &[ContentItem]) -> UserMessageItem {
     let mut content: Vec<UserInput> = Vec::new();
 
     for (idx, content_item) in message.iter().enumerate() {
@@ -119,7 +123,7 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
         }
     }
 
-    Some(UserMessageItem::new(&content))
+    UserMessageItem::new(&content)
 }
 
 fn parse_agent_message(

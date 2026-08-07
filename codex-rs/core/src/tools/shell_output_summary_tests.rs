@@ -58,6 +58,32 @@ fn failed_output_keeps_exact_error_lines() {
 }
 
 #[test]
+fn critical_error_survives_earlier_warning_flood() {
+    let mut lines = (0..900)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>();
+    for warning_index in 0..47 {
+        let line_index = 20 + warning_index * 8;
+        lines[line_index] = format!("warning: noisy advisory {line_index}");
+    }
+    lines[420] = "error[E0599]: no method named `repair_bug` found".to_string();
+    let output = lines.join("\n");
+
+    let summary = summarize_shell_output_for_model(
+        &output,
+        1,
+        false,
+        options(Some("cargo test -p codex-core"), false),
+    )
+    .unwrap();
+
+    assert!(summary.contains("error[E0599]: no method named `repair_bug` found"));
+    assert!(summary.contains("line 419"));
+    assert!(summary.contains("line 421"));
+    assert!(summary.contains("line 899"));
+}
+
+#[test]
 fn validation_output_keeps_failure_status_and_tail() {
     let mut lines = Vec::new();
     for index in 0..700 {

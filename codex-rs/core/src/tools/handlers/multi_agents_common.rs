@@ -21,12 +21,13 @@ use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
+use codex_tools::ToolOutputProjectionMetadata;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
-pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
+pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = MIN_WAIT_TIMEOUT_MS;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-5.6-terra";
 pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
@@ -70,6 +71,18 @@ where
     serde_json::to_value(value).unwrap_or_else(|err| {
         JsonValue::String(format!("failed to serialize {tool_name} result: {err}"))
     })
+}
+
+pub(crate) fn tool_output_projection_metadata<T>(
+    value: &T,
+    success: bool,
+) -> Option<ToolOutputProjectionMetadata>
+where
+    T: Serialize,
+{
+    serde_json::to_value(value)
+        .ok()
+        .map(|value| ToolOutputProjectionMetadata::from_json(&value, success, None))
 }
 
 pub(crate) fn collab_spawn_error(err: CodexErr) -> FunctionCallError {
@@ -286,6 +299,10 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     let selected_model_info = models_manager
         .get_model_info(&selected_model_name, &config.to_models_manager_config())
         .await;
+    // Carry the resolved child-model limits into the spawn config so bounded history forks can
+    // reject a selection that would already exhaust the child's usable context window.
+    config.model_context_window = selected_model_info.resolved_context_window();
+    config.model_auto_compact_token_limit = selected_model_info.auto_compact_token_limit();
     // Fallback metadata has no authoritative effort list. Preserve an explicit role-owned effort
     // for custom models while still validating every catalog-backed final pair.
     if !role_locks.reasoning_effort || !selected_model_info.used_fallback_model_metadata {

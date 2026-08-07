@@ -58,9 +58,9 @@ impl Handler {
         let default_timeout_ms = turn.config.multi_agent_v2.default_wait_timeout_ms;
         let timeout_ms = match args.timeout_ms {
             Some(ms) if ms < min_timeout_ms => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "timeout_ms must be at least {min_timeout_ms}"
-                )));
+                return Err(FunctionCallError::RespondToModel(
+                    "Omit timeout_ms for the normal wait. Use list_agents or get_agent_task for an immediate status snapshot.".to_owned(),
+                ));
             }
             Some(ms) if ms > max_timeout_ms => {
                 return Err(FunctionCallError::RespondToModel(format!(
@@ -98,7 +98,8 @@ impl Handler {
             )
             .await;
 
-        let cursor = args
+        let explicit_cursor = args.cursor.is_some();
+        let parsed_cursor = args
             .cursor
             .as_deref()
             .map(WakeEventId::parse)
@@ -128,21 +129,87 @@ impl Handler {
         }
         let store = coordinator.store();
         let root_session_id = coordinator.root_session_id();
+        let consuming_agent_path = turn
+            .session_source
+            .get_agent_path()
+            .unwrap_or_else(AgentPath::root)
+            .to_string();
+        let mut cursor = match (explicit_cursor, store.as_ref(), root_session_id.as_deref()) {
+            (false, Some(store), Some(root_session_id)) => store
+                .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone())
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "wait_agent could not initialize its automatic cursor: {error}"
+                    ))
+                })?,
+            _ => parsed_cursor,
+        };
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let (outcome, wake_read) = wait_for_activity(
-            &mut activity_rx,
-            pending_activity,
-            deadline,
-            store.as_ref(),
-            root_session_id.as_deref(),
-            cursor,
-        )
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "wait_agent could not read durable typed-task progress: {error}"
-            ))
-        })?;
+        let mut pending_activity = pending_activity;
+        let (outcome, wake_read) = loop {
+            let (outcome, wake_read) = wait_for_activity(
+                &mut activity_rx,
+                pending_activity.take(),
+                deadline,
+                store.as_ref(),
+                root_session_id.as_deref(),
+                cursor,
+            )
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "wait_agent could not read durable typed-task progress: {error}"
+                ))
+            })?;
+            let (Some(store), Some(root_session_id), Some(next_cursor)) = (
+                store.as_ref(),
+                root_session_id.as_deref(),
+                wake_read.latest_event_id,
+            ) else {
+                break (outcome, wake_read);
+            };
+            if explicit_cursor || wake_read.updated_agents.is_empty() {
+                break (outcome, wake_read);
+            }
+            if store
+                .compare_and_swap_automatic_wake_cursor(
+                    root_session_id.to_string(),
+                    consuming_agent_path.clone(),
+                    cursor,
+                    next_cursor,
+                )
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "wait_agent could not advance its automatic cursor: {error}"
+                    ))
+                })?
+            {
+                break (outcome, wake_read);
+            }
+
+            cursor = store
+                .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone())
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "wait_agent could not reread its automatic cursor: {error}"
+                    ))
+                })?;
+            if outcome != WaitOutcome::DurableActivity {
+                break (
+                    outcome,
+                    WakeRead {
+                        reason: None,
+                        updated_agents: Vec::new(),
+                        latest_event_id: cursor,
+                        truncated_count: 0,
+                        timed_out: false,
+                    },
+                );
+            }
+        };
         let mut typed_deltas = Vec::with_capacity(wake_read.updated_agents.len());
         for event in &wake_read.updated_agents {
             let task = coordinator
@@ -366,6 +433,10 @@ impl ToolOutput for WaitAgentResult {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

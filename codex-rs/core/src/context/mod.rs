@@ -51,6 +51,8 @@ pub(crate) use codex_core_skills::SkillInstructions;
 pub(crate) use collaboration_mode_instructions::CollaborationModeInstructions;
 pub(crate) use completion_review_repair::CompletionReviewRepair;
 pub(crate) use contextual_user_message::is_contextual_user_fragment;
+pub(crate) use contextual_user_message::is_legacy_compaction_warning_fragment;
+pub(crate) use contextual_user_message::is_startup_contextual_user_fragment;
 pub(crate) use contextual_user_message::parse_visible_hook_prompt_message;
 pub(crate) use current_time_reminder::CurrentTimeReminder;
 pub(crate) use guardian_followup_review_reminder::GuardianFollowupReviewReminder;

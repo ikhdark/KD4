@@ -9,6 +9,7 @@ pub(crate) struct AppsRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
     workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
+    last_notified_apps: Arc<Mutex<Option<Vec<AppInfo>>>>,
     shutdown_token: CancellationToken,
     _shutdown_drop_guard: DropGuard,
 }
@@ -29,6 +30,7 @@ impl AppsRequestProcessor {
             outgoing,
             config_manager,
             workspace_settings_cache,
+            last_notified_apps: Arc::new(Mutex::new(None)),
             shutdown_token,
             _shutdown_drop_guard: shutdown_drop_guard,
         }
@@ -99,12 +101,14 @@ impl AppsRequestProcessor {
         let environment_manager = self.thread_manager.environment_manager();
         let mcp_manager = self.thread_manager.mcp_manager();
         let plugins_manager = self.thread_manager.plugins_manager();
+        let last_notified_apps = Arc::clone(&self.last_notified_apps);
         let shutdown_token = self.shutdown_token.child_token();
         tokio::spawn(async move {
             tokio::select! {
                 _ = shutdown_token.cancelled() => {}
                 _ = Self::apps_list_task(
                     outgoing,
+                    last_notified_apps,
                     request,
                     params,
                     config,
@@ -125,6 +129,7 @@ impl AppsRequestProcessor {
     #[allow(clippy::too_many_arguments)]
     async fn apps_list_task(
         outgoing: Arc<OutgoingMessageSender>,
+        last_notified_apps: Arc<Mutex<Option<Vec<AppInfo>>>>,
         request_id: ConnectionRequestId,
         params: AppsListParams,
         config: Config,
@@ -141,6 +146,7 @@ impl AppsRequestProcessor {
         let retry_plugins_manager = Arc::clone(&plugins_manager);
         let result = Self::apps_list_response(
             &outgoing,
+            &last_notified_apps,
             params,
             config,
             environment_manager,
@@ -163,6 +169,7 @@ impl AppsRequestProcessor {
             retry_params.force_refetch = true;
             if let Err(err) = Self::apps_list_response(
                 &outgoing,
+                &last_notified_apps,
                 retry_params,
                 retry_config,
                 retry_environment_manager,
@@ -178,6 +185,7 @@ impl AppsRequestProcessor {
 
     async fn apps_list_response(
         outgoing: &Arc<OutgoingMessageSender>,
+        last_notified_apps: &Mutex<Option<Vec<AppInfo>>>,
         params: AppsListParams,
         config: Config,
         environment_manager: Arc<EnvironmentManager>,
@@ -190,6 +198,7 @@ impl AppsRequestProcessor {
             thread_id: _,
             force_refetch,
         } = params;
+        let mut request_last_notified_apps = None;
         let start = match cursor {
             Some(cursor) => match cursor.parse::<usize>() {
                 Ok(idx) => idx,
@@ -245,8 +254,6 @@ impl AppsRequestProcessor {
         let mut accessible_loaded = false;
         let mut all_loaded = false;
         let mut codex_apps_ready = true;
-        let mut last_notified_apps = None;
-
         if accessible_connectors.is_some() || all_connectors.is_some() {
             let merged = connectors::with_app_enabled_state(
                 merge_loaded_apps(all_connectors.as_deref(), accessible_connectors.as_deref()),
@@ -257,8 +264,14 @@ impl AppsRequestProcessor {
                 accessible_loaded,
                 all_loaded,
             ) {
-                send_app_list_updated_notification(outgoing, merged.clone()).await;
-                last_notified_apps = Some(merged);
+                send_app_list_updated_notification(
+                    outgoing,
+                    last_notified_apps,
+                    &mut request_last_notified_apps,
+                    merged,
+                    !force_refetch,
+                )
+                .await;
             }
         }
 
@@ -315,10 +328,15 @@ impl AppsRequestProcessor {
                 merged.as_slice(),
                 accessible_loaded,
                 all_loaded,
-            ) && last_notified_apps.as_ref() != Some(&merged)
-            {
-                send_app_list_updated_notification(outgoing, merged.clone()).await;
-                last_notified_apps = Some(merged.clone());
+            ) {
+                send_app_list_updated_notification(
+                    outgoing,
+                    last_notified_apps,
+                    &mut request_last_notified_apps,
+                    merged.clone(),
+                    !force_refetch,
+                )
+                .await;
             }
 
             if accessible_loaded && all_loaded {
@@ -446,12 +464,31 @@ fn paginate_apps(
 
 async fn send_app_list_updated_notification(
     outgoing: &Arc<OutgoingMessageSender>,
+    last_notified_apps: &Mutex<Option<Vec<AppInfo>>>,
+    request_last_notified_apps: &mut Option<Vec<AppInfo>>,
     data: Vec<AppInfo>,
+    dedupe_across_requests: bool,
 ) {
-    let data = data.into_iter().map(app_info_to_api).collect();
+    let notification_data = {
+        let mut last_notified_apps = last_notified_apps.lock().await;
+        if request_last_notified_apps.as_ref() == Some(&data)
+            || (dedupe_across_requests && last_notified_apps.as_ref() == Some(&data))
+        {
+            *request_last_notified_apps = Some(data);
+            return;
+        }
+
+        // Claim the snapshot atomically, but never hold the shared dedupe lock
+        // while a backpressured client notification waits on the outgoing queue.
+        *request_last_notified_apps = Some(data.clone());
+        *last_notified_apps = Some(data.clone());
+        data.into_iter().map(app_info_to_api).collect()
+    };
     outgoing
         .send_server_notification(ServerNotification::AppListUpdated(
-            AppListUpdatedNotification { data },
+            AppListUpdatedNotification {
+                data: notification_data,
+            },
         ))
         .await;
 }

@@ -4,6 +4,9 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::ToolCallSource;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_core_skills::HostSkillsSnapshot;
+use codex_core_skills::SkillLoadOutcome;
+use codex_core_skills::SkillMetadata;
 use codex_exec_server::LocalFileSystem;
 use codex_file_search::source_search::SourceLine;
 use codex_file_search::source_search::SourceSearchCoverage;
@@ -19,6 +22,7 @@ use codex_file_system::ReadDirectoryOutcome;
 use codex_file_system::RemoveOptions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::TempDirExt;
@@ -521,7 +525,7 @@ async fn search_handler_passes_sandbox_context_to_filesystem_operations() {
         .handle(ToolInvocation {
             session: Arc::new(session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
+            turn: Arc::clone(&turn),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-search-source".to_string(),
@@ -602,6 +606,120 @@ async fn search_handler_reads_through_selected_local_filesystem() {
     assert_eq!(manifest[0].path, "src/lib.rs");
     assert!(manifest[0].existed);
     assert!(manifest[0].content_hash.is_some());
+}
+
+#[tokio::test]
+async fn supporting_read_coordination_cannot_hold_up_source_output() {
+    let started = tokio::time::Instant::now();
+
+    await_supporting_read_coordination(
+        Duration::from_millis(10),
+        std::future::pending::<Result<(), FunctionCallError>>(),
+    )
+    .await
+    .expect("a stalled coordination write should not block confined source output");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "coordination wait exceeded its bounded allowance"
+    );
+}
+
+#[tokio::test]
+async fn read_file_span_handler_reads_exact_loaded_skill_path() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    replace_primary_environment_cwd(&mut turn, source_dir.abs());
+    turn.permission_profile = PermissionProfile::Disabled;
+
+    let skill_dir = tempfile::tempdir().expect("create skill temp dir");
+    let skill_path = skill_dir.abs().join("SKILL.md");
+    std::fs::write(skill_path.as_path(), "first\ninstalled skill\nthird\n")
+        .expect("write installed skill");
+    let mut outcome = SkillLoadOutcome::default();
+    outcome.skills = vec![SkillMetadata {
+        name: "installed-test".to_string(),
+        description: "test installed skill".to_string(),
+        short_description: None,
+        interface: None,
+        dependencies: None,
+        policy: None,
+        path_to_skills_md: skill_path.clone(),
+        scope: SkillScope::User,
+        plugin_id: None,
+    }];
+    turn.turn_skills = crate::session::turn_context::TurnSkillsContext::new(
+        HostSkillsSnapshot::new(Arc::new(outcome)),
+    );
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "path": skill_path.to_string_lossy(),
+            "start_line": 2,
+            "line_count": 1
+        })
+        .to_string(),
+    };
+
+    let output = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-loaded-skill".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
+        .await
+        .expect("loaded skill read should succeed");
+
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        output.to_response_item("call-read-loaded-skill", &payload)
+    else {
+        panic!("expected function call output");
+    };
+    let text = output.body.to_text().expect("text output");
+    assert!(text.contains("installed skill"), "{text}");
+    assert!(text.contains("     2 | installed skill"), "{text}");
+}
+
+#[tokio::test]
+async fn read_file_span_handler_rejects_unloaded_path_outside_repository() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    replace_primary_environment_cwd(&mut turn, source_dir.abs());
+    turn.permission_profile = PermissionProfile::Disabled;
+
+    let outside_dir = tempfile::tempdir().expect("create outside temp dir");
+    let outside_path = outside_dir.abs().join("outside.rs");
+    std::fs::write(outside_path.as_path(), "outside\n").expect("write outside file");
+    let turn = Arc::new(turn);
+    let result = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-unloaded-outside".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({ "path": outside_path.to_string_lossy() }).to_string(),
+            },
+        })
+        .await;
+
+    let Err(FunctionCallError::RespondToModel(message)) = result else {
+        panic!("expected outside-repository rejection");
+    };
+    assert!(
+        message.contains("resolves outside repository root"),
+        "{message}"
+    );
 }
 
 #[tokio::test]

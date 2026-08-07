@@ -79,6 +79,28 @@ async fn test_config() -> (TempDir, Config) {
     test_config_with_cli_overrides(Vec::new()).await
 }
 
+#[test]
+fn bounded_fork_rejects_history_at_child_token_limit() {
+    let items = vec![RolloutItem::ResponseItem(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "oversized fork history".repeat(64),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    })];
+
+    let err = AgentControl::validate_forked_rollout_token_limit(&items, 1)
+        .expect_err("history at the child token limit should be rejected");
+    assert!(
+        err.to_string().contains(
+            "meets or exceeds the child token limit of 1; use fork_turns=\"none\" or fewer turns"
+        ),
+        "unexpected error: {err}"
+    );
+}
+
 fn text_input(text: &str) -> Vec<UserInput> {
     vec![UserInput::Text {
         text: text.to_string(),
@@ -204,6 +226,7 @@ async fn persisted_originator(thread: &CodexThread) -> String {
         .find_map(|item| match item {
             RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.originator.clone()),
             RolloutItem::ResponseItem(_)
+            | RolloutItem::ToolManifest(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::EventMsg(_)

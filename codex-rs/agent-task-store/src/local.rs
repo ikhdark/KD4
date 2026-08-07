@@ -88,6 +88,10 @@ use crate::scope::repository_identity;
 
 const COORDINATION_DIR: &str = "agent-task-coordination";
 const COLD_REVIEW_REASON_PREFIX: &str = "cold review required: ";
+// Snapshot capture can retain SQLite's single writer while a bounded file copy is
+// flushed. Give short-lived lease and provenance writes enough time to wait out
+// that contention instead of failing an otherwise read-only source inspection.
+const DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
 const NONEXISTENT_SENTINEL: &[u8] = b"CODEX_AGENT_TASK_STORE_NONEXISTENT\n";
 
@@ -144,7 +148,8 @@ impl LocalAgentTaskStore {
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal);
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(DATABASE_BUSY_TIMEOUT);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -163,6 +168,13 @@ impl LocalAgentTaskStore {
 
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn configured_busy_timeout_millis(&self) -> StoreResult<i64> {
+        Ok(sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn validate_dependencies(
@@ -2143,6 +2155,96 @@ impl LocalAgentTaskStore {
         })
     }
 
+    async fn automatic_wake_cursor_impl(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+    ) -> StoreResult<Option<WakeEventId>> {
+        if root_session_id.trim().is_empty() || consuming_agent_path.trim().is_empty() {
+            return Err(StoreError::InvalidAssignment(
+                "automatic wake cursor keys cannot be empty".to_string(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        if let Some(row) = sqlx::query(
+            "SELECT event_id FROM automatic_wake_cursors
+             WHERE root_session_id = ? AND consuming_agent_path = ?",
+        )
+        .bind(&root_session_id)
+        .bind(&consuming_agent_path)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let event_id = row
+                .get::<Option<String>, _>("event_id")
+                .map(|value| WakeEventId::parse(&value))
+                .transpose()?;
+            transaction.commit().await?;
+            return Ok(event_id);
+        }
+
+        let snapshot_before = sqlx::query(
+            "SELECT event_id FROM wake_events
+             WHERE root_session_id = ?
+             ORDER BY wake_sequence DESC
+             LIMIT 1 OFFSET ?",
+        )
+        .bind(&root_session_id)
+        .bind(MAX_WAKE_EVENTS_PER_READ as i64)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| row.get::<String, _>("event_id"));
+        sqlx::query(
+            "INSERT OR IGNORE INTO automatic_wake_cursors
+             (root_session_id, consuming_agent_path, event_id, updated_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&root_session_id)
+        .bind(&consuming_agent_path)
+        .bind(&snapshot_before)
+        .bind(encode(&Utc::now())?)
+        .execute(&mut *transaction)
+        .await?;
+        let stored = sqlx::query(
+            "SELECT event_id FROM automatic_wake_cursors
+             WHERE root_session_id = ? AND consuming_agent_path = ?",
+        )
+        .bind(&root_session_id)
+        .bind(&consuming_agent_path)
+        .fetch_one(&mut *transaction)
+        .await?
+        .get::<Option<String>, _>("event_id")
+        .map(|value| WakeEventId::parse(&value))
+        .transpose()?;
+        transaction.commit().await?;
+        Ok(stored)
+    }
+
+    async fn compare_and_swap_automatic_wake_cursor_impl(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+        expected: Option<WakeEventId>,
+        next: WakeEventId,
+    ) -> StoreResult<bool> {
+        let expected = expected.map(|value| value.to_string());
+        let changed = sqlx::query(
+            "UPDATE automatic_wake_cursors
+             SET event_id = ?, updated_at = ?
+             WHERE root_session_id = ? AND consuming_agent_path = ?
+               AND ((event_id = ?) OR (event_id IS NULL AND ? IS NULL))",
+        )
+        .bind(next.to_string())
+        .bind(encode(&Utc::now())?)
+        .bind(root_session_id)
+        .bind(consuming_agent_path)
+        .bind(&expected)
+        .bind(&expected)
+        .execute(&self.pool)
+        .await?;
+        Ok(changed.rows_affected() == 1)
+    }
+
     async fn reserve_stalled_nudge_impl(
         &self,
         assignment_id: AssignmentId,
@@ -2926,6 +3028,35 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         Box::pin(async move {
             self.read_wake_events_impl(root_session_id, after_event_id)
                 .await
+        })
+    }
+
+    fn automatic_wake_cursor(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+    ) -> TaskStoreFuture<'_, Option<WakeEventId>> {
+        Box::pin(async move {
+            self.automatic_wake_cursor_impl(root_session_id, consuming_agent_path)
+                .await
+        })
+    }
+
+    fn compare_and_swap_automatic_wake_cursor(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+        expected: Option<WakeEventId>,
+        next: WakeEventId,
+    ) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move {
+            self.compare_and_swap_automatic_wake_cursor_impl(
+                root_session_id,
+                consuming_agent_path,
+                expected,
+                next,
+            )
+            .await
         })
     }
 

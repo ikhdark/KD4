@@ -1,7 +1,6 @@
-use std::path::PathBuf;
-
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::user_input::UserInput;
+use codex_utils_path_uri::PathUri;
 
 /// Host-owned turn environment summary visible to turn-input contributors.
 #[derive(Debug, Clone)]
@@ -9,7 +8,7 @@ pub struct TurnInputEnvironment {
     /// Stable host environment id used to route executor-scoped capabilities.
     pub environment_id: String,
     /// Effective working directory for this turn in the environment.
-    pub cwd: PathBuf,
+    pub cwd: PathUri,
     /// Whether this is the primary environment for the turn.
     pub is_primary: bool,
 }

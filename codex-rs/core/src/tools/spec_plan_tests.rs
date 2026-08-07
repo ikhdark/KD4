@@ -109,11 +109,13 @@ struct ToolPlanProbe {
     namespace_functions: BTreeMap<String, Vec<String>>,
     registered_names: Vec<String>,
     exposures: BTreeMap<String, ToolExposure>,
+    warnings: Vec<String>,
 }
 
 impl ToolPlanProbe {
     fn from_router(router: ToolRouter) -> Self {
         let visible_specs = router.model_visible_specs();
+        let warnings = router.planning_warnings().to_vec();
         let visible_names = visible_specs
             .iter()
             .map(|spec| spec.name().to_string())
@@ -157,6 +159,7 @@ impl ToolPlanProbe {
             namespace_functions,
             registered_names,
             exposures,
+            warnings,
         }
     }
 
@@ -997,6 +1000,34 @@ async fn deferred_extension_tools_are_discoverable_with_tool_search() {
     plan.assert_visible_lacks(&["extension_echo"]);
     plan.assert_registered_contains(&["extension_echo"]);
     assert_eq!(plan.exposure("extension_echo"), ToolExposure::Deferred);
+}
+
+#[tokio::test]
+async fn duplicate_extension_tool_names_surface_an_actionable_warning() {
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            extension_tool_executors: vec![
+                Arc::new(DeferredExtensionTool),
+                Arc::new(DeferredExtensionTool),
+            ],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        plan.registered_names
+            .iter()
+            .filter(|name| name.as_str() == "extension_echo")
+            .count(),
+        1
+    );
+    let [warning] = plan.warnings.as_slice() else {
+        panic!("duplicate extension tool should produce exactly one warning");
+    };
+    assert!(warning.contains("extension_echo"));
+    assert!(warning.contains("Rename or disable"));
 }
 
 #[tokio::test]

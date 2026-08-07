@@ -269,6 +269,10 @@ impl ToolOutput for SpawnAgentResult {
         true
     }
 
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         tool_output_response_item(call_id, payload, self, Some(true), "spawn_agent")
     }

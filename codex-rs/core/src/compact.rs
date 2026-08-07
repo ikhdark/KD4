@@ -4,6 +4,8 @@ use std::time::Instant;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::context::is_legacy_compaction_warning_fragment;
+use crate::context::is_startup_contextual_user_fragment;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::hook_runtime::PostCompactHookOutcome;
@@ -44,9 +46,8 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
-use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::truncate_text;
+use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::prelude::*;
 
 use codex_model_provider_info::ModelProviderInfo;
@@ -54,7 +55,8 @@ use codex_model_provider_info::ModelProviderInfo;
 pub use codex_prompts::COMPACTION_BASE_INSTRUCTIONS;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
-const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 4_000;
+const COMPACT_TASK_STATE_MAX_TOKENS: usize = 4_000;
 pub(crate) const MAX_RETAINED_USER_IMAGES: usize = 8;
 pub(crate) const MAX_RETAINED_USER_IMAGE_BYTES: usize =
     MAX_PROMPT_IMAGE_SOURCE_BYTES / 3 * 4 + 4096;
@@ -265,6 +267,7 @@ async fn run_compact_task_inner_impl(
     let turn_input = history
         .clone()
         .for_prompt(&turn_context.model_info.input_modalities);
+    let turn_input = strip_compaction_startup_envelopes(turn_input);
     let prompt = Prompt {
         input: turn_input,
         base_instructions: base_instructions.clone(),
@@ -331,8 +334,9 @@ async fn run_compact_task_inner_impl(
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.raw_items();
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
-    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
-    let user_messages = collect_user_messages(history_items);
+    let summary_text = bounded_task_state_summary(&summary_suffix);
+    let compactable_history = strip_compaction_startup_envelopes(history_items.to_vec());
+    let user_messages = collect_user_messages(&compactable_history);
 
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
     if let Some(summary_item) = new_history.last_mut() {
@@ -360,7 +364,7 @@ async fn run_compact_task_inner_impl(
     };
     let compacted_item = CompactedItem {
         message: summary_text.clone(),
-        replacement_history: Some(new_history.clone()),
+        replacement_history: None,
         window_number: Some(window_number),
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
@@ -383,6 +387,38 @@ async fn run_compact_task_inner_impl(
     });
     sess.send_event(&turn_context, warning).await;
     Ok(summary_suffix)
+}
+
+pub(crate) fn strip_compaction_startup_envelopes(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message {
+                id,
+                role,
+                mut content,
+                phase,
+                internal_chat_message_metadata_passthrough,
+            } if role == "user" => {
+                content.retain(|part| !is_startup_contextual_user_fragment(part));
+                (!content.is_empty()).then_some(ResponseItem::Message {
+                    id,
+                    role,
+                    content,
+                    phase,
+                    internal_chat_message_metadata_passthrough,
+                })
+            }
+            item => Some(item),
+        })
+        .collect()
+}
+
+fn bounded_task_state_summary(summary_suffix: &str) -> String {
+    truncate_text_to_token_ceiling(
+        &format!("{SUMMARY_PREFIX}\n{summary_suffix}"),
+        COMPACT_TASK_STATE_MAX_TOKENS,
+    )
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
@@ -508,22 +544,25 @@ pub(crate) struct CompactedUserMessage {
 pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUserMessage> {
     items
         .iter()
-        .filter_map(|item| match crate::event_mapping::parse_turn_item(item) {
-            Some(TurnItem::UserMessage(user)) => {
-                if is_summary_message(&user.message()) {
-                    None
-                } else {
-                    Some(CompactedUserMessage {
-                        content: user.content,
-                        internal_chat_message_metadata_passthrough: match item {
-                            ResponseItem::Message {
-                                internal_chat_message_metadata_passthrough,
-                                ..
-                            } => internal_chat_message_metadata_passthrough.clone(),
-                            _ => None,
-                        },
-                    })
+        .filter_map(|item| match item {
+            ResponseItem::Message {
+                role,
+                content,
+                internal_chat_message_metadata_passthrough,
+                ..
+            } if role == "user" => {
+                let message = content_items_to_text(content).unwrap_or_default();
+                if is_summary_message(&message)
+                    || content.iter().any(is_legacy_compaction_warning_fragment)
+                {
+                    return None;
                 }
+                let content = crate::event_mapping::parse_user_message_content(content).content;
+                Some(CompactedUserMessage {
+                    content,
+                    internal_chat_message_metadata_passthrough:
+                        internal_chat_message_metadata_passthrough.clone(),
+                })
             }
             _ => None,
         })
@@ -646,7 +685,7 @@ fn build_compacted_history_with_limits(
                         });
                         remaining = remaining.saturating_sub(tokens);
                     } else {
-                        let truncated = truncate_text(text, TruncationPolicy::Tokens(remaining));
+                        let truncated = truncate_text_to_token_ceiling(text, remaining);
                         if !truncated.is_empty() {
                             content.push(UserInput::Text {
                                 text: truncated,

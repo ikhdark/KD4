@@ -36,7 +36,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                 (
                     "max_bytes".to_string(),
                     JsonSchema::integer(Some(
-                        "Maximum output bytes to retain, from 1 through 65536. Defaults to 16384."
+                        "Maximum output bytes to retain, from 1 through 16384. Defaults to 16384."
                             .to_string(),
                     )),
                 ),

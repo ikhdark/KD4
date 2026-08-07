@@ -16,7 +16,10 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TokenCountEvent;
+use codex_protocol::protocol::ToolManifestItem;
 use codex_protocol::protocol::TurnContextItem;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
 use std::fs;
@@ -592,6 +595,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         /*meta*/ None,
         home.path().to_path_buf(),
         rollout_path.clone(),
+        Default::default(),
     );
     state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
         AgentMessageEvent {
@@ -610,6 +614,85 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
     Ok(())
 }
 
+#[test]
+fn writer_state_deduplicates_manifests_and_coalesces_token_counts() {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let mut state = RolloutWriterState::new(
+        /*writer*/ None,
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        rollout_path,
+        HashSet::from(["already-persisted".to_string()]),
+    );
+    let manifest = |hash: &str| {
+        RolloutItem::ToolManifest(ToolManifestItem {
+            hash: hash.to_string(),
+            manifest: serde_json::json!({"hash": hash}),
+        })
+    };
+    let token_count = || {
+        RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+            info: None,
+            rate_limits: None,
+        }))
+    };
+    let boundary = RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: "turn-2".to_string(),
+        trace_id: None,
+        started_at: None,
+        model_context_window: None,
+        collaboration_mode_kind: Default::default(),
+    }));
+
+    state.add_items(vec![
+        manifest("already-persisted"),
+        manifest("new"),
+        manifest("new"),
+        token_count(),
+        token_count(),
+        boundary,
+    ]);
+
+    assert_eq!(state.pending_items.len(), 3);
+    assert!(matches!(
+        &state.pending_items[0],
+        RolloutItem::ToolManifest(item) if item.hash == "new"
+    ));
+    assert!(matches!(
+        &state.pending_items[1],
+        RolloutItem::EventMsg(EventMsg::TokenCount(_))
+    ));
+    assert!(matches!(
+        &state.pending_items[2],
+        RolloutItem::EventMsg(EventMsg::TurnStarted(_))
+    ));
+    assert!(state.pending_token_count.is_none());
+}
+
+#[tokio::test]
+async fn existing_manifest_hashes_skips_malformed_lines() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let manifest = RolloutLine {
+        timestamp: "2026-08-06T00:00:00Z".to_string(),
+        item: RolloutItem::ToolManifest(ToolManifestItem {
+            hash: "persisted".to_string(),
+            manifest: serde_json::json!({"tools": []}),
+        }),
+    };
+    fs::write(
+        &rollout_path,
+        format!("not-json\n{}\n", serde_json::to_string(&manifest)?),
+    )?;
+
+    let hashes = RolloutRecorder::existing_manifest_hashes(&rollout_path).await?;
+
+    assert_eq!(hashes, HashSet::from(["persisted".to_string()]));
+    Ok(())
+}
+
 async fn assert_failed_append_is_written_once(
     fault: JsonlWriteFault,
     message: &str,
@@ -625,6 +708,7 @@ async fn assert_failed_append_is_written_once(
         /*meta*/ None,
         home.path().to_path_buf(),
         rollout_path.clone(),
+        Default::default(),
     );
     state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
         AgentMessageEvent {

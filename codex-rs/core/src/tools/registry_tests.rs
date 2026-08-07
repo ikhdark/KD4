@@ -337,6 +337,7 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
             ),
         }),
         post_tool_use_payload: None,
+        model_projection: None,
     };
 
     assert_eq!(
@@ -364,6 +365,7 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
             ),
         }),
         post_tool_use_payload: None,
+        model_projection: None,
     };
 
     assert_eq!(

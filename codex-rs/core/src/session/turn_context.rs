@@ -141,6 +141,9 @@ pub struct TurnContext {
     pub(crate) unified_exec_shell_mode: UnifiedExecShellMode,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
+    /// Deferred tools selected by `tool_search` during this turn. This state is
+    /// intentionally turn-scoped so prior selections do not accumulate.
+    pub(crate) activated_deferred_tools: Arc<std::sync::RwLock<HashSet<codex_tools::ToolName>>>,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_skills: TurnSkillsContext,
@@ -156,6 +159,30 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
+    pub(crate) fn activate_deferred_tools(
+        &self,
+        tools: impl IntoIterator<Item = codex_tools::ToolName>,
+    ) {
+        self.activated_deferred_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(tools);
+    }
+
+    pub(crate) fn deferred_tool_is_activated(&self, tool_name: &codex_tools::ToolName) -> bool {
+        self.activated_deferred_tools
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(tool_name)
+    }
+
+    pub(crate) fn activated_deferred_tools(&self) -> HashSet<codex_tools::ToolName> {
+        self.activated_deferred_tools
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn item_ids_enabled(&self) -> bool {
         self.config.features.enabled(Feature::ItemIds)
             || matches!(self.history_mode, ThreadHistoryMode::Paginated)
@@ -299,6 +326,7 @@ impl TurnContext {
             unified_exec_shell_mode: self.unified_exec_shell_mode.clone(),
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
+            activated_deferred_tools: Arc::clone(&self.activated_deferred_tools),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
             turn_skills: self.turn_skills.clone(),
@@ -583,6 +611,7 @@ impl Session {
             unified_exec_shell_mode,
             final_output_json_schema: None,
             dynamic_tools: session_configuration.dynamic_tools.clone(),
+            activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             turn_metadata_state,
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),
