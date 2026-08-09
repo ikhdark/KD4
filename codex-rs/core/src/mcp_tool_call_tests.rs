@@ -177,6 +177,7 @@ async fn step_context_with_live_apps(
     );
 
     let mcp = Arc::new(McpRuntimeSnapshot::new(
+        base_mcp.generation(),
         Arc::new(base_mcp.config().clone()),
         base_mcp.plugins_available(),
         Arc::new(manager),

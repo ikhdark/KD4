@@ -20,6 +20,47 @@ fn provider_reuses_its_live_process_host() {
 }
 
 #[test]
+fn shared_host_lease_is_released_after_the_final_session_drops() {
+    let provider = ProcessOwnedCodeModeSessionProvider::default();
+    let process_host = provider.process_host();
+    let first = ProcessOwnedCodeModeSession::with_process_host(
+        Arc::new(NoopCodeModeSessionDelegate),
+        Arc::clone(&process_host),
+    );
+    let second = ProcessOwnedCodeModeSession::with_process_host(
+        Arc::new(NoopCodeModeSessionDelegate),
+        Arc::clone(&process_host),
+    );
+
+    assert_eq!(
+        process_host
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_sessions,
+        2
+    );
+    drop(first);
+    assert_eq!(
+        process_host
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_sessions,
+        1
+    );
+    drop(second);
+    assert_eq!(
+        process_host
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_sessions,
+        0
+    );
+}
+
+#[test]
 fn host_program_override_takes_precedence() {
     assert_eq!(
         resolve_host_program(

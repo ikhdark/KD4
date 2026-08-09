@@ -168,6 +168,7 @@ impl Session {
             // the projected servers and connectors do not, advance the input key without
             // replacing the live manager and restarting its processes.
             let runtime = Arc::new(McpRuntimeSnapshot::new(
+                current.generation(),
                 Arc::new(current.config().clone()),
                 mcp_projection.plugins_available,
                 current.manager_arc(),

@@ -47,7 +47,7 @@ impl CellHost for PanickingCallbackHost {
         panic!("unexpected completion commit");
     }
 
-    async fn closed(&self) {}
+    async fn closed(&self, _event: Option<CellEvent>) {}
 }
 
 #[tokio::test]

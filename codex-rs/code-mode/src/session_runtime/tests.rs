@@ -102,6 +102,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     let host = RuntimeCellHost {
         cell_id: CellId::new("terminating-writer"),
         inner: Arc::clone(&runtime.inner),
+        cell_permit: Mutex::new(None),
     };
     let completion = CellEvent::Completed {
         content_items: vec![OutputItem::Text {
@@ -173,6 +174,86 @@ fn execute_request(source: &str) -> CreateCellRequest {
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn terminal_result_remains_observable_after_active_cell_removal() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let started = runtime
+        .execute(
+            execute_request(r#"text("done");"#),
+            ObserveMode::YieldAfter(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    let cell_id = started.cell_id.clone();
+    let completed = started.initial_event().await.unwrap();
+    assert!(matches!(completed, CellEvent::Completed { .. }));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !runtime.inner.cells.lock().await.contains_key(&cell_id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cell should leave the active registry");
+
+    assert_eq!(
+        runtime
+            .observe(&cell_id, ObserveMode::PendingFrontier)
+            .await,
+        Ok(completed.clone())
+    );
+    assert_eq!(runtime.terminate(&cell_id).await, Ok(completed));
+}
+
+#[tokio::test]
+async fn ninth_cell_waits_until_a_terminal_cell_releases_its_permit() {
+    let runtime = Arc::new(SessionRuntime::new(Arc::new(RecordingDelegate)));
+    let mut active_cell_ids = Vec::new();
+    for _ in 0..MAX_ACTIVE_CELLS {
+        let started = runtime
+            .execute(
+                execute_request("await new Promise(() => {});"),
+                ObserveMode::YieldAfter(Duration::from_millis(1)),
+            )
+            .await
+            .expect("cell should be admitted");
+        active_cell_ids.push(started.cell_id);
+    }
+
+    let ninth_runtime = Arc::clone(&runtime);
+    let ninth = tokio::spawn(async move {
+        ninth_runtime
+            .execute(
+                execute_request("await new Promise(() => {});"),
+                ObserveMode::YieldAfter(Duration::from_millis(1)),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!ninth.is_finished());
+
+    runtime
+        .terminate(&active_cell_ids[0])
+        .await
+        .expect("terminal cell should release its permit");
+    let ninth_cell_id = tokio::time::timeout(Duration::from_secs(2), ninth)
+        .await
+        .expect("ninth cell should be admitted after permit release")
+        .expect("ninth task should not panic")
+        .expect("ninth cell should start")
+        .cell_id;
+
+    for cell_id in active_cell_ids.into_iter().skip(1).chain([ninth_cell_id]) {
+        runtime
+            .terminate(&cell_id)
+            .await
+            .expect("test cell should terminate");
     }
 }
 

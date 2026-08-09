@@ -7,6 +7,7 @@ use codex_mcp::McpRuntimeContext;
 
 /// MCP config, plugin availability, exact environment bindings, and manager for one request.
 pub struct McpRuntimeSnapshot {
+    generation: u64,
     config: Arc<McpConfig>,
     plugins_available: bool,
     manager: Arc<McpConnectionManager>,
@@ -16,6 +17,7 @@ pub struct McpRuntimeSnapshot {
 
 impl McpRuntimeSnapshot {
     pub(crate) fn new(
+        generation: u64,
         config: Arc<McpConfig>,
         plugins_available: bool,
         manager: Arc<McpConnectionManager>,
@@ -23,12 +25,17 @@ impl McpRuntimeSnapshot {
         available_environment_ids: Vec<String>,
     ) -> Self {
         Self {
+            generation,
             config,
             plugins_available,
             manager,
             runtime_context,
             available_environment_ids,
         }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn config(&self) -> &McpConfig {
@@ -92,6 +99,7 @@ impl McpRuntimeSnapshot {
             config.cwd.to_path_buf(),
         );
         Arc::new(Self::new(
+            0,
             Arc::new(mcp_config),
             /*plugins_available*/ false,
             Arc::new(manager),
@@ -105,6 +113,7 @@ impl fmt::Debug for McpRuntimeSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("McpRuntimeSnapshot")
+            .field("generation", &self.generation)
             .finish_non_exhaustive()
     }
 }

@@ -1,3 +1,4 @@
+mod managed_process;
 pub mod pipe;
 mod process;
 pub mod process_group;
@@ -11,6 +12,11 @@ mod windows_input;
 
 pub const DEFAULT_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
 
+pub use managed_process::ManagedRootAdmissionReclaimerGuard;
+pub use managed_process::ManagedRootProcess;
+pub use managed_process::ManagedRootReclaimFuture;
+pub use managed_process::ManagedRootReclaimHook;
+pub use managed_process::install_managed_root_admission_reclaimer;
 /// Spawn a non-interactive process using regular pipes for stdin/stdout/stderr.
 pub use pipe::spawn_process as spawn_pipe_process;
 /// Spawn a non-interactive process using regular pipes, but close stdin immediately.

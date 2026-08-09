@@ -33,6 +33,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tracing::Instrument;
 use tracing::Span;
@@ -658,9 +659,7 @@ async fn run_websocket_response_stream(
         }
         let message = match response {
             Ok(Some(Ok(msg))) => msg,
-            Ok(Some(Err(err))) => {
-                return Err(ApiError::Stream(err.to_string()));
-            }
+            Ok(Some(Err(err))) => return Err(websocket_read_error(err)),
             Ok(None) => {
                 return Err(ApiError::Stream(
                     "stream closed before response.completed".into(),
@@ -770,6 +769,16 @@ async fn run_websocket_response_stream(
     Ok(())
 }
 
+fn websocket_read_error(err: WsError) -> ApiError {
+    let message = match err {
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            "websocket closed before response.completed".to_string()
+        }
+        err => err.to_string(),
+    };
+    ApiError::Stream(message)
+}
+
 fn safety_buffering_for_event(
     event: &ResponsesStreamEvent,
     treatment: &mut SafetyBufferingTreatment,
@@ -829,6 +838,30 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn reset_without_close_handshake_maps_to_incomplete_stream_error() {
+        let error = websocket_read_error(WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake,
+        ));
+        let ApiError::Stream(message) = error else {
+            panic!("expected stream error");
+        };
+
+        assert_eq!(message, "websocket closed before response.completed");
+    }
+
+    #[test]
+    fn other_websocket_read_errors_keep_their_message() {
+        let source = WsError::ConnectionClosed;
+        let expected = source.to_string();
+        let error = websocket_read_error(source);
+        let ApiError::Stream(message) = error else {
+            panic!("expected stream error");
+        };
+
+        assert_eq!(message, expected);
+    }
 
     #[test]
     fn direct_serialization_preserves_websocket_request_payload() {

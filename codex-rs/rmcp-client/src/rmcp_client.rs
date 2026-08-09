@@ -727,20 +727,41 @@ impl RmcpClient {
         }
     }
 
-    /// Stop the MCP transport and any stdio server process owned by this client.
+    /// Ask the MCP transport to close gracefully and release a reaped stdio root.
     pub async fn shutdown(&self) {
         let previous_state = {
             let mut guard = self.state.lock().await;
             std::mem::replace(&mut *guard, ClientState::Closed)
         };
 
+        if let ClientState::Ready { service, .. } = previous_state {
+            match Arc::try_unwrap(service) {
+                Ok(service) => {
+                    if let Err(error) = service.cancel().await {
+                        warn!("failed to close MCP transport gracefully: {error}");
+                    }
+                }
+                Err(service) => {
+                    service.cancellation_token().cancel();
+                    while !service.is_transport_closed() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+
+        if let Some(process) = &self.stdio_process {
+            process.reaped();
+        }
+    }
+
+    /// Force-close the process tree after the manager-wide grace period expires.
+    pub async fn force_shutdown(&self) {
         if let Some(process) = &self.stdio_process
             && let Err(error) = process.terminate().await
         {
             warn!("failed to terminate MCP stdio server process: {error}");
         }
-
-        drop(previous_state);
     }
 
     /// This should be called after every tool call so that if a given tool call triggered

@@ -2527,6 +2527,7 @@ version = "0.0.0"
 dependencies = [
  "codex-code-mode-protocol",
  "codex-protocol",
+ "codex-utils-pty",
  "deno_core_icudata",
  "futures",
  "pretty_assertions",

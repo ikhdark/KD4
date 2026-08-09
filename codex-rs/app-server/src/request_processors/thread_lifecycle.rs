@@ -1,14 +1,147 @@
 use super::*;
 use codex_protocol::config_types::MultiAgentMode;
+use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
-pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
+pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(5 * 60);
+const MAX_INACTIVE_THREADS: usize = 8;
+
+struct EligibleThread {
+    sequence: u64,
+    evict_tx: mpsc::UnboundedSender<EvictionRequest>,
+}
+
+#[derive(Default)]
+struct EvictionRequest {
+    completion: Option<oneshot::Sender<()>>,
+}
+
+pub(super) struct EvictionCompletion(Option<oneshot::Sender<()>>);
+
+impl Drop for EvictionCompletion {
+    fn drop(&mut self) {
+        if let Some(completion) = self.0.take() {
+            let _ = completion.send(());
+        }
+    }
+}
+
+#[derive(Default)]
+struct ThreadUnloadAuthorityState {
+    unloading: HashSet<ThreadId>,
+    eligible: HashMap<ThreadId, EligibleThread>,
+    next_sequence: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct PendingThreadUnloads {
+    state: Mutex<ThreadUnloadAuthorityState>,
+    changed: Notify,
+}
+
+impl PendingThreadUnloads {
+    pub(super) async fn begin(&self, thread_id: ThreadId) -> bool {
+        let mut state = self.state.lock().await;
+        state.eligible.remove(&thread_id);
+        state.unloading.insert(thread_id)
+    }
+
+    pub(super) async fn finish(&self, thread_id: &ThreadId) {
+        if self.state.lock().await.unloading.remove(thread_id) {
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(super) async fn contains(&self, thread_id: &ThreadId) -> bool {
+        self.state.lock().await.unloading.contains(thread_id)
+    }
+
+    async fn set_eligible(
+        &self,
+        thread_id: ThreadId,
+        eligible: bool,
+        evict_tx: &mpsc::UnboundedSender<EvictionRequest>,
+    ) {
+        let evict_tx = {
+            let mut state = self.state.lock().await;
+            state
+                .eligible
+                .retain(|_, entry| !entry.evict_tx.is_closed());
+            if !eligible || state.unloading.contains(&thread_id) {
+                state.eligible.remove(&thread_id);
+                return;
+            }
+            if !state.eligible.contains_key(&thread_id) {
+                let sequence = state.next_sequence;
+                state.next_sequence = state.next_sequence.wrapping_add(1);
+                state.eligible.insert(
+                    thread_id,
+                    EligibleThread {
+                        sequence,
+                        evict_tx: evict_tx.clone(),
+                    },
+                );
+            }
+            if state.eligible.len() <= MAX_INACTIVE_THREADS {
+                return;
+            }
+            let oldest = state
+                .eligible
+                .iter()
+                .min_by_key(|(_, entry)| entry.sequence)
+                .map(|(thread_id, _)| *thread_id);
+            oldest.and_then(|thread_id| state.eligible.remove(&thread_id))
+        };
+        if let Some(entry) = evict_tx {
+            let _ = entry.evict_tx.send(EvictionRequest::default());
+        }
+    }
+
+    pub(crate) async fn evict_one_eligible_and_wait(&self) {
+        let entry = {
+            let mut state = self.state.lock().await;
+            state
+                .eligible
+                .retain(|_, entry| !entry.evict_tx.is_closed());
+            let oldest = state
+                .eligible
+                .iter()
+                .min_by_key(|(_, entry)| entry.sequence)
+                .map(|(thread_id, _)| *thread_id);
+            oldest.and_then(|thread_id| state.eligible.remove(&thread_id))
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        let (completion_tx, completion_rx) = oneshot::channel();
+        if entry
+            .evict_tx
+            .send(EvictionRequest {
+                completion: Some(completion_tx),
+            })
+            .is_ok()
+        {
+            let _ = completion_rx.await;
+        }
+    }
+
+    pub(super) async fn wait_until_finished(&self, thread_id: &ThreadId) {
+        loop {
+            let changed = self.changed.notified();
+            if !self.contains(thread_id).await {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
     pub(super) thread_manager: Arc<ThreadManager>,
     pub(super) thread_state_manager: ThreadStateManager,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
-    pub(super) pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pub(super) pending_thread_unloads: Arc<PendingThreadUnloads>,
     pub(super) thread_watch_manager: ThreadWatchManager,
     pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) fallback_model_provider: String,
@@ -17,11 +150,20 @@ pub(super) struct ListenerTaskContext {
 }
 
 struct UnloadingState {
+    thread_id: ThreadId,
+    authority: Arc<PendingThreadUnloads>,
     delay: Duration,
     has_subscribers_rx: watch::Receiver<bool>,
     has_subscribers: (bool, Instant),
     thread_status_rx: watch::Receiver<ThreadStatus>,
     is_active: (bool, Instant),
+    evict_tx: mpsc::UnboundedSender<EvictionRequest>,
+    evict_rx: mpsc::UnboundedReceiver<EvictionRequest>,
+}
+
+enum UnloadingTrigger {
+    IdleTimeout,
+    LruPressure(EvictionCompletion),
 }
 
 impl UnloadingState {
@@ -43,13 +185,20 @@ impl UnloadingState {
             matches!(*thread_status_rx.borrow(), ThreadStatus::Active { .. }),
             Instant::now(),
         );
-        Some(Self {
+        let (evict_tx, evict_rx) = mpsc::unbounded_channel();
+        let state = Self {
+            thread_id,
+            authority: listener_task_context.pending_thread_unloads.clone(),
             delay,
             has_subscribers_rx,
             has_subscribers,
             thread_status_rx,
             is_active,
-        })
+            evict_tx,
+            evict_rx,
+        };
+        state.sync_eligibility().await;
+        Some(state)
     }
 
     fn unloading_target(&self) -> Option<Instant> {
@@ -79,20 +228,42 @@ impl UnloadingState {
             .is_some_and(|target| target <= Instant::now())
     }
 
+    fn is_unload_eligible(&mut self) -> bool {
+        self.sync_receiver_values();
+        !self.has_subscribers.0 && !self.is_active.0
+    }
+
+    async fn sync_eligibility(&self) {
+        self.authority
+            .set_eligible(
+                self.thread_id,
+                !self.has_subscribers.0 && !self.is_active.0,
+                &self.evict_tx,
+            )
+            .await;
+    }
+
+    async fn unregister(&self) {
+        self.authority
+            .set_eligible(self.thread_id, false, &self.evict_tx)
+            .await;
+    }
+
     fn note_thread_activity_observed(&mut self) {
         if !self.is_active.0 {
             self.is_active = (false, Instant::now());
         }
     }
 
-    async fn wait_for_unloading_trigger(&mut self) -> bool {
+    async fn wait_for_unloading_trigger(&mut self) -> Option<UnloadingTrigger> {
         loop {
             self.sync_receiver_values();
+            self.sync_eligibility().await;
             let unloading_target = self.unloading_target();
             if let Some(target) = unloading_target
                 && target <= Instant::now()
             {
-                return true;
+                return Some(UnloadingTrigger::IdleTimeout);
             }
             let unloading_sleep = async {
                 if let Some(target) = unloading_target {
@@ -102,16 +273,22 @@ impl UnloadingState {
                 }
             };
             tokio::select! {
-                _ = unloading_sleep => return true,
+                _ = unloading_sleep => return Some(UnloadingTrigger::IdleTimeout),
+                evict = self.evict_rx.recv() => {
+                    let request = evict?;
+                    return Some(UnloadingTrigger::LruPressure(EvictionCompletion(
+                        request.completion,
+                    )));
+                },
                 changed = self.has_subscribers_rx.changed() => {
                     if changed.is_err() {
-                        return false;
+                        return None;
                     }
                     self.sync_receiver_values();
                 },
                 changed = self.thread_status_rx.changed() => {
                     if changed.is_err() {
-                        return false;
+                        return None;
                     }
                     self.sync_receiver_values();
                 },
@@ -131,10 +308,6 @@ pub(super) enum EnsureConversationListenerResult {
     ConnectionClosed,
 }
 
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "listener subscription must be serialized against pending unloads"
-)]
 pub(super) async fn ensure_conversation_listener(
     listener_task_context: ListenerTaskContext,
     conversation_id: ThreadId,
@@ -154,8 +327,11 @@ pub(super) async fn ensure_conversation_listener(
         }
     };
     let thread_state = {
-        let pending_thread_unloads = listener_task_context.pending_thread_unloads.lock().await;
-        if pending_thread_unloads.contains(&conversation_id) {
+        if listener_task_context
+            .pending_thread_unloads
+            .contains(&conversation_id)
+            .await
+        {
             return Err(invalid_request(format!(
                 "thread {conversation_id} is closing; retry after the thread is closed"
             )));
@@ -346,27 +522,31 @@ pub(super) async fn ensure_listener_task_running(
                     )
                     .await;
                 }
-                unloading_watchers_open = unloading_state.wait_for_unloading_trigger() => {
-                    if !unloading_watchers_open {
+                unloading_trigger = unloading_state.wait_for_unloading_trigger() => {
+                    let Some(unloading_trigger) = unloading_trigger else {
                         break;
-                    }
-                    if !unloading_state.should_unload_now() {
+                    };
+                    if !unloading_state.is_unload_eligible()
+                        || matches!(&unloading_trigger, UnloadingTrigger::IdleTimeout)
+                            && !unloading_state.should_unload_now()
+                    {
                         continue;
                     }
                     if matches!(conversation.agent_status().await, AgentStatus::Running) {
                         unloading_state.note_thread_activity_observed();
                         continue;
                     }
-                    {
-                        let mut pending_thread_unloads = pending_thread_unloads.lock().await;
-                        if pending_thread_unloads.contains(&conversation_id) {
-                            continue;
-                        }
-                        if !unloading_state.should_unload_now() {
-                            continue;
-                        }
-                        pending_thread_unloads.insert(conversation_id);
+                    if !pending_thread_unloads.begin(conversation_id).await {
+                        continue;
                     }
+                    if !unloading_state.is_unload_eligible() {
+                        pending_thread_unloads.finish(&conversation_id).await;
+                        continue;
+                    }
+                    let eviction_completion = match unloading_trigger {
+                        UnloadingTrigger::IdleTimeout => EvictionCompletion(None),
+                        UnloadingTrigger::LruPressure(completion) => completion,
+                    };
                     unload_thread_without_subscribers(
                         thread_manager.clone(),
                         outgoing_for_task.clone(),
@@ -375,6 +555,7 @@ pub(super) async fn ensure_listener_task_running(
                         thread_watch_manager.clone(),
                         conversation_id,
                         conversation.clone(),
+                        eviction_completion,
                     )
                     .await;
                     break;
@@ -382,6 +563,7 @@ pub(super) async fn ensure_listener_task_running(
             }
         }
 
+        unloading_state.unregister().await;
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_generation == listener_generation {
             thread_state_manager.unregister_listener_command_tx(conversation_id);
@@ -399,14 +581,16 @@ pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> Threa
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn unload_thread_without_subscribers(
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
-    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pending_thread_unloads: Arc<PendingThreadUnloads>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
+    eviction_completion: EvictionCompletion,
 ) {
     info!("thread {thread_id} has no subscribers and is idle; shutting down");
 
@@ -415,19 +599,20 @@ pub(super) async fn unload_thread_without_subscribers(
     outgoing
         .cancel_requests_for_thread(thread_id, /*error*/ None)
         .await;
-    thread_state_manager.remove_thread_state(thread_id).await;
-
     tokio::spawn(async move {
         match wait_for_thread_shutdown(&thread).await {
             ThreadShutdownResult::Complete => {
                 if thread_manager.remove_thread(&thread_id).await.is_none() {
                     info!("thread {thread_id} was already removed before teardown finalized");
+                    thread_state_manager.remove_thread_state(thread_id).await;
                     thread_watch_manager
                         .remove_thread(&thread_id.to_string())
                         .await;
-                    pending_thread_unloads.lock().await.remove(&thread_id);
+                    pending_thread_unloads.finish(&thread_id).await;
+                    drop(eviction_completion);
                     return;
                 }
+                thread_state_manager.remove_thread_state(thread_id).await;
                 thread_watch_manager
                     .remove_thread(&thread_id.to_string())
                     .await;
@@ -437,17 +622,18 @@ pub(super) async fn unload_thread_without_subscribers(
                 outgoing
                     .send_server_notification(ServerNotification::ThreadClosed(notification))
                     .await;
-                pending_thread_unloads.lock().await.remove(&thread_id);
+                pending_thread_unloads.finish(&thread_id).await;
             }
             ThreadShutdownResult::SubmitFailed => {
-                pending_thread_unloads.lock().await.remove(&thread_id);
+                pending_thread_unloads.finish(&thread_id).await;
                 warn!("failed to submit Shutdown to thread {thread_id}");
             }
             ThreadShutdownResult::TimedOut => {
-                pending_thread_unloads.lock().await.remove(&thread_id);
+                pending_thread_unloads.finish(&thread_id).await;
                 warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
             }
         }
+        drop(eviction_completion);
     });
 }
 
@@ -460,7 +646,7 @@ pub(super) async fn handle_thread_listener_command(
     thread_state: &Arc<Mutex<ThreadState>>,
     thread_watch_manager: &ThreadWatchManager,
     outgoing: &Arc<OutgoingMessageSender>,
-    pending_thread_unloads: &Arc<Mutex<HashSet<ThreadId>>>,
+    pending_thread_unloads: &Arc<PendingThreadUnloads>,
     listener_command: ThreadListenerCommand,
 ) {
     match listener_command {
@@ -518,10 +704,6 @@ pub(super) async fn handle_thread_listener_command(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "running-thread resume subscription must be serialized against pending unloads"
-)]
 pub(super) async fn handle_pending_thread_resume_request(
     conversation_id: ThreadId,
     conversation: &Arc<CodexThread>,
@@ -530,7 +712,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     thread_state: &Arc<Mutex<ThreadState>>,
     thread_watch_manager: &ThreadWatchManager,
     outgoing: &Arc<OutgoingMessageSender>,
-    pending_thread_unloads: &Arc<Mutex<HashSet<ThreadId>>>,
+    pending_thread_unloads: &Arc<PendingThreadUnloads>,
     pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
     let active_turn = {
@@ -598,9 +780,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     }
 
     {
-        let pending_thread_unloads = pending_thread_unloads.lock().await;
-        if pending_thread_unloads.contains(&conversation_id) {
-            drop(pending_thread_unloads);
+        if pending_thread_unloads.contains(&conversation_id).await {
             outgoing
                 .send_error(
                     request_id,
@@ -812,4 +992,86 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
         }
     }
     thread.status = status;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resume_waiter_is_released_only_after_unload_finishes() {
+        let pending = Arc::new(PendingThreadUnloads::default());
+        let thread_id = ThreadId::new();
+        assert!(pending.begin(thread_id).await);
+
+        let waiter_pending = Arc::clone(&pending);
+        let waiter = tokio::spawn(async move {
+            waiter_pending.wait_until_finished(&thread_id).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        pending.finish(&thread_id).await;
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("resume waiter should continue after teardown")
+            .expect("resume waiter should not panic");
+    }
+
+    #[test]
+    fn inactive_thread_unload_delay_is_five_minutes() {
+        assert_eq!(THREAD_UNLOADING_DELAY, Duration::from_secs(5 * 60));
+    }
+
+    #[tokio::test]
+    async fn inactive_thread_lru_selects_only_the_oldest_above_eight() {
+        let authority = PendingThreadUnloads::default();
+        let mut receivers = Vec::new();
+        for _ in 0..=MAX_INACTIVE_THREADS {
+            let thread_id = ThreadId::new();
+            let (evict_tx, evict_rx) = mpsc::unbounded_channel();
+            authority.set_eligible(thread_id, true, &evict_tx).await;
+            receivers.push(evict_rx);
+        }
+
+        let eviction = receivers[0]
+            .try_recv()
+            .expect("oldest inactive task should be selected");
+        assert!(eviction.completion.is_none());
+        for receiver in &mut receivers[1..] {
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        assert_eq!(
+            authority.state.lock().await.eligible.len(),
+            MAX_INACTIVE_THREADS
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_eviction_waits_for_unload_completion() {
+        let authority = Arc::new(PendingThreadUnloads::default());
+        let thread_id = ThreadId::new();
+        let (evict_tx, mut evict_rx) = mpsc::unbounded_channel();
+        authority.set_eligible(thread_id, true, &evict_tx).await;
+
+        let eviction_authority = Arc::clone(&authority);
+        let eviction = tokio::spawn(async move {
+            eviction_authority.evict_one_eligible_and_wait().await;
+        });
+        let request = evict_rx
+            .recv()
+            .await
+            .expect("eligible task should receive admission-pressure eviction");
+        let completion = EvictionCompletion(request.completion);
+        assert!(!eviction.is_finished());
+
+        drop(completion);
+        tokio::time::timeout(Duration::from_secs(1), eviction)
+            .await
+            .expect("admission retry should continue after unload completion")
+            .expect("admission eviction should not panic");
+    }
 }

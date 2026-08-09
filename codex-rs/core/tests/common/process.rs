@@ -21,12 +21,25 @@ pub async fn wait_for_pid_file(path: &Path) -> anyhow::Result<String> {
     Ok(pid)
 }
 
+#[cfg(unix)]
 pub fn process_is_alive(pid: &str) -> anyhow::Result<bool> {
     let status = std::process::Command::new("kill")
         .args(["-0", pid])
         .status()
         .context("failed to probe process liveness with kill -0")?;
     Ok(status.success())
+}
+
+#[cfg(windows)]
+pub fn process_is_alive(pid: &str) -> anyhow::Result<bool> {
+    let pid = pid.parse::<u32>().context("pid file was not numeric")?;
+    let filter = format!("PID eq {pid}");
+    let output = std::process::Command::new("tasklist.exe")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+        .context("failed to probe process liveness with tasklist")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(output.status.success() && stdout.contains(&format!("\"{pid}\"")))
 }
 
 async fn wait_for_process_exit_inner(pid: String) -> anyhow::Result<()> {

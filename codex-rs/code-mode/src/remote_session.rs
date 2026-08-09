@@ -83,16 +83,26 @@ impl CodeModeSessionProvider for ProcessOwnedCodeModeSessionProvider {
 
 struct OwnedProcessHost {
     host_program: PathBuf,
-    connection: StdMutex<Option<Arc<Connection>>>,
+    state: StdMutex<OwnedProcessHostState>,
     spawn_permit: Semaphore,
     next_session_id: AtomicU64,
+}
+
+#[derive(Default)]
+struct OwnedProcessHostState {
+    connection: Option<Arc<Connection>>,
+    active_sessions: usize,
+}
+
+struct HostSessionLease {
+    process_host: Arc<OwnedProcessHost>,
 }
 
 impl OwnedProcessHost {
     fn new(host_program: PathBuf) -> Self {
         Self {
             host_program,
-            connection: StdMutex::new(None),
+            state: StdMutex::new(OwnedProcessHostState::default()),
             spawn_permit: Semaphore::new(/*permits*/ 1),
             next_session_id: AtomicU64::new(1),
         }
@@ -112,20 +122,31 @@ impl OwnedProcessHost {
             return Ok(connection);
         }
         let new_connection = Arc::new(Connection::spawn(&self.host_program).await?);
-        *self
-            .connection
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&new_connection));
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection = Some(Arc::clone(&new_connection));
         Ok(new_connection)
     }
 
     fn live_connection(&self) -> Option<Arc<Connection>> {
-        self.connection
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection
             .as_ref()
             .filter(|connection| connection.is_alive())
             .cloned()
+    }
+
+    fn acquire_session(self: &Arc<Self>) -> HostSessionLease {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_sessions += 1;
+        HostSessionLease {
+            process_host: Arc::clone(self),
+        }
     }
 
     fn allocate_session_id(&self) -> SessionId {
@@ -134,6 +155,29 @@ impl OwnedProcessHost {
             Ok(session_id) => session_id,
             Err(_) => unreachable!("a generated code-mode session ID is nonempty"),
         }
+    }
+}
+
+impl Drop for HostSessionLease {
+    fn drop(&mut self) {
+        let connection = {
+            let mut state = self
+                .process_host
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            debug_assert!(
+                state.active_sessions > 0,
+                "code-mode host session lease count underflow"
+            );
+            state.active_sessions = state.active_sessions.saturating_sub(1);
+            if state.active_sessions == 0 {
+                state.connection.take()
+            } else {
+                None
+            }
+        };
+        drop(connection);
     }
 }
 
@@ -157,6 +201,7 @@ struct SessionBinding {
 
 struct SessionInner {
     process_host: Arc<OwnedProcessHost>,
+    _host_lease: HostSessionLease,
     delegate: Arc<dyn CodeModeSessionDelegate>,
     state: StdMutex<SessionState>,
     next_generation: AtomicU64,
@@ -182,9 +227,11 @@ impl ProcessOwnedCodeModeSession {
         delegate: Arc<dyn CodeModeSessionDelegate>,
         process_host: Arc<OwnedProcessHost>,
     ) -> Self {
+        let host_lease = process_host.acquire_session();
         Self {
             inner: Arc::new(SessionInner {
                 process_host,
+                _host_lease: host_lease,
                 delegate,
                 state: StdMutex::new(SessionState::New),
                 next_generation: AtomicU64::new(1),

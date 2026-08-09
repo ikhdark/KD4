@@ -53,10 +53,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct SessionServices {
-    /// Mirror of the latest manager for extension resource clients that predate runtime snapshots.
-    pub(crate) mcp_connection_manager: Arc<ArcSwap<McpConnectionManager>>,
-    /// The latest atomically published MCP config and manager pair.
-    pub(crate) mcp_runtime: ArcSwapOption<McpRuntimeSnapshot>,
+    /// The sole atomically published MCP runtime generation.
+    pub(crate) mcp_runtime: Arc<ArcSwapOption<McpRuntimeSnapshot>>,
     /// Aggregate generation for model-visible planning state. Every invalidating
     /// publication must advance this value before a pending turn may replan.
     pub(crate) planning_generation: AtomicU64,
@@ -144,10 +142,9 @@ impl SessionServices {
         manager: McpConnectionManager,
     ) -> Arc<McpRuntimeSnapshot> {
         let manager = Arc::new(manager);
-        // Publish the manager for legacy resource clients first. Once the paired snapshot is
-        // visible, every model-scoped consumer observes this exact manager.
-        self.mcp_connection_manager.store(Arc::clone(&manager));
+        let generation = self.bump_planning_generation();
         let runtime = Arc::new(McpRuntimeSnapshot::new(
+            generation,
             config,
             plugins_available,
             manager,
@@ -155,7 +152,6 @@ impl SessionServices {
             available_environment_ids,
         ));
         self.mcp_runtime.store(Some(Arc::clone(&runtime)));
-        self.bump_planning_generation();
         runtime
     }
 

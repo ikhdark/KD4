@@ -53,8 +53,7 @@ use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
-#[cfg(target_os = "windows")]
-use codex_utils_pty::JobObject;
+use codex_utils_pty::ManagedRootProcess;
 use codex_utils_pty::process_group::kill_child_process_group;
 
 pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
@@ -939,9 +938,8 @@ async fn exec(
         ))
     })?;
     let arg0_ref = arg0.as_deref();
-    #[cfg(target_os = "windows")]
-    let windows_job = JobObject::create();
-    let child = spawn_child_async(SpawnChildRequest {
+    let managed_root = ManagedRootProcess::reserve_with_reclaim().await?;
+    let mut child = spawn_child_async(SpawnChildRequest {
         program: PathBuf::from(program),
         args: args.into(),
         arg0: arg0_ref,
@@ -953,25 +951,20 @@ async fn exec(
         network: None,
         stdio_policy: StdioPolicy::RedirectForShellTool,
         env,
+        #[cfg(windows)]
+        creation_flags: ManagedRootProcess::WINDOWS_CREATION_FLAGS,
     })
     .await?;
     #[cfg(target_os = "windows")]
-    let windows_job = match windows_job.and_then(|job| {
-        let process_handle = child
-            .raw_handle()
-            .ok_or_else(|| io::Error::other("missing child process handle"))?;
-        job.assign_process(process_handle)?;
-        Ok(job)
-    }) {
-        Ok(job) => Some(job),
-        Err(err) => {
-            tracing::warn!(
-                "Windows direct exec process tree containment unavailable; \
-                 cancellation will terminate only the root process: {err}"
-            );
-            None
-        }
-    };
+    if let Err(err) = managed_root.attach_and_resume(
+        child
+            .id()
+            .ok_or_else(|| io::Error::other("missing child process id"))?,
+    ) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(err.into());
+    }
     if let Some(after_spawn) = after_spawn {
         after_spawn();
     }
@@ -980,26 +973,23 @@ async fn exec(
         expiration,
         capture_policy,
         stdout_stream,
-        #[cfg(target_os = "windows")]
-        windows_job,
+        managed_root,
     )
     .await
 }
 
 fn kill_child_process_tree(
     child: &mut Child,
-    #[cfg(target_os = "windows")] windows_job: Option<&JobObject>,
+    #[cfg(target_os = "windows")] managed_root: &ManagedRootProcess,
 ) -> io::Result<()> {
     #[cfg(target_os = "windows")]
-    if let Some(job) = windows_job {
-        match job.terminate() {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                tracing::warn!(
-                    "Windows direct exec failed to terminate process tree; \
-                     falling back to the root process: {err}"
-                );
-            }
+    match managed_root.terminate() {
+        Ok(()) => return Ok(()),
+        Err(err) => {
+            tracing::warn!(
+                "Windows direct exec failed to terminate process tree; \
+                 falling back to the root process: {err}"
+            );
         }
     }
 
@@ -1014,7 +1004,7 @@ async fn consume_output(
     expiration: ExecExpiration,
     capture_policy: ExecCapturePolicy,
     stdout_stream: Option<StdoutStream>,
-    #[cfg(target_os = "windows")] windows_job: Option<JobObject>,
+    managed_root: ManagedRootProcess,
 ) -> Result<RawExecToolCallOutput> {
     // Both stdout and stderr were configured with `Stdio::piped()`
     // above, therefore `take()` should normally return `Some`.  If it doesn't
@@ -1057,9 +1047,7 @@ async fn consume_output(
         status_result = child.wait() => {
             let exit_status = status_result?;
             #[cfg(target_os = "windows")]
-            if let Some(job) = windows_job.as_ref()
-                && let Err(err) = job.preserve_descendants()
-            {
+            if let Err(err) = managed_root.preserve_descendants() {
                 tracing::warn!(
                     "Windows direct exec failed to preserve descendants after root exit: {err}"
                 );
@@ -1072,7 +1060,7 @@ async fn consume_output(
                     kill_child_process_tree(
                         &mut child,
                         #[cfg(target_os = "windows")]
-                        windows_job.as_ref(),
+                        &managed_root,
                     )?;
                     (
                         synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE),
@@ -1082,7 +1070,7 @@ async fn consume_output(
                 Some(ExecExpirationOutcome::Cancelled) => {
                     #[cfg(target_os = "windows")]
                     {
-                        kill_child_process_tree(&mut child, windows_job.as_ref())?;
+                        kill_child_process_tree(&mut child, &managed_root)?;
                         child.wait().await?;
                     }
                     #[cfg(not(target_os = "windows"))]
@@ -1128,7 +1116,7 @@ async fn consume_output(
             kill_child_process_tree(
                 &mut child,
                 #[cfg(target_os = "windows")]
-                windows_job.as_ref(),
+                &managed_root,
             )?;
             (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
         }

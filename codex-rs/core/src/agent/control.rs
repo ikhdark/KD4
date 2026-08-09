@@ -475,14 +475,23 @@ impl AgentControl {
             {
                 continue;
             }
-            if !self
+            match self
                 .task_coordinator()
                 .heartbeat_typed_actor_binding(&binding)
-                .await?
+                .await
             {
-                return Err(codex_agent_task_store::StoreError::AttemptNotActive(
-                    binding.attempt_id,
-                ));
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    %thread_id,
+                    attempt_id = %binding.attempt_id,
+                    "live typed actor heartbeat was rejected during reconciliation"
+                ),
+                Err(error) => warn!(
+                    %thread_id,
+                    attempt_id = %binding.attempt_id,
+                    %error,
+                    "live typed actor heartbeat failed during reconciliation"
+                ),
             }
         }
         Ok(())

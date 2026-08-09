@@ -3,7 +3,6 @@ use std::sync::Weak;
 
 use anyhow::Context;
 use anyhow::Result;
-use arc_swap::ArcSwap;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceContent;
 use rmcp::model::PaginatedRequestParams;
@@ -27,22 +26,30 @@ pub struct McpResourceReadResult {
     pub contents: Vec<ResourceContent>,
 }
 
-/// Session-scoped access to MCP resources through the currently installed manager.
-///
-/// The client retains the manager's shared publication handle rather than a manager
-/// snapshot, so calls automatically use replacements installed during startup and refresh.
+struct McpResourceLease {
+    _generation: Arc<dyn Send + Sync>,
+    manager: Arc<McpConnectionManager>,
+}
+
+type McpResourceLeaseProvider = dyn Fn() -> Option<McpResourceLease> + Send + Sync;
+
+/// Session-scoped access to MCP resources through the currently installed runtime generation.
 #[derive(Clone)]
 pub struct McpResourceClient {
-    manager: Arc<ArcSwap<McpConnectionManager>>,
+    lease: Arc<McpResourceLeaseProvider>,
 }
 
 /// Opaque identity for the manager currently used by an MCP resource client.
 #[derive(Clone)]
-pub struct McpResourceClientCacheKey(Weak<McpConnectionManager>);
+pub struct McpResourceClientCacheKey(Option<Weak<McpConnectionManager>>);
 
 impl PartialEq for McpResourceClientCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        self.0.ptr_eq(&other.0)
+        match (&self.0, &other.0) {
+            (Some(left), Some(right)) => left.ptr_eq(right),
+            (None, None) => true,
+            _ => false,
+        }
     }
 }
 
@@ -57,21 +64,32 @@ impl std::fmt::Debug for McpResourceClient {
 }
 
 impl McpResourceClient {
-    /// Creates a resource client backed by the session's replaceable MCP manager.
-    pub fn new(manager: Arc<ArcSwap<McpConnectionManager>>) -> Self {
-        Self { manager }
+    /// Creates a resource client backed by leases on the session's MCP runtime generation.
+    pub fn new<L, F>(lease: F) -> Self
+    where
+        L: Send + Sync + 'static,
+        F: Fn() -> Option<(Arc<L>, Arc<McpConnectionManager>)> + Send + Sync + 'static,
+    {
+        Self {
+            lease: Arc::new(move || {
+                lease().map(|(generation, manager)| McpResourceLease {
+                    _generation: generation,
+                    manager,
+                })
+            }),
+        }
     }
 
     /// Returns an identity that changes whenever the published manager changes.
     pub fn cache_key(&self) -> McpResourceClientCacheKey {
-        McpResourceClientCacheKey(Arc::downgrade(&self.manager.load_full()))
+        McpResourceClientCacheKey((self.lease)().map(|lease| Arc::downgrade(&lease.manager)))
     }
 
     /// Returns whether the current manager contains the named server.
     ///
     /// This does not wait for server startup or imply that startup succeeded.
     pub async fn has_server(&self, server: &str) -> bool {
-        self.manager.load_full().contains_server(server)
+        (self.lease)().is_some_and(|lease| lease.manager.contains_server(server))
     }
 
     /// Lists one resource page from the named server.
@@ -82,11 +100,8 @@ impl McpResourceClient {
     ) -> Result<McpResourcePage> {
         let params =
             cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-        let result = self
-            .manager
-            .load_full()
-            .list_resources(server, params)
-            .await?;
+        let lease = (self.lease)().context("MCP runtime is not installed")?;
+        let result = lease.manager.list_resources(server, params).await?;
         let resources = result
             .resources
             .into_iter()
@@ -100,9 +115,9 @@ impl McpResourceClient {
 
     /// Reads one resource from the named server.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
-        let result = self
+        let lease = (self.lease)().context("MCP runtime is not installed")?;
+        let result = lease
             .manager
-            .load_full()
             .read_resource(server, ReadResourceRequestParams::new(uri.to_string()))
             .await?;
         let contents = result
@@ -111,6 +126,26 @@ impl McpResourceClient {
             .map(resource_content_from_rmcp)
             .collect::<Result<Vec<_>>>()?;
         Ok(McpResourceReadResult { contents })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unavailable_runtime_is_reported_without_panicking() {
+        let client = McpResourceClient::new(|| None::<(Arc<()>, Arc<McpConnectionManager>)>);
+
+        assert!(client.cache_key() == client.cache_key());
+        assert!(!client.has_server("not-installed").await);
+        assert!(client.list_resources("not-installed", None).await.is_err());
+        assert!(
+            client
+                .read_resource("not-installed", "test://resource")
+                .await
+                .is_err()
+        );
     }
 }
 

@@ -46,6 +46,8 @@ pub(crate) struct SpawnChildRequest<'a> {
     pub network: Option<&'a NetworkProxy>,
     pub stdio_policy: StdioPolicy,
     pub env: HashMap<String, String>,
+    #[cfg(windows)]
+    pub creation_flags: u32,
 }
 
 pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io::Result<Child> {
@@ -58,6 +60,8 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         network,
         stdio_policy,
         mut env,
+        #[cfg(windows)]
+        creation_flags,
     } = request;
 
     if let Some(network) = network {
@@ -82,6 +86,10 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     cmd.current_dir(cwd);
     cmd.env_clear();
     cmd.envs(env);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(creation_flags);
+    }
 
     // If this Codex process dies (including being killed via SIGKILL), we want
     // any child processes that were spawned as part of a `"shell"` tool call

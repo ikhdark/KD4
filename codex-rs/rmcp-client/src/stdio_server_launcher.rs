@@ -19,14 +19,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-#[cfg(unix)]
-use std::thread::sleep;
-#[cfg(unix)]
-use std::thread::spawn;
-#[cfg(unix)]
-use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -38,10 +33,9 @@ use codex_exec_server::ExecProcess;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
+use codex_utils_pty::ManagedRootProcess;
 #[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
-#[cfg(unix)]
-use codex_utils_pty::process_group::terminate_process_group;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use rmcp::service::RoleClient;
@@ -191,27 +185,17 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
         command: StdioServerCommand,
     ) -> BoxFuture<'static, io::Result<StdioServerTransport>> {
         let fallback_cwd = self.fallback_cwd.clone();
-        async move { Self::launch_server(command, fallback_cwd) }.boxed()
+        async move { Self::launch_server(command, fallback_cwd).await }.boxed()
     }
 }
 
 // Local private implementation.
 
-#[cfg(unix)]
-const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
-
-#[cfg(unix)]
 struct LocalProcessTerminator {
+    managed: Mutex<Option<Arc<ManagedRootProcess>>>,
+    #[cfg(unix)]
     process_group_id: u32,
 }
-
-#[cfg(windows)]
-struct LocalProcessTerminator {
-    pid: u32,
-}
-
-#[cfg(not(any(unix, windows)))]
-struct LocalProcessTerminator;
 
 #[derive(Clone)]
 pub(crate) struct StdioServerProcessHandle {
@@ -236,7 +220,7 @@ mod private {
 impl private::Sealed for LocalStdioServerLauncher {}
 
 impl LocalStdioServerLauncher {
-    fn launch_server(
+    async fn launch_server(
         command: StdioServerCommand,
         fallback_cwd: PathBuf,
     ) -> io::Result<StdioServerTransport> {
@@ -264,13 +248,21 @@ impl LocalStdioServerLauncher {
             .args(args);
         #[cfg(unix)]
         command.process_group(0);
+        let managed = Arc::new(ManagedRootProcess::reserve_with_reclaim().await?);
+        #[cfg(windows)]
+        command.creation_flags(ManagedRootProcess::WINDOWS_CREATION_FLAGS);
 
         let (transport, stderr) = TokioChildProcess::builder(command)
             .stderr(Stdio::piped())
             .spawn()?;
+        let process_id = transport
+            .id()
+            .ok_or_else(|| io::Error::other("spawned MCP server has no process id"))?;
+        #[cfg(windows)]
+        managed.attach_and_resume(process_id)?;
         let process = StdioServerProcessHandle::local(
             program_name.clone(),
-            transport.id().map(LocalProcessTerminator::new),
+            Some(LocalProcessTerminator::new(process_id, managed)),
         );
 
         if let Some(stderr) = stderr {
@@ -299,59 +291,68 @@ impl LocalStdioServerLauncher {
 }
 
 impl LocalProcessTerminator {
-    fn new(process_group_id: u32) -> Self {
+    fn new(process_group_id: u32, managed: Arc<ManagedRootProcess>) -> Self {
         #[cfg(unix)]
         {
-            Self { process_group_id }
+            Self {
+                managed: Mutex::new(Some(managed)),
+                process_group_id,
+            }
         }
         #[cfg(windows)]
         {
+            let _ = process_group_id;
             Self {
-                pid: process_group_id,
+                managed: Mutex::new(Some(managed)),
             }
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = process_group_id;
-            Self
+            Self {
+                managed: Mutex::new(Some(managed)),
+            }
         }
     }
 
     #[cfg(unix)]
     fn terminate(&self) {
-        let process_group_id = self.process_group_id;
-        let should_escalate = match terminate_process_group(process_group_id) {
-            Ok(exists) => exists,
-            Err(error) => {
-                warn!("Failed to terminate MCP process group {process_group_id}: {error}");
-                false
-            }
+        let Some(_managed) = self.take_managed() else {
+            return;
         };
-        if should_escalate {
-            spawn(move || {
-                sleep(PROCESS_GROUP_TERM_GRACE_PERIOD);
-                if let Err(error) = kill_process_group(process_group_id) {
-                    warn!("Failed to kill MCP process group {process_group_id}: {error}");
-                }
-            });
+        if let Err(error) = kill_process_group(self.process_group_id) {
+            warn!(
+                "Failed to kill MCP process group {}: {error}",
+                self.process_group_id
+            );
         }
     }
 
     #[cfg(windows)]
     fn terminate(&self) {
-        let _ = std::process::Command::new("taskkill")
-            .arg("/PID")
-            .arg(self.pid.to_string())
-            .arg("/T")
-            .arg("/F")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let Some(managed) = self.take_managed() else {
+            return;
+        };
+        if let Err(error) = managed.terminate() {
+            warn!(
+                "Failed to terminate Windows MCP process tree lifecycle_id={}: {error}",
+                managed.id()
+            );
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
-    fn terminate(&self) {}
+    fn terminate(&self) {
+        let _ = self.take_managed();
+    }
+
+    fn reaped(&self) {
+        let _ = self.take_managed();
+    }
+
+    fn take_managed(&self) -> Option<Arc<ManagedRootProcess>> {
+        self.managed.lock().ok()?.take()
+    }
 }
 
 impl StdioServerProcessHandle {
@@ -393,6 +394,13 @@ impl StdioServerProcessHandle {
                     Err(io::Error::other(error))
                 }
             },
+        }
+    }
+
+    pub(crate) fn reaped(&self) {
+        self.inner.terminated.store(true, Ordering::Release);
+        if let StdioServerProcessKind::Local(Some(terminator)) = &self.inner.kind {
+            terminator.reaped();
         }
     }
 }

@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -172,6 +173,48 @@ pub struct McpConnectionManager {
     prefix_mcp_tool_names: bool,
     elicitation_requests: ElicitationRequestManager,
     startup_cancellation_token: CancellationToken,
+}
+
+async fn shutdown_clients_with_deadline<T, G, GFut, F, FFut>(
+    clients: Vec<T>,
+    grace_period: Duration,
+    graceful_shutdown: G,
+    force_shutdown: F,
+) where
+    T: Clone + Send + 'static,
+    G: Fn(T) -> GFut,
+    GFut: Future<Output = ()> + Send + 'static,
+    F: Fn(T) -> FFut,
+    FFut: Future<Output = ()> + Send + 'static,
+{
+    let mut shutdowns = JoinSet::new();
+    for client in &clients {
+        shutdowns.spawn(graceful_shutdown(client.clone()));
+    }
+
+    let graceful = tokio::time::timeout(grace_period, async {
+        while let Some(result) = shutdowns.join_next().await {
+            if let Err(error) = result {
+                warn!("MCP client graceful shutdown failed: {error}");
+            }
+        }
+    })
+    .await;
+
+    if graceful.is_err() {
+        shutdowns.abort_all();
+        while shutdowns.join_next().await.is_some() {}
+
+        let mut forced = JoinSet::new();
+        for client in clients {
+            forced.spawn(force_shutdown(client));
+        }
+        while let Some(result) = forced.join_next().await {
+            if let Err(error) = result {
+                warn!("MCP client forced shutdown failed: {error}");
+            }
+        }
+    }
 }
 
 impl McpConnectionManager {
@@ -448,15 +491,19 @@ impl McpConnectionManager {
         self.clients.contains_key(server_name)
     }
 
-    /// Stop all MCP clients owned by this manager and terminate stdio server processes.
+    /// Stop all MCP clients with one manager-wide grace period before forcing process trees.
     pub async fn shutdown(&self) {
         self.startup_cancellation_token.cancel();
         let clients = self.clients.values().cloned().collect::<Vec<_>>();
         // Keep cleanup alive if an interrupt cancels the refresh that requested it.
         let shutdown_task = tokio::spawn(async move {
-            for client in clients {
-                client.shutdown().await;
-            }
+            shutdown_clients_with_deadline(
+                clients,
+                Duration::from_secs(2),
+                |client| async move { client.shutdown().await },
+                |client| async move { client.force_shutdown().await },
+            )
+            .await;
         });
         if let Err(error) = shutdown_task.await {
             warn!("MCP client shutdown task failed: {error}");

@@ -1766,3 +1766,41 @@ fn mcp_init_error_display_includes_startup_timeout_hint() {
         display
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_clients_share_one_deadline_before_forcing() {
+    let graceful_started = Arc::new(AtomicUsize::new(0));
+    let forced = Arc::new(AtomicUsize::new(0));
+    let graceful_started_for_shutdown = Arc::clone(&graceful_started);
+    let forced_for_shutdown = Arc::clone(&forced);
+
+    let shutdown = tokio::spawn(shutdown_clients_with_deadline(
+        vec![0, 1, 2],
+        Duration::from_secs(2),
+        move |_| {
+            let graceful_started = Arc::clone(&graceful_started_for_shutdown);
+            async move {
+                graceful_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+        },
+        move |_| {
+            let forced = Arc::clone(&forced_for_shutdown);
+            async move {
+                forced.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        },
+    ));
+
+    tokio::task::yield_now().await;
+    assert_eq!(
+        graceful_started.load(std::sync::atomic::Ordering::SeqCst),
+        3
+    );
+    assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    shutdown.await.expect("shutdown task should finish");
+
+    assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), 3);
+}

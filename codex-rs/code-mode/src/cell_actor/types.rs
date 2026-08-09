@@ -59,7 +59,7 @@ pub(crate) trait CellHost: Send + Sync + 'static {
         cell_state: Arc<CellState>,
     ) -> impl Future<Output = CompletionCommit> + Send;
 
-    fn closed(&self) -> impl Future<Output = ()> + Send;
+    fn closed(&self, event: Option<CellEvent>) -> impl Future<Output = ()> + Send;
 }
 
 #[derive(Clone)]
@@ -107,6 +107,7 @@ impl CellHandle {
 /// while it is held.
 pub(crate) struct CellState {
     phase: Mutex<CellPhase>,
+    terminal_event: Mutex<Option<CellEvent>>,
     cancellation_token: CancellationToken,
 }
 
@@ -148,6 +149,7 @@ impl CellState {
     pub(crate) fn new(cancellation_token: CancellationToken) -> Self {
         Self {
             phase: Mutex::new(CellPhase::Running),
+            terminal_event: Mutex::new(None),
             cancellation_token,
         }
     }
@@ -243,8 +245,10 @@ impl CellState {
             };
             return CompletionDelivery::Buffered;
         };
+        let terminal_event = event.clone();
         match response_tx.send(Ok(event)) {
             Ok(()) => {
+                self.record_terminal_event(&terminal_event);
                 self.cancellation_token.cancel();
                 CompletionDelivery::Delivered
             }
@@ -308,8 +312,10 @@ impl CellState {
             } => {
                 let delivered_event =
                     prepend_initial_yield(event.clone(), pending_initial_yield_items.clone());
+                let terminal_event = delivered_event.clone();
                 match response_tx.send(Ok(delivered_event)) {
                     Ok(()) => {
+                        self.record_terminal_event(&terminal_event);
                         self.cancellation_token.cancel();
                         ObservationDelivery::Delivered
                     }
@@ -364,8 +370,28 @@ impl CellState {
             CellPhase::CompletionClaimed(completed_event) => Some(completed_event),
             CellPhase::Tombstone => None,
         };
+        if let Some(event) = observer_event.as_ref() {
+            self.record_terminal_event(event);
+        }
         self.cancellation_token.cancel();
         observer_event
+    }
+
+    pub(crate) fn terminal_event(&self) -> Option<CellEvent> {
+        self.terminal_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record_terminal_event(&self, event: &CellEvent) {
+        let mut terminal_event = self
+            .terminal_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if terminal_event.is_none() {
+            *terminal_event = Some(event.clone());
+        }
     }
 
     pub(crate) fn tombstone(&self) {

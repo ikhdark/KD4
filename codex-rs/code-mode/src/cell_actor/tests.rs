@@ -51,7 +51,7 @@ impl CellHost for TestHost {
         cell_state.commit_completion(event, pending_initial_yield_items, || {})
     }
 
-    async fn closed(&self) {}
+    async fn closed(&self, _event: Option<CellEvent>) {}
 }
 
 impl CellHost for RecordingHost {
@@ -83,7 +83,7 @@ impl CellHost for RecordingHost {
         cell_state.commit_completion(event, pending_initial_yield_items, || {})
     }
 
-    async fn closed(&self) {}
+    async fn closed(&self, _event: Option<CellEvent>) {}
 }
 
 struct CellActorHarness {

@@ -1,14 +1,18 @@
 mod types;
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -35,6 +39,28 @@ use crate::cell_actor::CellToolCall;
 use crate::cell_actor::CompletionCommit;
 
 type RuntimeEventFuture = Pin<Box<dyn Future<Output = Result<CellEvent, Error>> + Send + 'static>>;
+const TERMINAL_CELL_CACHE_CAPACITY: usize = 256;
+const MAX_ACTIVE_CELLS: usize = 8;
+
+#[derive(Default)]
+struct TerminalCellCache {
+    events: HashMap<CellId, CellEvent>,
+    order: VecDeque<CellId>,
+}
+
+impl TerminalCellCache {
+    fn insert(&mut self, cell_id: CellId, event: CellEvent) {
+        if self.events.insert(cell_id.clone(), event).is_some() {
+            return;
+        }
+        self.order.push_back(cell_id);
+        while self.order.len() > TERMINAL_CELL_CACHE_CAPACITY {
+            if let Some(expired) = self.order.pop_front() {
+                self.events.remove(&expired);
+            }
+        }
+    }
+}
 
 /// Owns all cells and shared state for one transport-neutral code-mode session.
 pub(crate) struct SessionRuntime<D: SessionRuntimeDelegate> {
@@ -44,6 +70,8 @@ pub(crate) struct SessionRuntime<D: SessionRuntimeDelegate> {
 struct Inner<D: SessionRuntimeDelegate> {
     stored_values: Mutex<HashMap<String, JsonValue>>,
     cells: Mutex<HashMap<CellId, CellHandle>>,
+    terminal_cells: StdMutex<TerminalCellCache>,
+    active_cell_permits: Arc<Semaphore>,
     cell_tasks: TaskTracker,
     shutdown_token: CancellationToken,
     delegate: Arc<D>,
@@ -64,6 +92,8 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             inner: Arc::new(Inner {
                 stored_values: Mutex::new(HashMap::new()),
                 cells: Mutex::new(HashMap::new()),
+                terminal_cells: StdMutex::new(TerminalCellCache::default()),
+                active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
                 cell_tasks: TaskTracker::new(),
                 shutdown_token: CancellationToken::new(),
                 delegate,
@@ -104,28 +134,39 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         cell_id: &CellId,
         mode: ObserveMode,
     ) -> Result<PendingEvent, Error> {
-        let handle = self
-            .inner
-            .cells
-            .lock()
-            .await
-            .get(cell_id)
-            .cloned()
-            .ok_or_else(|| Error::MissingCell(cell_id.clone()))?;
+        let handle = self.inner.cells.lock().await.get(cell_id).cloned();
+        let Some(handle) = handle else {
+            let event = self
+                .inner
+                .terminal_cells
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .events
+                .get(cell_id)
+                .cloned()
+                .ok_or_else(|| Error::MissingCell(cell_id.clone()))?;
+            return Ok(PendingEvent {
+                event: Box::pin(async move { Ok(event) }),
+            });
+        };
         Ok(PendingEvent {
             event: map_actor_event(cell_id.clone(), handle.observe(mode)),
         })
     }
 
     pub(crate) async fn terminate(&self, cell_id: &CellId) -> Result<CellEvent, Error> {
-        let handle = self
-            .inner
-            .cells
-            .lock()
-            .await
-            .get(cell_id)
-            .cloned()
-            .ok_or_else(|| Error::MissingCell(cell_id.clone()))?;
+        let handle = self.inner.cells.lock().await.get(cell_id).cloned();
+        let Some(handle) = handle else {
+            return self
+                .inner
+                .terminal_cells
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .events
+                .get(cell_id)
+                .cloned()
+                .ok_or_else(|| Error::MissingCell(cell_id.clone()));
+        };
         handle
             .terminate()
             .await
@@ -159,10 +200,17 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         request: CreateCellRequest,
         initial_observe_mode: ObserveMode,
     ) -> Result<RuntimeEventFuture, Error> {
+        let cell_permit = tokio::select! {
+            _ = self.inner.shutdown_token.cancelled() => return Err(Error::ShuttingDown),
+            permit = Arc::clone(&self.inner.active_cell_permits).acquire_owned() => {
+                permit.map_err(|_| Error::ShuttingDown)?
+            }
+        };
         let stored_values = self.inner.stored_values.lock().await.clone();
         let host = Arc::new(RuntimeCellHost {
             cell_id: cell_id.clone(),
             inner: Arc::clone(&self.inner),
+            cell_permit: Mutex::new(Some(cell_permit)),
         });
         let mut cells = self.inner.cells.lock().await;
         if self.inner.shutdown_token.is_cancelled() {
@@ -235,6 +283,7 @@ impl PendingEvent {
 struct RuntimeCellHost<D: SessionRuntimeDelegate> {
     cell_id: CellId,
     inner: Arc<Inner<D>>,
+    cell_permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
@@ -290,8 +339,22 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         })
     }
 
-    async fn closed(&self) {
-        self.inner.cells.lock().await.remove(&self.cell_id);
+    async fn closed(&self, event: Option<CellEvent>) {
+        {
+            let mut cells = self.inner.cells.lock().await;
+            let removed = cells.remove(&self.cell_id);
+            if removed.is_none() {
+                return;
+            }
+            if let Some(event) = event {
+                self.inner
+                    .terminal_cells
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(self.cell_id.clone(), event);
+            }
+        }
+        self.cell_permit.lock().await.take();
         self.inner.delegate.cell_closed(&self.cell_id);
     }
 }

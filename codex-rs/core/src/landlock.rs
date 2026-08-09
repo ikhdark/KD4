@@ -65,6 +65,8 @@ where
         network,
         stdio_policy,
         env,
+        #[cfg(windows)]
+        creation_flags: 0,
     })
     .await
 }

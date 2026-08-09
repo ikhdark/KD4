@@ -32,6 +32,7 @@ use crate::request_processors::GitRequestProcessor;
 use crate::request_processors::InitializeRequestProcessor;
 use crate::request_processors::MarketplaceRequestProcessor;
 use crate::request_processors::McpRequestProcessor;
+use crate::request_processors::PendingThreadUnloads;
 use crate::request_processors::PluginRequestProcessor;
 use crate::request_processors::ProcessExecRequestProcessor;
 use crate::request_processors::RemoteControlRequestProcessor;
@@ -75,7 +76,6 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
-use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
@@ -125,6 +125,7 @@ pub(crate) struct MessageProcessor {
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
+    _managed_root_admission_reclaimer: codex_utils_pty::ManagedRootAdmissionReclaimerGuard,
 }
 
 #[derive(Debug)]
@@ -306,7 +307,24 @@ impl MessageProcessor {
             .set_analytics_events_client(analytics_events_client.clone());
         let skills_watcher = SkillsWatcher::new(thread_manager.skills_service(), outgoing.clone());
 
-        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let pending_thread_unloads = Arc::new(PendingThreadUnloads::default());
+        let eviction_authority = Arc::clone(&pending_thread_unloads);
+        let managed_root_admission_reclaimer =
+            codex_utils_pty::install_managed_root_admission_reclaimer(
+                Arc::new(|| -> codex_utils_pty::ManagedRootReclaimFuture {
+                    Box::pin(async {
+                        // Retired zero-lease snapshots drop their manager directly; allow
+                        // their already-scheduled shutdown work to make progress first.
+                        tokio::task::yield_now().await;
+                    })
+                }),
+                Arc::new(move || -> codex_utils_pty::ManagedRootReclaimFuture {
+                    let eviction_authority = Arc::clone(&eviction_authority);
+                    Box::pin(async move {
+                        eviction_authority.evict_one_eligible_and_wait().await;
+                    })
+                }),
+            );
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
@@ -493,6 +511,7 @@ impl MessageProcessor {
             turn_processor,
             windows_sandbox_processor,
             request_serialization_queues: RequestSerializationQueues::default(),
+            _managed_root_admission_reclaimer: managed_root_admission_reclaimer,
         }
     }
 

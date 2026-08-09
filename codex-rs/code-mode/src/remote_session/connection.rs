@@ -21,6 +21,7 @@ use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_utils_pty::ManagedRootProcess;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
@@ -61,6 +62,7 @@ struct CallerCancellation {
 
 struct ConnectionSupervisor {
     child: Child,
+    managed: Arc<ManagedRootProcess>,
     event_tx: mpsc::Sender<DriverEvent>,
     cancellation: CancellationToken,
     alive: Arc<AtomicBool>,
@@ -100,6 +102,13 @@ impl Connection {
         let mut command = Command::new(host_program);
         #[cfg(unix)]
         command.process_group(0);
+        let managed = Arc::new(
+            ManagedRootProcess::reserve_with_reclaim()
+                .await
+                .map_err(|err| format!("failed to reserve code-mode host process: {err}"))?,
+        );
+        #[cfg(windows)]
+        command.creation_flags(ManagedRootProcess::WINDOWS_CREATION_FLAGS);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -112,6 +121,19 @@ impl Connection {
                     host_program.display()
                 )
             })?;
+        let process_id = child
+            .id()
+            .ok_or_else(|| "spawned code-mode host has no process id".to_string())?;
+        #[cfg(windows)]
+        if let Err(err) = managed.attach_and_resume(process_id) {
+            kill_and_reap(&mut child, &managed).await;
+            return Err(format!(
+                "failed to contain code-mode host {}: {err}",
+                host_program.display()
+            ));
+        }
+        #[cfg(not(windows))]
+        let _ = process_id;
 
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
@@ -173,12 +195,12 @@ impl Connection {
         let handshake_result = match tokio::time::timeout(HOST_HANDSHAKE_TIMEOUT, handshake).await {
             Ok(result) => result,
             Err(_) => {
-                kill_and_reap(&mut child).await;
+                kill_and_reap(&mut child, &managed).await;
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
         };
         if let Err(err) = handshake_result {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(&mut child, &managed).await;
             return Err(err);
         }
 
@@ -228,6 +250,7 @@ impl Connection {
         tokio::spawn(
             ConnectionSupervisor {
                 child,
+                managed,
                 event_tx,
                 cancellation: cancellation.clone(),
                 alive: Arc::clone(&alive),
@@ -414,7 +437,7 @@ impl ConnectionSupervisor {
         let _ = self.event_tx.try_send(DriverEvent::Failed(reason));
         self.cancellation.cancel();
         if !child_exited {
-            kill_and_reap(&mut self.child).await;
+            kill_and_reap(&mut self.child, &self.managed).await;
         }
     }
 }
@@ -452,7 +475,11 @@ fn failure_message(failure: &std::sync::Mutex<Option<String>>) -> String {
         .unwrap_or_else(|| "code-mode host connection closed".to_string())
 }
 
-async fn kill_and_reap(child: &mut Child) {
+async fn kill_and_reap(child: &mut Child, managed: &ManagedRootProcess) {
+    #[cfg(windows)]
+    let _ = managed.terminate();
+    #[cfg(not(windows))]
+    let _ = managed;
     let _ = child.start_kill();
     let _ = child.wait().await;
 }

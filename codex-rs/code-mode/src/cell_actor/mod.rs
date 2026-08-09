@@ -510,7 +510,7 @@ async fn run_cell<H: CellHost>(
         task_failure_handler.as_ref(),
     )
     .await;
-    host.closed().await;
+    host.closed(cell_state.terminal_event()).await;
 }
 
 fn send_observer_event(observer: Option<Observer>, event: CellEvent) -> Result<(), CellEvent> {
