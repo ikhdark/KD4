@@ -1850,6 +1850,10 @@ pub struct ShellCommandToolCallParams {
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub justification: Option<String>,
+    /// Execute normally rather than reusing prior immutable evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub force_fresh: Option<bool>,
 }
 
 /// Responses API compatible content items that can be returned by a tool call.

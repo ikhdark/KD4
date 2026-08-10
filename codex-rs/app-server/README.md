@@ -177,7 +177,7 @@ Example with notification opt-out:
 - `thread/realtime/appendText` — append text input to the active realtime session with a required `role` of `user`, `developer`, or `assistant` (experimental); returns `{}`. Older clients that omit `role` default to `user`.
 - `thread/realtime/appendSpeech` — append text that the realtime model should speak to the user (experimental); returns `{}`.
 - `thread/realtime/stop` — stop the active realtime session for the thread (experimental); returns `{}`.
-- `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start` and emits `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review.
+- `bug/create` — durably save an exact bug or audit report for an initialized thread without creating or waiting for a turn; responds with its numeric and formatted IDs plus the initial `pending` status.
 - `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
 - `command/exec/write` — write base64-decoded stdin bytes to a running `command/exec` session or close stdin; returns `{}`.
 - `command/exec/resize` — resize a running PTY-backed `command/exec` session by `processId`; returns `{}`.
@@ -991,74 +991,32 @@ not emit `turn/started` and does not accept thread settings overrides.
 active turn, or the active turn kind does not accept same-turn steering (for example review or
 manual compaction), the request fails with an `invalid request` error.
 
-### Example: Request a code review
+### Example: Capture a bug or audit report
 
-Use `review/start` to run Codex’s reviewer on the currently checked-out project. The request takes the thread id plus a `target` describing what should be reviewed:
-
-- `{"type":"uncommittedChanges"}` — staged, unstaged, and untracked files.
-- `{"type":"baseBranch","branch":"main"}` — diff against the provided branch’s upstream (see prompt for the exact `git merge-base`/`git diff` instructions Codex will run).
-- `{"type":"commit","sha":"abc1234","title":"Optional subject"}` — review a specific commit.
-- `{"type":"custom","instructions":"Free-form reviewer instructions"}` — fallback prompt equivalent to the legacy manual review request.
-- `delivery` (`"inline"` or `"detached"`, default `"inline"`) — where the review runs:
-  - `"inline"`: run the review as a new turn on the existing thread. The response’s `reviewThreadId` equals the original `threadId`, and no new `thread/started` notification is emitted.
-  - `"detached"`: fork a new review thread from the parent conversation and run the review there. The response’s `reviewThreadId` is the id of this new review thread, and the server emits a `thread/started` notification for it before streaming review items.
-
-Example request/response:
+Use `bug/create` with only the initialized thread ID and the exact decoded report text:
 
 ```json
-{ "method": "review/start", "id": 40, "params": {
-    "threadId": "thr_123",
-    "delivery": "inline",
-    "target": { "type": "commit", "sha": "1234567deadbeef", "title": "Polish tui colors" }
+{ "method": "bug/create", "id": 31, "params": {
+    "threadId": "67e23d7c-...",
+    "rawText": "First line\r\nSecond line"
 } }
-{ "id": 40, "result": {
-    "turn": {
-        "id": "turn_900",
-        "status": "inProgress",
-        "items": [
-            { "type": "userMessage", "id": "turn_900", "content": [ { "type": "text", "text": "Review commit 1234567: Polish tui colors" } ] }
-        ],
-        "error": null
-    },
-    "reviewThreadId": "thr_123"
+{ "id": 31, "result": {
+    "id": 123,
+    "displayId": "B000123",
+    "durableSaveResult": true,
+    "status": "pending"
 } }
 ```
 
-For a detached review, use `"delivery": "detached"`. The response is the same shape, but `reviewThreadId` will be the id of the new review thread (different from the original `threadId`). The server also emits a `thread/started` notification for that new thread before streaming the review turn.
+The save bypasses the active-turn queue and does not create a turn, message, review item, rollout
+item, or other thread item. The server rejects empty or whitespace-only text but otherwise stores
+`rawText` exactly as received at the app-server boundary. Reports are stored in `bugs_1.sqlite`
+under the app-server host's resolved SQLite home, so remote clients store reports on the remote
+host.
 
-Codex streams the usual `turn/started` notification followed by an `item/started`
-with an `enteredReviewMode` item so clients can show progress:
-
-```json
-{
-  "method": "item/started",
-  "params": {
-    "item": {
-      "type": "enteredReviewMode",
-      "id": "turn_900",
-      "review": "current changes"
-    }
-  }
-}
-```
-
-When the reviewer finishes, the server emits `item/started` and `item/completed`
-containing an `exitedReviewMode` item with the final review text:
-
-```json
-{
-  "method": "item/completed",
-  "params": {
-    "item": {
-      "type": "exitedReviewMode",
-      "id": "turn_900",
-      "review": "Looks solid overall...\n\n- Prefer Stylize helpers — app.rs:10-20\n  ..."
-    }
-  }
-}
-```
-
-The `review` string is plain text that already bundles the overall explanation plus a bullet list for each structured finding (matching `ThreadItem::ExitedReviewMode` in the generated schema). Use this notification to render the reviewer output in your client.
+After the durable response, a shutdown-cancellable worker sends the exact report to the configured
+provider in a separate isolated classification request. Classification failure never invalidates
+the saved report.
 
 ### Example: One-off command execution
 

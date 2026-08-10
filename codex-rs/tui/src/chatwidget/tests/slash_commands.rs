@@ -197,7 +197,7 @@ async fn queued_slash_compact_dispatches_after_active_turn() {
 }
 
 #[tokio::test]
-async fn queued_slash_review_with_args_dispatches_after_active_turn() {
+async fn queued_slash_review_with_args_does_not_submit_a_review_turn() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
     handle_turn_started(&mut chat, "turn-1");
@@ -206,15 +206,7 @@ async fn queued_slash_review_with_args_dispatches_after_active_turn() {
 
     complete_turn_with_message(&mut chat, "turn-1", Some("done"));
 
-    match op_rx.try_recv() {
-        Ok(Op::Review { target }) => assert_eq!(
-            target,
-            ReviewTarget::Custom {
-                instructions: "check regressions".to_string(),
-            }
-        ),
-        other => panic!("expected queued /review to submit review op, got {other:?}"),
-    }
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[tokio::test]

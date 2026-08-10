@@ -13,6 +13,7 @@ const COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE: usize = 100;
 const ERROR_MAX_TOKENS: usize =
     COMPLETION_MESSAGE_MAX_TOKENS - COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE;
 const ERROR_NEXT_ACTION: &str = "This agent's turn failed. If you still need this agent, use the available collaboration tools to give it another task.";
+const TYPED_COMPLETION_NEXT_ACTION: &str = "The full sealed receipt remains available through get_agent_task; retrieve it with the assignment id returned by spawn_agent.";
 
 // Helpers for model-visible session state markers that are stored in user-role
 // messages but are not user intent.
@@ -56,7 +57,11 @@ pub(crate) fn format_inter_agent_completion_message(
     status: &AgentStatus,
 ) -> Option<String> {
     let payload = match status {
-        AgentStatus::Completed(Some(message)) => message.clone(),
+        AgentStatus::Completed(Some(message)) => {
+            return Some(format_bounded_inter_agent_completion_message(
+                task_name, sender, message,
+            ));
+        }
         AgentStatus::Completed(None) => String::new(),
         AgentStatus::Errored(error) => {
             let error = truncate_text(error, TruncationPolicy::Tokens(ERROR_MAX_TOKENS));
@@ -67,6 +72,38 @@ pub(crate) fn format_inter_agent_completion_message(
         AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted => return None,
     };
     Some(InterAgentCompletionMessage::new(task_name, sender, payload).render())
+}
+
+fn format_bounded_inter_agent_completion_message(
+    task_name: AgentPath,
+    sender: AgentPath,
+    payload: &str,
+) -> String {
+    let unabridged =
+        InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload.to_string())
+            .render();
+    if approx_token_count(&unabridged) < COMPLETION_MESSAGE_MAX_TOKENS {
+        return unabridged;
+    }
+
+    let mut payload_budget = ERROR_MAX_TOKENS;
+    loop {
+        let payload = truncate_text(payload, TruncationPolicy::Tokens(payload_budget));
+        let payload = format!("{payload}\n\n{TYPED_COMPLETION_NEXT_ACTION}");
+        let message =
+            InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload).render();
+        let message_tokens = approx_token_count(&message);
+        if message_tokens < COMPLETION_MESSAGE_MAX_TOKENS || payload_budget == 0 {
+            return message;
+        }
+
+        // Rendering adds the typed envelope and can expand escaped control characters. Tighten
+        // the source budget until the complete model-visible notification fits the ceiling.
+        let next_budget = payload_budget
+            .saturating_mul(COMPLETION_MESSAGE_MAX_TOKENS.saturating_sub(1))
+            / message_tokens;
+        payload_budget = next_budget.min(payload_budget.saturating_sub(1));
+    }
 }
 
 #[cfg(test)]

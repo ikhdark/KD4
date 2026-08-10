@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "displayId": {
+      "type": "string"
+    },
+    "durableSaveResult": {
+      "type": "boolean"
+    },
+    "id": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "status": {
+      "description": "Always `pending` when returned; persistence has committed already.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "displayId",
+    "durableSaveResult",
+    "id",
+    "status"
+  ],
+  "title": "BugCreateResponse",
+  "type": "object"
+}

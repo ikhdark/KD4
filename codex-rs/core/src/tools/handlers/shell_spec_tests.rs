@@ -115,6 +115,12 @@ fn exec_command_tool_matches_expected_spec() {
     properties.extend(create_approval_parameters(
         /*exec_permission_approvals_enabled*/ false,
     ));
+    properties.insert(
+        "force_fresh".to_string(),
+        JsonSchema::boolean(Some(
+            "Execute without reusing prior immutable evidence.".to_string(),
+        )),
+    );
 
     assert_eq!(
         tool,

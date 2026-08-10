@@ -10,6 +10,7 @@ const _: () = assert!(
 );
 
 mod audit;
+mod bugs;
 mod extract;
 pub mod log_db;
 mod migrations;
@@ -27,6 +28,12 @@ pub use runtime::StateRuntime;
 
 pub use audit::ThreadStateAuditRow;
 pub use audit::read_thread_state_audit_rows;
+pub use bugs::BugClaim;
+pub use bugs::BugClassification;
+pub use bugs::BugCreateParams;
+pub use bugs::BugCreateResult;
+pub use bugs::BugFailureCategory;
+pub use bugs::BugStore;
 /// Low-level storage engine: useful for focused tests.
 ///
 /// Most consumers should prefer [`StateRuntime`].
@@ -98,6 +105,7 @@ pub const SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
 pub const LOGS_DB_FILENAME: &str = "logs_2.sqlite";
 pub const GOALS_DB_FILENAME: &str = "goals_1.sqlite";
 pub const MEMORIES_DB_FILENAME: &str = "memories_1.sqlite";
+pub const BUGS_DB_FILENAME: &str = "bugs_1.sqlite";
 pub const STATE_DB_FILENAME: &str = "state_5.sqlite";
 
 /// Errors encountered during DB operations. Tags: [stage]

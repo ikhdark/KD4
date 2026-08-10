@@ -76,6 +76,21 @@ fn retry_guard_counts_operational_rejections_but_not_user_declines() {
 }
 
 #[test]
+fn known_delta_reuses_only_complete_successes() {
+    let mut output = codex_protocol::exec_output::ExecToolCallOutput::default();
+    assert!(super::is_complete_success(&output));
+
+    output.exit_code = 1;
+    assert!(!super::is_complete_success(&output));
+    output.exit_code = 0;
+    output.timed_out = true;
+    assert!(!super::is_complete_success(&output));
+    output.timed_out = false;
+    output.aggregated_output.truncated_after_lines = Some(1);
+    assert!(!super::is_complete_success(&output));
+}
+
+#[test]
 fn independent_review_rejects_non_inspection_before_validation() {
     let reviewer = codex_protocol::protocol::SessionSource::SubAgent(
         codex_protocol::protocol::SubAgentSource::Review,
@@ -857,6 +872,7 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
         additional_permissions: None,
         prefix_rule: None,
         justification: justification.clone(),
+        force_fresh: None,
     };
 
     let exec_params = ShellCommandHandler::to_exec_params(
@@ -943,6 +959,7 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
         additional_permissions: None,
         prefix_rule: None,
         justification: None,
+        force_fresh: None,
     };
 
     let exec_params = ShellCommandHandler::to_exec_params(
@@ -988,6 +1005,7 @@ async fn shell_command_handler_preserves_structured_argv_shape() {
         additional_permissions: None,
         prefix_rule: None,
         justification: None,
+        force_fresh: None,
     };
     let invocation = CommandInvocation::from_parts(
         "shell_command",

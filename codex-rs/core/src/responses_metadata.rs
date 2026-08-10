@@ -79,7 +79,7 @@ pub(crate) struct CompactionTurnMetadata {
 }
 
 impl CompactionTurnMetadata {
-    pub(crate) fn new(
+    pub fn new(
         trigger: CompactionTrigger,
         reason: CompactionReason,
         implementation: CompactionImplementation,
@@ -170,7 +170,7 @@ pub struct CodexResponsesMetadata {
 }
 
 impl CodexResponsesMetadata {
-    pub(crate) fn new(
+    pub fn new(
         installation_id: String,
         session_id: String,
         thread_id: String,

@@ -4,6 +4,7 @@ use codex_utils_output_truncation::approx_token_count;
 
 use super::COMPLETION_MESSAGE_MAX_TOKENS;
 use super::ERROR_NEXT_ACTION;
+use super::TYPED_COMPLETION_NEXT_ACTION;
 use super::format_inter_agent_completion_message;
 use super::format_subagent_notification_message;
 
@@ -26,4 +27,17 @@ fn legacy_error_completion_message_stays_below_manual_review_threshold() {
         format_subagent_notification_message("worker", &AgentStatus::Errored("\0".repeat(10_000)));
 
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
+}
+
+#[test]
+fn typed_completion_message_stays_bounded_and_points_to_durable_receipt() {
+    let message = format_inter_agent_completion_message(
+        AgentPath::try_from("/root/architect").expect("valid task path"),
+        AgentPath::try_from("/root/architect").expect("valid agent path"),
+        &AgentStatus::Completed(Some("architecture contract ".repeat(10_000))),
+    )
+    .expect("completed status should produce a completion message");
+
+    assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
+    assert!(message.contains(TYPED_COMPLETION_NEXT_ACTION));
 }

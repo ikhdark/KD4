@@ -28,7 +28,7 @@ use super::textarea::TextAreaState;
 /// Callback invoked when the user submits a custom prompt.
 pub(crate) type PromptSubmitted = Box<dyn Fn(String) + Send + Sync>;
 
-/// Minimal multi-line text input view to collect custom review instructions.
+/// Minimal multi-line text input view.
 pub(crate) struct CustomPromptView {
     title: String,
     placeholder: String,
@@ -40,6 +40,7 @@ pub(crate) struct CustomPromptView {
     textarea_state: RefCell<TextAreaState>,
     paste_burst: PasteBurst,
     completion: Option<ViewCompletion>,
+    preserve_submission_text: bool,
 }
 
 impl CustomPromptView {
@@ -49,6 +50,41 @@ impl CustomPromptView {
         initial_text: String,
         context_label: Option<String>,
         on_submit: PromptSubmitted,
+    ) -> Self {
+        Self::new_inner(
+            title,
+            placeholder,
+            initial_text,
+            context_label,
+            on_submit,
+            false,
+        )
+    }
+
+    pub(crate) fn new_preserving_text(
+        title: String,
+        placeholder: String,
+        initial_text: String,
+        context_label: Option<String>,
+        on_submit: PromptSubmitted,
+    ) -> Self {
+        Self::new_inner(
+            title,
+            placeholder,
+            initial_text,
+            context_label,
+            on_submit,
+            true,
+        )
+    }
+
+    fn new_inner(
+        title: String,
+        placeholder: String,
+        initial_text: String,
+        context_label: Option<String>,
+        on_submit: PromptSubmitted,
+        preserve_submission_text: bool,
     ) -> Self {
         let mut textarea = TextArea::new();
         if !initial_text.is_empty() {
@@ -65,6 +101,7 @@ impl CustomPromptView {
             textarea_state: RefCell::new(TextAreaState::default()),
             paste_burst: PasteBurst::default(),
             completion: None,
+            preserve_submission_text,
         }
     }
 
@@ -86,10 +123,16 @@ impl CustomPromptView {
                     return;
                 }
                 if modifiers == KeyModifiers::NONE {
-                    let text = self.textarea.text().trim().to_string();
-                    if !text.is_empty() {
-                        (self.on_submit)(text);
+                    let text = self.textarea.text();
+                    if self.preserve_submission_text {
+                        (self.on_submit)(text.to_string());
                         self.completion = Some(ViewCompletion::Accepted);
+                    } else {
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            (self.on_submit)(text);
+                            self.completion = Some(ViewCompletion::Accepted);
+                        }
                     }
                 } else {
                     self.textarea.input(key_event);

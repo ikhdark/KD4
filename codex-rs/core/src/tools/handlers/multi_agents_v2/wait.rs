@@ -230,7 +230,10 @@ impl Handler {
                 "created_at": event.created_at,
                 "epoch": task.workspace_status.epoch,
                 "gates": task.gates,
-                "receipt": task.receipt,
+                "receipt": durable_receipt_pointer(
+                    event.assignment_id.to_string(),
+                    task.receipt.is_some(),
+                ),
                 "last_progress_at": task.workspace_status.last_progress_at,
                 "lease_state": task.workspace_status.lease_state,
                 "stale_reason": task.workspace_status.stale_reason,
@@ -279,6 +282,33 @@ impl Handler {
             .await;
 
         Ok(boxed_tool_output(result))
+    }
+}
+
+fn durable_receipt_pointer(assignment_id: String, available: bool) -> JsonValue {
+    json!({
+        "available": available,
+        "source": "get_agent_task",
+        "assignment_id": assignment_id,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_receipt_pointer_never_embeds_receipt_contents() {
+        let pointer = durable_receipt_pointer("assignment-1".to_string(), true);
+
+        assert_eq!(
+            pointer,
+            json!({
+                "available": true,
+                "source": "get_agent_task",
+                "assignment_id": "assignment-1",
+            })
+        );
     }
 }
 

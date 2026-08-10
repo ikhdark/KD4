@@ -328,6 +328,18 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    pub(crate) fn open_bug_capture_prompt(&mut self) {
+        let tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new_preserving_text(
+            "Capture audit".to_string(),
+            "Describe the bug or audit finding, then press Enter to save it.".to_string(),
+            String::new(),
+            None,
+            Box::new(move |raw_text: String| tx.bug_create(raw_text)),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     pub(super) fn ensure_thread_rename_allowed(&mut self) -> bool {
         match self.thread_rename_block_message.clone() {
             Some(message) => {

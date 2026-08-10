@@ -132,6 +132,8 @@ pub enum Feature {
     UseLegacyLandlock,
     /// Experimental shell snapshotting.
     ShellSnapshot,
+    /// Collect and, after shadow validation, reuse immutable tool output evidence.
+    KnownDeltaStore,
     /// Allow turns to start while selected executors are still starting.
     DeferredExecutor,
     /// Enable runtime metrics snapshots via a manual reader.
@@ -847,6 +849,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "shell_snapshot",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::KnownDeltaStore,
+        key: "known_delta_store",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::DeferredExecutor,

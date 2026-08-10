@@ -3,73 +3,185 @@ WORKTREE REVIEW LEDGER
 
 Scope freeze
 ------------
-Baseline: 41 unstaged paths (40 modified, 1 untracked); no staged changes,
-deletions, renames, or submodule changes. Each frozen path appears exactly once
-below. The review covered each complete current file, its complete diff, owning
-callers/contracts, and directly affected tests. Generated metadata was checked
-against its source manifest rather than edited by hand.
+Frozen baseline: 78 paths (63 tracked changes and 15 untracked files), all
+unstaged; no staged changes or submodule changes. The tracked set contains 7
+deletions. The previously clean tracked report was not part of the frozen set;
+updating it is a required review artifact and makes it an additional final diff.
+Review scope covers the complete current/base representation, diffs, owning
+callers and contracts, generated provenance, focused tests, runtime wiring, and
+fork-local publication risk.
 
-Confirmed findings before repair
---------------------------------
-F1 (high): The process-root admission reclaimer stores only one global
-registration. A newer live app-server instance overwrites an older one, and
-dropping the newer guard clears reclamation instead of restoring the still-live
-registration. Under the global root cap this can reject admission even though an
-older server owns reclaimable inactive roots.
+Contract map
+------------
+A. Durable bug capture: app-server protocol, BugStore, classifier, TUI command,
+   exact-text privacy, migrations, tests, README, and generated schemas.
+B. Known-delta evidence: clean Git identity, evidence/blob storage, source and
+   shell callers, feature/config schema, artifact reminting, and tests.
+C. Typed-agent completion: compact notification and receipt-pointer behavior.
+D. Review UI cleanup and supporting process-limit maintenance.
 
-F2 (medium): Runtime cell closure removes the active cell before publishing its
-terminal event. A concurrent observer can fall between those operations, see
-neither representation, and return MissingCell for a cell that just completed.
+Findings before repair
+----------------------
+F1 (medium, confirmed): codex-rs/tui/tooltips.txt still says `/review` reviews
+current changes, while the changed command now opens exact-text bug/audit
+capture. This is an affected user-visible consumer omitted from the initial
+change set and contradicts the new slash-command description and runtime.
 
-No other correctness, security, lifecycle, compatibility, or generated-contract
-defect was confirmed in the frozen scope. Validation status is pending repair.
+F2 (validation gap, open): the classifier parser and BugStore have focused unit
+coverage, but the changed app-server suite has no end-to-end `bug/create` RPC
+test proving thread lookup, selected sqlite_home persistence, response shape,
+and background-classifier launch wiring together. Focused validation covered the
+components but not that combined route, so this remains an explicit open gap.
 
-Per-path disposition
---------------------
-[01] codex-rs/Cargo.lock — generated dependency lock; manifest-consistent.
-[02] codex-rs/app-server/src/message_processor.rs — F1 consumer/registration lifecycle.
-[03] codex-rs/app-server/src/request_processors.rs — unload-state wiring; no independent finding.
-[04] codex-rs/app-server/src/request_processors/thread_lifecycle.rs — reclaim hooks and unload authority; no independent finding.
-[05] codex-rs/app-server/src/request_processors/thread_processor.rs — thread lifecycle caller updates; no independent finding.
-[06] codex-rs/app-server/src/request_processors/turn_processor.rs — eligibility/lease caller updates; no independent finding.
-[07] codex-rs/code-mode/Cargo.toml — dependency source for entry 01; consistent.
-[08] codex-rs/code-mode/src/cell_actor/callbacks_tests.rs — terminal callback tests; supports F2 surface.
-[09] codex-rs/code-mode/src/cell_actor/mod.rs — terminal event propagation; supports F2 surface.
-[10] codex-rs/code-mode/src/cell_actor/tests.rs — actor lifecycle coverage; no independent finding.
-[11] codex-rs/code-mode/src/cell_actor/types.rs — terminal event representation; no independent finding.
-[12] codex-rs/code-mode/src/remote_session.rs — session lease/root lifecycle; no independent finding.
-[13] codex-rs/code-mode/src/remote_session/connection.rs — managed subprocess containment; no independent finding.
-[14] codex-rs/code-mode/src/remote_session_tests.rs — remote lifecycle coverage; no independent finding.
-[15] codex-rs/code-mode/src/session_runtime/mod.rs — F2 owning implementation.
-[16] codex-rs/code-mode/src/session_runtime/tests.rs — F2 regression-test owner.
-[17] codex-rs/codex-api/src/endpoint/responses_websocket.rs — reset normalization; tests match contract.
-[18] codex-rs/codex-mcp/src/connection_manager.rs — graceful/forced shutdown orchestration; no independent finding.
-[19] codex-rs/codex-mcp/src/connection_manager_tests.rs — shutdown coverage; no independent finding.
-[20] codex-rs/codex-mcp/src/resource_client.rs — generation lease ownership; no independent finding.
-[21] codex-rs/codex-mcp/src/rmcp_client.rs — shutdown delegation; no independent finding.
-[22] codex-rs/core/src/agent/control.rs — heartbeat reconciliation resilience; no independent finding.
-[23] codex-rs/core/src/exec.rs — managed root admission/termination consumer; no independent finding.
-[24] codex-rs/core/src/landlock.rs — spawn request compatibility update; no independent finding.
-[25] codex-rs/core/src/mcp_tool_call_tests.rs — MCP generation coverage; no independent finding.
-[26] codex-rs/core/src/session/mcp.rs — generation publication/reuse; no independent finding.
-[27] codex-rs/core/src/session/mcp_runtime.rs — runtime snapshot contract; no independent finding.
-[28] codex-rs/core/src/session/session.rs — resource lease wiring; no independent finding.
-[29] codex-rs/core/src/session/tests.rs — session lifecycle coverage; no independent finding.
-[30] codex-rs/core/src/spawn.rs — Windows creation-flags contract; no independent finding.
-[31] codex-rs/core/src/state/service.rs — snapshot generation publication; no independent finding.
-[32] codex-rs/core/src/tools/handlers/mcp_resource_tests.rs — resource-generation coverage; no independent finding.
-[33] codex-rs/core/tests/common/process.rs — process-liveness test helper; no independent finding.
-[34] codex-rs/core/tests/suite/mcp_refresh_cleanup.rs — old-generation cleanup coverage; no independent finding.
-[35] codex-rs/core/tests/suite/mod.rs — suite registration only.
-[36] codex-rs/rmcp-client/src/rmcp_client.rs — transport shutdown/reap ordering; no independent finding.
-[37] codex-rs/rmcp-client/src/stdio_server_launcher.rs — managed stdio root ownership; no independent finding.
-[38] codex-rs/utils/pty/src/lib.rs — managed-process module/export wiring; supports F1 owner.
-[39] codex-rs/utils/pty/src/pipe.rs — managed PTY root consumer; no independent finding.
-[40] codex-rs/utils/pty/src/pipe_tests.rs — descendant containment coverage; no independent finding.
-[41] codex-rs/utils/pty/src/managed_process.rs — F1 owning implementation and regression-test owner.
+F3 (uncertain, investigated): bug repository metadata is taken from the
+app-server processor config cwd rather than the target thread. The available
+thread config snapshot does not carry cwd, and existing app-server request
+processors consistently use the processor config for repository-scoped
+metadata. No incorrect persisted value is yet demonstrated; do not change
+without a failing multi-thread reproduction or a thread-cwd contract.
+
+F4 (medium, confirmed and fixed): codex-rs/core/src/session_prefix_tests.rs
+referenced TYPED_COMPLETION_NEXT_ACTION without importing it. The focused core
+test compile failed with an unresolved-name error. The missing import was added,
+and the focused typed-completion test now passes.
+
+F5 (low, confirmed and fixed): changed code retained an obsolete exec import and
+an unread ReviewRequest field, plus a needless clone and collapsible conditional
+in the app-server classifier path. These were removed or simplified without
+changing the review-summary or classifier behavior; focused compilation and the
+changed-package Clippy traversal no longer report them.
+
+Frozen-path ledger
+------------------
+[01] codex-rs/Cargo.lock — Cargo-generated dependency lock updates for rollout-trace and state test support; provenance/check pending; no independent logic finding.
+[02] codex-rs/app-server-protocol/schema/json/ClientRequest.json — generated BugCreate/AppsRead client request union; generator check pending.
+[03] codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json — generated aggregate protocol schema; generator check pending.
+[04] codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json — generated v2 aggregate schema; generator check pending.
+[05] codex-rs/app-server-protocol/schema/json/v2/ReviewStartParams.json — generated deletion matching removed review/start contract; reference check pending.
+[06] codex-rs/app-server-protocol/schema/json/v2/ReviewStartResponse.json — generated deletion matching removed review/start contract; reference check pending.
+[07] codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts — generated BugCreate/AppsRead request union; generator check pending.
+[08] codex-rs/app-server-protocol/schema/typescript/v2/ReviewDelivery.ts — generated deletion matching removed review API; reference check pending.
+[09] codex-rs/app-server-protocol/schema/typescript/v2/ReviewStartParams.ts — generated deletion matching removed review API; reference check pending.
+[10] codex-rs/app-server-protocol/schema/typescript/v2/ReviewStartResponse.ts — generated deletion matching removed review API; reference check pending.
+[11] codex-rs/app-server-protocol/schema/typescript/v2/ReviewTarget.ts — generated deletion matching removed review API; reference check pending.
+[12] codex-rs/app-server-protocol/schema/typescript/v2/index.ts — generated export replacement/additions; generator check pending.
+[13] codex-rs/app-server-protocol/src/protocol/common.rs — request method swaps review/start for bug/create and emits existing apps/read artifacts; no independent finding.
+[14] codex-rs/app-server-protocol/src/protocol/v2/mod.rs — v2 module/export replacement from review to bug; no independent finding.
+[15] codex-rs/app-server-protocol/src/protocol/v2/review.rs — deleted review/start source contract; callers surveyed; no remaining app-server-protocol reference found.
+[16] codex-rs/app-server/Cargo.toml — runtime rollout-trace dependency and model-provider-info dependency placement; lock provenance pending.
+[17] codex-rs/app-server/README.md — documents exact durable report, bugs_1.sqlite, and separate best-effort classification; matches implementation.
+[18] codex-rs/app-server/src/message_processor.rs — cancellation ownership/drain wiring for classifier tasks; no independent finding.
+[19] codex-rs/app-server/src/request_processors.rs — BugStore and classifier task ownership plus bug/create dispatch; no independent finding.
+[20] codex-rs/app-server/src/request_processors/turn_processor.rs — durable save, repository metadata, bounded classifier, exact evidence validation; F2/F3 apply.
+[21] codex-rs/app-server/src/request_processors/turn_processor_tests.rs — multibyte evidence/schema/severity parser coverage; F2 applies.
+[22] codex-rs/app-server/tests/common/test_app_server.rs — removed review notification helper; no dangling suite consumer found.
+[23] codex-rs/app-server/tests/suite/v2/client_metadata.rs — client metadata expectations updated after protocol change; focused test pending.
+[24] codex-rs/app-server/tests/suite/v2/mod.rs — removes deleted review suite module; F2 applies.
+[25] codex-rs/app-server/tests/suite/v2/review.rs — deleted review/start integration suite matching removed endpoint; F2 applies.
+[26] codex-rs/core/src/responses_metadata.rs — constructors made public for rollout-trace classifier usage; API visibility is narrowly consumed.
+[27] codex-rs/core/src/session_prefix.rs — typed completion notification is token-bounded and points to get_agent_task; focused tests pending.
+[28] codex-rs/core/src/session_prefix_tests.rs — covers receipt pointer and bounded completion text; focused tests pending.
+[29] codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs — replaces embedded sealed receipt with assignment pointer; store remains authoritative; focused tests pending.
+[30] codex-rs/core/src/tools/handlers/shell.rs — feature-gated immutable git-show lookup, shadow validation, force-fresh quarantine; no unsafe reuse path found.
+[31] codex-rs/core/src/tools/handlers/shell/shell_command.rs — force_fresh argument forwarding; schema/handler parity found.
+[32] codex-rs/core/src/tools/handlers/shell_spec.rs — documents optional force_fresh shell parameter; protocol parity found.
+[33] codex-rs/core/src/tools/handlers/shell_spec_tests.rs — schema coverage for force_fresh; focused tests pending.
+[34] codex-rs/core/src/tools/handlers/shell_tests.rs — known-delta and force-fresh handler coverage; focused tests pending.
+[35] codex-rs/core/src/tools/handlers/source.rs — clean tracked-file identity, reminted task handle, shadow promotion, and contradiction path; no unsafe reuse path found.
+[36] codex-rs/core/src/tools/handlers/source_spec.rs — source force_fresh schema wiring; handler parity found.
+[37] codex-rs/core/src/tools/mod.rs — known_delta_store module ownership wiring; no independent finding.
+[38] codex-rs/core/src/tools/runtimes/shell.rs — cache-hit short circuit preserves normal tool output shape; focused tests pending.
+[39] codex-rs/core/src/tools/runtimes/shell_tests.rs — runtime cache-hit projection coverage; focused tests pending.
+[40] codex-rs/exec/src/lib.rs — removes app-server review/start client path while preserving local exec review; no dangling API reference found.
+[41] codex-rs/features/src/lib.rs — KnownDeltaStore is under-development and disabled by default; compatibility risk contained.
+[42] codex-rs/protocol/src/models.rs — optional shell force_fresh protocol field with serde/TS compatibility defaults; no independent finding.
+[43] codex-rs/state/Cargo.toml — tempfile test dependency; lock provenance pending.
+[44] codex-rs/state/src/lib.rs — exports bug store types and database filename; no independent finding.
+[45] codex-rs/state/src/migrations.rs — isolated bug database migrator wiring; migration test pending.
+[46] codex-rs/tui/src/app/event_dispatch.rs — removes deleted review popup events; remaining event matches surveyed.
+[47] codex-rs/tui/src/app/thread_routing.rs — bug command routes to the owning thread session; no independent finding.
+[48] codex-rs/tui/src/app_command.rs — Review API command replaced by exact raw-text BugCreate; session-log privacy consumer checked.
+[49] codex-rs/tui/src/app_event.rs — removes obsolete review popup events; no dangling variant found.
+[50] codex-rs/tui/src/app_event_sender.rs — bug_create sender preserves raw text; no independent finding.
+[51] codex-rs/tui/src/app_server_session.rs — sends bug/create and reports RPC failure; response lifecycle consistent with fire-and-report UI.
+[52] codex-rs/tui/src/bottom_pane/custom_prompt_view.rs — preserving constructor retains exact report whitespace while rejecting whitespace-only submission; focused tests pending.
+[53] codex-rs/tui/src/chatwidget.rs — removes review popup module/methods; command path now uses capture prompt.
+[54] codex-rs/tui/src/chatwidget/interaction.rs — opens exact-text bug capture modal; F1 applies to affected tooltip consumer.
+[55] codex-rs/tui/src/chatwidget/review_popups.rs — deleted review target/commit popup implementation; no remaining module reference found.
+[56] codex-rs/tui/src/chatwidget/slash_dispatch.rs — `/review` now opens capture modal and rejects inline text; F1 applies.
+[57] codex-rs/tui/src/chatwidget/tests.rs — removes deleted review-popup test module wiring; no independent finding.
+[58] codex-rs/tui/src/chatwidget/tests/composer_submission.rs — expectation updated for Review command while busy/modal; focused tests pending.
+[59] codex-rs/tui/src/chatwidget/tests/review_mode.rs — preserves core review-turn behavior while removing app-server popup assumptions; focused tests pending.
+[60] codex-rs/tui/src/chatwidget/tests/slash_commands.rs — bug capture event and exact-text coverage replaces popup coverage; focused tests pending.
+[61] codex-rs/tui/src/session_log.rs — excludes raw BugCreate text from outbound logs and adds privacy test; no independent finding.
+[62] codex-rs/tui/src/slash_command.rs — description says capture bug/audit report; F1 is the contradictory external tooltip.
+[63] codex-rs/utils/pty/src/managed_process.rs — doubles managed-root warning/limit; inherited prior repair, no new independent finding in this worktree.
+[64] codex-rs/app-server-protocol/schema/json/v2/AppsReadParams.json — generated artifact for existing apps/read source; generator check pending.
+[65] codex-rs/app-server-protocol/schema/json/v2/AppsReadResponse.json — generated artifact for existing apps/read source; generator check pending.
+[66] codex-rs/app-server-protocol/schema/json/v2/BugCreateParams.json — generated new bug/create request schema; generator check pending.
+[67] codex-rs/app-server-protocol/schema/json/v2/BugCreateResponse.json — generated new bug/create response schema; generator check pending.
+[68] codex-rs/app-server-protocol/schema/typescript/v2/AppToolSummary.ts — generated artifact for existing apps/read source; generator check pending.
+[69] codex-rs/app-server-protocol/schema/typescript/v2/AppsReadParams.ts — generated artifact for existing apps/read source; generator check pending.
+[70] codex-rs/app-server-protocol/schema/typescript/v2/AppsReadResponse.ts — generated artifact for existing apps/read source; generator check pending.
+[71] codex-rs/app-server-protocol/schema/typescript/v2/BugCreateParams.ts — generated new bug/create request type; generator check pending.
+[72] codex-rs/app-server-protocol/schema/typescript/v2/BugCreateResponse.ts — generated new bug/create response type; generator check pending.
+[73] codex-rs/app-server-protocol/schema/typescript/v2/ConnectorMetadata.ts — generated artifact for existing apps/read source; generator check pending.
+[74] codex-rs/app-server-protocol/src/protocol/v2/bug.rs — source-of-truth exact-text request and durable response contract; no independent finding.
+[75] codex-rs/core/src/tools/known_delta_store.rs — fail-open content-addressed cache, safe path/object identity, quarantine, atomic writes, and tests; feature disabled by default.
+[76] codex-rs/state/bugs_migrations/0001_bugs.sql — separate immutable raw-report schema, claim constraints, and indexes; focused migration tests pending.
+[77] codex-rs/state/src/bugs/mod.rs — exact persistence and atomic bounded claim/commit implementation; no confirmed concurrency defect found.
+[78] codex-rs/state/src/bugs/tests.rs — exact-text, selected-home, claim race/stale retry/immutability/order coverage; focused tests pending.
 
 Repair and validation record
 ----------------------------
-Pending. This section will be updated after the mandatory reread, repairs,
-focused tests, full applicable Clippy with --keep-going, dependency analysis,
-dead-code analysis, and final worktree audit.
+The complete initial report was reread from disk before repair. Ledger entries
+that still say "pending" preserve the frozen pre-validation review state; the
+final dispositions below supersede those annotations.
+
+- Repairs: corrected codex-rs/tui/tooltips.txt; imported
+  TYPED_COMPLETION_NEXT_ACTION in codex-rs/core/src/session_prefix_tests.rs;
+  removed the obsolete exec import/unread ReviewRequest field in
+  codex-rs/exec/src/lib.rs; removed the needless clone and collapsed the
+  classifier conditional in
+  codex-rs/app-server/src/request_processors/turn_processor.rs.
+- Formatting/worktree: cargo fmt --all -- --check passed; git diff --check
+  passed (only line-ending warnings); cargo metadata --locked --no-deps
+  --format-version 1 passed.
+- Generated contracts: just app-server-schema-check passed, including schema
+  freshness tests.
+- State: cargo test -p codex-state bugs::tests passed 5 tests.
+- Core: cargo test -p codex-core --lib known_delta_store -- --nocapture passed
+  7 tests; the typed-completion and known-delta focused tests each passed.
+- TUI: the outbound session-log redaction test passed; 3 review-capture prompt
+  tests passed; the queued /review-with-arguments guard test passed.
+- App server: cargo check -p codex-app-server --lib --message-format short
+  passed after repair. A classifier unit-test invocation remains blocked by 10
+  compile errors in unchanged config_manager_service_tests.rs tuple-field
+  accesses; that file has no worktree diff.
+- Exec: downstream TUI validation compiled the edited exec library. Two
+  standalone exec unit-test attempts timed out while rebuilding after distinct
+  RUSTFLAGS invalidated the cache, without reaching a code error; no identical
+  retry was made.
+- Dependencies/dead code: just cargo-shear passed with "no issues found." The
+  documented just rust-dead-code-matrix --keep-going emitted no dead-code
+  diagnostics before the same unchanged app-server test compile errors.
+- Clippy: the required workspace/all-targets/all-features/--keep-going lane was
+  attempted and externally blocked by rusty_v8 v149.2.0 returning HTTP 404 for
+  its Windows prebuilt archive. A changed-package all-targets/all-features lane
+  found and drove F5; after repair, remaining diagnostics were the unchanged
+  app-server test tuple-field errors and unchanged account_processor.rs
+  too-many-arguments lint.
+- Remaining gap: no app-server integration test exercises bug/create end to
+  end. State persistence, protocol generation, classifier helpers, and
+  app-server library compilation are covered; this stays open rather than being
+  disguised by unrelated test expansion.
+- F3 remains unconfirmed: no stronger per-thread cwd contract was found.
+- Final audit: all 78 frozen paths remain present in status and appear exactly
+  once in the ledger (unique range 1-78). The only final-status additions are
+  this required report and the F1 tooltip repair. No files are staged;
+  git diff --check passes. Focused source reinspection confirms the F4 import,
+  unit Review variant, removed obsolete notification import/clone, collapsed
+  classifier conditional, and corrected tooltip text.
+- Desktop activation was not performed; source changes here do not hot-apply to
+  the installed app.
+- Publication, staging, commit, install, and restart were not performed.

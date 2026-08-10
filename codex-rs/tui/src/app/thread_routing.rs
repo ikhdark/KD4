@@ -710,13 +710,17 @@ impl App {
                     .await;
                 Ok(true)
             }
-            AppCommand::Review { target } => {
-                let response = app_server.review_start(thread_id, target.clone()).await?;
-                let review_thread_id = ThreadId::from_string(&response.review_thread_id)
-                    .wrap_err("review/start returned invalid review thread id")?;
-                let store = Arc::clone(&self.ensure_thread_channel(review_thread_id).store);
-                let mut store = store.lock().await;
-                store.active_turn_id = Some(response.turn.id);
+            AppCommand::BugCreate { raw_text } => {
+                let response = app_server.bug_create(thread_id, raw_text.clone()).await?;
+                self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_info_event(
+                        format!(
+                            "Audit {} saved; classification pending.",
+                            response.display_id
+                        ),
+                        None,
+                    ),
+                )));
                 Ok(true)
             }
             AppCommand::CleanBackgroundTerminals => {

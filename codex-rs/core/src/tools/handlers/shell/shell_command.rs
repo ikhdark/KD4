@@ -326,6 +326,7 @@ impl ShellCommandHandler {
             track_validation_freshness: true,
             attempt_key: Some(attempt_key),
             repair_notice,
+            force_fresh: params.force_fresh.unwrap_or(false),
         })
         .await
         .map(boxed_tool_output)

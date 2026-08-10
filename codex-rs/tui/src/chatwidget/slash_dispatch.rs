@@ -261,7 +261,7 @@ impl ChatWidget {
                 self.app_event_tx.compact();
             }
             SlashCommand::Review => {
-                self.open_review_popup();
+                self.open_bug_capture_prompt();
             }
             SlashCommand::Rename => {
                 self.session_telemetry
@@ -867,9 +867,9 @@ impl ChatWidget {
                 self.request_side_conversation(parent_thread_id, Some(user_message));
             }
             SlashCommand::Review if !trimmed.is_empty() => {
-                self.submit_op(AppCommand::review(ReviewTarget::Custom {
-                    instructions: args,
-                }));
+                self.add_error_message(
+                    "`/review` accepts no inline text. Use the multiline prompt.".to_string(),
+                );
             }
             SlashCommand::Resume if !trimmed.is_empty() => {
                 self.app_event_tx
@@ -1036,7 +1036,9 @@ impl ChatWidget {
     }
 
     fn queued_command_drain_result(&self, cmd: SlashCommand) -> QueueDrain {
-        if self.is_user_turn_pending_or_running() || !self.bottom_pane.no_modal_or_popup_active() {
+        if (self.is_user_turn_pending_or_running() && cmd != SlashCommand::Review)
+            || !self.bottom_pane.no_modal_or_popup_active()
+        {
             return QueueDrain::Stop;
         }
         match cmd {
@@ -1058,6 +1060,7 @@ impl ChatWidget {
             | SlashCommand::Diff
             | SlashCommand::App
             | SlashCommand::Rename
+            | SlashCommand::Review
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Feedback
             | SlashCommand::New
@@ -1068,7 +1071,6 @@ impl ChatWidget {
             | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact
-            | SlashCommand::Review
             | SlashCommand::Model
             | SlashCommand::Personality
             | SlashCommand::Plan

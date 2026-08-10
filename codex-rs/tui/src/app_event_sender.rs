@@ -10,7 +10,6 @@ use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
-use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_protocol::ThreadId;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -60,8 +59,8 @@ impl AppEventSender {
         self.send(AppEvent::CodexOp(AppCommand::set_thread_name(name)));
     }
 
-    pub(crate) fn review(&self, target: ReviewTarget) {
-        self.send(AppEvent::CodexOp(AppCommand::review(target)));
+    pub(crate) fn bug_create(&self, raw_text: String) {
+        self.send(AppEvent::CodexOp(AppCommand::bug_create(raw_text)));
     }
 
     pub(crate) fn list_skills(&self, cwds: Vec<PathBuf>, force_reload: bool) {

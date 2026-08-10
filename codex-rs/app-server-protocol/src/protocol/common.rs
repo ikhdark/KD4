@@ -862,10 +862,10 @@ client_request_definitions! {
         serialization: None,
         response: v2::ThreadRealtimeListVoicesResponse,
     },
-    ReviewStart => "review/start" {
-        params: v2::ReviewStartParams,
-        serialization: thread_id(params.thread_id),
-        response: v2::ReviewStartResponse,
+    BugCreate => "bug/create" {
+        params: v2::BugCreateParams,
+        serialization: None,
+        response: v2::BugCreateResponse,
     },
 
     ModelList => "model/list" {
@@ -3080,11 +3080,7 @@ mod tests {
             }
         }))?;
 
-        let ClientRequest::AppsRead {
-            request_id,
-            params,
-        } = request
-        else {
+        let ClientRequest::AppsRead { request_id, params } = request else {
             panic!("expected app/read request");
         };
         assert_eq!(request_id, RequestId::Integer(9));

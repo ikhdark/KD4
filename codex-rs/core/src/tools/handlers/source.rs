@@ -9,12 +9,14 @@ use crate::tools::handlers::source_spec::SEARCH_SOURCE_TOOL_NAME;
 use crate::tools::handlers::source_spec::SourceToolOptions;
 use crate::tools::handlers::source_spec::create_read_file_span_tool;
 use crate::tools::handlers::source_spec::create_search_source_tool;
+use crate::tools::known_delta_store;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_agent_task_store::WorkspaceActorKind;
 use codex_agent_task_store::WorkspaceActorRegistration;
 use codex_agent_task_store::WorkspaceManifestEntry;
 use codex_agent_task_store::WorkspaceStrategy;
+use codex_features::Feature;
 use codex_file_search::source_search::ReadFileSpanOutput;
 use codex_file_search::source_search::SOURCE_READ_DEFAULT_LINES;
 use codex_file_search::source_search::SOURCE_SEARCH_DEFAULT_MAX_MATCHES;
@@ -49,6 +51,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tracing::warn;
 
 const SOURCE_TOOL_MAX_RENDERED_BYTES: usize = 8 * 1024;
@@ -84,6 +87,9 @@ struct ReadFileSpanArgs {
     start_line: Option<usize>,
     #[serde(default)]
     line_count: Option<usize>,
+    /// Execute normally rather than reusing prior immutable evidence.
+    #[serde(default)]
+    force_fresh: bool,
     #[serde(default)]
     environment_id: Option<String>,
 }
@@ -278,38 +284,114 @@ async fn handle_read_file_span(
     }
     let source_context = local_source_context(&invocation, args.environment_id.as_deref()).await?;
     let path = resolve_confined_path(&source_context, &args.path, "source file").await?;
-    let metadata = source_context
-        .fs
-        .get_metadata(&path, Some(&source_context.sandbox))
-        .await
-        .map_err(|err| source_fs_error("inspect", &path, err))?;
-    if !metadata.is_file {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "source path `{}` is not a file",
-            args.path
-        )));
-    }
-    let file_len = usize::try_from(metadata.size).unwrap_or(usize::MAX);
-    if file_len > SOURCE_SEARCH_MAX_FILE_BYTES {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "source file `{}` is too large ({} bytes, max {})",
-            args.path, file_len, SOURCE_SEARCH_MAX_FILE_BYTES
-        )));
-    }
-    let Some(bytes) = read_source_file_stably(&source_context, &path, &metadata).await? else {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "source file `{}` changed while it was being read; retry the read",
-            args.path
-        )));
-    };
     let relative_path = relative_source_path(&source_context, &path)?;
-    let supporting_entry = manifest_entry_from_bytes(relative_path.clone(), &bytes);
-    let output = read_file_span_from_bytes(relative_path, bytes, start_line, line_count)
-        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
-    record_supporting_source_reads(&invocation, &source_context, vec![supporting_entry]).await?;
+    let cache_enabled = source_context.is_git_repository
+        && invocation
+            .step_context
+            .turn
+            .config
+            .features
+            .enabled(Feature::KnownDeltaStore);
+    let identity = if cache_enabled {
+        known_delta_store::immutable_file_identity(
+            source_context.repo_root_abs.as_path(),
+            &relative_path,
+            start_line,
+            line_count,
+        )
+        .await
+    } else {
+        None
+    };
+    let candidate = if let Some(identity) = identity.as_ref() {
+        known_delta_store::lookup(
+            invocation.step_context.turn.config.codex_home.as_path(),
+            identity,
+        )
+        .await
+    } else {
+        None
+    };
+    if !args.force_fresh
+        && let Some(candidate) = candidate.as_ref()
+        && candidate.reusable()
+    {
+        let artifact = known_delta_store::remint_task_handle(
+            invocation.step_context.turn.config.codex_home.as_path(),
+            &invocation.session.thread_id.to_string(),
+            candidate,
+        )
+        .await;
+        if artifact.model_projection().2.is_none() {
+            return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                known_delta_store::render_hit(candidate, &artifact),
+                Some(true),
+            )));
+        }
+    }
+    let executor_started = Instant::now();
+    let execution = async {
+        let metadata = source_context
+            .fs
+            .get_metadata(&path, Some(&source_context.sandbox))
+            .await
+            .map_err(|err| source_fs_error("inspect", &path, err))?;
+        if !metadata.is_file {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "source path `{}` is not a file",
+                args.path
+            )));
+        }
+        let file_len = usize::try_from(metadata.size).unwrap_or(usize::MAX);
+        if file_len > SOURCE_SEARCH_MAX_FILE_BYTES {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "source file `{}` is too large ({} bytes, max {})",
+                args.path, file_len, SOURCE_SEARCH_MAX_FILE_BYTES
+            )));
+        }
+        let Some(bytes) = read_source_file_stably(&source_context, &path, &metadata).await? else {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "source file `{}` changed while it was being read; retry the read",
+                args.path
+            )));
+        };
+        let supporting_entry = manifest_entry_from_bytes(relative_path.clone(), &bytes);
+        let output = read_file_span_from_bytes(relative_path, bytes, start_line, line_count)
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+        record_supporting_source_reads(&invocation, &source_context, vec![supporting_entry])
+            .await?;
+        Ok(render_read_output(&output))
+    }
+    .await;
+    let rendered = match execution {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            if args.force_fresh
+                && let Some(identity) = identity.as_ref()
+            {
+                known_delta_store::record_contradictory_failure(
+                    invocation.step_context.turn.config.codex_home.as_path(),
+                    identity,
+                    candidate.is_some(),
+                )
+                .await;
+            }
+            return Err(err);
+        }
+    };
+    if let Some(identity) = identity.as_ref() {
+        let _ = known_delta_store::record_success(
+            invocation.step_context.turn.config.codex_home.as_path(),
+            identity,
+            candidate.as_ref(),
+            rendered.as_bytes(),
+            executor_started.elapsed(),
+        )
+        .await;
+    }
 
     Ok(boxed_tool_output(FunctionToolOutput::from_text(
-        render_read_output(&output),
+        rendered,
         Some(true),
     )))
 }

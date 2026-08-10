@@ -123,6 +123,7 @@ pub(crate) struct MessageProcessor {
     thread_goal_processor: ThreadGoalRequestProcessor,
     thread_processor: ThreadRequestProcessor,
     turn_processor: TurnRequestProcessor,
+    bug_worker_shutdown: CancellationToken,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
     _managed_root_admission_reclaimer: codex_utils_pty::ManagedRootAdmissionReclaimerGuard,
@@ -244,6 +245,7 @@ impl MessageProcessor {
             remote_control_handle,
             plugin_startup_tasks,
         } = args;
+        let bug_worker_shutdown = CancellationToken::new();
         let thread_state_manager = ThreadStateManager::new();
         // The thread store is intentionally process-scoped. Config reloads can
         // affect per-thread behavior, but they must not move newly started,
@@ -442,6 +444,7 @@ impl MessageProcessor {
             thread_watch_manager,
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
+            bug_worker_shutdown.clone(),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
@@ -509,6 +512,7 @@ impl MessageProcessor {
             thread_goal_processor,
             thread_processor,
             turn_processor,
+            bug_worker_shutdown,
             windows_sandbox_processor,
             request_serialization_queues: RequestSerializationQueues::default(),
             _managed_root_admission_reclaimer: managed_root_admission_reclaimer,
@@ -697,6 +701,7 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
+        self.bug_worker_shutdown.cancel();
         self.models_refresh_worker.shutdown();
         self.thread_processor.drain_background_tasks().await;
         self.outgoing.shutdown_delivery_tasks().await;
@@ -1243,9 +1248,7 @@ impl MessageProcessor {
             ClientRequest::AppsList { params, .. } => {
                 self.apps_processor.apps_list(&request_id, params).await
             }
-            ClientRequest::AppsRead { params, .. } => {
-                self.apps_processor.apps_read(params).await
-            }
+            ClientRequest::AppsRead { params, .. } => self.apps_processor.apps_read(params).await,
             ClientRequest::AppsInstalled { params, .. } => self
                 .apps_processor
                 .apps_installed(params)
@@ -1330,9 +1333,7 @@ impl MessageProcessor {
             ClientRequest::ThreadRealtimeListVoices { params: _, .. } => {
                 self.turn_processor.thread_realtime_list_voices().await
             }
-            ClientRequest::ReviewStart { params, .. } => {
-                self.turn_processor.review_start(&request_id, params).await
-            }
+            ClientRequest::BugCreate { params, .. } => self.turn_processor.bug_create(params).await,
             ClientRequest::McpServerOauthLogin { params, .. } => {
                 self.mcp_processor.mcp_server_oauth_login(params).await
             }

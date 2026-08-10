@@ -22,6 +22,8 @@ use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode;
+use codex_app_server_protocol::BugCreateParams;
+use codex_app_server_protocol::BugCreateResponse;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigRequirementsReadResponse;
@@ -43,10 +45,6 @@ use codex_app_server_protocol::ModelListResponse;
 use codex_app_server_protocol::NewThreadModelDefaults;
 use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ReviewDelivery;
-use codex_app_server_protocol::ReviewStartParams;
-use codex_app_server_protocol::ReviewStartResponse;
-use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
@@ -1094,23 +1092,22 @@ impl AppServerSession {
             .wrap_err("thread/rollback failed in TUI")
     }
 
-    pub(crate) async fn review_start(
+    pub(crate) async fn bug_create(
         &mut self,
         thread_id: ThreadId,
-        target: ReviewTarget,
-    ) -> Result<ReviewStartResponse> {
+        raw_text: String,
+    ) -> Result<BugCreateResponse> {
         let request_id = self.next_request_id();
         self.client
-            .request_typed(ClientRequest::ReviewStart {
+            .request_typed(ClientRequest::BugCreate {
                 request_id,
-                params: ReviewStartParams {
+                params: BugCreateParams {
                     thread_id: thread_id.to_string(),
-                    target,
-                    delivery: Some(ReviewDelivery::Inline),
+                    raw_text,
                 },
             })
             .await
-            .wrap_err("review/start failed in TUI")
+            .wrap_err("bug/create failed in TUI")
     }
 
     pub(crate) async fn skills_list(

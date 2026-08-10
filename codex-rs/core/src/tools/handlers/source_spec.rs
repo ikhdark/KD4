@@ -99,6 +99,12 @@ pub(crate) fn create_read_file_span_tool(options: SourceToolOptions) -> ToolSpec
                 "Number of lines to return; must be between 1 and {SOURCE_READ_MAX_LINES}."
             ))),
         ),
+        (
+            "force_fresh".to_string(),
+            JsonSchema::boolean(Some(
+                "Execute the read without reusing prior immutable evidence.".to_string(),
+            )),
+        ),
     ]);
     add_environment_id(&mut properties, options);
 

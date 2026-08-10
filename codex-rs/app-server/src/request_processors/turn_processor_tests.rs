@@ -88,3 +88,91 @@ fn map_additional_context_preserves_client_order() {
         vec!["dependency", "consumer"]
     );
 }
+
+#[test]
+fn bug_classifier_accepts_exact_multibyte_evidence_offsets() {
+    let raw = "Crash in caf\u{e9}";
+    let output = r#"{
+        "summary":"A crash is reported.",
+        "severity":null,
+        "failureMechanism":{"value":"Crash","evidence":{"startByte":0,"endByte":5,"text":"Crash"}},
+        "affectedComponents":[{"value":"café","evidence":{"startByte":9,"endByte":14,"text":"café"}}],
+        "statedCause":null,
+        "requiredRepair":null
+    }"#;
+
+    let result = parse_bug_classification(output, raw).expect("valid UTF-8 byte ranges");
+
+    assert_eq!(result.failure_mechanism.as_deref(), Some("Crash"));
+    assert_eq!(result.affected_components_json, r#"["café"]"#);
+}
+
+#[test]
+fn bug_classifier_rejects_non_boundary_and_unsupported_facts() {
+    let raw = "café";
+    let non_boundary = r#"{
+        "summary":"A report.",
+        "severity":null,
+        "failureMechanism":{"value":"é","evidence":{"startByte":4,"endByte":5,"text":"é"}},
+        "affectedComponents":[],
+        "statedCause":null,
+        "requiredRepair":null
+    }"#;
+    let unsupported = r#"{
+        "summary":"A report.",
+        "severity":null,
+        "failureMechanism":{"value":"invented","evidence":{"startByte":0,"endByte":3,"text":"caf"}},
+        "affectedComponents":[],
+        "statedCause":null,
+        "requiredRepair":null
+    }"#;
+
+    assert!(matches!(
+        parse_bug_classification(non_boundary, raw),
+        Err(BugClassificationFailure::Grounding)
+    ));
+    assert!(matches!(
+        parse_bug_classification(unsupported, raw),
+        Err(BugClassificationFailure::Grounding)
+    ));
+}
+
+#[test]
+fn bug_classifier_requires_exact_schema_and_normalizes_cited_severity() {
+    let raw = "HIGH failure";
+    let valid = r#"{
+        "summary":"A high-severity failure is reported.",
+        "severity":{"value":"high","evidence":{"startByte":0,"endByte":4,"text":"HIGH"}},
+        "failureMechanism":null,
+        "affectedComponents":[],
+        "statedCause":null,
+        "requiredRepair":null
+    }"#;
+    let missing_key = r#"{
+        "summary":"A report.",
+        "severity":null,
+        "failureMechanism":null,
+        "affectedComponents":[],
+        "statedCause":null
+    }"#;
+    let unknown_key = r#"{
+        "summary":"A report.",
+        "severity":null,
+        "failureMechanism":null,
+        "affectedComponents":[],
+        "statedCause":null,
+        "requiredRepair":null,
+        "extra":"not allowed"
+    }"#;
+
+    let result = parse_bug_classification(valid, raw).expect("cited severity should normalize");
+    assert_eq!(result.severity.as_deref(), Some("high"));
+    assert!(matches!(
+        parse_bug_classification(missing_key, raw),
+        Err(BugClassificationFailure::Schema)
+    ));
+    assert!(matches!(
+        parse_bug_classification(unknown_key, raw),
+        Err(BugClassificationFailure::Schema)
+    ));
+}

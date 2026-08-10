@@ -1035,31 +1035,22 @@ async fn ctrl_c_cleared_prompt_is_recoverable_via_history() {
     assert_eq!(vec![PathBuf::from("/tmp/preview.png")], images);
 }
 
-/// Selecting the custom prompt option from the review popup sends
-/// OpenReviewCustomPrompt to the app event channel.
+/// The review capture prompt forwards its exact text to the app-server command.
 #[tokio::test]
-async fn review_popup_custom_prompt_action_sends_event() {
+async fn review_capture_prompt_forwards_exact_text() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    // Open the preset selection popup
-    chat.open_review_popup();
-
-    // Move selection down to the fourth item: "Custom review instructions"
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    // Activate
+    let raw_text = "  first line\r\n\tCafe\u{301}!?  ";
+    chat.open_bug_capture_prompt();
+    chat.handle_paste(raw_text.to_string());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    // Drain events and ensure we saw the OpenReviewCustomPrompt request
-    let mut found = false;
-    while let Ok(ev) = rx.try_recv() {
-        if let AppEvent::OpenReviewCustomPrompt = ev {
-            found = true;
-            break;
+    match rx.try_recv().expect("expected bug capture command") {
+        AppEvent::CodexOp(AppCommand::BugCreate { raw_text: actual }) => {
+            assert_eq!(actual, raw_text);
         }
+        other => panic!("unexpected app event: {other:?}"),
     }
-    assert!(found, "expected OpenReviewCustomPrompt event to be sent");
 }
 
 /// The commit picker shows only commit subjects (no timestamps).
@@ -1067,23 +1058,7 @@ async fn review_popup_custom_prompt_action_sends_event() {
 async fn review_commit_picker_shows_subjects_without_timestamps() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    // Open the Review presets parent popup.
-    chat.open_review_popup();
-
-    // Show commit picker with synthetic entries.
-    let entries = vec![
-        CommitLogEntry {
-            sha: "1111111deadbeef".to_string(),
-            timestamp: 0,
-            subject: "Add new feature X".to_string(),
-        },
-        CommitLogEntry {
-            sha: "2222222cafebabe".to_string(),
-            timestamp: 0,
-            subject: "Fix bug Y".to_string(),
-        },
-    ];
-    super::show_review_commit_picker_with_entries(&mut chat, entries);
+    chat.open_bug_capture_prompt();
 
     // Render the bottom pane and inspect the lines for subjects and absence of time words.
     let width = 72;
@@ -1106,10 +1081,9 @@ async fn review_commit_picker_shows_subjects_without_timestamps() {
     }
 
     assert!(
-        blob.contains("Add new feature X"),
-        "expected subject in output"
+        blob.contains("Capture audit"),
+        "expected capture prompt title in output"
     );
-    assert!(blob.contains("Fix bug Y"), "expected subject in output");
 
     // Ensure no relative-time phrasing is present.
     let lowered = blob.to_lowercase();
@@ -1119,47 +1093,26 @@ async fn review_commit_picker_shows_subjects_without_timestamps() {
             && !lowered.contains(" minute")
             && !lowered.contains(" hour")
             && !lowered.contains(" day"),
-        "expected no relative time in commit picker output: {blob:?}"
+        "expected no relative time in capture prompt output: {blob:?}"
     );
 }
 
-/// Submitting the custom prompt view sends Op::Review with the typed prompt
-/// and uses the same text for the user-facing hint.
+/// Empty capture input is forwarded without local normalization so the server can
+/// enforce the authoritative rejection rule.
 #[tokio::test]
-async fn custom_prompt_submit_sends_review_op() {
+async fn review_capture_prompt_forwards_empty_text() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.show_review_custom_prompt();
-    // Paste prompt text via ChatWidget handler, then submit
-    chat.handle_paste("  please audit dependencies  ".to_string());
+    chat.open_bug_capture_prompt();
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    // Expect AppEvent::CodexOp(Op::Review { .. }) with trimmed prompt
     let evt = rx.try_recv().expect("expected one app event");
     match evt {
-        AppEvent::CodexOp(Op::Review { target }) => {
-            assert_eq!(
-                target,
-                ReviewTarget::Custom {
-                    instructions: "please audit dependencies".to_string(),
-                }
-            );
+        AppEvent::CodexOp(AppCommand::BugCreate { raw_text }) => {
+            assert!(raw_text.is_empty());
         }
         other => panic!("unexpected app event: {other:?}"),
     }
-}
-
-/// Hitting Enter on an empty custom prompt view does not submit.
-#[tokio::test]
-async fn custom_prompt_enter_empty_does_not_send() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    chat.show_review_custom_prompt();
-    // Enter without any text
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    // No AppEvent::CodexOp should be sent
-    assert!(rx.try_recv().is_err(), "no app event should be sent");
 }
 
 // Snapshot test: interrupting a running exec finalizes the active cell with a red ✗
@@ -1333,70 +1286,18 @@ async fn interrupted_turn_pending_steers_message_snapshot() {
     assert_chatwidget_snapshot!("interrupted_turn_pending_steers_message", info);
 }
 
-/// Opening custom prompt from the review popup, pressing Esc returns to the
-/// parent popup, pressing Esc again dismisses all panels (back to normal mode).
+/// The one-shot capture prompt dismisses back to the normal composer.
 #[tokio::test]
-async fn review_custom_prompt_escape_navigates_back_then_dismisses() {
+async fn review_capture_prompt_escape_dismisses() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    // Open the Review presets parent popup.
-    chat.open_review_popup();
-
-    // Open the custom prompt submenu (child view) directly.
-    chat.show_review_custom_prompt();
-
-    // Verify child view is on top.
+    chat.open_bug_capture_prompt();
     let header = render_bottom_first_row(&chat, /*width*/ 60);
     assert!(
-        header.contains("Custom review instructions"),
-        "expected custom prompt view header: {header:?}"
+        header.contains("Capture audit"),
+        "expected capture prompt header: {header:?}"
     );
 
-    // Esc once: child view closes, parent (review presets) remains.
-    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    let header = render_bottom_first_row(&chat, /*width*/ 60);
-    assert!(
-        header.contains("Select a review preset"),
-        "expected to return to parent review popup: {header:?}"
-    );
-
-    // Esc again: parent closes; back to normal composer state.
-    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(
-        chat.is_normal_backtrack_mode(),
-        "expected to be back in normal composer mode"
-    );
-}
-
-/// Opening base-branch picker from the review popup, pressing Esc returns to the
-/// parent popup, pressing Esc again dismisses all panels (back to normal mode).
-#[tokio::test]
-async fn review_branch_picker_escape_navigates_back_then_dismisses() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    // Open the Review presets parent popup.
-    chat.open_review_popup();
-
-    // Open the branch picker submenu (child view). Using a temp cwd with no git repo is fine.
-    let cwd = std::env::temp_dir();
-    chat.show_review_branch_picker(&cwd).await;
-
-    // Verify child view header.
-    let header = render_bottom_first_row(&chat, /*width*/ 60);
-    assert!(
-        header.contains("Select a base branch"),
-        "expected branch picker header: {header:?}"
-    );
-
-    // Esc once: child view closes, parent remains.
-    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    let header = render_bottom_first_row(&chat, /*width*/ 60);
-    assert!(
-        header.contains("Select a review preset"),
-        "expected to return to parent review popup: {header:?}"
-    );
-
-    // Esc again: parent closes; back to normal composer state.
     chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(
         chat.is_normal_backtrack_mode(),

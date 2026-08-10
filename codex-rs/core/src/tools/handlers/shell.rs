@@ -44,7 +44,9 @@ use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::known_delta_store;
 use crate::tools::orchestrator::ToolOrchestrator;
+use crate::tools::runtimes::shell::KnownDeltaShellRequest;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
@@ -121,6 +123,7 @@ pub(super) struct RunExecLikeArgs {
     pub(super) track_validation_freshness: bool,
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
+    pub(super) force_fresh: bool,
 }
 
 pub(super) struct RunExecLikeResult {
@@ -1454,6 +1457,7 @@ async fn run_exec_like_with_exit_code_inner(
         track_validation_freshness,
         attempt_key,
         repair_notice,
+        force_fresh,
     } = args;
 
     let fs = turn_environment.environment.get_filesystem();
@@ -1512,6 +1516,53 @@ async fn run_exec_like_with_exit_code_inner(
     let attempt_key =
         attempt_key.map(|key| key.with_permission_context(&effective_permission_context));
 
+    let known_delta = if turn.config.features.enabled(Feature::KnownDeltaStore)
+        && !focused_validation
+        && !exec_params.command.is_empty()
+    {
+        if let Some(identity) = known_delta_store::immutable_git_show_identity(
+            &exec_params.cwd,
+            &exec_params.command[0],
+            &exec_params.command[1..],
+        )
+        .await
+        {
+            let candidate =
+                known_delta_store::lookup(turn.config.codex_home.as_path(), &identity).await;
+            let hit_output = if !force_fresh
+                && let Some(candidate) = candidate.as_ref()
+                && candidate.reusable()
+            {
+                let artifact = known_delta_store::remint_task_handle(
+                    turn.config.codex_home.as_path(),
+                    &session.thread_id.to_string(),
+                    candidate,
+                )
+                .await;
+                if artifact.model_projection().2.is_none() {
+                    Some(known_delta_store::render_hit(candidate, &artifact))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Some(KnownDeltaShellRequest {
+                identity,
+                candidate,
+                hit_output,
+                force_fresh,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let known_delta_hit = known_delta
+        .as_ref()
+        .is_some_and(|request| request.hit_output.is_some());
+
     // Approval policy guard for explicit escalation in non-OnRequest modes.
     // Sticky turn permissions have already been approved, so they should
     // continue through the normal exec approval flow for the command.
@@ -1530,7 +1581,7 @@ async fn run_exec_like_with_exit_code_inner(
         )));
     }
 
-    if let Some(attempt_key) = attempt_key.as_ref() {
+    if !known_delta_hit && let Some(attempt_key) = attempt_key.as_ref() {
         session
             .services
             .command_execution
@@ -1634,6 +1685,7 @@ async fn run_exec_like_with_exit_code_inner(
             .permissions_preapproved,
         justification: exec_params.justification.clone(),
         exec_approval_requirement,
+        known_delta: known_delta.clone(),
     };
     let mut orchestrator = ToolOrchestrator::new();
     let mut runtime = ShellRuntime::for_shell_command(shell_runtime_backend);
@@ -1653,9 +1705,43 @@ async fn run_exec_like_with_exit_code_inner(
         )
         .await
         .map(|result| result.output);
+    if !known_delta_hit && let Some(known_delta) = known_delta.as_ref() {
+        match &out {
+            Ok(output) if is_complete_success(output) => {
+                let _ = known_delta_store::record_success(
+                    turn.config.codex_home.as_path(),
+                    &known_delta.identity,
+                    known_delta.candidate.as_ref(),
+                    output.aggregated_output.text.as_bytes(),
+                    output.duration,
+                )
+                .await;
+            }
+            Ok(output) if output.aggregated_output.truncated_after_lines.is_some() => {}
+            Err(_) if known_delta.force_fresh => {
+                known_delta_store::record_contradictory_failure(
+                    turn.config.codex_home.as_path(),
+                    &known_delta.identity,
+                    known_delta.candidate.is_some(),
+                )
+                .await;
+            }
+            Ok(_) if known_delta.force_fresh => {
+                known_delta_store::record_contradictory_failure(
+                    turn.config.codex_home.as_path(),
+                    &known_delta.identity,
+                    known_delta.candidate.is_some(),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
     let exit_code = out.as_ref().ok().map(|output| output.exit_code);
     let retry_exit_code = retry_exit_code(&out);
-    if let (Some(attempt_key), Some(retry_exit_code)) = (attempt_key.as_ref(), retry_exit_code) {
+    if !known_delta_hit
+        && let (Some(attempt_key), Some(retry_exit_code)) = (attempt_key.as_ref(), retry_exit_code)
+    {
         session
             .services
             .command_execution
@@ -1682,18 +1768,19 @@ async fn run_exec_like_with_exit_code_inner(
             &output.aggregated_output.text,
         )
     });
-    let raw_output_artifact = if let (Some(_attempt_key), Ok(output)) = (&attempt_key, &out) {
-        Some(
-            create_raw_output_artifact(
-                turn.config.codex_home.as_path(),
-                &session.thread_id.to_string(),
-                output.aggregated_output.text.as_bytes(),
+    let raw_output_artifact =
+        if !known_delta_hit && let (Some(_attempt_key), Ok(output)) = (&attempt_key, &out) {
+            Some(
+                create_raw_output_artifact(
+                    turn.config.codex_home.as_path(),
+                    &session.thread_id.to_string(),
+                    output.aggregated_output.text.as_bytes(),
+                )
+                .await,
             )
-            .await,
-        )
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let finish_result = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
         .await;
@@ -1744,6 +1831,12 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
         Err(ToolError::Denied(_)) => None,
         Err(ToolError::Rejected(_)) => Some(-1),
     }
+}
+
+fn is_complete_success(output: &ExecToolCallOutput) -> bool {
+    output.exit_code == 0
+        && !output.timed_out
+        && output.aggregated_output.truncated_after_lines.is_none()
 }
 
 fn insert_metadata_before_output(content: &mut String, metadata: &str) {

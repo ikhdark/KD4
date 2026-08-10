@@ -457,8 +457,8 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
     let remote_url = "https://example.com/remote-only.png".to_string();
     chat.set_remote_image_urls(vec![remote_url.clone()]);
 
-    chat.open_review_popup();
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    chat.open_bug_capture_prompt();
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
     assert_eq!(chat.remote_image_urls(), vec![remote_url]);
     assert_no_submit_op(&mut op_rx);

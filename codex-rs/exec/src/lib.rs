@@ -25,9 +25,6 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ReviewStartParams;
-use codex_app_server_protocol::ReviewStartResponse;
-use codex_app_server_protocol::ReviewTarget as ApiReviewTarget;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
@@ -49,7 +46,6 @@ use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
-use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_config::cloud_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
@@ -168,9 +164,7 @@ enum InitialOperation {
         items: Vec<UserInput>,
         output_schema: Option<Value>,
     },
-    Review {
-        review_request: ReviewRequest,
-    },
+    Review,
 }
 
 enum StdinPromptBehavior {
@@ -733,7 +727,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         (Some(ExecCommand::Review(review_cli)), _, _) => {
             let review_request = build_review_request(review_cli)?;
             let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
-            (InitialOperation::Review { review_request }, summary)
+            (InitialOperation::Review, summary)
         }
         (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
             let prompt_arg = args
@@ -915,30 +909,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             info!("Sent prompt with event ID: {task_id}");
             task_id
         }
-        InitialOperation::Review { review_request } => {
-            let response: ReviewStartResponse = send_request_with_response(
-                &client,
-                ClientRequest::ReviewStart {
-                    request_id: request_ids.next(),
-                    params: ReviewStartParams {
-                        thread_id: primary_thread_id_for_span.clone(),
-                        target: review_target_to_api(review_request.target),
-                        delivery: None,
-                    },
-                },
-                "review/start",
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
-            let _ = event_processor.process_server_notification(ServerNotification::TurnStarted(
-                TurnStartedNotification {
-                    thread_id: response.review_thread_id.clone(),
-                    turn: response.turn.clone(),
-                },
+        InitialOperation::Review => {
+            return Err(anyhow::anyhow!(
+                "review requests are not available through the app-server protocol"
             ));
-            let task_id = response.turn.id;
-            info!("Sent review request with event ID: {task_id}");
-            task_id
         }
     };
     exec_span.record("turn.id", task_id.as_str());
@@ -1229,15 +1203,6 @@ fn session_configured_from_thread_resume_response(
         response.cwd.clone(),
         response.reasoning_effort.clone(),
     )
-}
-
-fn review_target_to_api(target: ReviewTarget) -> ApiReviewTarget {
-    match target {
-        ReviewTarget::UncommittedChanges => ApiReviewTarget::UncommittedChanges,
-        ReviewTarget::BaseBranch { branch } => ApiReviewTarget::BaseBranch { branch },
-        ReviewTarget::Commit { sha, title } => ApiReviewTarget::Commit { sha, title },
-        ReviewTarget::Custom { instructions } => ApiReviewTarget::Custom { instructions },
-    }
 }
 
 #[expect(

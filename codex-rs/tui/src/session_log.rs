@@ -197,6 +197,15 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
             });
             LOGGER.write_json_line(value);
         }
+        AppEvent::CodexOp(AppCommand::BugCreate { .. }) => {
+            let value = json!({
+                "ts": now_ts(),
+                "dir": "to_tui",
+                "kind": "app_event",
+                "variant": "BugCreate",
+            });
+            LOGGER.write_json_line(value);
+        }
         // Noise or control flow – record variant only
         other => {
             let value = json!({
@@ -214,7 +223,17 @@ pub(crate) fn log_outbound_op(op: &AppCommand) {
     if !LOGGER.is_enabled() {
         return;
     }
+    // Bug reports are deliberately excluded from command/session logs. The
+    // durable bug database and isolated classifier request are their only raw
+    // text sinks.
+    if !outbound_op_is_loggable(op) {
+        return;
+    }
     write_record("from_tui", "op", op);
+}
+
+fn outbound_op_is_loggable(op: &AppCommand) -> bool {
+    !matches!(op, AppCommand::BugCreate { .. })
 }
 
 pub(crate) fn log_session_end() {
@@ -240,4 +259,16 @@ where
         "payload": obj,
     });
     LOGGER.write_json_line(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bug_report_text_is_excluded_from_outbound_session_logs() {
+        let op = AppCommand::bug_create("private report text".to_string());
+
+        assert!(!outbound_op_is_loggable(&op));
+    }
 }

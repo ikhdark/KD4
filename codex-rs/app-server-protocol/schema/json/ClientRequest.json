@@ -137,6 +137,26 @@
       },
       "type": "object"
     },
+    "AppsReadParams": {
+      "description": "EXPERIMENTAL - read metadata for specific apps/connectors.",
+      "properties": {
+        "appIds": {
+          "description": "App ids to read. The server accepts at most 100 ids and deduplicates repeated ids while preserving their first-request order.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "includeTools": {
+          "description": "When true, include display-only public tool summaries in the returned metadata.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "appIds"
+      ],
+      "type": "object"
+    },
     "AskForApproval": {
       "oneOf": [
         {
@@ -185,6 +205,22 @@
           "type": "object"
         }
       ]
+    },
+    "BugCreateParams": {
+      "description": "Exact decoded report text. The server accepts no attachments or turn data.",
+      "properties": {
+        "rawText": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "rawText",
+        "threadId"
+      ],
+      "type": "object"
     },
     "ByteRange": {
       "properties": {
@@ -3173,131 +3209,6 @@
         }
       ]
     },
-    "ReviewDelivery": {
-      "enum": [
-        "inline",
-        "detached"
-      ],
-      "type": "string"
-    },
-    "ReviewStartParams": {
-      "properties": {
-        "delivery": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReviewDelivery"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Where to run the review: inline (default) on the current thread or detached on a new thread (returned in `reviewThreadId`)."
-        },
-        "target": {
-          "$ref": "#/definitions/ReviewTarget"
-        },
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "target",
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "ReviewTarget": {
-      "oneOf": [
-        {
-          "description": "Review the working tree: staged, unstaged, and untracked files.",
-          "properties": {
-            "type": {
-              "enum": [
-                "uncommittedChanges"
-              ],
-              "title": "UncommittedChangesReviewTargetType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "UncommittedChangesReviewTarget",
-          "type": "object"
-        },
-        {
-          "description": "Review changes between the current branch and the given base branch.",
-          "properties": {
-            "branch": {
-              "type": "string"
-            },
-            "type": {
-              "enum": [
-                "baseBranch"
-              ],
-              "title": "BaseBranchReviewTargetType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "branch",
-            "type"
-          ],
-          "title": "BaseBranchReviewTarget",
-          "type": "object"
-        },
-        {
-          "description": "Review the changes introduced by a specific commit.",
-          "properties": {
-            "sha": {
-              "type": "string"
-            },
-            "title": {
-              "description": "Optional human-readable label (e.g., commit subject) for UIs.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "type": {
-              "enum": [
-                "commit"
-              ],
-              "title": "CommitReviewTargetType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sha",
-            "type"
-          ],
-          "title": "CommitReviewTarget",
-          "type": "object"
-        },
-        {
-          "description": "Arbitrary instructions, equivalent to the old free-form prompt.",
-          "properties": {
-            "instructions": {
-              "type": "string"
-            },
-            "type": {
-              "enum": [
-                "custom"
-              ],
-              "title": "CustomReviewTargetType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "instructions",
-            "type"
-          ],
-          "title": "CustomReviewTarget",
-          "type": "object"
-        }
-      ]
-    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -5773,6 +5684,30 @@
         },
         "method": {
           "enum": [
+            "app/read"
+          ],
+          "title": "App/readRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AppsReadParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "App/readRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
             "app/installed"
           ],
           "title": "App/installedRequestMethod",
@@ -6157,13 +6092,13 @@
         },
         "method": {
           "enum": [
-            "review/start"
+            "bug/create"
           ],
-          "title": "Review/startRequestMethod",
+          "title": "Bug/createRequestMethod",
           "type": "string"
         },
         "params": {
-          "$ref": "#/definitions/ReviewStartParams"
+          "$ref": "#/definitions/BugCreateParams"
         }
       },
       "required": [
@@ -6171,7 +6106,7 @@
         "method",
         "params"
       ],
-      "title": "Review/startRequest",
+      "title": "Bug/createRequest",
       "type": "object"
     },
     {

@@ -33,6 +33,7 @@ async fn approval_key_includes_environment_id() {
             bypass_sandbox: false,
             proposed_execpolicy_amendment: None,
         },
+        known_delta: None,
     };
     let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
     let original_key = runtime.approval_keys(&request);
@@ -80,6 +81,7 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
             bypass_sandbox: false,
             proposed_execpolicy_amendment: None,
         },
+        known_delta: None,
     };
     let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
 

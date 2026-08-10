@@ -948,15 +948,6 @@ pub(crate) enum AppEvent {
     /// Re-open the permissions presets popup.
     OpenPermissionsPopup,
 
-    /// Open the branch picker option from the review popup.
-    OpenReviewBranchPicker(PathBuf),
-
-    /// Open the commit picker option from the review popup.
-    OpenReviewCommitPicker(PathBuf),
-
-    /// Open the custom prompt option from the review popup.
-    OpenReviewCustomPrompt,
-
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {
         text: String,

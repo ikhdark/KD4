@@ -1,12 +1,31 @@
 use super::*;
+use codex_core::CodexResponsesMetadata;
+use codex_core::ModelClient;
+use codex_core::Prompt;
+use codex_core::ResponseEvent;
+use codex_features::Feature;
+use codex_login::auth::AgentIdentityAuthPolicy;
+use codex_model_provider_info::ModelProviderInfo;
+use codex_otel::SessionTelemetry;
+use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_rollout_trace::InferenceTraceContext;
+use codex_state::BugClaim;
+use codex_state::BugClassification;
+use codex_state::BugCreateParams as StateBugCreateParams;
+use codex_state::BugFailureCategory;
+use codex_state::BugStore;
+use futures::StreamExt;
 use indexmap::IndexMap;
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
@@ -86,6 +105,7 @@ pub(crate) struct TurnRequestProcessor {
     thread_watch_manager: ThreadWatchManager,
     thread_list_state_permit: Arc<Semaphore>,
     skills_watcher: Arc<SkillsWatcher>,
+    bug_worker_shutdown: CancellationToken,
 }
 
 fn map_additional_context(
@@ -200,6 +220,7 @@ impl TurnRequestProcessor {
         thread_watch_manager: ThreadWatchManager,
         thread_list_state_permit: Arc<Semaphore>,
         skills_watcher: Arc<SkillsWatcher>,
+        bug_worker_shutdown: CancellationToken,
     ) -> Self {
         Self {
             auth_manager,
@@ -214,6 +235,7 @@ impl TurnRequestProcessor {
             thread_watch_manager,
             thread_list_state_permit,
             skills_watcher,
+            bug_worker_shutdown,
         }
     }
 
@@ -341,14 +363,78 @@ impl TurnRequestProcessor {
         ))
     }
 
-    pub(crate) async fn review_start(
+    pub(crate) async fn bug_create(
         &self,
-        request_id: &ConnectionRequestId,
-        params: ReviewStartParams,
+        params: BugCreateParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.review_start_inner(request_id, params)
+        if params.raw_text.trim().is_empty() {
+            return Err(invalid_request("bug report text must not be empty"));
+        }
+        // Loading is validation only: no turn is created and the thread is not
+        // changed or waited on. The report's lifecycle belongs to SQLite.
+        let (_, thread) = self.load_thread(&params.thread_id).await?;
+        let snapshot = thread.config_snapshot().await;
+        let models_manager = self.thread_manager.get_models_manager();
+        let model_info = models_manager
+            .get_model_info(
+                snapshot.model.as_str(),
+                &self.config.to_models_manager_config(),
+            )
+            .await;
+        let provider = self
+            .config
+            .model_providers
+            .get(&snapshot.model_provider_id)
+            .cloned()
+            .ok_or_else(|| internal_error("thread model provider is not configured"))?;
+        let classifier = BugClassifierContext {
+            auth_manager: Arc::clone(&self.auth_manager),
+            config: Arc::clone(&self.config),
+            provider,
+            provider_id: snapshot.model_provider_id.clone(),
+            requested_model: snapshot.model.clone(),
+            model_info,
+            session_source: snapshot.session_source.clone(),
+            originator: snapshot.originator.clone(),
+            shutdown: self.bug_worker_shutdown.clone(),
+        };
+        let cwd_path = self.config.cwd.to_path_buf();
+        let cwd = cwd_path.to_string_lossy().into_owned();
+        let repository_root = codex_git_utils::get_git_repo_root(cwd_path.as_path())
+            .map(|path| path.to_string_lossy().into_owned());
+        let git_commit = codex_git_utils::get_head_commit_hash(cwd_path.as_path())
             .await
-            .map(|()| None)
+            .map(|sha| sha.0);
+        let store = BugStore::open(self.config.sqlite_home.as_path())
+            .await
+            .map_err(|_| internal_error("failed to persist bug report"))?;
+        let created = store
+            .create(StateBugCreateParams {
+                raw_text: &params.raw_text,
+                thread_id: &params.thread_id,
+                cwd: Some(&cwd),
+                repository_root: repository_root.as_deref(),
+                git_commit: git_commit.as_deref(),
+            })
+            .await
+            .map_err(|_| internal_error("failed to persist bug report"))?;
+        let response = BugCreateResponse {
+            id: created.id,
+            display_id: created.display_id,
+            status: "pending".to_string(),
+            durable_save_result: true,
+        };
+        let created_id = created.id;
+        tokio::spawn(async move {
+            let Ok(Some(new_claim)) = store.claim_by_id(created_id).await else {
+                return;
+            };
+            classify_bug_claim(&store, &classifier, new_claim).await;
+            if let Ok(Some(older_claim)) = store.claim_next_older(created_id).await {
+                classify_bug_claim(&store, &classifier, older_claim).await;
+            }
+        });
+        Ok(Some(response.into()))
     }
 
     fn track_error_response(
@@ -416,57 +502,6 @@ impl TurnRequestProcessor {
         }
 
         collaboration_mode
-    }
-
-    fn review_request_from_target(
-        target: ApiReviewTarget,
-    ) -> Result<(ReviewRequest, String), JSONRPCErrorError> {
-        let cleaned_target = match target {
-            ApiReviewTarget::UncommittedChanges => ApiReviewTarget::UncommittedChanges,
-            ApiReviewTarget::BaseBranch { branch } => {
-                let branch = branch.trim().to_string();
-                if branch.is_empty() {
-                    return Err(invalid_request("branch must not be empty".to_string()));
-                }
-                ApiReviewTarget::BaseBranch { branch }
-            }
-            ApiReviewTarget::Commit { sha, title } => {
-                let sha = sha.trim().to_string();
-                if sha.is_empty() {
-                    return Err(invalid_request("sha must not be empty".to_string()));
-                }
-                let title = title
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty());
-                ApiReviewTarget::Commit { sha, title }
-            }
-            ApiReviewTarget::Custom { instructions } => {
-                let trimmed = instructions.trim().to_string();
-                if trimmed.is_empty() {
-                    return Err(invalid_request(
-                        "instructions must not be empty".to_string(),
-                    ));
-                }
-                ApiReviewTarget::Custom {
-                    instructions: trimmed,
-                }
-            }
-        };
-
-        let core_target = match cleaned_target {
-            ApiReviewTarget::UncommittedChanges => CoreReviewTarget::UncommittedChanges,
-            ApiReviewTarget::BaseBranch { branch } => CoreReviewTarget::BaseBranch { branch },
-            ApiReviewTarget::Commit { sha, title } => CoreReviewTarget::Commit { sha, title },
-            ApiReviewTarget::Custom { instructions } => CoreReviewTarget::Custom { instructions },
-        };
-
-        let hint = codex_core::review_prompts::user_facing_hint(&core_target);
-        let review_request = ReviewRequest {
-            target: core_target,
-            user_facing_hint: Some(hint.clone()),
-        };
-
-        Ok((review_request, hint))
     }
 
     async fn request_trace_context(
@@ -1209,221 +1244,6 @@ impl TurnRequestProcessor {
         Ok(Some(ThreadRealtimeStopResponse::default()))
     }
 
-    fn build_review_turn(turn_id: String, display_text: &str) -> Turn {
-        let items = if display_text.is_empty() {
-            Vec::new()
-        } else {
-            vec![ThreadItem::UserMessage {
-                id: turn_id.clone(),
-                client_id: None,
-                content: vec![V2UserInput::Text {
-                    text: display_text.to_string(),
-                    // Review prompt display text is synthesized; no UI element ranges to preserve.
-                    text_elements: Vec::new(),
-                }],
-            }]
-        };
-
-        Turn {
-            id: turn_id,
-            items,
-            items_view: TurnItemsView::NotLoaded,
-            error: None,
-            status: TurnStatus::InProgress,
-            started_at: None,
-            completed_at: None,
-            duration_ms: None,
-            reasoning_policy_history: None,
-        }
-    }
-
-    async fn emit_review_started(
-        &self,
-        request_id: &ConnectionRequestId,
-        turn: Turn,
-        review_thread_id: String,
-    ) {
-        let response = ReviewStartResponse {
-            turn,
-            review_thread_id,
-        };
-        self.outgoing
-            .send_response(request_id.clone(), response)
-            .await;
-    }
-
-    async fn start_inline_review(
-        &self,
-        request_id: &ConnectionRequestId,
-        parent_thread: Arc<CodexThread>,
-        review_request: ReviewRequest,
-        display_text: &str,
-        parent_thread_id: String,
-    ) -> std::result::Result<(), JSONRPCErrorError> {
-        let turn_id = self
-            .submit_core_op(
-                request_id,
-                parent_thread.as_ref(),
-                Op::Review { review_request },
-            )
-            .await
-            .map_err(|err| internal_error(format!("failed to start review: {err}")))?;
-        let turn = Self::build_review_turn(turn_id, display_text);
-        self.emit_review_started(request_id, turn, parent_thread_id)
-            .await;
-        Ok(())
-    }
-
-    async fn start_detached_review(
-        &self,
-        request_id: &ConnectionRequestId,
-        parent_thread_id: ThreadId,
-        parent_thread: Arc<CodexThread>,
-        review_request: ReviewRequest,
-        display_text: &str,
-    ) -> std::result::Result<(), JSONRPCErrorError> {
-        parent_thread.ensure_rollout_materialized().await;
-        parent_thread.flush_rollout().await.map_err(|err| {
-            internal_error(format!(
-                "failed to flush parent thread {parent_thread_id}: {err}"
-            ))
-        })?;
-        let parent_history = parent_thread
-            .load_history(/*include_archived*/ true)
-            .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to load parent thread {parent_thread_id}: {err}"
-                ))
-            })?;
-
-        let mut config = self.config.as_ref().clone();
-        if let Some(review_model) = &config.review_model {
-            config.model = Some(review_model.clone());
-        }
-
-        let NewThread {
-            thread_id,
-            thread: review_thread,
-            ..
-        } = self
-            .thread_manager
-            .fork_thread_from_history(
-                ForkSnapshot::Interrupted,
-                config.clone(),
-                InitialHistory::Resumed(ResumedHistory {
-                    conversation_id: parent_thread_id,
-                    history: Arc::new(parent_history.items),
-                    rollout_path: parent_thread.rollout_path(),
-                }),
-                /*thread_source*/ None,
-                self.request_trace_context(request_id).await,
-                /*supports_openai_form_elicitation*/ false,
-            )
-            .await
-            .map_err(|err| {
-                internal_error(format!("error creating detached review thread: {err}"))
-            })?;
-
-        log_listener_attach_result(
-            self.ensure_conversation_listener(
-                thread_id,
-                request_id.connection_id,
-                /*raw_events_enabled*/ false,
-            )
-            .await,
-            thread_id,
-            request_id.connection_id,
-            "review thread",
-        );
-
-        let fallback_provider = self.config.model_provider_id.as_str();
-        match review_thread
-            .read_thread(
-                /*include_archived*/ true, /*include_history*/ false,
-            )
-            .await
-        {
-            Ok(stored_thread) => {
-                let (mut thread, _) =
-                    thread_from_stored_thread(stored_thread, fallback_provider, &self.config.cwd);
-                thread.session_id = review_thread.session_configured().session_id.to_string();
-                self.thread_watch_manager
-                    .upsert_thread_silently(thread.clone())
-                    .await;
-                thread.status = resolve_thread_status(
-                    self.thread_watch_manager
-                        .loaded_status_for_thread(&thread.id)
-                        .await,
-                    /*has_in_progress_turn*/ false,
-                );
-                let notif = thread_started_notification(thread);
-                self.outgoing
-                    .send_server_notification(ServerNotification::ThreadStarted(notif))
-                    .await;
-            }
-            Err(err) => {
-                tracing::warn!("failed to load summary for review thread {thread_id}: {err}");
-            }
-        }
-
-        let turn_id = self
-            .submit_core_op(
-                request_id,
-                review_thread.as_ref(),
-                Op::Review { review_request },
-            )
-            .await
-            .map_err(|err| {
-                internal_error(format!("failed to start detached review turn: {err}"))
-            })?;
-
-        let turn = Self::build_review_turn(turn_id, display_text);
-        let review_thread_id = thread_id.to_string();
-        self.emit_review_started(request_id, turn, review_thread_id)
-            .await;
-
-        Ok(())
-    }
-
-    async fn review_start_inner(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ReviewStartParams,
-    ) -> Result<(), JSONRPCErrorError> {
-        let ReviewStartParams {
-            thread_id,
-            target,
-            delivery,
-        } = params;
-
-        let (parent_thread_id, parent_thread) = self.load_thread(&thread_id).await?;
-        let (review_request, display_text) = Self::review_request_from_target(target)?;
-        match delivery.unwrap_or(ApiReviewDelivery::Inline).to_core() {
-            CoreReviewDelivery::Inline => {
-                self.start_inline_review(
-                    request_id,
-                    parent_thread,
-                    review_request,
-                    &display_text,
-                    thread_id,
-                )
-                .await?;
-            }
-            CoreReviewDelivery::Detached => {
-                self.start_detached_review(
-                    request_id,
-                    parent_thread_id,
-                    parent_thread,
-                    review_request,
-                    &display_text,
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-
     async fn turn_interrupt_inner(
         &self,
         request_id: &ConnectionRequestId,
@@ -1517,6 +1337,361 @@ impl TurnRequestProcessor {
         )
         .await
     }
+}
+
+const BUG_CLASSIFIER_SCHEMA_VERSION: &str = "bug-classification-v1";
+const BUG_CLASSIFIER_PROMPT_VERSION: &str = "bug-classifier-prompt-v1";
+const BUG_CLASSIFIER_INSTRUCTIONS: &str = "Classify the supplied bug report. Return only the requested JSON object. The summary may be abstractive. Every other populated field must quote exact source text through its evidence range. Do not infer facts that are not stated in the report.";
+
+#[derive(Clone)]
+struct BugClassifierContext {
+    auth_manager: Arc<AuthManager>,
+    config: Arc<Config>,
+    provider: ModelProviderInfo,
+    provider_id: String,
+    requested_model: String,
+    model_info: ModelInfo,
+    session_source: SessionSource,
+    originator: String,
+    shutdown: CancellationToken,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BugClassifierResult {
+    summary: String,
+    severity: Option<CitedFact>,
+    failure_mechanism: Option<CitedFact>,
+    affected_components: Vec<CitedFact>,
+    stated_cause: Option<CitedFact>,
+    required_repair: Option<CitedFact>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CitedFact {
+    value: String,
+    evidence: ByteEvidence,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ByteEvidence {
+    start_byte: usize,
+    end_byte: usize,
+    text: String,
+}
+
+struct ValidatedBugClassification {
+    summary: String,
+    severity: Option<String>,
+    failure_mechanism: Option<String>,
+    affected_components_json: String,
+    stated_cause: Option<String>,
+    required_repair: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BugClassificationFailure {
+    Cancelled,
+    Provider,
+    MalformedOutput,
+    Schema,
+    Grounding,
+}
+
+impl BugClassificationFailure {
+    fn category(self) -> BugFailureCategory {
+        match self {
+            Self::Cancelled => BugFailureCategory::Cancelled,
+            Self::Provider => BugFailureCategory::Provider,
+            Self::MalformedOutput => BugFailureCategory::MalformedOutput,
+            Self::Schema => BugFailureCategory::Schema,
+            Self::Grounding => BugFailureCategory::Grounding,
+        }
+    }
+}
+
+async fn classify_bug_claim(store: &BugStore, context: &BugClassifierContext, claim: BugClaim) {
+    match classify_bug_report(context, &claim.raw_text).await {
+        Ok(classification) => {
+            let normalized = BugClassification {
+                summary: &classification.summary,
+                severity: classification.severity.as_deref(),
+                failure_mechanism: classification.failure_mechanism.as_deref(),
+                affected_components_json: &classification.affected_components_json,
+                stated_cause: classification.stated_cause.as_deref(),
+                required_repair: classification.required_repair.as_deref(),
+                classifier_provider_id: &context.provider_id,
+                classifier_requested_model: &context.requested_model,
+                classifier_resolved_model: Some(context.model_info.slug.as_str()),
+                classifier_reasoning_effort: "low",
+                classifier_schema_version: BUG_CLASSIFIER_SCHEMA_VERSION,
+                classifier_prompt_version: BUG_CLASSIFIER_PROMPT_VERSION,
+            };
+            // A failed result commit deliberately leaves the claim in place until its lease
+            // expires; the consumed attempt must not be replayed immediately.
+            let _ = store
+                .commit_classification(claim.id, &claim.claim_token, normalized)
+                .await;
+        }
+        Err(failure) => {
+            let _ = store
+                .release_failure(claim.id, &claim.claim_token, failure.category())
+                .await;
+        }
+    }
+}
+
+async fn classify_bug_report(
+    context: &BugClassifierContext,
+    raw_text: &str,
+) -> Result<ValidatedBugClassification, BugClassificationFailure> {
+    let agent_identity_policy = if context.config.features.enabled(Feature::UseAgentIdentity) {
+        AgentIdentityAuthPolicy::ChatGptAuth
+    } else {
+        AgentIdentityAuthPolicy::JwtOnly
+    };
+    let model_client = ModelClient::new(
+        Some(Arc::clone(&context.auth_manager)),
+        agent_identity_policy,
+        ThreadId::new(),
+        context.provider.clone(),
+        context.session_source.clone(),
+        context.originator.clone(),
+        context.config.model_verbosity,
+        context
+            .config
+            .features
+            .enabled(Feature::EnableRequestCompression),
+        context.config.features.enabled(Feature::RuntimeMetrics),
+        None,
+        context.config.features.enabled(Feature::ItemIds),
+        context
+            .config
+            .features
+            .enabled(Feature::ConcurrentReasoningSummaries),
+        None,
+        context.config.http_client_factory(),
+    );
+
+    let mut prompt = Prompt::default();
+    prompt.input = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: raw_text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    prompt.base_instructions.text = BUG_CLASSIFIER_INSTRUCTIONS.to_string();
+    prompt.output_schema = Some(bug_classifier_schema());
+
+    let classifier_thread_id = ThreadId::new();
+    let telemetry = SessionTelemetry::new(
+        classifier_thread_id,
+        context.requested_model.as_str(),
+        context.model_info.slug.as_str(),
+        None,
+        None,
+        None,
+        "bug-classifier".to_string(),
+        false,
+        "bug-classifier".to_string(),
+        context.session_source.clone(),
+    );
+    let responses_metadata = CodexResponsesMetadata::new(
+        String::new(),
+        ThreadId::new().to_string(),
+        ThreadId::new().to_string(),
+        String::new(),
+    );
+    let inference_trace = InferenceTraceContext::disabled();
+    let mut session = model_client.new_session();
+    let mut stream = tokio::select! {
+        _ = context.shutdown.cancelled() => return Err(BugClassificationFailure::Cancelled),
+        result = session.stream(
+            &prompt,
+            &context.model_info,
+            &telemetry,
+            Some(ReasoningEffort::Low),
+            ReasoningSummary::None,
+            None,
+            &responses_metadata,
+            &inference_trace,
+        ) => result.map_err(|_| BugClassificationFailure::Provider)?,
+    };
+
+    let mut completed = false;
+    let mut output_count = 0usize;
+    let mut output = None;
+    loop {
+        let event = tokio::select! {
+            _ = context.shutdown.cancelled() => return Err(BugClassificationFailure::Cancelled),
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
+        match event.map_err(|_| BugClassificationFailure::Provider)? {
+            ResponseEvent::OutputItemDone(item) => {
+                output_count += 1;
+                if let ResponseItem::Message { role, content, .. } = item
+                    && role == "assistant"
+                    && let [ContentItem::OutputText { text }] = content.as_slice()
+                {
+                    output = Some(text.clone());
+                }
+            }
+            ResponseEvent::Completed { .. } => {
+                completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if !completed || output_count != 1 {
+        return Err(BugClassificationFailure::MalformedOutput);
+    }
+    let output = output.ok_or(BugClassificationFailure::MalformedOutput)?;
+    parse_bug_classification(&output, raw_text)
+}
+
+fn parse_bug_classification(
+    output: &str,
+    raw_text: &str,
+) -> Result<ValidatedBugClassification, BugClassificationFailure> {
+    let value: Value =
+        serde_json::from_str(output).map_err(|_| BugClassificationFailure::MalformedOutput)?;
+    let object = value.as_object().ok_or(BugClassificationFailure::Schema)?;
+    let expected = [
+        "summary",
+        "severity",
+        "failureMechanism",
+        "affectedComponents",
+        "statedCause",
+        "requiredRepair",
+    ];
+    if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
+        return Err(BugClassificationFailure::Schema);
+    }
+    let result: BugClassifierResult =
+        serde_json::from_value(value).map_err(|_| BugClassificationFailure::Schema)?;
+    if result.summary.trim().is_empty() {
+        return Err(BugClassificationFailure::Schema);
+    }
+
+    let severity = result
+        .severity
+        .map(|fact| normalize_severity(&fact, raw_text))
+        .transpose()?;
+    let failure_mechanism = result
+        .failure_mechanism
+        .map(|fact| validate_free_text_fact(&fact, raw_text))
+        .transpose()?;
+    let affected_components = result
+        .affected_components
+        .iter()
+        .map(|fact| validate_free_text_fact(fact, raw_text))
+        .collect::<Result<Vec<_>, _>>()?;
+    let stated_cause = result
+        .stated_cause
+        .map(|fact| validate_free_text_fact(&fact, raw_text))
+        .transpose()?;
+    let required_repair = result
+        .required_repair
+        .map(|fact| validate_free_text_fact(&fact, raw_text))
+        .transpose()?;
+    let affected_components_json = serde_json::to_string(&affected_components)
+        .map_err(|_| BugClassificationFailure::Schema)?;
+
+    Ok(ValidatedBugClassification {
+        summary: result.summary,
+        severity,
+        failure_mechanism,
+        affected_components_json,
+        stated_cause,
+        required_repair,
+    })
+}
+
+fn validate_free_text_fact(
+    fact: &CitedFact,
+    raw_text: &str,
+) -> Result<String, BugClassificationFailure> {
+    validate_evidence(&fact.evidence, raw_text)?;
+    if fact.value != fact.evidence.text {
+        return Err(BugClassificationFailure::Grounding);
+    }
+    Ok(fact.value.clone())
+}
+
+fn normalize_severity(
+    fact: &CitedFact,
+    raw_text: &str,
+) -> Result<String, BugClassificationFailure> {
+    validate_evidence(&fact.evidence, raw_text)?;
+    let normalized = fact.evidence.text.trim().to_ascii_lowercase();
+    if !matches!(normalized.as_str(), "critical" | "high" | "medium" | "low")
+        || fact.value != normalized
+    {
+        return Err(BugClassificationFailure::Grounding);
+    }
+    Ok(normalized)
+}
+
+fn validate_evidence(
+    evidence: &ByteEvidence,
+    raw_text: &str,
+) -> Result<(), BugClassificationFailure> {
+    if evidence.start_byte >= evidence.end_byte
+        || evidence.end_byte > raw_text.len()
+        || !raw_text.is_char_boundary(evidence.start_byte)
+        || !raw_text.is_char_boundary(evidence.end_byte)
+        || raw_text.get(evidence.start_byte..evidence.end_byte) != Some(evidence.text.as_str())
+    {
+        return Err(BugClassificationFailure::Grounding);
+    }
+    Ok(())
+}
+
+fn bug_classifier_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "severity", "failureMechanism", "affectedComponents", "statedCause", "requiredRepair"],
+        "properties": {
+            "summary": { "type": "string" },
+            "severity": { "anyOf": [{ "type": "null" }, cited_fact_schema()] },
+            "failureMechanism": { "anyOf": [{ "type": "null" }, cited_fact_schema()] },
+            "affectedComponents": { "type": "array", "items": cited_fact_schema() },
+            "statedCause": { "anyOf": [{ "type": "null" }, cited_fact_schema()] },
+            "requiredRepair": { "anyOf": [{ "type": "null" }, cited_fact_schema()] }
+        }
+    })
+}
+
+fn cited_fact_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["value", "evidence"],
+        "properties": {
+            "value": { "type": "string" },
+            "evidence": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["startByte", "endByte", "text"],
+                "properties": {
+                    "startByte": { "type": "integer", "minimum": 0 },
+                    "endByte": { "type": "integer", "minimum": 0 },
+                    "text": { "type": "string" }
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]

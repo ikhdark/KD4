@@ -17,6 +17,8 @@ use crate::sandboxing::execute_env;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::flat_tool_name;
+use crate::tools::known_delta_store::EvidenceCandidate;
+use crate::tools::known_delta_store::EvidenceIdentity;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::RuntimePathPrepends;
@@ -71,6 +73,15 @@ pub struct ShellRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
+    pub(crate) known_delta: Option<KnownDeltaShellRequest>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct KnownDeltaShellRequest {
+    pub(crate) identity: EvidenceIdentity,
+    pub(crate) candidate: Option<EvidenceCandidate>,
+    pub(crate) hit_output: Option<String>,
+    pub(crate) force_fresh: bool,
 }
 
 /// Selects `ShellRuntime` behavior for different callers.
@@ -247,6 +258,19 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
+        if let Some(hit_output) = req
+            .known_delta
+            .as_ref()
+            .and_then(|known_delta| known_delta.hit_output.as_ref())
+        {
+            return Ok(ExecToolCallOutput {
+                stdout: codex_protocol::exec_output::StreamOutput::new(hit_output.clone()),
+                aggregated_output: codex_protocol::exec_output::StreamOutput::new(
+                    hit_output.clone(),
+                ),
+                ..Default::default()
+            });
+        }
         let session_shell = ctx.session.user_shell();
         let shell = req
             .turn_environment

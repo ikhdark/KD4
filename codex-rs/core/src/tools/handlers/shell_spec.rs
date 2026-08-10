@@ -257,6 +257,12 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
     properties.extend(create_approval_parameters(
         options.exec_permission_approvals_enabled,
     ));
+    properties.insert(
+        "force_fresh".to_string(),
+        JsonSchema::boolean(Some(
+            "Execute without reusing prior immutable evidence.".to_string(),
+        )),
+    );
 
     let description = if cfg!(windows) {
         format!(
