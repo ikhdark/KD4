@@ -12,8 +12,11 @@
 //! Returned `io::Error` values still carry the detail needed by CLI/browser callers, while
 //! structured logs only emit explicitly reviewed fields plus redacted URL/error values.
 use std::io::Cursor;
+use std::io::Read;
 use std::io::Write;
 use std::io::{self};
+use std::net::SocketAddr;
+use std::net::TcpStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +27,9 @@ use std::time::Duration;
 use crate::auth::AuthDotJson;
 use crate::auth::AuthKeyringBackendKind;
 use crate::auth::save_auth;
-use crate::default_client::build_raw_auth_reqwest_client;
+use crate::callback_params::LoginCallbackResult;
+use crate::callback_params::login_callback_result_from_state;
+use crate::default_client::create_raw_auth_client;
 use crate::default_client::originator;
 use crate::outbound_proxy::AuthRouteConfig;
 use crate::pkce::PkceCodes;
@@ -74,7 +79,7 @@ pub struct ServerOptions {
     pub login_success_page: LoginSuccessPage,
     pub cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
     pub auth_keyring_backend_kind: AuthKeyringBackendKind,
-    pub auth_route_config: Option<AuthRouteConfig>,
+    pub auth_route_config: AuthRouteConfig,
 }
 
 impl ServerOptions {
@@ -85,7 +90,7 @@ impl ServerOptions {
         forced_chatgpt_workspace_id: Option<Vec<String>>,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
         auth_keyring_backend_kind: AuthKeyringBackendKind,
-        auth_route_config: Option<AuthRouteConfig>,
+        auth_route_config: AuthRouteConfig,
     ) -> Self {
         Self {
             codex_home,
@@ -108,13 +113,20 @@ impl ServerOptions {
 pub struct LoginServer {
     pub auth_url: String,
     pub actual_port: u16,
-    server_handle: tokio::task::JoinHandle<io::Result<()>>,
+    server_handle: tokio::task::JoinHandle<io::Result<LoginCallbackResult>>,
     shutdown_handle: ShutdownHandle,
 }
 
 impl LoginServer {
     /// Waits for the login callback loop to finish.
     pub async fn block_until_done(self) -> io::Result<()> {
+        self.block_until_done_with_callback_result()
+            .await
+            .map(|_| ())
+    }
+
+    /// Waits for login to finish and returns allowlisted callback metadata.
+    pub async fn block_until_done_with_callback_result(self) -> io::Result<LoginCallbackResult> {
         self.server_handle
             .await
             .map_err(|err| io::Error::other(format!("login server thread panicked: {err:?}")))?
@@ -198,6 +210,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         let shutdown_notify = shutdown_notify.clone();
         let server = server;
         tokio::spawn(async move {
+            let mut callback_result = LoginCallbackResult::default();
             let result = loop {
                 tokio::select! {
                     _ = shutdown_notify.notified() => {
@@ -225,7 +238,8 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                 let _ = tokio::task::spawn_blocking(move || req.respond(response)).await;
                                 None
                             }
-                            HandledRequest::RedirectWithHeader(header) => {
+                            HandledRequest::RedirectWithHeader { header, result } => {
+                                callback_result = result;
                                 let redirect = Response::empty(302).with_header(header);
                                 let _ = tokio::task::spawn_blocking(move || req.respond(redirect)).await;
                                 None
@@ -244,9 +258,9 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                     )
                                 })
                                 .await;
-                                Some(result)
+                                Some(result.map(|()| callback_result))
                             }
-                            HandledRequest::RedirectAndExit(header) => {
+                            HandledRequest::RedirectAndExit { header, result } => {
                                 match tokio::task::spawn_blocking(move || {
                                     send_response_with_disconnect(
                                         req,
@@ -265,7 +279,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                         warn!("hosted login redirect task failed: {err}");
                                     }
                                 }
-                                Some(Ok(()))
+                                Some(Ok(result))
                             }
                         };
 
@@ -294,8 +308,14 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
 /// Internal callback handling outcome.
 enum HandledRequest {
     Response(Response<Cursor<Vec<u8>>>),
-    RedirectWithHeader(Header),
-    RedirectAndExit(Header),
+    RedirectWithHeader {
+        header: Header,
+        result: LoginCallbackResult,
+    },
+    RedirectAndExit {
+        header: Header,
+        result: LoginCallbackResult,
+    },
     ResponseAndExit {
         headers: Vec<Header>,
         body: Vec<u8>,
@@ -329,7 +349,10 @@ async fn process_request(
             let has_code = params.get("code").is_some_and(|code| !code.is_empty());
             let has_state = params.get("state").is_some_and(|state| !state.is_empty());
             let has_error = params.get("error").is_some_and(|error| !error.is_empty());
-            let state_valid = params.get("state").map(String::as_str) == Some(state);
+            let callback_result = params
+                .get("state")
+                .and_then(|callback_state| login_callback_result_from_state(callback_state, state));
+            let state_valid = callback_result.is_some();
             info!(
                 path = %path,
                 has_code,
@@ -377,6 +400,7 @@ async fn process_request(
                     );
                 }
             };
+            let callback_result = callback_result.unwrap_or_default();
 
             match exchange_code_for_tokens(
                 &opts.issuer,
@@ -384,7 +408,7 @@ async fn process_request(
                 redirect_uri,
                 pkce,
                 &code,
-                opts.auth_route_config.as_ref(),
+                &opts.auth_route_config,
             )
             .await
             {
@@ -406,7 +430,7 @@ async fn process_request(
                         &opts.issuer,
                         &opts.client_id,
                         &tokens.id_token,
-                        opts.auth_route_config.as_ref(),
+                        &opts.auth_route_config,
                     )
                     .await
                     .ok();
@@ -438,34 +462,19 @@ async fn process_request(
                         opts.codex_streamlined_login,
                         &opts.login_success_page,
                     );
-                    let redirect = match redirect {
-                        LoginSuccessRedirect::Local(url) => match url::Url::parse(&url) {
-                            Ok(mut parsed) => {
-                                parsed.query_pairs_mut().append_pair("state", state);
-                                LoginSuccessRedirect::Local(parsed.to_string())
-                            }
-                            Err(_) => {
-                                return login_error_response(
-                                    "Sign-in completed but the local success URL was invalid.",
-                                    io::ErrorKind::InvalidData,
-                                    Some("redirect_failed"),
-                                    /*error_description*/ None,
-                                );
-                            }
-                        },
-                        hosted @ LoginSuccessRedirect::Hosted(_) => hosted,
-                    };
                     let url = match &redirect {
                         LoginSuccessRedirect::Local(url) | LoginSuccessRedirect::Hosted(url) => url,
                     };
                     match tiny_http::Header::from_bytes(&b"Location"[..], url.as_bytes()) {
                         Ok(header) => match redirect {
-                            LoginSuccessRedirect::Local(_) => {
-                                HandledRequest::RedirectWithHeader(header)
-                            }
-                            LoginSuccessRedirect::Hosted(_) => {
-                                HandledRequest::RedirectAndExit(header)
-                            }
+                            LoginSuccessRedirect::Local(_) => HandledRequest::RedirectWithHeader {
+                                header,
+                                result: callback_result,
+                            },
+                            LoginSuccessRedirect::Hosted(_) => HandledRequest::RedirectAndExit {
+                                header,
+                                result: callback_result,
+                            },
                         },
                         Err(_) => login_error_response(
                             "Sign-in completed but redirecting back to Codex failed.",
@@ -488,15 +497,6 @@ async fn process_request(
             }
         }
         "/success" => {
-            if parsed_url
-                .query_pairs()
-                .find(|(key, _)| key == "state")
-                .is_none_or(|(_, value)| value != state)
-            {
-                return HandledRequest::Response(
-                    Response::from_string("State mismatch").with_status_code(400),
-                );
-            }
             let use_streamlined_success = parsed_url
                 .query_pairs()
                 .any(|(key, value)| key == "codex_streamlined_login" && value == "true");
@@ -517,26 +517,14 @@ async fn process_request(
                 result: Ok(()),
             }
         }
-        "/cancel" => {
-            if parsed_url
-                .query_pairs()
-                .find(|(key, _)| key == "state")
-                .is_none_or(|(_, value)| value != state)
-            {
-                HandledRequest::Response(
-                    Response::from_string("State mismatch").with_status_code(400),
-                )
-            } else {
-                HandledRequest::ResponseAndExit {
-                    headers: Vec::new(),
-                    body: b"Login cancelled".to_vec(),
-                    result: Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "Login cancelled",
-                    )),
-                }
-            }
-        }
+        "/cancel" => HandledRequest::ResponseAndExit {
+            headers: Vec::new(),
+            body: b"Login cancelled".to_vec(),
+            result: Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Login cancelled",
+            )),
+        },
         _ => HandledRequest::Response(Response::from_string("Not Found").with_status_code(404)),
     }
 }
@@ -629,10 +617,28 @@ fn generate_state() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn send_cancel_request(port: u16) -> io::Result<()> {
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+    stream.write_all(b"GET /cancel HTTP/1.1\r\n")?;
+    stream.write_all(format!("Host: 127.0.0.1:{port}\r\n").as_bytes())?;
+    stream.write_all(b"Connection: close\r\n\r\n")?;
+
+    let mut buf = [0u8; 64];
+    let _ = stream.read(&mut buf);
+    Ok(())
+}
+
 fn bind_server(port: u16) -> io::Result<Server> {
     let preferred_bind_address = format!("127.0.0.1:{port}");
     let fallback_bind_address = format!("127.0.0.1:{FALLBACK_PORT}");
     let mut bind_address = preferred_bind_address.clone();
+    let mut cancel_attempted = false;
     let mut attempts = 0;
     let mut using_fallback_port = false;
     const MAX_ATTEMPTS: u32 = 10;
@@ -648,7 +654,16 @@ fn bind_server(port: u16) -> io::Result<Server> {
                     .map(|io_err| io_err.kind() == io::ErrorKind::AddrInUse)
                     .unwrap_or(false);
 
+                // If the address is in use, there may be another instance of the login server
+                // running. Attempt to cancel it and retry before falling back.
                 if is_addr_in_use {
+                    if !cancel_attempted && !using_fallback_port {
+                        cancel_attempted = true;
+                        if let Err(cancel_err) = send_cancel_request(port) {
+                            eprintln!("Failed to cancel previous login server: {cancel_err}");
+                        }
+                    }
+
                     thread::sleep(RETRY_DELAY);
 
                     if attempts >= MAX_ATTEMPTS {
@@ -762,8 +777,10 @@ fn redact_sensitive_url_parts(url: &mut url::Url) {
     url.set_query(Some(&redacted_query));
 }
 
-/// Redacts any URL attached to a reqwest transport error before it is logged or returned.
-fn redact_sensitive_error_url(mut err: reqwest::Error) -> reqwest::Error {
+/// Redacts any URL attached to an HTTP transport error before it is logged or returned.
+fn redact_sensitive_error_url(
+    mut err: codex_http_client::HttpError,
+) -> codex_http_client::HttpError {
     if let Some(url) = err.url_mut() {
         redact_sensitive_url_parts(url);
     }
@@ -795,7 +812,7 @@ pub(crate) async fn exchange_code_for_tokens(
     redirect_uri: &str,
     pkce: &PkceCodes,
     code: &str,
-    auth_route_config: Option<&AuthRouteConfig>,
+    auth_route_config: &AuthRouteConfig,
 ) -> io::Result<ExchangedTokens> {
     #[derive(serde::Deserialize)]
     struct TokenResponse {
@@ -806,7 +823,7 @@ pub(crate) async fn exchange_code_for_tokens(
 
     // The route selected for the issuer is reused for token exchange; the token endpoint path is
     // not resolved separately.
-    let client = build_raw_auth_reqwest_client(issuer.trim_end_matches('/'), auth_route_config)?;
+    let client = create_raw_auth_client(issuer.trim_end_matches('/'), auth_route_config)?;
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
     info!(
         issuer = %sanitize_url_for_logging(issuer),
@@ -1120,7 +1137,7 @@ pub(crate) async fn obtain_api_key(
     issuer: &str,
     client_id: &str,
     id_token: &str,
-    auth_route_config: Option<&AuthRouteConfig>,
+    auth_route_config: &AuthRouteConfig,
 ) -> io::Result<String> {
     // Token exchange for an API key access token
     #[derive(serde::Deserialize)]
@@ -1128,7 +1145,7 @@ pub(crate) async fn obtain_api_key(
         access_token: String,
     }
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
-    let client = build_raw_auth_reqwest_client(&token_endpoint, auth_route_config)?;
+    let client = create_raw_auth_client(&token_endpoint, auth_route_config)?;
     let resp = client
         .post(token_endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")

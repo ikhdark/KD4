@@ -737,6 +737,11 @@ client_request_definitions! {
         serialization: None,
         response: v2::AppsListResponse,
     },
+    AppsRead => "app/read" {
+        params: v2::AppsReadParams,
+        serialization: None,
+        response: v2::AppsReadResponse,
+    },
     AppsInstalled => "app/installed" {
         params: v2::AppsInstalledParams,
         serialization: None,
@@ -3062,6 +3067,29 @@ mod tests {
             }),
             serde_json::to_value(&request)?,
         );
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_read_apps() -> Result<()> {
+        let request: ClientRequest = serde_json::from_value(json!({
+            "method": "app/read",
+            "id": 9,
+            "params": {
+                "appIds": ["app-a", "app-b"]
+            }
+        }))?;
+
+        let ClientRequest::AppsRead {
+            request_id,
+            params,
+        } = request
+        else {
+            panic!("expected app/read request");
+        };
+        assert_eq!(request_id, RequestId::Integer(9));
+        assert_eq!(params.app_ids, ["app-a", "app-b"]);
+        assert!(!params.include_tools);
         Ok(())
     }
 

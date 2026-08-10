@@ -13,6 +13,7 @@ chrono = { workspace = true, features = ["serde"] }
 codex-backend-client = { workspace = true }
 codex-config = { workspace = true }
 codex-core = { workspace = true }
+codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }

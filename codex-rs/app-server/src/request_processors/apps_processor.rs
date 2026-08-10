@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_info::app_info_to_api;
+use crate::app_info::connector_metadata_to_api;
 
 mod installed;
 
@@ -44,6 +45,84 @@ impl AppsRequestProcessor {
         self.apps_list_inner(request_id, params)
             .await
             .map(|response| response.map(Into::into))
+    }
+
+    pub(crate) async fn apps_read(
+        &self,
+        params: AppsReadParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        const APP_READ_MAX_IDS: usize = 100;
+
+        let AppsReadParams {
+            app_ids,
+            include_tools: _,
+        } = params;
+        if app_ids.len() > APP_READ_MAX_IDS {
+            return Err(invalid_params(format!(
+                "app/read accepts at most {APP_READ_MAX_IDS} appIds"
+            )));
+        }
+
+        let mut seen_app_ids = HashSet::new();
+        let app_ids = app_ids
+            .into_iter()
+            .filter(|app_id| seen_app_ids.insert(app_id.clone()))
+            .collect::<Vec<_>>();
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let auth = self.auth_manager.auth().await;
+        if !config
+            .features
+            .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
+            || !self
+                .workspace_codex_plugins_enabled(&config, auth.as_ref())
+                .await
+        {
+            return Ok(Some(
+                AppsReadResponse {
+                    apps: Vec::new(),
+                    missing_app_ids: app_ids,
+                }
+                .into(),
+            ));
+        }
+
+        let loaded_plugins = self
+            .thread_manager
+            .plugins_manager()
+            .plugins_for_config(&config.plugins_config_input())
+            .await;
+        let connector_snapshot =
+            codex_connectors::ConnectorSnapshot::from_plugin_capability_summaries(
+                loaded_plugins.capability_summaries(),
+            );
+        let plugin_apps = connector_snapshot.connector_ids().to_vec();
+        let available_apps = connectors::list_all_connectors_with_options(
+            &config,
+            /*force_refetch*/ false,
+            &plugin_apps,
+        )
+        .await
+        .map_err(|err| internal_error(format!("failed to read app metadata: {err}")))?;
+        let mut available_apps = available_apps
+            .into_iter()
+            .map(|app| (app.id.clone(), app))
+            .collect::<HashMap<_, _>>();
+        let mut apps = Vec::new();
+        let mut missing_app_ids = Vec::new();
+        for app_id in app_ids {
+            match available_apps.remove(&app_id) {
+                Some(app) => apps.push(connector_metadata_to_api(app)),
+                None => missing_app_ids.push(app_id),
+            }
+        }
+
+        Ok(Some(
+            AppsReadResponse {
+                apps,
+                missing_app_ids,
+            }
+            .into(),
+        ))
     }
 
     async fn apps_list_inner(

@@ -1243,6 +1243,9 @@ impl MessageProcessor {
             ClientRequest::AppsList { params, .. } => {
                 self.apps_processor.apps_list(&request_id, params).await
             }
+            ClientRequest::AppsRead { params, .. } => {
+                self.apps_processor.apps_read(params).await
+            }
             ClientRequest::AppsInstalled { params, .. } => self
                 .apps_processor
                 .apps_installed(params)

@@ -3,6 +3,7 @@ use codex_app_server_protocol::AppInfo as ApiAppInfo;
 use codex_app_server_protocol::AppMetadata as ApiAppMetadata;
 use codex_app_server_protocol::AppReview as ApiAppReview;
 use codex_app_server_protocol::AppScreenshot as ApiAppScreenshot;
+use codex_app_server_protocol::ConnectorMetadata as ApiConnectorMetadata;
 use codex_connectors::AppBranding;
 use codex_connectors::AppInfo;
 use codex_connectors::AppMetadata;
@@ -49,6 +50,34 @@ pub(crate) fn app_info_to_api(app: AppInfo) -> ApiAppInfo {
         is_accessible,
         is_enabled,
         plugin_display_names,
+    }
+}
+
+/// Projects directory metadata into the narrower `app/read` response shape.
+pub(crate) fn connector_metadata_to_api(app: AppInfo) -> ApiConnectorMetadata {
+    let AppInfo {
+        id,
+        name,
+        description,
+        logo_url,
+        logo_url_dark,
+        distribution_channel,
+        install_url,
+        plugin_display_names,
+        ..
+    } = app;
+    ApiConnectorMetadata {
+        id,
+        name,
+        description,
+        icon_url: logo_url,
+        icon_url_dark: logo_url_dark,
+        distribution_channel,
+        install_url,
+        plugin_display_names,
+        // Directory listings do not carry public tool summaries. Returning metadata without the
+        // optional summaries preserves compatibility without triggering another request loop.
+        tool_summaries: None,
     }
 }
 

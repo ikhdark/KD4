@@ -159,6 +159,7 @@ async fn install_config_loaders_from_config(
     config_manager.replace_cloud_config_bundle_loader(
         Arc::clone(&auth_manager),
         config.chatgpt_base_url.clone(),
+        config.http_client_factory(),
     );
     auth_manager
 }

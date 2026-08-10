@@ -8,6 +8,7 @@ use codex_config::loader::load_config_layers_state;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_exec_server::LOCAL_FS;
+use codex_features::Features;
 use codex_features::feature_for_key;
 use codex_login::AuthManager;
 use codex_login::default_client::set_default_client_residency_requirement;
@@ -95,9 +96,14 @@ impl ConfigManager {
         &self,
         auth_manager: Arc<AuthManager>,
         chatgpt_base_url: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
     ) {
-        let loader =
-            cloud_config_bundle_loader(auth_manager, chatgpt_base_url, self.codex_home.clone());
+        let loader = cloud_config_bundle_loader(
+            auth_manager,
+            chatgpt_base_url,
+            self.codex_home.clone(),
+            http_client_factory,
+        );
         if let Ok(mut guard) = self.cloud_config_bundle.write() {
             *guard = loader;
         } else {
@@ -287,6 +293,18 @@ impl ConfigManager {
         apply_runtime_feature_enablement(config, &self.current_runtime_feature_enablement());
     }
 
+    pub(crate) fn apply_runtime_feature_enablement_to_features(
+        &self,
+        features: &mut Features,
+        config_layer_stack: &ConfigLayerStack,
+    ) {
+        apply_runtime_feature_enablement_to_features(
+            features,
+            config_layer_stack,
+            &self.current_runtime_feature_enablement(),
+        );
+    }
+
     fn current_runtime_feature_enablement(&self) -> BTreeMap<String, bool> {
         self.runtime_feature_enablement
             .read()
@@ -367,5 +385,22 @@ pub(crate) fn apply_runtime_feature_enablement(
                 "failed to apply runtime feature enablement"
             );
         }
+    }
+}
+
+fn apply_runtime_feature_enablement_to_features(
+    features: &mut Features,
+    config_layer_stack: &ConfigLayerStack,
+    runtime_feature_enablement: &BTreeMap<String, bool>,
+) {
+    let protected_features = protected_feature_keys(config_layer_stack);
+    for (name, enabled) in runtime_feature_enablement {
+        if protected_features.contains(name) {
+            continue;
+        }
+        let Some(feature) = feature_for_key(name) else {
+            continue;
+        };
+        features.set_enabled(feature, *enabled);
     }
 }

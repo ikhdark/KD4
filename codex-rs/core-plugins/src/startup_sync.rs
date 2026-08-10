@@ -6,15 +6,16 @@ use std::process::Output;
 use std::process::Stdio;
 use std::time::Duration;
 
+use codex_http_client::HttpClient;
+use codex_http_client::RequestBuilder;
 use codex_otel::CURATED_PLUGINS_STARTUP_SYNC_FINAL_METRIC;
 use codex_otel::CURATED_PLUGINS_STARTUP_SYNC_METRIC;
-use reqwest::Client;
 use serde::Deserialize;
 use tempfile::TempDir;
 use tracing::warn;
 use zip::ZipArchive;
 
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::create_client_without_request_logging;
 
 const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const GITHUB_API_ACCEPT_HEADER: &str = "application/vnd.github+json";
@@ -766,7 +767,7 @@ fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {
 async fn fetch_curated_repo_remote_sha(api_base_url: &str) -> Result<String, String> {
     let api_base_url = api_base_url.trim_end_matches('/');
     let repo_url = format!("{api_base_url}/repos/{OPENAI_PLUGINS_OWNER}/{OPENAI_PLUGINS_REPO}");
-    let client = build_reqwest_client();
+    let client = create_client_without_request_logging();
     let repo_body = fetch_github_text(&client, &repo_url, "get curated plugins repository").await?;
     let repo_summary: GitHubRepositorySummary =
         serde_json::from_str(&repo_body).map_err(|err| {
@@ -800,14 +801,14 @@ async fn fetch_curated_repo_zipball(
     let api_base_url = api_base_url.trim_end_matches('/');
     let repo_url = format!("{api_base_url}/repos/{OPENAI_PLUGINS_OWNER}/{OPENAI_PLUGINS_REPO}");
     let zipball_url = format!("{repo_url}/zipball/{remote_sha}");
-    let client = build_reqwest_client();
+    let client = create_client_without_request_logging();
     fetch_github_bytes(&client, &zipball_url, "download curated plugins archive").await
 }
 
 async fn fetch_curated_repo_backup_archive_zip(
     backup_archive_api_url: &str,
 ) -> Result<Vec<u8>, String> {
-    let client = build_reqwest_client();
+    let client = create_client_without_request_logging();
     let export_body = fetch_public_text(
         &client,
         backup_archive_api_url,
@@ -924,7 +925,11 @@ fn read_git_ref_sha(git_dir: &Path, reference: &str) -> Result<String, String> {
     ))
 }
 
-async fn fetch_github_text(client: &Client, url: &str, context: &str) -> Result<String, String> {
+async fn fetch_github_text(
+    client: &HttpClient,
+    url: &str,
+    context: &str,
+) -> Result<String, String> {
     let response = github_request(client, url)
         .send()
         .await
@@ -939,7 +944,11 @@ async fn fetch_github_text(client: &Client, url: &str, context: &str) -> Result<
     Ok(body)
 }
 
-async fn fetch_github_bytes(client: &Client, url: &str, context: &str) -> Result<Vec<u8>, String> {
+async fn fetch_github_bytes(
+    client: &HttpClient,
+    url: &str,
+    context: &str,
+) -> Result<Vec<u8>, String> {
     let response = github_request(client, url)
         .send()
         .await
@@ -958,7 +967,11 @@ async fn fetch_github_bytes(client: &Client, url: &str, context: &str) -> Result
     Ok(body.to_vec())
 }
 
-async fn fetch_public_text(client: &Client, url: &str, context: &str) -> Result<String, String> {
+async fn fetch_public_text(
+    client: &HttpClient,
+    url: &str,
+    context: &str,
+) -> Result<String, String> {
     let response = client
         .get(url)
         .timeout(CURATED_PLUGINS_BACKUP_ARCHIVE_TIMEOUT)
@@ -975,7 +988,11 @@ async fn fetch_public_text(client: &Client, url: &str, context: &str) -> Result<
     Ok(body)
 }
 
-async fn fetch_public_bytes(client: &Client, url: &str, context: &str) -> Result<Vec<u8>, String> {
+async fn fetch_public_bytes(
+    client: &HttpClient,
+    url: &str,
+    context: &str,
+) -> Result<Vec<u8>, String> {
     let response = client
         .get(url)
         .timeout(CURATED_PLUGINS_BACKUP_ARCHIVE_TIMEOUT)
@@ -996,7 +1013,7 @@ async fn fetch_public_bytes(client: &Client, url: &str, context: &str) -> Result
     Ok(body.to_vec())
 }
 
-fn github_request(client: &Client, url: &str) -> reqwest::RequestBuilder {
+fn github_request(client: &HttpClient, url: &str) -> RequestBuilder {
     client
         .get(url)
         .timeout(CURATED_PLUGINS_HTTP_TIMEOUT)

@@ -592,6 +592,7 @@ async fn status_line_uses_secondary_fallback_for_unsupported_window() {
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -621,6 +622,7 @@ async fn status_line_legacy_limit_items_prefer_matching_windows() {
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -654,6 +656,7 @@ async fn status_line_shows_secondary_non_weekly_when_primary_is_weekly() {
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -683,6 +686,7 @@ async fn status_line_five_hour_item_omits_weekly_only_limit() {
         secondary: None,
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -712,6 +716,7 @@ async fn status_line_single_monthly_primary_omits_weekly_limit_item() {
         secondary: None,
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -741,6 +746,7 @@ async fn status_line_secondary_only_non_weekly_limit_omits_primary_limit_item() 
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -770,6 +776,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
             balance: Some("17.5".to_string()),
         }),
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -791,6 +798,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
         secondary: None,
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -865,6 +873,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: Some(PlanType::Plus),
         rate_limit_reached_type: None,
     }));
@@ -885,6 +894,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: Some(PlanType::Pro),
         rate_limit_reached_type: None,
     }));
@@ -905,6 +915,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -930,6 +941,7 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
             balance: Some("5.00".to_string()),
         }),
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: Some(PlanType::Pro),
         rate_limit_reached_type: None,
     }));
@@ -945,6 +957,7 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
         secondary: None,
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: Some(PlanType::Pro),
         rate_limit_reached_type: None,
     }));
@@ -999,6 +1012,7 @@ async fn rate_limit_switch_prompt_skips_non_codex_limit() {
         secondary: None,
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -4183,5 +4197,69 @@ async fn chatwidget_tall() {
     assert_chatwidget_snapshot!(
         "chatwidget_tall",
         normalize_snapshot_paths(term.backend().vt100().screen().contents())
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_usage_warnings_preserve_and_clear_spend_control_state() {
+    let (mut chat, mut rx, _) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.has_chatgpt_account = true;
+
+    let mut blocked_snapshot = snapshot(/*percent*/ 0.0);
+    blocked_snapshot.credits = Some(CreditsSnapshot {
+        has_credits: true,
+        unlimited: false,
+        balance: None,
+    });
+    blocked_snapshot.spend_control_reached = Some(true);
+    blocked_snapshot.rate_limit_reached_type =
+        Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached);
+    chat.on_rate_limit_snapshot(Some(blocked_snapshot));
+    assert_eq!(chat.codex_spend_control_reached, Some(true));
+
+    chat.on_rolling_rate_limit_snapshot(snapshot(/*percent*/ 95.0));
+    assert!(
+        !drain_insert_history(&mut rx).is_empty(),
+        "a sparse rolling snapshot should preserve a reached spend control"
+    );
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+    assert_eq!(chat.codex_spend_control_reached, Some(true));
+
+    let mut recovered_snapshot = snapshot(/*percent*/ 95.0);
+    recovered_snapshot.credits = Some(CreditsSnapshot {
+        has_credits: true,
+        unlimited: false,
+        balance: None,
+    });
+    recovered_snapshot.spend_control_reached = Some(false);
+    chat.on_rolling_rate_limit_snapshot(recovered_snapshot);
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+    assert_eq!(chat.codex_spend_control_reached, Some(false));
+    assert_eq!(
+        chat.codex_rate_limit_reached_type,
+        Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached)
+    );
+
+    chat.on_rolling_rate_limit_snapshot(snapshot(/*percent*/ 95.0));
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "a later sparse rolling snapshot should not clear an existing workspace hard stop"
+    );
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+    assert_eq!(chat.codex_spend_control_reached, Some(false));
+    assert_eq!(
+        chat.codex_rate_limit_reached_type,
+        Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached)
     );
 }

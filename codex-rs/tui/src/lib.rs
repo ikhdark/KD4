@@ -1162,6 +1162,7 @@ pub async fn run_main(
             keyring_backend_kind: config.auth_keyring_backend_kind(),
             forced_login_method: config.forced_login_method,
             forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
+            managed_auth_policy: Default::default(),
             chatgpt_base_url: Some(config.chatgpt_base_url.clone()),
             auth_route_config,
         })

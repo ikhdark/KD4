@@ -14,6 +14,7 @@ use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_config::ConstrainedWithSource;
 use codex_config::FeatureRequirementsToml;
+use codex_config::ManagedAuthPolicy;
 use codex_config::McpServerRequirement;
 use codex_config::PluginRequirementsToml;
 use codex_config::ProfileV2Name;
@@ -1309,15 +1310,23 @@ impl AuthManagerConfig for Config {
         Config::auth_keyring_backend_kind(self)
     }
 
+    fn forced_login_method(&self) -> Option<ForcedLoginMethod> {
+        self.forced_login_method
+    }
+
     fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>> {
         self.forced_chatgpt_workspace_id.clone()
+    }
+
+    fn managed_auth_policy(&self) -> ManagedAuthPolicy {
+        ManagedAuthPolicy::default()
     }
 
     fn chatgpt_base_url(&self) -> String {
         self.chatgpt_base_url.clone()
     }
 
-    fn auth_route_config(&self) -> Option<AuthRouteConfig> {
+    fn auth_route_config(&self) -> AuthRouteConfig {
         Config::auth_route_config(self)
     }
 }
@@ -1571,9 +1580,9 @@ impl Config {
         }
     }
 
-    pub fn auth_route_config(&self) -> Option<AuthRouteConfig> {
-        self.respect_system_proxy
-            .then(AuthRouteConfig::respect_system_proxy)
+    /// Returns auth routing resolved from the effective feature configuration.
+    pub fn auth_route_config(&self) -> AuthRouteConfig {
+        AuthRouteConfig::from_http_client_factory(self.http_client_factory())
     }
 
     /// Creates the HTTP client factory resolved from the effective feature configuration.
@@ -2874,14 +2883,14 @@ fn network_proxy_toml_config(features: Option<&FeaturesToml>) -> Option<&Network
     }
 }
 
-/// Bootstrap-only resolver for the cloud-config fetch.
+/// Resolves configured feature values without constructing a complete [`Config`].
 ///
-/// Call before a cloud-config bundle is available. Final [`Config`] loading
-/// resolves the effective feature value after all layers are available.
-pub fn resolve_bootstrap_respect_system_proxy(
+/// Callers must provide requirements from the same layer stack that produced
+/// `cfg` so managed feature constraints remain consistent.
+pub fn resolve_configured_features(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<Features> {
     let configured_features = Features::from_sources(
         FeatureConfigSource {
             features: cfg.features.as_ref(),
@@ -2892,16 +2901,43 @@ pub fn resolve_bootstrap_respect_system_proxy(
     );
     let features =
         ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())?;
-    Ok(features.get().enabled(Feature::RespectSystemProxy))
+    Ok(features.get().clone())
+}
+
+/// Bootstrap-only resolver for the cloud-config fetch.
+///
+/// Call before a cloud-config bundle is available. Final [`Config`] loading
+/// resolves the effective feature value after all layers are available.
+pub fn resolve_bootstrap_respect_system_proxy(
+    cfg: &ConfigToml,
+    feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
+) -> std::io::Result<bool> {
+    resolve_configured_features(cfg, feature_requirements)
+        .map(|features| features.enabled(Feature::RespectSystemProxy))
 }
 
 /// Resolves auth route settings for the initial cloud-config bootstrap.
 pub fn resolve_bootstrap_auth_route_config(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
-) -> std::io::Result<Option<AuthRouteConfig>> {
-    resolve_bootstrap_respect_system_proxy(cfg, feature_requirements)
-        .map(|enabled| enabled.then(AuthRouteConfig::respect_system_proxy))
+) -> std::io::Result<AuthRouteConfig> {
+    resolve_bootstrap_http_client_factory(cfg, feature_requirements)
+        .map(AuthRouteConfig::from_http_client_factory)
+}
+
+/// Resolves shared HTTP routing for startup work that runs before final [`Config`] loading.
+pub fn resolve_bootstrap_http_client_factory(
+    cfg: &ConfigToml,
+    feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
+) -> std::io::Result<HttpClientFactory> {
+    resolve_bootstrap_respect_system_proxy(cfg, feature_requirements).map(|respect_system_proxy| {
+        let outbound_proxy_policy = if respect_system_proxy {
+            OutboundProxyPolicy::RespectSystemProxy
+        } else {
+            OutboundProxyPolicy::ReqwestDefault
+        };
+        HttpClientFactory::new(outbound_proxy_policy)
+    })
 }
 
 pub(crate) fn resolve_web_search_mode_for_turn(

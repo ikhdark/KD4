@@ -2,10 +2,41 @@ use super::sanitize_user_agent;
 use super::*;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
+use std::io;
+use std::io::Write;
 use std::sync::Arc;
-use std::sync::Barrier;
-use std::sync::RwLock;
-use std::thread;
+use std::sync::Mutex;
+use tracing_subscriber::layer::SubscriberExt;
+
+#[derive(Clone)]
+struct TestLogWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+struct TestLogSink {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+    type Writer = TestLogSink;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TestLogSink {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+impl Write for TestLogSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.lock().expect("log buffer lock").extend(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[test]
 fn test_get_codex_user_agent() {
@@ -34,6 +65,54 @@ fn is_first_party_chat_originator_matches_known_values() {
     );
     assert_eq!(is_first_party_chat_originator(DEFAULT_ORIGINATOR), false);
     assert_eq!(is_first_party_chat_originator("codex_vscode"), false);
+}
+
+#[test]
+fn add_originator_header_inserts_non_default_originator() {
+    let default_originator = originator();
+    let thread_originator = if default_originator.value == "chatgpt_cca" {
+        "codex_work_cca"
+    } else {
+        "chatgpt_cca"
+    };
+    let mut headers = HeaderMap::new();
+
+    add_originator_header(&mut headers, thread_originator);
+
+    assert_eq!(
+        headers
+            .get("originator")
+            .and_then(|value| value.to_str().ok()),
+        Some(thread_originator)
+    );
+}
+
+#[test]
+fn add_originator_header_preserves_provider_default() {
+    let default_originator = originator();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "originator",
+        HeaderValue::from_static("provider-originator"),
+    );
+
+    add_originator_header(&mut headers, &default_originator.value);
+
+    assert_eq!(
+        headers
+            .get("originator")
+            .and_then(|value| value.to_str().ok()),
+        Some("provider-originator")
+    );
+}
+
+#[test]
+fn add_originator_header_omits_invalid_originator() {
+    let mut headers = HeaderMap::new();
+
+    add_originator_header(&mut headers, "invalid\noriginator");
+
+    assert!(headers.is_empty());
 }
 
 #[tokio::test]
@@ -93,6 +172,94 @@ async fn test_create_client_sets_default_headers() {
     set_default_client_residency_requirement(/*enforce_residency*/ None);
 }
 
+#[tokio::test]
+async fn raw_auth_client_does_not_log_sensitive_request_or_response_data() {
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-sensitive-response", "response-secret-value"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let authority = server
+        .uri()
+        .strip_prefix("http://")
+        .expect("wiremock URI should use HTTP")
+        .to_string();
+    let endpoint = format!(
+        "http://auth-user:password-secret-value@{authority}/token?client_secret=query-secret-value"
+    );
+    let client = create_raw_auth_client(
+        &endpoint,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .expect("raw auth client should build");
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(TestLogWriter {
+                buffer: Arc::clone(&buffer),
+            }),
+    );
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::debug!("log capture sentinel");
+
+    let response = client
+        .post(&endpoint)
+        .header("x-sensitive-request", "request-header-secret-value")
+        .body("request-body-secret-value")
+        .send()
+        .await
+        .expect("raw auth request should succeed");
+    assert!(response.status().is_success());
+
+    let unresponsive_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("unresponsive local listener should bind");
+    let unresponsive_addr = unresponsive_listener
+        .local_addr()
+        .expect("unresponsive local address should be available");
+    let unresponsive_endpoint = format!(
+        "http://auth-user:failure-password-secret-value@{unresponsive_addr}/token?client_secret=failure-query-secret-value"
+    );
+    let unresponsive_client = create_raw_auth_client(
+        &unresponsive_endpoint,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .expect("raw auth client should build");
+    let error = unresponsive_client
+        .post(&unresponsive_endpoint)
+        .header("x-sensitive-request", "failure-request-header-secret-value")
+        .body("failure-request-body-secret-value")
+        .timeout(std::time::Duration::from_secs(1))
+        .send()
+        .await
+        .expect_err("request to an unresponsive local listener should time out");
+    assert!(error.is_timeout());
+
+    let logs = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
+        .expect("logs should be UTF-8");
+    assert!(logs.contains("log capture sentinel"));
+    assert!(!logs.contains("password-secret-value"));
+    assert!(!logs.contains("query-secret-value"));
+    assert!(!logs.contains("request-header-secret-value"));
+    assert!(!logs.contains("request-body-secret-value"));
+    assert!(!logs.contains("response-secret-value"));
+    assert!(!logs.contains("failure-password-secret-value"));
+    assert!(!logs.contains("failure-query-secret-value"));
+    assert!(!logs.contains("failure-request-header-secret-value"));
+    assert!(!logs.contains("failure-request-body-secret-value"));
+}
+
 #[test]
 fn test_invalid_suffix_is_sanitized() {
     let prefix = "codex_cli_rs/0.0.0";
@@ -113,90 +280,6 @@ fn test_invalid_suffix_is_sanitized2() {
         sanitize_user_agent(format!("{prefix} ({suffix})"), prefix),
         "codex_cli_rs/0.0.0 (bad_suffix)"
     );
-}
-
-#[test]
-fn concurrent_process_identity_installation_never_exposes_a_mixed_user_agent() {
-    let state = Arc::new(RwLock::new(ProcessIdentityState::default()));
-    let barrier = Arc::new(Barrier::new(4));
-
-    let spawn_writer = |originator: &'static str, suffix: &'static str| {
-        let state = Arc::clone(&state);
-        let barrier = Arc::clone(&barrier);
-        thread::spawn(move || {
-            barrier.wait();
-            install_process_identity(
-                &state,
-                originator.to_string(),
-                Some(Some(suffix.to_string())),
-                || None,
-            )
-        })
-    };
-    let writer_a = spawn_writer("client_a", "client_a; 1.0.0");
-    let writer_b = spawn_writer("client_b", "client_b; 2.0.0");
-
-    let reader_state = Arc::clone(&state);
-    let reader_barrier = Arc::clone(&barrier);
-    let reader = thread::spawn(move || {
-        reader_barrier.wait();
-        (0..2_000)
-            .map(|_| {
-                let snapshot = process_identity_snapshot_from_state(&reader_state, || None);
-                thread::yield_now();
-                codex_user_agent_for_identity(&snapshot)
-            })
-            .collect::<Vec<_>>()
-    });
-
-    barrier.wait();
-    let results = [
-        writer_a.join().expect("client_a writer should not panic"),
-        writer_b.join().expect("client_b writer should not panic"),
-    ];
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-
-    for user_agent in reader.join().expect("identity reader should not panic") {
-        let is_unclaimed = user_agent.starts_with(&format!("{DEFAULT_ORIGINATOR}/"))
-            && !user_agent.ends_with(" (client_a; 1.0.0)")
-            && !user_agent.ends_with(" (client_b; 2.0.0)");
-        let is_client_a =
-            user_agent.starts_with("client_a/") && user_agent.ends_with(" (client_a; 1.0.0)");
-        let is_client_b =
-            user_agent.starts_with("client_b/") && user_agent.ends_with(" (client_b; 2.0.0)");
-        assert!(
-            is_unclaimed || is_client_a || is_client_b,
-            "observed mixed process identity: {user_agent}"
-        );
-    }
-
-    let final_user_agent =
-        codex_user_agent_for_identity(&process_identity_snapshot_from_state(&state, || None));
-    assert!(
-        (final_user_agent.starts_with("client_a/")
-            && final_user_agent.ends_with(" (client_a; 1.0.0)"))
-            || (final_user_agent.starts_with("client_b/")
-                && final_user_agent.ends_with(" (client_b; 2.0.0)"))
-    );
-}
-
-#[test]
-fn process_originator_override_discards_request_client_suffix() {
-    let state = RwLock::new(ProcessIdentityState::default());
-    install_process_identity(
-        &state,
-        "request_client".to_string(),
-        Some(Some("request_client; 1.0.0".to_string())),
-        || Some("process_override".to_string()),
-    )
-    .expect("override identity should install");
-
-    let snapshot = process_identity_snapshot_from_state(&state, || None);
-    assert_eq!(snapshot.originator.value, "process_override");
-    assert_eq!(snapshot.suffix, None);
-    let user_agent = codex_user_agent_for_identity(&snapshot);
-    assert!(user_agent.starts_with("process_override/"));
-    assert!(!user_agent.contains("request_client"));
 }
 
 #[test]

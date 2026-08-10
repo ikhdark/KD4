@@ -23,11 +23,13 @@ use codex_config::merge_toml_values;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
+use codex_core::config::resolve_configured_features;
 use codex_core::config::validate_feature_requirements_for_config_toml;
 use codex_core::path_utils;
 use codex_core::path_utils::SymlinkWritePaths;
 use codex_core::path_utils::resolve_symlink_write_paths;
 use codex_core::path_utils::write_atomically;
+use codex_features::Features;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
 use std::borrow::Cow;
@@ -111,7 +113,7 @@ impl ConfigManager {
     pub(crate) async fn read(
         &self,
         params: ConfigReadParams,
-    ) -> Result<ConfigReadResponse, ConfigManagerError> {
+    ) -> Result<(ConfigReadResponse, Features), ConfigManagerError> {
         let layers = match params.cwd.as_deref() {
             Some(cwd) => {
                 let cwd = AbsolutePathBuf::try_from(PathBuf::from(cwd)).map_err(|err| {
@@ -131,12 +133,19 @@ impl ConfigManager {
             .try_into()
             .map_err(|err| ConfigManagerError::toml("invalid configuration", err))?;
 
+        let mut features = resolve_configured_features(
+            &effective_config_toml,
+            layers.requirements().feature_requirements.as_ref(),
+        )
+        .map_err(|err| ConfigManagerError::io("failed to resolve configuration features", err))?;
+        self.apply_runtime_feature_enablement_to_features(&mut features, &layers);
+
         let json_value = serde_json::to_value(&effective_config_toml)
             .map_err(|err| ConfigManagerError::json("failed to serialize configuration", err))?;
         let config: ApiConfig = serde_json::from_value(json_value)
             .map_err(|err| ConfigManagerError::json("failed to deserialize configuration", err))?;
 
-        Ok(ConfigReadResponse {
+        let response = ConfigReadResponse {
             config,
             origins: layers
                 .origins()
@@ -153,7 +162,9 @@ impl ConfigManager {
                     .map(|layer| config_layer_to_api(layer.as_layer()))
                     .collect()
             }),
-        })
+        };
+
+        Ok((response, features))
     }
 
     pub(crate) async fn read_requirements(

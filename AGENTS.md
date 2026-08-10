@@ -7,6 +7,9 @@
 - [`SOURCEMAP.md`](SOURCEMAP.md) owns repository inventory, runtime entrypoints,
   package and Rust-domain routing, generated contracts, validation routes, and
   cross-cutting change routes.
+- [`do-not-code.md`](do-not-code.md) owns the complete `codex-rs` top-level
+  classification, exact upstream-mirror paths, and generator-managed exceptions.
+  Consult it before changing or upstream-syncing Rust workspace paths.
 - Known top-level scoped instruction files include `codex-rs/AGENTS.md` and
   `scripts/AGENTS.md`; further nested files apply only where present.
 - `.codex/README.md` documents workspace routing, `.codex/config.toml` owns

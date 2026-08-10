@@ -1,27 +1,23 @@
 //! Default Codex HTTP client: shared `User-Agent`, `originator`, optional residency header, and
-//! reqwest/`HttpClient` construction.
+//! `HttpClient` construction.
 //!
 //! Use [`crate::default_client`] or [`codex_login::default_client`] from other crates in this
 //! workspace.
 
-use codex_http_client::BuildCustomCaTransportError;
 use codex_http_client::BuildRouteAwareHttpClientError;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 pub use codex_http_client::RequestBuilder as CodexRequestBuilder;
-use codex_http_client::build_reqwest_client_with_custom_ca;
-use codex_http_client::with_chatgpt_cloudflare_cookie_store;
 use codex_terminal_detection::user_agent;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderValue;
-use reqwest::header::USER_AGENT;
-use std::ops::Deref;
-use std::ops::DerefMut;
+use http::HeaderMap;
+use http::HeaderValue;
+use http::header::USER_AGENT;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::RwLockWriteGuard;
 
 use crate::outbound_proxy::AuthRouteConfig;
 
@@ -40,7 +36,7 @@ use crate::outbound_proxy::AuthRouteConfig;
 /// A space is automatically added between the suffix and the rest of the User-Agent string.
 /// The full user agent string is returned from the mcp initialize response.
 /// Parenthesis will be added by Codex. This should only specify what goes inside of the parenthesis.
-pub static USER_AGENT_SUFFIX: UserAgentSuffix = UserAgentSuffix;
+pub static USER_AGENT_SUFFIX: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 pub const RESIDENCY_HEADER_NAME: &str = "x-openai-internal-codex-residency";
@@ -52,53 +48,7 @@ pub struct Originator {
     pub value: String,
     pub header_value: HeaderValue,
 }
-
-#[derive(Default)]
-struct ProcessIdentityState {
-    originator: Option<Originator>,
-    suffix: Option<String>,
-}
-
-#[derive(Clone)]
-struct ProcessIdentitySnapshot {
-    originator: Originator,
-    suffix: Option<String>,
-}
-
-static PROCESS_IDENTITY: LazyLock<RwLock<ProcessIdentityState>> =
-    LazyLock::new(|| RwLock::new(ProcessIdentityState::default()));
-
-pub struct UserAgentSuffix;
-
-#[derive(Debug, Clone, Copy)]
-pub struct UserAgentSuffixLockError;
-
-pub struct UserAgentSuffixGuard<'a> {
-    guard: RwLockWriteGuard<'a, ProcessIdentityState>,
-}
-
-impl UserAgentSuffix {
-    pub fn lock(&self) -> Result<UserAgentSuffixGuard<'static>, UserAgentSuffixLockError> {
-        PROCESS_IDENTITY
-            .write()
-            .map(|guard| UserAgentSuffixGuard { guard })
-            .map_err(|_| UserAgentSuffixLockError)
-    }
-}
-
-impl Deref for UserAgentSuffixGuard<'_> {
-    type Target = Option<String>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard.suffix
-    }
-}
-
-impl DerefMut for UserAgentSuffixGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard.suffix
-    }
-}
+static ORIGINATOR: LazyLock<RwLock<Option<Originator>>> = LazyLock::new(|| RwLock::new(None));
 static REQUIREMENTS_RESIDENCY: LazyLock<RwLock<Option<ResidencyRequirement>>> =
     LazyLock::new(|| RwLock::new(None));
 static ROUTE_AWARE_CLIENT_BUILD_PERMIT: tokio::sync::Semaphore =
@@ -111,7 +61,10 @@ pub enum SetOriginatorError {
 }
 
 fn get_originator_value(provided: Option<String>) -> Originator {
-    let value = provided.unwrap_or(DEFAULT_ORIGINATOR.to_string());
+    let value = std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR)
+        .ok()
+        .or(provided)
+        .unwrap_or(DEFAULT_ORIGINATOR.to_string());
 
     match HeaderValue::from_str(&value) {
         Ok(header_value) => Originator {
@@ -128,51 +81,19 @@ fn get_originator_value(provided: Option<String>) -> Originator {
     }
 }
 
-fn install_process_identity<F>(
-    state: &RwLock<ProcessIdentityState>,
-    value: String,
-    suffix: Option<Option<String>>,
-    originator_override: F,
-) -> Result<(), SetOriginatorError>
-where
-    F: FnOnce() -> Option<String>,
-{
+pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
     if HeaderValue::from_str(&value).is_err() {
         return Err(SetOriginatorError::InvalidHeaderValue);
     }
-    let Ok(mut guard) = state.write() else {
+    let originator = get_originator_value(Some(value));
+    let Ok(mut guard) = ORIGINATOR.write() else {
         return Err(SetOriginatorError::AlreadyInitialized);
     };
-    if guard.originator.is_some() {
+    if guard.is_some() {
         return Err(SetOriginatorError::AlreadyInitialized);
     }
-    let originator_override = originator_override();
-    guard.originator = Some(get_originator_value(
-        originator_override.clone().or(Some(value)),
-    ));
-    // An environment override owns process identity independently of an
-    // app-server request client. Do not pair it with that client's suffix.
-    if originator_override.is_none()
-        && let Some(suffix) = suffix
-    {
-        guard.suffix = suffix;
-    }
+    *guard = Some(originator);
     Ok(())
-}
-
-pub fn set_default_process_identity(
-    value: String,
-    suffix: Option<String>,
-) -> Result<(), SetOriginatorError> {
-    install_process_identity(&PROCESS_IDENTITY, value, Some(suffix), || {
-        std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).ok()
-    })
-}
-
-pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
-    install_process_identity(&PROCESS_IDENTITY, value, /*suffix*/ None, || {
-        std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).ok()
-    })
 }
 
 pub fn set_default_client_residency_requirement(enforce_residency: Option<ResidencyRequirement>) {
@@ -183,41 +104,45 @@ pub fn set_default_client_residency_requirement(enforce_residency: Option<Reside
     *guard = enforce_residency;
 }
 
-fn process_identity_snapshot_from_state<F>(
-    state: &RwLock<ProcessIdentityState>,
-    originator_override: F,
-) -> ProcessIdentitySnapshot
-where
-    F: FnOnce() -> Option<String>,
-{
-    let Ok(mut guard) = state.write() else {
-        return ProcessIdentitySnapshot {
-            originator: get_originator_value(/*provided*/ None),
-            suffix: None,
-        };
-    };
-    if guard.originator.is_none()
-        && let Some(originator_override) = originator_override()
-    {
-        guard.originator = Some(get_originator_value(Some(originator_override)));
-    }
-    ProcessIdentitySnapshot {
-        originator: guard
-            .originator
-            .clone()
-            .unwrap_or_else(|| get_originator_value(/*provided*/ None)),
-        suffix: guard.suffix.clone(),
-    }
-}
-
-fn process_identity_snapshot() -> ProcessIdentitySnapshot {
-    process_identity_snapshot_from_state(&PROCESS_IDENTITY, || {
-        std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).ok()
-    })
-}
-
 pub fn originator() -> Originator {
-    process_identity_snapshot().originator
+    if let Ok(guard) = ORIGINATOR.read()
+        && let Some(originator) = guard.as_ref()
+    {
+        return originator.clone();
+    }
+
+    if std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).is_ok() {
+        let originator = get_originator_value(/*provided*/ None);
+        if let Ok(mut guard) = ORIGINATOR.write() {
+            match guard.as_ref() {
+                Some(originator) => return originator.clone(),
+                None => *guard = Some(originator.clone()),
+            }
+        }
+        return originator;
+    }
+
+    get_originator_value(/*provided*/ None)
+}
+
+/// Adds a valid, non-default thread originator override to request headers.
+///
+/// The default client already supplies the process originator. Thread-scoped callers should use
+/// this helper to override that value only when the thread originator differs.
+pub fn add_originator_header(headers: &mut HeaderMap, originator_value: &str) {
+    let default_originator = originator();
+    if originator_value == default_originator.value.as_str() {
+        return;
+    }
+
+    match HeaderValue::from_str(originator_value) {
+        Ok(header_value) => {
+            headers.insert("originator", header_value);
+        }
+        Err(err) => {
+            tracing::warn!("ignoring invalid thread originator header value: {err}");
+        }
+    }
 }
 
 pub fn is_first_party_originator(originator_value: &str) -> bool {
@@ -231,30 +156,30 @@ pub fn is_first_party_chat_originator(originator_value: &str) -> bool {
     originator_value == "codex_atlas" || originator_value == "codex_chatgpt_desktop"
 }
 
-fn codex_user_agent_for_identity(identity: &ProcessIdentitySnapshot) -> String {
+pub fn get_codex_user_agent() -> String {
     let build_version = env!("CARGO_PKG_VERSION");
     let os_info = os_info::get();
+    let originator = originator();
     let prefix = format!(
         "{}/{build_version} ({} {}; {}) {}",
-        identity.originator.value.as_str(),
+        originator.value.as_str(),
         os_info.os_type(),
         os_info.version(),
         os_info.architecture().unwrap_or("unknown"),
         user_agent()
     );
-    let suffix = identity
-        .suffix
+    let suffix = USER_AGENT_SUFFIX
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let suffix = suffix
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map_or_else(String::new, |value| format!(" ({value})"));
 
     let candidate = format!("{prefix}{suffix}");
-    sanitize_user_agent_with_originator(candidate, &prefix, &identity.originator.value)
-}
-
-pub fn get_codex_user_agent() -> String {
-    codex_user_agent_for_identity(&process_identity_snapshot())
+    sanitize_user_agent(candidate, &prefix)
 }
 
 /// Sanitize the user agent string.
@@ -262,16 +187,7 @@ pub fn get_codex_user_agent() -> String {
 /// Invalid characters are replaced with an underscore.
 ///
 /// If the user agent fails to parse, it falls back to fallback and then to ORIGINATOR.
-#[cfg(test)]
 fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
-    sanitize_user_agent_with_originator(candidate, fallback, &originator().value)
-}
-
-fn sanitize_user_agent_with_originator(
-    candidate: String,
-    fallback: &str,
-    originator: &str,
-) -> String {
     if HeaderValue::from_str(candidate.as_str()).is_ok() {
         return candidate;
     }
@@ -294,153 +210,127 @@ fn sanitize_user_agent_with_originator(
         tracing::warn!(
             "Falling back to default Codex originator because base user agent string is invalid"
         );
-        originator.to_string()
+        originator().value
     }
 }
 
 /// Create an HTTP client with default `originator` and `User-Agent` headers set.
 ///
-/// This supported default path preserves reqwest's existing proxy behavior and does not opt into
+/// This supported default path preserves the transport's existing proxy behavior and does not opt into
 /// Codex's route-aware system/PAC resolution.
 pub fn create_client() -> HttpClient {
-    let inner = build_reqwest_client();
-    HttpClient::new(inner)
+    build_default_client(default_http_client_builder())
 }
 
-/// Builds the default reqwest client used for ordinary Codex HTTP traffic.
-///
-/// This starts from the standard Codex user agent, default headers, and sandbox-specific proxy
-/// policy, then layers in shared custom CA handling from `CODEX_CA_CERTIFICATE` /
-/// `SSL_CERT_FILE`. The function remains infallible for compatibility with existing call sites, so
-/// a custom-CA or builder failure is logged and falls back to `reqwest::Client::new()`.
-///
-/// This supported default path preserves reqwest's existing proxy behavior and does not opt into
-/// Codex's route-aware system/PAC resolution. Auth callers with route settings must use
-/// `build_default_auth_reqwest_client` or `create_default_auth_client`.
-pub fn build_reqwest_client() -> reqwest::Client {
-    try_build_reqwest_client().unwrap_or_else(|error| {
-        tracing::warn!(error = %error, "failed to build default reqwest client");
-        with_chatgpt_cloudflare_cookie_store(reqwest::Client::builder())
-            .build()
-            .unwrap_or_else(|fallback_error| {
-                tracing::warn!(
-                    error = %fallback_error,
-                    "failed to build fallback reqwest client with ChatGPT Cloudflare cookie store"
-                );
-                reqwest::Client::new()
-            })
-    })
+/// Creates the default client with configured ChatGPT cookies and no sensitive-response logging.
+pub fn create_client_with_chatgpt_cookies(http_client_factory: &HttpClientFactory) -> HttpClient {
+    build_default_client(
+        default_http_client_builder()
+            .with_chatgpt_cookies(http_client_factory)
+            .without_request_logging(),
+    )
 }
 
-/// Tries to build the default reqwest client used for ordinary Codex HTTP traffic.
+/// Create the default HTTP client without request URL or response-header diagnostics.
 ///
-/// Callers that need a structured CA-loading failure instead of the legacy logged fallback can use
-/// this method directly.
-pub fn try_build_reqwest_client() -> Result<reqwest::Client, BuildCustomCaTransportError> {
-    build_reqwest_client_with_custom_ca(default_reqwest_client_builder())
+/// This preserves the default client's legacy custom-CA fallback and transport proxy behavior while
+/// avoiding diagnostics that could expose credentials embedded in request URLs or headers.
+pub fn create_client_without_request_logging() -> HttpClient {
+    build_default_client(default_http_client_builder().without_request_logging())
 }
 
-/// Builds the default Codex reqwest client for a concrete outbound route.
+/// Builds the default Codex HTTP client for a concrete outbound route.
 ///
 /// When route-aware proxy handling is disabled, or the client is running inside the Codex
 /// sandbox, this preserves the default client's existing proxy behavior. Otherwise it resolves
 /// the destination through the shared system/PAC-aware routing policy.
-pub fn build_default_reqwest_client_for_route(
+pub fn create_client_for_route(
     http_client_factory: &HttpClientFactory,
     request_url: &str,
     route_class: ClientRouteClass,
-) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
+) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
     if matches!(
         http_client_factory.outbound_proxy_policy(),
         OutboundProxyPolicy::ReqwestDefault
     ) {
-        return Ok(build_reqwest_client());
+        return Ok(create_client());
     }
     if is_sandboxed() {
         // Preserve the sandbox's existing no-proxy policy; sandboxed command egress is routed
         // separately through network-proxy.
-        return Ok(build_reqwest_client());
+        return Ok(create_client());
     }
 
-    http_client_factory.build_reqwest_client(
-        default_reqwest_client_builder(),
+    default_http_client_builder().build_respecting_outbound_proxy_policy(
+        http_client_factory,
         request_url,
         route_class,
     )
 }
 
-/// Builds the default Codex reqwest client for a concrete outbound route without blocking the
+/// Builds the default Codex HTTP client for a concrete outbound route without blocking the
 /// async runtime worker that initiated the request.
-pub async fn build_default_reqwest_client_for_route_async(
+pub async fn create_client_for_route_async(
     http_client_factory: HttpClientFactory,
     request_url: String,
     route_class: ClientRouteClass,
-) -> std::io::Result<reqwest::Client> {
+) -> std::io::Result<HttpClient> {
     let permit = ROUTE_AWARE_CLIENT_BUILD_PERMIT
         .acquire()
         .await
         .map_err(std::io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build_default_reqwest_client_for_route(&http_client_factory, &request_url, route_class)
+        create_client_for_route(&http_client_factory, &request_url, route_class)
             .map_err(std::io::Error::from)
     })
     .await
     .map_err(std::io::Error::other)?
 }
 
-fn default_reqwest_client_builder() -> reqwest::ClientBuilder {
-    let mut builder = reqwest::Client::builder().default_headers(default_headers());
+fn default_http_client_builder() -> HttpClientBuilder {
+    HttpClientBuilder::new()
+        .default_headers(default_headers())
+        .with_chatgpt_cloudflare_cookie_store()
+}
+
+// These legacy constructors intentionally preserve the infallible behavior of `create_client`.
+// New endpoint-aware call sites use `create_client_for_route` and propagate construction errors.
+#[allow(deprecated)]
+fn build_default_client(builder: HttpClientBuilder) -> HttpClient {
     if is_sandboxed() {
-        builder = builder.no_proxy();
+        builder.build_direct_with_custom_ca_fallback()
+    } else {
+        builder.build_with_transport_default_proxy_and_custom_ca_fallback()
     }
-    with_chatgpt_cloudflare_cookie_store(builder)
 }
 
-/// Builds a raw reqwest client for an auth endpoint without Codex default headers.
-pub(crate) fn build_raw_auth_reqwest_client(
+/// Builds an HTTP client for an auth endpoint without Codex default headers.
+pub(crate) fn create_raw_auth_client(
     endpoint: &str,
-    auth_route_config: Option<&AuthRouteConfig>,
-) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
-    auth_http_client_factory(auth_route_config).build_reqwest_client(
-        reqwest::Client::builder(),
-        endpoint,
-        ClientRouteClass::Auth,
-    )
-}
-
-/// Builds the default Codex reqwest client for an auth endpoint.
-pub(crate) fn build_default_auth_reqwest_client(
-    endpoint: &str,
-    auth_route_config: Option<&AuthRouteConfig>,
-) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
-    build_default_reqwest_client_for_route(
-        &auth_http_client_factory(auth_route_config),
-        endpoint,
-        ClientRouteClass::Auth,
-    )
+    auth_route_config: &AuthRouteConfig,
+) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+    auth_route_config
+        .http_client_factory()
+        .build_client_without_request_logging(endpoint, ClientRouteClass::Auth)
 }
 
 /// Builds the default Codex HTTP client wrapper for an auth endpoint.
 pub(crate) fn create_default_auth_client(
     endpoint: &str,
-    auth_route_config: Option<&AuthRouteConfig>,
+    auth_route_config: &AuthRouteConfig,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
-    build_default_auth_reqwest_client(endpoint, auth_route_config).map(HttpClient::new)
-}
-
-fn auth_http_client_factory(auth_route_config: Option<&AuthRouteConfig>) -> HttpClientFactory {
-    auth_route_config.map_or_else(
-        || HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-        |config| config.http_client_factory().clone(),
+    create_client_for_route(
+        auth_route_config.http_client_factory(),
+        endpoint,
+        ClientRouteClass::Auth,
     )
 }
 
 pub fn default_headers() -> HeaderMap {
-    let identity = process_identity_snapshot();
     let mut headers = HeaderMap::new();
-    headers.insert("originator", identity.originator.header_value.clone());
-    if let Ok(user_agent) = HeaderValue::from_str(&codex_user_agent_for_identity(&identity)) {
+    headers.insert("originator", originator().header_value);
+    if let Ok(user_agent) = HeaderValue::from_str(&get_codex_user_agent()) {
         headers.insert(USER_AGENT, user_agent);
     }
     if let Ok(guard) = REQUIREMENTS_RESIDENCY.read()

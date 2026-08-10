@@ -143,6 +143,10 @@ impl WsStream {
     async fn next(&mut self) -> Option<Result<Message, WsError>> {
         self.rx_message.recv().await
     }
+
+    fn is_closed(&self) -> bool {
+        self.pump_task.is_finished()
+    }
 }
 
 impl Drop for WsStream {
@@ -204,7 +208,10 @@ impl ResponsesWebsocketConnection {
     }
 
     pub async fn is_closed(&self) -> bool {
-        self.stream.lock().await.is_none()
+        match self.stream.lock().await.as_ref() {
+            Some(stream) => stream.is_closed(),
+            None => true,
+        }
     }
 
     #[instrument(
@@ -861,6 +868,39 @@ mod tests {
         };
 
         assert_eq!(message, expected);
+    }
+
+    #[tokio::test]
+    async fn connection_reports_closed_after_websocket_pump_exits() {
+        let (tx_command, rx_command) = mpsc::channel::<WsCommand>(1);
+        let (_tx_message, rx_message) = mpsc::unbounded_channel();
+        let (tx_done, rx_done) = oneshot::channel();
+        let pump_task = tokio::spawn(async move {
+            let _rx_command = rx_command;
+            let _ = rx_done.await;
+        });
+        let connection = ResponsesWebsocketConnection::new(
+            WsStream {
+                tx_command,
+                rx_message,
+                pump_task,
+            },
+            Duration::from_secs(1),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        assert!(!connection.is_closed().await);
+        tx_done.send(()).expect("websocket pump should be running");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !connection.is_closed().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("websocket pump should stop");
     }
 
     #[test]

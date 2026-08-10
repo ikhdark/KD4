@@ -129,6 +129,8 @@ below.
 | `.markdownlint-cli2.yaml`, `.prettierignore`, `.prettierrc.toml` | Markdown and Prettier formatting policy |
 | `.npmrc` | npm and pnpm behavior used by the JavaScript workspace |
 | `AGENTS.md`, `SOURCEMAP.md` | Repository-wide editing policy and this cross-cutting ownership contract |
+| `do-not-code.md` | Complete `codex-rs` protected/editable/mixed classification, exact upstream-mirror boundary, and generator-managed exceptions |
+| `WORKTREE_REVIEW.txt` | Plain-text audit ledger for the current whole-worktree review workflow |
 | `CHANGELOG.md`, `LICENSE`, `NOTICE` | Release history and legal notices |
 | `flake.nix`, `flake.lock` | Nix development/build environment and its locked inputs |
 | `justfile`, `kd4_features.toml` | Preferred command router and KD4 feature inventory |

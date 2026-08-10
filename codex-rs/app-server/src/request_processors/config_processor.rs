@@ -83,26 +83,22 @@ impl ConfigRequestProcessor {
         &self,
         params: ConfigReadParams,
     ) -> Result<ConfigReadResponse, JSONRPCErrorError> {
-        let fallback_cwd = params.cwd.as_ref().map(PathBuf::from);
-        let mut response = self.config_manager.read(params).await.map_err(map_error)?;
-        let config = self.load_latest_config(fallback_cwd).await?;
+        let (mut response, features) = self.config_manager.read(params).await.map_err(map_error)?;
         for feature_key in SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT {
             let Some(feature) = feature_for_key(feature_key) else {
                 continue;
             };
-            let features = response
+            let features_value = response
                 .config
                 .additional
                 .entry("features".to_string())
                 .or_insert_with(|| json!({}));
-            if !features.is_object() {
-                *features = json!({});
+            if !features_value.is_object() {
+                *features_value = json!({});
             }
-            if let Some(features) = features.as_object_mut() {
-                features.insert(
-                    (*feature_key).to_string(),
-                    json!(config.features.enabled(feature)),
-                );
+            if let Some(features_object) = features_value.as_object_mut() {
+                features_object
+                    .insert((*feature_key).to_string(), json!(features.enabled(feature)));
             }
         }
         Ok(response)
