@@ -141,6 +141,7 @@ use futures::stream::FuturesOrdered;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::error;
 use tracing::field;
@@ -362,10 +363,19 @@ pub(crate) async fn run_turn(
             }
 
             // Construct the input that we will send to the model.
-            let sampling_request_input: Vec<ResponseItem> = async {
-                sess.clone_history()
-                    .await
-                    .for_prompt(&turn_context.model_info.input_modalities)
+            let sampling_request_input: Arc<[ResponseItem]> = async {
+                let history_snapshot_guard = turn_context
+                    .turn_timing_state
+                    .begin_local_phase(TurnLocalPhase::HistorySnapshot);
+                let history = sess.clone_history().await;
+                drop(history_snapshot_guard);
+                let normalization_guard = turn_context
+                    .turn_timing_state
+                    .begin_local_phase(TurnLocalPhase::Normalization);
+                let prepared =
+                    history.prepare_for_prompt(&turn_context.model_info.input_modalities);
+                drop(normalization_guard);
+                prepared.shared_items()
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
@@ -907,11 +917,20 @@ async fn build_pure_pending_turn_plan(
     );
 
     if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        let (history_items, first_router, context_update_items) = tokio::join!(
+        let (prepared_history, first_router, context_update_items) = tokio::join!(
             async {
-                sess.clone_history()
-                    .await
-                    .for_prompt(&turn_context.model_info.input_modalities)
+                let history_snapshot_guard = turn_context
+                    .turn_timing_state
+                    .begin_local_phase(TurnLocalPhase::HistorySnapshot);
+                let history = sess.clone_history().await;
+                drop(history_snapshot_guard);
+                let normalization_guard = turn_context
+                    .turn_timing_state
+                    .begin_local_phase(TurnLocalPhase::Normalization);
+                let prepared =
+                    history.prepare_for_prompt(&turn_context.model_info.input_modalities);
+                drop(normalization_guard);
+                prepared
             },
             built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token),
             sess.estimate_context_update_items(step_context.as_ref()),
@@ -919,17 +938,23 @@ async fn build_pure_pending_turn_plan(
         let first_router = first_router?;
         let identity = PlanningSnapshotIdentity {
             generation,
-            state_digest: planning_state_digest(PlanningStateDigestInput {
-                step_context: step_context.as_ref(),
-                mcp_tools: &[],
-                connectors: &[],
-                plugins: &[],
-                injection_items: &[],
-                context_update_items: &context_update_items,
-                user_input: &user_input,
-                router: first_router.as_ref(),
-                history_items: &history_items,
-            }),
+            state_digest: {
+                let _planning_identity_guard = turn_context
+                    .turn_timing_state
+                    .begin_local_phase(TurnLocalPhase::PlanningIdentity);
+                planning_state_digest(PlanningStateDigestInput {
+                    step_context: step_context.as_ref(),
+                    mcp_tools: &[],
+                    connectors: &[],
+                    plugins: &[],
+                    injection_items: &[],
+                    context_update_items: &context_update_items,
+                    user_input: &user_input,
+                    router: first_router.as_ref(),
+                    history_items: prepared_history.items(),
+                    history_fingerprint: prepared_history.fingerprint(),
+                })
+            },
         };
         let pending_token_estimate =
             estimate_pending_tokens(input, &[], &context_update_items, first_router.as_ref());
@@ -1078,11 +1103,19 @@ async fn build_pure_pending_turn_plan(
 
     // Final read-only DAG leaves: capture the model-visible history and build the
     // router concurrently, then validate the generation before accepting either.
-    let (history_items, first_router, context_update_items) = tokio::join!(
+    let (prepared_history, first_router, context_update_items) = tokio::join!(
         async {
-            sess.clone_history()
-                .await
-                .for_prompt(&turn_context.model_info.input_modalities)
+            let history_snapshot_guard = turn_context
+                .turn_timing_state
+                .begin_local_phase(TurnLocalPhase::HistorySnapshot);
+            let history = sess.clone_history().await;
+            drop(history_snapshot_guard);
+            let normalization_guard = turn_context
+                .turn_timing_state
+                .begin_local_phase(TurnLocalPhase::Normalization);
+            let prepared = history.prepare_for_prompt(&turn_context.model_info.input_modalities);
+            drop(normalization_guard);
+            prepared
         },
         built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token),
         sess.estimate_context_update_items(step_context.as_ref()),
@@ -1096,17 +1129,23 @@ async fn build_pure_pending_turn_plan(
     warnings.extend(skill_plan.injections.warnings.iter().cloned());
     let identity = PlanningSnapshotIdentity {
         generation,
-        state_digest: planning_state_digest(PlanningStateDigestInput {
-            step_context: step_context.as_ref(),
-            mcp_tools,
-            connectors: &available_connectors,
-            plugins: &mentioned_plugins,
-            injection_items: &injection_items,
-            context_update_items: &context_update_items,
-            user_input: &user_input,
-            router: first_router.as_ref(),
-            history_items: &history_items,
-        }),
+        state_digest: {
+            let _planning_identity_guard = turn_context
+                .turn_timing_state
+                .begin_local_phase(TurnLocalPhase::PlanningIdentity);
+            planning_state_digest(PlanningStateDigestInput {
+                step_context: step_context.as_ref(),
+                mcp_tools,
+                connectors: &available_connectors,
+                plugins: &mentioned_plugins,
+                injection_items: &injection_items,
+                context_update_items: &context_update_items,
+                user_input: &user_input,
+                router: first_router.as_ref(),
+                history_items: prepared_history.items(),
+                history_fingerprint: prepared_history.fingerprint(),
+            })
+        },
     };
     let pending_token_estimate = estimate_pending_tokens(
         input,
@@ -1448,6 +1487,7 @@ struct PlanningStateDigestInput<'a> {
     user_input: &'a [UserInput],
     router: &'a ToolRouter,
     history_items: &'a [ResponseItem],
+    history_fingerprint: Option<[u8; 32]>,
 }
 
 fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
@@ -1461,6 +1501,7 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         user_input,
         router,
         history_items,
+        history_fingerprint,
     } = input;
     let mut hasher = Sha256::new();
     for environment in &step_context.environments.turn_environments {
@@ -1489,11 +1530,19 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         serde_json::to_vec(context_update_items),
         serde_json::to_vec(user_input),
         serde_json::to_vec(&router.tool_manifest(step_context.turn.as_ref())),
-        serde_json::to_vec(history_items),
     ]
     .into_iter()
     .flatten()
     {
+        hasher.update(serialized);
+        hasher.update([0xff]);
+    }
+    if crate::latency_switches::history_identity_enabled()
+        && let Some(fingerprint) = history_fingerprint
+    {
+        hasher.update(b"prepared-history-fingerprint-v1");
+        hasher.update(fingerprint);
+    } else if let Ok(serialized) = serde_json::to_vec(history_items) {
         hasher.update(serialized);
         hasher.update([0xff]);
     }
@@ -2048,13 +2097,13 @@ pub(super) fn collect_explicit_app_ids_from_skill_items(
 
 #[instrument(level = "trace", skip_all)]
 pub(crate) fn build_prompt(
-    input: Vec<ResponseItem>,
+    input: impl Into<Arc<[ResponseItem]>>,
     router: &ToolRouter,
     turn_context: &TurnContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
     Prompt {
-        input,
+        input: input.into(),
         tools: router.model_visible_specs(),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
@@ -2082,7 +2131,7 @@ async fn run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
-    input: Vec<ResponseItem>,
+    input: Arc<[ResponseItem]>,
     prebuilt_router: &mut Option<Arc<ToolRouter>>,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     reasoning_phase: Option<SamplingReasoningPhase>,
@@ -2126,22 +2175,21 @@ async fn run_sampling_request(
     );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
-    let mut initial_input = Some(input);
-    let mut original_input = None;
+    let initial_input = Arc::clone(&input);
+    let prompt_construction_guard = turn_context
+        .turn_timing_state
+        .begin_local_phase(TurnLocalPhase::PromptConstruction);
+    let mut prompt = build_prompt(
+        input,
+        router.as_ref(),
+        turn_context.as_ref(),
+        base_instructions.clone(),
+    );
+    drop(prompt_construction_guard);
+    turn_context
+        .turn_timing_state
+        .begin_model_generation(pending_continuation_cause, &turn_context.session_source);
     loop {
-        let prompt_input = if let Some(input) = initial_input.take() {
-            input
-        } else {
-            sess.clone_history()
-                .await
-                .for_prompt(&turn_context.model_info.input_modalities)
-        };
-        let prompt = build_prompt(
-            prompt_input,
-            router.as_ref(),
-            turn_context.as_ref(),
-            base_instructions.clone(),
-        );
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -2154,13 +2202,12 @@ async fn run_sampling_request(
             preparation_timing_guard,
             reasoning_phase,
             reasoning_trigger,
-            pending_continuation_cause,
             cancellation_token.child_token(),
         )
         .await
         {
             Ok(output) => {
-                return Ok((output, original_input.unwrap_or(prompt.input)));
+                return Ok((output, initial_input.to_vec()));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -2175,10 +2222,6 @@ async fn run_sampling_request(
             }
             Err(err) => err,
         };
-
-        if original_input.is_none() {
-            original_input = Some(prompt.input);
-        }
 
         if !err.is_retryable() {
             return Err(err);
@@ -2198,6 +2241,18 @@ async fn run_sampling_request(
         drop(retry_timing_guard);
         retry_result?;
         turn_context.turn_timing_state.record_sampling_retry();
+        if !crate::latency_switches::shared_prompt_input_enabled() {
+            let retry_input = sess
+                .clone_history()
+                .await
+                .for_prompt(&turn_context.model_info.input_modalities);
+            prompt = build_prompt(
+                retry_input,
+                router.as_ref(),
+                turn_context.as_ref(),
+                base_instructions.clone(),
+            );
+        }
     }
 }
 
@@ -2946,6 +3001,19 @@ async fn drain_in_flight(
     first_error.map_or(Ok(()), Err)
 }
 
+fn start_eager_tool_future(
+    future: BoxFuture<'static, CodexResult<ResponseInputItem>>,
+) -> BoxFuture<'static, CodexResult<ResponseInputItem>> {
+    // Dropping a raw Tokio JoinHandle detaches its task. Keeping the abort-on-drop
+    // wrapper inside the ordered future makes collection teardown abort eager work.
+    let handle = AbortOnDropHandle::new(tokio::spawn(future));
+    Box::pin(async move {
+        handle
+            .await
+            .map_err(|err| CodexErr::Fatal(format!("eager tool task failed: {err}")))?
+    })
+}
+
 fn assign_missing_streamed_response_item_id(
     item: &mut ResponseItem,
     active_item: Option<&TurnItem>,
@@ -2981,7 +3049,6 @@ async fn try_run_sampling_request(
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     reasoning_phase: Option<SamplingReasoningPhase>,
     reasoning_trigger: codex_protocol::protocol::ReasoningPolicyTrigger,
-    pending_continuation_cause: &mut Option<ContinuationCause>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     sess.ensure_rollout_budget_available()?;
@@ -3005,9 +3072,6 @@ async fn try_run_sampling_request(
         turn_context.provider.info().name.as_str(),
     );
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
-    turn_context
-        .turn_timing_state
-        .consume_pending_continuation(pending_continuation_cause);
     let uses_sequential_cutoff_reasoning_summaries = turn_context
         .config
         .features
@@ -3060,6 +3124,7 @@ async fn try_run_sampling_request(
     let mut stream = stream_result??;
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
+    let mut earlier_tool_calls_eligible = true;
     let mut needs_follow_up = false;
     let mut tool_result_continuation = false;
     let mut server_end_turn_false = false;
@@ -3202,16 +3267,24 @@ async fn try_run_sampling_request(
                     cancellation_token: cancellation_token.child_token(),
                 };
 
-                let output_result =
-                    match handle_output_item_done(&mut ctx, item, previously_streamed_item)
-                        .instrument(handle_responses)
-                        .await
-                    {
-                        Ok(output_result) => output_result,
-                        Err(err) => break Err(err),
-                    };
+                let output_result = match handle_output_item_done(
+                    &mut ctx,
+                    item,
+                    previously_streamed_item,
+                    &mut earlier_tool_calls_eligible,
+                )
+                .instrument(handle_responses)
+                .await
+                {
+                    Ok(output_result) => output_result,
+                    Err(err) => break Err(err),
+                };
                 if let Some(tool_future) = output_result.tool_future {
-                    in_flight.push_back(tool_future);
+                    if output_result.eager_read_eligible {
+                        in_flight.push_back(start_eager_tool_future(tool_future));
+                    } else {
+                        in_flight.push_back(tool_future);
+                    }
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);

@@ -5,6 +5,8 @@ import type { TurnTimingCounters } from "./TurnTimingCounters";
 import type { TurnTimingExclusive } from "./TurnTimingExclusive";
 import type { TurnTimingLocal } from "./TurnTimingLocal";
 import type { TurnTimingMilestones } from "./TurnTimingMilestones";
+import type { TurnTimingModelRequest } from "./TurnTimingModelRequest";
+import type { TurnTimingPreFirstModelOutput } from "./TurnTimingPreFirstModelOutput";
 import type { TurnTimingUnions } from "./TurnTimingUnions";
 
 /**
@@ -17,4 +19,9 @@ export type TurnTiming = { schemaVersion: number, profileValid: boolean, classif
 /**
  * Inclusive duration minus only the interactive-only wait partition.
  */
-machineDurationNs: bigint, machineDurationMs: bigint, exclusive: TurnTimingExclusive, unions: TurnTimingUnions, local: TurnTimingLocal, milestones: TurnTimingMilestones, counters: TurnTimingCounters, };
+machineDurationNs: bigint, machineDurationMs: bigint, exclusive: TurnTimingExclusive, unions: TurnTimingUnions, local: TurnTimingLocal, milestones: TurnTimingMilestones, counters: TurnTimingCounters,
+/**
+ * Per-sampling-request milestones, ordered by request. Times are offsets
+ * from turn start and are diagnostic only; they are not additive buckets.
+ */
+modelRequests?: Array<TurnTimingModelRequest>, preFirstModelOutput?: TurnTimingPreFirstModelOutput, };

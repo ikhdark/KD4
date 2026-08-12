@@ -434,7 +434,7 @@ contains = "tool_search_cache_rebuilds_when_deferred_sources_change"
 [[features]]
 id = "source-tools"
 version = 1
-status = "disabled"
+status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/file-search"
 summary = "Feature-gated structured source search and bounded file-span reads."
@@ -459,7 +459,37 @@ contains = "key: \"source_tools\""
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/tools/spec_plan_tests.rs"
-contains = "source_tools_are_registered_only_when_enabled"
+contains = "source_tools_follow_default_and_explicit_disable"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/tests/suite/source_tools.rs"
+contains = "source_tools_execute_search_and_read_end_to_end"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/handlers/source_tests.rs"
+contains = "source_handlers_select_local_environment_and_reject_remote_environment"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/handlers/source_tests.rs"
+contains = "read_file_span_handler_rejects_symlink_or_junction_escape"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/handlers/source_tests.rs"
+contains = "read_file_span_handler_reads_exact_loaded_skill_path"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/file-search/src/source_search_tests.rs"
+contains = "representative_large_repository_search_stays_within_walk_and_output_bounds"
+
+[[features.evidence]]
+kind = "workflow"
+path = "scripts/kd4_perf_snapshot.py"
+contains = "source-tools-runtime-test"
 
 [[features]]
 id = "config-explain"

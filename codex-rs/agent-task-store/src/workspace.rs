@@ -10,7 +10,9 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::process::Child;
 use std::process::Command;
+use std::process::Stdio;
 use uuid::Uuid;
 
 use crate::AssignmentId;
@@ -1308,16 +1310,21 @@ fn include_manifest_paths(
 }
 
 fn collect_repository_overlay_files(root: &Path, files: &mut BTreeSet<String>) -> StoreResult<()> {
-    let tracked = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["diff", "--name-only", "-z", "--no-ext-diff", "HEAD", "--"])
-        .output();
-    let untracked = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output();
+    collect_repository_overlay_files_with(root, files, spawn_repository_overlay_command)
+}
+
+fn collect_repository_overlay_files_with(
+    root: &Path,
+    files: &mut BTreeSet<String>,
+    mut spawn: impl FnMut(&Path, &[&str]) -> std::io::Result<Child>,
+) -> StoreResult<()> {
+    let tracked = spawn(
+        root,
+        &["diff", "--name-only", "-z", "--no-ext-diff", "HEAD", "--"],
+    );
+    let untracked = spawn(root, &["ls-files", "--others", "--exclude-standard", "-z"]);
+    let tracked = tracked.and_then(Child::wait_with_output);
+    let untracked = untracked.and_then(Child::wait_with_output);
     if let (Ok(tracked), Ok(untracked)) = (tracked, untracked)
         && tracked.status.success()
         && untracked.status.success()
@@ -1342,6 +1349,16 @@ fn collect_repository_overlay_files(root: &Path, files: &mut BTreeSet<String>) -
     }
 
     collect_repository_files_fallback(root, root, files)
+}
+
+fn spawn_repository_overlay_command(root: &Path, args: &[&str]) -> std::io::Result<Child> {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
 }
 
 fn collect_repository_files_fallback(
@@ -1894,4 +1911,69 @@ fn json<T: serde::Serialize + ?Sized>(value: &T) -> StoreResult<String> {
 
 fn from_json<T: serde::de::DeserializeOwned>(value: &str) -> StoreResult<T> {
     Ok(serde_json::from_str(value)?)
+}
+
+#[cfg(test)]
+mod overlay_observation_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::time::Duration as StdDuration;
+    use std::time::Instant;
+
+    const HELPER_DIR: &str = "KD4_OVERLAY_HELPER_DIR";
+    const HELPER_ROLE: &str = "KD4_OVERLAY_HELPER_ROLE";
+
+    #[test]
+    #[ignore = "invoked as a child process by overlay_commands_start_before_either_is_reaped"]
+    fn overlay_observation_child() {
+        let dir = PathBuf::from(std::env::var_os(HELPER_DIR).expect("helper dir"));
+        let role = std::env::var(HELPER_ROLE).expect("helper role");
+        let other = if role == "tracked" {
+            "untracked"
+        } else {
+            "tracked"
+        };
+        std::fs::write(dir.join(&role), b"started").expect("write start marker");
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        while !dir.join(other).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "other overlay command never started"
+            );
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn overlay_commands_start_before_either_is_reaped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let helper_dir = temp.path().join("markers");
+        std::fs::create_dir(&helper_dir).expect("create marker dir");
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let spawn_count = Cell::new(0usize);
+        let mut files = BTreeSet::new();
+
+        collect_repository_overlay_files_with(temp.path(), &mut files, |_root, args| {
+            let role = if args.first() == Some(&"diff") {
+                "tracked"
+            } else {
+                "untracked"
+            };
+            spawn_count.set(spawn_count.get() + 1);
+            Command::new(&current_exe)
+                .arg("overlay_observation_child")
+                .arg("--ignored")
+                .env(HELPER_DIR, &helper_dir)
+                .env(HELPER_ROLE, role)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .expect("collect concurrent overlay observation");
+
+        assert_eq!(spawn_count.get(), 2);
+        assert!(helper_dir.join("tracked").exists());
+        assert!(helper_dir.join("untracked").exists());
+    }
 }

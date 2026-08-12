@@ -8,6 +8,7 @@ use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -17,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub struct Prompt {
     /// Conversation context input items.
-    pub input: Vec<ResponseItem>,
+    pub input: Arc<[ResponseItem]>,
 
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
@@ -38,7 +39,7 @@ pub struct Prompt {
 impl Default for Prompt {
     fn default() -> Self {
         Self {
-            input: Vec::new(),
+            input: Arc::from([]),
             tools: Vec::new(),
             parallel_tool_calls: false,
             base_instructions: BaseInstructions::default(),
@@ -52,13 +53,46 @@ impl Prompt {
     pub(crate) fn get_formatted_input_for_request(
         &self,
         use_responses_lite: bool,
-    ) -> Vec<ResponseItem> {
-        let mut input = self.input.clone();
-        if use_responses_lite {
-            strip_image_details(&mut input);
+    ) -> Arc<[ResponseItem]> {
+        let mut input = if crate::latency_switches::shared_prompt_input_enabled() {
+            Arc::clone(&self.input)
+        } else {
+            Arc::from(self.input.to_vec())
+        };
+        if use_responses_lite && has_image_details(&input) {
+            strip_image_details(Arc::make_mut(&mut input));
         }
         input
     }
+}
+
+fn has_image_details(items: &[ResponseItem]) -> bool {
+    items.iter().any(|item| match item {
+        ResponseItem::Message { content, .. } => content.iter().any(|content_item| {
+            matches!(
+                content_item,
+                ContentItem::InputImage {
+                    detail: Some(_),
+                    ..
+                }
+            )
+        }),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            output.content_items().is_some_and(|content| {
+                content.iter().any(|content_item| {
+                    matches!(
+                        content_item,
+                        FunctionCallOutputContentItem::InputImage {
+                            detail: Some(_),
+                            ..
+                        }
+                    )
+                })
+            })
+        }
+        _ => false,
+    })
 }
 
 fn strip_image_details(items: &mut [ResponseItem]) {

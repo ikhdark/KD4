@@ -1,3 +1,4 @@
+use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::ShellCommandToolCallParams;
 use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
@@ -16,6 +17,7 @@ use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::shell::get_shell;
 use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -31,6 +33,14 @@ use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
+use crate::validation_admission::ValidationAdmission;
+use crate::validation_admission::ValidationLaunchPlan;
+use crate::validation_admission::ValidationLeader;
+use crate::validation_admission::ValidationLeaderOwnership;
+use crate::validation_admission::ValidationRegistration;
+use crate::validation_admission::admit_validation;
+use crate::validation_admission::register_if_absent;
+use crate::validation_admission::validation_identity;
 use codex_tools::ToolSpec;
 
 use super::super::shell_spec::CommandToolOptions;
@@ -44,6 +54,39 @@ use super::shell_command_payload_command;
 enum ShellCommandBackend {
     Classic,
     ZshFork,
+}
+
+#[derive(Default)]
+pub(super) struct ValidationRegistrationRoles {
+    pub(super) execution: Option<ValidationLeaderOwnership>,
+    pub(super) worker_waiter: Option<ValidationLeader>,
+    pub(super) owner_waiter: Option<ValidationLeader>,
+}
+
+pub(super) fn validation_registration_roles(
+    registration: ValidationRegistration,
+) -> ValidationRegistrationRoles {
+    match registration {
+        ValidationRegistration::Leader { execution, waiter } => ValidationRegistrationRoles {
+            execution: Some(execution),
+            worker_waiter: None,
+            owner_waiter: Some(waiter),
+        },
+        ValidationRegistration::Follower(waiter) => ValidationRegistrationRoles {
+            execution: None,
+            worker_waiter: Some(waiter),
+            owner_waiter: None,
+        },
+    }
+}
+
+pub(super) async fn await_validation_execution<T>(
+    task: tokio::task::JoinHandle<T>,
+    owner_waiter: Option<ValidationLeader>,
+) -> Result<T, tokio::task::JoinError> {
+    let result = task.await;
+    drop(owner_waiter);
+    result
 }
 
 pub struct ShellCommandHandler {
@@ -248,6 +291,31 @@ impl ShellCommandHandler {
         })?;
         let command_invocation = preflight.invocation;
         let repair_notice = preflight.repair_notice;
+        let repository = get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf());
+        let repository_key = repository.to_string_lossy();
+        let validation_launch = match admit_validation(
+            &turn.validation_authorization,
+            session.services.state_db.as_deref(),
+            repository_key.as_bytes(),
+            &command_invocation,
+        )
+        .await
+        {
+            ValidationAdmission::Skip(skipped) => {
+                tracing::info!(reason = ?skipped.reason, "validation command skipped");
+                return Ok(boxed_tool_output(validation_structured_output(
+                    serde_json::to_value(skipped).unwrap_or_default(),
+                )));
+            }
+            ValidationAdmission::Execute {
+                authorization_revision,
+                observation,
+            } => observation.map(|observation| ValidationLaunchPlan {
+                invocation: command_invocation.clone(),
+                authorization_revision,
+                observation: Some(observation),
+            }),
+        };
         let hook_command = command_invocation.display_command();
         maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &hook_command, &cwd)
             .await;
@@ -289,6 +357,35 @@ impl ShellCommandHandler {
             exec_params.network,
         );
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+        let ValidationRegistrationRoles {
+            execution: validation_leader,
+            worker_waiter: validation_waiter,
+            owner_waiter: validation_owner_waiter,
+        } = if validation_launch.is_some() {
+            let environment = super::validation_environment_hash(&exec_params.env);
+            let toolchain = super::child_env_value(&exec_params.env, "RUSTUP_TOOLCHAIN")
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let identity = validation_identity(
+                repository_key.as_bytes(),
+                exec_params.cwd.to_string_lossy(),
+                &command_invocation,
+                environment,
+                toolchain,
+                observed_mutation_revision,
+            );
+            validation_registration_roles(
+                register_if_absent(
+                    &turn.validation_singleflight,
+                    identity,
+                    &call_id,
+                    &cancellation_token,
+                )
+                .await,
+            )
+        } else {
+            ValidationRegistrationRoles::default()
+        };
         let repository_epoch = session
             .services
             .command_execution
@@ -307,7 +404,7 @@ impl ShellCommandHandler {
         .with_input_context(&prefix_rule)
         .with_runtime_context(&runtime_context)
         .with_repository_epoch(repository_epoch);
-        run_exec_like(RunExecLikeArgs {
+        let mut run_args = RunExecLikeArgs {
             tool_name,
             exec_params,
             cancellation_token,
@@ -327,10 +424,42 @@ impl ShellCommandHandler {
             attempt_key: Some(attempt_key),
             repair_notice,
             force_fresh: params.force_fresh.unwrap_or(false),
-        })
-        .await
-        .map(boxed_tool_output)
+            validation_launch,
+            validation_leader,
+            validation_waiter,
+        };
+        if let Some(leader) = run_args.validation_leader.as_ref() {
+            run_args.cancellation_token = leader.cancellation_token();
+            await_validation_execution(
+                tokio::spawn(async move { run_exec_like(run_args).await }),
+                validation_owner_waiter,
+            )
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "shared validation execution task failed: {error}"
+                ))
+            })?
+            .map(boxed_tool_output)
+        } else {
+            run_exec_like(run_args).await.map(boxed_tool_output)
+        }
     }
+}
+
+pub(super) fn validation_structured_output(value: serde_json::Value) -> FunctionToolOutput {
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    let success = value
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let mut output = FunctionToolOutput::from_text(text, Some(success));
+    output.post_tool_use_response = Some(value);
+    output
 }
 
 pub(super) fn resolve_command_shell(

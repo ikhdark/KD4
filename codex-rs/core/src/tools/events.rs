@@ -56,6 +56,7 @@ impl<'a> ToolEventCtx<'a> {
 
 pub(crate) enum ToolEventStage<'a> {
     Begin,
+    Skipped(String),
     Success {
         output: ExecToolCallOutput,
         applied_patch_delta: Option<&'a AppliedPatchDelta>,
@@ -400,6 +401,7 @@ impl ToolEmitter {
                 )
                 .await;
             }
+            (Self::ApplyPatch { .. }, ToolEventStage::Skipped(_)) => {}
             (
                 Self::UnifiedExec {
                     command,
@@ -503,6 +505,13 @@ impl ToolEmitter {
                 let event = ToolEventStage::Failure(ToolEventFailure::Message(message.clone()));
                 let result = Err(FunctionCallError::RespondToModel(message));
                 (event, result)
+            }
+            Err(ToolError::ValidationSkipped(skipped)) => {
+                let content = serde_json::to_string(&skipped).unwrap_or_else(|_| {
+                    r#"{"reason":"validation_skipped","command_was_executed":false}"#.to_string()
+                });
+                tracing::info!(reason = ?skipped.reason, "validation command skipped");
+                (ToolEventStage::Skipped(content.clone()), Ok(content))
             }
             Err(ToolError::Rejected(msg)) => {
                 let bounded =
@@ -648,6 +657,9 @@ async fn emit_exec_stage(
                 timed_out: false,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
+        }
+        ToolEventStage::Skipped(output) => {
+            tracing::info!(%output, "exec tool completed with a skipped outcome");
         }
     }
 }

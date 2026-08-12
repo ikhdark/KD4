@@ -129,6 +129,22 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
         .remove("trace_id")
         .context("tool call log event must include trace_id")?;
     anyhow::ensure!(trace_id.is_string(), "trace_id must be a string");
+    let item_to_first_poll_ms = fields
+        .remove("item_to_first_poll_ms")
+        .and_then(|duration| duration.as_u64())
+        .context("item_to_first_poll_ms must be a nonnegative integer")?;
+    let parallel_gate_wait_ms = fields
+        .remove("parallel_gate_wait_ms")
+        .and_then(|duration| duration.as_u64())
+        .context("parallel_gate_wait_ms must be a nonnegative integer")?;
+    let authorization_state_coordination_ms = fields
+        .remove("authorization_state_coordination_ms")
+        .and_then(|duration| duration.as_u64())
+        .context("authorization_state_coordination_ms must be a nonnegative integer")?;
+    let first_poll_to_handler_entry_ms = fields
+        .remove("first_poll_to_handler_entry_ms")
+        .and_then(|duration| duration.as_u64())
+        .context("first_poll_to_handler_entry_ms must be a nonnegative integer")?;
     let dispatch_duration_ms = fields
         .remove("dispatch_duration_ms")
         .and_then(|duration| duration.as_u64())
@@ -141,13 +157,21 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
         .remove("total_duration_ms")
         .and_then(|duration| duration.as_u64())
         .context("total_duration_ms must be a nonnegative integer")?;
-    let accounted_duration_ms = dispatch_duration_ms
-        .checked_add(handler_duration_ms)
-        .context("dispatch and handler durations must not overflow")?;
     anyhow::ensure!(
-        total_duration_ms >= accounted_duration_ms
-            && total_duration_ms - accounted_duration_ms <= 1,
-        "dispatch and handler durations must account for total duration within integer truncation"
+        dispatch_duration_ms == parallel_gate_wait_ms,
+        "legacy dispatch duration must alias parallel-gate wait"
+    );
+    anyhow::ensure!(
+        [
+            item_to_first_poll_ms,
+            parallel_gate_wait_ms,
+            authorization_state_coordination_ms,
+            first_poll_to_handler_entry_ms,
+            handler_duration_ms,
+        ]
+        .into_iter()
+        .all(|duration| duration <= total_duration_ms),
+        "each correlated timing segment must fit within total duration"
     );
 
     assert_eq!(
@@ -163,6 +187,7 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
                 "call_id": "exec-call-1",
                 "tool_source": "direct",
                 "execution_started": true,
+                "eager": false,
             },
             "target": "codex_core::tools::parallel",
         })

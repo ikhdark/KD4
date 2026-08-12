@@ -30,6 +30,9 @@ pub enum ToolCallOutcome {
         /// The tool output's own success marker for telemetry/logging.
         success: bool,
     },
+    /// The tool returned a structured result without executing the requested
+    /// operation.
+    Skipped,
     /// The tool was blocked by host policy before the handler ran.
     Blocked,
     /// The tool did not produce a normal output.

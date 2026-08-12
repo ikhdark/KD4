@@ -347,6 +347,23 @@ async fn start_focused_validation(
     call_id: &str,
     command: &str,
 ) -> ValidationCall {
+    start_focused_validation_with_evidence(
+        store,
+        attempt_id,
+        call_id,
+        command,
+        ValidationEvidence::default(),
+    )
+    .await
+}
+
+async fn start_focused_validation_with_evidence(
+    store: &LocalAgentTaskStore,
+    attempt_id: AttemptId,
+    call_id: &str,
+    command: &str,
+    evidence: ValidationEvidence,
+) -> ValidationCall {
     store
         .record_validation_call(ValidationCall {
             call_id: call_id.to_string(),
@@ -354,7 +371,7 @@ async fn start_focused_validation(
             command_summary: command.to_string(),
             resolved_executable: resolved_test_executable(),
             proof_kind: ValidationProofKind::Focused,
-            evidence: ValidationEvidence::default(),
+            evidence,
             status: ValidationCallStatus::Running,
             recorded_at: Utc::now(),
         })
@@ -3399,6 +3416,247 @@ async fn validation_singleflight_is_exact_and_epoch_bound() {
     )
     .await;
     assert_eq!(third.evidence.shared_from_call_id, None);
+}
+
+#[tokio::test]
+async fn completed_validation_reuse_is_successful_exact_and_manifest_bound() {
+    fn rust_evidence() -> ValidationEvidence {
+        ValidationEvidence {
+            cwd: Some("codex-rs".to_string()),
+            environment_hash: Some("rust-env".to_string()),
+            toolchain: Some("stable".to_string()),
+            ..ValidationEvidence::default()
+        }
+    }
+
+    async fn attempt_for(
+        fixture: &Fixture,
+        root_session_id: &str,
+        scope: &str,
+        command: &str,
+    ) -> Attempt {
+        let draft = validation_worker_draft(root_session_id, scope, command);
+        fixture
+            .store
+            .create_assignment(fixture.repo.path(), draft)
+            .await
+            .expect("validation assignment")
+            .1
+    }
+
+    let fixture = Fixture::new().await;
+    let rust_source = fixture.repo.path().join("codex-rs/core/src/lib.rs");
+    std::fs::create_dir_all(rust_source.parent().expect("rust source parent"))
+        .expect("rust source directory");
+    std::fs::write(&rust_source, "pub fn source_a() {}\n").expect("rust source fixture");
+    let command = "cargo clippy -p codex-core --all-targets";
+    let first_attempt = attempt_for(&fixture, "reuse-root", "codex-rs/core", command).await;
+    let first = start_focused_validation_with_evidence(
+        &fixture.store,
+        first_attempt.attempt_id,
+        "reuse-success-call",
+        command,
+        rust_evidence(),
+    )
+    .await;
+    finish_focused_validation(&fixture.store, first).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            first_attempt.attempt_id,
+            completed_receipt(vec!["reuse-success-call".to_string()]),
+        )
+        .await
+        .expect("first validation receipt");
+
+    std::fs::write(
+        fixture.repo.path().join("validation-report.md"),
+        "report only\n",
+    )
+    .expect("report fixture");
+    fixture
+        .store
+        .capture_workspace_revision(
+            fixture.repo.path(),
+            vec!["validation-report.md".to_string()],
+        )
+        .await
+        .expect("report revision");
+    let report_attempt = attempt_for(&fixture, "reuse-root", "codex-rs/core", command).await;
+    let report_follow_up = start_focused_validation_with_evidence(
+        &fixture.store,
+        report_attempt.attempt_id,
+        "reuse-report-call",
+        command,
+        rust_evidence(),
+    )
+    .await;
+    assert_eq!(
+        report_follow_up.evidence.shared_from_call_id.as_deref(),
+        Some("reuse-success-call")
+    );
+    finish_focused_validation(&fixture.store, report_follow_up).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            report_attempt.attempt_id,
+            completed_receipt(vec!["reuse-report-call".to_string()]),
+        )
+        .await
+        .expect("report validation receipt");
+
+    std::fs::write(&rust_source, "pub fn source_b() {}\n").expect("changed rust source fixture");
+    let changed_attempt = attempt_for(&fixture, "reuse-root", "codex-rs/core", command).await;
+    let changed = start_focused_validation_with_evidence(
+        &fixture.store,
+        changed_attempt.attempt_id,
+        "reuse-source-change-call",
+        command,
+        rust_evidence(),
+    )
+    .await;
+    assert_eq!(changed.evidence.shared_from_call_id, None);
+    finish_focused_validation(&fixture.store, changed).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            changed_attempt.attempt_id,
+            completed_receipt(vec!["reuse-source-change-call".to_string()]),
+        )
+        .await
+        .expect("changed validation receipt");
+
+    let unknown_attempt = attempt_for(&fixture, "reuse-root", "codex-rs/core", command).await;
+    let unknown = start_focused_validation(
+        &fixture.store,
+        unknown_attempt.attempt_id,
+        "reuse-unknown-call",
+        command,
+    )
+    .await;
+    assert_eq!(unknown.evidence.shared_from_call_id, None);
+    finish_focused_validation(&fixture.store, unknown).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            unknown_attempt.attempt_id,
+            completed_receipt(vec!["reuse-unknown-call".to_string()]),
+        )
+        .await
+        .expect("unknown validation receipt");
+
+    let generated_command = "python scripts/check_generated.py";
+    let generated_source = fixture.repo.path().join("schema/input.json");
+    std::fs::create_dir_all(generated_source.parent().expect("generated source parent"))
+        .expect("generated source directory");
+    std::fs::write(&generated_source, "{\"version\":\"a\"}\n").expect("generated source fixture");
+    let generated_attempt = attempt_for(
+        &fixture,
+        "generated-root",
+        "schema/input.json",
+        generated_command,
+    )
+    .await;
+    let generated = start_focused_validation_with_evidence(
+        &fixture.store,
+        generated_attempt.attempt_id,
+        "generated-success-call",
+        generated_command,
+        ValidationEvidence::default(),
+    )
+    .await;
+    finish_focused_validation(&fixture.store, generated).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            generated_attempt.attempt_id,
+            completed_receipt(vec!["generated-success-call".to_string()]),
+        )
+        .await
+        .expect("generated validation receipt");
+    std::fs::write(&generated_source, "{\"version\":\"b\"}\n")
+        .expect("changed generated source fixture");
+    let changed_generated_attempt = attempt_for(
+        &fixture,
+        "generated-root",
+        "schema/input.json",
+        generated_command,
+    )
+    .await;
+    let changed_generated = start_focused_validation_with_evidence(
+        &fixture.store,
+        changed_generated_attempt.attempt_id,
+        "generated-change-call",
+        generated_command,
+        ValidationEvidence::default(),
+    )
+    .await;
+    assert_eq!(changed_generated.evidence.shared_from_call_id, None);
+}
+
+#[tokio::test]
+async fn failed_and_cancelled_validation_evidence_is_not_reused() {
+    let fixture = Fixture::new().await;
+    let command = "cargo clippy -p codex-core --all-targets";
+    for (status, suffix) in [
+        (ValidationCallStatus::Failed, "failed"),
+        (ValidationCallStatus::Cancelled, "cancelled"),
+    ] {
+        let root_session_id = format!("{suffix}-root");
+        let mut first_draft = validation_worker_draft(&root_session_id, "unused-a", command);
+        first_draft.write_scope.clear();
+        let (_, first_attempt) = fixture
+            .store
+            .create_assignment(fixture.repo.path(), first_draft)
+            .await
+            .expect("terminal validation assignment");
+        let evidence = ValidationEvidence {
+            covered_scopes: vec![RepoScope {
+                path: "codex-rs/core".to_string(),
+                recursive: true,
+            }],
+            covered_manifest: vec![WorkspaceManifestEntry {
+                path: "codex-rs/core/src/lib.rs".to_string(),
+                content_hash: Some("source-a".to_string()),
+                existed: true,
+            }],
+            manifest_hash: "rust-manifest-a".to_string(),
+            ..ValidationEvidence::default()
+        };
+        let mut first = start_focused_validation_with_evidence(
+            &fixture.store,
+            first_attempt.attempt_id,
+            &format!("{suffix}-source"),
+            command,
+            evidence.clone(),
+        )
+        .await;
+        first.status = status;
+        first.recorded_at += Duration::milliseconds(1);
+        fixture
+            .store
+            .record_validation_call(first)
+            .await
+            .expect("terminal validation finishes");
+
+        let mut retry_draft = validation_worker_draft(&root_session_id, "unused-b", command);
+        retry_draft.write_scope.clear();
+        let (_, retry_attempt) = fixture
+            .store
+            .create_assignment(fixture.repo.path(), retry_draft)
+            .await
+            .expect("retry assignment");
+        let retry = start_focused_validation_with_evidence(
+            &fixture.store,
+            retry_attempt.attempt_id,
+            &format!("{suffix}-retry-call"),
+            command,
+            evidence,
+        )
+        .await;
+        assert_eq!(retry.evidence.shared_from_call_id, None);
+        finish_focused_validation(&fixture.store, retry).await;
+    }
 }
 
 #[tokio::test]

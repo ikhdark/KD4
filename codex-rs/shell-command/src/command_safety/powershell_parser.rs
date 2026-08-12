@@ -42,12 +42,27 @@ enum PowershellFlavor {
 
 type CachedParser = Arc<Mutex<Option<PowershellParserProcess>>>;
 
+static PARSER_PROCESSES: LazyLock<Mutex<HashMap<PowershellFlavor, CachedParser>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PowershellResolutionState {
+    pub cwd: String,
+    pub path: String,
+    pub pathext: String,
+}
+
 /// Cache one long-lived parser process per trusted PowerShell flavor. The map lock only protects
 /// cache lookup; each parser has its own lock so a stalled host cannot block the other flavor.
 pub(super) fn parse_with_powershell_ast(executable: &str, script: &str) -> PowershellParseOutcome {
-    static PARSER_PROCESSES: LazyLock<Mutex<HashMap<PowershellFlavor, CachedParser>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    parse_with_powershell_ast_request(executable, script, None)
+}
 
+fn parse_with_powershell_ast_request(
+    executable: &str,
+    script: &str,
+    resolution: Option<&PowershellResolutionState>,
+) -> PowershellParseOutcome {
     let Some(flavor) = PowershellFlavor::from_requested_executable(executable) else {
         return PowershellParseOutcome::Failed;
     };
@@ -61,7 +76,7 @@ pub(super) fn parse_with_powershell_ast(executable: &str, script: &str) -> Power
             .clone()
     };
     let mut parser = parser.lock().unwrap_or_else(PoisonError::into_inner);
-    parse_with_cached_process(&mut parser, executable, script)
+    parse_with_cached_process(&mut parser, executable, script, resolution)
 }
 
 pub(crate) fn try_parse_powershell_ast_commands(
@@ -69,7 +84,42 @@ pub(crate) fn try_parse_powershell_ast_commands(
     script: &str,
 ) -> Option<Vec<Vec<String>>> {
     match parse_with_powershell_ast(executable, script) {
-        PowershellParseOutcome::Commands(commands) => Some(commands),
+        PowershellParseOutcome::Analysis(analysis) => Some(analysis.commands),
+        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PowershellDirectArgvCandidate {
+    pub argv: Vec<String>,
+    pub native_argument_mode: String,
+    pub powershell_version: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PowershellParseAnalysis {
+    pub commands: Vec<Vec<String>>,
+    pub direct_argv: Option<PowershellDirectArgvCandidate>,
+    pub resolved_application: Option<String>,
+}
+
+pub(crate) fn try_parse_powershell_ast_analysis(
+    executable: &str,
+    script: &str,
+) -> Option<PowershellParseAnalysis> {
+    match parse_with_powershell_ast(executable, script) {
+        PowershellParseOutcome::Analysis(analysis) => Some(analysis),
+        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed => None,
+    }
+}
+
+pub(crate) fn try_parse_powershell_ast_analysis_with_resolution(
+    executable: &str,
+    script: &str,
+    resolution: &PowershellResolutionState,
+) -> Option<PowershellParseAnalysis> {
+    match parse_with_powershell_ast_request(executable, script, Some(resolution)) {
+        PowershellParseOutcome::Analysis(analysis) => Some(analysis),
         PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed => None,
     }
 }
@@ -86,7 +136,7 @@ pub(crate) fn is_trusted_powershell_host(executable: &str) -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum PowershellParseOutcome {
-    Commands(Vec<Vec<String>>),
+    Analysis(PowershellParseAnalysis),
     Unsupported,
     Failed,
 }
@@ -95,6 +145,7 @@ fn parse_with_cached_process(
     parser_process: &mut Option<PowershellParserProcess>,
     executable: &str,
     script: &str,
+    resolution: Option<&PowershellResolutionState>,
 ) -> PowershellParseOutcome {
     for attempt in 0..=1 {
         if parser_process.is_none() {
@@ -109,7 +160,7 @@ fn parse_with_cached_process(
         let Some(process) = parser_process.as_mut() else {
             return PowershellParseOutcome::Failed;
         };
-        let parse_result = process.parse(script);
+        let parse_result = process.parse_request(script, resolution);
         match parse_result {
             Ok(outcome) => return outcome,
             Err(error) => {
@@ -137,9 +188,23 @@ fn encode_powershell_base64(script: &str) -> String {
     BASE64_STANDARD.encode(utf16)
 }
 
-fn encoded_parser_script() -> &'static str {
+const PARSER_SOURCE_ENV: &str = "CODEX_INTERNAL_POWERSHELL_PARSER_SOURCE";
+const PARSER_BOOTSTRAP: &str = concat!(
+    "$s=$env:",
+    "CODEX_INTERNAL_POWERSHELL_PARSER_SOURCE",
+    ";Remove-Item Env:",
+    "CODEX_INTERNAL_POWERSHELL_PARSER_SOURCE",
+    ";Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)))"
+);
+
+fn encoded_parser_source() -> &'static str {
     static ENCODED: LazyLock<String> =
-        LazyLock::new(|| encode_powershell_base64(POWERSHELL_PARSER_SCRIPT));
+        LazyLock::new(|| BASE64_STANDARD.encode(POWERSHELL_PARSER_SCRIPT.as_bytes()));
+    &ENCODED
+}
+
+fn encoded_parser_bootstrap() -> &'static str {
+    static ENCODED: LazyLock<String> = LazyLock::new(|| encode_powershell_base64(PARSER_BOOTSTRAP));
     &ENCODED
 }
 
@@ -177,8 +242,9 @@ impl PowershellParserProcess {
                 "-NoProfile",
                 "-NonInteractive",
                 "-EncodedCommand",
-                encoded_parser_script(),
+                encoded_parser_bootstrap(),
             ])
+            .env(PARSER_SOURCE_ENV, encoded_parser_source())
             .current_dir(trusted_working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -231,10 +297,20 @@ impl PowershellParserProcess {
         })
     }
 
+    #[cfg(test)]
     fn parse(&mut self, script: &str) -> std::io::Result<PowershellParseOutcome> {
+        self.parse_request(script, None)
+    }
+
+    fn parse_request(
+        &mut self,
+        script: &str,
+        resolution: Option<&PowershellResolutionState>,
+    ) -> std::io::Result<PowershellParseOutcome> {
         let request = PowershellParserRequest {
             id: self.next_request_id,
             payload: encode_powershell_base64(script),
+            resolution: resolution.cloned(),
         };
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let mut request_json = serialize_request(&request)?;
@@ -555,6 +631,7 @@ fn deserialize_response(response_line: &str) -> std::io::Result<PowershellParser
 struct PowershellParserRequest {
     id: u64,
     payload: String,
+    resolution: Option<PowershellResolutionState>,
 }
 
 #[derive(Deserialize)]
@@ -563,6 +640,10 @@ struct PowershellParserResponse {
     id: u64,
     status: String,
     commands: Option<Vec<Vec<String>>>,
+    direct_argv: Option<Vec<String>>,
+    native_argument_mode: Option<String>,
+    powershell_version: Option<String>,
+    resolved_application: Option<String>,
 }
 
 impl PowershellParserResponse {
@@ -574,9 +655,30 @@ impl PowershellParserResponse {
                     !commands.is_empty()
                         && commands
                             .iter()
-                            .all(|cmd| !cmd.is_empty() && cmd.iter().all(|word| !word.is_empty()))
+                            .all(|cmd| !cmd.is_empty() && !cmd[0].is_empty())
                 })
-                .map(PowershellParseOutcome::Commands)
+                .map(|commands| {
+                    let direct_argv = self
+                        .direct_argv
+                        .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
+                        .zip(self.native_argument_mode.zip(self.powershell_version))
+                        .filter(|(_, (mode, version))| {
+                            matches!(mode.as_str(), "Standard" | "Windows")
+                                && version.split('.').next() == Some("7")
+                        })
+                        .map(|(argv, (native_argument_mode, powershell_version))| {
+                            PowershellDirectArgvCandidate {
+                                argv,
+                                native_argument_mode,
+                                powershell_version,
+                            }
+                        });
+                    PowershellParseOutcome::Analysis(PowershellParseAnalysis {
+                        commands,
+                        direct_argv,
+                        resolved_application: self.resolved_application,
+                    })
+                })
                 .unwrap_or(PowershellParseOutcome::Unsupported),
             "unsupported" => PowershellParseOutcome::Unsupported,
             _ => PowershellParseOutcome::Failed,
@@ -607,6 +709,42 @@ mod tests {
     use crate::powershell::try_find_powershell_executable_blocking;
     use pretty_assertions::assert_eq;
 
+    fn parser_response_with_mode(mode: &str, version: &str) -> PowershellParseOutcome {
+        PowershellParserResponse {
+            id: 1,
+            status: "ok".to_string(),
+            commands: Some(vec![vec!["python".to_string()]]),
+            direct_argv: Some(vec!["python".to_string()]),
+            native_argument_mode: Some(mode.to_string()),
+            powershell_version: Some(version.to_string()),
+            resolved_application: None,
+        }
+        .into_outcome()
+    }
+
+    #[test]
+    fn direct_candidate_requires_a_supported_native_argument_mode() {
+        for (mode, version) in [
+            ("Legacy", "7.5.0"),
+            ("Standard", "5.1.0"),
+            ("Future", "8.0.0"),
+        ] {
+            let PowershellParseOutcome::Analysis(analysis) =
+                parser_response_with_mode(mode, version)
+            else {
+                panic!("expected parser analysis");
+            };
+            assert_eq!(analysis.direct_argv, None);
+        }
+
+        let PowershellParseOutcome::Analysis(analysis) =
+            parser_response_with_mode("Standard", "7.5.0")
+        else {
+            panic!("expected parser analysis");
+        };
+        assert!(analysis.direct_argv.is_some());
+    }
+
     #[test]
     fn parser_process_handles_multiple_requests() {
         let Some(powershell) = try_find_powershell_executable_blocking() else {
@@ -616,21 +754,24 @@ mod tests {
         let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
 
         let first = parser.parse("Get-Content 'foo bar'").unwrap();
+        let PowershellParseOutcome::Analysis(first) = first else {
+            panic!("expected parser analysis");
+        };
         assert_eq!(
-            first,
-            PowershellParseOutcome::Commands(vec![vec![
-                "Get-Content".to_string(),
-                "foo bar".to_string(),
-            ]]),
+            first.commands,
+            vec![vec!["Get-Content".to_string(), "foo bar".to_string(),]],
         );
 
         let second = parser.parse("Write-Output foo | Measure-Object").unwrap();
+        let PowershellParseOutcome::Analysis(second) = second else {
+            panic!("expected parser analysis");
+        };
         assert_eq!(
-            second,
-            PowershellParseOutcome::Commands(vec![
+            second.commands,
+            vec![
                 vec!["Write-Output".to_string(), "foo".to_string()],
                 vec!["Measure-Object".to_string()],
-            ]),
+            ],
         );
     }
 

@@ -51,6 +51,11 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
         Some(hint_text) => MultiAgentMode::Custom(hint_text.clone()),
         None => match turn_context.effective_reasoning_effort() {
             Some(ReasoningEffort::Ultra) => MultiAgentMode::Proactive,
+            Some(ReasoningEffort::High | ReasoningEffort::XHigh)
+                if turn_context.model_info.slug == "gpt-5.6-sol" =>
+            {
+                MultiAgentMode::Proactive
+            }
             _ => MultiAgentMode::ExplicitRequestOnly,
         },
     };

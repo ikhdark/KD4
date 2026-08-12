@@ -486,7 +486,8 @@ fn tool_attempt_counts_for_goal_progress(outcome: ToolCallOutcome) -> bool {
         ToolCallOutcome::Failed {
             handler_executed: true,
         } => true,
-        ToolCallOutcome::Blocked
+        ToolCallOutcome::Skipped
+        | ToolCallOutcome::Blocked
         | ToolCallOutcome::Failed {
             handler_executed: false,
         }

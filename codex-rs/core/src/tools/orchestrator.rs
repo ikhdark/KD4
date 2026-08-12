@@ -643,7 +643,10 @@ fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str> {
         ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { .. })) => Some("denied"),
         ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { .. })) => Some("timed_out"),
         ToolError::Codex(CodexErr::Sandbox(SandboxErr::Signal(_))) => Some("signal"),
-        ToolError::Denied(_) | ToolError::Rejected(_) | ToolError::Codex(_) => None,
+        ToolError::Denied(_)
+        | ToolError::Rejected(_)
+        | ToolError::ValidationSkipped(_)
+        | ToolError::Codex(_) => None,
     }
 }
 

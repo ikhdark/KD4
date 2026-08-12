@@ -269,10 +269,11 @@ async fn run_compact_task_inner_impl(
         .for_prompt(&turn_context.model_info.input_modalities);
     let turn_input = strip_compaction_startup_envelopes(turn_input);
     let prompt = Prompt {
-        input: turn_input,
+        input: turn_input.into(),
         base_instructions: base_instructions.clone(),
         ..Default::default()
     };
+    turn_context.turn_timing_state.begin_compaction_generation();
     let mut retries = 0;
     loop {
         let attempt_result = drain_to_completed(
@@ -327,6 +328,7 @@ async fn run_compact_task_inner_impl(
                     sess.send_event(&turn_context, event).await;
                     return Err(e);
                 }
+                turn_context.turn_timing_state.record_model_retry();
             }
         }
     }

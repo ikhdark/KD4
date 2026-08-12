@@ -1,0 +1,6 @@
+[2m2026-08-11T05:14:48.943016Z[0m [31mERROR[0m [2mcodex_app_server[0m[2m:[0m Project-local config, hooks, and exec policies are disabled in the following folders until the project is trusted, but skills still load.
+    1. C:\Users\kuh\Desktop\kd4\.codex
+       To load project-local config, hooks, and exec policies, add c:\users\kuh\desktop\kd4 as a trusted project in C:\Users\kuh\Desktop\kd4\task-evidence\sqlite-isolation-20260811\without-state_5-sqlite\config.toml.
+
+[2m2026-08-11T05:14:49.075911Z[0m [33m WARN[0m [2mcodex_core_plugins::manager[0m[2m:[0m failed to warm featured plugin ids cache [3merror[0m[2m=[0mremote featured plugin request to https://chatgpt.com/backend-api/plugins/featured failed with status 401 Unauthorized: {"detail":"Unauthorized"}
+[2m2026-08-11T05:14:52.255018Z[0m [33m WARN[0m [2mcodex_core_plugins::startup_sync[0m[2m:[0m git sync failed for curated plugin sync; falling back to GitHub HTTP [3merror[0m[2m=[0mgit reset curated plugins repo failed with status exit code: 128: fatal: cannot create directory at 'plugins/nvidia/skills/omniverse-cad-to-simready/references/simready-conform-profile/references/FET_004_SIMULATE_MULTI_BODY_PHYSICS/scripts': Filename too long

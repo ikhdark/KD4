@@ -4,8 +4,8 @@ use std::time::Instant;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Utc;
-use codex_git_utils::collect_git_info;
-use codex_git_utils::get_git_repo_root;
+use codex_git_utils::RepositoryContext;
+use codex_git_utils::discover_repository_context;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
@@ -47,18 +47,27 @@ pub(crate) struct PendingThreadMetadataPatch {
 }
 
 impl ThreadMetadataSync {
-    pub(crate) async fn for_create(params: &CreateThreadParams) -> Self {
+    pub(crate) async fn collect_repository_context_for_create(
+        params: &CreateThreadParams,
+    ) -> Option<RepositoryContext> {
+        let cwd = params.metadata.cwd.clone().unwrap_or_default();
+        discover_repository_context(cwd.as_path()).await
+    }
+
+    pub(crate) fn git_info_from_repository_context(context: &RepositoryContext) -> GitInfo {
+        GitInfo {
+            commit_hash: context.git_info.commit_hash.clone(),
+            branch: context.git_info.branch.clone(),
+            repository_url: context.git_info.repository_url.clone(),
+        }
+    }
+
+    pub(crate) fn for_create_with_git_info(
+        params: &CreateThreadParams,
+        git_info: Option<GitInfo>,
+    ) -> Self {
         let created_at = Utc::now();
         let cwd = params.metadata.cwd.clone().unwrap_or_default();
-        let git_info = if get_git_repo_root(cwd.as_path()).is_some() {
-            collect_git_info(cwd.as_path()).await.map(|info| GitInfo {
-                commit_hash: info.commit_hash,
-                branch: info.branch,
-                repository_url: info.repository_url,
-            })
-        } else {
-            None
-        };
         let update = ThreadMetadataPatch {
             model_provider: Some(params.metadata.model_provider.clone()),
             created_at: Some(created_at),

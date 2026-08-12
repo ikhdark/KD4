@@ -3,6 +3,7 @@ use crate::CreateThreadParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::error::reject_paginated_history_mode;
+use codex_git_utils::RepositoryContext;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
@@ -11,6 +12,22 @@ use codex_rollout::RolloutRecorderParams;
 pub(super) async fn create_thread(
     store: &LocalThreadStore,
     params: CreateThreadParams,
+) -> ThreadStoreResult<RolloutRecorder> {
+    create_thread_inner(store, params, None).await
+}
+
+pub(super) async fn create_thread_with_repository_context(
+    store: &LocalThreadStore,
+    params: CreateThreadParams,
+    repository_context: Option<RepositoryContext>,
+) -> ThreadStoreResult<RolloutRecorder> {
+    create_thread_inner(store, params, Some(repository_context)).await
+}
+
+async fn create_thread_inner(
+    store: &LocalThreadStore,
+    params: CreateThreadParams,
+    known_repository_context: Option<Option<RepositoryContext>>,
 ) -> ThreadStoreResult<RolloutRecorder> {
     reject_paginated_history_mode(params.history_mode)?;
     let cwd = params
@@ -27,7 +44,7 @@ pub(super) async fn create_thread(
         model_provider_id: params.metadata.model_provider.clone(),
         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
     };
-    RolloutRecorder::new(
+    RolloutRecorder::new_with_repository_context(
         &config,
         RolloutRecorderParams::new(
             params.thread_id,
@@ -44,6 +61,7 @@ pub(super) async fn create_thread(
         .with_multi_agent_version(params.multi_agent_version)
         .with_history_mode(params.history_mode)
         .with_initial_window_id(params.initial_window_id),
+        known_repository_context,
     )
     .await
     .map_err(|err| ThreadStoreError::Internal {

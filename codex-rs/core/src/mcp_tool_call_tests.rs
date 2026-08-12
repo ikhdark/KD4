@@ -79,6 +79,49 @@ use wiremock::matchers::body_partial_json;
 use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
 
+#[test]
+fn repo_atlas_task_normalizes_oversized_max_tokens_before_execution() {
+    let mut arguments = Some(serde_json::json!({ "maxTokens": 7_000 }));
+    normalize_mcp_tool_arguments_before_execution(
+        REPO_ATLAS_SERVER_NAME,
+        REPO_ATLAS_TASK_TOOL_NAME,
+        &mut arguments,
+    );
+    assert_eq!(
+        arguments,
+        Some(serde_json::json!({ "maxTokens": REPO_ATLAS_TASK_MAX_TOKENS }))
+    );
+    let mut normalized_name_arguments = Some(serde_json::json!({ "maxTokens": 7_000 }));
+    normalize_mcp_tool_arguments_before_execution(
+        REPO_ATLAS_NORMALIZED_SERVER_NAME,
+        REPO_ATLAS_TASK_TOOL_NAME,
+        &mut normalized_name_arguments,
+    );
+    assert_eq!(
+        normalized_name_arguments,
+        Some(serde_json::json!({ "maxTokens": REPO_ATLAS_TASK_MAX_TOKENS }))
+    );
+}
+
+#[test]
+fn repo_atlas_task_preflight_leaves_valid_and_unrelated_arguments_unchanged() {
+    let mut valid = Some(serde_json::json!({ "maxTokens": 4_000 }));
+    let expected_valid = valid.clone();
+    normalize_mcp_tool_arguments_before_execution(
+        REPO_ATLAS_SERVER_NAME,
+        REPO_ATLAS_TASK_TOOL_NAME,
+        &mut valid,
+    );
+    assert_eq!(valid, expected_valid);
+
+    let mut unrelated = Some(serde_json::json!({ "maxTokens": 7_000 }));
+    let expected_unrelated = unrelated.clone();
+    normalize_mcp_tool_arguments_before_execution("other-server", "task", &mut unrelated);
+    assert_eq!(unrelated, expected_unrelated);
+    normalize_mcp_tool_arguments_before_execution(REPO_ATLAS_SERVER_NAME, "batch", &mut unrelated);
+    assert_eq!(unrelated, expected_unrelated);
+}
+
 fn annotations(
     read_only: Option<bool>,
     destructive: Option<bool>,

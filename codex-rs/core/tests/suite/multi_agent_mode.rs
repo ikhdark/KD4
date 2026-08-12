@@ -129,6 +129,53 @@ async fn ultra_reasoning_uses_max_and_proactive_mode() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sol_high_and_xhigh_use_proactive_mode() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        (1..=2)
+            .map(|index| {
+                sse(vec![
+                    ev_response_created(&format!("resp-{index}")),
+                    ev_completed(&format!("resp-{index}")),
+                ])
+            })
+            .collect(),
+    )
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.6-sol")
+        .with_config(configure_multi_agent_v2)
+        .build(&server)
+        .await?;
+
+    submit_turn(&test.codex, "high", Some(ReasoningEffort::High)).await?;
+    submit_turn(&test.codex, "xhigh", Some(ReasoningEffort::XHigh)).await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    for (request, expected_effort) in requests.iter().zip(["high", "xhigh"]) {
+        assert_eq!(
+            request.body_json()["reasoning"]["effort"].as_str(),
+            Some(expected_effort)
+        );
+        let input = request.input();
+        let texts = developer_texts(&input);
+        assert_eq!(
+            (
+                count_containing(&texts, NO_SPAWN_TEXT),
+                count_containing(&texts, PROACTIVE_TEXT),
+            ),
+            (0, 1)
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_mode_hint_uses_custom_mode_across_reasoning_efforts() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

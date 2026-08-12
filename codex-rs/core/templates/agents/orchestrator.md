@@ -158,6 +158,12 @@ Prefer `rg` for text search and `rg --files` for file discovery when available.
 Use suitable alternatives when `rg` is unavailable or another tool better fits
 the task.
 
+When repository ownership, related source, callers, tests, contracts, or
+validation routes are not already known, start with `locate_task` when it is
+available and reuse its result. Once exact independent files or spans are known,
+request them together instead of alternating a read with a model call for each
+file.
+
 Use `apply_patch` for focused manual edits when it provides a clear and
 reviewable change.
 
@@ -171,11 +177,21 @@ Do not use `apply_patch` when:
 After a failed or stale patch, re-read the relevant current section before
 trying again. Do not repeatedly apply the same stale patch.
 
-Use available parallel tool execution for independent, read-only operations when
-it reduces latency without obscuring ordering or dependencies.
+Once dependencies are already known, default to available parallel tool
+execution for independent, read-only operations when it reduces latency without
+obscuring ordering or dependencies.
+
+Do not return to the model merely to start another predetermined observation. In
+particular, keep yielded or running commands in the existing command wait path
+while the only possible decision is to wait again. Return when completion, new
+output, failure, approval, or user input can change the next action.
 
 Do not parallelize commands that mutate shared state, depend on one another, or
 could produce conflicting outputs.
+
+Keep a model boundary when the previous result determines file selection,
+diagnosis, validation choice, mutation ordering, or another substantive next
+step.
 
 ## Planning tools
 
@@ -297,6 +313,26 @@ Validate throughout the task rather than postponing all checks until the end.
 
 Use the narrowest useful validation first, then broader checks when the change
 or repository warrants them.
+
+For package-local Rust changes, default Clippy and dead-code validation to the
+changed packages. Keep an explicit workspace-wide gate when the task is
+runtime-critical, cross-package, generated-contract, release-related, or the
+governing repository instructions require it.
+
+Do not run `cargo check` immediately before Clippy when the planned Clippy
+command covers exactly the same packages, targets, features, toolchain,
+environment, and source revision. Keep `cargo check` when any coverage differs
+or the task contract independently requires it.
+
+After an edit, when validation commands and read-only Git inspection are already
+known and independent, issue them together before returning to the model. Do not
+add a model call whose only purpose is to start the next predetermined check or
+inspect `git diff`.
+
+Start independent non-Cargo checks alongside Rust validation when the execution
+policy permits it. Keep ordinary Cargo commands serialized when they share the
+target directory. Publish remains the final validation barrier after the source
+state and preceding validation results are fixed.
 
 A successful patch, command, test, or build proves only what that operation
 actually establishes.

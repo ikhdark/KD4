@@ -198,6 +198,17 @@ impl ExecApprovalRequirement {
     }
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn same_exec_authorization_envelope(
+    original: &ExecApprovalRequirement,
+    canonical: &ExecApprovalRequirement,
+) -> bool {
+    // Fail closed on every policy-visible detail, including approval reasons and proposed policy
+    // amendments. The canonical target is an internal compatibility check only; the original
+    // PowerShell requirement remains the one consumed by the execution path.
+    original == canonical
+}
+
 /// - Never: do not ask
 /// - OnRequest: ask unless filesystem access is unrestricted
 /// - Granular: ask unless filesystem access is unrestricted, but auto-reject
@@ -394,6 +405,7 @@ pub(crate) enum ToolError {
     Denied(String),
     /// An operational failure that prevents the tool request from running.
     Rejected(String),
+    ValidationSkipped(crate::validation_admission::ValidationSkippedToolOutput),
     Codex(CodexErr),
 }
 

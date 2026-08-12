@@ -137,7 +137,14 @@ openssl-sys = { workspace = true, features = ["vendored"] }
 [target.'cfg(unix)'.dependencies]
 codex-shell-escalation = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 whoami = { workspace = true }
 codex-extension-items = { workspace = true }
 assert_cmd = { workspace = true }

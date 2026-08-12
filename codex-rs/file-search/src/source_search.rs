@@ -12,6 +12,8 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -431,18 +433,39 @@ pub struct ReadFileSpanOptions {
     pub line_count: usize,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone)]
 pub struct SourceSearchOutput {
     pub query: String,
     pub roots: Vec<String>,
     pub truncated: bool,
     pub truncated_reason: Option<SourceTruncatedReason>,
+    pub coverage_complete: bool,
+    pub coverage_note: Option<String>,
     pub coverage: SourceSearchCoverage,
     pub matches: Vec<SourceSearchMatch>,
+    #[serde(skip)]
+    pub diagnostics: SourceSearchDiagnostics,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+impl PartialEq for SourceSearchOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.query == other.query
+            && self.roots == other.roots
+            && self.truncated == other.truncated
+            && self.truncated_reason == other.truncated_reason
+            && self.coverage_complete == other.coverage_complete
+            && self.coverage_note == other.coverage_note
+            && self.coverage == other.coverage
+            && self.matches == other.matches
+    }
+}
+
+impl Eq for SourceSearchOutput {}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 pub struct SourceSearchCoverage {
+    pub walked_entries: usize,
+    pub ignored_entries: usize,
     pub files_scanned: usize,
     pub files_skipped_too_large: usize,
     pub files_skipped_non_utf8: usize,
@@ -457,6 +480,15 @@ pub struct SourceSearchCoverage {
     pub max_bytes: usize,
     pub max_file_bytes: usize,
     pub max_result_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceSearchDiagnostics {
+    pub total_micros: u64,
+    pub first_match_micros: Option<u64>,
+    pub traversal_micros: u64,
+    pub file_scan_match_micros: u64,
+    pub projection_micros: u64,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -579,12 +611,14 @@ fn search_source_with_walk_limits(
     let roots = resolve_search_roots(&repo_root, &options.roots)?;
     let mut accumulator = SourceSearchAccumulator::new(&options)?;
 
+    let traversal_started = Instant::now();
     for root in &roots {
         if accumulator.should_stop() {
             break;
         }
         scan_root(&repo_root, root, &mut accumulator, walk_limits)?;
     }
+    accumulator.record_traversal_duration(traversal_started.elapsed());
 
     let roots = roots
         .iter()
@@ -702,6 +736,11 @@ pub struct SourceSearchAccumulator {
     include_generated: bool,
     include_vendor: bool,
     include_locks: bool,
+    unscoped: bool,
+    started_at: Instant,
+    traversal_duration: Duration,
+    file_scan_match_duration: Duration,
+    first_match_duration: Option<Duration>,
     state: SearchState,
 }
 
@@ -733,6 +772,11 @@ impl SourceSearchAccumulator {
             include_generated: options.include_generated,
             include_vendor: options.include_vendor,
             include_locks: options.include_locks,
+            unscoped: options.roots.is_empty(),
+            started_at: Instant::now(),
+            traversal_duration: Duration::ZERO,
+            file_scan_match_duration: Duration::ZERO,
+            first_match_duration: None,
             state: SearchState::new(options.max_matches),
         })
     }
@@ -751,6 +795,11 @@ impl SourceSearchAccumulator {
         ) {
             return false;
         }
+        self.consider_walked_file(file_len)
+    }
+
+    /// Records a file already accepted by the walker entry filter.
+    pub fn consider_walked_file(&mut self, file_len: usize) -> bool {
         if self.state.files_scanned >= SOURCE_SEARCH_MAX_FILES {
             self.state.coverage_limit = Some(SourceTruncatedReason::MaxFiles);
             return false;
@@ -784,6 +833,7 @@ impl SourceSearchAccumulator {
             self.state.files_skipped_non_utf8 = self.state.files_skipped_non_utf8.saturating_add(1);
             return;
         };
+        let matches_before = self.state.total_matches;
         collect_matches(
             relative_path,
             &text,
@@ -792,6 +842,9 @@ impl SourceSearchAccumulator {
             &self.query_cmp,
             &mut self.state,
         );
+        if self.first_match_duration.is_none() && self.state.total_matches > matches_before {
+            self.first_match_duration = Some(self.started_at.elapsed());
+        }
     }
 
     pub fn mark_walk_limit(&mut self) {
@@ -821,6 +874,18 @@ impl SourceSearchAccumulator {
             .min(limit);
     }
 
+    pub fn record_ignored_entries(&mut self, count: usize) {
+        self.state.ignored_entries = self.state.ignored_entries.saturating_add(count);
+    }
+
+    pub fn record_traversal_duration(&mut self, duration: Duration) {
+        self.traversal_duration = self.traversal_duration.saturating_add(duration);
+    }
+
+    pub fn record_file_scan_match_duration(&mut self, duration: Duration) {
+        self.file_scan_match_duration = self.file_scan_match_duration.saturating_add(duration);
+    }
+
     pub fn mark_file_changed_during_read(&mut self) {
         self.state.files_changed_during_read =
             self.state.files_changed_during_read.saturating_add(1);
@@ -831,6 +896,7 @@ impl SourceSearchAccumulator {
     }
 
     pub fn finish(mut self, roots: Vec<String>) -> SourceSearchOutput {
+        let projection_started = Instant::now();
         self.state.matches.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -839,13 +905,15 @@ impl SourceSearchAccumulator {
         let coverage_limit = self.state.coverage_limit;
         let mut result_limit = self.state.result_limit;
         let coverage = SourceSearchCoverage {
+            walked_entries: self.state.walk_entries_seen,
+            ignored_entries: self.state.ignored_entries,
             files_scanned: self.state.files_scanned,
             files_skipped_too_large: self.state.files_skipped_too_large,
             files_skipped_non_utf8: self.state.files_skipped_non_utf8,
             files_changed_during_read: self.state.files_changed_during_read,
             filesystem_errors: self.state.filesystem_errors,
             bytes_scanned: self.state.bytes_scanned,
-            result_bytes: self.state.result_bytes,
+            result_bytes: 0,
             total_matches: self.state.total_matches,
             matches_returned: self.state.matches.len(),
             max_matches: self.state.max_matches,
@@ -859,60 +927,58 @@ impl SourceSearchAccumulator {
             roots,
             truncated: false,
             truncated_reason: None,
+            coverage_complete: true,
+            coverage_note: None,
             coverage,
             matches: self.state.matches,
+            diagnostics: SourceSearchDiagnostics::default(),
         };
-
-        loop {
-            output.truncated_reason = source_truncated_reason(
-                coverage_limit,
-                result_limit,
-                output.coverage.files_changed_during_read,
-                output.coverage.filesystem_errors,
-                output.coverage.files_skipped_too_large,
-                output.coverage.files_skipped_non_utf8,
-            );
-            output.truncated = output.truncated_reason.is_some();
-            output.coverage.matches_returned = output.matches.len();
-            let serialized_bytes = refresh_serialized_result_bytes(&mut output);
-            if serialized_bytes <= SOURCE_SEARCH_MAX_RESULT_BYTES {
-                return output;
-            }
-
+        update_search_output_status(&mut output, coverage_limit, result_limit, self.unscoped);
+        let matches = std::mem::take(&mut output.matches);
+        let match_projection_bytes = matches
+            .iter()
+            .map(pretty_projected_match_bytes)
+            .collect::<Vec<_>>();
+        let mut projection = largest_serialized_prefix(&mut output, &match_projection_bytes);
+        if projection.0 < matches.len() {
             result_limit = Some(SourceTruncatedReason::MaxResultBytes);
-            if output.matches.pop().is_none() {
-                output.truncated_reason = source_truncated_reason(
-                    coverage_limit,
-                    result_limit,
-                    output.coverage.files_changed_during_read,
-                    output.coverage.filesystem_errors,
-                    output.coverage.files_skipped_too_large,
-                    output.coverage.files_skipped_non_utf8,
-                );
-                output.truncated = true;
-                output.coverage.matches_returned = 0;
-                refresh_serialized_result_bytes(&mut output);
-                return output;
-            }
+            update_search_output_status(&mut output, coverage_limit, result_limit, self.unscoped);
+            projection = largest_serialized_prefix(&mut output, &match_projection_bytes);
         }
+        output.matches = matches.into_iter().take(projection.0).collect();
+        output.coverage.matches_returned = projection.0;
+        output.coverage.result_bytes = projection.1;
+        let final_serialized_bytes = serde_json::to_vec_pretty(&output)
+            .map(|bytes| bytes.len().saturating_add(1))
+            .unwrap_or(usize::MAX);
+        debug_assert_eq!(final_serialized_bytes, projection.1);
+        output.coverage.result_bytes = final_serialized_bytes;
+        let projection_duration = projection_started.elapsed();
+        output.diagnostics = SourceSearchDiagnostics {
+            total_micros: duration_micros(self.started_at.elapsed()),
+            first_match_micros: self.first_match_duration.map(duration_micros),
+            traversal_micros: duration_micros(self.traversal_duration),
+            file_scan_match_micros: duration_micros(self.file_scan_match_duration),
+            projection_micros: duration_micros(projection_duration),
+        };
+        output
     }
 }
 
 struct SearchState {
     walk_directories_seen: usize,
     walk_entries_seen: usize,
+    ignored_entries: usize,
     files_scanned: usize,
     files_skipped_too_large: usize,
     files_skipped_non_utf8: usize,
     files_changed_during_read: usize,
     filesystem_errors: usize,
     bytes_scanned: usize,
-    result_bytes: usize,
     total_matches: usize,
     max_matches: usize,
     coverage_limit: Option<SourceTruncatedReason>,
     result_limit: Option<SourceTruncatedReason>,
-    matches_serialized_bytes: usize,
     matches: Vec<SourceSearchMatch>,
 }
 
@@ -921,18 +987,17 @@ impl SearchState {
         Self {
             walk_directories_seen: 0,
             walk_entries_seen: 0,
+            ignored_entries: 0,
             files_scanned: 0,
             files_skipped_too_large: 0,
             files_skipped_non_utf8: 0,
             files_changed_during_read: 0,
             filesystem_errors: 0,
             bytes_scanned: 0,
-            result_bytes: 0,
             total_matches: 0,
             max_matches,
             coverage_limit: None,
             result_limit: None,
-            matches_serialized_bytes: 2,
             matches: Vec::new(),
         }
     }
@@ -956,15 +1021,127 @@ fn source_truncated_reason(
         .or_else(|| (files_skipped_non_utf8 > 0).then_some(SourceTruncatedReason::NonUtf8Files))
 }
 
-fn refresh_serialized_result_bytes(output: &mut SourceSearchOutput) -> usize {
+fn update_search_output_status(
+    output: &mut SourceSearchOutput,
+    coverage_limit: Option<SourceTruncatedReason>,
+    result_limit: Option<SourceTruncatedReason>,
+    unscoped: bool,
+) {
+    output.truncated_reason = source_truncated_reason(
+        coverage_limit,
+        result_limit,
+        output.coverage.files_changed_during_read,
+        output.coverage.filesystem_errors,
+        output.coverage.files_skipped_too_large,
+        output.coverage.files_skipped_non_utf8,
+    );
+    output.truncated = output.truncated_reason.is_some();
+    output.coverage_complete = output.truncated_reason.is_none();
+    output.coverage.matches_returned = output.matches.len();
+    let cap_reason = coverage_limit
+        .filter(|reason| reason.is_search_cap())
+        .or_else(|| result_limit.filter(|reason| reason.is_search_cap()));
+    output.coverage_note = unscoped.then_some(cap_reason).flatten().map(|cap_reason| {
+        let result_summary = if output.coverage.total_matches == 0 {
+            "No matches were found in the scanned portion of the repository."
+        } else {
+            "Returned matches cover only the scanned portion of the repository."
+        };
+        format!(
+            "{result_summary} Coverage is incomplete because this unscoped search reached the {}. Narrow `paths` or use `locate_task` to identify the owning scope.",
+            cap_reason.display_name()
+        )
+    });
+}
+
+impl SourceTruncatedReason {
+    fn is_search_cap(self) -> bool {
+        matches!(
+            self,
+            Self::MaxMatches
+                | Self::MaxFiles
+                | Self::MaxBytes
+                | Self::MaxResultBytes
+                | Self::WalkLimit
+        )
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::MaxMatches => "match-result cap",
+            Self::MaxFiles => "file-scan cap",
+            Self::MaxBytes => "scan-byte cap",
+            Self::MaxResultBytes => "result-byte cap",
+            Self::WalkLimit => "repository traversal cap",
+            Self::FilesChangedDuringRead
+            | Self::OversizedFiles
+            | Self::NonUtf8Files
+            | Self::FilesystemErrors => "coverage limit",
+        }
+    }
+}
+
+fn largest_serialized_prefix(
+    output: &mut SourceSearchOutput,
+    match_projection_bytes: &[usize],
+) -> (usize, usize) {
+    output.coverage.matches_returned = 0;
+    output.coverage.result_bytes = 0;
+    let empty_output_bytes = serde_json::to_vec_pretty(output)
+        .map(|bytes| bytes.len().saturating_add(1))
+        .unwrap_or(usize::MAX);
+    let fixed_bytes = empty_output_bytes.saturating_sub(2);
+    let mut prefix_payload_bytes = 0usize;
+    let mut fitting = (0usize, serialized_prefix_bytes(fixed_bytes, 0, 0));
+
+    for (index, match_bytes) in match_projection_bytes.iter().copied().enumerate() {
+        prefix_payload_bytes = prefix_payload_bytes.saturating_add(match_bytes);
+        let count = index.saturating_add(1);
+        let match_array_growth = prefix_payload_bytes
+            .saturating_add(count.saturating_mul(2))
+            .saturating_add(2);
+        let serialized_bytes = serialized_prefix_bytes(fixed_bytes, count, match_array_growth);
+        if serialized_bytes > SOURCE_SEARCH_MAX_RESULT_BYTES {
+            break;
+        }
+        fitting = (count, serialized_bytes);
+    }
+
+    fitting
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn pretty_projected_match_bytes(source_match: &SourceSearchMatch) -> usize {
+    let serialized = serde_json::to_vec_pretty(source_match).unwrap_or_default();
+    let line_count = serialized
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .saturating_add(1);
+    serialized
+        .len()
+        .saturating_add(line_count.saturating_mul(4))
+}
+
+fn serialized_prefix_bytes(
+    fixed_bytes: usize,
+    matches_returned: usize,
+    match_array_growth: usize,
+) -> usize {
+    let without_result_bytes = fixed_bytes
+        .saturating_add(matches_returned.to_string().len())
+        .saturating_add(match_array_growth);
+    let mut result_bytes_digits = 1usize;
     loop {
-        let serialized_bytes = serde_json::to_vec_pretty(output)
-            .map(|bytes| bytes.len().saturating_add(1))
-            .unwrap_or(usize::MAX);
-        if output.coverage.result_bytes == serialized_bytes {
+        let serialized_bytes = without_result_bytes.saturating_add(result_bytes_digits);
+        let next_digits = serialized_bytes.to_string().len();
+        if next_digits == result_bytes_digits {
             return serialized_bytes;
         }
-        output.coverage.result_bytes = serialized_bytes;
+        result_bytes_digits = next_digits;
     }
 }
 
@@ -982,7 +1159,7 @@ fn scan_root(
         }
     };
     if metadata.is_file() {
-        recover_scan_result(scan_file(repo_root, root, accumulator), accumulator);
+        recover_scan_result(scan_file(repo_root, root, accumulator, false), accumulator);
         return Ok(());
     }
     if !metadata.is_dir() {
@@ -994,6 +1171,7 @@ fn scan_root(
 
     let include_generated = accumulator.include_generated;
     let include_vendor = accumulator.include_vendor;
+    let include_locks = accumulator.include_locks;
     let depth_limit_hit = Arc::new(AtomicBool::new(false));
     let filter_depth_limit_hit = Arc::clone(&depth_limit_hit);
     let remaining_entries = accumulator.remaining_walk_entries(walk_limits.max_entries);
@@ -1005,8 +1183,13 @@ fn scan_root(
     let filter_entries_examined = Arc::clone(&entries_examined);
     let entry_limit_hit = Arc::new(AtomicBool::new(false));
     let filter_entry_limit_hit = Arc::clone(&entry_limit_hit);
+    let limit_entry_should_process = Arc::new(AtomicBool::new(true));
+    let filter_limit_entry_should_process = Arc::clone(&limit_entry_should_process);
+    let ignored_entries = Arc::new(AtomicUsize::new(0));
+    let filter_ignored_entries = Arc::clone(&ignored_entries);
     let ignore_matcher = Arc::new(SourceIgnoreMatcher::new(root));
     let filter_ignore_matcher = Arc::clone(&ignore_matcher);
+    let filter_root = repo_root.to_path_buf();
     let mut builder = WalkBuilder::new(root);
     builder
         .standard_filters(false)
@@ -1020,21 +1203,33 @@ fn scan_root(
             let examined = filter_entries_examined
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1);
-            if examined >= remaining_entries {
-                filter_entry_limit_hit.store(true, Ordering::Relaxed);
-                // Force the budget-consuming entry to be yielded so the
-                // iterator can be dropped before it examines another entry.
-                return true;
-            }
-            let (should_yield, depth_exceeded) =
-                source_walk_entry_filter(entry, walk_limits, include_generated, include_vendor);
+            let (should_yield, depth_exceeded) = source_walk_entry_filter(
+                entry,
+                &filter_root,
+                walk_limits,
+                include_generated,
+                include_vendor,
+                include_locks,
+            );
             if depth_exceeded {
                 filter_depth_limit_hit.store(true, Ordering::Relaxed);
             }
             let is_directory = entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_dir());
-            should_yield && !filter_ignore_matcher.is_ignored(entry.path(), is_directory)
+            let should_process =
+                should_yield && !filter_ignore_matcher.is_ignored(entry.path(), is_directory);
+            if !should_process {
+                filter_ignored_entries.fetch_add(1, Ordering::Relaxed);
+            }
+            if examined >= remaining_entries {
+                filter_entry_limit_hit.store(true, Ordering::Relaxed);
+                filter_limit_entry_should_process.store(should_process, Ordering::Relaxed);
+                // Force the budget-consuming entry to be yielded so the
+                // iterator can be dropped before it examines another entry.
+                return true;
+            }
+            should_process
         });
 
     for entry in builder.build() {
@@ -1060,17 +1255,11 @@ fn scan_root(
                 continue;
             }
         };
-        let (mut should_process, depth_exceeded) =
-            source_walk_entry_filter(&entry, walk_limits, include_generated, include_vendor);
-        if depth_exceeded {
-            depth_limit_hit.store(true, Ordering::Relaxed);
-        }
+        let should_process = !entry_limit_hit.load(Ordering::Relaxed)
+            || limit_entry_should_process.load(Ordering::Relaxed);
         let is_directory = entry
             .file_type()
             .is_some_and(|file_type| file_type.is_dir());
-        if should_process && ignore_matcher.is_ignored(entry.path(), is_directory) {
-            should_process = false;
-        }
         if is_directory {
             if should_process && !accumulator.reserve_walk_directory(walk_limits.max_directories) {
                 break;
@@ -1086,7 +1275,10 @@ fn scan_root(
                 .file_type()
                 .is_some_and(|file_type| file_type.is_file())
         {
-            recover_scan_result(scan_file(repo_root, entry.path(), accumulator), accumulator);
+            recover_scan_result(
+                scan_file(repo_root, entry.path(), accumulator, true),
+                accumulator,
+            );
         }
         if entry_limit_hit.load(Ordering::Relaxed) {
             accumulator.mark_walk_limit();
@@ -1099,6 +1291,7 @@ fn scan_root(
             .min(remaining_entries),
         walk_limits.max_entries,
     );
+    accumulator.record_ignored_entries(ignored_entries.load(Ordering::Relaxed));
     if depth_limit_hit.load(Ordering::Relaxed) {
         accumulator.mark_walk_limit();
     }
@@ -1110,16 +1303,35 @@ fn scan_root(
 
 fn source_walk_entry_filter(
     entry: &ignore::DirEntry,
+    root: &Path,
     walk_limits: SourceWalkLimits,
     include_generated: bool,
     include_vendor: bool,
+    include_locks: bool,
 ) -> (bool, bool) {
+    let relative_path = entry
+        .path()
+        .strip_prefix(root)
+        .unwrap_or_else(|_| entry.path());
     let is_directory = entry
         .file_type()
         .is_some_and(|file_type| file_type.is_dir());
     if entry.depth() > 0
         && is_directory
-        && !should_descend_source_path(entry.path(), include_generated, include_vendor)
+        && !should_descend_source_path(relative_path, include_generated, include_vendor)
+    {
+        return (false, false);
+    }
+    if !is_directory
+        && entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        && !should_scan_source_file(
+            relative_path,
+            include_generated,
+            include_vendor,
+            include_locks,
+        )
     {
         return (false, false);
     }
@@ -1155,13 +1367,31 @@ fn scan_file(
     repo_root: &Path,
     path: &Path,
     accumulator: &mut SourceSearchAccumulator,
+    already_filtered: bool,
+) -> anyhow::Result<()> {
+    let scan_started = Instant::now();
+    let result = scan_file_inner(repo_root, path, accumulator, already_filtered);
+    accumulator.record_file_scan_match_duration(scan_started.elapsed());
+    result
+}
+
+fn scan_file_inner(
+    repo_root: &Path,
+    path: &Path,
+    accumulator: &mut SourceSearchAccumulator,
+    already_filtered: bool,
 ) -> anyhow::Result<()> {
     let path = resolve_confined_path(repo_root, path, "source file")?;
     let mut file = open_confined_file(repo_root, &path)?;
     let metadata = file.metadata()?;
     let file_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
     let relative_path = path.strip_prefix(repo_root).unwrap_or(&path);
-    if !accumulator.consider_file(relative_path, file_len) {
+    let should_read = if already_filtered {
+        accumulator.consider_walked_file(file_len)
+    } else {
+        accumulator.consider_file(relative_path, file_len)
+    };
+    if !should_read {
         return Ok(());
     }
 
@@ -1411,23 +1641,7 @@ fn collect_matches(
             end_line: end,
             lines: source_lines,
         };
-        let serialized_match_bytes = serde_json::to_vec(&source_match)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
-        let separator_bytes = usize::from(!state.matches.is_empty());
-        let result_bytes = state
-            .matches_serialized_bytes
-            .saturating_add(separator_bytes)
-            .saturating_add(serialized_match_bytes);
-        if result_bytes > SOURCE_SEARCH_MAX_RESULT_BYTES {
-            state
-                .result_limit
-                .get_or_insert(SourceTruncatedReason::MaxResultBytes);
-            continue;
-        }
         state.matches.push(source_match);
-        state.matches_serialized_bytes = result_bytes;
-        state.result_bytes = result_bytes;
     }
 }
 

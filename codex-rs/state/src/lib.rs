@@ -18,6 +18,7 @@ mod model;
 mod paths;
 mod runtime;
 mod telemetry;
+mod validation_history;
 
 pub use model::LogEntry;
 pub use model::LogQuery;
@@ -25,6 +26,11 @@ pub use model::LogRow;
 pub use model::Phase2JobClaimOutcome;
 /// Preferred entrypoint: owns configuration and metrics.
 pub use runtime::StateRuntime;
+pub use validation_history::ValidationHistoryAggregate;
+pub use validation_history::ValidationHistoryKey;
+pub use validation_history::ValidationHistoryObservation;
+pub use validation_history::ValidationHistoryScope;
+pub use validation_history::ValidationHistoryStore;
 
 pub use audit::ThreadStateAuditRow;
 pub use audit::read_thread_state_audit_rows;

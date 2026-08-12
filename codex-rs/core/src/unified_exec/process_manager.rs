@@ -32,6 +32,8 @@ use crate::tools::runtimes::unified_exec::UnifiedExecRuntime;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
+#[cfg(windows)]
+use crate::tools::sandboxing::same_exec_authorization_envelope;
 use crate::turn_timing::TurnLocalPhase;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
@@ -65,6 +67,8 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_sandboxing::SandboxCommand;
+#[cfg(windows)]
+use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathUri;
@@ -509,6 +513,8 @@ fn network_approval_error_message(err: ToolError) -> String {
     match err {
         ToolError::Denied(message) | ToolError::Rejected(message) => message,
         ToolError::Codex(err) => err.to_string(),
+        ToolError::ValidationSkipped(skipped) => serde_json::to_string(&skipped)
+            .unwrap_or_else(|_| "validation command skipped".to_string()),
     }
 }
 
@@ -702,7 +708,7 @@ impl UnifiedExecProcessManager {
         );
         let result = self
             .exec_command_inner(
-                &request,
+                &mut request,
                 &mut process_id_reservation,
                 context,
                 &mut registration,
@@ -720,7 +726,7 @@ impl UnifiedExecProcessManager {
 
     async fn exec_command_inner(
         &self,
-        request: &ExecCommandRequest,
+        request: &mut ExecCommandRequest,
         process_id_reservation: &mut ProcessIdReservation,
         context: &UnifiedExecContext,
         registration: &mut PendingProcessRegistration,
@@ -812,6 +818,17 @@ impl UnifiedExecProcessManager {
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
                 registration,
+                request
+                    .validation_observation
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take()),
+                request
+                    .validation_leader
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take()),
+                request.validation_waiter.take(),
             )
             .await?;
             Some(InitialExecCommandGuard {
@@ -984,6 +1001,37 @@ impl UnifiedExecProcessManager {
             raw_output_artifact: process.raw_output_artifact().await,
             repair_notice: None,
         };
+
+        if response.process_id.is_none() {
+            let duration_ms = u64::try_from(response.wall_time.as_millis()).unwrap_or(u64::MAX);
+            if let Some(observation) = request
+                .validation_observation
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+            {
+                if process.termination_was_requested() {
+                    observation.record_cancelled(duration_ms).await;
+                } else {
+                    observation.record_completed(duration_ms).await;
+                }
+            }
+            if let Some(leader) = request
+                .validation_leader
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+            {
+                leader
+                    .complete(crate::validation_admission::ReusableValidationResult {
+                        value: serde_json::json!({
+                            "text": String::from_utf8_lossy(&response.raw_output),
+                            "success": response.exit_code == Some(0),
+                        }),
+                    })
+                    .await;
+            }
+        }
 
         Ok(response)
     }
@@ -1249,6 +1297,9 @@ impl UnifiedExecProcessManager {
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
         registration: &mut PendingProcessRegistration,
+        validation_observation: Option<crate::validation_admission::ValidationObservationToken>,
+        validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
+        validation_waiter: Option<crate::validation_admission::ValidationLeader>,
     ) -> Result<(), UnifiedExecError> {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
@@ -1319,6 +1370,9 @@ impl UnifiedExecProcessManager {
             started_at,
             context.tracker.clone(),
             registration.completion_activity.take(),
+            validation_observation,
+            validation_leader,
+            validation_waiter,
         );
         registration.commit();
         Ok(())
@@ -1557,6 +1611,40 @@ impl UnifiedExecProcessManager {
             request.shell_mode.clone(),
             pending_spawns,
         );
+        #[cfg(windows)]
+        let proven_direct_argv = (request.shell_type == crate::shell::ShellType::PowerShell
+            && request.command == request.command_for_safety)
+            .then(|| {
+                request.normalization_cwd.as_ref().and_then(|cwd| {
+                    prove_noprofile_powershell_command_as_direct_argv(&request.command, cwd, &env)
+                })
+            })
+            .flatten();
+        #[cfg(windows)]
+        let canonical_exec_approval_requirement = if let Some(proof) = proven_direct_argv.as_ref() {
+            Some(
+                context
+                    .session
+                    .services
+                    .exec_policy
+                    .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+                        command: proof.command_for_policy(),
+                        command_for_safety: None,
+                        approval_policy: context.turn.approval_policy.value(),
+                        permission_profile: context.turn.permission_profile(),
+                        windows_sandbox_level: context.turn.windows_sandbox_level,
+                        sandbox_permissions: if request.additional_permissions_preapproved {
+                            crate::sandboxing::SandboxPermissions::UseDefault
+                        } else {
+                            request.sandbox_permissions
+                        },
+                        prefix_rule: None,
+                    })
+                    .await,
+            )
+        } else {
+            None
+        };
         let exec_approval_requirement = context
             .session
             .services
@@ -1575,9 +1663,24 @@ impl UnifiedExecProcessManager {
                 prefix_rule: request.prefix_rule.clone(),
             })
             .await;
+        #[cfg(windows)]
+        let approved_powershell_direct_argv = if let (Some(proof), Some(canonical_requirement)) =
+            (proven_direct_argv, canonical_exec_approval_requirement)
+            && same_exec_authorization_envelope(&exec_approval_requirement, &canonical_requirement)
+            && let Some(cwd) = request.normalization_cwd.as_ref()
+            && let Some(command) = proof.into_command_for_state(&request.command, cwd, &env)
+        {
+            Some(command)
+        } else {
+            None
+        };
         let req = UnifiedExecToolRequest {
             command: request.command.clone(),
             command_for_approval: request.command_for_safety.clone(),
+            #[cfg(windows)]
+            normalization_cwd: request.normalization_cwd.clone(),
+            #[cfg(windows)]
+            approved_powershell_direct_argv,
             raw_output_artifact: request.raw_output_artifact.clone(),
             shell_type: request.shell_type,
             hook_command: request.hook_command.clone(),
@@ -1602,6 +1705,8 @@ impl UnifiedExecProcessManager {
             additional_permissions_preapproved: request.additional_permissions_preapproved,
             justification: request.justification.clone(),
             exec_approval_requirement,
+            validation_launch: request.validation_launch.clone(),
+            validation_observation: Arc::clone(&request.validation_observation),
         };
         let tool_ctx = ToolCtx {
             session: context.session.clone(),
@@ -1629,6 +1734,9 @@ impl UnifiedExecProcessManager {
                         output.aggregated_output.text.clone()
                     };
                     UnifiedExecError::sandbox_denied(message, output)
+                }
+                ToolError::ValidationSkipped(skipped) => {
+                    UnifiedExecError::ValidationSkipped(skipped)
                 }
                 other => UnifiedExecError::create_process(format!("{other:?}")),
             })

@@ -568,6 +568,9 @@
             "js_repl_tools_only": {
               "type": "boolean"
             },
+            "known_delta_store": {
+              "type": "boolean"
+            },
             "local_thread_store_compression": {
               "type": "boolean"
             },
@@ -5022,6 +5025,9 @@
           "type": "boolean"
         },
         "js_repl_tools_only": {
+          "type": "boolean"
+        },
+        "known_delta_store": {
           "type": "boolean"
         },
         "local_thread_store_compression": {

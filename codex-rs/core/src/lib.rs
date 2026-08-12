@@ -157,6 +157,7 @@ mod tools;
 pub(crate) mod turn_diff_tracker;
 mod turn_metadata;
 mod turn_timing;
+mod validation_admission;
 pub use rollout::ARCHIVED_SESSIONS_SUBDIR;
 pub use rollout::Cursor;
 pub use rollout::INTERACTIVE_SESSION_SOURCES;

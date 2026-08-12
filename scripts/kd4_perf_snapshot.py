@@ -19,6 +19,11 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Sequence
 
+try:
+    from scripts import kd4_model_attempt_analysis
+except ImportError:  # Direct script execution places scripts/ on sys.path.
+    import kd4_model_attempt_analysis
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT_SECONDS = 1_800
@@ -130,6 +135,36 @@ def scenario_catalog(repo_root: Path = REPO_ROOT) -> dict[str, Scenario]:
             2,
             "test",
         ),
+        "source-tools-runtime-test": Scenario(
+            "source-tools-runtime-test",
+            (
+                "cargo",
+                "nextest",
+                "run",
+                "-p",
+                "codex-core",
+                "-E",
+                "test(source_tools_execute_search_and_read_end_to_end)",
+            ),
+            codex_rs,
+            2,
+            "test",
+        ),
+        "source-tools-bounded-search-test": Scenario(
+            "source-tools-bounded-search-test",
+            (
+                "cargo",
+                "nextest",
+                "run",
+                "-p",
+                "codex-file-search",
+                "-E",
+                "test(representative_large_repository_search_stays_within_walk_and_output_bounds)",
+            ),
+            codex_rs,
+            2,
+            "test",
+        ),
         "local-cli-build": Scenario(
             "local-cli-build",
             ("cargo", "build", "-p", "codex-cli"),
@@ -170,6 +205,8 @@ PROFILE_SCENARIOS = {
         "feature-check",
         "installed-codex-version",
         "focused-core-test",
+        "source-tools-runtime-test",
+        "source-tools-bounded-search-test",
         "local-cli-build",
         "app-server-initialize-test",
         "desktop-publish-dry-run",
@@ -347,6 +384,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hash-binary", action="store_true")
     parser.add_argument("--allow-failures", action="store_true")
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--model-attempt-jsonl",
+        action="append",
+        type=Path,
+        help="Analyze privacy-safe codex.model_attempt JSONL telemetry.",
+    )
+    parser.add_argument(
+        "--model-attempt-report",
+        type=Path,
+        help="Write a human-readable model-attempt report.",
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -382,6 +430,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "failedScenarios": failed,
         "ok": not failed,
     }
+    if args.model_attempt_jsonl:
+        attempts, exclusions = kd4_model_attempt_analysis.load_jsonl(
+            args.model_attempt_jsonl
+        )
+        attempt_analysis = kd4_model_attempt_analysis.analyze(attempts, exclusions)
+        payload["modelAttemptAnalysis"] = attempt_analysis
+        human_report = kd4_model_attempt_analysis.render(attempt_analysis)
+        if args.model_attempt_report is not None:
+            args.model_attempt_report.parent.mkdir(parents=True, exist_ok=True)
+            args.model_attempt_report.write_text(human_report + "\n", encoding="utf-8")
+        if not args.json:
+            print(human_report)
     if args.output is not None:
         write_json_atomic(args.output, payload)
     if args.json:

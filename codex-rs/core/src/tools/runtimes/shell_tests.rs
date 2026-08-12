@@ -10,6 +10,8 @@ async fn approval_key_includes_environment_id() {
     let mut request = ShellRequest {
         command: vec!["echo".to_string(), "hello".to_string()],
         command_for_approval: vec!["echo".to_string(), "hello".to_string()],
+        #[cfg(windows)]
+        approved_powershell_direct_argv: None,
         turn_environment: TurnEnvironment::new(
             "remote".to_string(),
             Arc::new(Environment::default_for_tests()),
@@ -34,6 +36,7 @@ async fn approval_key_includes_environment_id() {
             proposed_execpolicy_amendment: None,
         },
         known_delta: None,
+        validation_launch: None,
     };
     let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
     let original_key = runtime.approval_keys(&request);
@@ -58,6 +61,8 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
             "-Command".to_string(),
             "Get-ChildItem".to_string(),
         ],
+        #[cfg(windows)]
+        approved_powershell_direct_argv: None,
         turn_environment: TurnEnvironment::new(
             "local".to_string(),
             Arc::new(Environment::default_for_tests()),
@@ -82,6 +87,7 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
             proposed_execpolicy_amendment: None,
         },
         known_delta: None,
+        validation_launch: None,
     };
     let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
 

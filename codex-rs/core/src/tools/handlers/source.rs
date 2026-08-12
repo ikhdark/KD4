@@ -4,19 +4,19 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::resolve_tool_environment;
+use crate::tools::handlers::source_spec::LOCATE_TASK_TOOL_NAME;
 use crate::tools::handlers::source_spec::READ_FILE_SPAN_TOOL_NAME;
 use crate::tools::handlers::source_spec::SEARCH_SOURCE_TOOL_NAME;
 use crate::tools::handlers::source_spec::SourceToolOptions;
+use crate::tools::handlers::source_spec::create_locate_task_tool;
 use crate::tools::handlers::source_spec::create_read_file_span_tool;
 use crate::tools::handlers::source_spec::create_search_source_tool;
-use crate::tools::known_delta_store;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_agent_task_store::WorkspaceActorKind;
 use codex_agent_task_store::WorkspaceActorRegistration;
 use codex_agent_task_store::WorkspaceManifestEntry;
 use codex_agent_task_store::WorkspaceStrategy;
-use codex_features::Feature;
 use codex_file_search::source_search::ReadFileSpanOutput;
 use codex_file_search::source_search::SOURCE_READ_DEFAULT_LINES;
 use codex_file_search::source_search::SOURCE_SEARCH_DEFAULT_MAX_MATCHES;
@@ -33,6 +33,10 @@ use codex_file_search::source_search::read_file_span_from_bytes;
 use codex_file_search::source_search::should_descend_source_path;
 use codex_file_search::source_search::should_scan_source_file;
 use codex_file_search::source_search::validate_read_file_span_bounds;
+use codex_file_search::task_locator::LOCATE_TASK_MAX_FILES;
+use codex_file_search::task_locator::LOCATE_TASK_MAX_SOURCE_BYTES;
+use codex_file_search::task_locator::LocateTaskRequest;
+use codex_file_search::task_locator::locate_task;
 use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FileMetadata;
 use codex_file_system::FileSystemSandboxContext;
@@ -54,8 +58,65 @@ use std::time::Duration;
 use std::time::Instant;
 use tracing::warn;
 
+#[cfg(test)]
+pub(crate) mod test_observation {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Clone, Default)]
+    struct Counters {
+        successful_content_reads: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Snapshot {
+        pub successful_content_reads: usize,
+    }
+
+    tokio::task_local! {
+        static COUNTERS: Counters;
+    }
+
+    pub(crate) async fn observe<F: Future>(future: F) -> (F::Output, Snapshot) {
+        let counters = Counters::default();
+        let output = COUNTERS.scope(counters.clone(), future).await;
+        let snapshot = Snapshot {
+            successful_content_reads: counters.successful_content_reads.load(Ordering::Relaxed),
+        };
+        (output, snapshot)
+    }
+
+    pub(super) fn record_successful_content_read() {
+        let _ = COUNTERS.try_with(|counters| {
+            counters
+                .successful_content_reads
+                .fetch_add(1, Ordering::Relaxed);
+        });
+    }
+}
+
 const SOURCE_TOOL_MAX_RENDERED_BYTES: usize = 8 * 1024;
 const SOURCE_COORDINATION_MAX_WAIT: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocateTaskArgs {
+    task: String,
+    #[serde(default)]
+    path_anchor: Option<String>,
+    #[serde(default)]
+    symbol_anchor: Option<String>,
+    #[serde(default)]
+    max_files: Option<usize>,
+    #[serde(default)]
+    max_source_bytes: Option<usize>,
+    #[serde(default)]
+    force_fresh: bool,
+    #[serde(default)]
+    environment_id: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +153,20 @@ struct ReadFileSpanArgs {
     force_fresh: bool,
     #[serde(default)]
     environment_id: Option<String>,
+}
+
+pub struct LocateTaskHandler {
+    options: SourceToolOptions,
+}
+
+impl LocateTaskHandler {
+    pub(crate) fn new(include_environment_id: bool) -> Self {
+        Self {
+            options: SourceToolOptions {
+                include_environment_id,
+            },
+        }
+    }
 }
 
 pub struct SearchSourceHandler {
@@ -142,6 +217,26 @@ impl ToolExecutor<ToolInvocation> for SearchSourceHandler {
 
 impl CoreToolRuntime for SearchSourceHandler {}
 
+impl ToolExecutor<ToolInvocation> for LocateTaskHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(LOCATE_TASK_TOOL_NAME)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        create_locate_task_tool(self.options)
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(handle_locate_task(invocation, self.options))
+    }
+}
+
+impl CoreToolRuntime for LocateTaskHandler {}
+
 impl ToolExecutor<ToolInvocation> for ReadFileSpanHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(READ_FILE_SPAN_TOOL_NAME)
@@ -161,6 +256,97 @@ impl ToolExecutor<ToolInvocation> for ReadFileSpanHandler {
 }
 
 impl CoreToolRuntime for ReadFileSpanHandler {}
+
+async fn handle_locate_task(
+    invocation: ToolInvocation,
+    tool_options: SourceToolOptions,
+) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+    let ToolPayload::Function { ref arguments } = invocation.payload else {
+        return Err(FunctionCallError::RespondToModel(
+            "locate_task received unsupported payload".to_string(),
+        ));
+    };
+    let args: LocateTaskArgs = serde_json::from_str(arguments).map_err(|err| {
+        FunctionCallError::RespondToModel(format!("failed to parse locate_task arguments: {err}"))
+    })?;
+    reject_unadvertised_environment_id(
+        LOCATE_TASK_TOOL_NAME,
+        tool_options,
+        args.environment_id.as_deref(),
+    )?;
+    if args.task.trim().is_empty() {
+        return Err(FunctionCallError::RespondToModel(
+            "locate_task requires a nonempty task description".to_string(),
+        ));
+    }
+    let max_files = args.max_files.unwrap_or(LOCATE_TASK_MAX_FILES);
+    if max_files == 0 || max_files > LOCATE_TASK_MAX_FILES {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "locate_task max_files must be between 1 and {LOCATE_TASK_MAX_FILES}"
+        )));
+    }
+    let max_source_bytes = args
+        .max_source_bytes
+        .unwrap_or(LOCATE_TASK_MAX_SOURCE_BYTES);
+    if max_source_bytes == 0 || max_source_bytes > LOCATE_TASK_MAX_SOURCE_BYTES {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "locate_task max_source_bytes must be between 1 and {LOCATE_TASK_MAX_SOURCE_BYTES}"
+        )));
+    }
+
+    let source_context = local_source_context(&invocation, args.environment_id.as_deref()).await?;
+    let repository_root = source_context.repo_root_abs.as_path().to_path_buf();
+    let cache_root = invocation
+        .step_context
+        .turn
+        .config
+        .codex_home
+        .as_path()
+        .to_path_buf();
+    let manifest_path = repository_root.join("source_owners.toml");
+    let environment_id = args.environment_id.clone();
+    let task = args.task;
+    let path_anchor = args.path_anchor;
+    let symbol_anchor = args.symbol_anchor;
+    let force_fresh = args.force_fresh;
+    let output = tokio::task::spawn_blocking(move || {
+        locate_task(&LocateTaskRequest {
+            repository_root: &repository_root,
+            cache_root: &cache_root,
+            manifest_path: &manifest_path,
+            environment_id: environment_id.as_deref(),
+            task: &task,
+            path_anchor: path_anchor.as_deref(),
+            symbol_anchor: symbol_anchor.as_deref(),
+            max_files,
+            max_source_bytes,
+            force_fresh,
+        })
+    })
+    .await
+    .map_err(|err| {
+        FunctionCallError::RespondToModel(format!("locate_task indexing task failed: {err}"))
+    })?
+    .map_err(|err| {
+        FunctionCallError::RespondToModel(format!("locate_task query failed: {err:#}"))
+    })?;
+
+    let supporting_entries = output
+        .supporting_reads
+        .into_iter()
+        .map(|read| WorkspaceManifestEntry {
+            path: read.path,
+            content_hash: Some(read.content_hash),
+            existed: true,
+        })
+        .collect();
+    record_supporting_source_reads(&invocation, &source_context, supporting_entries).await?;
+
+    Ok(boxed_tool_output(FunctionToolOutput::from_text(
+        output.rendered,
+        Some(true),
+    )))
+}
 
 async fn handle_search_source(
     invocation: ToolInvocation,
@@ -203,7 +389,8 @@ async fn handle_search_source(
     load_repository_exclude_rules(&source_context, &ignore_matcher).await?;
     load_global_ignore_rules(&source_context, &ignore_matcher).await;
     let mut observed_entries = BTreeMap::new();
-    scan_source_roots(
+    let traversal_started = Instant::now();
+    let scan_result = scan_source_roots(
         &source_context,
         &roots,
         &options,
@@ -212,7 +399,9 @@ async fn handle_search_source(
         &mut observed_entries,
         recover_explicit_root_failures,
     )
-    .await?;
+    .await;
+    accumulator.record_traversal_duration(traversal_started.elapsed());
+    scan_result?;
     let output = accumulator.finish(
         roots
             .iter()
@@ -285,51 +474,9 @@ async fn handle_read_file_span(
     let source_context = local_source_context(&invocation, args.environment_id.as_deref()).await?;
     let path = resolve_confined_path(&source_context, &args.path, "source file").await?;
     let relative_path = relative_source_path(&source_context, &path)?;
-    let cache_enabled = source_context.is_git_repository
-        && invocation
-            .step_context
-            .turn
-            .config
-            .features
-            .enabled(Feature::KnownDeltaStore);
-    let identity = if cache_enabled {
-        known_delta_store::immutable_file_identity(
-            source_context.repo_root_abs.as_path(),
-            &relative_path,
-            start_line,
-            line_count,
-        )
-        .await
-    } else {
-        None
-    };
-    let candidate = if let Some(identity) = identity.as_ref() {
-        known_delta_store::lookup(
-            invocation.step_context.turn.config.codex_home.as_path(),
-            identity,
-        )
-        .await
-    } else {
-        None
-    };
-    if !args.force_fresh
-        && let Some(candidate) = candidate.as_ref()
-        && candidate.reusable()
-    {
-        let artifact = known_delta_store::remint_task_handle(
-            invocation.step_context.turn.config.codex_home.as_path(),
-            &invocation.session.thread_id.to_string(),
-            candidate,
-        )
-        .await;
-        if artifact.model_projection().2.is_none() {
-            return Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                known_delta_store::render_hit(candidate, &artifact),
-                Some(true),
-            )));
-        }
-    }
-    let executor_started = Instant::now();
+    // Bounded file reads are statically cheap and always execute the fresh-read path. Keep
+    // accepting `force_fresh` for request compatibility even though both values now behave alike.
+    let _ = args.force_fresh;
     let execution = async {
         let metadata = source_context
             .fs
@@ -363,32 +510,7 @@ async fn handle_read_file_span(
         Ok(render_read_output(&output))
     }
     .await;
-    let rendered = match execution {
-        Ok(rendered) => rendered,
-        Err(err) => {
-            if args.force_fresh
-                && let Some(identity) = identity.as_ref()
-            {
-                known_delta_store::record_contradictory_failure(
-                    invocation.step_context.turn.config.codex_home.as_path(),
-                    identity,
-                    candidate.is_some(),
-                )
-                .await;
-            }
-            return Err(err);
-        }
-    };
-    if let Some(identity) = identity.as_ref() {
-        let _ = known_delta_store::record_success(
-            invocation.step_context.turn.config.codex_home.as_path(),
-            identity,
-            candidate.as_ref(),
-            rendered.as_bytes(),
-            executor_started.elapsed(),
-        )
-        .await;
-    }
+    let rendered = execution?;
 
     Ok(boxed_tool_output(FunctionToolOutput::from_text(
         rendered,
@@ -789,13 +911,22 @@ async fn load_global_ignore_rules(
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
+    load_global_ignore_rules_from(context, ignore_matcher, &home, &config_root).await;
+}
+
+async fn load_global_ignore_rules_from(
+    context: &LocalSourceContext,
+    ignore_matcher: &SourceIgnoreMatcher,
+    home: &Path,
+    config_root: &Path,
+) {
     let config_paths = [home.join(".gitconfig"), config_root.join("git/config")];
     let mut ignore_path = None;
     for config_path in config_paths {
         let Some(contents) = read_optional_host_ignore_text(context, &config_path).await else {
             continue;
         };
-        if let Some(configured_path) = parse_global_excludes_path(&contents, &home) {
+        if let Some(configured_path) = parse_global_excludes_path(&contents, home) {
             ignore_path = Some(configured_path);
             break;
         }
@@ -963,7 +1094,7 @@ async fn scan_source_root(
         .await
         .map_err(|err| source_fs_error("inspect", root, err))?;
     if metadata.is_file {
-        return add_source_file(context, root, accumulator, observed_entries).await;
+        return add_source_file(context, root, accumulator, observed_entries, false).await;
     }
     if !metadata.is_directory {
         return Err(FunctionCallError::RespondToModel(format!(
@@ -1046,6 +1177,7 @@ async fn scan_source_root(
                     )
                     || source_path_is_ignored(&child, true, ignore_matcher)?
                 {
+                    accumulator.record_ignored_entries(1);
                     continue;
                 }
                 if depth >= SOURCE_SEARCH_MAX_WALK_DEPTH {
@@ -1056,6 +1188,7 @@ async fn scan_source_root(
                 continue;
             }
             if !entry.is_file {
+                accumulator.record_ignored_entries(1);
                 continue;
             }
             let Some(relative) =
@@ -1070,6 +1203,7 @@ async fn scan_source_root(
                 options.include_locks,
             ) || source_path_is_ignored(&child, false, ignore_matcher)?
             {
+                accumulator.record_ignored_entries(1);
                 continue;
             }
             let Some(canonical) = recover_scan_result(
@@ -1086,7 +1220,7 @@ async fn scan_source_root(
                 continue;
             }
             let _ = recover_scan_result(
-                add_source_file(context, &canonical, accumulator, observed_entries).await,
+                add_source_file(context, &canonical, accumulator, observed_entries, true).await,
                 accumulator,
             );
         }
@@ -1134,6 +1268,27 @@ async fn add_source_file(
     path: &PathUri,
     accumulator: &mut SourceSearchAccumulator,
     observed_entries: &mut BTreeMap<String, WorkspaceManifestEntry>,
+    already_filtered: bool,
+) -> Result<(), FunctionCallError> {
+    let started = Instant::now();
+    let result = add_source_file_inner(
+        context,
+        path,
+        accumulator,
+        observed_entries,
+        already_filtered,
+    )
+    .await;
+    accumulator.record_file_scan_match_duration(started.elapsed());
+    result
+}
+
+async fn add_source_file_inner(
+    context: &LocalSourceContext,
+    path: &PathUri,
+    accumulator: &mut SourceSearchAccumulator,
+    observed_entries: &mut BTreeMap<String, WorkspaceManifestEntry>,
+    already_filtered: bool,
 ) -> Result<(), FunctionCallError> {
     let metadata = context
         .fs
@@ -1148,7 +1303,12 @@ async fn add_source_file(
     }
     let relative = relative_source_path(context, path)?;
     let file_len = usize::try_from(metadata.size).unwrap_or(usize::MAX);
-    if !accumulator.consider_file(Path::new(&relative), file_len) {
+    let should_scan = if already_filtered {
+        accumulator.consider_walked_file(file_len)
+    } else {
+        accumulator.consider_file(Path::new(&relative), file_len)
+    };
+    if !should_scan {
         return Ok(());
     }
     match read_source_file_stably(context, path, &metadata).await? {
@@ -1195,6 +1355,8 @@ async fn read_source_file_stably(
     let Some(bytes) = bytes else {
         return Ok(None);
     };
+    #[cfg(test)]
+    test_observation::record_successful_content_read();
     let metadata_after = match context.fs.get_metadata(path, Some(&context.sandbox)).await {
         Ok(metadata) => metadata,
         Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
@@ -1268,6 +1430,20 @@ fn render_search_output(output: &SourceSearchOutput) -> String {
     if let Some(reason) = output.truncated_reason {
         let _ = rendered.push_line(format!("truncated_reason: {reason:?}"));
     }
+    if let Some(note) = &output.coverage_note {
+        let _ = rendered.push_line(format!("coverage_note: {note}"));
+    }
+    let first_match_micros = output
+        .diagnostics
+        .first_match_micros
+        .map_or_else(|| "none".to_string(), |duration| duration.to_string());
+    let _ = rendered.push_line(format!(
+        "diagnostics: total_us={} first_match_us={first_match_micros} traversal_us={} file_scan_match_us={} projection_us={}",
+        output.diagnostics.total_micros,
+        output.diagnostics.traversal_micros,
+        output.diagnostics.file_scan_match_micros,
+        output.diagnostics.projection_micros,
+    ));
     let render_reason_index = rendered.line_count();
 
     'matches: for source_match in &output.matches {
@@ -1303,7 +1479,10 @@ fn render_search_output(output: &SourceSearchOutput) -> String {
 
 fn render_search_coverage(output: &SourceSearchOutput, truncated: bool) -> String {
     format!(
-        "coverage: files={} skipped_too_large={} skipped_non_utf8={} changed_during_read={} filesystem_errors={} bytes={} total_matches={} returned={} truncated={truncated}",
+        "coverage: complete={} walked={} ignored={} files={} skipped_too_large={} skipped_non_utf8={} changed_during_read={} filesystem_errors={} bytes={} total_matches={} returned={} truncated={truncated}",
+        output.coverage_complete,
+        output.coverage.walked_entries,
+        output.coverage.ignored_entries,
         output.coverage.files_scanned,
         output.coverage.files_skipped_too_large,
         output.coverage.files_skipped_non_utf8,

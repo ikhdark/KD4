@@ -20,3 +20,13 @@ pub(crate) fn stage5_executor_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     enabled("CODEX_LATENCY_STAGE5", &ENABLED)
 }
+
+pub(crate) fn history_identity_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    enabled("CODEX_LATENCY_STAGE_HISTORY_IDENTITY", &ENABLED)
+}
+
+pub(crate) fn shared_prompt_input_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    enabled("CODEX_LATENCY_STAGE_SHARED_PROMPT_INPUT", &ENABLED)
+}

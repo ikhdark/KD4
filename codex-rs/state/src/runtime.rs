@@ -167,6 +167,7 @@ pub struct StateRuntime {
     logs_pool: Arc<sqlx::SqlitePool>,
     thread_goals: GoalStore,
     memories: MemoryStore,
+    validation_history: crate::ValidationHistoryStore,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
 }
@@ -307,9 +308,12 @@ SELECT
             };
         let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
         let thread_recency_at_millis = thread_recency_at_millis.unwrap_or(0);
+        let validation_history =
+            crate::ValidationHistoryStore::new(Arc::clone(&pool), &codex_home).await;
         let runtime = Arc::new(Self {
             thread_goals: GoalStore::new(Arc::clone(&goals_pool)),
             memories: MemoryStore::new(Arc::clone(&memories_pool), Arc::clone(&pool)),
+            validation_history,
             pool,
             logs_pool,
             codex_home,
@@ -337,6 +341,10 @@ SELECT
 
     pub fn memories(&self) -> &MemoryStore {
         &self.memories
+    }
+
+    pub fn validation_history(&self) -> &crate::ValidationHistoryStore {
+        &self.validation_history
     }
 
     /// Close all SQLite pools and wait for outstanding pool workers to exit.

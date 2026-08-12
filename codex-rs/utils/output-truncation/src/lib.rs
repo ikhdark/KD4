@@ -19,6 +19,7 @@ pub enum OutputOutcome {
     Success,
     Failure,
     TimedOut,
+    Skipped,
 }
 
 /// Classification supplied by the producing tool before model projection.
@@ -92,7 +93,7 @@ pub fn resolve_projected_output_limits(
     let default_limit = match diagnostic_class {
         OutputDiagnosticClass::HighSignal => DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
         OutputDiagnosticClass::Normal => match outcome {
-            OutputOutcome::Success => DEFAULT_SUCCESS_OUTPUT_TOKENS,
+            OutputOutcome::Success | OutputOutcome::Skipped => DEFAULT_SUCCESS_OUTPUT_TOKENS,
             OutputOutcome::Failure | OutputOutcome::TimedOut => DEFAULT_FAILURE_OUTPUT_TOKENS,
         },
     };

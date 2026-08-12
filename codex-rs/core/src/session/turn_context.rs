@@ -144,6 +144,8 @@ pub struct TurnContext {
     /// Deferred tools selected by `tool_search` during this turn. This state is
     /// intentionally turn-scoped so prior selections do not accumulate.
     pub(crate) activated_deferred_tools: Arc<std::sync::RwLock<HashSet<codex_tools::ToolName>>>,
+    pub(crate) validation_authorization: crate::validation_admission::SharedValidationAuthorization,
+    pub(crate) validation_singleflight: crate::validation_admission::SharedValidationSingleflight,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_skills: TurnSkillsContext,
@@ -159,6 +161,17 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
+    pub(crate) async fn update_validation_authorization(
+        &self,
+        input: &[codex_protocol::user_input::UserInput],
+    ) {
+        let mut authorization = self.validation_authorization.write().await;
+        for item in input {
+            if let codex_protocol::user_input::UserInput::Text { text, .. } = item {
+                authorization.update_from_user_input(text);
+            }
+        }
+    }
     pub(crate) fn activate_deferred_tools(
         &self,
         tools: impl IntoIterator<Item = codex_tools::ToolName>,
@@ -327,6 +340,8 @@ impl TurnContext {
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
             activated_deferred_tools: Arc::clone(&self.activated_deferred_tools),
+            validation_authorization: Arc::clone(&self.validation_authorization),
+            validation_singleflight: Arc::clone(&self.validation_singleflight),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
             turn_skills: self.turn_skills.clone(),
@@ -612,6 +627,12 @@ impl Session {
             final_output_json_schema: None,
             dynamic_tools: session_configuration.dynamic_tools.clone(),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            validation_authorization: Arc::new(tokio::sync::RwLock::new(
+                crate::validation_admission::ValidationAuthorization::default(),
+            )),
+            validation_singleflight: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             turn_metadata_state,
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),

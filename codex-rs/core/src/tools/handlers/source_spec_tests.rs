@@ -67,6 +67,29 @@ fn source_tools_describe_local_environment_selection() {
 }
 
 #[test]
+fn search_source_guides_callers_to_ownership_scoped_paths() {
+    let tool = serde_json::to_value(create_search_source_tool(SourceToolOptions {
+        include_environment_id: false,
+    }))
+    .expect("serialize search tool");
+    let description = tool
+        .pointer("/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("tool description");
+    let paths_description = tool
+        .pointer("/parameters/properties/paths/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("paths description");
+
+    for guidance in ["locate_task once", "owner or closure paths"] {
+        assert!(description.contains(guidance), "{guidance}");
+        assert!(paths_description.contains(guidance), "{guidance}");
+    }
+    assert!(description.contains("deliberate repository-wide"));
+    assert!(paths_description.contains("Empty remains valid"));
+}
+
+#[test]
 fn source_tool_count_and_line_parameters_are_integers() {
     let search_tool = serde_json::to_value(create_search_source_tool(SourceToolOptions {
         include_environment_id: false,

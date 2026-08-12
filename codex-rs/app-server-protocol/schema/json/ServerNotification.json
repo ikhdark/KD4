@@ -5733,6 +5733,23 @@
         "milestones": {
           "$ref": "#/definitions/TurnTimingMilestones"
         },
+        "modelRequests": {
+          "description": "Per-sampling-request milestones, ordered by request. Times are offsets from turn start and are diagnostic only; they are not additive buckets.",
+          "items": {
+            "$ref": "#/definitions/TurnTimingModelRequest"
+          },
+          "type": "array"
+        },
+        "preFirstModelOutput": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnTimingPreFirstModelOutput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "profileValid": {
           "type": "boolean"
         },
@@ -5769,6 +5786,39 @@
       ],
       "type": "object"
     },
+    "TurnTimingAttemptKind": {
+      "enum": [
+        "primary",
+        "retry",
+        "fallback"
+      ],
+      "type": "string"
+    },
+    "TurnTimingAttemptKindCounts": {
+      "properties": {
+        "fallback": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "primary": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retry": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fallback",
+        "primary",
+        "retry"
+      ],
+      "type": "object"
+    },
     "TurnTimingCounters": {
       "properties": {
         "approvalWaitCount": {
@@ -5776,12 +5826,47 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "attemptsByKind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingAttemptKindCounts"
+            }
+          ],
+          "default": {
+            "fallback": 0,
+            "primary": 0,
+            "retry": 0
+          }
+        },
         "clockRegressionCount": {
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
+        "generationsByReason": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingGenerationReasonCounts"
+            }
+          ],
+          "default": {
+            "compaction": 0,
+            "completionRepairRereview": 0,
+            "completionReview": 0,
+            "initial": 0,
+            "other": 0,
+            "subagent": 0,
+            "toolContinuation": 0
+          }
+        },
         "invalidTransitionCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "logicalGenerationCount": {
+          "default": 0,
+          "description": "Logical workflow generations. `model_request_count` remains the authoritative physical provider-attempt aggregate.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -5909,6 +5994,67 @@
       ],
       "type": "object"
     },
+    "TurnTimingGenerationReason": {
+      "enum": [
+        "initial",
+        "tool_continuation",
+        "completion_review",
+        "completion_repair_rereview",
+        "compaction",
+        "subagent",
+        "other"
+      ],
+      "type": "string"
+    },
+    "TurnTimingGenerationReasonCounts": {
+      "properties": {
+        "compaction": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "completionRepairRereview": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "completionReview": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "initial": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "other": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "subagent": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolContinuation": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "compaction",
+        "completionRepairRereview",
+        "completionReview",
+        "initial",
+        "other",
+        "subagent",
+        "toolContinuation"
+      ],
+      "type": "object"
+    },
     "TurnTimingLocal": {
       "properties": {
         "compactionUnionNs": {
@@ -5994,6 +6140,157 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "TurnTimingModelRequest": {
+      "properties": {
+        "attemptKind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingAttemptKind"
+            }
+          ],
+          "default": "primary"
+        },
+        "completedMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "dispatchMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstModelOutputMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "generationIndex": {
+          "default": 0,
+          "description": "Zero-based logical generation owning this physical provider attempt.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "generationReason": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingGenerationReason"
+            }
+          ],
+          "default": "other"
+        },
+        "isContinuation": {
+          "type": "boolean"
+        },
+        "modelStreamWaitNs": {
+          "default": 0,
+          "description": "Directly observed model-stream wait for this physical attempt.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolCallCount": {
+          "default": 0,
+          "description": "Tool calls emitted by this generation. Recorded on its primary attempt.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "isContinuation"
+      ],
+      "type": "object"
+    },
+    "TurnTimingPreFirstModelOutput": {
+      "properties": {
+        "attributedClientUnionNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "capturedAtNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "clientCriticalPathNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "firstRequestDispatchReadyNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "historySnapshotNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "normalizationNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "planningIdentityNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "promptConstructionNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "requestTransformationNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "serializationNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "transportReadinessNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unattributedPreOutputNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "attributedClientUnionNs",
+        "capturedAtNs",
+        "clientCriticalPathNs",
+        "firstRequestDispatchReadyNs",
+        "historySnapshotNs",
+        "normalizationNs",
+        "planningIdentityNs",
+        "promptConstructionNs",
+        "requestTransformationNs",
+        "serializationNs",
+        "transportReadinessNs",
+        "unattributedPreOutputNs"
+      ],
       "type": "object"
     },
     "TurnTimingUnions": {

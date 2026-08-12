@@ -68,6 +68,7 @@ coverage/
 
 # personal files
 personal/
+/kd-ui/
 .codex/harness/runs/
 .codex/evals/investigation/
 .codex/locks/

@@ -315,7 +315,8 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
             content: vec![ContentItem::InputText { text: "hi".into() }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }],
+        }]
+        .into(),
         tools: Some(Vec::new()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
@@ -329,7 +330,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
         text: None,
         client_metadata: None,
     };
-    let expected = serde_json::to_value(&request)?;
+    let expected_wire_bytes = serde_json::to_vec(&request)?;
 
     let _stream = client
         .stream_request(request, ResponsesOptions::default())
@@ -340,9 +341,9 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
     let prepared = requests[0]
         .prepare_body_for_send()
         .expect("body should prepare");
-    let body: serde_json::Value =
-        serde_json::from_slice(prepared.body.as_deref().expect("body should be JSON"))?;
-    assert_eq!(body, expected);
+    let wire_bytes = prepared.body.as_deref().expect("body should be JSON");
+    assert_eq!(wire_bytes, expected_wire_bytes);
+    let body: serde_json::Value = serde_json::from_slice(wire_bytes)?;
     assert_eq!(body["input"][0]["id"], "msg_1");
     assert_eq!(
         prepared.headers.get(http::header::CONTENT_TYPE),
@@ -402,7 +403,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
         instructions: "Say hi".into(),
-        input: Vec::new(),
+        input: Vec::new().into(),
         tools: Some(Vec::new()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
@@ -522,7 +523,8 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
             content: vec![ContentItem::InputText { text: "hi".into() }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }],
+        }]
+        .into(),
         tools: Some(Vec::new()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,

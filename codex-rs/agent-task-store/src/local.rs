@@ -1017,24 +1017,63 @@ impl LocalAgentTaskStore {
             }
             let mut is_singleflight_leader = false;
             if call.proof_kind == crate::ValidationProofKind::Focused {
-                let fingerprint = validation_fingerprint(&call)?;
+                let workspace_id =
+                    assignment_workspace_id_tx(&mut transaction, attempt.assignment_id).await?;
+                if let Some(evidence_key) = validation_evidence_key(&call)? {
+                    let successful = sqlx::query(
+                        "SELECT validation_calls.body_json
+                         FROM validation_calls
+                         JOIN attempts
+                           ON attempts.attempt_id = validation_calls.attempt_id
+                         JOIN assignment_repositories
+                           ON assignment_repositories.assignment_id = attempts.assignment_id
+                         WHERE assignment_repositories.workspace_id = ?
+                           AND validation_calls.status = ?
+                         ORDER BY validation_calls.recorded_at DESC
+                         LIMIT 64",
+                    )
+                    .bind(&workspace_id)
+                    .bind(encode(&crate::ValidationCallStatus::Succeeded)?)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+                    for row in successful {
+                        let candidate: ValidationCall = decode(&row.get::<String, _>("body_json"))?;
+                        if candidate.status != crate::ValidationCallStatus::Succeeded
+                            || candidate.evidence.stale_reason.is_some()
+                        {
+                            continue;
+                        }
+                        if validation_evidence_key(&candidate)?.as_ref() == Some(&evidence_key) {
+                            call.evidence.shared_from_call_id = Some(
+                                candidate
+                                    .evidence
+                                    .shared_from_call_id
+                                    .unwrap_or(candidate.call_id),
+                            );
+                            break;
+                        }
+                    }
+                }
+                let fingerprint = validation_inflight_fingerprint(&call)?;
                 let now = encode(&comparison_now())?;
-                if let Some(leader) = sqlx::query_scalar::<_, String>(
-                    "SELECT leader_call_id FROM validation_singleflight
-                     WHERE workspace_id = ? AND start_epoch = ? AND fingerprint = ?
-                       AND state = 'running'
-                       AND julianday(json_extract(lease_expires_at, '$')) >= julianday(json_extract(?, '$'))",
-                )
-                .bind(&assignment_workspace_id_tx(&mut transaction, attempt.assignment_id).await?)
-                .bind(call.evidence.start_epoch as i64)
-                .bind(&fingerprint)
-                .bind(&now)
-                .fetch_optional(&mut *transaction)
-                .await?
-                {
-                    call.evidence.shared_from_call_id = Some(leader);
-                } else {
-                    is_singleflight_leader = true;
+                if call.evidence.shared_from_call_id.is_none() {
+                    if let Some(leader) = sqlx::query_scalar::<_, String>(
+                        "SELECT leader_call_id FROM validation_singleflight
+                         WHERE workspace_id = ? AND start_epoch = ? AND fingerprint = ?
+                           AND state = 'running'
+                           AND julianday(json_extract(lease_expires_at, '$')) >= julianday(json_extract(?, '$'))",
+                    )
+                    .bind(&workspace_id)
+                    .bind(call.evidence.start_epoch as i64)
+                    .bind(&fingerprint)
+                    .bind(&now)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    {
+                        call.evidence.shared_from_call_id = Some(leader);
+                    } else {
+                        is_singleflight_leader = true;
+                    }
                 }
             }
             sqlx::query("INSERT INTO validation_calls (call_id, attempt_id, body_json, status, recorded_at) VALUES (?, ?, ?, ?, ?)")
@@ -1061,7 +1100,7 @@ impl LocalAgentTaskStore {
                 )
                 .bind(workspace_id)
                 .bind(call.evidence.start_epoch as i64)
-                .bind(validation_fingerprint(&call)?)
+                .bind(validation_inflight_fingerprint(&call)?)
                 .bind(&call.call_id)
                 .bind(
                     call.evidence
@@ -4086,27 +4125,59 @@ fn is_repository_global_validation_file(path: &Path) -> bool {
                 .is_some_and(|parent| parent.eq_ignore_ascii_case(".cargo"))
 }
 
-fn validation_fingerprint(call: &ValidationCall) -> StoreResult<String> {
+fn validation_inflight_fingerprint(call: &ValidationCall) -> StoreResult<String> {
     #[derive(Serialize)]
     struct Fingerprint<'a> {
-        start_epoch: u64,
         command: &'a str,
         executable: &'a Option<String>,
         cwd: &'a Option<String>,
         environment_hash: &'a Option<String>,
         toolchain: &'a Option<String>,
-        manifest_hash: &'a str,
+        covered_scopes: &'a [RepoScope],
+        covered_contracts: &'a [String],
+        repository_wide: bool,
     }
     let payload = encode(&Fingerprint {
-        start_epoch: call.evidence.start_epoch,
         command: &call.command_summary,
         executable: &call.resolved_executable,
         cwd: &call.evidence.cwd,
         environment_hash: &call.evidence.environment_hash,
         toolchain: &call.evidence.toolchain,
-        manifest_hash: &call.evidence.manifest_hash,
+        covered_scopes: &call.evidence.covered_scopes,
+        covered_contracts: &call.evidence.covered_contracts,
+        repository_wide: call.evidence.repository_wide,
     })?;
     Ok(format!("{:x}", Sha256::digest(payload.as_bytes())))
+}
+
+fn validation_evidence_key(call: &ValidationCall) -> StoreResult<Option<String>> {
+    if call.evidence.manifest_hash.is_empty() || call.evidence.covered_manifest.is_empty() {
+        return Ok(None);
+    }
+    #[derive(Serialize)]
+    struct EvidenceKey<'a> {
+        command: &'a str,
+        executable: &'a Option<String>,
+        cwd: &'a Option<String>,
+        environment_hash: &'a Option<String>,
+        toolchain: &'a Option<String>,
+        covered_scopes: &'a [RepoScope],
+        covered_contracts: &'a [String],
+        repository_wide: bool,
+        manifest_hash: &'a str,
+    }
+    let payload = encode(&EvidenceKey {
+        command: &call.command_summary,
+        executable: &call.resolved_executable,
+        cwd: &call.evidence.cwd,
+        environment_hash: &call.evidence.environment_hash,
+        toolchain: &call.evidence.toolchain,
+        covered_scopes: &call.evidence.covered_scopes,
+        covered_contracts: &call.evidence.covered_contracts,
+        repository_wide: call.evidence.repository_wide,
+        manifest_hash: &call.evidence.manifest_hash,
+    })?;
+    Ok(Some(format!("{:x}", Sha256::digest(payload.as_bytes()))))
 }
 
 async fn assignment_workspace_id_tx(

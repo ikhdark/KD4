@@ -526,6 +526,8 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         max_output_tokens: None,
         #[allow(deprecated)]
         cwd: turn.cwd.clone().into(),
+        #[cfg(windows)]
+        normalization_cwd: None,
         #[allow(deprecated)]
         sandbox_cwd: turn.cwd.clone().into(),
         turn_environment: turn
@@ -543,6 +545,10 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         prefix_rule: None,
         workspace_mutation: None,
         completion_activity: None,
+        validation_launch: None,
+        validation_observation: Arc::new(std::sync::Mutex::new(None)),
+        validation_leader: Arc::new(std::sync::Mutex::new(None)),
+        validation_waiter: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));

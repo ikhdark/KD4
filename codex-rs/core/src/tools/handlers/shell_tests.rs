@@ -41,6 +41,52 @@ use tokio::sync::Mutex;
 use super::parse_shell_command_hook_invocation;
 
 #[test]
+fn direct_normalization_requires_the_same_authorization_envelope() {
+    use crate::tools::sandboxing::ExecApprovalRequirement;
+
+    let sandboxed_skip = ExecApprovalRequirement::Skip {
+        bypass_sandbox: false,
+        proposed_execpolicy_amendment: None,
+    };
+    let unsandboxed_skip = ExecApprovalRequirement::Skip {
+        bypass_sandbox: true,
+        proposed_execpolicy_amendment: None,
+    };
+    let needs_approval = ExecApprovalRequirement::NeedsApproval {
+        reason: Some("approval required".to_string()),
+        proposed_execpolicy_amendment: None,
+    };
+    let differently_explained_approval = ExecApprovalRequirement::NeedsApproval {
+        reason: Some("canonical target requires approval".to_string()),
+        proposed_execpolicy_amendment: None,
+    };
+    let forbidden = ExecApprovalRequirement::Forbidden {
+        reason: "executable-specific denial".to_string(),
+    };
+
+    assert!(super::same_exec_authorization_envelope(
+        &sandboxed_skip,
+        &sandboxed_skip,
+    ));
+    assert!(!super::same_exec_authorization_envelope(
+        &needs_approval,
+        &differently_explained_approval,
+    ));
+    assert!(!super::same_exec_authorization_envelope(
+        &sandboxed_skip,
+        &unsandboxed_skip,
+    ));
+    assert!(!super::same_exec_authorization_envelope(
+        &sandboxed_skip,
+        &needs_approval,
+    ));
+    assert!(!super::same_exec_authorization_envelope(
+        &needs_approval,
+        &forbidden,
+    ));
+}
+
+#[test]
 fn shell_metadata_does_not_change_the_output_payload() {
     let mut content = "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nline1\n".to_string();
 
@@ -73,6 +119,64 @@ fn retry_guard_counts_operational_rejections_but_not_user_declines() {
 
     assert_eq!(super::retry_exit_code(&operational), Some(-1));
     assert_eq!(super::retry_exit_code(&user_declined), None);
+}
+
+#[test]
+fn successful_validation_skip_remains_successful_for_reuse() {
+    let skipped = super::RunExecLikeResult {
+        output: FunctionToolOutput::from_text("validation skipped".to_string(), Some(true)),
+        exit_code: None,
+        validation_reuse_success: Some(true),
+    };
+    assert!(skipped.validation_reuse_succeeded());
+
+    let unknown_exit = super::RunExecLikeResult {
+        output: FunctionToolOutput::from_text("no exit".to_string(), Some(true)),
+        exit_code: None,
+        validation_reuse_success: None,
+    };
+    assert!(!unknown_exit.validation_reuse_succeeded());
+}
+
+#[tokio::test]
+async fn validation_owner_retains_sole_waiter_until_worker_completion() {
+    let registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let invocation = CommandInvocation::Script("cargo test -p codex-core".to_string());
+    let identity = crate::validation_admission::validation_identity(
+        b"repo",
+        "codex-rs",
+        &invocation,
+        "env",
+        "stable",
+        1,
+    );
+    let caller_cancellation = tokio_util::sync::CancellationToken::new();
+    let registration = crate::validation_admission::register_if_absent(
+        &registry,
+        identity,
+        "leader-call",
+        &caller_cancellation,
+    )
+    .await;
+    let roles = super::shell_command::validation_registration_roles(registration);
+    assert!(roles.worker_waiter.is_none());
+    let execution = roles.execution.expect("leader execution ownership");
+    let owner_waiter = roles.owner_waiter.expect("leader owner waiter");
+    let execution_cancellation = execution.cancellation_token();
+    let worker_cancellation = execution_cancellation.clone();
+    let worker = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        assert!(!worker_cancellation.is_cancelled());
+        execution
+            .complete(crate::validation_admission::ReusableValidationResult {
+                value: serde_json::json!({"success": true}),
+            })
+            .await;
+    });
+
+    super::shell_command::await_validation_execution(worker, Some(owner_waiter))
+        .await
+        .expect("validation worker should complete");
 }
 
 #[test]
@@ -995,8 +1099,13 @@ async fn shell_command_handler_preserves_structured_argv_shape() {
     let params = ShellCommandToolCallParams {
         command: None,
         kind: Some("argv".to_string()),
-        program: Some("rg".to_string()),
-        args: Some(vec!["--files".to_string()]),
+        program: Some("python".to_string()),
+        args: Some(vec![
+            "script with spaces.py".to_string(),
+            "quote\"inside".to_string(),
+            String::new(),
+            "Grüße 世界".to_string(),
+        ]),
         script_body: None,
         workdir: None,
         login: None,
@@ -1029,7 +1138,16 @@ async fn shell_command_handler_preserves_structured_argv_shape() {
     )
     .expect("argv command should resolve");
 
-    assert_eq!(exec_params.command, vec!["rg", "--files"]);
+    assert_eq!(
+        exec_params.command,
+        vec![
+            "python",
+            "script with spaces.py",
+            "quote\"inside",
+            "",
+            "Grüße 世界",
+        ]
+    );
 }
 
 #[test]

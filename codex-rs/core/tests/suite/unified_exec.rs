@@ -1291,6 +1291,180 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_exec_host_wait_removes_model_mediated_poll_generation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 1; Write-Output POLL_DONE\""
+    } else {
+        "sleep 1 && echo POLL_DONE"
+    };
+
+    let baseline_server = start_mock_server().await;
+    let baseline_open_args = json!({
+        "cmd": command,
+        "yield_time_ms": 10,
+        "tty": true,
+    });
+    let baseline_poll_args = json!({
+        "chars": "",
+        "session_id": 1000,
+        "yield_time_ms": 3_000,
+    });
+    let baseline_responses = mount_sse_sequence(
+        &baseline_server,
+        vec![
+            sse(vec![
+                ev_response_created("baseline-open"),
+                ev_function_call(
+                    "baseline-open-call",
+                    "unified_exec",
+                    &serde_json::to_string(&baseline_open_args)?,
+                ),
+                ev_completed("baseline-open"),
+            ]),
+            sse(vec![
+                ev_response_created("baseline-poll"),
+                ev_function_call(
+                    "baseline-poll-call",
+                    "write_stdin",
+                    &serde_json::to_string(&baseline_poll_args)?,
+                ),
+                ev_completed("baseline-poll"),
+            ]),
+            sse(vec![
+                ev_response_created("baseline-final"),
+                ev_assistant_message("baseline-message", "complete"),
+                ev_completed("baseline-final"),
+            ]),
+        ],
+    )
+    .await;
+    let mut baseline_builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let baseline = baseline_builder
+        .build_with_auto_env(&baseline_server)
+        .await?;
+    submit_unified_exec_turn(
+        &baseline,
+        "run the command and wait for it to finish",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+    let mut baseline_output = None;
+    let baseline_completion = loop {
+        match wait_for_event(&baseline.codex, |_| true).await {
+            EventMsg::ExecCommandEnd(event) => baseline_output = Some(event.aggregated_output),
+            EventMsg::TurnComplete(event) => break event,
+            _ => {}
+        }
+    };
+
+    let optimized_server = start_mock_server().await;
+    let optimized_open_args = json!({
+        "cmd": command,
+        "yield_time_ms": 3_000,
+        "tty": true,
+    });
+    let optimized_responses = mount_sse_sequence(
+        &optimized_server,
+        vec![
+            sse(vec![
+                ev_response_created("optimized-open"),
+                ev_function_call(
+                    "optimized-open-call",
+                    "unified_exec",
+                    &serde_json::to_string(&optimized_open_args)?,
+                ),
+                ev_completed("optimized-open"),
+            ]),
+            sse(vec![
+                ev_response_created("optimized-final"),
+                ev_assistant_message("optimized-message", "complete"),
+                ev_completed("optimized-final"),
+            ]),
+        ],
+    )
+    .await;
+    let mut optimized_builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let optimized = optimized_builder
+        .build_with_auto_env(&optimized_server)
+        .await?;
+    submit_unified_exec_turn(
+        &optimized,
+        "run the command and wait for it to finish",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+    let mut optimized_output = None;
+    let optimized_completion = loop {
+        match wait_for_event(&optimized.codex, |_| true).await {
+            EventMsg::ExecCommandEnd(event) => optimized_output = Some(event.aggregated_output),
+            EventMsg::TurnComplete(event) => break event,
+            _ => {}
+        }
+    };
+
+    assert_eq!(
+        baseline_completion.last_agent_message.as_deref(),
+        Some("complete")
+    );
+    assert_eq!(
+        baseline_completion.last_agent_message,
+        optimized_completion.last_agent_message
+    );
+    assert!(
+        baseline_output
+            .as_deref()
+            .is_some_and(|output| output.contains("POLL_DONE"))
+    );
+    assert!(
+        optimized_output
+            .as_deref()
+            .is_some_and(|output| output.contains("POLL_DONE"))
+    );
+    assert_eq!(baseline_responses.requests().len(), 3);
+    assert_eq!(optimized_responses.requests().len(), 2);
+
+    let baseline_timing = baseline_completion.timing.expect("baseline turn timing");
+    let optimized_timing = optimized_completion.timing.expect("optimized turn timing");
+    assert_eq!(baseline_timing.counters.logical_generation_count, 3);
+    assert_eq!(baseline_timing.counters.generations_by_reason.initial, 1);
+    assert_eq!(
+        baseline_timing
+            .counters
+            .generations_by_reason
+            .tool_continuation,
+        2
+    );
+    assert_eq!(baseline_timing.counters.tool_call_count, 2);
+    assert_eq!(optimized_timing.counters.logical_generation_count, 2);
+    assert_eq!(optimized_timing.counters.generations_by_reason.initial, 1);
+    assert_eq!(
+        optimized_timing
+            .counters
+            .generations_by_reason
+            .tool_continuation,
+        1
+    );
+    assert_eq!(optimized_timing.counters.tool_call_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_emits_one_begin_and_one_end_event() -> Result<()> {
     // TODO(anp): Remove after unified-exec fixtures use target-native commands.
     skip_if_target_windows!(Ok(()), "uses bash and a POSIX sleep command");

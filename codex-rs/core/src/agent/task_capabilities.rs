@@ -253,6 +253,7 @@ pub(crate) fn classify_typed_tool(
     if matches_name(
         name,
         &[
+            "locate_task",
             "search_source",
             "read_file_span",
             "read_tool_output",

@@ -2,7 +2,11 @@ use super::AuthRequestTelemetryContext;
 use super::CanonicalPrefixHash;
 use super::CompactConversationRequestSettings;
 use super::LastResponse;
+use super::MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES;
+use super::ModelAttemptGuard;
+use super::ModelAttemptOffsets;
 use super::ModelClient;
+use super::ModelRequestMeasurements;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
 use super::UnauthorizedRecoveryExecution;
@@ -11,6 +15,9 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::attempt_offsets_are_nondecreasing;
+use super::new_attempt_id;
+use super::new_sampling_request_id;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -36,6 +43,9 @@ use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
+use codex_otel::ModelAttemptRequestKind;
+use codex_otel::ModelAttemptRetryReason;
+use codex_otel::ModelAttemptTransport;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
@@ -56,6 +66,7 @@ use codex_rollout_trace::RawTraceEventPayload;
 use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
+use codex_utils_output_truncation::approx_token_count;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -173,7 +184,7 @@ fn history_test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
     ResponsesApiRequest {
         model: "test-model".to_string(),
         instructions: "test instructions".to_string(),
-        input,
+        input: input.into(),
         tools: None,
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
@@ -187,6 +198,138 @@ fn history_test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
         text: None,
         client_metadata: None,
     }
+}
+
+#[test]
+fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
+    let sensitive_payload = "UNIQUE_PROMPT_SENTINEL_42";
+    let sampling_request_id = new_sampling_request_id();
+    let independently_created_sampling_request_id = new_sampling_request_id();
+    let first_attempt_id = new_attempt_id();
+    let second_attempt_id = new_attempt_id();
+
+    assert_ne!(
+        sampling_request_id,
+        independently_created_sampling_request_id
+    );
+    assert_ne!(first_attempt_id, second_attempt_id);
+    for id in [
+        &sampling_request_id,
+        &independently_created_sampling_request_id,
+        &first_attempt_id,
+        &second_attempt_id,
+    ] {
+        assert!(!id.contains(sensitive_payload));
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+    }
+
+    let measurements =
+        ModelRequestMeasurements::for_responses_request(&history_test_request(vec![
+            history_test_item(sensitive_payload, None),
+        ]))
+        .expect("measure request");
+    let mut first = ModelAttemptGuard::new(
+        test_session_telemetry(),
+        &sampling_request_id,
+        0,
+        ModelAttemptRetryReason::None,
+        ModelAttemptRequestKind::Initial,
+        ModelAttemptTransport::ResponsesHttp,
+        measurements.clone(),
+        super::ModelAttemptClock::new(),
+    );
+    let mut retry = ModelAttemptGuard::new(
+        test_session_telemetry(),
+        &sampling_request_id,
+        1,
+        ModelAttemptRetryReason::Unauthorized,
+        ModelAttemptRequestKind::Initial,
+        ModelAttemptTransport::ResponsesHttp,
+        measurements,
+        super::ModelAttemptClock::new(),
+    );
+    assert_eq!(first.sampling_request_id, retry.sampling_request_id);
+    assert_ne!(first.attempt_id, retry.attempt_id);
+    first.emitted = true;
+    retry.emitted = true;
+}
+
+#[test]
+fn model_request_measurements_count_serialized_tools_independently() {
+    let without_tools = history_test_request(vec![history_test_item("input", None)]);
+    let mut with_tools = without_tools.clone();
+    with_tools.tools = Some(vec![json!({
+        "type": "function",
+        "name": "lookup",
+        "description": "A deliberately verbose schema for directional token counting",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+    })]);
+
+    let baseline = ModelRequestMeasurements::for_responses_request(&without_tools)
+        .expect("measure request without tools");
+    let measured = ModelRequestMeasurements::for_responses_request(&with_tools)
+        .expect("measure request with tools");
+    let serialized_tools = serde_json::to_string(with_tools.tools.as_ref().unwrap()).unwrap();
+
+    assert_eq!(baseline.tool_token_count, 0);
+    assert!(measured.tool_token_count > baseline.tool_token_count);
+    assert_eq!(
+        measured.tool_token_count,
+        i64::try_from(approx_token_count(&serialized_tools)).expect("tool token count fits in i64")
+    );
+    assert_ne!(measured.tool_token_count, 123_456);
+}
+
+#[test]
+fn model_request_measurements_reconcile_and_match_serialized_wire_payload() {
+    let request = history_test_request(vec![history_test_item(r#"input with escaping: \""#, None)]);
+    let measured =
+        ModelRequestMeasurements::for_responses_request(&request).expect("measure request");
+    let final_payload = serde_json::to_vec(&request).expect("serialize final request");
+    let classified = measured.base_instructions_bytes
+        + measured.tool_schemas_bytes
+        + measured.conversation_history_bytes
+        + measured.current_input_bytes
+        + measured.repository_context_bytes
+        + measured.memory_bytes
+        + measured.skills_bytes;
+    let reconciled =
+        classified + measured.other_injected_context_bytes + measured.envelope_overhead_bytes;
+
+    assert_eq!(measured.wire_request_bytes, final_payload.len() as u64);
+    assert_eq!(measured.logical_request_bytes, final_payload.len() as u64);
+    assert_eq!(
+        measured.reconciliation_residual_bytes,
+        measured.logical_request_bytes as i64 - reconciled as i64
+    );
+    assert!(
+        measured.reconciliation_residual_bytes.abs()
+            <= MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES
+    );
+    assert_eq!(measured.conversation_history_bytes, 0);
+    assert_eq!(measured.current_input_bytes, 0);
+    assert_eq!(measured.other_injected_context_bytes > 0, true);
+}
+
+#[test]
+fn model_attempt_offsets_require_monotonic_elapsed_values_and_allow_nulls() {
+    let minimal = ModelAttemptOffsets::default();
+    assert!(attempt_offsets_are_nondecreasing(&minimal, 1));
+
+    let ordered = ModelAttemptOffsets {
+        dispatch_ready_us: 10,
+        stream_established_us: Some(20),
+        first_provider_event_us: Some(30),
+        first_model_output_us: Some(40),
+        first_visible_output_us: Some(50),
+    };
+    assert!(attempt_offsets_are_nondecreasing(&ordered, 60));
+
+    let out_of_order = ModelAttemptOffsets {
+        first_model_output_us: Some(9),
+        ..ordered
+    };
+    assert!(!attempt_offsets_are_nondecreasing(&out_of_order, 60));
 }
 
 #[test]
@@ -216,8 +359,10 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
     };
     let delta = history_test_item("next", Some("turn-b"));
     let mut extended = original.clone();
-    extended.input.extend(response.items_added.clone());
-    extended.input.push(delta.clone());
+    let mut extended_input = extended.input.to_vec();
+    extended_input.extend(response.items_added.clone());
+    extended_input.push(delta.clone());
+    extended.input = extended_input.into();
 
     assert_eq!(
         session.get_incremental_items(&extended, Some(&response), false),
@@ -225,7 +370,7 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
     );
 
     let mut changed_prefix = extended.clone();
-    changed_prefix.input[0] = history_test_item("changed", Some("turn-a"));
+    Arc::make_mut(&mut changed_prefix.input)[0] = history_test_item("changed", Some("turn-a"));
     assert_eq!(
         session.get_incremental_items(&changed_prefix, Some(&response), false),
         None
@@ -339,7 +484,8 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }],
+        }]
+        .into(),
         base_instructions: BaseInstructions {
             text: "base instructions".to_string(),
         },
@@ -783,6 +929,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        None,
     );
 
     let observed = stream
@@ -833,6 +980,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
+        None,
     );
 
     while stream.next().await.is_some() {}
@@ -908,6 +1056,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        None,
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output

@@ -1994,6 +1994,116 @@ fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history()
 }
 
 #[test]
+fn prepared_prompt_cache_reuses_shared_items_across_non_history_changes() {
+    let mut history = create_history_with_items(vec![agent_message("hello")]);
+    let first = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    history.set_token_info(history.token_info());
+    let second = history.prepare_for_prompt(&default_input_modalities());
+
+    assert!(Arc::ptr_eq(&first.shared_items(), &second.shared_items()));
+    assert_eq!(first.fingerprint(), second.fingerprint());
+}
+
+#[test]
+fn prepared_prompt_cache_does_not_cross_divergent_clone_branches() {
+    let mut left = create_history_with_items(vec![agent_message("shared")]);
+    let mut right = left.clone();
+    let left_only = agent_message("left only");
+    let right_only = agent_message("right only");
+    left.record_items([&left_only], TruncationPolicy::Tokens(10_000));
+    right.record_items([&right_only], TruncationPolicy::Tokens(10_000));
+
+    let left_prepared = left.prepare_for_prompt(&default_input_modalities());
+    let right_prepared = right.prepare_for_prompt(&default_input_modalities());
+
+    assert_eq!(
+        left_prepared.items(),
+        &[agent_message("shared"), agent_message("left only")]
+    );
+    assert_eq!(
+        right_prepared.items(),
+        &[agent_message("shared"), agent_message("right only")]
+    );
+    assert_ne!(left_prepared.fingerprint(), right_prepared.fingerprint());
+}
+
+#[test]
+fn prepared_prompt_cache_does_not_extend_a_sibling_reasoning_branch() {
+    let mut left = create_history_with_items(vec![agent_message("shared")]);
+    let _base = left.clone().prepare_for_prompt(&default_input_modalities());
+    let mut right = left.clone();
+    let left_reasoning = reasoning_msg("left only");
+    let right_reasoning = reasoning_msg("right only");
+    left.record_items([&left_reasoning], TruncationPolicy::Tokens(10_000));
+    right.record_items([&right_reasoning], TruncationPolicy::Tokens(10_000));
+
+    let right_prepared = right.prepare_for_prompt(&default_input_modalities());
+
+    assert_eq!(
+        right_prepared.items(),
+        &[agent_message("shared"), reasoning_msg("right only")]
+    );
+}
+
+#[test]
+fn prepared_prompt_cache_updates_only_for_safe_reasoning_append() {
+    let mut history = create_history_with_items(vec![agent_message("hello")]);
+    let first = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let reasoning = reasoning_msg("next");
+    history.record_items([&reasoning], TruncationPolicy::Tokens(10_000));
+
+    let cached = history
+        .prepared_history
+        .lock()
+        .expect("prepared history lock")
+        .clone()
+        .expect("safe reasoning append should update the existing cache");
+    assert_eq!(cached.projection_revision, history.projection_revision);
+    assert_eq!(
+        &cached.prepared.items()[..first.items().len()],
+        first.items()
+    );
+    assert_ne!(cached.prepared.fingerprint(), first.fingerprint());
+
+    let invalidating_item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "new boundary".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items([&invalidating_item], TruncationPolicy::Tokens(10_000));
+    assert!(
+        history
+            .prepared_history
+            .lock()
+            .expect("prepared history lock")
+            .is_none()
+    );
+}
+
+#[test]
+fn replacing_history_releases_obsolete_prepared_input() {
+    let mut history = create_history_with_items(vec![agent_message("before")]);
+    let prepared = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let shared = prepared.shared_items();
+    let weak = Arc::downgrade(&shared);
+    drop(shared);
+    drop(prepared);
+
+    history.replace(vec![agent_message("after")]);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
 fn normalize_adds_missing_output_for_tool_search_call() {
     let items = vec![ResponseItem::ToolSearchCall {
         id: None,

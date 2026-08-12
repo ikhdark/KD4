@@ -109,6 +109,118 @@ pub struct SessionTelemetry {
     pub(crate) metrics_use_metadata_tags: bool,
 }
 
+/// Privacy-safe, completed measurements for one physical model request.
+///
+/// This is deliberately an allowlist: it contains no prompt-bearing values, endpoints, errors, or
+/// arbitrary attributes. Times are elapsed microseconds from the process-local attempt start; an
+/// `Instant` is never stored or serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAttemptRetryReason {
+    None,
+    Unauthorized,
+}
+
+impl ModelAttemptRetryReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unauthorized => "unauthorized",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAttemptOutcome {
+    Success,
+    Failed,
+    Cancelled,
+}
+
+impl ModelAttemptOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAttemptRequestKind {
+    Initial,
+    Continuation,
+}
+
+impl ModelAttemptRequestKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Continuation => "continuation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAttemptTransport {
+    ResponsesHttp,
+    ResponsesWebsocket,
+}
+
+impl ModelAttemptTransport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponsesHttp => "responses_http",
+            Self::ResponsesWebsocket => "responses_websocket",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelAttemptTelemetry {
+    pub sampling_request_id: String,
+    pub attempt_id: String,
+    pub retry_index: u32,
+    pub retry_reason: ModelAttemptRetryReason,
+    pub outcome: ModelAttemptOutcome,
+    pub request_kind: ModelAttemptRequestKind,
+    pub transport: ModelAttemptTransport,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub uncached_input_tokens: Option<i64>,
+    pub tool_token_count: i64,
+    pub wire_request_bytes: u64,
+    pub logical_request_bytes: u64,
+    pub base_instructions_bytes: u64,
+    pub tool_schemas_bytes: u64,
+    pub conversation_history_bytes: u64,
+    pub current_input_bytes: u64,
+    pub repository_context_bytes: u64,
+    pub memory_bytes: u64,
+    pub skills_bytes: u64,
+    pub other_injected_context_bytes: u64,
+    pub envelope_overhead_bytes: u64,
+    pub reconciliation_residual_bytes: i64,
+    pub dispatch_ready_us: u64,
+    pub stream_established_us: Option<u64>,
+    pub first_provider_event_us: Option<u64>,
+    pub first_model_output_us: Option<u64>,
+    pub first_visible_output_us: Option<u64>,
+    pub completed_us: u64,
+}
+
+/// Accept only short normalized telemetry identifiers. URL/path delimiters and whitespace are
+/// deliberately excluded so endpoints and arbitrary configuration strings cannot enter this
+/// event through categorical fields.
+fn normalized_model_attempt_label(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+    .then_some(value)
+}
+
 impl SessionTelemetry {
     pub fn with_auth_env(mut self, auth_env: AuthEnvTelemetryMetadata) -> Self {
         self.metadata.auth_env = auth_env;
@@ -931,6 +1043,58 @@ impl SessionTelemetry {
         );
     }
 
+    /// Emits only the explicit allowlist in [`ModelAttemptTelemetry`].
+    pub fn model_attempt_completed(&self, record: &ModelAttemptTelemetry) {
+        let provider = self
+            .metadata
+            .service_name
+            .as_deref()
+            .and_then(normalized_model_attempt_label);
+        let model = normalized_model_attempt_label(&self.metadata.model);
+        let service_tier = self
+            .metadata
+            .service_tier
+            .as_deref()
+            .and_then(normalized_model_attempt_label);
+        tracing::event!(
+                target: crate::targets::OTEL_LOG_ONLY_TARGET,
+                tracing::Level::INFO,
+                event.name = "codex.model_attempt",
+                sampling_request_id = %record.sampling_request_id,
+                attempt_id = %record.attempt_id,
+                retry_index = record.retry_index,
+                retry_reason = record.retry_reason.as_str(),
+                outcome = record.outcome.as_str(),
+                request_kind = record.request_kind.as_str(),
+                transport = record.transport.as_str(),
+                provider = provider,
+                model = model,
+                service_tier = service_tier,
+                input_token_count = record.input_tokens,
+                cached_input_token_count = record.cached_input_tokens,
+                uncached_input_token_count = record.uncached_input_tokens,
+                tool_token_count = record.tool_token_count,
+                wire_request_bytes = record.wire_request_bytes,
+                logical_request_bytes = record.logical_request_bytes,
+                base_instructions_bytes = record.base_instructions_bytes,
+                tool_schemas_bytes = record.tool_schemas_bytes,
+                conversation_history_bytes = record.conversation_history_bytes,
+                current_input_bytes = record.current_input_bytes,
+                repository_context_bytes = record.repository_context_bytes,
+                memory_bytes = record.memory_bytes,
+                skills_bytes = record.skills_bytes,
+                other_injected_context_bytes = record.other_injected_context_bytes,
+                envelope_overhead_bytes = record.envelope_overhead_bytes,
+                reconciliation_residual_bytes = record.reconciliation_residual_bytes,
+                dispatch_ready_us = record.dispatch_ready_us,
+                stream_established_us = record.stream_established_us,
+                first_provider_event_us = record.first_provider_event_us,
+                first_model_output_us = record.first_model_output_us,
+                first_visible_output_us = record.first_visible_output_us,
+                completed_us = record.completed_us,
+        );
+    }
+
     pub fn user_prompt(&self, items: &[UserInput]) {
         let prompt = items
             .iter()
@@ -1244,4 +1408,27 @@ fn duration_from_ms_value(value: Option<&serde_json::Value>) -> Option<Duration>
     }
     let clamped = ms.min(u64::MAX as f64);
     Some(Duration::from_millis(clamped.round() as u64))
+}
+
+#[cfg(test)]
+mod model_attempt_privacy_tests {
+    use super::normalized_model_attempt_label;
+
+    #[test]
+    fn categorical_labels_accept_normalized_ids_and_reject_arbitrary_strings() {
+        assert_eq!(
+            normalized_model_attempt_label("gpt-5.2_codex"),
+            Some("gpt-5.2_codex")
+        );
+        assert_eq!(
+            normalized_model_attempt_label("responses_websocket"),
+            Some("responses_websocket")
+        );
+        assert_eq!(
+            normalized_model_attempt_label("https://example.test/v1"),
+            None
+        );
+        assert_eq!(normalized_model_attempt_label("provider with spaces"), None);
+        assert_eq!(normalized_model_attempt_label(&"x".repeat(97)), None);
+    }
 }

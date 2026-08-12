@@ -1301,3 +1301,224 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
         Some("plan contributed assistant text")
     );
 }
+
+fn synthetic_tool_result(call_id: &str) -> ResponseInputItem {
+    ResponseInputItem::ToolSearchOutput {
+        call_id: call_id.to_string(),
+        status: "completed".to_string(),
+        execution: "client".to_string(),
+        tools: Vec::new(),
+    }
+}
+
+fn controlled_tool_future(
+    call_id: &'static str,
+    first_poll: tokio::sync::oneshot::Sender<tokio::time::Instant>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> BoxFuture<'static, CodexResult<ResponseInputItem>> {
+    Box::pin(async move {
+        let _ = first_poll.send(tokio::time::Instant::now());
+        let _ = release.await;
+        Ok(synthetic_tool_result(call_id))
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn eager_tool_poll_overlaps_a_controlled_response_tail_without_changing_results() {
+    const RESPONSE_TAIL: Duration = Duration::from_millis(250);
+    let baseline_item_accepted = tokio::time::Instant::now();
+    let (baseline_first_poll_tx, mut baseline_first_poll_rx) = tokio::sync::oneshot::channel();
+    let (baseline_release_tx, baseline_release_rx) = tokio::sync::oneshot::channel();
+    let mut baseline: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+        FuturesOrdered::new();
+    baseline.push_back(controlled_tool_future(
+        "read-1",
+        baseline_first_poll_tx,
+        baseline_release_rx,
+    ));
+
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        baseline_first_poll_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    tokio::time::advance(RESPONSE_TAIL).await;
+    let baseline_result_task =
+        tokio::spawn(async move { baseline.next().await.expect("baseline result should exist") });
+    let baseline_first_poll = baseline_first_poll_rx
+        .await
+        .expect("baseline future should be polled");
+    assert_eq!(
+        baseline_first_poll.duration_since(baseline_item_accepted),
+        RESPONSE_TAIL
+    );
+    baseline_release_tx
+        .send(())
+        .expect("baseline tool should still be attached");
+    let baseline_result = baseline_result_task
+        .await
+        .expect("baseline result task should finish")
+        .expect("baseline tool should succeed");
+
+    let eager_item_accepted = tokio::time::Instant::now();
+    let (eager_first_poll_tx, eager_first_poll_rx) = tokio::sync::oneshot::channel();
+    let (eager_release_tx, eager_release_rx) = tokio::sync::oneshot::channel();
+    let mut eager: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+        FuturesOrdered::new();
+    eager.push_back(start_eager_tool_future(controlled_tool_future(
+        "read-1",
+        eager_first_poll_tx,
+        eager_release_rx,
+    )));
+
+    let eager_first_poll = eager_first_poll_rx
+        .await
+        .expect("eager future should start before the response tail is released");
+    assert_eq!(
+        eager_first_poll.duration_since(eager_item_accepted),
+        Duration::ZERO
+    );
+    let (stream_tail_completed_tx, stream_tail_completed_rx) = tokio::sync::oneshot::channel();
+    let stream_tail = tokio::spawn(async move {
+        tokio::time::sleep(RESPONSE_TAIL).await;
+        let _ = stream_tail_completed_tx.send(tokio::time::Instant::now());
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(RESPONSE_TAIL).await;
+    let eager_tail_completed = stream_tail_completed_rx
+        .await
+        .expect("the model-response tail should continue while the tool is blocked");
+    stream_tail.await.expect("stream-tail task should finish");
+    assert_eq!(
+        eager_tail_completed.duration_since(eager_first_poll),
+        RESPONSE_TAIL
+    );
+
+    // The simulated stream tail completed while tool work was still deliberately blocked.
+    // Model continuation remains behind the ordered tool-result barrier.
+    let next_sampling_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let next_sampling_started_after_drain = Arc::clone(&next_sampling_started);
+    let continuation = tokio::spawn(async move {
+        let result = eager
+            .next()
+            .await
+            .expect("eager result should exist")
+            .expect("eager tool should succeed");
+        next_sampling_started_after_drain.store(true, Ordering::SeqCst);
+        result
+    });
+    tokio::task::yield_now().await;
+    assert!(!next_sampling_started.load(Ordering::SeqCst));
+    eager_release_tx
+        .send(())
+        .expect("eager tool should still be attached");
+    let eager_result = continuation
+        .await
+        .expect("continuation barrier task should finish");
+
+    assert_eq!(eager_result, baseline_result);
+    assert!(next_sampling_started.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn eager_tool_results_remain_in_call_order_after_reverse_completion() {
+    let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+    let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
+    let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+    let (second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+        FuturesOrdered::new();
+    in_flight.push_back(start_eager_tool_future(controlled_tool_future(
+        "first",
+        first_started_tx,
+        first_release_rx,
+    )));
+    in_flight.push_back(start_eager_tool_future(controlled_tool_future(
+        "second",
+        second_started_tx,
+        second_release_rx,
+    )));
+
+    first_started_rx.await.expect("first tool should start");
+    second_started_rx.await.expect("second tool should start");
+    second_release_tx
+        .send(())
+        .expect("second tool should still be attached");
+    tokio::task::yield_now().await;
+    first_release_tx
+        .send(())
+        .expect("first tool should still be attached");
+
+    let first = in_flight
+        .next()
+        .await
+        .expect("first result")
+        .expect("success");
+    let second = in_flight
+        .next()
+        .await
+        .expect("second result")
+        .expect("success");
+    assert_eq!(first, synthetic_tool_result("first"));
+    assert_eq!(second, synthetic_tool_result("second"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn eager_tool_failure_is_observed_only_after_response_streaming_finishes() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let future: BoxFuture<'static, CodexResult<ResponseInputItem>> = Box::pin(async move {
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        Err(CodexErr::Fatal("synthetic eager tool failure".to_string()))
+    });
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+        FuturesOrdered::new();
+    in_flight.push_back(start_eager_tool_future(future));
+
+    started_rx.await.expect("eager tool should start");
+    tokio::time::advance(Duration::from_millis(250)).await;
+    let response_tail_finished = true;
+    assert!(response_tail_finished);
+
+    release_tx
+        .send(())
+        .expect("failed eager tool should remain attached until collection drain");
+    let error = in_flight
+        .next()
+        .await
+        .expect("failed result should retain its ordered slot")
+        .expect_err("synthetic tool should fail");
+    assert!(error.to_string().contains("synthetic eager tool failure"));
+}
+
+struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropping_in_flight_collection_aborts_eager_tool_work() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    let future: BoxFuture<'static, CodexResult<ResponseInputItem>> = Box::pin(async move {
+        let _drop_signal = DropSignal(Some(dropped_tx));
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+        unreachable!("aborted eager work must not resume")
+    });
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+        FuturesOrdered::new();
+    in_flight.push_back(start_eager_tool_future(future));
+
+    started_rx.await.expect("eager work should start");
+    drop(in_flight);
+    dropped_rx
+        .await
+        .expect("dropping the collection must abort, not detach, eager work");
+}

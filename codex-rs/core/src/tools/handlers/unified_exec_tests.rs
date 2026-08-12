@@ -1206,7 +1206,13 @@ async fn exec_command_hook_preserves_and_rewrites_direct_argv_structurally() {
             serde_json::json!({
                 "kind": "argv",
                 "program": "kds",
-                "args": ["--agent", "--", "rg", "--files"],
+                "args": [
+                    "--agent",
+                    "path with spaces",
+                    "quote\"inside",
+                    "",
+                    "Grüße 世界",
+                ],
             }),
         )
         .expect("structured argv rewrite should remain direct");
@@ -1225,7 +1231,14 @@ async fn exec_command_hook_preserves_and_rewrites_direct_argv_structurally() {
     .expect("rewritten argv should resolve directly");
     assert_eq!(
         resolved.command,
-        vec!["kds", "--agent", "--", "rg", "--files"]
+        vec![
+            "kds",
+            "--agent",
+            "path with spaces",
+            "quote\"inside",
+            "",
+            "Grüße 世界",
+        ]
     );
     assert_eq!(resolved.preflight_shell_type, None);
 

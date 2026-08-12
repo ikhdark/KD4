@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::function_tool::FunctionCallError;
@@ -13,6 +14,7 @@ use crate::tools::command_execution::acquire_workspace_mutation_lease;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -38,6 +40,12 @@ use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::generate_chunk_id;
+use crate::validation_admission::ValidationAdmission;
+use crate::validation_admission::ValidationLaunchPlan;
+use crate::validation_admission::ValidationRegistration;
+use crate::validation_admission::admit_validation;
+use crate::validation_admission::register_if_absent;
+use crate::validation_admission::validation_identity;
 use codex_agent_task_store::REPOSITORY_WIDE_PATH;
 use codex_agent_task_store::WorkspaceActorKind;
 use codex_agent_task_store::WorkspaceMutationRequest;
@@ -64,6 +72,37 @@ use super::ExecCommandEnvironmentArgs;
 use super::get_command;
 use super::post_unified_exec_tool_use_payload;
 use super::shell_mode_for_environment;
+
+fn validation_structured_output(value: serde_json::Value) -> FunctionToolOutput {
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    let success = value
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let mut output = FunctionToolOutput::from_text(text, Some(success));
+    output.post_tool_use_response = Some(value);
+    output
+}
+
+fn joined_validation_structured_output(
+    mut value: serde_json::Value,
+    call_id: &str,
+    shared_from_call_id: &str,
+) -> FunctionToolOutput {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("call_id".to_string(), call_id.into());
+        object.insert("admission_disposition".to_string(), "joined".into());
+        object.insert(
+            "shared_from_call_id".to_string(),
+            shared_from_call_id.into(),
+        );
+    }
+    validation_structured_output(value)
+}
 
 #[derive(Debug, Deserialize)]
 struct ExecCommandHookArgs {
@@ -472,6 +511,35 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
+        let repository_key = native_cwd
+            .as_ref()
+            .map(|cwd| get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf()))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cwd.to_string());
+        let validation_launch = match admit_validation(
+            &turn.validation_authorization,
+            session.services.state_db.as_deref(),
+            repository_key.as_bytes(),
+            &command_invocation,
+        )
+        .await
+        {
+            ValidationAdmission::Skip(skipped) => {
+                tracing::info!(reason = ?skipped.reason, "validation command skipped");
+                return Ok(boxed_tool_output(validation_structured_output(
+                    serde_json::to_value(skipped).unwrap_or_default(),
+                )));
+            }
+            ValidationAdmission::Execute {
+                authorization_revision,
+                observation,
+            } => observation.map(|observation| ValidationLaunchPlan {
+                invocation: command_invocation.clone(),
+                authorization_revision,
+                observation: Some(observation),
+            }),
+        };
+        let validation_observation = Arc::new(StdMutex::new(None));
         validate_independent_review_shell(
             &turn.session_source,
             is_known_safe_command(&resolved_command.safety_command),
@@ -622,6 +690,84 @@ impl ExecCommandHandler {
             .begin_attempt(&attempt_key, repair_notice.is_some())
             .await
             .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
+        let (validation_leader, validation_waiter) = if validation_launch.is_some() {
+            let environment =
+                crate::tools::handlers::shell::validation_environment_hash(&effective_environment);
+            let toolchain = crate::tools::handlers::shell::child_env_value(
+                &effective_environment,
+                "RUSTUP_TOOLCHAIN",
+            )
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+            let identity = validation_identity(
+                repository_key.as_bytes(),
+                cwd.to_string(),
+                &command_invocation,
+                environment,
+                toolchain,
+                observed_mutation_revision,
+            );
+            loop {
+                match register_if_absent(
+                    &turn.validation_singleflight,
+                    identity.clone(),
+                    &call_id,
+                    &cancellation_token,
+                )
+                .await
+                {
+                    ValidationRegistration::Leader { execution, waiter } => {
+                        break (Some(execution), Some(waiter));
+                    }
+                    ValidationRegistration::Follower(waiter) => {
+                        let shared_from_call_id = waiter.shared_from_call_id().to_string();
+                        let joined = tokio::select! {
+                            result = waiter.join() => result,
+                            _ = cancellation_token.cancelled() => {
+                                session
+                                    .services
+                                    .command_execution
+                                    .record_exit(&attempt_key, -1)
+                                    .await;
+                                return Err(FunctionCallError::RespondToModel(
+                                    "shared validation wait was cancelled".to_string(),
+                                ));
+                            }
+                        };
+                        if let Some(result) = joined {
+                            let exit_code = result
+                                .value
+                                .get("exit_code")
+                                .and_then(serde_json::Value::as_i64)
+                                .and_then(|code| i32::try_from(code).ok())
+                                .unwrap_or_else(|| {
+                                    if result.value.get("success")
+                                        == Some(&serde_json::Value::Bool(false))
+                                    {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                });
+                            session
+                                .services
+                                .command_execution
+                                .record_exit(&attempt_key, exit_code)
+                                .await;
+                            return Ok(boxed_tool_output(joined_validation_structured_output(
+                                result.value,
+                                &call_id,
+                                &shared_from_call_id,
+                            )));
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let validation_leader = Arc::new(StdMutex::new(validation_leader));
         let interception_started_at = std::time::Instant::now();
         let intercepted = intercept_apply_patch(
             &command,
@@ -736,6 +882,12 @@ impl ExecCommandHandler {
                     yield_time_ms,
                     max_output_tokens,
                     cwd,
+                    #[cfg(windows)]
+                    normalization_cwd: if turn_environment.environment.is_remote() {
+                        None
+                    } else {
+                        native_cwd.as_ref().map(|cwd| cwd.as_path().to_path_buf())
+                    },
                     sandbox_cwd: native_environment_cwd,
                     turn_environment: turn_environment.clone(),
                     shell_mode,
@@ -749,6 +901,10 @@ impl ExecCommandHandler {
                     prefix_rule,
                     workspace_mutation,
                     completion_activity: Some(completion_activity),
+                    validation_launch,
+                    validation_observation,
+                    validation_leader,
+                    validation_waiter,
                 },
                 process_id_reservation,
                 &context,
@@ -826,6 +982,9 @@ impl ExecCommandHandler {
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 Ok(boxed_tool_output(response))
             }
+            Err(UnifiedExecError::ValidationSkipped(skipped)) => Ok(boxed_tool_output(
+                validation_structured_output(serde_json::to_value(skipped).unwrap_or_default()),
+            )),
             Err(err) => {
                 let retry_failure = matches!(
                     &err,

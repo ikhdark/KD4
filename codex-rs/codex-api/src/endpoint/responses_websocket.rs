@@ -214,17 +214,28 @@ impl ResponsesWebsocketConnection {
         }
     }
 
+    pub async fn stream_request(
+        &self,
+        request: ResponsesWsRequest,
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+    ) -> Result<ResponseStream, ApiError> {
+        self.stream_request_with_dispatch_ready(request, connection_reused, turn_state, || {})
+            .await
+    }
+
     #[instrument(
         name = "responses_websocket.stream_request",
         level = "info",
         skip_all,
         fields(transport = "responses_websocket", api.path = "responses")
     )]
-    pub async fn stream_request(
+    pub async fn stream_request_with_dispatch_ready(
         &self,
         request: ResponsesWsRequest,
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
+        dispatch_ready: impl FnOnce(),
     ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
@@ -235,6 +246,7 @@ impl ResponsesWebsocketConnection {
         let server_model = self.server_model.clone();
         let telemetry = self.telemetry.clone();
         let request_text = serialize_websocket_request(&request)?;
+        dispatch_ready();
 
         let current_span = Span::current();
         tokio::spawn(
@@ -917,7 +929,8 @@ mod tests {
                 }],
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
-            }],
+            }]
+            .into(),
             tools: Some(vec![json!({
                 "type": "function",
                 "name": "lookup",

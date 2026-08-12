@@ -30,6 +30,7 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tracing::debug;
 use tracing::warn;
 
 const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 6;
@@ -94,10 +95,107 @@ pub(crate) struct TaskEvidenceLedger {
     document: Arc<Mutex<Option<TaskEvidenceDocument>>>,
     persistence_gate: Arc<Semaphore>,
     external_evidence_gate: Arc<Semaphore>,
+    freshness_gate: Arc<Semaphore>,
+    freshness_state: Arc<std::sync::Mutex<FreshnessState>>,
     last_persisted_revision: Arc<AtomicU64>,
     source_capture_failed: Arc<AtomicBool>,
     #[cfg(test)]
     persistence_test_control: Arc<std::sync::Mutex<Option<PersistenceTestControl>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedFileToken {
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    mtime: i64,
+    #[cfg(unix)]
+    mtime_nsec: i64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+    #[cfg(windows)]
+    volume_serial_number: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+    #[cfg(windows)]
+    file_attributes: u32,
+    #[cfg(windows)]
+    last_write_time: i64,
+    #[cfg(windows)]
+    change_time: i64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedStrongHash {
+    token: TrustedFileToken,
+    sha1: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FreshnessManifest {
+    state_signature: String,
+    evidence_epoch: u64,
+    requirements: Vec<GeneratedArtifactRequirement>,
+    tracked: BTreeMap<String, FileHashSnapshot>,
+    artifacts: BTreeMap<String, FileHashSnapshot>,
+    artifact_paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionProof {
+    manifest: FreshnessManifest,
+    tokens: BTreeMap<PathBuf, TrustedFileToken>,
+    all_reusable: bool,
+}
+
+#[derive(Debug)]
+struct FreshnessScanResult {
+    snapshots: BTreeMap<String, FileHashSnapshot>,
+    tokens: BTreeMap<PathBuf, TrustedFileToken>,
+    cache_updates: BTreeMap<PathBuf, CachedStrongHash>,
+    cache_removals: BTreeSet<PathBuf>,
+    all_reusable: bool,
+}
+
+#[derive(Debug)]
+struct FreshnessPathObservation {
+    snapshot: FileHashSnapshot,
+    token: Option<TrustedFileToken>,
+}
+
+#[derive(Debug, Default)]
+struct FreshnessState {
+    cache: BTreeMap<PathBuf, CachedStrongHash>,
+    completion_proof: Option<CompletionProof>,
+    diagnostics: FreshnessDiagnostics,
+    #[cfg(test)]
+    before_next_scan: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    #[cfg(test)]
+    force_untrusted_tokens: bool,
+    #[cfg(test)]
+    force_ambiguous_tokens: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FreshnessDiagnostics {
+    pub(crate) scan_invocations: u64,
+    pub(crate) files_strongly_hashed: u64,
+    pub(crate) bytes_strongly_hashed: u64,
+    pub(crate) strong_hashes_reused: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshnessPurpose {
+    Ordinary,
+    CompletionFresh,
+    CompletionRetry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +218,7 @@ enum PersistOutcome {
 struct PersistenceTestControl {
     before_next_write: Arc<std::sync::Mutex<Option<PersistenceWriteBarrierPair>>>,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    supersede_writes: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1286,6 +1385,8 @@ impl TaskEvidenceLedger {
             document: Arc::new(Mutex::new(Some(document.clone()))),
             persistence_gate: Arc::new(Semaphore::new(1)),
             external_evidence_gate: Arc::new(Semaphore::new(1)),
+            freshness_gate: Arc::new(Semaphore::new(1)),
+            freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
             last_persisted_revision: Arc::new(AtomicU64::new(0)),
             source_capture_failed: Arc::new(AtomicBool::new(source_capture_failed)),
             #[cfg(test)]
@@ -1369,6 +1470,8 @@ impl TaskEvidenceLedger {
             document: Arc::new(Mutex::new(None)),
             persistence_gate: Arc::new(Semaphore::new(1)),
             external_evidence_gate: Arc::new(Semaphore::new(1)),
+            freshness_gate: Arc::new(Semaphore::new(1)),
+            freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
             last_persisted_revision: Arc::new(AtomicU64::new(0)),
             source_capture_failed: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -1793,13 +1896,14 @@ impl TaskEvidenceLedger {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
-        let mut files = Vec::with_capacity(paths.len());
-        for path in paths {
-            let normalized = normalize_input_path(repo_root, Some(cwd), path);
+        let normalized_paths = paths
+            .iter()
+            .map(|path| normalize_input_path(repo_root, Some(cwd), path))
+            .collect::<BTreeSet<_>>();
+        let mut files = Vec::with_capacity(normalized_paths.len());
+        for normalized in normalized_paths {
             files.push(snapshot_file(repo_root, &normalized).await);
         }
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        files.dedup_by(|left, right| left.path == right.path);
         let evidence_call_id = provenance
             .map(|value| format!("{}:{call_id}", value.source_thread_id))
             .unwrap_or_else(|| call_id.to_string());
@@ -3816,11 +3920,30 @@ impl TaskEvidenceLedger {
         }
         let source_capture_failed = self.user_source_capture_failed();
         let mut latest_gate = None;
-        for _ in 0..8 {
-            self.refresh_external_file_freshness().await;
+        for persistence_retry in 0..8 {
+            let freshness_ready = self
+                .refresh_external_file_freshness_for(if persistence_retry == 0 {
+                    FreshnessPurpose::CompletionFresh
+                } else {
+                    FreshnessPurpose::CompletionRetry
+                })
+                .await;
+            if !freshness_ready {
+                continue;
+            }
+            let completion_proof_manifest = self.completion_proof_manifest();
+            let mut freshness_state_changed = false;
             let (gate, snapshot) = self
                 .update_document(|document| {
                     if !task_is_tracked(document) {
+                        return None;
+                    }
+                    let current_manifest = freshness_manifest(document);
+                    if (!current_manifest.tracked.is_empty()
+                        || !current_manifest.artifact_paths.is_empty())
+                        && completion_proof_manifest.as_ref() != Some(&current_manifest)
+                    {
+                        freshness_state_changed = true;
                         return None;
                     }
                     if self.evidence_path.is_some() {
@@ -3833,6 +3956,9 @@ impl TaskEvidenceLedger {
                     Some(gate)
                 })
                 .await?;
+            if freshness_state_changed {
+                continue;
+            }
             let gate = gate?;
             latest_gate = Some(gate.clone());
             match self.persist_document(&snapshot).await {
@@ -3910,53 +4036,115 @@ impl TaskEvidenceLedger {
     }
 
     async fn refresh_external_file_freshness(&self) {
+        let _ = self
+            .refresh_external_file_freshness_for(FreshnessPurpose::Ordinary)
+            .await;
+    }
+
+    async fn refresh_external_file_freshness_for(&self, purpose: FreshnessPurpose) -> bool {
+        for _ in 0..3 {
+            if self.refresh_external_file_freshness_once(purpose).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns false only when ledger state changed during the filesystem scan.
+    async fn refresh_external_file_freshness_once(&self, purpose: FreshnessPurpose) -> bool {
         if !self.allows_kd4_completion() {
-            return;
+            return true;
         }
-        let Some(repo_root) = self.repo_root.as_ref() else {
-            return;
-        };
-        let (expected, previous_artifacts, artifact_paths) = {
+        if self.repo_root.is_none() {
+            return true;
+        }
+        let manifest = {
             let guard = self.document.lock().await;
-            guard
-                .as_ref()
-                .map(|document| {
-                    (
-                        document.latest_file_hashes.clone(),
-                        document.latest_generated_artifact_hashes.clone(),
-                        document
-                            .generated_artifact_requirements
-                            .iter()
-                            .filter_map(|requirement| requirement.path.clone())
-                            .collect::<BTreeSet<_>>(),
-                    )
-                })
-                .unwrap_or_default()
+            guard.as_ref().map(freshness_manifest).unwrap_or_default()
         };
-        if expected.is_empty() && artifact_paths.is_empty() {
-            return;
+        if manifest.tracked.is_empty() && manifest.artifact_paths.is_empty() {
+            return true;
         }
+        let _freshness_permit = self
+            .freshness_gate
+            .acquire()
+            .await
+            .expect("freshness semaphore remains open");
+        let manifest_after_wait = {
+            let guard = self.document.lock().await;
+            guard.as_ref().map(freshness_manifest).unwrap_or_default()
+        };
+        if manifest_after_wait != manifest {
+            return false;
+        }
+        if purpose == FreshnessPurpose::CompletionRetry
+            && let Some(reused_hashes) = self.completion_proof_reuse_count(&manifest).await
+        {
+            let manifest_after_token_check = {
+                let guard = self.document.lock().await;
+                guard.as_ref().map(freshness_manifest).unwrap_or_default()
+            };
+            if manifest_after_token_check != manifest {
+                return false;
+            }
+            self.freshness_state
+                .lock()
+                .expect("freshness state mutex")
+                .diagnostics
+                .strong_hashes_reused += reused_hashes;
+            return true;
+        }
+        self.freshness_state
+            .lock()
+            .expect("freshness state mutex")
+            .diagnostics
+            .scan_invocations += 1;
+        let scan = self
+            .scan_freshness_manifest(&manifest, purpose == FreshnessPurpose::Ordinary)
+            .await;
+        let manifest_after_scan = {
+            let guard = self.document.lock().await;
+            guard.as_ref().map(freshness_manifest).unwrap_or_default()
+        };
+        if manifest_after_scan != manifest {
+            return false;
+        }
+        self.commit_freshness_cache(&scan);
+        let expected = manifest.tracked.clone();
+        let previous_artifacts = manifest.artifacts.clone();
         let mut changed = Vec::new();
         for (path, previous) in expected {
-            let current = snapshot_file(repo_root, &path).await;
+            let current = scan
+                .snapshots
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| previous.clone());
             if current != previous {
                 changed.push((previous, current));
             }
         }
         let mut current_artifacts = BTreeMap::new();
         let mut changed_artifacts = false;
-        for path in artifact_paths {
-            let current = snapshot_generated_artifact(repo_root, &path).await;
-            changed_artifacts |= previous_artifacts.get(&path) != Some(&current);
-            current_artifacts.insert(path, current);
+        for path in &manifest.artifact_paths {
+            let current = scan.snapshots.get(path).cloned().unwrap_or_else(|| {
+                rejected_generated_artifact_snapshot(path, "FreshnessScanUnavailable")
+            });
+            changed_artifacts |= previous_artifacts.get(path) != Some(&current);
+            current_artifacts.insert(path.clone(), current);
         }
         changed_artifacts |= previous_artifacts.len() != current_artifacts.len();
         if changed.is_empty() && !changed_artifacts {
-            return;
+            if purpose != FreshnessPurpose::Ordinary {
+                self.store_completion_proof(manifest, scan);
+            }
+            return true;
         }
 
-        let Some((_, snapshot)) = self
+        let Some((committed, snapshot)) = self
             .update_document(|document| {
+                if freshness_manifest(document) != manifest {
+                    return false;
+                }
                 let changed = changed
                     .into_iter()
                     .filter(|(previous, current)| {
@@ -3967,7 +4155,7 @@ impl TaskEvidenceLedger {
                 let artifact_state_is_current =
                     document.latest_generated_artifact_hashes == previous_artifacts;
                 if changed.is_empty() && (!changed_artifacts || !artifact_state_is_current) {
-                    return;
+                    return false;
                 }
                 let prior_artifact_state_exists = changed_artifacts
                     && !previous_artifacts.is_empty()
@@ -4010,12 +4198,324 @@ impl TaskEvidenceLedger {
                 }
                 document.updated_at = timestamp();
                 document.completion = None;
+                true
             })
             .await
         else {
-            return;
+            return true;
         };
+        if !committed {
+            return false;
+        }
+        if purpose == FreshnessPurpose::Ordinary {
+            self.freshness_state
+                .lock()
+                .expect("freshness state mutex")
+                .completion_proof = None;
+        } else {
+            self.store_completion_proof(freshness_manifest(&snapshot), scan);
+        }
         self.persist_document(&snapshot).await;
+        true
+    }
+
+    async fn scan_freshness_manifest(
+        &self,
+        manifest: &FreshnessManifest,
+        allow_cache_reuse: bool,
+    ) -> FreshnessScanResult {
+        let repo_root = self.repo_root.as_deref().expect("freshness has repo root");
+        let mut requests = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+        let mut snapshots = BTreeMap::new();
+        for path in manifest.tracked.keys() {
+            requests
+                .entry(lexical_absolute_path(repo_root, Path::new(path)))
+                .or_default()
+                .insert(path.clone());
+        }
+        for path in &manifest.artifact_paths {
+            match validated_generated_artifact_path(repo_root, path) {
+                Ok(absolute) => {
+                    requests.entry(absolute).or_default().insert(path.clone());
+                }
+                Err(snapshot) => {
+                    snapshots.insert(path.clone(), snapshot);
+                }
+            }
+        }
+
+        #[cfg(test)]
+        let before_scan = {
+            self.freshness_state
+                .lock()
+                .expect("freshness state mutex")
+                .before_next_scan
+                .take()
+        };
+        #[cfg(test)]
+        if let Some((started, release)) = before_scan {
+            started.wait().await;
+            release.wait().await;
+        }
+
+        let request_count = requests.len();
+        let mut tokens = BTreeMap::new();
+        let mut cache_updates = BTreeMap::new();
+        let mut cache_removals = BTreeSet::new();
+        for (absolute, associations) in requests {
+            let observation = self
+                .observe_freshness_file(&absolute, allow_cache_reuse)
+                .await;
+            if let (Some(token), Some(sha1)) = (
+                observation.token.as_ref(),
+                observation.snapshot.sha1.as_ref(),
+            ) {
+                tokens.insert(absolute.clone(), token.clone());
+                cache_updates.insert(
+                    absolute.clone(),
+                    CachedStrongHash {
+                        token: token.clone(),
+                        sha1: sha1.clone(),
+                    },
+                );
+            } else {
+                cache_removals.insert(absolute.clone());
+            }
+            for path in associations {
+                let mut snapshot = observation.snapshot.clone();
+                snapshot.path = normalize_slashes(&path);
+                snapshots.insert(path, snapshot);
+            }
+        }
+        let all_reusable = tokens.len() == request_count;
+        FreshnessScanResult {
+            snapshots,
+            tokens,
+            cache_updates,
+            cache_removals,
+            all_reusable,
+        }
+    }
+
+    fn commit_freshness_cache(&self, scan: &FreshnessScanResult) {
+        let mut state = self.freshness_state.lock().expect("freshness state mutex");
+        for path in &scan.cache_removals {
+            state.cache.remove(path);
+        }
+        state.cache.extend(scan.cache_updates.clone());
+        debug!(
+            freshness_scan_invocations = state.diagnostics.scan_invocations,
+            freshness_files_strongly_hashed = state.diagnostics.files_strongly_hashed,
+            freshness_bytes_strongly_hashed = state.diagnostics.bytes_strongly_hashed,
+            freshness_strong_hashes_reused = state.diagnostics.strong_hashes_reused,
+            "task-evidence freshness diagnostics"
+        );
+    }
+
+    async fn observe_freshness_file(
+        &self,
+        absolute: &Path,
+        allow_cache_reuse: bool,
+    ) -> FreshnessPathObservation {
+        let display_path = normalize_slashes(&absolute.to_string_lossy());
+        let mut file = match tokio::fs::File::open(absolute).await {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return FreshnessPathObservation {
+                    snapshot: FileHashSnapshot {
+                        path: display_path,
+                        sha1: None,
+                        exists: false,
+                        read_error: None,
+                    },
+                    token: None,
+                };
+            }
+            Err(err) => {
+                return FreshnessPathObservation {
+                    snapshot: FileHashSnapshot {
+                        path: display_path,
+                        sha1: None,
+                        exists: tokio::fs::symlink_metadata(absolute).await.is_ok(),
+                        read_error: Some(format!("{:?}", err.kind())),
+                    },
+                    token: None,
+                };
+            }
+        };
+        #[cfg(test)]
+        let (force_untrusted_tokens, force_ambiguous_tokens) = {
+            let state = self.freshness_state.lock().expect("freshness state mutex");
+            (state.force_untrusted_tokens, state.force_ambiguous_tokens)
+        };
+        #[cfg(not(test))]
+        let force_untrusted_tokens = false;
+        let token_before = if force_untrusted_tokens {
+            None
+        } else {
+            trusted_file_token(&file).await
+        };
+        if allow_cache_reuse
+            && let Some(token) = token_before.as_ref()
+            && let Some(cached) = self
+                .freshness_state
+                .lock()
+                .expect("freshness state mutex")
+                .cache
+                .get(absolute)
+                .cloned()
+            && cached.token == *token
+        {
+            self.freshness_state
+                .lock()
+                .expect("freshness state mutex")
+                .diagnostics
+                .strong_hashes_reused += 1;
+            return FreshnessPathObservation {
+                snapshot: FileHashSnapshot {
+                    path: display_path,
+                    sha1: Some(cached.sha1),
+                    exists: true,
+                    read_error: None,
+                },
+                token: Some(token.clone()),
+            };
+        }
+
+        let mut hasher = Sha1::new();
+        let mut buffer = vec![0_u8; FILE_HASH_CHUNK_SIZE];
+        let mut bytes_hashed = 0_u64;
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    hasher.update(&buffer[..bytes_read]);
+                    bytes_hashed += bytes_read as u64;
+                }
+                Err(err) => {
+                    return FreshnessPathObservation {
+                        snapshot: FileHashSnapshot {
+                            path: display_path,
+                            sha1: None,
+                            exists: true,
+                            read_error: Some(format!("{:?}", err.kind())),
+                        },
+                        token: None,
+                    };
+                }
+            }
+        }
+        {
+            let mut state = self.freshness_state.lock().expect("freshness state mutex");
+            state.diagnostics.files_strongly_hashed += 1;
+            state.diagnostics.bytes_strongly_hashed += bytes_hashed;
+        }
+        let sha1 = format!("{:x}", hasher.finalize());
+        let token_after = if force_untrusted_tokens {
+            None
+        } else {
+            trusted_file_token(&file).await
+        };
+        #[cfg(test)]
+        let token_after = if force_ambiguous_tokens {
+            token_after.map(|mut token| {
+                token.len = token.len.wrapping_add(1);
+                token
+            })
+        } else {
+            token_after
+        };
+        let stable_token = token_before.filter(|before| token_after.as_ref() == Some(before));
+        FreshnessPathObservation {
+            snapshot: FileHashSnapshot {
+                path: display_path,
+                sha1: Some(sha1),
+                exists: true,
+                read_error: None,
+            },
+            token: stable_token,
+        }
+    }
+
+    async fn completion_proof_reuse_count(&self, manifest: &FreshnessManifest) -> Option<u64> {
+        let proof = self
+            .freshness_state
+            .lock()
+            .expect("freshness state mutex")
+            .completion_proof
+            .clone();
+        let Some(proof) = proof else {
+            return None;
+        };
+        if !proof.all_reusable || proof.manifest != *manifest {
+            return None;
+        }
+        for (path, expected) in &proof.tokens {
+            let Ok(file) = tokio::fs::File::open(path).await else {
+                return None;
+            };
+            if trusted_file_token(&file).await.as_ref() != Some(expected) {
+                return None;
+            }
+        }
+        Some(proof.tokens.len() as u64)
+    }
+
+    fn completion_proof_manifest(&self) -> Option<FreshnessManifest> {
+        self.freshness_state
+            .lock()
+            .expect("freshness state mutex")
+            .completion_proof
+            .as_ref()
+            .map(|proof| proof.manifest.clone())
+    }
+
+    fn store_completion_proof(&self, manifest: FreshnessManifest, scan: FreshnessScanResult) {
+        self.freshness_state
+            .lock()
+            .expect("freshness state mutex")
+            .completion_proof = Some(CompletionProof {
+            manifest,
+            tokens: scan.tokens,
+            all_reusable: scan.all_reusable,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn freshness_diagnostics(&self) -> FreshnessDiagnostics {
+        self.freshness_state
+            .lock()
+            .expect("freshness state mutex")
+            .diagnostics
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_freshness_scan_barrier(
+        &self,
+    ) -> (Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>) {
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        self.freshness_state
+            .lock()
+            .expect("freshness state mutex")
+            .before_next_scan = Some((Arc::clone(&started), Arc::clone(&release)));
+        (started, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_force_untrusted_freshness_tokens(&self, force: bool) {
+        self.freshness_state
+            .lock()
+            .expect("freshness state mutex")
+            .force_untrusted_tokens = force;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_force_ambiguous_freshness_tokens(&self, force: bool) {
+        self.freshness_state
+            .lock()
+            .expect("freshness state mutex")
+            .force_ambiguous_tokens = force;
     }
 
     pub(crate) async fn reconcile_default_child_workspace_events(
@@ -6123,7 +6623,15 @@ async fn persist_document_with_permit(
             release.wait();
         }
         let last_revision = last_persisted_revision.load(Ordering::Acquire);
-        let outcome = if last_revision > document.revision {
+        let force_superseded = test_control.as_ref().is_some_and(|control| {
+            control
+                .supersede_writes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        });
+        let outcome = if force_superseded || last_revision > document.revision {
             PersistOutcome::Superseded
         } else if last_revision == document.revision && last_revision != 0 {
             PersistOutcome::Persisted
@@ -8569,17 +9077,108 @@ fn upsert_risk(document: &mut TaskEvidenceDocument, risk: EvidenceRisk) {
 }
 
 fn normalize_input_path(repo_root: &Path, cwd: Option<&Path>, path: &Path) -> String {
-    let absolute = if path.is_absolute() {
+    let absolute = lexical_clean_path(if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.unwrap_or(repo_root).join(path)
-    };
+    });
+    let repo_root = lexical_clean_path(repo_root.to_path_buf());
     absolute
-        .strip_prefix(repo_root)
+        .strip_prefix(&repo_root)
         .map(Path::to_path_buf)
         .unwrap_or(absolute)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn lexical_absolute_path(repo_root: &Path, path: &Path) -> PathBuf {
+    lexical_clean_path(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    })
+}
+
+fn lexical_clean_path(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !cleaned.pop() {
+                    cleaned.push(component.as_os_str());
+                }
+            }
+            _ => cleaned.push(component.as_os_str()),
+        }
+    }
+    cleaned
+}
+
+fn freshness_manifest(document: &TaskEvidenceDocument) -> FreshnessManifest {
+    FreshnessManifest {
+        state_signature: completion_freshness_state_signature(document),
+        evidence_epoch: document.evidence_epoch,
+        requirements: document.generated_artifact_requirements.clone(),
+        tracked: document.latest_file_hashes.clone(),
+        artifacts: document.latest_generated_artifact_hashes.clone(),
+        artifact_paths: document
+            .generated_artifact_requirements
+            .iter()
+            .filter_map(|requirement| requirement.path.clone())
+            .map(|path| normalize_slashes(&path))
+            .collect(),
+    }
+}
+
+fn completion_freshness_state_signature(document: &TaskEvidenceDocument) -> String {
+    let mut state = document.clone();
+    state.revision = 0;
+    state.updated_at.clear();
+    state.completion = None;
+    state
+        .risks
+        .retain(|risk| risk.id != "task-evidence-storage-failure");
+    let value = serde_json::to_value(state)
+        .unwrap_or_else(|_| unreachable!("task evidence state must serialize"));
+    canonical_hash("KD4_FRESHNESS_PROOF_STATE_V1", &value)
+}
+
+fn validated_generated_artifact_path(
+    repo_root: &Path,
+    normalized: &str,
+) -> Result<PathBuf, FileHashSnapshot> {
+    let normalized = normalize_slashes(normalized);
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
+        return Err(rejected_generated_artifact_snapshot(
+            &normalized,
+            "AbsoluteArtifactPath",
+        ));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(rejected_generated_artifact_snapshot(
+            &normalized,
+            "PathTraversalOutsideRepository",
+        ));
+    }
+    let absolute = lexical_absolute_path(repo_root, path);
+    if !generated_artifact_path_is_contained(repo_root, &absolute) {
+        return Err(rejected_generated_artifact_snapshot(
+            &normalized,
+            "OutsideRepository",
+        ));
+    }
+    Ok(absolute)
 }
 
 fn normalize_slashes(path: &str) -> String {
@@ -8615,29 +9214,6 @@ async fn snapshot_file(repo_root: &Path, normalized: &str) -> FileHashSnapshot {
     }
 }
 
-async fn snapshot_generated_artifact(repo_root: &Path, normalized: &str) -> FileHashSnapshot {
-    let normalized = normalize_slashes(normalized);
-    let path = Path::new(&normalized);
-    if path.is_absolute() {
-        return rejected_generated_artifact_snapshot(&normalized, "AbsoluteArtifactPath");
-    }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    }) {
-        return rejected_generated_artifact_snapshot(&normalized, "PathTraversalOutsideRepository");
-    }
-    let absolute = repo_root.join(path);
-    if !generated_artifact_path_is_contained(repo_root, &absolute) {
-        return rejected_generated_artifact_snapshot(&normalized, "OutsideRepository");
-    }
-    snapshot_file(repo_root, &normalized).await
-}
-
 fn generated_artifact_path_is_contained(repo_root: &Path, candidate: &Path) -> bool {
     let Ok(canonical_repo_root) = dunce::canonicalize(repo_root) else {
         return false;
@@ -8668,6 +9244,101 @@ fn rejected_generated_artifact_snapshot(normalized: &str, reason: &str) -> FileH
         exists: false,
         read_error: Some(reason.to_string()),
     }
+}
+
+async fn trusted_file_token(file: &tokio::fs::File) -> Option<TrustedFileToken> {
+    let metadata = file.metadata().await.ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    trusted_file_token_from_handle(file, &metadata)
+}
+
+#[cfg(unix)]
+fn trusted_file_token_from_handle(
+    _file: &tokio::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Option<TrustedFileToken> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(TrustedFileToken {
+        len: metadata.len(),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(windows)]
+fn trusted_file_token_from_handle(
+    file: &tokio::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Option<TrustedFileToken> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO;
+    use windows_sys::Win32::Storage::FileSystem::FileBasicInfo;
+    use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut id = MaybeUninit::<FILE_ID_INFO>::uninit();
+    // SAFETY: `file` owns a valid handle and `id` is correctly sized writable storage.
+    let id_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            id.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if id_ok == 0 {
+        return None;
+    }
+    let mut basic = MaybeUninit::<FILE_BASIC_INFO>::uninit();
+    // SAFETY: `file` owns a valid handle and `basic` is correctly sized writable storage.
+    let basic_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            basic.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if basic_ok == 0 {
+        return None;
+    }
+    // SAFETY: successful calls initialized both complete structures.
+    let id = unsafe { id.assume_init() };
+    let basic = unsafe { basic.assume_init() };
+    if id.FileId.Identifier.iter().all(|byte| *byte == 0)
+        || basic.LastWriteTime == 0
+        || basic.ChangeTime == 0
+    {
+        return None;
+    }
+    Some(TrustedFileToken {
+        len: metadata.len(),
+        volume_serial_number: id.VolumeSerialNumber,
+        file_id: id.FileId.Identifier,
+        file_attributes: basic.FileAttributes,
+        last_write_time: basic.LastWriteTime,
+        change_time: basic.ChangeTime,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn trusted_file_token_from_handle(
+    _file: &tokio::fs::File,
+    _metadata: &std::fs::Metadata,
+) -> Option<TrustedFileToken> {
+    None
 }
 
 async fn sha1_file(path: &Path) -> io::Result<String> {

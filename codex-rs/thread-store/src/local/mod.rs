@@ -12,6 +12,7 @@ mod update_thread_metadata;
 #[cfg(test)]
 mod test_support;
 
+use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutRecorder;
@@ -244,6 +245,17 @@ impl ThreadStore for LocalThreadStore {
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { live_writer::create_thread(self, params).await })
+    }
+
+    fn create_thread_with_repository_context(
+        &self,
+        params: CreateThreadParams,
+        repository_context: Option<RepositoryContext>,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            live_writer::create_thread_with_repository_context(self, params, repository_context)
+                .await
+        })
     }
 
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {

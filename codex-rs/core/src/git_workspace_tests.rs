@@ -129,7 +129,41 @@ async fn root_snapshot_invalidates_git_marker_creation_and_removal() {
 }
 
 #[tokio::test]
-async fn stable_metadata_dependencies_refresh_head_and_remotes_but_dirty_is_always_fresh() {
+async fn stable_metadata_dependencies_refresh_head_but_dirty_is_always_fresh() {
+    let (_temp_dir, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let source = GitWorkspaceMetadataSource {
+        cwd: repo.clone(),
+        repo_root: repo.clone(),
+        cache,
+    };
+
+    let first = source.metadata().await;
+    assert_eq!(first.has_changes, Some(false));
+    let first_head = first.latest_git_commit_hash.expect("initial head");
+
+    std::fs::write(repo.join("dirty.txt"), "dirty\n").expect("write dirty file");
+    assert_eq!(source.metadata().await.has_changes, Some(true));
+    std::fs::remove_file(repo.join("dirty.txt")).expect("remove dirty file");
+    assert_eq!(source.metadata().await.has_changes, Some(false));
+
+    run_git(repo.as_path(), &["checkout", "-q", "-b", "next"]).await;
+    run_git(
+        repo.as_path(),
+        &["commit", "--allow-empty", "-q", "-m", "next"],
+    )
+    .await;
+
+    let changed = source.metadata().await;
+    assert_ne!(
+        changed.latest_git_commit_hash.as_deref(),
+        Some(first_head.as_str())
+    );
+    assert_eq!(changed.has_changes, Some(false));
+}
+
+#[tokio::test]
+async fn stable_metadata_dependencies_refresh_remotes() {
     let (_temp_dir, repo) = create_clean_git_repo().await;
     run_git(
         repo.as_path(),
@@ -144,7 +178,6 @@ async fn stable_metadata_dependencies_refresh_head_and_remotes_but_dirty_is_alwa
     };
 
     let first = source.metadata().await;
-    assert_eq!(first.has_changes, Some(false));
     assert_eq!(
         first
             .associated_remote_urls
@@ -153,19 +186,7 @@ async fn stable_metadata_dependencies_refresh_head_and_remotes_but_dirty_is_alwa
             .map(String::as_str),
         Some("https://example.com/old.git")
     );
-    let first_head = first.latest_git_commit_hash.expect("initial head");
 
-    std::fs::write(repo.join("dirty.txt"), "dirty\n").expect("write dirty file");
-    assert_eq!(source.metadata().await.has_changes, Some(true));
-    std::fs::remove_file(repo.join("dirty.txt")).expect("remove dirty file");
-    assert_eq!(source.metadata().await.has_changes, Some(false));
-
-    run_git(repo.as_path(), &["checkout", "-q", "-b", "next"]).await;
-    run_git(
-        repo.as_path(),
-        &["commit", "--allow-empty", "-q", "-m", "next"],
-    )
-    .await;
     run_git(
         repo.as_path(),
         &["remote", "set-url", "origin", "https://example.com/new.git"],
@@ -173,10 +194,6 @@ async fn stable_metadata_dependencies_refresh_head_and_remotes_but_dirty_is_alwa
     .await;
 
     let changed = source.metadata().await;
-    assert_ne!(
-        changed.latest_git_commit_hash.as_deref(),
-        Some(first_head.as_str())
-    );
     assert_eq!(
         changed
             .associated_remote_urls
@@ -185,7 +202,85 @@ async fn stable_metadata_dependencies_refresh_head_and_remotes_but_dirty_is_alwa
             .map(String::as_str),
         Some("https://example.com/new.git")
     );
-    assert_eq!(changed.has_changes, Some(false));
+}
+
+#[tokio::test]
+async fn namespace_dependencies_refresh_head_and_root_history() {
+    let (_temp_dir, repo) = create_clean_git_repo().await;
+    let source = GitWorkspaceMetadataSource {
+        cwd: repo.clone(),
+        repo_root: repo.clone(),
+        cache: GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop()))),
+    };
+    let namespace_before = source.project_namespace().await.expect("namespace");
+    let dependencies_before = StableMetadataDependencies::capture_project_namespace(&source)
+        .expect("namespace dependencies");
+
+    run_git(
+        repo.as_path(),
+        &["commit", "--allow-empty", "-q", "-m", "next"],
+    )
+    .await;
+
+    let dependencies_after = StableMetadataDependencies::capture_project_namespace(&source)
+        .expect("namespace dependencies");
+    assert_ne!(dependencies_before, dependencies_after);
+    assert_eq!(
+        source.project_namespace().await,
+        Some(namespace_before.clone())
+    );
+
+    run_git(
+        repo.as_path(),
+        &["checkout", "-q", "--orphan", "unrelated-root"],
+    )
+    .await;
+    run_git(
+        repo.as_path(),
+        &["commit", "--allow-empty", "-q", "-m", "unrelated root"],
+    )
+    .await;
+
+    let unrelated_namespace = source.project_namespace().await.expect("namespace");
+    assert_ne!(namespace_before, unrelated_namespace);
+}
+
+#[tokio::test]
+async fn watcher_generation_rejects_stable_identity_caches() {
+    let (_temp_dir, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let source = GitWorkspaceMetadataSource {
+        cwd: repo.clone(),
+        repo_root: repo.clone(),
+        cache: Arc::clone(&cache),
+    };
+    let expected_metadata = source.metadata().await;
+    let expected_namespace = source.project_namespace().await.expect("namespace");
+
+    {
+        let mut state = cache.state.lock().await;
+        state
+            .metadata
+            .get_mut(repo.as_path())
+            .expect("metadata cache entry")
+            .metadata = StableGitMetadata::default();
+        state
+            .project_namespaces
+            .get_mut(repo.as_path())
+            .expect("namespace cache entry")
+            .namespace = "stale-namespace".to_string();
+    }
+    cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
+
+    assert_eq!(
+        source.metadata().await,
+        GitWorkspaceMetadata {
+            associated_remote_urls: expected_metadata.associated_remote_urls,
+            latest_git_commit_hash: expected_metadata.latest_git_commit_hash,
+            has_changes: Some(false),
+        }
+    );
+    assert_eq!(source.project_namespace().await, Some(expected_namespace));
 }
 
 #[test]
@@ -213,5 +308,6 @@ async fn watcher_failure_clears_and_disables_cached_identity() {
     let state = cache.state.lock().await;
     assert!(state.root.is_none());
     assert!(state.metadata.is_empty());
+    assert!(state.project_namespaces.is_empty());
     assert!(!cache.watcher_reliable.load(Ordering::Acquire));
 }

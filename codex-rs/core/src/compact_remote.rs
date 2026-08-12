@@ -193,6 +193,7 @@ async fn run_remote_compact_task_inner_impl(
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
+    turn_context.turn_timing_state.begin_compaction_generation();
     let context_compaction_item = ContextCompactionItem::new();
     let compaction_id = context_compaction_item.id.clone();
     // Use the UI compaction item ID as the trace compaction ID so protocol lifecycle events,
@@ -232,6 +233,7 @@ async fn run_remote_compact_task_inner_impl(
                     fallback_turn_context.model_info.slug.as_str(),
                     fallback_turn_context.provider.info().name.as_str(),
                 );
+            turn_context.turn_timing_state.record_model_fallback();
             let fallback_result = run_remote_compact_attempt(
                 sess,
                 fallback_step_context,
@@ -241,7 +243,6 @@ async fn run_remote_compact_task_inner_impl(
                 analytics_details,
             )
             .await;
-            turn_context.turn_timing_state.record_model_fallback();
             record_model_fallback(
                 &sess.services.session_telemetry,
                 turn_context.model_info.slug.as_str(),

@@ -1484,7 +1484,8 @@ async fn classify_bug_report(
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
-    }];
+    }]
+    .into();
     prompt.base_instructions.text = BUG_CLASSIFIER_INSTRUCTIONS.to_string();
     prompt.output_schema = Some(bug_classifier_schema());
 

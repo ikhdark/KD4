@@ -25,7 +25,33 @@ use crate::tools::context::ToolPayload;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::turn_diff_tracker::TurnDiffTracker;
+
+#[tokio::test(start_paused = true)]
+async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boundaries() {
+    let accepted_at = tokio::time::Instant::now();
+    let timing = ToolDispatchTiming::new(accepted_at, /*eager*/ true);
+
+    tokio::time::advance(std::time::Duration::from_millis(20)).await;
+    timing.mark_first_poll();
+    tokio::time::advance(std::time::Duration::from_millis(30)).await;
+    timing.mark_parallel_gate_admitted();
+    timing.record_authorization_state_coordination(std::time::Duration::from_millis(17));
+    tokio::time::advance(std::time::Duration::from_millis(40)).await;
+    timing.mark_handler_entry();
+    tokio::time::advance(std::time::Duration::from_millis(10)).await;
+
+    let snapshot = timing.snapshot(tokio::time::Instant::now());
+    assert!(snapshot.eager);
+    assert_eq!(snapshot.item_to_first_poll_ms, Some(20));
+    assert_eq!(snapshot.parallel_gate_wait_ms, Some(30));
+    assert_eq!(snapshot.authorization_state_coordination_ms, Some(17));
+    assert_eq!(snapshot.first_poll_to_handler_entry_ms, Some(70));
+    // Compatibility fields keep their prior boundaries.
+    assert_eq!(snapshot.handler_duration_ms, Some(50));
+    assert_eq!(snapshot.total_duration_ms, Some(80));
+}
 
 struct TestHandler {
     tool_name: codex_tools::ToolName,

@@ -2683,6 +2683,285 @@ async fn snapshot_file_hashes_across_multiple_bounded_chunks() {
     assert_eq!(snapshot.read_error, None);
 }
 
+async fn install_tracked_freshness_file(
+    ledger: &TaskEvidenceLedger,
+    repo: &Path,
+    path: &str,
+    bytes: &[u8],
+) -> TrustedFileToken {
+    let absolute = repo.join(path);
+    if let Some(parent) = absolute.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .expect("tracked file parent");
+    }
+    tokio::fs::write(&absolute, bytes)
+        .await
+        .expect("tracked freshness file");
+    let snapshot = snapshot_file(repo, path).await;
+    ledger
+        .document
+        .lock()
+        .await
+        .as_mut()
+        .expect("document")
+        .latest_file_hashes
+        .insert(path.to_string(), snapshot);
+    let file = tokio::fs::File::open(absolute)
+        .await
+        .expect("open tracked freshness file");
+    trusted_file_token(&file)
+        .await
+        .expect("test filesystem exposes a trusted freshness token")
+}
+
+#[tokio::test]
+async fn ordinary_freshness_refresh_reuses_unchanged_strong_hashes() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let bytes = b"unchanged freshness\n";
+    install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", bytes).await;
+
+    for _ in 0..3 {
+        ledger.refresh_external_file_freshness().await;
+    }
+
+    assert_eq!(
+        ledger.freshness_diagnostics(),
+        FreshnessDiagnostics {
+            scan_invocations: 3,
+            files_strongly_hashed: 1,
+            bytes_strongly_hashed: bytes.len() as u64,
+            strong_hashes_reused: 2,
+        }
+    );
+}
+
+#[tokio::test]
+async fn trusted_token_change_forces_ordinary_strong_rehash() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let before = install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", b"one").await;
+    ledger.refresh_external_file_freshness().await;
+
+    tokio::fs::write(repo.join("src/fresh.txt"), b"two-with-a-different-length")
+        .await
+        .expect("mutate tracked file");
+    let file = tokio::fs::File::open(repo.join("src/fresh.txt"))
+        .await
+        .expect("open mutated file");
+    let after = trusted_file_token(&file)
+        .await
+        .expect("trusted token after mutation");
+    assert_ne!(
+        before, after,
+        "the content mutation must alter the trusted token"
+    );
+
+    ledger.refresh_external_file_freshness().await;
+
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 2);
+    assert_eq!(diagnostics.files_strongly_hashed, 2);
+    assert_eq!(diagnostics.strong_hashes_reused, 0);
+}
+
+#[tokio::test]
+async fn unavailable_trusted_tokens_remain_strong_hash_only() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let bytes = b"fail closed\n";
+    install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", bytes).await;
+    ledger.set_force_untrusted_freshness_tokens(true);
+
+    for _ in 0..3 {
+        ledger.refresh_external_file_freshness().await;
+    }
+
+    assert_eq!(
+        ledger.freshness_diagnostics(),
+        FreshnessDiagnostics {
+            scan_invocations: 3,
+            files_strongly_hashed: 3,
+            bytes_strongly_hashed: 3 * bytes.len() as u64,
+            strong_hashes_reused: 0,
+        }
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_trusted_tokens_remain_strong_hash_only() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let bytes = b"unstable identity\n";
+    install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", bytes).await;
+    ledger.set_force_ambiguous_freshness_tokens(true);
+
+    for _ in 0..3 {
+        ledger.refresh_external_file_freshness().await;
+    }
+
+    assert_eq!(
+        ledger.freshness_diagnostics(),
+        FreshnessDiagnostics {
+            scan_invocations: 3,
+            files_strongly_hashed: 3,
+            bytes_strongly_hashed: 3 * bytes.len() as u64,
+            strong_hashes_reused: 0,
+        }
+    );
+}
+
+#[tokio::test]
+async fn tracked_and_artifact_lexical_aliases_hash_once_and_keep_associations() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let tracked_path = "target/out.txt";
+    let artifact_path = "target/./out.txt";
+    install_tracked_freshness_file(&ledger, &repo, tracked_path, b"shared output\n").await;
+    let artifact_snapshot = snapshot_file(&repo, artifact_path).await;
+    {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        document
+            .generated_artifact_requirements
+            .push(GeneratedArtifactRequirement {
+                id: "artifact".to_string(),
+                step_id: None,
+                path: Some(artifact_path.to_string()),
+            });
+        document
+            .latest_generated_artifact_hashes
+            .insert(artifact_path.to_string(), artifact_snapshot);
+    }
+
+    ledger.refresh_external_file_freshness().await;
+
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 1);
+    assert_eq!(diagnostics.files_strongly_hashed, 1);
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert!(document.latest_file_hashes.contains_key(tracked_path));
+    assert!(
+        document
+            .latest_generated_artifact_hashes
+            .contains_key(artifact_path)
+    );
+}
+
+#[tokio::test]
+async fn completion_proof_cycle_starts_with_fresh_hash_then_reuses_retry_proof() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", b"proof\n").await;
+
+    ledger.refresh_external_file_freshness().await;
+    ledger
+        .refresh_external_file_freshness_for(FreshnessPurpose::CompletionFresh)
+        .await;
+    ledger
+        .refresh_external_file_freshness_for(FreshnessPurpose::CompletionRetry)
+        .await;
+    ledger
+        .refresh_external_file_freshness_for(FreshnessPurpose::CompletionRetry)
+        .await;
+
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 2);
+    assert_eq!(diagnostics.files_strongly_hashed, 2);
+    assert_eq!(diagnostics.strong_hashes_reused, 2);
+}
+
+#[tokio::test]
+async fn requirement_manifest_change_starts_a_new_completion_proof_scan() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", b"tracked\n").await;
+    tokio::fs::write(repo.join("artifact.txt"), b"artifact\n")
+        .await
+        .expect("artifact");
+    ledger
+        .refresh_external_file_freshness_for(FreshnessPurpose::CompletionFresh)
+        .await;
+    let artifact_snapshot = snapshot_file(&repo, "artifact.txt").await;
+    {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        document
+            .generated_artifact_requirements
+            .push(GeneratedArtifactRequirement {
+                id: "artifact".to_string(),
+                step_id: None,
+                path: Some("artifact.txt".to_string()),
+            });
+        document
+            .latest_generated_artifact_hashes
+            .insert("artifact.txt".to_string(), artifact_snapshot);
+    }
+
+    ledger
+        .refresh_external_file_freshness_for(FreshnessPurpose::CompletionRetry)
+        .await;
+
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 2);
+    assert_eq!(diagnostics.files_strongly_hashed, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_evidence_change_discards_scan_candidate_and_retries() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", b"candidate\n").await;
+    let ledger = Arc::new(ledger);
+    let (started, release) = ledger.install_freshness_scan_barrier();
+    let refresh_ledger = Arc::clone(&ledger);
+    let refresh = tokio::spawn(async move {
+        refresh_ledger.refresh_external_file_freshness().await;
+    });
+
+    started.wait().await;
+    {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        document.host_mutation_revision = document.host_mutation_revision.saturating_add(1);
+        document.revision = document.revision.saturating_add(1);
+    }
+    release.wait().await;
+    refresh.await.expect("freshness refresh");
+
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 2);
+    assert_eq!(diagnostics.files_strongly_hashed, 2);
+    assert_eq!(diagnostics.strong_hashes_reused, 0);
+}
+
+#[tokio::test]
+async fn exact_patch_lexical_aliases_are_deduplicated_before_snapshots() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("src/nested"))
+        .await
+        .expect("source tree");
+    tokio::fs::write(repo.join("src/file.rs"), "fn main() {}\n")
+        .await
+        .expect("source file");
+
+    ledger
+        .record_edit_intent(
+            "patch",
+            &repo,
+            &[
+                PathBuf::from("src/file.rs"),
+                PathBuf::from("src/./file.rs"),
+                PathBuf::from("src/nested/../file.rs"),
+            ],
+        )
+        .await;
+
+    let guard = ledger.document.lock().await;
+    let intent = guard
+        .as_ref()
+        .expect("document")
+        .edit_intents
+        .last()
+        .expect("edit intent");
+    assert_eq!(intent.files.len(), 1);
+    assert_eq!(intent.files[0].path, "src/file.rs");
+}
+
 #[tokio::test]
 async fn older_persistence_snapshot_is_reported_as_superseded() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
@@ -2723,8 +3002,32 @@ fn install_persistence_test_control(
             Arc::clone(&release),
         )))),
         fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(fail_writes)),
+        supersede_writes: Arc::new(AtomicU64::new(0)),
     });
     (started, release)
+}
+
+fn set_persistence_test_superseded_writes(ledger: &TaskEvidenceLedger, count: u64) {
+    let guard = ledger
+        .persistence_test_control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .as_ref()
+        .expect("persistence test control")
+        .supersede_writes
+        .store(count, Ordering::Release);
+}
+
+fn install_persistence_supersede_control(ledger: &TaskEvidenceLedger, count: u64) {
+    *ledger
+        .persistence_test_control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PersistenceTestControl {
+        before_next_write: Arc::new(std::sync::Mutex::new(None)),
+        fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        supersede_writes: Arc::new(AtomicU64::new(count)),
+    });
 }
 
 fn set_persistence_test_failure(ledger: &TaskEvidenceLedger, fail_writes: bool) {
@@ -2743,6 +3046,95 @@ async fn wait_persistence_barrier(barrier: Arc<std::sync::Barrier>) {
     tokio::task::spawn_blocking(move || barrier.wait())
         .await
         .expect("persistence barrier");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_persistence_retries_reuse_one_completion_proof_scan() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    install_tracked_freshness_file(&ledger, &repo, "tracked.txt", b"unchanged\n").await;
+    install_persistence_supersede_control(&ledger, 2);
+
+    let gate = ledger.completion_gate().await.expect("completion gate");
+
+    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 1);
+    assert_eq!(diagnostics.files_strongly_hashed, 1);
+    assert_eq!(diagnostics.strong_hashes_reused, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_token_change_between_persistence_retries_starts_new_proof() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    let token_before =
+        install_tracked_freshness_file(&ledger, &repo, "tracked.txt", b"before\n").await;
+    let ledger = Arc::new(ledger);
+    let (started, release) = install_persistence_test_control(&ledger, false);
+    set_persistence_test_superseded_writes(&ledger, 1);
+
+    let completion_ledger = Arc::clone(&ledger);
+    let completion = tokio::spawn(async move { completion_ledger.completion_gate().await });
+    wait_persistence_barrier(started).await;
+    tokio::fs::write(repo.join("tracked.txt"), b"after with a different length\n")
+        .await
+        .expect("mutate tracked file");
+    let file = tokio::fs::File::open(repo.join("tracked.txt"))
+        .await
+        .expect("reopen tracked file");
+    let token_after = trusted_file_token(&file)
+        .await
+        .expect("trusted token after mutation");
+    assert_ne!(token_before, token_after);
+    wait_persistence_barrier(release).await;
+
+    let gate = completion
+        .await
+        .expect("completion task")
+        .expect("completion gate");
+    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 2);
+    assert_eq!(diagnostics.files_strongly_hashed, 2);
+    assert_eq!(diagnostics.strong_hashes_reused, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evidence_change_between_persistence_retries_starts_new_proof() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    install_tracked_freshness_file(&ledger, &repo, "tracked.txt", b"unchanged\n").await;
+    let ledger = Arc::new(ledger);
+    let (started, release) = install_persistence_test_control(&ledger, false);
+    set_persistence_test_superseded_writes(&ledger, 1);
+
+    let completion_ledger = Arc::clone(&ledger);
+    let completion = tokio::spawn(async move { completion_ledger.completion_gate().await });
+    wait_persistence_barrier(started).await;
+    {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        document.host_mutation_revision += 1;
+        document.revision += 1;
+    }
+    wait_persistence_barrier(release).await;
+
+    let gate = completion
+        .await
+        .expect("completion task")
+        .expect("completion gate");
+    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 2);
+    assert_eq!(diagnostics.files_strongly_hashed, 2);
+    assert_eq!(diagnostics.strong_hashes_reused, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

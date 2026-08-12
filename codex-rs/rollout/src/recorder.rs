@@ -58,6 +58,7 @@ use super::session_index::find_thread_names_by_ids;
 use crate::config::RolloutConfigView;
 use crate::state_db;
 use crate::state_db::StateDbHandle;
+use codex_git_utils::RepositoryContext;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::protocol::EventMsg;
@@ -760,6 +761,18 @@ impl RolloutRecorder {
         config: &impl RolloutConfigView,
         params: RolloutRecorderParams,
     ) -> std::io::Result<Self> {
+        Self::new_with_repository_context(config, params, None).await
+    }
+
+    /// Creates a recorder while optionally reusing repository context discovered by the caller.
+    ///
+    /// `None` means the caller has no observation and preserves the normal discovery path.
+    /// `Some(None)` records a known absence without probing again.
+    pub async fn new_with_repository_context(
+        config: &impl RolloutConfigView,
+        params: RolloutRecorderParams,
+        known_repository_context: Option<Option<RepositoryContext>>,
+    ) -> std::io::Result<Self> {
         let (writer, deferred_log_file_info, rollout_path, meta, persisted_manifest_hashes) =
             match params {
                 RolloutRecorderParams::Create {
@@ -855,6 +868,7 @@ impl RolloutRecorder {
                 rx,
                 meta,
                 cwd,
+                known_repository_context,
                 rollout_path_for_spawn.clone(),
                 persisted_manifest_hashes,
             )
@@ -1616,6 +1630,7 @@ struct RolloutWriterState {
     pending_items: Vec<RolloutItem>,
     meta: Option<SessionMeta>,
     cwd: PathBuf,
+    known_repository_context: Option<Option<RepositoryContext>>,
     rollout_path: PathBuf,
     last_logged_error: Option<String>,
     retry_blocked_error: Option<String>,
@@ -1629,6 +1644,7 @@ impl RolloutWriterState {
         deferred_log_file_info: Option<LogFileInfo>,
         meta: Option<SessionMeta>,
         cwd: PathBuf,
+        known_repository_context: Option<Option<RepositoryContext>>,
         rollout_path: PathBuf,
         persisted_manifest_hashes: HashSet<String>,
     ) -> Self {
@@ -1638,6 +1654,7 @@ impl RolloutWriterState {
             pending_items: Vec::new(),
             meta,
             cwd,
+            known_repository_context,
             rollout_path,
             last_logged_error: None,
             retry_blocked_error: None,
@@ -1820,7 +1837,13 @@ impl RolloutWriterState {
         let Some(session_meta) = self.meta.as_ref().cloned() else {
             return Ok(());
         };
-        write_session_meta(self.writer.as_mut(), session_meta, &self.cwd).await?;
+        write_session_meta(
+            self.writer.as_mut(),
+            session_meta,
+            &self.cwd,
+            self.known_repository_context.clone(),
+        )
+        .await?;
         self.meta = None;
         Ok(())
     }
@@ -1860,12 +1883,14 @@ impl RolloutWriterState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rollout_writer(
     writer: Option<JsonlWriter>,
     deferred_log_file_info: Option<LogFileInfo>,
     mut rx: mpsc::Receiver<RolloutCmd>,
     meta: Option<SessionMeta>,
     cwd: PathBuf,
+    known_repository_context: Option<Option<RepositoryContext>>,
     rollout_path: PathBuf,
     persisted_manifest_hashes: HashSet<String>,
 ) -> std::io::Result<()> {
@@ -1874,6 +1899,7 @@ async fn rollout_writer(
         deferred_log_file_info,
         meta,
         cwd,
+        known_repository_context,
         rollout_path,
         persisted_manifest_hashes,
     );
@@ -1910,15 +1936,22 @@ async fn write_session_meta(
     mut writer: Option<&mut JsonlWriter>,
     session_meta: SessionMeta,
     cwd: &Path,
+    known_repository_context: Option<Option<RepositoryContext>>,
 ) -> std::io::Result<()> {
-    let git_info = if get_git_repo_root(cwd).is_some() {
-        collect_git_info(cwd).await.map(|info| ProtocolGitInfo {
-            commit_hash: info.commit_hash,
-            branch: info.branch,
-            repository_url: info.repository_url,
-        })
-    } else {
-        None
+    let git_info = match known_repository_context {
+        Some(repository_context) => repository_context.map(|context| ProtocolGitInfo {
+            commit_hash: context.git_info.commit_hash,
+            branch: context.git_info.branch,
+            repository_url: context.git_info.repository_url,
+        }),
+        None if get_git_repo_root(cwd).is_some() => {
+            collect_git_info(cwd).await.map(|info| ProtocolGitInfo {
+                commit_hash: info.commit_hash,
+                branch: info.branch,
+                repository_url: info.repository_url,
+            })
+        }
+        None => None,
     };
     let session_meta_line = SessionMetaLine {
         meta: session_meta,

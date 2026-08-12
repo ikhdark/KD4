@@ -9,11 +9,19 @@ use codex_analytics::TurnProfile;
 use codex_otel::TURN_TTFM_DURATION_METRIC;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnTiming;
+use codex_protocol::protocol::TurnTimingAttemptKind;
+use codex_protocol::protocol::TurnTimingAttemptKindCounts;
 use codex_protocol::protocol::TurnTimingCounters;
 use codex_protocol::protocol::TurnTimingExclusive;
+use codex_protocol::protocol::TurnTimingGenerationReason;
+use codex_protocol::protocol::TurnTimingGenerationReasonCounts;
 use codex_protocol::protocol::TurnTimingLocal;
 use codex_protocol::protocol::TurnTimingMilestones;
+use codex_protocol::protocol::TurnTimingModelRequest;
+use codex_protocol::protocol::TurnTimingPreFirstModelOutput;
 use codex_protocol::protocol::TurnTimingUnions;
 
 use crate::ResponseEvent;
@@ -21,7 +29,7 @@ use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 1;
+const TIMING_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContinuationCause {
@@ -220,9 +228,81 @@ impl TurnTimingSnapshot {
                 .first_agent_message_ns
                 .map(|value| public_ms(value, &mut saturation_count)),
         };
+        let pre_first_model_output =
+            profile
+                .pre_first_model_output
+                .as_ref()
+                .map(|timing| TurnTimingPreFirstModelOutput {
+                    captured_at_ns: public_ns(timing.captured_at_ns, &mut saturation_count),
+                    first_request_dispatch_ready_ns: public_ns(
+                        timing.first_request_dispatch_ready_ns,
+                        &mut saturation_count,
+                    ),
+                    client_critical_path_ns: public_ns(
+                        timing.client_critical_path_ns,
+                        &mut saturation_count,
+                    ),
+                    attributed_client_union_ns: public_ns(
+                        timing.attributed_client_union_ns,
+                        &mut saturation_count,
+                    ),
+                    unattributed_pre_output_ns: public_ns(
+                        timing.unattributed_pre_output_ns,
+                        &mut saturation_count,
+                    ),
+                    history_snapshot_ns: public_ns(
+                        timing.history_snapshot_ns,
+                        &mut saturation_count,
+                    ),
+                    normalization_ns: public_ns(timing.normalization_ns, &mut saturation_count),
+                    planning_identity_ns: public_ns(
+                        timing.planning_identity_ns,
+                        &mut saturation_count,
+                    ),
+                    prompt_construction_ns: public_ns(
+                        timing.prompt_construction_ns,
+                        &mut saturation_count,
+                    ),
+                    request_transformation_ns: public_ns(
+                        timing.request_transformation_ns,
+                        &mut saturation_count,
+                    ),
+                    serialization_ns: public_ns(timing.serialization_ns, &mut saturation_count),
+                    transport_readiness_ns: public_ns(
+                        timing.transport_readiness_ns,
+                        &mut saturation_count,
+                    ),
+                });
+        let model_requests = profile
+            .model_requests
+            .iter()
+            .map(|request| TurnTimingModelRequest {
+                generation_index: request.generation_index,
+                generation_reason: request.generation_reason,
+                attempt_kind: request.attempt_kind,
+                is_continuation: request.is_continuation,
+                model_stream_wait_ns: public_ns(
+                    request.model_stream_wait_ns,
+                    &mut saturation_count,
+                ),
+                tool_call_count: request.tool_call_count,
+                dispatch_ms: request
+                    .dispatch_ns
+                    .map(|value| public_ms(value, &mut saturation_count)),
+                first_model_output_ms: request
+                    .first_model_output_ns
+                    .map(|value| public_ms(value, &mut saturation_count)),
+                completed_ms: request
+                    .completed_ns
+                    .map(|value| public_ms(value, &mut saturation_count)),
+            })
+            .collect();
         let profile_valid =
             profile.profile_valid && saturation_count == profile.counters.saturation_count;
         let counters = TurnTimingCounters {
+            logical_generation_count: profile.counters.logical_generation_count,
+            generations_by_reason: profile.counters.generations_by_reason.clone(),
+            attempts_by_kind: profile.counters.attempts_by_kind.clone(),
             model_request_count: profile.counters.model_request_count,
             model_retry_count: profile.counters.model_retry_count,
             model_fallback_count: profile.counters.model_fallback_count,
@@ -251,6 +331,8 @@ impl TurnTimingSnapshot {
             local,
             milestones,
             counters,
+            model_requests,
+            pre_first_model_output,
         }
     }
 }
@@ -270,6 +352,48 @@ pub(crate) struct TurnTimingProfile {
     pub(crate) local: LocalTiming,
     pub(crate) milestones: TimingMilestones,
     pub(crate) counters: TimingCounters,
+    pub(crate) model_requests: Vec<ModelRequestTiming>,
+    pub(crate) pre_first_model_output: Option<PreFirstModelOutputTiming>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ModelRequestTiming {
+    generation_index: u32,
+    generation_reason: TurnTimingGenerationReason,
+    attempt_kind: TurnTimingAttemptKind,
+    model_stream_wait_ns: u128,
+    tool_call_count: u32,
+    dispatch_ns: Option<u128>,
+    first_model_output_ns: Option<u128>,
+    completed_ns: Option<u128>,
+    is_continuation: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PreFirstModelOutputTiming {
+    captured_at_ns: u128,
+    first_request_dispatch_ready_ns: u128,
+    client_critical_path_ns: u128,
+    attributed_client_union_ns: u128,
+    unattributed_pre_output_ns: u128,
+    history_snapshot_ns: u128,
+    normalization_ns: u128,
+    planning_identity_ns: u128,
+    prompt_construction_ns: u128,
+    request_transformation_ns: u128,
+    serialization_ns: u128,
+    transport_readiness_ns: u128,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ClientCriticalPhaseTiming {
+    history_snapshot_ns: u128,
+    normalization_ns: u128,
+    planning_identity_ns: u128,
+    prompt_construction_ns: u128,
+    request_transformation_ns: u128,
+    serialization_ns: u128,
+    transport_readiness_ns: u128,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -350,6 +474,9 @@ pub(crate) struct TimingMilestones {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TimingCounters {
+    pub(crate) logical_generation_count: u32,
+    pub(crate) generations_by_reason: TurnTimingGenerationReasonCounts,
+    pub(crate) attempts_by_kind: TurnTimingAttemptKindCounts,
     pub(crate) model_request_count: u32,
     pub(crate) model_retry_count: u32,
     pub(crate) model_fallback_count: u32,
@@ -373,8 +500,16 @@ struct TurnTimingStateInner {
     local: LocalTiming,
     milestones: TimingMilestones,
     counters: TimingCounters,
+    model_requests: Vec<ModelRequestTiming>,
+    current_generation_index: Option<u32>,
+    current_generation_reason: TurnTimingGenerationReason,
+    next_attempt_kind: TurnTimingAttemptKind,
     legacy: LegacyProfileState,
     completed_snapshot: Option<TurnTimingSnapshot>,
+    attributed_client_union_ns: u128,
+    client_critical_phases: ClientCriticalPhaseTiming,
+    dispatch_ready_snapshot: Option<(u128, u128, ClientCriticalPhaseTiming)>,
+    pre_first_model_output: Option<PreFirstModelOutputTiming>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -389,12 +524,18 @@ struct ActiveSet {
     standalone: u32,
     preparation: u32,
     planning: u32,
+    history_snapshot: u32,
+    normalization: u32,
+    planning_identity: u32,
+    prompt_construction: u32,
+    request_transformation: u32,
     compaction: u32,
     persistence: u32,
     serialization: u32,
     router_build: u32,
     startup_prewarm_wait: u32,
     executor_readiness_wait: u32,
+    transport_readiness: u32,
     finalizing: bool,
 }
 
@@ -493,12 +634,18 @@ pub(crate) enum InteractiveWaitKind {
 pub(crate) enum TurnLocalPhase {
     Preparation,
     Planning,
+    HistorySnapshot,
+    Normalization,
+    PlanningIdentity,
+    PromptConstruction,
+    RequestTransformation,
     Compaction,
     Persistence,
     Serialization,
     RouterBuild,
     StartupPrewarmWait,
     ExecutorReadinessWait,
+    TransportReadiness,
 }
 
 #[must_use]
@@ -547,24 +694,75 @@ impl TurnTimingState {
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
         state.legacy.record_sampling_retry();
-        state.counters.model_retry_count = state.counters.model_retry_count.saturating_add(1);
+        state.record_model_retry();
     }
 
-    pub(crate) fn consume_pending_continuation(&self, pending: &mut Option<ContinuationCause>) {
-        if let Some(cause) = pending.take() {
-            let mut state = self.state();
+    pub(crate) fn record_model_retry(&self) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        state.record_model_retry();
+    }
+
+    pub(crate) fn begin_model_generation(
+        &self,
+        pending: &mut Option<ContinuationCause>,
+        session_source: &SessionSource,
+    ) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        let cause = pending.take();
+        if let Some(cause) = cause {
             state.legacy.record_continuation(cause);
         }
+        let reason = match (cause, session_source) {
+            (Some(ContinuationCause::CompletionReviewRepair), _) => {
+                TurnTimingGenerationReason::CompletionRepairRereview
+            }
+            (Some(ContinuationCause::Compaction), _) => TurnTimingGenerationReason::Compaction,
+            (_, SessionSource::SubAgent(SubAgentSource::Compact)) => {
+                TurnTimingGenerationReason::Compaction
+            }
+            (_, SessionSource::SubAgent(SubAgentSource::Review)) => {
+                TurnTimingGenerationReason::CompletionReview
+            }
+            (_, SessionSource::SubAgent(_)) => TurnTimingGenerationReason::Subagent,
+            (Some(ContinuationCause::ToolResult), _) => {
+                TurnTimingGenerationReason::ToolContinuation
+            }
+            (None, _) if state.counters.logical_generation_count == 0 => {
+                TurnTimingGenerationReason::Initial
+            }
+            _ => TurnTimingGenerationReason::Other,
+        };
+        state.start_generation(reason);
+    }
+
+    pub(crate) fn begin_compaction_generation(&self) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        state.start_generation(TurnTimingGenerationReason::Compaction);
     }
 
     pub(crate) fn record_model_fallback(&self) {
         let mut state = self.state();
         state.counters.model_fallback_count = state.counters.model_fallback_count.saturating_add(1);
+        state.next_attempt_kind = TurnTimingAttemptKind::Fallback;
     }
 
     pub(crate) fn record_tool_call(&self) {
         let mut state = self.state();
         state.counters.tool_call_count = state.counters.tool_call_count.saturating_add(1);
+        if let Some(generation_index) = state.current_generation_index
+            && let Some(request) = state.model_requests.iter_mut().find(|request| {
+                request.generation_index == generation_index
+                    && request.attempt_kind == TurnTimingAttemptKind::Primary
+            })
+        {
+            request.tool_call_count = request.tool_call_count.saturating_add(1);
+        }
     }
 
     pub(crate) fn begin_tool_blocking(self: &Arc<Self>) -> TurnTimingGuard {
@@ -574,6 +772,34 @@ impl TurnTimingState {
     pub(crate) fn begin_model_request_wait(self: &Arc<Self>) -> TurnTimingGuard {
         {
             let mut state = self.state();
+            if state.current_generation_index.is_none() {
+                state.start_generation(TurnTimingGenerationReason::Other);
+            }
+            let is_continuation = !state.model_requests.is_empty();
+            let generation_index = state.current_generation_index.unwrap_or_default();
+            let generation_reason = state.current_generation_reason;
+            let attempt_kind = std::mem::take(&mut state.next_attempt_kind);
+            state.model_requests.push(ModelRequestTiming {
+                generation_index,
+                generation_reason,
+                attempt_kind,
+                is_continuation,
+                ..Default::default()
+            });
+            match attempt_kind {
+                TurnTimingAttemptKind::Primary => {
+                    state.counters.attempts_by_kind.primary =
+                        state.counters.attempts_by_kind.primary.saturating_add(1);
+                }
+                TurnTimingAttemptKind::Retry => {
+                    state.counters.attempts_by_kind.retry =
+                        state.counters.attempts_by_kind.retry.saturating_add(1);
+                }
+                TurnTimingAttemptKind::Fallback => {
+                    state.counters.attempts_by_kind.fallback =
+                        state.counters.attempts_by_kind.fallback.saturating_add(1);
+                }
+            }
             state.counters.model_request_count =
                 state.counters.model_request_count.saturating_add(1);
         }
@@ -629,21 +855,75 @@ impl TurnTimingState {
     ) -> Option<Duration> {
         let records_model_output = response_event_records_model_output(event);
         let records_visible_output = response_event_records_visible_output(event);
-        if !records_model_output && !records_visible_output {
+        let records_completion = matches!(event, ResponseEvent::Completed { .. });
+        if !records_model_output && !records_visible_output && !records_completion {
             return None;
         }
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
         let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns)?;
+        if records_completion
+            && let Some(request) = state.model_requests.last_mut()
+            && request.completed_ns.is_none()
+        {
+            request.completed_ns = Some(elapsed_ns);
+        }
+        if records_model_output
+            && let Some(request) = state.model_requests.last_mut()
+            && request.first_model_output_ns.is_none()
+        {
+            request.first_model_output_ns = Some(elapsed_ns);
+        }
         if records_model_output && state.milestones.first_model_output_ns.is_none() {
             state.milestones.first_model_output_ns = Some(elapsed_ns);
+            if state.pre_first_model_output.is_none()
+                && let Some((dispatch_ready_ns, attributed_ns, phases)) =
+                    state.dispatch_ready_snapshot.clone()
+            {
+                state.pre_first_model_output = Some(PreFirstModelOutputTiming {
+                    captured_at_ns: elapsed_ns,
+                    first_request_dispatch_ready_ns: dispatch_ready_ns,
+                    client_critical_path_ns: dispatch_ready_ns,
+                    attributed_client_union_ns: attributed_ns.min(dispatch_ready_ns),
+                    unattributed_pre_output_ns: dispatch_ready_ns
+                        .saturating_sub(attributed_ns.min(dispatch_ready_ns)),
+                    history_snapshot_ns: phases.history_snapshot_ns,
+                    normalization_ns: phases.normalization_ns,
+                    planning_identity_ns: phases.planning_identity_ns,
+                    prompt_construction_ns: phases.prompt_construction_ns,
+                    request_transformation_ns: phases.request_transformation_ns,
+                    serialization_ns: phases.serialization_ns,
+                    transport_readiness_ns: phases.transport_readiness_ns,
+                });
+            }
         }
         if !records_visible_output || state.milestones.first_visible_output_ns.is_some() {
             return None;
         }
         state.milestones.first_visible_output_ns = Some(elapsed_ns);
         Some(duration_from_nanos(elapsed_ns))
+    }
+
+    pub(crate) fn mark_model_request_dispatched(&self) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if state.dispatch_ready_snapshot.is_none()
+            && let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
+        {
+            state.dispatch_ready_snapshot = Some((
+                elapsed_ns,
+                state.attributed_client_union_ns,
+                state.client_critical_phases.clone(),
+            ));
+        }
+        if let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
+            && let Some(request) = state.model_requests.last_mut()
+            && request.dispatch_ns.is_none()
+        {
+            request.dispatch_ns = Some(elapsed_ns);
+        }
     }
 
     pub(crate) fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration> {
@@ -691,6 +971,45 @@ impl Drop for TurnTimingGuard {
 }
 
 impl TurnTimingStateInner {
+    fn record_model_retry(&mut self) {
+        self.counters.model_retry_count = self.counters.model_retry_count.saturating_add(1);
+        if self.next_attempt_kind != TurnTimingAttemptKind::Fallback {
+            self.next_attempt_kind = TurnTimingAttemptKind::Retry;
+        }
+    }
+
+    fn start_generation(&mut self, reason: TurnTimingGenerationReason) {
+        let generation_index = self.counters.logical_generation_count;
+        self.counters.logical_generation_count =
+            self.counters.logical_generation_count.saturating_add(1);
+        let count = match reason {
+            TurnTimingGenerationReason::Initial => &mut self.counters.generations_by_reason.initial,
+            TurnTimingGenerationReason::ToolContinuation => {
+                &mut self.counters.generations_by_reason.tool_continuation
+            }
+            TurnTimingGenerationReason::CompletionReview => {
+                &mut self.counters.generations_by_reason.completion_review
+            }
+            TurnTimingGenerationReason::CompletionRepairRereview => {
+                &mut self
+                    .counters
+                    .generations_by_reason
+                    .completion_repair_rereview
+            }
+            TurnTimingGenerationReason::Compaction => {
+                &mut self.counters.generations_by_reason.compaction
+            }
+            TurnTimingGenerationReason::Subagent => {
+                &mut self.counters.generations_by_reason.subagent
+            }
+            TurnTimingGenerationReason::Other => &mut self.counters.generations_by_reason.other,
+        };
+        *count = count.saturating_add(1);
+        self.current_generation_index = Some(generation_index);
+        self.current_generation_reason = reason;
+        self.next_attempt_kind = TurnTimingAttemptKind::Primary;
+    }
+
     fn start(&mut self, sample: ClockSample) {
         *self = Self {
             started_sample: Some(sample),
@@ -808,6 +1127,19 @@ impl TurnTimingStateInner {
         }
         self.add_unions(elapsed_ns);
         self.add_local_unions(elapsed_ns);
+        self.add_client_critical_phase_unions(elapsed_ns);
+        if self.dispatch_ready_snapshot.is_none()
+            && (self.activity.history_snapshot > 0
+                || self.activity.normalization > 0
+                || self.activity.planning_identity > 0
+                || self.activity.prompt_construction > 0
+                || self.activity.request_transformation > 0
+                || self.activity.serialization > 0
+                || self.activity.transport_readiness > 0)
+        {
+            self.attributed_client_union_ns =
+                self.attributed_client_union_ns.saturating_add(elapsed_ns);
+        }
         self.legacy.advance(now_ns);
     }
 
@@ -832,6 +1164,13 @@ impl TurnTimingStateInner {
                 elapsed_ns,
                 &mut self.counters.saturation_count,
             );
+            if let Some(request) = self.model_requests.last_mut() {
+                add_saturating(
+                    &mut request.model_stream_wait_ns,
+                    elapsed_ns,
+                    &mut self.counters.saturation_count,
+                );
+            }
         }
         if self.activity.model_stream_processing > 0 {
             add_saturating(
@@ -881,6 +1220,40 @@ impl TurnTimingStateInner {
         }
     }
 
+    fn add_client_critical_phase_unions(&mut self, elapsed_ns: u128) {
+        if self.dispatch_ready_snapshot.is_some() {
+            return;
+        }
+        let active = self.activity;
+        let phases = &mut self.client_critical_phases;
+        let saturation_count = &mut self.counters.saturation_count;
+        for (is_active, target) in [
+            (active.history_snapshot > 0, &mut phases.history_snapshot_ns),
+            (active.normalization > 0, &mut phases.normalization_ns),
+            (
+                active.planning_identity > 0,
+                &mut phases.planning_identity_ns,
+            ),
+            (
+                active.prompt_construction > 0,
+                &mut phases.prompt_construction_ns,
+            ),
+            (
+                active.request_transformation > 0,
+                &mut phases.request_transformation_ns,
+            ),
+            (active.serialization > 0, &mut phases.serialization_ns),
+            (
+                active.transport_readiness > 0,
+                &mut phases.transport_readiness_ns,
+            ),
+        ] {
+            if is_active {
+                add_saturating(target, elapsed_ns, saturation_count);
+            }
+        }
+    }
+
     fn complete(&mut self, sample: ClockSample) -> TurnTimingSnapshot {
         if let Some(snapshot) = self.completed_snapshot.as_ref() {
             return snapshot.clone();
@@ -916,6 +1289,8 @@ impl TurnTimingStateInner {
             local: self.local.clone(),
             milestones: self.milestones.clone(),
             counters: self.counters.clone(),
+            model_requests: self.model_requests.clone(),
+            pre_first_model_output: self.pre_first_model_output.clone(),
         };
         let legacy_profile = self
             .legacy
@@ -956,12 +1331,18 @@ impl TurnTimingStateInner {
         let counter = match phase {
             TurnLocalPhase::Preparation => &mut self.activity.preparation,
             TurnLocalPhase::Planning => &mut self.activity.planning,
+            TurnLocalPhase::HistorySnapshot => &mut self.activity.history_snapshot,
+            TurnLocalPhase::Normalization => &mut self.activity.normalization,
+            TurnLocalPhase::PlanningIdentity => &mut self.activity.planning_identity,
+            TurnLocalPhase::PromptConstruction => &mut self.activity.prompt_construction,
+            TurnLocalPhase::RequestTransformation => &mut self.activity.request_transformation,
             TurnLocalPhase::Compaction => &mut self.activity.compaction,
             TurnLocalPhase::Persistence => &mut self.activity.persistence,
             TurnLocalPhase::Serialization => &mut self.activity.serialization,
             TurnLocalPhase::RouterBuild => &mut self.activity.router_build,
             TurnLocalPhase::StartupPrewarmWait => &mut self.activity.startup_prewarm_wait,
             TurnLocalPhase::ExecutorReadinessWait => &mut self.activity.executor_readiness_wait,
+            TurnLocalPhase::TransportReadiness => &mut self.activity.transport_readiness,
         };
         *counter = counter.saturating_add(1);
     }
@@ -970,12 +1351,18 @@ impl TurnTimingStateInner {
         let counter = match phase {
             TurnLocalPhase::Preparation => &mut self.activity.preparation,
             TurnLocalPhase::Planning => &mut self.activity.planning,
+            TurnLocalPhase::HistorySnapshot => &mut self.activity.history_snapshot,
+            TurnLocalPhase::Normalization => &mut self.activity.normalization,
+            TurnLocalPhase::PlanningIdentity => &mut self.activity.planning_identity,
+            TurnLocalPhase::PromptConstruction => &mut self.activity.prompt_construction,
+            TurnLocalPhase::RequestTransformation => &mut self.activity.request_transformation,
             TurnLocalPhase::Compaction => &mut self.activity.compaction,
             TurnLocalPhase::Persistence => &mut self.activity.persistence,
             TurnLocalPhase::Serialization => &mut self.activity.serialization,
             TurnLocalPhase::RouterBuild => &mut self.activity.router_build,
             TurnLocalPhase::StartupPrewarmWait => &mut self.activity.startup_prewarm_wait,
             TurnLocalPhase::ExecutorReadinessWait => &mut self.activity.executor_readiness_wait,
+            TurnLocalPhase::TransportReadiness => &mut self.activity.transport_readiness,
         };
         decrement(counter)
     }
@@ -1162,7 +1549,7 @@ impl LegacyProfileState {
     }
 }
 
-fn response_event_records_model_output(event: &ResponseEvent) -> bool {
+pub(crate) fn response_event_records_model_output(event: &ResponseEvent) -> bool {
     match event {
         ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
             response_item_records_model_output(item)
@@ -1185,7 +1572,7 @@ fn response_event_records_model_output(event: &ResponseEvent) -> bool {
     }
 }
 
-fn response_event_records_visible_output(event: &ResponseEvent) -> bool {
+pub(crate) fn response_event_records_visible_output(event: &ResponseEvent) -> bool {
     match event {
         ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
             response_item_records_visible_output(item)

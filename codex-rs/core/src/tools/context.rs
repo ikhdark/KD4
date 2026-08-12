@@ -250,13 +250,25 @@ impl ToolOutput for FunctionToolOutput {
         self.success.unwrap_or(true)
     }
 
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        if self
+            .post_tool_use_response
+            .as_ref()
+            .and_then(|value| value.get("command_was_executed"))
+            .and_then(JsonValue::as_bool)
+            == Some(false)
+        {
+            ToolOutputOutcome::Skipped
+        } else if self.success.unwrap_or(true) {
+            ToolOutputOutcome::Success
+        } else {
+            ToolOutputOutcome::Failure
+        }
+    }
+
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         Some(ToolOutputProjectionMetadata {
-            outcome: if self.success.unwrap_or(true) {
-                ToolOutputOutcome::Success
-            } else {
-                ToolOutputOutcome::Failure
-            },
+            outcome: self.outcome_for_logging(),
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             spillable_text: self
                 .body

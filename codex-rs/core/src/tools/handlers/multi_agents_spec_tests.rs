@@ -71,9 +71,8 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
     assert!(!description.contains("max_concurrent_threads_per_session"));
     assert!(description.contains(&spawn_agent_default_guidance()));
     assert!(
-        description.contains(
-            "Available model overrides (optional; `gpt-5.6-terra` is the spawn default):"
-        )
+        description
+            .contains("Available model overrides (optional; `gpt-5.6-sol` is the spawn default):")
     );
     assert!(description.contains(
         "- `visible-model`: visible description Reasoning efforts: medium (catalog default). Service tiers: priority."

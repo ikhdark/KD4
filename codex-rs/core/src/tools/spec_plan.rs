@@ -16,6 +16,7 @@ use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
+use crate::tools::handlers::LocateTaskHandler;
 use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::NewContextWindowHandler;
 use crate::tools::handlers::PlanHandler;
@@ -776,6 +777,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
             .any(|environment| !environment.environment.is_remote())
     {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
+        planned_tools.add(LocateTaskHandler::new(include_environment_id));
         planned_tools.add(SearchSourceHandler::new(include_environment_id));
         planned_tools.add(ReadFileSpanHandler::new(include_environment_id));
     }

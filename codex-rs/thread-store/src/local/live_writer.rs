@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
@@ -30,6 +31,22 @@ pub(super) async fn create_thread(
     let history_mode = params.history_mode;
     store.ensure_live_recorder_absent(thread_id).await?;
     let recorder = create_thread::create_thread(store, params).await?;
+    store
+        .insert_live_recorder(thread_id, recorder, history_mode)
+        .await
+}
+
+pub(super) async fn create_thread_with_repository_context(
+    store: &LocalThreadStore,
+    params: CreateThreadParams,
+    repository_context: Option<RepositoryContext>,
+) -> ThreadStoreResult<()> {
+    let thread_id = params.thread_id;
+    let history_mode = params.history_mode;
+    store.ensure_live_recorder_absent(thread_id).await?;
+    let recorder =
+        create_thread::create_thread_with_repository_context(store, params, repository_context)
+            .await?;
     store
         .insert_live_recorder(thread_id, recorder, history_mode)
         .await

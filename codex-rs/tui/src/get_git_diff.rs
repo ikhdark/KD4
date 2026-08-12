@@ -5,6 +5,7 @@
 //! untracked files. When the current directory is not inside a Git
 //! repository, the function returns `Ok((false, String::new()))`.
 
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -14,6 +15,9 @@ use crate::workspace_command::WorkspaceCommandOutput;
 use codex_git_utils::FsmonitorOverride;
 use codex_git_utils::FsmonitorProbeRunner;
 use codex_git_utils::detect_fsmonitor_override;
+use diffy::DiffOptions;
+use sha1::Digest;
+use sha1::Sha1;
 
 const DIFF_COMMAND_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
@@ -101,6 +105,14 @@ pub(crate) async fn get_git_diff(
     let (files_to_diff, omitted_files) =
         untracked_files.split_at(untracked_files.len().min(MAX_UNTRACKED_FILE_DIFFS));
     for file in files_to_diff {
+        if let Ok(diff) = render_local_untracked_file(cwd, file) {
+            untracked_diff.push_str(&diff);
+            continue;
+        }
+
+        // Remote workspace runners do not expose a file-read API. Preserve the existing
+        // executor-backed Git path when the file is not locally readable rather than widening
+        // that contract or making remote `/diff` incomplete.
         let args = [
             "diff",
             "--no-textconv",
@@ -122,11 +134,150 @@ pub(crate) async fn get_git_diff(
     Ok((true, format!("{tracked_diff}{untracked_diff}")))
 }
 
-fn parse_untracked_files(output: &str) -> Vec<&str> {
+fn render_local_untracked_file(cwd: &Path, file: &str) -> std::io::Result<String> {
+    let path = cwd.join(file);
+    let metadata = fs::symlink_metadata(&path)?;
+    let (contents, mode) = if metadata.file_type().is_symlink() {
+        (
+            fs::read_link(&path)?
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes(),
+            "120000",
+        )
+    } else if metadata.is_file() {
+        (fs::read(&path)?, untracked_file_mode(&metadata))
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "untracked path is not a file or symlink",
+        ));
+    };
+
+    Ok(render_untracked_new_file(file, mode, &contents))
+}
+
+#[cfg(unix)]
+fn untracked_file_mode(metadata: &fs::Metadata) -> &'static str {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o111 == 0 {
+        "100644"
+    } else {
+        "100755"
+    }
+}
+
+#[cfg(not(unix))]
+fn untracked_file_mode(_metadata: &fs::Metadata) -> &'static str {
+    "100644"
+}
+
+fn render_untracked_new_file(file: &str, mode: &str, contents: &[u8]) -> String {
+    let old_path = "/dev/null";
+    let new_path = format!("b/{file}");
+    let mut output = String::new();
+    output.push_str("\x1b[1mdiff --git ");
+    output.push_str(&quote_diff_path(&format!("a/{file}")));
+    output.push(' ');
+    output.push_str(&quote_diff_path(&new_path));
+    output.push_str("\x1b[m\n");
+    output.push_str(&format!("\x1b[1mnew file mode {mode}\x1b[m\n"));
+    output.push_str(&format!(
+        "\x1b[1mindex 0000000..{}\x1b[m\n",
+        git_blob_abbreviation(contents)
+    ));
+
+    if contents.is_empty() {
+        return output;
+    }
+    if contents.contains(&0) {
+        output.push_str("Binary files /dev/null and ");
+        output.push_str(&quote_diff_path(&new_path));
+        output.push_str(" differ\n");
+        return output;
+    }
+
+    let mut options = DiffOptions::new();
+    options
+        .set_original_filename(old_path)
+        .set_modified_filename(new_path.clone());
+    let contents = String::from_utf8_lossy(contents);
+    let patch = options.create_patch("", &contents).to_string();
+    let mut lines = patch.lines();
+    let _ = lines.next();
+    let _ = lines.next();
+
+    output.push_str("\x1b[1m--- /dev/null\x1b[m\n");
+    output.push_str("\x1b[1m+++ ");
+    output.push_str(&quote_diff_path(&new_path));
+    output.push_str("\x1b[m");
+    if path_needs_separator_tab(&new_path) {
+        output.push('\t');
+    }
+    output.push('\n');
+    for line in lines {
+        if line.starts_with("@@") {
+            output.push_str("\x1b[36m");
+            output.push_str(line);
+            output.push_str("\x1b[m\n");
+        } else if let Some(inserted) = line.strip_prefix('+') {
+            output.push_str("\x1b[32m+\x1b[m\x1b[32m");
+            output.push_str(inserted);
+            output.push_str("\x1b[m\n");
+        } else if line == "\\ No newline at end of file" {
+            output.push_str(line);
+            output.push_str("\x1b[m\n");
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
     output
+}
+
+fn git_blob_abbreviation(contents: &[u8]) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", contents.len()).as_bytes());
+    hasher.update(contents);
+    format!("{:x}", hasher.finalize())[..7].to_string()
+}
+
+fn path_needs_separator_tab(path: &str) -> bool {
+    path.bytes().any(|byte| byte == b' ' || byte == b'\t')
+}
+
+fn quote_diff_path(path: &str) -> String {
+    let needs_quotes = path
+        .bytes()
+        .any(|byte| !matches!(byte, 0x20..=0x21 | 0x23..=0x7e));
+    if !needs_quotes {
+        return path.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    for byte in path.bytes() {
+        match byte {
+            b'\\' => quoted.push_str("\\\\"),
+            b'\"' => quoted.push_str("\\\""),
+            b'\n' => quoted.push_str("\\n"),
+            b'\r' => quoted.push_str("\\r"),
+            b'\t' => quoted.push_str("\\t"),
+            0x20..=0x7e => quoted.push(char::from(byte)),
+            _ => quoted.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    quoted.push('\"');
+    quoted
+}
+
+fn parse_untracked_files(output: &str) -> Vec<&str> {
+    let mut files = output
         .split_terminator('\0')
         .filter(|path| !path.is_empty())
-        .collect()
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+    files
 }
 
 fn append_omitted_untracked_diff_notice(diff: &mut String, omitted_files: &[&str]) {
@@ -320,7 +471,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::pin::Pin;
-    #[cfg(unix)]
     use std::process::Command as ProcessCommand;
     use std::sync::Mutex;
 
@@ -343,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_git_diff_disables_helpers_for_tracked_and_untracked_diffs() {
+    async fn unreadable_untracked_file_uses_executor_git_fallback_without_helpers() {
         let cwd = PathBuf::from("/workspace");
         let runner = FakeRunner::new(vec![
             response(
@@ -782,6 +932,161 @@ mod tests {
         assert!(notice.lines().all(|line| line.len() < 2_100));
     }
 
+    #[test]
+    fn local_untracked_renderer_matches_observable_git_new_file_output() {
+        assert_eq!(
+            render_untracked_new_file("text.txt", "100644", b"hello\nworld\n"),
+            concat!(
+                "\x1b[1mdiff --git a/text.txt b/text.txt\x1b[m\n",
+                "\x1b[1mnew file mode 100644\x1b[m\n",
+                "\x1b[1mindex 0000000..94954ab\x1b[m\n",
+                "\x1b[1m--- /dev/null\x1b[m\n",
+                "\x1b[1m+++ b/text.txt\x1b[m\n",
+                "\x1b[36m@@ -0,0 +1,2 @@\x1b[m\n",
+                "\x1b[32m+\x1b[m\x1b[32mhello\x1b[m\n",
+                "\x1b[32m+\x1b[m\x1b[32mworld\x1b[m\n",
+            )
+        );
+        assert!(
+            render_untracked_new_file("no-newline", "120000", b"target").ends_with(
+                "\x1b[32m+\x1b[m\x1b[32mtarget\x1b[m\n\\ No newline at end of file\x1b[m\n"
+            )
+        );
+        assert!(
+            render_untracked_new_file("line\nbreak.txt", "100644", b"x\n").starts_with(
+                "\x1b[1mdiff --git \"a/line\\nbreak.txt\" \"b/line\\nbreak.txt\"\x1b[m\n"
+            )
+        );
+    }
+
+    #[test]
+    fn local_untracked_renderer_matches_git_for_text_binary_empty_and_newline_cases() {
+        let tempdir = tempfile::tempdir().expect("create temp directory");
+        let cwd = tempdir.path();
+        let cases = [
+            ("text.txt", b"hello\nworld\n".as_slice()),
+            ("binary.dat", b"a\0b".as_slice()),
+            ("empty.txt", b"".as_slice()),
+            ("no-newline.txt", b"last line".as_slice()),
+            ("path with spaces.txt", b"quoted\n".as_slice()),
+        ];
+        for (path, contents) in cases {
+            fs::write(cwd.join(path), contents).expect("write golden input");
+            assert_eq!(
+                render_local_untracked_file(cwd, path).expect("render untracked file"),
+                git_untracked_new_file_diff(cwd, path),
+                "renderer differs from git for {path:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_untracked_renderer_matches_git_for_executable_symlink_and_quoted_path() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("create temp directory");
+        let cwd = tempdir.path();
+
+        let executable = "executable.sh";
+        fs::write(cwd.join(executable), "#!/bin/sh\nexit 0\n").expect("write executable");
+        let mut permissions = fs::metadata(cwd.join(executable))
+            .expect("read executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(cwd.join(executable), permissions).expect("mark executable");
+
+        let link = "linked-file";
+        symlink("target with spaces", cwd.join(link)).expect("create symlink");
+
+        let quoted = "line\nbreak.txt";
+        fs::write(cwd.join(quoted), "quoted\n").expect("write unusual path");
+
+        for path in [executable, link, quoted] {
+            assert_eq!(
+                render_local_untracked_file(cwd, path).expect("render untracked file"),
+                git_untracked_new_file_diff(cwd, path),
+                "renderer differs from git for {path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_untracked_files_do_not_launch_per_file_git_diffs() {
+        let tempdir = tempfile::tempdir().expect("create temp directory");
+        let cwd = tempdir.path().to_path_buf();
+        let files = (0..32)
+            .map(|index| format!("new-{index:02}.txt"))
+            .collect::<Vec<_>>();
+        for file in &files {
+            fs::write(cwd.join(file), format!("{file}\n")).expect("write local untracked file");
+        }
+        let untracked_output = files
+            .iter()
+            .map(|file| format!("{file}\0"))
+            .collect::<String>();
+        let runner = FakeRunner::new(vec![
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &["rev-parse", "--is-inside-work-tree"],
+                ),
+                0,
+                "true\n",
+            ),
+            response(
+                git_probe_command(&["config", "--null", "--get", "core.fsmonitor"]),
+                1,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "config",
+                        "--null",
+                        "--name-only",
+                        "--get-regexp",
+                        EXECUTABLE_FILTER_CONFIG_PATTERN,
+                    ],
+                ),
+                1,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "diff",
+                        "--no-textconv",
+                        "--no-ext-diff",
+                        "--submodule=short",
+                        "--ignore-submodules=dirty",
+                        "--color",
+                    ],
+                ),
+                0,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                ),
+                0,
+                &untracked_output,
+            ),
+        ]);
+
+        let result = get_git_diff(&runner, &cwd)
+            .await
+            .expect("render local diff");
+
+        assert!(result.0);
+        assert_eq!(runner.commands().len(), 5);
+        assert_eq!(result.1.matches("diff --git").count(), 32);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn get_git_diff_does_not_execute_configured_filters_fsmonitor_or_hooks() {
@@ -978,6 +1283,35 @@ mod tests {
 
     fn null_device() -> &'static str {
         if cfg!(windows) { "NUL" } else { "/dev/null" }
+    }
+
+    fn git_untracked_new_file_diff(cwd: &Path, path: &str) -> String {
+        let output = ProcessCommand::new("git")
+            .args(["-c", "core.fsmonitor=false", "-c", DISABLE_HOOKS_CONFIG])
+            .args([
+                "diff",
+                "--no-index",
+                "--no-textconv",
+                "--no-ext-diff",
+                "--submodule=short",
+                "--ignore-submodules=dirty",
+                "--color",
+                "--",
+                null_device(),
+                path,
+            ])
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .current_dir(cwd)
+            .output()
+            .expect("run git golden command");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "git golden command failed for {path:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git diff output should be UTF-8")
     }
 
     #[cfg(unix)]

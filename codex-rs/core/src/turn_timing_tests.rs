@@ -8,6 +8,10 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TurnTimingAttemptKind;
+use codex_protocol::protocol::TurnTimingGenerationReason;
 use pretty_assertions::assert_eq;
 
 use super::ClockSample;
@@ -89,6 +93,71 @@ fn turn_timing_state_records_visible_output_only_once() {
     assert_eq!(
         state
             .record_response_event_milestones(&ResponseEvent::OutputTextDelta("again".to_string())),
+        None
+    );
+}
+
+#[test]
+fn pre_first_model_output_snapshot_is_atomic_and_immutable() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+
+    clock.set_ms(1);
+    let history = state.begin_local_phase(TurnLocalPhase::HistorySnapshot);
+    clock.set_ms(4);
+    drop(history);
+    let normalization = state.begin_local_phase(TurnLocalPhase::Normalization);
+    clock.set_ms(6);
+    drop(normalization);
+    clock.set_ms(10);
+    state.mark_model_request_dispatched();
+
+    clock.set_ms(15);
+    assert_eq!(
+        state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("hi".to_string())),
+        Some(Duration::from_millis(15))
+    );
+
+    clock.set_ms(20);
+    let later_work = state.begin_local_phase(TurnLocalPhase::PromptConstruction);
+    clock.set_ms(25);
+    drop(later_work);
+    clock.set_ms(30);
+    assert_eq!(
+        state
+            .record_response_event_milestones(&ResponseEvent::OutputTextDelta("again".to_string())),
+        None
+    );
+
+    let snapshot = state.complete_snapshot();
+    let pre_output = snapshot
+        .profile
+        .pre_first_model_output
+        .expect("substantive model output should freeze the snapshot");
+    assert_eq!(pre_output.captured_at_ns, 15 * NS_PER_MS);
+    assert_eq!(pre_output.first_request_dispatch_ready_ns, 10 * NS_PER_MS);
+    assert_eq!(pre_output.client_critical_path_ns, 10 * NS_PER_MS);
+    assert_eq!(pre_output.attributed_client_union_ns, 5 * NS_PER_MS);
+    assert_eq!(pre_output.unattributed_pre_output_ns, 5 * NS_PER_MS);
+    assert_eq!(pre_output.history_snapshot_ns, 3 * NS_PER_MS);
+    assert_eq!(pre_output.normalization_ns, 2 * NS_PER_MS);
+    assert_eq!(pre_output.prompt_construction_ns, 0);
+}
+
+#[test]
+fn pre_first_model_output_snapshot_is_absent_without_model_output() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(5);
+    state.mark_model_request_dispatched();
+    clock.set_ms(10);
+    assert_eq!(
+        state.record_response_event_milestones(&ResponseEvent::Created),
+        None
+    );
+
+    assert_eq!(
+        state.complete_snapshot().profile.pre_first_model_output,
         None
     );
 }
@@ -246,7 +315,7 @@ fn continuation_counters_are_consumed_once_and_retries_are_not_recounted() {
     for cause in causes {
         let mut pending = Some(cause);
         let sampling = state.begin_sampling();
-        state.consume_pending_continuation(&mut pending);
+        state.begin_model_generation(&mut pending, &SessionSource::Cli);
         drop(sampling);
         assert_eq!(pending, None);
     }
@@ -272,6 +341,179 @@ fn continuation_counters_are_consumed_once_and_retries_are_not_recounted() {
         continuation_sum + profile.sampling_retry_count,
         profile.sampling_request_count.saturating_sub(1)
     );
+}
+
+#[test]
+fn model_requests_record_dispatch_output_completion_and_continuation() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+
+    clock.set_ms(10);
+    let initial_wait = state.begin_model_request_wait();
+    clock.set_ms(20);
+    state.mark_model_request_dispatched();
+    clock.set_ms(25);
+    drop(initial_wait);
+    clock.set_ms(30);
+    state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("first".to_string()));
+    clock.set_ms(40);
+    state.record_response_event_milestones(&ResponseEvent::Completed {
+        response_id: "response-1".to_string(),
+        token_usage: None,
+        end_turn: Some(false),
+    });
+
+    clock.set_ms(50);
+    let continuation_wait = state.begin_model_request_wait();
+    clock.set_ms(60);
+    state.mark_model_request_dispatched();
+    clock.set_ms(65);
+    drop(continuation_wait);
+    clock.set_ms(70);
+    state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("second".to_string()));
+    clock.set_ms(80);
+    state.record_response_event_milestones(&ResponseEvent::Completed {
+        response_id: "response-2".to_string(),
+        token_usage: None,
+        end_turn: Some(true),
+    });
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.schema_version, 3);
+    assert_eq!(timing.model_requests.len(), 2);
+    assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
+    assert_eq!(timing.model_requests[0].first_model_output_ms, Some(30));
+    assert_eq!(timing.model_requests[0].completed_ms, Some(40));
+    assert!(!timing.model_requests[0].is_continuation);
+    assert_eq!(timing.model_requests[1].dispatch_ms, Some(60));
+    assert_eq!(timing.model_requests[1].first_model_output_ms, Some(70));
+    assert_eq!(timing.model_requests[1].completed_ms, Some(80));
+    assert!(timing.model_requests[1].is_continuation);
+}
+
+#[test]
+fn logical_generations_are_classified_by_workflow_purpose() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+
+    let cases = [
+        (None, SessionSource::Cli),
+        (Some(ContinuationCause::ToolResult), SessionSource::Cli),
+        (
+            Some(ContinuationCause::CompletionReviewRepair),
+            SessionSource::Cli,
+        ),
+        (None, SessionSource::SubAgent(SubAgentSource::Review)),
+        (
+            None,
+            SessionSource::SubAgent(SubAgentSource::Other("test".to_string())),
+        ),
+        (Some(ContinuationCause::PendingInput), SessionSource::Cli),
+    ];
+
+    for (mut pending, source) in cases {
+        state.begin_model_generation(&mut pending, &source);
+        drop(state.begin_model_request_wait());
+    }
+    state.begin_compaction_generation();
+    drop(state.begin_model_request_wait());
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.counters.logical_generation_count, 7);
+    assert_eq!(timing.counters.generations_by_reason.initial, 1);
+    assert_eq!(timing.counters.generations_by_reason.tool_continuation, 1);
+    assert_eq!(timing.counters.generations_by_reason.completion_review, 1);
+    assert_eq!(
+        timing
+            .counters
+            .generations_by_reason
+            .completion_repair_rereview,
+        1
+    );
+    assert_eq!(timing.counters.generations_by_reason.compaction, 1);
+    assert_eq!(timing.counters.generations_by_reason.subagent, 1);
+    assert_eq!(timing.counters.generations_by_reason.other, 1);
+    assert_eq!(
+        timing
+            .model_requests
+            .iter()
+            .map(|request| request.generation_reason)
+            .collect::<Vec<_>>(),
+        vec![
+            TurnTimingGenerationReason::Initial,
+            TurnTimingGenerationReason::ToolContinuation,
+            TurnTimingGenerationReason::CompletionRepairRereview,
+            TurnTimingGenerationReason::CompletionReview,
+            TurnTimingGenerationReason::Subagent,
+            TurnTimingGenerationReason::Other,
+            TurnTimingGenerationReason::Compaction,
+        ]
+    );
+}
+
+#[test]
+fn attempts_reconcile_and_stream_wait_is_attributed_without_inflating_generations() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut pending = None;
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+
+    let primary = state.begin_model_request_wait();
+    clock.set_ms(10);
+    drop(primary);
+    state.record_tool_call();
+    state.record_tool_call();
+
+    state.record_model_retry();
+    let retry = state.begin_model_request_wait();
+    clock.set_ms(15);
+    drop(retry);
+
+    state.record_model_fallback();
+    state.record_model_retry();
+    let fallback = state.begin_model_request_wait();
+    clock.set_ms(22);
+    drop(fallback);
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.counters.logical_generation_count, 1);
+    assert_eq!(timing.counters.model_request_count, 3);
+    assert_eq!(timing.counters.attempts_by_kind.primary, 1);
+    assert_eq!(timing.counters.attempts_by_kind.retry, 1);
+    assert_eq!(timing.counters.attempts_by_kind.fallback, 1);
+    assert_eq!(
+        timing.counters.model_request_count,
+        timing.counters.attempts_by_kind.primary
+            + timing.counters.attempts_by_kind.retry
+            + timing.counters.attempts_by_kind.fallback
+    );
+    assert_eq!(
+        timing
+            .model_requests
+            .iter()
+            .map(|request| request.attempt_kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TurnTimingAttemptKind::Primary,
+            TurnTimingAttemptKind::Retry,
+            TurnTimingAttemptKind::Fallback,
+        ]
+    );
+    assert_eq!(
+        timing.model_requests[0].model_stream_wait_ns,
+        10 * NS_PER_MS as u64
+    );
+    assert_eq!(
+        timing.model_requests[1].model_stream_wait_ns,
+        5 * NS_PER_MS as u64
+    );
+    assert_eq!(
+        timing.model_requests[2].model_stream_wait_ns,
+        7 * NS_PER_MS as u64
+    );
+    assert_eq!(timing.model_requests[0].tool_call_count, 2);
+    assert_eq!(timing.model_requests[1].tool_call_count, 0);
+    assert_eq!(timing.model_requests[2].tool_call_count, 0);
 }
 
 #[test]
@@ -319,7 +561,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 1);
+    assert_eq!(profile.schema_version, 3);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);

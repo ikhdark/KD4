@@ -162,7 +162,8 @@ async fn responses_websocket_streams_request() {
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     let mut prompt = prompt_with_input(vec![message_item("hello")]);
-    prompt.input[0].set_id(Some(ResponseItemId::with_suffix("msg", "existing")));
+    Arc::make_mut(&mut prompt.input)[0]
+        .set_id(Some(ResponseItemId::with_suffix("msg", "existing")));
 
     stream_until_complete(&mut client_session, &harness, &prompt).await;
 
@@ -2241,7 +2242,7 @@ fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
 
 fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt {
     let mut prompt = Prompt::default();
-    prompt.input = input;
+    prompt.input = input.into();
     prompt
 }
 

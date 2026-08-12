@@ -86,6 +86,16 @@ pub struct GitInfo {
     pub repository_url: Option<String>,
 }
 
+/// Confirmed, runtime-only repository identity plus stable Git metadata.
+/// Mutable worktree, index, and untracked-file observations stay external.
+#[derive(Clone, Debug)]
+pub struct RepositoryContext {
+    pub repo_root: PathBuf,
+    pub common_dir: PathBuf,
+    pub worktree_git_dir: PathBuf,
+    pub git_info: GitInfo,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GitDiffToRemote {
     pub sha: GitSha,
@@ -107,10 +117,56 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
         return None;
     }
 
-    // Run all git info collection commands in parallel
-    let (commit_result, branch_result, url_result) = tokio::join!(
-        run_git_command_with_timeout(&["rev-parse", "HEAD"], cwd),
-        run_git_command_with_timeout(&["rev-parse", "--abbrev-ref", "HEAD"], cwd),
+    Some(collect_git_info_assume_git_repo(cwd).await)
+}
+
+/// Discover a small repository context for callers that naturally own it.
+/// Standalone callers should continue to use [`collect_git_info`].
+pub async fn discover_repository_context(cwd: &Path) -> Option<RepositoryContext> {
+    let output = run_git_command_with_timeout(
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--git-dir",
+        ],
+        cwd,
+    )
+    .await?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut lines = stdout.lines();
+    let repo_root = resolve_git_identity_path(cwd, lines.next()?)?;
+    let common_dir = resolve_git_identity_path(cwd, lines.next()?)?;
+    let worktree_git_dir = resolve_git_identity_path(cwd, lines.next()?)?;
+    if lines.next().is_some() {
+        return None;
+    }
+
+    Some(RepositoryContext {
+        repo_root,
+        common_dir,
+        worktree_git_dir,
+        git_info: collect_git_info_assume_git_repo(cwd).await,
+    })
+}
+
+fn resolve_git_identity_path(cwd: &Path, output: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(output.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    path.canonicalize().ok()
+}
+
+/// Collect Git metadata when repository membership has already been established.
+pub async fn collect_git_info_assume_git_repo(cwd: &Path) -> GitInfo {
+    let (head_result, url_result) = tokio::join!(
+        run_git_command_with_timeout(&["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], cwd),
         run_git_command_with_timeout(&["remote", "get-url", "origin"], cwd)
     );
 
@@ -120,22 +176,19 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
         repository_url: None,
     };
 
-    // Process commit hash
-    if let Some(output) = commit_result
+    // `rev-parse` prints one line per argument, preserving the previous
+    // detached-HEAD marker while avoiding a second process.
+    if let Some(output) = head_result
         && output.status.success()
-        && let Ok(hash) = String::from_utf8(output.stdout)
+        && let Ok(stdout) = String::from_utf8(output.stdout)
     {
-        git_info.commit_hash = Some(GitSha::new(hash.trim()));
-    }
-
-    // Process branch name
-    if let Some(output) = branch_result
-        && output.status.success()
-        && let Ok(branch) = String::from_utf8(output.stdout)
-    {
-        let branch = branch.trim();
-        if branch != "HEAD" {
-            git_info.branch = Some(branch.to_string());
+        let mut lines = stdout.lines();
+        if let (Some(hash), Some(branch)) = (lines.next(), lines.next()) {
+            git_info.commit_hash = Some(GitSha::new(hash.trim()));
+            let branch = branch.trim();
+            if branch != "HEAD" {
+                git_info.branch = Some(branch.to_string());
+            }
         }
     }
 
@@ -147,7 +200,7 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
         git_info.repository_url = Some(url.trim().to_string());
     }
 
-    Some(git_info)
+    git_info
 }
 
 /// Collect fetch remotes in a multi-root-friendly format: {"origin": "https://..."}.
@@ -1053,6 +1106,83 @@ mod tests {
         );
 
         (repo, remote, branch, base_sha)
+    }
+
+    #[tokio::test]
+    async fn combined_git_info_preserves_unborn_attached_and_detached_head_behavior() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+
+        let unborn = collect_git_info_assume_git_repo(&repo).await;
+        assert_eq!(unborn.commit_hash, None);
+        assert_eq!(unborn.branch, None);
+        assert_eq!(unborn.repository_url, None);
+
+        std::fs::write(repo.join("tracked.txt"), "base\n").expect("write tracked file");
+        run_git(&repo, &["add", "tracked.txt"]);
+        run_git(&repo, &["commit", "-m", "base"]);
+        let branch = run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let commit = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let attached = collect_git_info_assume_git_repo(&repo).await;
+        assert_eq!(attached.commit_hash, Some(GitSha::new(&commit)));
+        assert_eq!(attached.branch.as_deref(), Some(branch.as_str()));
+
+        run_git(&repo, &["checkout", "--detach"]);
+        let detached = collect_git_info_assume_git_repo(&repo).await;
+        assert_eq!(detached.commit_hash, Some(GitSha::new(&commit)));
+        assert_eq!(detached.branch, None);
+    }
+
+    #[tokio::test]
+    async fn repository_context_distinguishes_linked_worktree_identity() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo = temp.path().join("repo");
+        let linked = temp.path().join("linked");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("tracked.txt"), "base\n").expect("write tracked file");
+        run_git(&repo, &["add", "tracked.txt"]);
+        run_git(&repo, &["commit", "-m", "base"]);
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().expect("utf-8 linked path"),
+                "HEAD",
+            ],
+        );
+
+        let primary = discover_repository_context(&repo)
+            .await
+            .expect("primary context");
+        let linked_context = discover_repository_context(&linked)
+            .await
+            .expect("linked context");
+
+        assert_eq!(
+            primary.repo_root,
+            repo.canonicalize().expect("primary root")
+        );
+        assert_eq!(
+            linked_context.repo_root,
+            linked.canonicalize().expect("linked root")
+        );
+        assert_eq!(primary.common_dir, linked_context.common_dir);
+        assert_ne!(primary.worktree_git_dir, linked_context.worktree_git_dir);
+        assert_eq!(
+            primary.git_info.commit_hash,
+            linked_context.git_info.commit_hash
+        );
+        assert_eq!(linked_context.git_info.branch, None);
     }
 
     #[test]

@@ -14,6 +14,17 @@ use super::repair_legacy_recency_migration_version;
 use super::runtime_migrator_for_pool;
 use super::runtime_state_migrator;
 
+const HISTORICAL_VALIDATION_HISTORY_41_LF_CHECKSUM: [u8; 48] = [
+    0x44, 0x70, 0xf6, 0x8c, 0xf6, 0xf7, 0x0d, 0xc5, 0xb1, 0xbe, 0xa9, 0x19, 0xc8, 0xbf, 0x86, 0xe8,
+    0x56, 0xd6, 0x36, 0xc2, 0x15, 0x8f, 0xb8, 0x94, 0xfa, 0x64, 0x6f, 0x40, 0x07, 0x56, 0xdf, 0xd7,
+    0x1b, 0x49, 0x83, 0xe1, 0xf2, 0xf0, 0xca, 0xcf, 0x4c, 0x24, 0x04, 0xb8, 0xc4, 0xfa, 0x5a, 0xef,
+];
+const HISTORICAL_VALIDATION_HISTORY_41_CRLF_CHECKSUM: [u8; 48] = [
+    0x5c, 0xdf, 0x7e, 0xfc, 0xbf, 0x99, 0xb6, 0xd8, 0x78, 0x16, 0xd0, 0xaa, 0x05, 0x7d, 0x79, 0x96,
+    0xc6, 0x5a, 0x52, 0xa0, 0xfe, 0xb0, 0x1d, 0x8e, 0x7c, 0x45, 0x52, 0x20, 0x1c, 0x8b, 0x5f, 0x92,
+    0x93, 0xa2, 0xb4, 0xa9, 0xf4, 0xe2, 0xf6, 0x18, 0x48, 0xc8, 0xda, 0x41, 0x0e, 0x25, 0x64, 0xbe,
+];
+
 fn migrator_through(version: i64) -> Migrator {
     Migrator {
         migrations: Cow::Owned(
@@ -231,15 +242,18 @@ async fn runtime_migrator_preserves_the_complete_crlf_ledger() {
         .connect("sqlite::memory:")
         .await
         .expect("in-memory database should open");
-    let crlf_migrator = migrator_with_line_endings(
-        &migrator_through(/*version*/ 40),
-        MigrationLineEndings::Crlf,
-    );
+    let crlf_migrator = migrator_with_line_endings(&STATE_MIGRATOR, MigrationLineEndings::Crlf);
     crlf_migrator
         .run(&pool)
         .await
         .expect("CRLF migration history should apply");
-    for version in 41_i64..=44_i64 {
+    let latest_known_version = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .expect("state migrations should not be empty");
+    for version in (latest_known_version + 1)..=(latest_known_version + 4) {
         sqlx::query(
             r#"
 INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
@@ -270,12 +284,22 @@ VALUES (?, ?, TRUE, ?, 0)
         .expect("compatible index creation should be idempotent");
 
     assert_eq!(migration_ledger(&pool).await, original_ledger);
-    assert!(
+    assert_eq!(latest_known_version, 42);
+    assert_eq!(
         STATE_MIGRATOR
             .migrations
             .iter()
-            .all(|migration| migration.version <= 40),
-        "fork-only indexes must not occupy the shared SQLx migration ledger"
+            .find(|migration| migration.version == 41)
+            .map(|migration| migration.description.as_ref()),
+        Some("validation history")
+    );
+    assert_eq!(
+        STATE_MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 42)
+            .map(|migration| migration.description.as_ref()),
+        Some("thread and agent job indexes")
     );
     let index_exists = sqlx::query_scalar::<_, i64>(
         "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_threads_cwd_norm'",
@@ -285,6 +309,127 @@ VALUES (?, ?, TRUE, ?, 0)
     .expect("index lookup should run")
     .is_some();
     assert!(index_exists);
+}
+
+#[tokio::test]
+async fn historical_validation_history_41_upgrades_without_checksum_mismatch_or_data_loss() {
+    let historical_migration = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == 41)
+        .expect("historical migration 41 should exist");
+    assert_eq!(
+        historical_migration.description.as_ref(),
+        "validation history"
+    );
+    assert_eq!(
+        migration_checksum(historical_migration, MigrationLineEndings::Lf),
+        HISTORICAL_VALIDATION_HISTORY_41_LF_CHECKSUM
+    );
+    assert_eq!(
+        migration_checksum(historical_migration, MigrationLineEndings::Crlf),
+        HISTORICAL_VALIDATION_HISTORY_41_CRLF_CHECKSUM
+    );
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("historical in-memory database should open");
+    migrator_through(/*version*/ 41)
+        .run(&pool)
+        .await
+        .expect("historical migrations through validation history should apply");
+    sqlx::query(
+        r#"
+INSERT INTO validation_history_aggregates (
+    scope_kind,
+    repository_id,
+    fingerprint_id,
+    operation,
+    ecosystem,
+    breadth,
+    model_version,
+    key_version,
+    completed_count,
+    censored_below_count,
+    censored_above_count,
+    duration_sum_ms,
+    duration_sum_squares_ms,
+    updated_at
+) VALUES (1, 'historical-repository', 'historical-fingerprint', 2, 3, 4, 5, 6, 7, 8, 9, 10.5, 11.5, 12)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("historical validation aggregate should insert");
+    let historical_ledger_row = migration_ledger(&pool)
+        .await
+        .into_iter()
+        .find(|row| row.0 == 41)
+        .expect("historical migration 41 ledger row should exist");
+
+    runtime_migrator_for_pool(&pool, &runtime_state_migrator())
+        .await
+        .expect("current migrator should accept historical migration 41")
+        .run(&pool)
+        .await
+        .expect("historical database should upgrade through current migrations");
+
+    let upgraded_ledger_row = migration_ledger(&pool)
+        .await
+        .into_iter()
+        .find(|row| row.0 == 41)
+        .expect("upgraded migration 41 ledger row should remain");
+    assert_eq!(upgraded_ledger_row, historical_ledger_row);
+    let preserved = sqlx::query_as::<_, (i64, i64, i64, f64, f64, i64)>(
+        r#"
+SELECT
+    completed_count,
+    censored_below_count,
+    censored_above_count,
+    duration_sum_ms,
+    duration_sum_squares_ms,
+    updated_at
+FROM validation_history_aggregates
+WHERE repository_id = 'historical-repository'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical validation aggregate should remain");
+    assert_eq!(preserved, (7, 8, 9, 10.5, 11.5, 12));
+
+    let fresh_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("fresh in-memory database should open");
+    STATE_MIGRATOR
+        .run(&fresh_pool)
+        .await
+        .expect("fresh database should reach the current schema");
+    let schema_query = r#"
+SELECT type, name, tbl_name
+FROM sqlite_master
+WHERE name IN (
+    'validation_history_aggregates',
+    'validation_history_aggregates_updated_at_idx',
+    'idx_agent_job_items_job_row',
+    'idx_threads_cwd_norm'
+)
+ORDER BY type, name
+    "#;
+    let upgraded_schema = sqlx::query_as::<_, (String, String, String)>(schema_query)
+        .fetch_all(&pool)
+        .await
+        .expect("upgraded schema should load");
+    let fresh_schema = sqlx::query_as::<_, (String, String, String)>(schema_query)
+        .fetch_all(&fresh_pool)
+        .await
+        .expect("fresh schema should load");
+    assert_eq!(upgraded_schema, fresh_schema);
+    assert_eq!(upgraded_schema.len(), 4);
 }
 
 #[tokio::test]

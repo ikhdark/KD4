@@ -113,6 +113,39 @@ const MCP_RESULT_TELEMETRY_SERVER_USER_FLOW_SPAN_ATTR: &str =
 const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
 const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 const MCP_TOOL_CALL_CANCELLED_MESSAGE: &str = "MCP tool call cancelled";
+const REPO_ATLAS_SERVER_NAME: &str = "repo-atlas";
+const REPO_ATLAS_NORMALIZED_SERVER_NAME: &str = "repo_atlas";
+const REPO_ATLAS_TASK_TOOL_NAME: &str = "task";
+const REPO_ATLAS_TASK_MAX_TOKENS: u64 = 4_000;
+
+fn normalize_mcp_tool_arguments_before_execution(
+    server: &str,
+    tool_name: &str,
+    arguments: &mut Option<JsonValue>,
+) {
+    if !matches!(
+        server,
+        REPO_ATLAS_SERVER_NAME | REPO_ATLAS_NORMALIZED_SERVER_NAME
+    ) || tool_name != REPO_ATLAS_TASK_TOOL_NAME
+    {
+        return;
+    }
+
+    let Some(arguments) = arguments.as_mut().and_then(JsonValue::as_object_mut) else {
+        return;
+    };
+    let Some(max_tokens) = arguments.get("maxTokens").and_then(JsonValue::as_u64) else {
+        return;
+    };
+    if max_tokens <= REPO_ATLAS_TASK_MAX_TOKENS {
+        return;
+    }
+
+    arguments.insert(
+        "maxTokens".to_string(),
+        JsonValue::from(REPO_ATLAS_TASK_MAX_TOKENS),
+    );
+}
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
 /// item lifecycle events to the `Session`.
@@ -131,7 +164,7 @@ pub(crate) async fn handle_mcp_tool_call(
     let sampled_tool_name = sampled_tool_name.to_string();
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
     // is not.
-    let arguments_value = if arguments.trim().is_empty() {
+    let mut arguments_value = if arguments.trim().is_empty() {
         None
     } else {
         match serde_json::from_str::<serde_json::Value>(&arguments) {
@@ -146,6 +179,11 @@ pub(crate) async fn handle_mcp_tool_call(
             }
         }
     };
+    normalize_mcp_tool_arguments_before_execution(
+        &sampled_server,
+        &sampled_tool_name,
+        &mut arguments_value,
+    );
 
     let live_tool_info = tokio::select! {
         biased;

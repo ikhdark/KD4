@@ -57,6 +57,15 @@ impl<T: HttpTransport> ResponsesClient<T> {
         }
     }
 
+    pub async fn stream_request(
+        &self,
+        request: ResponsesApiRequest,
+        options: ResponsesOptions,
+    ) -> Result<ResponseStream, ApiError> {
+        self.stream_request_with_dispatch_ready(request, options, || {})
+            .await
+    }
+
     #[instrument(
         name = "responses.stream_request",
         level = "info",
@@ -67,10 +76,11 @@ impl<T: HttpTransport> ResponsesClient<T> {
             api.path = "responses"
         )
     )]
-    pub async fn stream_request(
+    pub async fn stream_request_with_dispatch_ready(
         &self,
         request: ResponsesApiRequest,
         options: ResponsesOptions,
+        dispatch_ready: impl FnOnce(),
     ) -> Result<ResponseStream, ApiError> {
         let ResponsesOptions {
             session_id,
@@ -93,6 +103,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
         }
 
+        dispatch_ready();
         self.stream_encoded(body, headers, compression, turn_state)
             .await
     }

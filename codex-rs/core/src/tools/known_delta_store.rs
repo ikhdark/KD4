@@ -11,6 +11,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -19,6 +20,69 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use uuid::Uuid;
+
+#[cfg(test)]
+pub(crate) mod test_observation {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Clone, Default)]
+    struct Counters {
+        immutable_git_show_identity_calls: Arc<AtomicUsize>,
+        lookup_calls: Arc<AtomicUsize>,
+        fingerprint_git_subprocesses: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Snapshot {
+        pub immutable_git_show_identity_calls: usize,
+        pub lookup_calls: usize,
+        pub fingerprint_git_subprocesses: usize,
+    }
+
+    tokio::task_local! {
+        static COUNTERS: Counters;
+    }
+
+    pub(crate) async fn observe<F: Future>(future: F) -> (F::Output, Snapshot) {
+        let counters = Counters::default();
+        let output = COUNTERS.scope(counters.clone(), future).await;
+        let snapshot = Snapshot {
+            immutable_git_show_identity_calls: counters
+                .immutable_git_show_identity_calls
+                .load(Ordering::Relaxed),
+            lookup_calls: counters.lookup_calls.load(Ordering::Relaxed),
+            fingerprint_git_subprocesses: counters
+                .fingerprint_git_subprocesses
+                .load(Ordering::Relaxed),
+        };
+        (output, snapshot)
+    }
+
+    pub(super) fn record_immutable_git_show_identity() {
+        let _ = COUNTERS.try_with(|counters| {
+            counters
+                .immutable_git_show_identity_calls
+                .fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    pub(super) fn record_lookup() {
+        let _ = COUNTERS.try_with(|counters| {
+            counters.lookup_calls.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    pub(super) fn record_fingerprint_git_subprocess() {
+        let _ = COUNTERS.try_with(|counters| {
+            counters
+                .fingerprint_git_subprocesses
+                .fetch_add(1, Ordering::Relaxed);
+        });
+    }
+}
 
 pub(crate) const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -90,63 +154,23 @@ struct EvidenceMetrics {
     executor_micros_avoided: u64,
 }
 
-pub(crate) async fn immutable_file_identity(
-    repo_root: &Path,
-    relative_path: &str,
-    start_line: usize,
-    line_count: usize,
-) -> Option<EvidenceIdentity> {
-    let started = Instant::now();
-    let relative_path = normalize_relative_path(relative_path)?;
-    let metadata = tokio::fs::symlink_metadata(repo_root.join(&relative_path))
-        .await
-        .ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let project_namespace = git_project_namespace(repo_root).await?;
-    let object_spec = format!("HEAD:{relative_path}");
-    let blob = git_stdout(repo_root, &["rev-parse", &object_spec]).await?;
-    if !is_resolved_object(&blob) {
-        return None;
-    }
-    if !git_success(
-        repo_root,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--quiet",
-            "HEAD",
-            "--",
-            &relative_path,
-        ],
-    )
-    .await
-    {
-        return None;
-    }
-
-    let lineage_key = digest(format!("read_file_span\0{relative_path}").as_bytes());
-    let fingerprint = digest(
-        format!(
-            "schema={EVIDENCE_SCHEMA_VERSION}\0project={project_namespace}\0op=read_file_span\0cwd=.\0path={relative_path}\0start={start_line}\0count={line_count}\0blob={blob}"
-        )
-        .as_bytes(),
-    );
-    Some(EvidenceIdentity {
-        project_namespace,
-        lineage_key,
-        fingerprint,
-        provenance: format!("git-clean:{relative_path}@{blob}"),
-        fingerprint_cost: started.elapsed(),
-    })
-}
-
+#[cfg(test)]
 pub(crate) async fn immutable_git_show_identity(
     cwd: &Path,
     program: &str,
     args: &[String],
 ) -> Option<EvidenceIdentity> {
+    immutable_git_show_identity_with_project_namespace(cwd, program, args, None).await
+}
+
+pub(crate) async fn immutable_git_show_identity_with_project_namespace(
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    known_project_namespace: Option<&str>,
+) -> Option<EvidenceIdentity> {
+    #[cfg(test)]
+    test_observation::record_immutable_git_show_identity();
     let started = Instant::now();
     if !is_git_program(program) || args.len() != 2 || args[0] != "show" {
         return None;
@@ -160,16 +184,14 @@ pub(crate) async fn immutable_git_show_identity(
     {
         return None;
     }
-    let project_namespace = git_project_namespace(cwd).await?;
+    let project_namespace = match known_project_namespace {
+        Some(namespace) => namespace.to_owned(),
+        None => git_project_namespace(cwd).await?,
+    };
     let cwd_position = git_stdout(cwd, &["rev-parse", "--show-prefix"])
         .await
         .unwrap_or_default();
-    let resolved_blob = git_stdout(cwd, &["rev-parse", "--verify", requested]).await?;
-    if !is_resolved_object(&resolved_blob)
-        || git_stdout(cwd, &["cat-file", "-t", &resolved_blob]).await? != "blob"
-    {
-        return None;
-    }
+    let resolved_blob = git_resolve_blob(cwd, requested).await?;
     let lineage_key = digest(format!("git_show_resolved_object\0{suffix}").as_bytes());
     let fingerprint = digest(
         format!(
@@ -190,6 +212,8 @@ pub(crate) async fn lookup(
     codex_home: &Path,
     identity: &EvidenceIdentity,
 ) -> Option<EvidenceCandidate> {
+    #[cfg(test)]
+    test_observation::record_lookup();
     let started = Instant::now();
     if tokio::fs::try_exists(unsafe_path(codex_home, identity))
         .await
@@ -385,6 +409,8 @@ async fn quarantine(codex_home: &Path, identity: &EvidenceIdentity) {
 }
 
 async fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    #[cfg(test)]
+    test_observation::record_fingerprint_git_subprocess();
     let mut command = Command::new("git");
     command
         .args(["-c", "core.hooksPath=NUL", "-c", "core.fsmonitor=false"])
@@ -400,6 +426,53 @@ async fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
         .map(|value| value.trim().replace('\\', "/"))
 }
 
+/// Resolve `spec` and verify that it names a blob with one bounded Git process.
+///
+/// `cat-file --batch-check` accepts the same revision/path expressions used by
+/// `git show` without the parsing ambiguity of appending `^{blob}` to a
+/// `REV:path` expression. This is intentionally a one-shot process: Known Delta
+/// does not own a persistent Git worker.
+async fn git_resolve_blob(cwd: &Path, spec: &str) -> Option<String> {
+    if spec.contains(['\n', '\r']) {
+        return None;
+    }
+
+    #[cfg(test)]
+    test_observation::record_fingerprint_git_subprocess();
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.hooksPath=NUL", "-c", "core.fsmonitor=false"])
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let query = format!("{spec}\n");
+    let output = timeout(GIT_TIMEOUT, async move {
+        stdin.write_all(query.as_bytes()).await.ok()?;
+        stdin.shutdown().await.ok()?;
+        drop(stdin);
+        child.wait_with_output().await.ok()
+    })
+    .await
+    .ok()??;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut fields = stdout.trim().split_whitespace();
+    let object = fields.next()?;
+    let object_type = fields.next()?;
+    if fields.next().is_some() || object_type != "blob" || !is_resolved_object(object) {
+        return None;
+    }
+    Some(object.to_string())
+}
+
 async fn git_project_namespace(cwd: &Path) -> Option<String> {
     let mut roots = git_stdout(cwd, &["rev-list", "--max-parents=0", "HEAD"])
         .await?
@@ -413,20 +486,6 @@ async fn git_project_namespace(cwd: &Path) -> Option<String> {
     Some(digest(
         format!("git-project-roots-v1\0{}", roots.join("\0")).as_bytes(),
     ))
-}
-
-async fn git_success(cwd: &Path, args: &[&str]) -> bool {
-    let mut command = Command::new("git");
-    command
-        .args(["-c", "core.hooksPath=NUL", "-c", "core.fsmonitor=false"])
-        .args(args)
-        .current_dir(cwd)
-        .kill_on_drop(true);
-    timeout(GIT_TIMEOUT, command.status())
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_some_and(|status| status.success())
 }
 
 fn normalize_relative_path(path: &str) -> Option<String> {
@@ -515,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn related_worktrees_share_identity_but_unrelated_projects_do_not() {
+    async fn related_worktrees_share_git_show_identity_but_unrelated_projects_do_not() {
         let root = TempDir::new().unwrap();
         let repo = root.path().join("repo");
         let worktree = root.path().join("worktree");
@@ -533,15 +592,20 @@ mod tests {
         );
         init_repo(&unrelated, "different\n");
 
-        let first = immutable_file_identity(&repo, "read.txt", 1, 20)
+        let first_blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
+        let related_blob = run_git(&worktree, &["rev-parse", "HEAD:read.txt"]);
+        let other_blob = run_git(&unrelated, &["rev-parse", "HEAD:read.txt"]);
+        let first = immutable_git_show_identity(&repo, "git", &["show".to_string(), first_blob])
             .await
             .unwrap();
-        let related = immutable_file_identity(&worktree, "read.txt", 1, 20)
-            .await
-            .unwrap();
-        let other = immutable_file_identity(&unrelated, "read.txt", 1, 20)
-            .await
-            .unwrap();
+        let related =
+            immutable_git_show_identity(&worktree, "git", &["show".to_string(), related_blob])
+                .await
+                .unwrap();
+        let other =
+            immutable_git_show_identity(&unrelated, "git", &["show".to_string(), other_blob])
+                .await
+                .unwrap();
         assert_eq!(first.project_namespace, related.project_namespace);
         assert_eq!(first.fingerprint, related.fingerprint);
         assert_ne!(first.project_namespace, other.project_namespace);
@@ -550,12 +614,99 @@ mod tests {
                 .provenance
                 .contains(root.path().to_string_lossy().as_ref())
         );
+    }
 
+    #[tokio::test]
+    async fn immutable_git_show_still_fingerprints_and_promotes_reusable_evidence() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let home = root.path().join("home");
+        init_repo(&repo, "immutable\n");
         let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
-        assert!(
-            immutable_git_show_identity(&repo, "git", &["show".to_string(), blob])
+
+        let (reusable, observed) = test_observation::observe(async {
+            let identity = immutable_git_show_identity(&repo, "git", &["show".to_string(), blob])
                 .await
-                .is_some()
+                .expect("git show should have an immutable identity");
+            assert!(lookup(&home, &identity).await.is_none());
+            assert_eq!(
+                record_success(
+                    &home,
+                    &identity,
+                    None,
+                    b"immutable output",
+                    Duration::from_secs(1),
+                )
+                .await,
+                Observation::Published
+            );
+            let candidate = lookup(&home, &identity)
+                .await
+                .expect("published evidence should be available for shadow validation");
+            assert!(!candidate.reusable());
+            assert_eq!(
+                record_success(
+                    &home,
+                    &identity,
+                    Some(&candidate),
+                    b"immutable output",
+                    Duration::from_secs(1),
+                )
+                .await,
+                Observation::Unchanged {
+                    reuse_enabled: true
+                }
+            );
+            lookup(&home, &identity)
+                .await
+                .expect("validated evidence should remain available")
+                .reusable()
+        })
+        .await;
+
+        assert!(reusable);
+        assert_eq!(observed.immutable_git_show_identity_calls, 1);
+        assert_eq!(observed.lookup_calls, 3);
+        assert_eq!(observed.fingerprint_git_subprocesses, 3);
+    }
+
+    #[tokio::test]
+    async fn known_project_namespace_removes_one_fingerprint_git_process() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo, "immutable\n");
+        let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
+        let namespace = git_project_namespace(&repo).await.unwrap();
+
+        let (identity, observed) = test_observation::observe(async {
+            immutable_git_show_identity_with_project_namespace(
+                &repo,
+                "git",
+                &["show".to_string(), blob],
+                Some(&namespace),
+            )
+            .await
+        })
+        .await;
+
+        assert!(identity.is_some());
+        assert_eq!(observed.fingerprint_git_subprocesses, 2);
+    }
+
+    #[tokio::test]
+    async fn one_shot_blob_lookup_accepts_blobs_and_rejects_other_object_types() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo, "immutable\n");
+
+        assert!(git_resolve_blob(&repo, "HEAD:read.txt").await.is_some());
+        assert!(git_resolve_blob(&repo, "HEAD").await.is_none());
+        assert!(git_resolve_blob(&repo, "HEAD^{tree}").await.is_none());
+        assert!(git_resolve_blob(&repo, "missing-object").await.is_none());
+        assert!(
+            git_resolve_blob(&repo, "HEAD\nHEAD:read.txt")
+                .await
+                .is_none()
         );
     }
 

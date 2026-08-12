@@ -1,6 +1,7 @@
 packages:
   - codex-cli
   - codex-rs/responses-api-proxy/npm
+  - kd-ui
   - sdk/typescript
 
 ignoredBuiltDependencies:
@@ -14,4 +15,6 @@ strictDepBuilds: true
 trustPolicy: no-downgrade
 trustPolicyIgnoreAfter: 10080
 trustPolicyExclude: []
-allowBuilds: {}
+allowBuilds:
+  electron: true
+  electron-winstaller: true

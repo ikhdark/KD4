@@ -52,9 +52,13 @@ use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
+#[cfg(any(windows, test))]
+use crate::tools::sandboxing::same_exec_authorization_envelope;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_shell_command::is_safe_command::is_known_safe_command;
+#[cfg(windows)]
+use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_tools::ToolName;
 use codex_utils_path_uri::PathUri;
 
@@ -124,11 +128,22 @@ pub(super) struct RunExecLikeArgs {
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
     pub(super) force_fresh: bool,
+    pub(super) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
+    pub(super) validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
+    pub(super) validation_waiter: Option<crate::validation_admission::ValidationLeader>,
 }
 
 pub(super) struct RunExecLikeResult {
     pub(super) output: FunctionToolOutput,
     pub(super) exit_code: Option<i32>,
+    pub(super) validation_reuse_success: Option<bool>,
+}
+
+impl RunExecLikeResult {
+    pub(super) fn validation_reuse_succeeded(&self) -> bool {
+        self.validation_reuse_success
+            .unwrap_or(self.exit_code == Some(0))
+    }
 }
 
 pub(super) async fn run_exec_like(
@@ -503,12 +518,48 @@ pub(super) async fn run_exec_like_with_exit_code(
                     post_tool_use_response: None,
                 },
                 exit_code: Some(if status.is_success() { 0 } else { 1 }),
+                validation_reuse_success: None,
             });
         }
         Some(token)
     } else {
         None
     };
+    if args.validation_leader.is_none()
+        && let Some(waiter) = args.validation_waiter.take()
+    {
+        let shared_from_call_id = waiter.shared_from_call_id().to_string();
+        let joined = tokio::select! {
+            result = waiter.join() => result,
+            _ = args.cancellation_token.cancelled() => {
+                return Err(FunctionCallError::RespondToModel(
+                    "shared validation wait was cancelled".to_string(),
+                ));
+            }
+        };
+        let result = joined.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "shared validation execution ended without a reusable result".to_string(),
+            )
+        })?;
+        let success = result
+            .value
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let text = result.value.get("text").cloned().unwrap_or_default();
+        return Ok(RunExecLikeResult {
+            output: shell_command::validation_structured_output(serde_json::json!({
+                "call_id": args.call_id.clone(),
+                "admission_disposition": "joined",
+                "shared_from_call_id": shared_from_call_id,
+                "text": text,
+                "success": success,
+            })),
+            exit_code: Some(if success { 0 } else { 1 }),
+            validation_reuse_success: None,
+        });
+    }
     let heartbeat_stop = CancellationToken::new();
     let heartbeat_task = focused_validation.as_ref().map(|token| {
         let coordinator = coordinator.clone();
@@ -585,7 +636,26 @@ pub(super) async fn run_exec_like_with_exit_code(
         }))
     });
     let cancellation_token = args.cancellation_token.clone();
+    let validation_leader = args.validation_leader.take();
     let result = run_exec_like_with_exit_code_inner(args, focused_validation.is_some()).await;
+    if let Some(leader) = validation_leader {
+        match &result {
+            Ok(result) => {
+                leader
+                    .complete(crate::validation_admission::ReusableValidationResult {
+                        value: serde_json::json!({
+                            "text": result.output.body.iter().filter_map(|item| match item {
+                                codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+                                _ => None,
+                            }).collect::<Vec<_>>().join("\n"),
+                            "success": result.validation_reuse_succeeded(),
+                        }),
+                    })
+                    .await;
+            }
+            Err(_) => leader.abandon().await,
+        }
+    }
     heartbeat_stop.cancel();
     if let Some(heartbeat_task) = heartbeat_task
         && let Err(error) = heartbeat_task.await
@@ -654,7 +724,9 @@ pub(super) async fn run_exec_like_with_exit_code(
     }
 }
 
-fn validation_environment_hash(env: &HashMap<String, String>) -> String {
+pub(in crate::tools::handlers) fn validation_environment_hash(
+    env: &HashMap<String, String>,
+) -> String {
     let mut entries = env.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(name, _)| *name);
     let mut digest = Sha256::new();
@@ -767,7 +839,7 @@ fn resolve_focused_validation_executable(
 }
 
 #[cfg(windows)]
-fn child_env_value<'a>(
+pub(in crate::tools::handlers) fn child_env_value<'a>(
     env: &'a HashMap<String, String>,
     name: &str,
 ) -> Option<&'a std::ffi::OsStr> {
@@ -777,7 +849,7 @@ fn child_env_value<'a>(
 }
 
 #[cfg(not(windows))]
-fn child_env_value<'a>(
+pub(in crate::tools::handlers) fn child_env_value<'a>(
     env: &'a HashMap<String, String>,
     name: &str,
 ) -> Option<&'a std::ffi::OsStr> {
@@ -1458,6 +1530,9 @@ async fn run_exec_like_with_exit_code_inner(
         attempt_key,
         repair_notice,
         force_fresh,
+        validation_launch,
+        validation_leader: _,
+        validation_waiter: _,
     } = args;
 
     let fs = turn_environment.environment.get_filesystem();
@@ -1520,12 +1595,21 @@ async fn run_exec_like_with_exit_code_inner(
         && !focused_validation
         && !exec_params.command.is_empty()
     {
-        if let Some(identity) = known_delta_store::immutable_git_show_identity(
-            &exec_params.cwd,
-            &exec_params.command[0],
-            &exec_params.command[1..],
-        )
-        .await
+        let project_namespace = if let Some(source) = turn.turn_metadata_state.git_metadata_source()
+            && exec_params.cwd.starts_with(source.repo_root().as_path())
+        {
+            source.project_namespace().await
+        } else {
+            None
+        };
+        if let Some(identity) =
+            known_delta_store::immutable_git_show_identity_with_project_namespace(
+                &exec_params.cwd,
+                &exec_params.command[0],
+                &exec_params.command[1..],
+                project_namespace.as_deref(),
+            )
+            .await
         {
             let candidate =
                 known_delta_store::lookup(turn.config.codex_home.as_path(), &identity).await;
@@ -1634,6 +1718,7 @@ async fn run_exec_like_with_exit_code_inner(
         return Ok(RunExecLikeResult {
             output,
             exit_code: Some(0),
+            validation_reuse_success: None,
         });
     }
 
@@ -1647,6 +1732,48 @@ async fn run_exec_like_with_exit_code_inner(
     let event_tracker = track_validation_freshness.then_some(&tracker);
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
     emitter.begin(event_ctx).await;
+
+    // This is a preliminary resolution used only for the policy compatibility check. The runtime
+    // re-proves the exact command against its final cwd and child environment immediately before
+    // constructing the sandbox request. A safety/execution mismatch fails closed.
+    #[cfg(windows)]
+    let proven_direct_argv = (is_powershell_script
+        && !turn_environment.environment.is_remote()
+        && exec_params.command == safety_command)
+        .then(|| {
+            prove_noprofile_powershell_command_as_direct_argv(
+                &exec_params.command,
+                exec_params.cwd.as_path(),
+                &exec_params.env,
+            )
+        })
+        .flatten();
+
+    #[cfg(windows)]
+    let canonical_exec_approval_requirement = if let Some(proof) = proven_direct_argv.as_ref() {
+        Some(
+            session
+                .services
+                .exec_policy
+                .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+                    command: proof.command_for_policy(),
+                    command_for_safety: None,
+                    approval_policy: turn.approval_policy.value(),
+                    permission_profile: turn.permission_profile(),
+                    windows_sandbox_level: turn.windows_sandbox_level,
+                    sandbox_permissions: if effective_additional_permissions.permissions_preapproved
+                    {
+                        codex_protocol::models::SandboxPermissions::UseDefault
+                    } else {
+                        effective_additional_permissions.sandbox_permissions
+                    },
+                    prefix_rule: None,
+                })
+                .await,
+        )
+    } else {
+        None
+    };
 
     let exec_approval_requirement = session
         .services
@@ -1666,9 +1793,25 @@ async fn run_exec_like_with_exit_code_inner(
         })
         .await;
 
+    #[cfg(windows)]
+    let approved_powershell_direct_argv = if let (Some(proof), Some(canonical_requirement)) =
+        (proven_direct_argv, canonical_exec_approval_requirement)
+        && same_exec_authorization_envelope(&exec_approval_requirement, &canonical_requirement)
+        && let Some(command) = proof.into_command_for_state(
+            &exec_params.command,
+            exec_params.cwd.as_path(),
+            &exec_params.env,
+        ) {
+        Some(command)
+    } else {
+        None
+    };
+
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
+        #[cfg(windows)]
+        approved_powershell_direct_argv,
         turn_environment: turn_environment.clone(),
         shell_type,
         hook_command,
@@ -1686,6 +1829,7 @@ async fn run_exec_like_with_exit_code_inner(
         justification: exec_params.justification.clone(),
         exec_approval_requirement,
         known_delta: known_delta.clone(),
+        validation_launch,
     };
     let mut orchestrator = ToolOrchestrator::new();
     let mut runtime = ShellRuntime::for_shell_command(shell_runtime_backend);
@@ -1695,7 +1839,7 @@ async fn run_exec_like_with_exit_code_inner(
         call_id: call_id.clone(),
         tool_name,
     };
-    let out = orchestrator
+    let out = match orchestrator
         .run(
             &mut runtime,
             &req,
@@ -1704,7 +1848,20 @@ async fn run_exec_like_with_exit_code_inner(
             turn.approval_policy.value(),
         )
         .await
-        .map(|result| result.output);
+    {
+        Ok(result) => Ok(result.output),
+        Err(ToolError::ValidationSkipped(skipped)) => {
+            let value = serde_json::to_value(skipped).unwrap_or_default();
+            let mut output = FunctionToolOutput::from_text(value.to_string(), Some(true));
+            output.post_tool_use_response = Some(value);
+            return Ok(RunExecLikeResult {
+                output,
+                exit_code: None,
+                validation_reuse_success: Some(true),
+            });
+        }
+        Err(error) => Err(error),
+    };
     if !known_delta_hit && let Some(known_delta) = known_delta.as_ref() {
         match &out {
             Ok(output) if is_complete_success(output) => {
@@ -1817,6 +1974,7 @@ async fn run_exec_like_with_exit_code_inner(
             post_tool_use_response,
         },
         exit_code,
+        validation_reuse_success: None,
     })
 }
 
@@ -1830,6 +1988,7 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
         Err(ToolError::Codex(_)) => Some(-1),
         Err(ToolError::Denied(_)) => None,
         Err(ToolError::Rejected(_)) => Some(-1),
+        Err(ToolError::ValidationSkipped(_)) => None,
     }
 }
 

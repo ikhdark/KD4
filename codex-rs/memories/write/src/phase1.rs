@@ -304,7 +304,8 @@ mod job {
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }];
+        }]
+        .into();
         prompt.base_instructions = BaseInstructions {
             text: crate::stage_one::PROMPT.to_string(),
         };

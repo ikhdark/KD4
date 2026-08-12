@@ -4,6 +4,9 @@
   [`openai/codex`](https://github.com/openai/codex) at
   `C:\Users\kuh\Desktop\kd4`. Treat work as fork-local unless the user
   explicitly requests upstream, product-facing, or distribution-ready changes.
+- Codex Desktop sets `CODEX_HOME` to `C:\Users\kuh\Desktop\LOCAL-KD`.
+  Use that directory for the active Desktop configuration and state rather than
+  assuming the default user-profile `.codex` directory.
 - [`SOURCEMAP.md`](SOURCEMAP.md) owns repository inventory, runtime entrypoints,
   package and Rust-domain routing, generated contracts, validation routes, and
   cross-cutting change routes.

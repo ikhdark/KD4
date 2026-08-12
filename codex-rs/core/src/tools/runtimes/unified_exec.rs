@@ -39,6 +39,8 @@ use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
 use crate::unified_exec::NoopSpawnLifecycle;
 use crate::unified_exec::PendingSpawnRegistration;
+use crate::unified_exec::SpawnLifecycle;
+use crate::unified_exec::SpawnLifecycleHandle;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -51,12 +53,15 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxablePreference;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
+#[cfg(windows)]
+use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_tools::UnifiedExecShellMode;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use tokio::sync::OwnedRwLockReadGuard;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
@@ -68,6 +73,10 @@ pub struct UnifiedExecRequest {
     /// Semantically equivalent, inspectable command used for approvals and
     /// approval caching when `command` contains an encoded runtime payload.
     pub command_for_approval: Vec<String>,
+    #[cfg(windows)]
+    pub normalization_cwd: Option<std::path::PathBuf>,
+    #[cfg(windows)]
+    pub approved_powershell_direct_argv: Option<Vec<String>>,
     pub raw_output_artifact: RawOutputArtifact,
     pub shell_type: ShellType,
     pub hook_command: String,
@@ -86,6 +95,73 @@ pub struct UnifiedExecRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
+    pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
+    pub validation_observation:
+        Arc<std::sync::Mutex<Option<crate::validation_admission::ValidationObservationToken>>>,
+}
+
+#[derive(Debug)]
+struct ValidationSpawnLifecycle {
+    inner: SpawnLifecycleHandle,
+    authorization_guard:
+        Option<OwnedRwLockReadGuard<crate::validation_admission::ValidationAuthorization>>,
+    observation: Option<crate::validation_admission::ValidationObservationToken>,
+}
+
+impl SpawnLifecycle for ValidationSpawnLifecycle {
+    fn inherited_fds(&self) -> Vec<i32> {
+        self.inner.inherited_fds()
+    }
+
+    fn after_spawn(&mut self) {
+        self.inner.after_spawn();
+        if let Some(observation) = self.observation.take() {
+            observation.arm();
+        }
+        self.authorization_guard.take();
+    }
+}
+
+async fn validation_spawn_lifecycle(
+    req: &UnifiedExecRequest,
+    ctx: &ToolCtx,
+    inner: SpawnLifecycleHandle,
+) -> Result<SpawnLifecycleHandle, ToolError> {
+    let Some(launch) = req.validation_launch.as_ref() else {
+        return Ok(inner);
+    };
+    let guard = Arc::clone(&ctx.turn.validation_authorization)
+        .read_owned()
+        .await;
+    if guard.revision != launch.authorization_revision
+        && !crate::validation_admission::admission_still_authorized(&guard, &launch.invocation)
+    {
+        let Some(skipped) =
+            crate::validation_admission::prohibited_skip_for(&guard, &launch.invocation)
+        else {
+            return Err(ToolError::Rejected(
+                "validation launch plan did not contain a validation command".to_string(),
+            ));
+        };
+        return Err(ToolError::ValidationSkipped(skipped));
+    }
+    let observation = match (
+        launch.observation.clone(),
+        ctx.session.services.state_db.clone(),
+    ) {
+        (Some(plan), Some(state)) => {
+            Some(crate::validation_admission::ValidationObservationToken::new(plan, state))
+        }
+        _ => None,
+    };
+    if let Ok(mut slot) = req.validation_observation.lock() {
+        *slot = observation.clone();
+    }
+    Ok(Box::new(ValidationSpawnLifecycle {
+        inner,
+        authorization_guard: Some(guard),
+        observation,
+    }))
 }
 
 /// Cache key for approval decisions that can be reused across equivalent
@@ -400,7 +476,25 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             attempt.windows_sandbox_level,
         );
         let command = if matches!(req.shell_type, ShellType::PowerShell) {
-            prefix_powershell_script_with_utf8(&command)
+            #[cfg(windows)]
+            {
+                let direct_command =
+                    req.approved_powershell_direct_argv
+                        .as_ref()
+                        .and_then(|approved| {
+                            let cwd = req.normalization_cwd.as_ref()?;
+                            let proof = prove_noprofile_powershell_command_as_direct_argv(
+                                &command, cwd, &env,
+                            )?;
+                            let direct = proof.into_command_for_state(&command, cwd, &env)?;
+                            (direct == *approved).then_some(direct)
+                        });
+                direct_command.unwrap_or_else(|| prefix_powershell_script_with_utf8(&command))
+            }
+            #[cfg(not(windows))]
+            {
+                prefix_powershell_script_with_utf8(&command)
+            }
         } else {
             command
         };
@@ -417,7 +511,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 ToolError::Rejected(_) => {
                     ToolError::Rejected("missing command line for PTY".to_string())
                 }
-                error @ (ToolError::Denied(_) | ToolError::Codex(_)) => error,
+                error @ (ToolError::Denied(_)
+                | ToolError::Codex(_)
+                | ToolError::ValidationSkipped(_)) => error,
             })?;
             let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
             let mut exec_env = attempt
@@ -445,13 +541,15 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                                 .to_string(),
                         ));
                     }
+                    let spawn_lifecycle =
+                        validation_spawn_lifecycle(req, ctx, prepared.spawn_lifecycle).await?;
                     return self
                         .manager
                         .open_session_with_prepared_exec_env(
                             req.process_id,
                             &prepared.exec_request,
                             req.tty,
-                            prepared.spawn_lifecycle,
+                            spawn_lifecycle,
                             Some(req.raw_output_artifact.clone()),
                             req.turn_environment.environment.as_ref(),
                             &self.pending_spawns,
@@ -485,9 +583,13 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             ToolError::Rejected(_) => {
                 ToolError::Rejected("missing command line for PTY".to_string())
             }
-            error @ (ToolError::Denied(_) | ToolError::Codex(_)) => error,
+            error @ (ToolError::Denied(_)
+            | ToolError::Codex(_)
+            | ToolError::ValidationSkipped(_)) => error,
         })?;
         let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
+        let spawn_lifecycle =
+            validation_spawn_lifecycle(req, ctx, Box::new(NoopSpawnLifecycle)).await?;
         self.manager
             .open_session_with_exec_env(
                 req.process_id,
@@ -498,7 +600,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
                 req.tty,
-                Box::new(NoopSpawnLifecycle),
+                spawn_lifecycle,
                 Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
                 &self.pending_spawns,
@@ -618,6 +720,10 @@ mod tests {
         let request = UnifiedExecRequest {
             command: vec!["pwd".to_string()],
             command_for_approval: vec!["pwd".to_string()],
+            #[cfg(windows)]
+            normalization_cwd: None,
+            #[cfg(windows)]
+            approved_powershell_direct_argv: None,
             raw_output_artifact: RawOutputArtifact::Failed {
                 id: None,
                 message: "test fixture".to_string(),
@@ -644,6 +750,8 @@ mod tests {
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
+            validation_launch: None,
+            validation_observation: Arc::new(std::sync::Mutex::new(None)),
         };
 
         assert_eq!(
@@ -727,6 +835,10 @@ mod tests {
         UnifiedExecRequest {
             command: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
             command_for_approval: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            #[cfg(windows)]
+            normalization_cwd: None,
+            #[cfg(windows)]
+            approved_powershell_direct_argv: None,
             raw_output_artifact: RawOutputArtifact::Failed {
                 id: None,
                 message: "test fixture".to_string(),
@@ -750,6 +862,8 @@ mod tests {
             additional_permissions_preapproved: false,
             justification: None,
             exec_approval_requirement,
+            validation_launch: None,
+            validation_observation: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

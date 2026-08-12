@@ -247,6 +247,38 @@ fn generated_vendor_and_lock_paths_are_excluded_by_default() {
 }
 
 #[test]
+fn explicit_generated_and_vendor_roots_still_use_repository_relative_exclusions() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(repo.path().join("target")).expect("target");
+    fs::create_dir_all(repo.path().join("vendor")).expect("vendor");
+    fs::write(
+        repo.path().join("target/generated.rs"),
+        "needle generated\n",
+    )
+    .expect("generated");
+    fs::write(repo.path().join("vendor/dependency.rs"), "needle vendor\n").expect("vendor");
+
+    let mut excluded = search_options(repo.path(), "needle");
+    excluded.roots = vec![PathBuf::from("target"), PathBuf::from("vendor")];
+    let output = search_source(excluded).expect("excluded search");
+    assert!(output.matches.is_empty());
+
+    let mut included = search_options(repo.path(), "needle");
+    included.roots = vec![PathBuf::from("target"), PathBuf::from("vendor")];
+    included.include_generated = true;
+    included.include_vendor = true;
+    let output = search_source(included).expect("included search");
+    assert_eq!(
+        output
+            .matches
+            .iter()
+            .map(|source_match| source_match.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["target/generated.rs", "vendor/dependency.rs"]
+    );
+}
+
+#[test]
 fn common_source_language_extensions_are_scanned() {
     let repo = tempfile::tempdir().expect("tempdir");
     let source_paths = [
@@ -492,5 +524,180 @@ fn read_span_rejects_invalid_line_count_and_outside_files() {
         outside_error
             .to_string()
             .contains("outside repository root")
+    );
+}
+
+#[test]
+fn representative_large_repository_search_stays_within_walk_and_output_bounds() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let source = repo.path().join("src");
+    fs::create_dir(&source).expect("source directory");
+    for index in 0..512 {
+        fs::write(
+            source.join(format!("module_{index:04}.rs")),
+            format!("pub fn readiness_needle_{index:04}() {{}}\n"),
+        )
+        .expect("write representative source file");
+    }
+    let mut options = search_options(repo.path(), "readiness_needle");
+    options.roots = vec![PathBuf::from("src")];
+
+    let output = search_source_with_walk_limits(
+        options,
+        SourceWalkLimits {
+            max_depth: SOURCE_SEARCH_MAX_WALK_DEPTH,
+            max_directories: SOURCE_SEARCH_MAX_WALK_DIRECTORIES,
+            max_entries: 64,
+        },
+    )
+    .expect("bounded representative search");
+
+    assert_eq!(
+        output.truncated_reason,
+        Some(SourceTruncatedReason::WalkLimit)
+    );
+    assert!(output.coverage.files_scanned <= 64);
+    assert!(output.coverage.matches_returned <= SOURCE_SEARCH_DEFAULT_MAX_MATCHES);
+    assert!(output.coverage.result_bytes <= SOURCE_SEARCH_MAX_RESULT_BYTES);
+}
+
+#[test]
+fn capped_unscoped_miss_reports_only_the_scanned_portion() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    for index in 0..4 {
+        fs::write(
+            repo.path().join(format!("source_{index}.rs")),
+            "pub fn unrelated() {}\n",
+        )
+        .expect("write source");
+    }
+
+    let output = search_source_with_walk_limits(
+        search_options(repo.path(), "absent_needle"),
+        SourceWalkLimits {
+            max_depth: SOURCE_SEARCH_MAX_WALK_DEPTH,
+            max_directories: SOURCE_SEARCH_MAX_WALK_DIRECTORIES,
+            max_entries: 1,
+        },
+    )
+    .expect("bounded unscoped miss");
+
+    assert!(!output.coverage_complete);
+    assert!(output.matches.is_empty());
+    let note = output.coverage_note.expect("incomplete coverage note");
+    assert!(note.contains("No matches were found in the scanned portion"));
+    assert!(note.contains("Narrow `paths` or use `locate_task`"));
+}
+
+#[test]
+fn capped_unscoped_hit_still_reports_incomplete_coverage() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join("a_match.rs"), "pub fn needle() {}\n").expect("write match");
+    fs::write(repo.path().join("z_unvisited.rs"), "pub fn later() {}\n")
+        .expect("write unvisited source");
+
+    let output = search_source_with_walk_limits(
+        search_options(repo.path(), "needle"),
+        SourceWalkLimits {
+            max_depth: SOURCE_SEARCH_MAX_WALK_DEPTH,
+            max_directories: SOURCE_SEARCH_MAX_WALK_DIRECTORIES,
+            max_entries: 1,
+        },
+    )
+    .expect("bounded unscoped hit");
+
+    assert_eq!(output.coverage.total_matches, 1);
+    assert!(!output.coverage_complete);
+    assert!(
+        output
+            .coverage_note
+            .as_deref()
+            .is_some_and(|note| note.contains("matches cover only the scanned portion"))
+    );
+}
+
+#[test]
+fn scoped_search_stays_within_owner_bounds_and_reports_counter_invariants() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let owner = repo.path().join("owner");
+    let elsewhere = repo.path().join("elsewhere");
+    fs::create_dir(&owner).expect("owner directory");
+    fs::create_dir(&elsewhere).expect("elsewhere directory");
+    for index in 0..5 {
+        fs::write(
+            owner.join(format!("owned_{index}.rs")),
+            format!("pub fn owned_{index}() {{}}\n"),
+        )
+        .expect("write owned source");
+    }
+    fs::write(owner.join("expected.rs"), "pub fn expected_needle() {}\n")
+        .expect("write expected source");
+    for index in 0..30 {
+        fs::write(
+            elsewhere.join(format!("unowned_{index}.rs")),
+            "pub fn expected_needle() {}\n",
+        )
+        .expect("write unowned source");
+    }
+    let mut options = search_options(repo.path(), "expected_needle");
+    options.roots = vec![PathBuf::from("owner")];
+
+    let output = search_source(options).expect("scoped search");
+
+    assert_eq!(output.coverage.total_matches, 1);
+    assert!(
+        output
+            .matches
+            .iter()
+            .all(|found| found.path.starts_with("owner/"))
+    );
+    assert!(output.coverage.files_scanned <= 20);
+    assert!(output.coverage.bytes_scanned <= 500 * 1024);
+    assert!(!output.truncated);
+    assert!(output.coverage_complete);
+    assert!(output.coverage.walked_entries >= output.coverage.files_scanned);
+    assert!(output.coverage.ignored_entries <= output.coverage.walked_entries);
+    assert!(output.diagnostics.traversal_micros <= output.diagnostics.total_micros);
+    assert!(output.diagnostics.file_scan_match_micros <= output.diagnostics.traversal_micros);
+    assert!(output.diagnostics.projection_micros <= output.diagnostics.total_micros);
+    assert!(
+        output
+            .diagnostics
+            .first_match_micros
+            .is_some_and(|duration| duration <= output.diagnostics.total_micros)
+    );
+}
+
+#[test]
+fn projection_is_deterministic_and_keeps_the_sorted_fitting_prefix() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let line = format!("needle {}\n", "x".repeat(SOURCE_SEARCH_MAX_LINE_BYTES));
+    fs::write(repo.path().join("b.rs"), line.repeat(100)).expect("write b");
+    fs::write(repo.path().join("a.rs"), line.repeat(100)).expect("write a");
+    let mut options = search_options(repo.path(), "needle");
+    options.max_matches = SOURCE_SEARCH_MAX_MATCHES;
+
+    let first = search_source(options.clone()).expect("first search");
+    let second = search_source(options).expect("second search");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        first.truncated_reason,
+        Some(SourceTruncatedReason::MaxResultBytes)
+    );
+    assert!(first.coverage.result_bytes <= SOURCE_SEARCH_MAX_RESULT_BYTES);
+    assert!(first.matches.windows(2).all(|pair| {
+        pair[0]
+            .path
+            .cmp(&pair[1].path)
+            .then_with(|| pair[0].line_number.cmp(&pair[1].line_number))
+            .is_le()
+    }));
+    assert_eq!(
+        first.coverage.result_bytes,
+        serde_json::to_vec_pretty(&first)
+            .expect("serialize projected output")
+            .len()
+            + 1
     );
 }

@@ -8,8 +8,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-const MANAGED_ROOT_WARNING_THRESHOLD: usize = 96;
-const MANAGED_ROOT_LIMIT: usize = 128;
+const MANAGED_ROOT_WARNING_THRESHOLD: usize = 384;
+const MANAGED_ROOT_LIMIT: usize = 512;
 
 static MANAGED_ROOT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_MANAGED_ROOT_ID: AtomicU64 = AtomicU64::new(1);

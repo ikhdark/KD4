@@ -30,11 +30,51 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use codex_utils_output_truncation::truncate_text;
+use sha2::Digest;
+use sha2::Sha256;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex as StdMutex;
+
+const PREPARED_HISTORY_POLICY_VERSION: u16 = 1;
+const PREPARED_HISTORY_HASH_DOMAIN: &[u8] = b"codex.pending-turn.prepared-history.v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedHistoryPolicy {
+    version: u16,
+    supports_images: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedPromptInput {
+    items: Arc<[ResponseItem]>,
+    fingerprint: Option<[u8; 32]>,
+    policy: PreparedHistoryPolicy,
+}
+
+impl PreparedPromptInput {
+    pub(crate) fn items(&self) -> &[ResponseItem] {
+        &self.items
+    }
+
+    pub(crate) fn shared_items(&self) -> Arc<[ResponseItem]> {
+        Arc::clone(&self.items)
+    }
+
+    pub(crate) fn fingerprint(&self) -> Option<[u8; 32]> {
+        self.fingerprint
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedHistoryCacheEntry {
+    source_items: Arc<Vec<ResponseItem>>,
+    projection_revision: u64,
+    prepared: PreparedPromptInput,
+}
 
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
@@ -45,6 +85,8 @@ pub(crate) struct ContextManager {
     items: Arc<Vec<ResponseItem>>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
+    projection_revision: u64,
+    prepared_history: Arc<StdMutex<Option<PreparedHistoryCacheEntry>>>,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -66,6 +108,8 @@ impl ContextManager {
         Self {
             items: Arc::new(Vec::new()),
             history_version: 0,
+            projection_revision: 0,
+            prepared_history: Arc::new(StdMutex::new(None)),
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
@@ -127,6 +171,8 @@ impl ContextManager {
         I: IntoIterator,
         I::Item: std::ops::Deref<Target = ResponseItem>,
     {
+        let pre_append_source = Arc::clone(&self.items);
+        let mut appended = Vec::new();
         for item in items {
             let item_ref = item.deref();
             if !is_api_message(item_ref) {
@@ -134,7 +180,11 @@ impl ContextManager {
             }
 
             let processed = self.process_item(item_ref, policy);
-            Arc::make_mut(&mut self.items).push(processed);
+            Arc::make_mut(&mut self.items).push(processed.clone());
+            appended.push(processed);
+        }
+        if !appended.is_empty() {
+            self.advance_prepared_history_for_append(&appended, &pre_append_source);
         }
     }
 
@@ -142,10 +192,57 @@ impl ContextManager {
     /// normalization and drops un-suited items. When `input_modalities` does not
     /// include `InputModality::Image`, images are stripped from messages and tool
     /// outputs.
-    pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
+    pub(crate) fn for_prompt(self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
+        self.prepare_for_prompt(input_modalities).items().to_vec()
+    }
+
+    pub(crate) fn prepare_for_prompt(
+        mut self,
+        input_modalities: &[InputModality],
+    ) -> PreparedPromptInput {
+        let policy = PreparedHistoryPolicy {
+            version: PREPARED_HISTORY_POLICY_VERSION,
+            supports_images: input_modalities.contains(&InputModality::Image),
+        };
+        let source_items = Arc::clone(&self.items);
+        if crate::latency_switches::history_identity_enabled()
+            && let Some(prepared) = self
+                .prepared_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .filter(|entry| {
+                    Arc::ptr_eq(&entry.source_items, &source_items)
+                        && entry.projection_revision == self.projection_revision
+                        && entry.prepared.policy == policy
+                })
+                .map(|entry| entry.prepared.clone())
+        {
+            return prepared;
+        }
         evict_resolved_reasoning(Arc::make_mut(&mut self.items));
         self.normalize_history(input_modalities);
-        Arc::unwrap_or_clone(self.items)
+        let items: Arc<[ResponseItem]> = Arc::from(Arc::unwrap_or_clone(self.items));
+        let fingerprint = crate::latency_switches::history_identity_enabled()
+            .then(|| prepared_history_fingerprint(&items, policy).ok())
+            .flatten();
+        let prepared = PreparedPromptInput {
+            items,
+            fingerprint,
+            policy,
+        };
+        if crate::latency_switches::history_identity_enabled() && prepared.fingerprint.is_some() {
+            *self
+                .prepared_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(PreparedHistoryCacheEntry {
+                    source_items,
+                    projection_revision: self.projection_revision,
+                    prepared: prepared.clone(),
+                });
+        }
+        prepared
     }
 
     /// Returns raw items in the history.
@@ -207,6 +304,7 @@ impl ContextManager {
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);
+        self.invalidate_prepared_history();
         self.world_state_baseline = None;
     }
 
@@ -245,6 +343,7 @@ impl ContextManager {
         }
         if replaced {
             self.history_version = self.history_version.saturating_add(1);
+            self.invalidate_prepared_history();
         }
         replaced
     }
@@ -468,6 +567,71 @@ impl ContextManager {
         }
         cut_idx
     }
+}
+
+impl ContextManager {
+    fn advance_prepared_history_for_append(
+        &mut self,
+        appended: &[ResponseItem],
+        pre_append_source: &Arc<Vec<ResponseItem>>,
+    ) {
+        let previous_revision = self.projection_revision;
+        self.projection_revision = self.projection_revision.saturating_add(1);
+        let mut cache = self
+            .prepared_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = cache.take() else {
+            return;
+        };
+        if !Arc::ptr_eq(&entry.source_items, pre_append_source)
+            || entry.projection_revision != previous_revision
+            || !appended
+                .iter()
+                .all(|item| matches!(item, ResponseItem::Reasoning { .. }))
+        {
+            return;
+        }
+        let mut items = entry.prepared.items.to_vec();
+        items.extend_from_slice(appended);
+        let items: Arc<[ResponseItem]> = items.into();
+        let Ok(fingerprint) = prepared_history_fingerprint(&items, entry.prepared.policy) else {
+            return;
+        };
+        *cache = Some(PreparedHistoryCacheEntry {
+            source_items: Arc::clone(&self.items),
+            projection_revision: self.projection_revision,
+            prepared: PreparedPromptInput {
+                items,
+                fingerprint: Some(fingerprint),
+                policy: entry.prepared.policy,
+            },
+        });
+    }
+
+    fn invalidate_prepared_history(&mut self) {
+        self.projection_revision = self.projection_revision.saturating_add(1);
+        *self
+            .prepared_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+fn prepared_history_fingerprint(
+    items: &[ResponseItem],
+    policy: PreparedHistoryPolicy,
+) -> serde_json::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(PREPARED_HISTORY_HASH_DOMAIN);
+    hasher.update(policy.version.to_be_bytes());
+    hasher.update([u8::from(policy.supports_images)]);
+    for item in items {
+        let encoded = serde_json::to_vec(item)?;
+        hasher.update((encoded.len() as u64).to_be_bytes());
+        hasher.update(encoded);
+    }
+    Ok(hasher.finalize().into())
 }
 
 pub(crate) fn truncate_function_output_payload(

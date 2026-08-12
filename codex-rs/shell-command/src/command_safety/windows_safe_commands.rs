@@ -1,5 +1,6 @@
 use crate::command_safety::is_safe_command::is_safe_git_command;
 use crate::command_safety::is_trusted_powershell_host;
+use crate::command_safety::powershell_parser::PowershellParseAnalysis;
 use crate::command_safety::powershell_parser::PowershellParseOutcome;
 use crate::command_safety::powershell_parser::parse_with_powershell_ast;
 
@@ -103,7 +104,7 @@ fn parse_powershell_invocation(executable: &str, args: &[String]) -> Option<Vec<
 /// Tokenizes an inline PowerShell script and delegates to the command splitter.
 /// Examples of when this is called: pwsh.exe -Command '<script>' or pwsh.exe -Command:<script>
 fn parse_powershell_script(executable: &str, script: &str) -> Option<Vec<Vec<String>>> {
-    if let PowershellParseOutcome::Commands(commands) =
+    if let PowershellParseOutcome::Analysis(PowershellParseAnalysis { commands, .. }) =
         parse_with_powershell_ast(executable, script)
     {
         Some(commands)

@@ -13,7 +13,7 @@ use crate::exec::ExecCapturePolicy;
 use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
-use crate::sandboxing::execute_env;
+use crate::sandboxing::execute_exec_request_with_after_spawn;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::flat_tool_name;
@@ -47,9 +47,12 @@ use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxablePreference;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
+#[cfg(windows)]
+use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -58,6 +61,8 @@ pub struct ShellRequest {
     /// Semantically equivalent, inspectable command used for approvals and
     /// approval caching when `command` contains an encoded runtime payload.
     pub command_for_approval: Vec<String>,
+    #[cfg(windows)]
+    pub approved_powershell_direct_argv: Option<Vec<String>>,
     pub turn_environment: TurnEnvironment,
     pub shell_type: Option<ShellType>,
     pub hook_command: String,
@@ -74,6 +79,7 @@ pub struct ShellRequest {
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub(crate) known_delta: Option<KnownDeltaShellRequest>,
+    pub(crate) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -319,7 +325,27 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             attempt.windows_sandbox_level,
         );
         let command = if matches!(shell.shell_type, ShellType::PowerShell) {
-            prefix_powershell_script_with_utf8(&command)
+            #[cfg(windows)]
+            {
+                if let Some(approved_command) = req.approved_powershell_direct_argv.as_ref()
+                    && let Some(proof) = prove_noprofile_powershell_command_as_direct_argv(
+                        &command,
+                        req.cwd.as_path(),
+                        &env,
+                    )
+                    && let Some(proven_command) =
+                        proof.into_command_for_state(&command, req.cwd.as_path(), &env)
+                    && &proven_command == approved_command
+                {
+                    proven_command
+                } else {
+                    prefix_powershell_script_with_utf8(&command)
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                prefix_powershell_script_with_utf8(&command)
+            }
         } else {
             command
         };
@@ -354,9 +380,63 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 Some(&req.turn_environment.environment_id),
             )
             .map_err(ToolError::Codex)?;
-        let out = execute_env(env, Self::stdout_stream(ctx))
+        let (authorization_guard, observation_token) = if let Some(launch) =
+            req.validation_launch.as_ref()
+        {
+            let guard = Arc::clone(&ctx.turn.validation_authorization)
+                .read_owned()
+                .await;
+            if guard.revision != launch.authorization_revision
+                && !crate::validation_admission::admission_still_authorized(
+                    &guard,
+                    &launch.invocation,
+                )
+            {
+                let Some(skipped) =
+                    crate::validation_admission::prohibited_skip_for(&guard, &launch.invocation)
+                else {
+                    return Err(ToolError::Rejected(
+                        "validation launch plan did not contain a validation command".to_string(),
+                    ));
+                };
+                return Err(ToolError::ValidationSkipped(skipped));
+            }
+            let token = match (
+                launch.observation.clone(),
+                ctx.session.services.state_db.clone(),
+            ) {
+                (Some(observation), Some(state)) => Some(
+                    crate::validation_admission::ValidationObservationToken::new(
+                        observation,
+                        state,
+                    ),
+                ),
+                _ => None,
+            };
+            (Some(guard), token)
+        } else {
+            (None, None)
+        };
+        let arm_token = observation_token.clone();
+        let after_spawn = authorization_guard.map(|guard| {
+            Box::new(move || {
+                if let Some(token) = arm_token {
+                    token.arm();
+                }
+                drop(guard);
+            }) as Box<dyn FnOnce() + Send>
+        });
+        let out = execute_exec_request_with_after_spawn(env, Self::stdout_stream(ctx), after_spawn)
             .await
             .map_err(ToolError::Codex)?;
+        if let Some(token) = observation_token {
+            let elapsed_ms = u64::try_from(out.duration.as_millis()).unwrap_or(u64::MAX);
+            if req.cancellation_token.is_cancelled() || out.timed_out {
+                token.record_cancelled(elapsed_ms).await;
+            } else {
+                token.record_completed(elapsed_ms).await;
+            }
+        }
         Ok(out)
     }
 }

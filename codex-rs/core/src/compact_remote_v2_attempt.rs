@@ -77,7 +77,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     .await?;
     input.push(ResponseItem::CompactionTrigger {});
     let prompt = Prompt {
-        input,
+        input: input.into(),
         tools: tool_router.model_visible_specs(),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
@@ -109,7 +109,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         compaction_output,
         token_usage,
     } = compaction_output_result?;
-    let mut prompt_input = prompt.input;
+    let mut prompt_input = prompt.input.to_vec();
     let Some(ResponseItem::CompactionTrigger {}) = prompt_input.pop() else {
         unreachable!("remote compaction v2 prompt must end with its synthetic trigger");
     };

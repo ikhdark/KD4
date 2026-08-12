@@ -68,7 +68,7 @@ pub(super) async fn run_remote_compact_attempt(
     )
     .await?;
     let prompt = Prompt {
-        input: prompt_input,
+        input: prompt_input.into(),
         tools: tool_router.model_visible_specs(),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,

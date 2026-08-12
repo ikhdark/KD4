@@ -95,8 +95,15 @@ impl LiveThread {
     ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
         let history_mode = params.history_mode;
-        let metadata_sync = ThreadMetadataSync::for_create(&params).await;
-        thread_store.create_thread(params).await?;
+        let repository_context =
+            ThreadMetadataSync::collect_repository_context_for_create(&params).await;
+        let git_info = repository_context
+            .as_ref()
+            .map(ThreadMetadataSync::git_info_from_repository_context);
+        let metadata_sync = ThreadMetadataSync::for_create_with_git_info(&params, git_info.clone());
+        thread_store
+            .create_thread_with_repository_context(params, repository_context)
+            .await?;
         Ok(Self {
             thread_id,
             history_mode,

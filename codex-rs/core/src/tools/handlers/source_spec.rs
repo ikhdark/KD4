@@ -1,6 +1,8 @@
 use codex_file_search::source_search::SOURCE_READ_MAX_LINES;
 use codex_file_search::source_search::SOURCE_SEARCH_MAX_CONTEXT_LINES;
 use codex_file_search::source_search::SOURCE_SEARCH_MAX_MATCHES;
+use codex_file_search::task_locator::LOCATE_TASK_MAX_FILES;
+use codex_file_search::task_locator::LOCATE_TASK_MAX_SOURCE_BYTES;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
@@ -8,6 +10,7 @@ use std::collections::BTreeMap;
 
 pub(crate) const SEARCH_SOURCE_TOOL_NAME: &str = "search_source";
 pub(crate) const READ_FILE_SPAN_TOOL_NAME: &str = "read_file_span";
+pub(crate) const LOCATE_TASK_TOOL_NAME: &str = "locate_task";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SourceToolOptions {
@@ -29,7 +32,7 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
                     "Repo-relative file or directory to search.".to_string(),
                 )),
                 Some(
-                    "Optional confined search roots. Empty searches the repository root."
+                    "Optional confined search roots. When ownership is unknown, call locate_task once and reuse its owner or closure paths here. Empty remains valid for deliberate repository-wide searches."
                         .to_string(),
                 ),
             ),
@@ -67,7 +70,7 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
 
     ToolSpec::Function(ResponsesApiTool {
         name: SEARCH_SOURCE_TOOL_NAME.to_string(),
-        description: "Search repository source with fixed-string matching and hard scan/result limits. This tool supports local environments only. Results include repo-relative 1-based line-span evidence citations."
+        description: "Search repository source with fixed-string matching and hard scan/result limits. Prefer ownership-scoped paths: when the owner is unknown, call locate_task once and reuse its owner or closure paths. Use empty paths only for deliberate repository-wide work. This tool supports local environments only. Results include repo-relative 1-based line-span evidence citations."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -76,6 +79,56 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
             Some(vec!["query".to_string()]),
             Some(false.into()),
         ),
+        output_schema: None,
+    })
+}
+
+pub(crate) fn create_locate_task_tool(options: SourceToolOptions) -> ToolSpec {
+    let mut properties = BTreeMap::from([
+        (
+            "task".to_string(),
+            JsonSchema::string(Some(
+                "Concrete task description used for deterministic owner routing.".to_string(),
+            )),
+        ),
+        (
+            "path_anchor".to_string(),
+            JsonSchema::string(Some(
+                "Optional exact repository-relative file or directory anchor.".to_string(),
+            )),
+        ),
+        (
+            "symbol_anchor".to_string(),
+            JsonSchema::string(Some("Optional exact source symbol anchor.".to_string())),
+        ),
+        (
+            "max_files".to_string(),
+            JsonSchema::integer(Some(format!(
+                "Maximum eligible files in the selected closure; hard-capped at {LOCATE_TASK_MAX_FILES}."
+            ))),
+        ),
+        (
+            "max_source_bytes".to_string(),
+            JsonSchema::integer(Some(format!(
+                "Maximum aggregate captured source bytes; hard-capped at {LOCATE_TASK_MAX_SOURCE_BYTES}."
+            ))),
+        ),
+        (
+            "force_fresh".to_string(),
+            JsonSchema::boolean(Some(
+                "Discard reusable syntax evidence for this query; defaults to false.".to_string(),
+            )),
+        ),
+    ]);
+    add_environment_id(&mut properties, options);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: LOCATE_TASK_TOOL_NAME.to_string(),
+        description: "Locate the owner, implementation span, source neighborhoods, conservative relationships, contracts, tests, validation, and governing instructions from one shared parser-backed source index. Call once and reuse the result for the same task and snapshot. Use read_file_span only for an exact missing detail; use narrowed search_source or an anchored locate_task for unresolved ambiguity. Local environments only; output is deterministically capped at 8 KiB."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(properties, Some(vec!["task".to_string()]), Some(false.into())),
         output_schema: None,
     })
 }

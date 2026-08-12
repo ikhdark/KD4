@@ -1,0 +1,114 @@
+schema_version = 1
+
+[[owners]]
+id = "app-server-runtime"
+concern_ids = ["app-server", "desktop-protocol"]
+aliases = ["app server", "desktop app server"]
+phrases = ["json rpc app server protocol"]
+roots = ["codex-rs/app-server"]
+primary_entries = [{ path = "codex-rs/app-server/src/lib.rs", symbol = "run_main" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = []
+contracts = []
+generated_mirrors = []
+tests = ["codex-rs/app-server/tests"]
+
+[[owners.validation]]
+id = "app-server-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-app-server"]
+role = "focused_tests"
+
+[[owners]]
+id = "cli-entrypoints"
+concern_ids = ["cli", "command-routing"]
+aliases = ["codex cli", "command line entrypoint"]
+phrases = ["cli command routing"]
+roots = ["codex-rs/cli"]
+primary_entries = [{ path = "codex-rs/cli/src/main.rs", symbol = "main" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = []
+contracts = []
+generated_mirrors = []
+tests = ["codex-rs/cli/tests"]
+
+[[owners.validation]]
+id = "cli-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-cli"]
+role = "focused_tests"
+
+[[owners]]
+id = "core-agent-runtime"
+concern_ids = ["agent-loop", "tool-runtime", "session"]
+aliases = ["agent runtime", "core session"]
+phrases = ["codex agent loop runtime"]
+roots = ["codex-rs/core/src"]
+primary_entries = [{ path = "codex-rs/core/src/session/mod.rs", symbol = "Codex" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = ["codex-rs/cli"]
+contracts = []
+generated_mirrors = []
+tests = ["codex-rs/core/tests"]
+
+[[owners.validation]]
+id = "core-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-core"]
+role = "focused_tests"
+
+[[owners]]
+id = "feature-registry"
+concern_ids = ["features", "rollout"]
+aliases = ["feature registry", "feature flag"]
+phrases = ["default feature rollout"]
+roots = ["codex-rs/features"]
+primary_entries = [{ path = "codex-rs/features/src/lib.rs", symbol = "Feature" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = ["codex-rs/core/src/config/managed_features.rs"]
+contracts = ["kd4_features.toml"]
+generated_mirrors = []
+tests = ["codex-rs/features/src/tests.rs"]
+
+[[owners.validation]]
+id = "features-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-features"]
+role = "focused_tests"
+
+[[owners]]
+id = "source-discovery"
+concern_ids = ["source-index", "source-tools", "task-location"]
+aliases = ["locate_task", "source locator", "source evidence index"]
+phrases = ["shared kd4 source index", "parser backed task location"]
+roots = [
+  "codex-rs/file-search/src",
+  "codex-rs/core/src/tools/handlers/source.rs",
+  "codex-rs/core/src/tools/handlers/source_spec.rs",
+  "codex-rs/core/src/tools/spec_plan.rs",
+]
+primary_entries = [
+  { path = "codex-rs/file-search/src/task_locator.rs", symbol = "locate_task" },
+  { path = "codex-rs/core/src/tools/handlers/source.rs", symbol = "LocateTaskHandler" },
+]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = ["codex-rs/core/src/agent/task_capabilities.rs"]
+contracts = ["source_owners.toml", "docs/source-tools.md"]
+generated_mirrors = ["SOURCEMAP.md"]
+tests = [
+  "codex-rs/file-search/src/task_locator_tests.rs",
+  "codex-rs/core/src/tools/handlers/source_tests.rs",
+  "codex-rs/core/src/tools/spec_plan_tests.rs",
+]
+
+[[owners.validation]]
+id = "file-search-locator-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-file-search", "task_locator"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "core-source-tools-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-core", "source_tools"]
+role = "focused_tests"

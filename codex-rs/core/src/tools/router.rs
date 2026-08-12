@@ -16,6 +16,7 @@ use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::build_tool_router;
+use crate::tools::tool_dispatch_trace::record_authorization_state_coordination;
 use codex_agent_task_store::AttemptState;
 use codex_git_utils::get_git_repo_root;
 use codex_mcp::ToolInfo;
@@ -36,6 +37,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use tracing::warn;
@@ -343,13 +345,16 @@ impl ToolRouter {
             &call,
             external_mutation_intent,
         )?;
-        authorize_bound_typed_tool_call(
+        let authorization_state_started = Instant::now();
+        let authorization_result = authorize_bound_typed_tool_call(
             session.as_ref(),
             step_context.as_ref(),
             &call,
             external_mutation_intent,
         )
-        .await?;
+        .await;
+        record_authorization_state_coordination(authorization_state_started.elapsed());
+        authorization_result?;
         let ToolCall {
             tool_name,
             call_id,

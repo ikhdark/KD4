@@ -10704,7 +10704,7 @@ async fn steer_input_enforces_expected_turn_id() {
     .await;
 
     let steer_input = vec![UserInput::Text {
-        text: "steer".to_string(),
+        text: "Run focused tests.".to_string(),
         text_elements: Vec::new(),
     }];
     let err = sess
@@ -10727,6 +10727,7 @@ async fn steer_input_enforces_expected_turn_id() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+    assert_eq!(tc.validation_authorization.read().await.revision, 0);
 }
 
 #[tokio::test]
@@ -10745,7 +10746,7 @@ async fn steer_input_rejects_non_regular_turns() {
         }];
         let turn_context = sess.new_default_turn_with_sub_id("turn".to_string()).await;
         sess.spawn_task(
-            turn_context,
+            Arc::clone(&turn_context),
             input,
             NeverEndingTask {
                 kind: task_kind,
@@ -10755,7 +10756,7 @@ async fn steer_input_rejects_non_regular_turns() {
         .await;
 
         let steer_input = vec![UserInput::Text {
-            text: "steer".to_string(),
+            text: "Run focused tests.".to_string(),
             text_elements: Vec::new(),
         }];
         let err = sess
@@ -10770,6 +10771,10 @@ async fn steer_input_rejects_non_regular_turns() {
             .expect_err("steering a non-regular turn should fail");
 
         assert_eq!(err, SteerInputError::ActiveTurnNotSteerable { turn_kind });
+        assert_eq!(
+            turn_context.validation_authorization.read().await.revision,
+            0
+        );
 
         sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
@@ -10796,7 +10801,7 @@ async fn steer_input_returns_active_turn_id() {
     .await;
 
     let steer_input = vec![UserInput::Text {
-        text: "steer".to_string(),
+        text: "Run focused tests.".to_string(),
         text_elements: Vec::new(),
     }];
     let turn_id = sess
@@ -10811,6 +10816,7 @@ async fn steer_input_returns_active_turn_id() {
         .expect("steering with matching expected turn id should succeed");
 
     assert_eq!(turn_id, tc.sub_id);
+    assert_eq!(tc.validation_authorization.read().await.revision, 1);
     assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
 }
 
@@ -11093,9 +11099,11 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         cancellation_token: CancellationToken::new(),
     };
 
-    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
-        .await
-        .expect("tool call should be handled");
+    let output = handle_output_item_done(
+        &mut ctx, item, /*previously_active_item*/ None, &mut true,
+    )
+    .await
+    .expect("tool call should be handled");
 
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_some());

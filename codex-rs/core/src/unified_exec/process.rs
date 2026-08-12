@@ -87,6 +87,7 @@ pub(crate) struct UnifiedExecProcess {
     output_closed: Arc<AtomicBool>,
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
+    termination_requested: AtomicBool,
     output_drained: Arc<Notify>,
     interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
@@ -132,6 +133,7 @@ impl UnifiedExecProcess {
             output_closed,
             output_closed_notify,
             cancellation_token,
+            termination_requested: AtomicBool::new(false),
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
             state_tx,
@@ -245,6 +247,7 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn terminate(&self) {
+        self.termination_requested.store(true, Ordering::Release);
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -258,6 +261,7 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
+        self.termination_requested.store(true, Ordering::Release);
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -273,6 +277,7 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn interrupt(&self) -> Result<(), UnifiedExecError> {
+        self.termination_requested.store(true, Ordering::Release);
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle
                 .signal(PtyProcessSignal::Interrupt)
@@ -282,6 +287,10 @@ impl UnifiedExecProcess {
                 .await
                 .map_err(|err| UnifiedExecError::process_failed(err.to_string())),
         }
+    }
+
+    pub(super) fn termination_was_requested(&self) -> bool {
+        self.termination_requested.load(Ordering::Acquire)
     }
 
     pub(super) fn fail_and_terminate(&self, message: String) {

@@ -24,6 +24,8 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
@@ -63,7 +65,6 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
 
 pub(crate) use errors::UnifiedExecError;
 pub(crate) use process::NoopSpawnLifecycle;
-#[cfg(unix)]
 pub(crate) use process::SpawnLifecycle;
 pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
@@ -126,6 +127,8 @@ pub(crate) struct ExecCommandRequest {
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub cwd: PathUri,
+    #[cfg(windows)]
+    pub normalization_cwd: Option<PathBuf>,
     pub sandbox_cwd: PathUri,
     pub turn_environment: TurnEnvironment,
     pub shell_mode: UnifiedExecShellMode,
@@ -142,6 +145,12 @@ pub(crate) struct ExecCommandRequest {
     /// Held until the terminal command-evidence event is emitted, including for detached
     /// processes whose repository lease has already been finalized.
     pub completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
+    pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
+    pub validation_observation:
+        Arc<StdMutex<Option<crate::validation_admission::ValidationObservationToken>>>,
+    pub validation_leader:
+        Arc<StdMutex<Option<crate::validation_admission::ValidationLeaderOwnership>>>,
+    pub validation_waiter: Option<crate::validation_admission::ValidationLeader>,
 }
 
 impl Drop for ExecCommandRequest {

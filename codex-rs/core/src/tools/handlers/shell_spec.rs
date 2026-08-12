@@ -6,6 +6,8 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
+const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandToolOptions {
     pub allow_login_shell: bool,
@@ -27,10 +29,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
-            JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and shell builtins. For a standalone executable, prefer `kind: \"argv\"`; for complex PowerShell, prefer `kind: \"powershell_script\"`."
-                    .to_string(),
-            )),
+            JsonSchema::string(Some(LEGACY_SHELL_SCRIPT_DESCRIPTION.to_string())),
         ),
         (
             "kind".to_string(),
@@ -192,10 +191,7 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
-            JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and shell builtins. For a standalone executable, prefer `kind: \"argv\"`; for complex PowerShell, prefer `kind: \"powershell_script\"`."
-                    .to_string(),
-            )),
+            JsonSchema::string(Some(LEGACY_SHELL_SCRIPT_DESCRIPTION.to_string())),
         ),
         (
             "kind".to_string(),

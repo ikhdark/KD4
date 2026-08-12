@@ -9,7 +9,12 @@ use super::response_item_may_include_external_context;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::ToolRouter;
+use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolInvocation;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
+use crate::tools::registry::ToolRegistry;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
@@ -26,7 +31,46 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
+
+struct PersistenceProbeHandler {
+    started: Arc<AtomicBool>,
+}
+
+impl ToolExecutor<ToolInvocation> for PersistenceProbeHandler {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        codex_tools::ToolName::plain("search_source")
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: "search_source".to_string(),
+            description: "Persistence ordering probe.".to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+        })
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        self.started.store(true, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(
+                Box::new(FunctionToolOutput::from_text("ok".to_string(), Some(true)))
+                    as Box<dyn crate::tools::context::ToolOutput>,
+            )
+        })
+    }
+}
+
+impl CoreToolRuntime for PersistenceProbeHandler {}
 
 fn assistant_output_text(text: &str) -> ResponseItem {
     assistant_output_text_with_phase(text, /*phase*/ None)
@@ -299,9 +343,11 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
         cancellation_token: CancellationToken::new(),
     };
 
-    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
-        .await
-        .expect("assistant message should complete");
+    let output = handle_output_item_done(
+        &mut ctx, item, /*previously_active_item*/ None, &mut true,
+    )
+    .await
+    .expect("assistant message should complete");
 
     assert_eq!(
         output.last_agent_message.as_deref(),
@@ -345,9 +391,11 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
         cancellation_token: CancellationToken::new(),
     };
 
-    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
-        .await
-        .expect("malformed tool_search call should be recorded for model recovery");
+    let output = handle_output_item_done(
+        &mut ctx, item, /*previously_active_item*/ None, &mut true,
+    )
+    .await
+    .expect("malformed tool_search call should be recorded for model recovery");
 
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_none());
@@ -373,6 +421,68 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     assert_eq!(status, "incomplete");
     assert_eq!(execution, "client");
     assert!(tools.is_empty());
+}
+
+#[tokio::test]
+async fn completed_tool_call_is_persisted_before_its_future_can_start() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let started = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(PersistenceProbeHandler {
+        started: Arc::clone(&started),
+    }) as Arc<dyn CoreToolRuntime>;
+    let router = Arc::new(ToolRouter::from_parts(
+        ToolRegistry::from_tools([handler]),
+        Vec::new(),
+    ));
+    let step_context =
+        StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
+    let tool_runtime = ToolCallRuntime::new(
+        Arc::clone(&session),
+        step_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+    );
+    let item = ResponseItem::FunctionCall {
+        id: None,
+        name: "search_source".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "persisted-read".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+    };
+    let mut eager_prefix_open = true;
+
+    let output = handle_output_item_done(
+        &mut ctx,
+        item,
+        /*previously_active_item*/ None,
+        &mut eager_prefix_open,
+    )
+    .await
+    .expect("read-safe tool call should be accepted");
+
+    assert!(output.eager_read_eligible);
+    assert!(!started.load(Ordering::SeqCst));
+    let history = session.clone_history().await;
+    let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
+        panic!("completed tool call must be persisted before dispatch")
+    };
+    assert_eq!(call_id, "persisted-read");
+
+    output
+        .tool_future
+        .expect("accepted tool call should retain its lazy future")
+        .await
+        .expect("persistence probe handler should succeed");
+    assert!(started.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

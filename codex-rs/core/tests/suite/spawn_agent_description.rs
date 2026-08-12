@@ -195,7 +195,7 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
     );
     assert!(
         description.contains(
-            "Spawned agents use `gpt-5.6-sol` with `xhigh` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If a model override does not support `xhigh`, also set `reasoning_effort` to a supported value listed for that model."
+            "Spawned agents use `gpt-5.6-sol` with `high` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If a model override does not support `high`, also set `reasoning_effort` to a supported value listed for that model."
         ),
         "expected built-in model and reasoning defaults in spawn_agent description: {description:?}"
     );

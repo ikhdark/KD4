@@ -594,6 +594,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         /*deferred_log_file_info*/ None,
         /*meta*/ None,
         home.path().to_path_buf(),
+        /*known_repository_context*/ None,
         rollout_path.clone(),
         Default::default(),
     );
@@ -623,6 +624,7 @@ fn writer_state_deduplicates_manifests_and_coalesces_token_counts() {
         /*deferred_log_file_info*/ None,
         /*meta*/ None,
         home.path().to_path_buf(),
+        /*known_repository_context*/ None,
         rollout_path,
         HashSet::from(["already-persisted".to_string()]),
     );
@@ -701,6 +703,7 @@ async fn deferred_writer_reuses_existing_session_metadata_and_manifests() -> std
             ..SessionMeta::default()
         }),
         home.path().to_path_buf(),
+        /*known_repository_context*/ None,
         rollout_path.clone(),
         HashSet::new(),
     );
@@ -772,6 +775,7 @@ async fn assert_failed_append_is_written_once(
         /*deferred_log_file_info*/ None,
         /*meta*/ None,
         home.path().to_path_buf(),
+        /*known_repository_context*/ None,
         rollout_path.clone(),
         Default::default(),
     );

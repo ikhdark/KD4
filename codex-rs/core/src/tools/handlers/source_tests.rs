@@ -3,13 +3,17 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::ToolCallSource;
+use crate::tools::known_delta_store;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_core_skills::SkillLoadOutcome;
 use codex_core_skills::SkillMetadata;
+use codex_exec_server::Environment;
 use codex_exec_server::LocalFileSystem;
+use codex_features::Feature;
 use codex_file_search::source_search::SourceLine;
 use codex_file_search::source_search::SourceSearchCoverage;
+use codex_file_search::source_search::SourceSearchDiagnostics;
 use codex_file_search::source_search::SourceSearchMatch;
 use codex_file_search::source_search::SourceTruncatedReason;
 use codex_file_system::CopyOptions;
@@ -210,7 +214,11 @@ fn sample_search_output(text: String) -> SourceSearchOutput {
         roots: vec![".".to_string()],
         truncated: false,
         truncated_reason: None,
+        coverage_complete: true,
+        coverage_note: None,
         coverage: SourceSearchCoverage {
+            walked_entries: 1,
+            ignored_entries: 0,
             files_scanned: 1,
             files_skipped_too_large: 0,
             files_skipped_non_utf8: 0,
@@ -238,6 +246,7 @@ fn sample_search_output(text: String) -> SourceSearchOutput {
                 text_truncated: false,
             }],
         }],
+        diagnostics: SourceSearchDiagnostics::default(),
     }
 }
 
@@ -248,6 +257,26 @@ fn search_render_includes_explicit_line_span_evidence() {
     let rendered = render_search_output(&output);
     assert!(rendered.contains("citation: src/lib.rs:7-9 (match line 8)"));
     assert!(rendered.contains("     8 | needle"));
+}
+
+#[test]
+fn capped_search_render_discloses_incomplete_coverage() {
+    let mut output = sample_search_output("needle".to_string());
+    output.truncated = true;
+    output.truncated_reason = Some(SourceTruncatedReason::WalkLimit);
+    output.coverage_complete = false;
+    output.coverage_note = Some(
+        "No matches were found in the scanned portion of the repository. Narrow with paths or use locate_task."
+            .to_string(),
+    );
+    output.matches.clear();
+    output.coverage.matches_returned = 0;
+
+    let rendered = render_search_output(&output);
+
+    assert!(rendered.contains("coverage: complete=false"));
+    assert!(rendered.contains("No matches were found in the scanned portion"));
+    assert!(rendered.contains("paths or use locate_task"));
 }
 
 #[test]
@@ -609,6 +638,141 @@ async fn search_handler_reads_through_selected_local_filesystem() {
 }
 
 #[tokio::test]
+async fn bounded_read_bypasses_known_delta_and_preserves_fresh_worktree_evidence() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let source_cwd = source_dir.abs();
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(source_cwd.as_path())
+            .env("GIT_AUTHOR_NAME", "Codex Test")
+            .env("GIT_AUTHOR_EMAIL", "codex@example.com")
+            .env("GIT_COMMITTER_NAME", "Codex Test")
+            .env("GIT_COMMITTER_EMAIL", "codex@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_git(&["init"]);
+    std::fs::create_dir(source_cwd.join("src").as_path()).expect("create src");
+    let tracked = "tracked one\nmiddle\nend\n";
+    let modified = "modified worktree contents\nmiddle\nend\n";
+    let source_path = source_cwd.join("src/lib.rs");
+    std::fs::write(source_path.as_path(), tracked).expect("write tracked source");
+    run_git(&["add", "src/lib.rs"]);
+    run_git(&["commit", "-m", "initial"]);
+
+    replace_primary_environment_cwd(&mut turn, source_cwd);
+    turn.permission_profile = PermissionProfile::Disabled;
+    let mut config = (*turn.config).clone();
+    let _ = config.features.enable(Feature::KnownDeltaStore);
+    turn.config = Arc::new(config);
+    let turn = Arc::new(turn);
+    let session = Arc::new(session);
+
+    let default_payload = ToolPayload::Function {
+        arguments: json!({
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "line_count": 3
+        })
+        .to_string(),
+    };
+    let ((default_result, default_reads), default_known_delta) =
+        known_delta_store::test_observation::observe(test_observation::observe(
+            ReadFileSpanHandler::new(false).handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                turn: Arc::clone(&turn),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "call-read-file-span-direct-default".to_string(),
+                tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+                source: ToolCallSource::Direct,
+                payload: default_payload.clone(),
+            }),
+        ))
+        .await;
+    let default_output = default_result.expect("default bounded read should succeed");
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        default_output.to_response_item("call-read-file-span-direct-default", &default_payload)
+    else {
+        panic!("expected function call output");
+    };
+    assert_eq!(output.success, Some(true));
+    let text = output.body.to_text().expect("text output");
+    assert!(text.contains("citation: src/lib.rs:1-3"), "{text}");
+    assert!(text.contains("     1 | tracked one"), "{text}");
+    assert_eq!(default_reads.successful_content_reads, 1);
+    assert_eq!(default_known_delta.lookup_calls, 0);
+    assert_eq!(default_known_delta.fingerprint_git_subprocesses, 0);
+
+    std::fs::write(source_path.as_path(), modified).expect("modify tracked source");
+    let fresh_payload = ToolPayload::Function {
+        arguments: json!({
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "line_count": 3,
+            "force_fresh": true
+        })
+        .to_string(),
+    };
+    let ((fresh_result, fresh_reads), fresh_known_delta) =
+        known_delta_store::test_observation::observe(test_observation::observe(
+            ReadFileSpanHandler::new(false).handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                turn: Arc::clone(&turn),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "call-read-file-span-direct-force-fresh".to_string(),
+                tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+                source: ToolCallSource::Direct,
+                payload: fresh_payload.clone(),
+            }),
+        ))
+        .await;
+    let fresh_output = fresh_result.expect("force-fresh bounded read should succeed");
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        fresh_output.to_response_item("call-read-file-span-direct-force-fresh", &fresh_payload)
+    else {
+        panic!("expected function call output");
+    };
+    assert_eq!(output.success, Some(true));
+    let text = output.body.to_text().expect("text output");
+    assert!(text.contains("citation: src/lib.rs:1-3"), "{text}");
+    assert!(
+        text.contains("     1 | modified worktree contents"),
+        "{text}"
+    );
+    assert_eq!(fresh_reads.successful_content_reads, 1);
+    assert_eq!(fresh_known_delta.lookup_calls, 0);
+    assert_eq!(fresh_known_delta.fingerprint_git_subprocesses, 0);
+
+    let coordinator = session.services.agent_control.task_coordinator();
+    let store = coordinator
+        .store()
+        .expect("bounded read lazily initializes durable coordination");
+    let actor_id = format!("root:{}", session.services.agent_control.session_id());
+    let manifest = store
+        .supporting_read_manifest(source_dir.path(), actor_id, vec!["src/lib.rs".to_string()])
+        .await
+        .expect("bounded read persists its supporting manifest");
+    assert_eq!(manifest.len(), 1);
+    assert_eq!(manifest[0].path, "src/lib.rs");
+    assert!(manifest[0].existed);
+    assert_eq!(
+        manifest[0].content_hash.as_deref(),
+        Some(format!("{:x}", Sha256::digest(modified.as_bytes())).as_str())
+    );
+}
+
+#[tokio::test]
 async fn supporting_read_coordination_cannot_hold_up_source_output() {
     let started = tokio::time::Instant::now();
 
@@ -933,4 +1097,237 @@ async fn source_handlers_reject_environment_id_when_not_advertised() {
         panic!("expected read parse error");
     };
     assert!(read_message.contains("unknown field `environment_id`"));
+}
+
+#[tokio::test]
+async fn source_handlers_select_local_environment_and_reject_remote_environment() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let source_cwd = source_dir.abs();
+    std::fs::create_dir(source_cwd.join(".git").as_path()).expect("create git marker");
+    std::fs::create_dir(source_cwd.join("src").as_path()).expect("create source directory");
+    std::fs::write(source_cwd.join("src/lib.rs").as_path(), "needle\n").expect("write source file");
+    replace_primary_environment_cwd(&mut turn, source_cwd);
+    turn.permission_profile = PermissionProfile::Disabled;
+
+    let local_environment_id = turn.environments.turn_environments[0]
+        .environment_id
+        .clone();
+    let mut remote_environment = turn.environments.turn_environments[0].clone();
+    remote_environment.environment_id = "remote-source".to_string();
+    remote_environment.environment = Arc::new(
+        Environment::create_for_tests(Some("ws://127.0.0.1:1/source-tools-remote".to_string()))
+            .expect("remote test environment"),
+    );
+    let remote_environment_id = remote_environment.environment_id.clone();
+    turn.environments.turn_environments.push(remote_environment);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let local_payload = ToolPayload::Function {
+        arguments: json!({
+            "query": "needle",
+            "environment_id": local_environment_id,
+        })
+        .to_string(),
+    };
+    SearchSourceHandler::new(true)
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-search-source-local-selection".to_string(),
+            tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: local_payload,
+        })
+        .await
+        .expect("selected local source search should succeed");
+
+    let remote_payload = ToolPayload::Function {
+        arguments: json!({
+            "query": "needle",
+            "environment_id": "remote-source",
+        })
+        .to_string(),
+    };
+    let remote_result = SearchSourceHandler::new(true)
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-search-source-remote-selection".to_string(),
+            tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: remote_payload,
+        })
+        .await;
+    let Err(FunctionCallError::RespondToModel(message)) = remote_result else {
+        panic!("expected remote source search to be rejected");
+    };
+    assert!(message.contains("source tools currently support local environments only"));
+
+    ReadFileSpanHandler::new(true)
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-file-span-local-selection".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({
+                    "path": "src/lib.rs",
+                    "environment_id": local_environment_id,
+                })
+                .to_string(),
+            },
+        })
+        .await
+        .expect("local source read succeeds");
+
+    let remote_read_result = ReadFileSpanHandler::new(true)
+        .handle(ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-file-span-remote-selection".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({
+                    "path": "src/lib.rs",
+                    "environment_id": remote_environment_id,
+                })
+                .to_string(),
+            },
+        })
+        .await;
+    let Err(FunctionCallError::RespondToModel(message)) = remote_read_result else {
+        panic!("expected remote source read to be rejected");
+    };
+    assert!(message.contains("source tools currently support local environments only"));
+}
+
+#[cfg(unix)]
+fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).expect("directory symlink is created");
+}
+
+#[cfg(windows)]
+fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+    let status = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()
+        .expect("junction command starts");
+    assert!(status.success(), "directory junction is created");
+}
+
+#[cfg(unix)]
+fn remove_directory_link(link: &std::path::Path) {
+    std::fs::remove_file(link).expect("directory symlink is removed");
+}
+
+#[cfg(windows)]
+fn remove_directory_link(link: &std::path::Path) {
+    std::fs::remove_dir(link).expect("directory junction is removed");
+}
+
+#[tokio::test]
+async fn read_file_span_handler_rejects_symlink_or_junction_escape() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let source_cwd = source_dir.abs();
+    std::fs::create_dir(source_cwd.join(".git").as_path()).expect("create git marker");
+    let outside_dir = tempfile::tempdir().expect("create outside temp dir");
+    std::fs::write(outside_dir.path().join("secret.rs"), "outside secret\n")
+        .expect("write outside source");
+    let link_path = source_cwd.join("escape");
+
+    create_directory_link(outside_dir.path(), link_path.as_path());
+
+    replace_primary_environment_cwd(&mut turn, source_cwd);
+    turn.permission_profile = PermissionProfile::Disabled;
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: json!({"path": "escape/secret.rs"}).to_string(),
+    };
+    let result = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-file-span-symlink-escape".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload,
+        })
+        .await;
+    remove_directory_link(link_path.as_path());
+    let Err(FunctionCallError::RespondToModel(message)) = result else {
+        panic!("expected symlink or junction escape to be rejected");
+    };
+    assert!(
+        message.contains("resolves outside repository root"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn global_git_excludes_are_loaded_without_process_environment_mutation() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let source_cwd = source_dir.abs();
+    std::fs::create_dir(source_cwd.join(".git").as_path()).expect("create git marker");
+    std::fs::write(source_cwd.join("ignored.rs").as_path(), "needle ignored\n")
+        .expect("write ignored source");
+    std::fs::write(source_cwd.join("visible.rs").as_path(), "needle visible\n")
+        .expect("write visible source");
+    replace_primary_environment_cwd(&mut turn, source_cwd.clone());
+    turn.permission_profile = PermissionProfile::Disabled;
+
+    let home = tempfile::tempdir().expect("create home temp dir");
+    let config_root = home.path().join(".config");
+    std::fs::write(
+        home.path().join(".gitconfig"),
+        "[core]\n    excludesfile = ~/.global-ignore\n",
+    )
+    .expect("write git config");
+    std::fs::write(home.path().join(".global-ignore"), "ignored.rs\n")
+        .expect("write global ignore");
+
+    let turn = Arc::new(turn);
+    let invocation = ToolInvocation {
+        session: Arc::new(session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "call-load-global-git-excludes".to_string(),
+        tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: json!({"query": "needle"}).to_string(),
+        },
+    };
+    let context = local_source_context(&invocation, None)
+        .await
+        .expect("resolve local source context");
+    let matcher = SourceIgnoreMatcher::new_preloaded(Some(source_cwd.as_path()));
+    load_global_ignore_rules_from(&context, &matcher, home.path(), &config_root).await;
+
+    assert!(matcher.is_ignored(source_cwd.join("ignored.rs").as_path(), false));
+    assert!(!matcher.is_ignored(source_cwd.join("visible.rs").as_path(), false));
 }

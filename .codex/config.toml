@@ -15,12 +15,12 @@ config_file = "./agents/kd4_explorer.toml"
 
 [features.multi_agent_v2]
 enabled = true
-max_concurrent_threads_per_session = 3
+max_concurrent_threads_per_session = 4
 
 [reasoning_phase_efforts]
 orient = "high"
-inspect = "xhigh"
-implement = "xhigh"
+inspect = "high"
+implement = "high"
 diagnose = "high"
 verify = "high"
 finalize = "low"

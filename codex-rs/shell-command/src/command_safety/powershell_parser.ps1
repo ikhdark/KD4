@@ -4,9 +4,13 @@ $ProgressPreference = 'SilentlyContinue'
 # Long-lived PowerShell AST parser used by the Rust command-safety layer on Windows.
 # The caller starts one child process per trusted PowerShell language flavor and then sends
 # newline-delimited JSON requests over stdin:
-#   { "id": <u64>, "payload": "<base64-encoded UTF-16LE script>" }
+#   { "id": <u64>, "payload": "<base64-encoded UTF-16LE script>",
+#     "resolution": { "cwd": "...", "path": "...", "pathext": "..." } | null }
 # We answer with one compact JSON line per request:
-#   { "id": <same>, "status": "ok", "commands": [["Get-Content", "foo.txt"]] }
+#   { "id": <same>, "status": "ok", "commands": [["Get-Content", "foo.txt"]],
+#     "direct_argv": ["git", "status"], "native_argument_mode": "Standard",
+#     "powershell_version": "7.5.2",
+#     "resolved_application": "C:\\Program Files\\Git\\cmd\\git.exe" | null }
 # or:
 #   { "id": <same>, "status": "parse_failed" | "parse_errors" | "unsupported" }
 #
@@ -22,7 +26,7 @@ $stdout = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8)
 $stdout.AutoFlush = $true
 
 function Invoke-ParseRequest {
-    param($RequestId, $Source)
+    param($RequestId, $Source, $Resolution)
 
     $tokens = $null
     $errors = $null
@@ -103,13 +107,106 @@ function Invoke-ParseRequest {
         return @{ id = $RequestId; status = 'unsupported' }
     }
 
-    return @{ id = $RequestId; status = 'ok'; commands = $commands }
+    $directArgv = Get-DirectArgvCandidate $ast
+    $nativeArgumentMode = $null
+    $powershellVersion = $null
+    if ($directArgv -ne $null) {
+        # Windows PowerShell and PowerShell's Legacy mode reconstruct one native command line.
+        # That is not unambiguously equivalent to passing an argv vector, especially for empty
+        # and quoted arguments. Standard and Windows mode both use the modern argv contract for
+        # .exe applications; the Rust side separately proves that the resolved target is an .exe.
+        $modeVariable = Get-Variable -Name PSNativeCommandArgumentPassing -ErrorAction SilentlyContinue
+        if ($modeVariable -ne $null -and $PSVersionTable.PSVersion.Major -eq 7) {
+            $mode = $modeVariable.Value.ToString()
+            if ($mode -eq 'Standard' -or $mode -eq 'Windows') {
+                $nativeArgumentMode = $mode
+                $powershellVersion = $PSVersionTable.PSVersion.ToString()
+            }
+        }
+
+        if ($nativeArgumentMode -eq $null) {
+            $directArgv = $null
+        }
+    }
+
+    $resolvedApplication = $null
+    if ($directArgv -ne $null -and $Resolution -ne $null) {
+        $resolvedApplication = Resolve-ApplicationAgainstState ($directArgv[0]) $Resolution
+    }
+
+    return @{
+        id = $RequestId
+        status = 'ok'
+        commands = $commands
+        direct_argv = $directArgv
+        native_argument_mode = $nativeArgumentMode
+        powershell_version = $powershellVersion
+        resolved_application = $resolvedApplication
+    }
 }
 
 function Write-Response {
     param($Response)
 
     $stdout.WriteLine(($Response | ConvertTo-Json -Compress -Depth 3))
+}
+
+function Resolve-ApplicationAgainstState {
+    param([string]$CommandName, $Resolution)
+
+    if (
+        [string]::IsNullOrEmpty($CommandName) -or
+        $Resolution -eq $null -or
+        [string]::IsNullOrEmpty($Resolution.cwd) -or
+        $Resolution.path -eq $null -or
+        $Resolution.pathext -eq $null
+    ) {
+        return $null
+    }
+
+    $previousLocation = Get-Location
+    $previousPath = $env:PATH
+    $previousPathExt = $env:PATHEXT
+    try {
+        $env:PATH = [string]$Resolution.path
+        $env:PATHEXT = [string]$Resolution.pathext
+        Set-Location -LiteralPath ([string]$Resolution.cwd)
+        if ((Get-Location).Provider.Name -ne 'FileSystem') {
+            return $null
+        }
+
+        # Do not filter by CommandType while resolving: the first PowerShell-visible command must
+        # itself be an application, otherwise an alias, function, cmdlet, or builtin shadows it.
+        $matches = @(Microsoft.PowerShell.Core\Get-Command -Name $CommandName -All -ErrorAction Stop)
+        if ($matches.Count -eq 0 -or $matches[0].CommandType -ne 'Application') {
+            return $null
+        }
+
+        $applicationPath = $matches[0].Path
+        if ([string]::IsNullOrEmpty($applicationPath)) {
+            $applicationPath = $matches[0].Source
+        }
+        return $applicationPath
+    } catch {
+        return $null
+    } finally {
+        if ($previousPath -eq $null) {
+            Remove-Item Env:PATH -ErrorAction SilentlyContinue
+        } else {
+            $env:PATH = $previousPath
+        }
+        if ($previousPathExt -eq $null) {
+            Remove-Item Env:PATHEXT -ErrorAction SilentlyContinue
+        } else {
+            $env:PATHEXT = $previousPathExt
+        }
+        try {
+            Set-Location -LiteralPath $previousLocation.Path
+        } catch {
+            # A failed restoration invalidates the long-lived parser host. Surface no proof and
+            # let the Rust caller's next request fail closed if the provider state is unusable.
+        }
+    }
 }
 
 function Convert-CommandElement {
@@ -149,6 +246,82 @@ function Convert-CommandElement {
     }
 
     return $null
+}
+
+function Convert-DirectCommandElement {
+    param($element)
+
+    if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        return @($element.Value)
+    }
+
+    if ($element -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+        if ($element.NestedExpressions.Count -gt 0) {
+            return $null
+        }
+        return @($element.Value)
+    }
+
+    if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+        # A parameter with an attached argument can have native tokenization semantics that are
+        # not represented by two argv values (for example -Name:value). Fail closed.
+        if ($element.Argument -ne $null) {
+            return $null
+        }
+        return @('-' + $element.ParameterName)
+    }
+
+    # ConstantExpressionAst and every other expression form are intentionally excluded from the
+    # direct candidate even though the broader safety parser can still inspect some of them.
+    return $null
+}
+
+function Get-DirectArgvCandidate {
+    param($ast)
+
+    if ($ast.EndBlock.Statements.Count -ne 1) {
+        return $null
+    }
+
+    $pipeline = $ast.EndBlock.Statements[0]
+    if (-not ($pipeline -is [System.Management.Automation.Language.PipelineAst])) {
+        return $null
+    }
+    $backgroundProperty = $pipeline.PSObject.Properties['Background']
+    if ($backgroundProperty -ne $null -and $backgroundProperty.Value) {
+        return $null
+    }
+    if ($pipeline.PipelineElements.Count -ne 1) {
+        return $null
+    }
+
+    $command = $pipeline.PipelineElements[0]
+    if (-not ($command -is [System.Management.Automation.Language.CommandAst])) {
+        return $null
+    }
+    if ($command.Redirections.Count -gt 0) {
+        return $null
+    }
+    if (
+        $command.InvocationOperator -ne $null -and
+        $command.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown
+    ) {
+        return $null
+    }
+
+    $argv = @()
+    foreach ($element in $command.CommandElements) {
+        $converted = Convert-DirectCommandElement $element
+        if ($converted -eq $null) {
+            return $null
+        }
+        $argv += $converted
+    }
+    if ($argv.Count -eq 0 -or [string]::IsNullOrEmpty($argv[0])) {
+        return $null
+    }
+    # Prevent PowerShell's function-output unrolling from turning a one-token argv into a scalar.
+    return ,$argv
 }
 
 function Convert-PipelineElement {
@@ -277,5 +450,7 @@ while (($requestLine = $stdin.ReadLine()) -ne $null) {
         continue
     }
 
-    Write-Response (Invoke-ParseRequest -RequestId $requestId -Source $source)
+    Write-Response (
+        Invoke-ParseRequest -RequestId $requestId -Source $source -Resolution $request.resolution
+    )
 }

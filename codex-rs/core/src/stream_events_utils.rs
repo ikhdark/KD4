@@ -25,6 +25,7 @@ use codex_rollout::state_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_stream_parser::strip_proposed_plan_blocks;
 use futures::Future;
+use tokio::time::Instant;
 use tracing::debug;
 use tracing::instrument;
 use tracing::warn;
@@ -225,6 +226,7 @@ pub(crate) struct OutputItemResult {
     pub last_agent_message: Option<String>,
     pub needs_follow_up: bool,
     pub tool_future: Option<InFlightFuture<'static>>,
+    pub eager_read_eligible: bool,
 }
 
 pub(crate) struct HandleOutputCtx {
@@ -317,7 +319,9 @@ pub(crate) async fn handle_output_item_done(
     ctx: &mut HandleOutputCtx,
     item: ResponseItem,
     previously_active_item: Option<TurnItem>,
+    earlier_tool_calls_eligible: &mut bool,
 ) -> Result<OutputItemResult> {
+    let item_accepted_at = Instant::now();
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
 
@@ -343,12 +347,21 @@ pub(crate) async fn handle_output_item_done(
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
 
+            output.eager_read_eligible = ctx
+                .tool_runtime
+                .take_eager_read_eligibility(&call, earlier_tool_calls_eligible);
+
             let cancellation_token = ctx.cancellation_token.child_token();
-            let tool_future: InFlightFuture<'static> = Box::pin(
-                ctx.tool_runtime
-                    .clone()
-                    .handle_tool_call(call, cancellation_token),
-            );
+            let tool_runtime = ctx.tool_runtime.clone();
+            let eager = output.eager_read_eligible;
+            // Keep deferred dispatch genuinely lazy. Eager callers poll this
+            // future after persistence; deferred callers do not construct the
+            // runtime dispatch task until the response tail has completed.
+            let tool_future: InFlightFuture<'static> = Box::pin(async move {
+                tool_runtime
+                    .handle_tool_call_with_timing(call, cancellation_token, item_accepted_at, eager)
+                    .await
+            });
 
             output.needs_follow_up = true;
             output.tool_future = Some(tool_future);
@@ -396,6 +409,9 @@ pub(crate) async fn handle_output_item_done(
             };
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
+            // A malformed tool item is deferred and closes the eager prefix for
+            // every later call in this model response.
+            *earlier_tool_calls_eligible = false;
             if let Some(response_item) = response_input_to_response_item(&response) {
                 ctx.sess
                     .record_conversation_items(

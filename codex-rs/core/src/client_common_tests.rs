@@ -45,7 +45,8 @@ fn prompt_with_image_outputs() -> Prompt {
                 ]),
                 internal_chat_message_metadata_passthrough: None,
             },
-        ],
+        ]
+        .into(),
         ..Default::default()
     }
 }
@@ -58,8 +59,8 @@ fn responses_lite_request_copies_strip_image_details() {
     let stripped = prompt.get_formatted_input_for_request(/*use_responses_lite*/ true);
 
     assert_eq!(
-        stripped,
-        vec![
+        stripped.as_ref(),
+        &[
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
@@ -103,13 +104,39 @@ fn responses_lite_request_copies_strip_image_details() {
 }
 
 #[test]
+fn formatted_input_reuses_shared_items_when_no_content_changes() {
+    let prompt = prompt_with_image_outputs();
+    let original = prompt.input.clone();
+    let regular = prompt.get_formatted_input_for_request(/*use_responses_lite*/ false);
+    assert!(Arc::ptr_eq(&regular, &original));
+
+    let prompt_without_details = Prompt {
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]
+        .into(),
+        ..Default::default()
+    };
+    let without_details = prompt_without_details.input.clone();
+    let lite =
+        prompt_without_details.get_formatted_input_for_request(/*use_responses_lite*/ true);
+    assert!(Arc::ptr_eq(&lite, &without_details));
+}
+
+#[test]
 fn serializes_text_verbosity_when_set() {
     let input: Vec<ResponseItem> = vec![];
     let tools: Vec<serde_json::Value> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
-        input,
+        input: input.into(),
         tools: Some(tools),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
@@ -157,7 +184,7 @@ fn serializes_text_schema_with_strict_format() {
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
-        input,
+        input: input.into(),
         tools: Some(tools),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
@@ -219,7 +246,7 @@ fn omits_text_when_not_set() {
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
-        input,
+        input: input.into(),
         tools: Some(tools),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
@@ -243,7 +270,7 @@ fn serializes_flex_service_tier_when_set() {
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
-        input: vec![],
+        input: Arc::from([]),
         tools: Some(vec![]),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,

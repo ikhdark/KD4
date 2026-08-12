@@ -34,7 +34,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "cmd".to_string(),
             JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and shell builtins. For a standalone executable, prefer `kind: \"argv\"`; for complex PowerShell, prefer `kind: \"powershell_script\"`."
+                "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`."
                     .to_string(),
             )),
         ),
@@ -269,7 +269,7 @@ Examples of valid command strings:
         (
             "command".to_string(),
             JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and shell builtins. For a standalone executable, prefer `kind: \"argv\"`; for complex PowerShell, prefer `kind: \"powershell_script\"`."
+                "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`."
                     .to_string(),
             )),
         ),

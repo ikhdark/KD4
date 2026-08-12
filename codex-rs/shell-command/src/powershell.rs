@@ -1,7 +1,25 @@
+#[cfg(windows)]
+use std::collections::HashMap;
+#[cfg(windows)]
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::fs;
+#[cfg(windows)]
+use std::path::Component;
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::path::Prefix;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 
+pub use crate::command_safety::PowershellDirectArgvCandidate;
+#[cfg(windows)]
+use crate::command_safety::PowershellResolutionState;
+use crate::command_safety::try_parse_powershell_ast_analysis;
+#[cfg(windows)]
+use crate::command_safety::try_parse_powershell_ast_analysis_with_resolution;
 use crate::command_safety::try_parse_powershell_ast_commands;
 use crate::shell_detect::ShellType;
 use crate::shell_detect::detect_shell_type;
@@ -139,6 +157,187 @@ pub fn parse_noprofile_powershell_command_into_plain_commands(
     try_parse_powershell_ast_commands(shell, script)
 }
 
+/// Return the semantic argv candidate for a single literal PowerShell native command.
+///
+/// This only classifies syntax and active native-argument mode. Callers must still prove native
+/// executable resolution against their final working directory and child environment immediately
+/// before spawning the command.
+pub fn parse_noprofile_powershell_command_into_direct_argv(
+    command: &[String],
+) -> Option<PowershellDirectArgvCandidate> {
+    let (shell, script) = extract_noprofile_powershell_command(command)?;
+    if !is_trusted_powershell_executable(shell) {
+        return None;
+    }
+    try_parse_powershell_ast_analysis(shell, script)?.direct_argv
+}
+
+/// A direct argv proven equivalent to a literal PowerShell native invocation in one final
+/// working-directory and child-environment state.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProvenPowershellDirectArgv {
+    command: Vec<String>,
+    classified_command: Vec<String>,
+    cwd: PathBuf,
+    env: HashMap<String, String>,
+}
+
+#[cfg(windows)]
+impl ProvenPowershellDirectArgv {
+    /// Borrow the proven canonical command for an internal policy compatibility check.
+    ///
+    /// The proof must still be consumed with [`Self::into_command_for_state`] before execution.
+    pub fn command_for_policy(&self) -> &[String] {
+        &self.command
+    }
+
+    /// Consume this proof only if the execution state is still exactly the state that was proven.
+    pub fn into_command_for_state(
+        self,
+        classified_command: &[String],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+    ) -> Option<Vec<String>> {
+        (self.classified_command == classified_command && self.cwd == cwd && self.env == *env)
+            .then_some(self.command)
+    }
+}
+
+/// Reclassify an exact-shape `-NoProfile -Command` invocation and prove that PowerShell and KD4's
+/// direct executable lookup select the same canonical `.exe` in the supplied final execution
+/// state. The returned command executes that canonical path and never performs another name lookup.
+#[cfg(windows)]
+pub fn prove_noprofile_powershell_command_as_direct_argv(
+    command: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Option<ProvenPowershellDirectArgv> {
+    let (shell, script) = extract_noprofile_powershell_command(command)?;
+    if !is_trusted_powershell_executable(shell) {
+        return None;
+    }
+
+    let resolution_state = powershell_resolution_state(cwd, env)?;
+    let analysis =
+        try_parse_powershell_ast_analysis_with_resolution(shell, script, &resolution_state)?;
+    let candidate = analysis.direct_argv?;
+    let powershell_path = canonical_exe(Path::new(&analysis.resolved_application?))?;
+    let direct_path = resolve_direct_exe(&candidate.argv[0], &resolution_state.path)?;
+    if !same_windows_path(&powershell_path, &direct_path) {
+        return None;
+    }
+    if candidate.native_argument_mode == "Windows"
+        && uses_legacy_windows_native_arguments(&powershell_path)
+    {
+        return None;
+    }
+
+    let mut direct_command = Vec::with_capacity(candidate.argv.len());
+    direct_command.push(powershell_path.to_str()?.to_owned());
+    direct_command.extend(candidate.argv.into_iter().skip(1));
+    Some(ProvenPowershellDirectArgv {
+        command: direct_command,
+        classified_command: command.to_vec(),
+        cwd: cwd.to_path_buf(),
+        env: env.clone(),
+    })
+}
+
+#[cfg(windows)]
+fn powershell_resolution_state(
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Option<PowershellResolutionState> {
+    Some(PowershellResolutionState {
+        cwd: cwd.to_str()?.to_owned(),
+        path: env_value_ignore_ascii_case(env, "PATH")?.to_owned(),
+        pathext: env_value_ignore_ascii_case(env, "PATHEXT")?.to_owned(),
+    })
+}
+
+#[cfg(windows)]
+fn env_value_ignore_ascii_case<'a>(
+    env: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    env.iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
+}
+
+#[cfg(windows)]
+fn resolve_direct_exe(command_name: &str, path: &str) -> Option<PathBuf> {
+    let command_path = Path::new(command_name);
+    if command_path.is_absolute() {
+        // A rooted local executable already has a stable execution identity. UNC paths are remote
+        // execution and deliberately remain in PowerShell.
+        let is_local_disk = command_path.components().next().is_some_and(|component| {
+            matches!(
+                component,
+                Component::Prefix(prefix)
+                    if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+            )
+        });
+        return is_local_disk.then(|| canonical_exe(command_path)).flatten();
+    }
+
+    if command_name.is_empty()
+        || command_name.contains(['/', '\\', ':', '*', '?', '[', ']'])
+        || matches!(command_name, "." | "..")
+    {
+        return None;
+    }
+
+    let executable_name = match command_path.extension().and_then(OsStr::to_str) {
+        None => format!("{command_name}.exe"),
+        Some(extension) if extension.eq_ignore_ascii_case("exe") => command_name.to_owned(),
+        Some(_) => return None,
+    };
+
+    for directory in std::env::split_paths(OsStr::new(path)) {
+        // Relative and empty PATH entries depend on cwd and Windows search behavior. Do not claim
+        // equivalence for them; PowerShell still handles the invocation.
+        if directory.as_os_str().is_empty() || !directory.is_absolute() {
+            return None;
+        }
+        let candidate = directory.join(&executable_name);
+        if candidate.is_file() {
+            return canonical_exe(&candidate);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn canonical_exe(path: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(path).ok()?;
+    (canonical.is_file()
+        && canonical
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")))
+    .then_some(canonical)
+}
+
+#[cfg(windows)]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+#[cfg(windows)]
+fn uses_legacy_windows_native_arguments(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "cmd.exe" | "cscript.exe" | "find.exe" | "sqlcmd.exe" | "wscript.exe"
+            )
+        })
+}
+
 /// This function attempts to find a powershell.exe executable on the system.
 pub fn try_find_powershell_executable_blocking() -> Option<AbsolutePathBuf> {
     try_find_powershellish_executable_in_path(&["powershell.exe"])
@@ -209,11 +408,39 @@ fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Pat
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::collections::HashMap;
+    #[cfg(windows)]
+    use std::fs;
+
     use super::UTF8_OUTPUT_PREFIX;
     use super::extract_powershell_command;
     #[cfg(windows)]
+    use super::parse_noprofile_powershell_command_into_direct_argv;
+    #[cfg(windows)]
     use super::parse_powershell_command_into_plain_commands;
     use super::prefix_powershell_script_with_utf8;
+    #[cfg(windows)]
+    use super::prove_noprofile_powershell_command_as_direct_argv;
+    #[cfg(windows)]
+    use super::resolve_direct_exe;
+    #[cfg(windows)]
+    use super::try_find_pwsh_executable_blocking;
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_resolution_accepts_rooted_local_exe_but_rejects_relative_and_unc_paths() {
+        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
+            return;
+        };
+        let canonical = fs::canonicalize(pwsh.as_path()).expect("canonical pwsh");
+        assert_eq!(
+            resolve_direct_exe(&canonical.to_string_lossy(), ""),
+            Some(canonical)
+        );
+        assert_eq!(resolve_direct_exe(".\\pwsh.exe", ""), None);
+        assert_eq!(resolve_direct_exe("\\\\server\\share\\pwsh.exe", ""), None);
+    }
 
     #[test]
     fn extracts_basic_powershell_command() {
@@ -338,5 +565,188 @@ mod tests {
                 vec!["Measure-Object".to_string()],
             ]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_candidate_contains_semantic_native_argument_values() {
+        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
+            return;
+        };
+        let command = vec![
+            pwsh.as_path().to_string_lossy().into_owned(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "python \"my file.py\" \"\" \"tick``value\" \"雪\" --flag -x".to_string(),
+        ];
+
+        let candidate = parse_noprofile_powershell_command_into_direct_argv(&command)
+            .expect("PowerShell 7 should classify a literal native argv");
+        assert_eq!(
+            candidate.argv,
+            [
+                "python",
+                "my file.py",
+                "",
+                "tick`value",
+                "雪",
+                "--flag",
+                "-x"
+            ]
+        );
+        assert!(matches!(
+            candidate.native_argument_mode.as_str(),
+            "Standard" | "Windows"
+        ));
+        assert_eq!(candidate.powershell_version.split('.').next(), Some("7"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_candidate_rejects_dynamic_and_compound_forms() {
+        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
+            return;
+        };
+        for script in [
+            "python $path",
+            "python (Get-Location)",
+            "python @args",
+            "python x | Out-Null",
+            "python x > out.txt",
+            "python x; git status",
+            "& python x",
+            "$x = 'x'; python $x",
+        ] {
+            let command = vec![
+                pwsh.as_path().to_string_lossy().into_owned(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                script.to_string(),
+            ];
+            assert_eq!(
+                parse_noprofile_powershell_command_into_direct_argv(&command),
+                None,
+                "unexpected direct candidate for {script:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_state_proof_executes_canonical_exe_and_is_state_bound() {
+        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
+            return;
+        };
+        let executable = fs::canonicalize(pwsh.as_path()).expect("canonical pwsh");
+        let executable_dir = executable.parent().expect("pwsh parent");
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut env = HashMap::from([
+            ("Path".to_string(), executable_dir.display().to_string()),
+            ("Pathext".to_string(), ".COM;.EXE;.BAT;.CMD".to_string()),
+        ]);
+        let command = vec![
+            pwsh.as_path().to_string_lossy().into_owned(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "pwsh --version".to_string(),
+        ];
+
+        let proof = prove_noprofile_powershell_command_as_direct_argv(&command, &cwd, &env)
+            .expect("matching final-state resolvers");
+        let direct = proof
+            .into_command_for_state(&command, &cwd, &env)
+            .expect("unchanged state");
+        assert!(super::same_windows_path(
+            std::path::Path::new(&direct[0]),
+            &executable
+        ));
+        assert_eq!(&direct[1..], ["--version"]);
+
+        let proof = prove_noprofile_powershell_command_as_direct_argv(&command, &cwd, &env)
+            .expect("matching final-state resolvers");
+        let rewritten_cwd = cwd.join("hook-rewritten-cwd");
+        assert_eq!(
+            proof.into_command_for_state(&command, &rewritten_cwd, &env),
+            None
+        );
+
+        let proof = prove_noprofile_powershell_command_as_direct_argv(&command, &cwd, &env)
+            .expect("matching final-state resolvers");
+        env.insert("Path".to_string(), cwd.display().to_string());
+        assert_eq!(proof.into_command_for_state(&command, &cwd, &env), None);
+
+        let mut env = HashMap::from([
+            ("Path".to_string(), executable_dir.display().to_string()),
+            ("Pathext".to_string(), ".COM;.EXE;.BAT;.CMD".to_string()),
+        ]);
+        let proof = prove_noprofile_powershell_command_as_direct_argv(&command, &cwd, &env)
+            .expect("matching final-state resolvers");
+        env.insert("HOOK_CHANGED_ENV".to_string(), "1".to_string());
+        assert_eq!(proof.into_command_for_state(&command, &cwd, &env), None);
+
+        let env = HashMap::from([
+            ("Path".to_string(), executable_dir.display().to_string()),
+            ("Pathext".to_string(), ".COM;.EXE;.BAT;.CMD".to_string()),
+        ]);
+        let proof = prove_noprofile_powershell_command_as_direct_argv(&command, &cwd, &env)
+            .expect("matching final-state resolvers");
+        let mut rewritten_command = command;
+        rewritten_command[3] = "pwsh -Help".to_string();
+        assert_eq!(
+            proof.into_command_for_state(&rewritten_command, &cwd, &env),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_shadowing_and_powershell_commands_fail_closed() {
+        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
+            return;
+        };
+        let executable = fs::canonicalize(pwsh.as_path()).expect("canonical pwsh");
+        let executable_dir = executable.parent().expect("pwsh parent");
+        let cwd = std::env::current_dir().expect("cwd");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let shadow_dir = std::env::temp_dir().join(format!(
+            "codex-powershell-shadow-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&shadow_dir).expect("create shadow dir");
+        fs::write(shadow_dir.join("pwsh.cmd"), "@echo off\r\n").expect("write shim");
+        let path = std::env::join_paths([shadow_dir.as_path(), executable_dir])
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned();
+        let env = HashMap::from([
+            ("PATH".to_string(), path),
+            ("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string()),
+        ]);
+        let native = vec![
+            pwsh.as_path().to_string_lossy().into_owned(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "pwsh --version".to_string(),
+        ];
+        assert_eq!(
+            prove_noprofile_powershell_command_as_direct_argv(&native, &cwd, &env),
+            None
+        );
+
+        let cmdlet = vec![
+            pwsh.as_path().to_string_lossy().into_owned(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Get-ChildItem value".to_string(),
+        ];
+        assert_eq!(
+            prove_noprofile_powershell_command_as_direct_argv(&cmdlet, &cwd, &env),
+            None
+        );
+        fs::remove_dir_all(&shadow_dir).expect("remove shadow dir");
     }
 }

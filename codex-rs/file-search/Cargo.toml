@@ -29,7 +29,14 @@ ignore = { workspace = true }
 nucleo = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+toml = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 unicode-casefold = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

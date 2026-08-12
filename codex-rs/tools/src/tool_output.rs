@@ -18,6 +18,7 @@ pub enum ToolOutputOutcome {
     Success,
     Failure,
     TimedOut,
+    Skipped,
 }
 
 /// Producer-supplied diagnostic classification used by model-output projection.
@@ -47,6 +48,14 @@ pub trait ToolOutput: Send {
     fn log_preview(&self) -> String;
 
     fn success_for_logging(&self) -> bool;
+
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        if self.success_for_logging() {
+            ToolOutputOutcome::Success
+        } else {
+            ToolOutputOutcome::Failure
+        }
+    }
 
     /// Internal, request-local signal consumed by the normal sampling loop.
     /// This is never serialized into the public protocol.
@@ -106,6 +115,10 @@ where
         (**self).success_for_logging()
     }
 
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        (**self).outcome_for_logging()
+    }
+
     fn sampling_request_signal(&self) -> Option<JsonValue> {
         (**self).sampling_request_signal()
     }
@@ -143,6 +156,7 @@ where
 pub struct JsonToolOutput {
     value: JsonValue,
     success: Option<bool>,
+    outcome: Option<ToolOutputOutcome>,
     contains_external_context: bool,
 }
 
@@ -151,6 +165,7 @@ impl JsonToolOutput {
         Self {
             value,
             success: Some(true),
+            outcome: None,
             contains_external_context: false,
         }
     }
@@ -159,6 +174,16 @@ impl JsonToolOutput {
         Self {
             value,
             success,
+            outcome: None,
+            contains_external_context: false,
+        }
+    }
+
+    pub fn skipped(value: JsonValue) -> Self {
+        Self {
+            value,
+            success: Some(true),
+            outcome: Some(ToolOutputOutcome::Skipped),
             contains_external_context: false,
         }
     }
@@ -246,16 +271,28 @@ impl ToolOutput for JsonToolOutput {
         self.success.unwrap_or(true)
     }
 
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        self.outcome.unwrap_or_else(|| {
+            if self.success.unwrap_or(true) {
+                ToolOutputOutcome::Success
+            } else {
+                ToolOutputOutcome::Failure
+            }
+        })
+    }
+
     fn contains_external_context(&self) -> bool {
         self.contains_external_context
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
-        Some(ToolOutputProjectionMetadata::from_json(
+        let mut metadata = ToolOutputProjectionMetadata::from_json(
             &self.value,
             self.success.unwrap_or(true),
             None,
-        ))
+        );
+        metadata.outcome = self.outcome_for_logging();
+        Some(metadata)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

@@ -1,3 +1,4 @@
+use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use std::any::Any;
@@ -44,6 +45,18 @@ pub trait ThreadStore: Any + Send + Sync {
 
     /// Creates a new live thread.
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()>;
+
+    /// Creates a thread while reusing Git metadata already observed by the caller.
+    ///
+    /// The default preserves standalone store behavior. Implementations that persist the same
+    /// metadata can override this to avoid rediscovery.
+    fn create_thread_with_repository_context(
+        &self,
+        params: CreateThreadParams,
+        _repository_context: Option<RepositoryContext>,
+    ) -> ThreadStoreFuture<'_, ()> {
+        self.create_thread(params)
+    }
 
     /// Reopens an existing thread for live appends.
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()>;

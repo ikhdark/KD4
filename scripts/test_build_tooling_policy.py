@@ -926,6 +926,31 @@ class BuildToolingPolicyTest(unittest.TestCase):
         ):
             self.assertIn(recipe, justfile)
 
+    def test_dead_code_matrix_uses_dedicated_cargo_lane(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'RUSTFLAGS="-Ddead_code" just cargo-lane rust-dead-code-matrix cargo check',
+            justfile,
+        )
+        self.assertIn(
+            '$env:RUSTFLAGS = "-Ddead_code"; just cargo-lane rust-dead-code-matrix cargo @cargo_args',
+            justfile,
+        )
+
+    def test_package_validation_defaults_do_not_expand_to_workspace(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+
+        self.assertIn("Pass a package/filter to 'just clippy'", justfile)
+        self.assertIn("clippy-workspace *args:", justfile)
+        self.assertIn("cargo clippy --tests @forwarded_args", justfile)
+        self.assertIn(
+            '($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package")',
+            justfile,
+        )
+        self.assertIn('workspace_arg="--workspace"', justfile)
+        self.assertIn('workspace_arg=""', justfile)
+
     def test_windows_process_suite_cannot_silently_skip_required_coverage(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         sandbox_tests = (

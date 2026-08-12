@@ -167,11 +167,11 @@ cargo-shear *args:
 
 [unix]
 rust-dead-code-matrix *args:
-    @if [ "${1:-}" = "--" ]; then shift; fi; workspace_arg="--workspace"; for arg in "$@"; do case "$arg" in -p|--package|--manifest-path) workspace_arg="";; esac; done; RUSTFLAGS="-Ddead_code" cargo check ${workspace_arg:+$workspace_arg} --all-targets "$@"
+    @if [ "${1:-}" = "--" ]; then shift; fi; workspace_arg="--workspace"; for arg in "$@"; do case "$arg" in -p|--package|--manifest-path) workspace_arg="";; esac; done; RUSTFLAGS="-Ddead_code" just cargo-lane rust-dead-code-matrix cargo check ${workspace_arg:+$workspace_arg} --all-targets "$@"
 
 [windows]
 rust-dead-code-matrix *args:
-    @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; $cargo_args = @("check"); if (-not (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package") -or ($forwarded_args -contains "--manifest-path"))) { $cargo_args += "--workspace" }; $cargo_args += "--all-targets"; $cargo_args += $forwarded_args; $env:RUSTFLAGS = "-Ddead_code"; cargo @cargo_args
+    @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; $cargo_args = @("check"); if (-not (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package") -or ($forwarded_args -contains "--manifest-path"))) { $cargo_args += "--workspace" }; $cargo_args += "--all-targets"; $cargo_args += $forwarded_args; $env:RUSTFLAGS = "-Ddead_code"; just cargo-lane rust-dead-code-matrix cargo @cargo_args
 
 [unix]
 install:
@@ -575,6 +575,12 @@ source-map-check:
     {{ python }} "{{ justfile_directory() }}/scripts/source_map_check.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" --require-markers "{{ justfile_directory() }}/SOURCEMAP.md"
+
+source-owners-generate:
+    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" generate
+
+source-owners-check:
+    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" check
 
 tui-large-widget-check:
     cargo nextest run -p codex-tui -E 'test(footer_collapse_snapshots) | test(handle_paste_large_uses_placeholder_and_replaces_on_submit) | test(resume_picker)'

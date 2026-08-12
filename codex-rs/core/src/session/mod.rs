@@ -4297,6 +4297,9 @@ impl Session {
         if input.is_empty() {
             return Err(SteerInputError::EmptyInput);
         }
+        active_turn_context
+            .update_validation_authorization(&input)
+            .await;
         let input_for_telemetry = input.clone();
 
         let additional_context_input = {

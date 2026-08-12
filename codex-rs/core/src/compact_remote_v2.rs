@@ -353,6 +353,7 @@ async fn run_remote_compaction_request_v2(
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retries = 0;
+    turn_context.turn_timing_state.begin_compaction_generation();
     loop {
         sess.ensure_rollout_budget_available()?;
         let trace_attempt = compaction_trace.start_attempt(&RemoteCompactionV2TraceRequest {
@@ -404,6 +405,7 @@ async fn run_remote_compaction_request_v2(
                     ResponsesStreamRequest::RemoteCompactionV2,
                 )
                 .await?;
+                turn_context.turn_timing_state.record_model_retry();
             }
         }
     }
@@ -779,7 +781,8 @@ mod tests {
             input: vec![
                 message("user", "compact this history", /*phase*/ None),
                 ResponseItem::CompactionTrigger {},
-            ],
+            ]
+            .into(),
             base_instructions: BaseInstructions {
                 text: "compact the conversation".to_string(),
             },

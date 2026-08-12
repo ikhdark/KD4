@@ -195,16 +195,45 @@ pub(crate) fn spawn_exit_watcher(
     started_at: Instant,
     tracker: Option<SharedTurnDiffTracker>,
     completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
+    validation_observation: Option<crate::validation_admission::ValidationObservationToken>,
+    validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
+    validation_waiter: Option<crate::validation_admission::ValidationLeader>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
+    if let Some(leader) = validation_leader.as_ref() {
+        let validation_cancellation = leader.cancellation_token();
+        let process_exit = exit_token.clone();
+        let validation_process = Arc::clone(&process);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = validation_cancellation.cancelled() => {
+                    if !validation_process.has_exited()
+                        && let Err(error) = validation_process.terminate_confirmed().await
+                    {
+                        tracing::warn!(%error, "failed to terminate abandoned shared validation");
+                    }
+                }
+                _ = process_exit.cancelled() => {}
+            }
+        });
+    }
 
     tokio::spawn(async move {
         let _completion_activity = completion_activity;
+        let _validation_waiter = validation_waiter;
         exit_token.cancelled().await;
         output_drained.notified().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
+        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        if let Some(observation) = validation_observation {
+            if process.termination_was_requested() {
+                observation.record_cancelled(duration_ms).await;
+            } else {
+                observation.record_completed(duration_ms).await;
+            }
+        }
         let failure_message = process.failure_message();
         let exit_code = if failure_message.is_some() {
             -1
@@ -287,6 +316,17 @@ pub(crate) fn spawn_exit_watcher(
                 .services
                 .command_execution
                 .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
+                .await;
+        }
+        if let Some(leader) = validation_leader {
+            let text = transcript.lock().await.to_bytes();
+            leader
+                .complete(crate::validation_admission::ReusableValidationResult {
+                    value: serde_json::json!({
+                        "text": String::from_utf8_lossy(&text),
+                        "success": failure_message.is_none() && exit_code == 0,
+                    }),
+                })
                 .await;
         }
     });

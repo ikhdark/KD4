@@ -168,6 +168,7 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
             "-AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30",
             justfile,
         )
+        self.assertNotIn("-SkipPreflightCheck", justfile)
         self.assertIn(
             "-ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User", justfile
         )

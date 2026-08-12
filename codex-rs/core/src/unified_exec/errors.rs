@@ -4,6 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub(crate) enum UnifiedExecError {
+    #[error("validation launch was skipped")]
+    ValidationSkipped(crate::validation_admission::ValidationSkippedToolOutput),
     #[error("Failed to create unified exec process: {message}")]
     CreateProcess { message: String },
     #[error("Unified exec process failed: {message}")]

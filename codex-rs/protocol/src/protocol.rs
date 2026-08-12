@@ -2053,6 +2053,106 @@ pub struct TurnTiming {
     pub local: TurnTimingLocal,
     pub milestones: TurnTimingMilestones,
     pub counters: TurnTimingCounters,
+    /// Per-sampling-request milestones, ordered by request. Times are offsets
+    /// from turn start and are diagnostic only; they are not additive buckets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_requests: Vec<TurnTimingModelRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pre_first_model_output: Option<TurnTimingPreFirstModelOutput>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingModelRequest {
+    /// Zero-based logical generation owning this physical provider attempt.
+    #[serde(default)]
+    pub generation_index: u32,
+    #[serde(default)]
+    pub generation_reason: TurnTimingGenerationReason,
+    #[serde(default)]
+    pub attempt_kind: TurnTimingAttemptKind,
+    pub is_continuation: bool,
+    /// Directly observed model-stream wait for this physical attempt.
+    #[serde(default)]
+    pub model_stream_wait_ns: u64,
+    /// Tool calls emitted by this generation. Recorded on its primary attempt.
+    #[serde(default)]
+    pub tool_call_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub dispatch_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub first_model_output_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub completed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum TurnTimingGenerationReason {
+    Initial,
+    ToolContinuation,
+    CompletionReview,
+    CompletionRepairRereview,
+    Compaction,
+    Subagent,
+    #[default]
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum TurnTimingAttemptKind {
+    #[default]
+    Primary,
+    Retry,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingGenerationReasonCounts {
+    pub initial: u32,
+    pub tool_continuation: u32,
+    pub completion_review: u32,
+    pub completion_repair_rereview: u32,
+    pub compaction: u32,
+    pub subagent: u32,
+    pub other: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingAttemptKindCounts {
+    pub primary: u32,
+    pub retry: u32,
+    pub fallback: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingPreFirstModelOutput {
+    pub captured_at_ns: u64,
+    pub first_request_dispatch_ready_ns: u64,
+    pub client_critical_path_ns: u64,
+    pub attributed_client_union_ns: u64,
+    pub unattributed_pre_output_ns: u64,
+    pub history_snapshot_ns: u64,
+    pub normalization_ns: u64,
+    pub planning_identity_ns: u64,
+    pub prompt_construction_ns: u64,
+    pub request_transformation_ns: u64,
+    pub serialization_ns: u64,
+    pub transport_readiness_ns: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2118,6 +2218,14 @@ pub struct TurnTimingMilestones {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingCounters {
+    /// Logical workflow generations. `model_request_count` remains the
+    /// authoritative physical provider-attempt aggregate.
+    #[serde(default)]
+    pub logical_generation_count: u32,
+    #[serde(default)]
+    pub generations_by_reason: TurnTimingGenerationReasonCounts,
+    #[serde(default)]
+    pub attempts_by_kind: TurnTimingAttemptKindCounts,
     pub model_request_count: u32,
     pub model_retry_count: u32,
     pub model_fallback_count: u32,
@@ -4620,6 +4728,48 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ThreadSource>(json!("automation"))?,
             source
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn turn_timing_generation_accounting_defaults_when_deserializing_legacy_payloads() -> Result<()>
+    {
+        let mut value = serde_json::to_value(TurnTiming::default())?;
+        let counters = value["counters"]
+            .as_object_mut()
+            .expect("turn timing counters object");
+        counters.remove("logicalGenerationCount");
+        counters.remove("generationsByReason");
+        counters.remove("attemptsByKind");
+
+        let mut request = serde_json::to_value(TurnTimingModelRequest::default())?;
+        let request = request.as_object_mut().expect("model request object");
+        request.remove("generationIndex");
+        request.remove("generationReason");
+        request.remove("attemptKind");
+        request.remove("modelStreamWaitNs");
+        request.remove("toolCallCount");
+        value["modelRequests"] = json!([request]);
+
+        let decoded: TurnTiming = serde_json::from_value(value)?;
+        assert_eq!(decoded.counters.logical_generation_count, 0);
+        assert_eq!(
+            decoded.counters.generations_by_reason,
+            TurnTimingGenerationReasonCounts::default()
+        );
+        assert_eq!(
+            decoded.counters.attempts_by_kind,
+            TurnTimingAttemptKindCounts::default()
+        );
+        assert_eq!(decoded.model_requests.len(), 1);
+        assert_eq!(
+            decoded.model_requests[0].generation_reason,
+            TurnTimingGenerationReason::Other
+        );
+        assert_eq!(
+            decoded.model_requests[0].attempt_kind,
+            TurnTimingAttemptKind::Primary
         );
         Ok(())
     }

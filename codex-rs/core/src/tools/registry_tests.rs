@@ -3,6 +3,86 @@ use crate::session::step_context::StepContext;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn complete_skill_source_read_uses_bounded_four_thousand_token_projection() {
+    let body = "complete skill instruction coverage ".repeat(280);
+    let output = format!(
+        "Source file evidence:\ncitation: C:\\skills\\repo-atlas\\SKILL.md:1-126\ntotal_lines: 126 bytes_returned: {} truncated: false\nsource_route: core\n{body}",
+        body.len()
+    );
+    assert!(approx_token_count(&output) > 1_000);
+    assert!(approx_token_count(&output) < COMPLETE_SKILL_READ_TOKEN_LIMIT);
+
+    let requested_limit = skill_read_projection_limit("read_file_span", &output);
+    assert_eq!(requested_limit, Some(COMPLETE_SKILL_READ_TOKEN_LIMIT));
+    assert_eq!(
+        skill_read_projection_limit("functions.read_file_span", &output),
+        Some(COMPLETE_SKILL_READ_TOKEN_LIMIT)
+    );
+    let limits = resolve_projected_output_limits(
+        requested_limit,
+        OutputOutcome::Success,
+        OutputDiagnosticClass::Normal,
+        usize::MAX,
+    );
+    let projected = formatted_truncate_text_with_output_limit(&output, limits);
+
+    assert!(!projected.was_truncated);
+    assert_eq!(projected.text, output);
+
+    let wrapped = format!("Script completed\nWall time 0.1 seconds\nOutput:\n\n{output}");
+    assert_eq!(
+        skill_read_projection_limit("functions.exec", &wrapped),
+        Some(COMPLETE_SKILL_READ_TOKEN_LIMIT)
+    );
+    let escaped = wrapped.replace('\n', "\\n");
+    assert_eq!(
+        skill_read_projection_limit("functions.exec", &escaped),
+        Some(COMPLETE_SKILL_READ_TOKEN_LIMIT)
+    );
+}
+
+#[test]
+fn ordinary_and_oversized_skill_outputs_keep_safe_projection_behavior() {
+    assert_eq!(
+        skill_read_projection_limit("read_file_span", "ordinary tool output"),
+        None
+    );
+    assert_eq!(
+        skill_read_projection_limit(
+            "read_file_span",
+            "citation: /skills/repo-atlas/SKILL.md:1-126\nSource file evidence:\nordinary output"
+        ),
+        None
+    );
+    let complete_envelope = "Source file evidence:\ncitation: /skills/repo-atlas/SKILL.md:1-126\ntotal_lines: 126 bytes_returned: 10 truncated: false\nsource_route: core\ninstructions";
+    assert_eq!(
+        skill_read_projection_limit("mcp__untrusted__tool", complete_envelope),
+        None
+    );
+    let ordinary_limits = resolve_projected_output_limits(
+        None,
+        OutputOutcome::Success,
+        OutputDiagnosticClass::Normal,
+        usize::MAX,
+    );
+    assert_eq!(ordinary_limits.applied_limit, 1_000);
+
+    let oversized = format!(
+        "Source file evidence:\ncitation: /skills/large/SKILL.md:1-900\ntotal_lines: 900 bytes_returned: 24000 truncated: false\nsource_route: core\n{}",
+        "large skill instruction ".repeat(1_000)
+    );
+    let skill_limits = resolve_projected_output_limits(
+        skill_read_projection_limit("read_file_span", &oversized),
+        OutputOutcome::Success,
+        OutputDiagnosticClass::Normal,
+        usize::MAX,
+    );
+    let projected = formatted_truncate_text_with_output_limit(&oversized, skill_limits);
+    assert_eq!(skill_limits.applied_limit, COMPLETE_SKILL_READ_TOKEN_LIMIT);
+    assert!(projected.was_truncated);
+}
+
+#[test]
 fn complete_projection_envelope_respects_applied_limit() {
     let envelope = serde_json::json!({
         "outcome": "success",

@@ -24,6 +24,7 @@ use crate::tools::hook_names::HookToolName;
 use crate::tools::lifecycle::notify_tool_finish;
 use crate::tools::lifecycle::notify_tool_start;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
+use crate::tools::tool_dispatch_trace::mark_tool_handler_entry;
 use crate::util::error_or_panic;
 use codex_extension_api::ToolCallOutcome;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -198,6 +199,10 @@ pub(crate) struct ModelToolProjection {
 impl AnyToolResult {
     pub(crate) fn success_for_logging(&self) -> bool {
         self.result.success_for_logging()
+    }
+
+    pub(crate) fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        self.result.outcome_for_logging()
     }
 
     pub(crate) fn sampling_request_signal(&self) -> Option<serde_json::Value> {
@@ -617,7 +622,7 @@ impl ToolRegistry {
                         match handle_any_tool(tool.as_ref(), invocation_for_tool).await {
                             Ok(result) => {
                                 let preview = result.result.log_preview();
-                                let success = result.result.success_for_logging();
+                                let success = result.success_for_logging();
                                 let mut guard = response_cell.lock().await;
                                 *guard = Some(result);
                                 Ok((preview, success))
@@ -671,8 +676,12 @@ impl ToolRegistry {
             Ok(_) => {
                 let guard = response_cell.lock().await;
                 match guard.as_ref() {
-                    Some(result) => ToolCallOutcome::Completed {
-                        success: result.result.success_for_logging(),
+                    Some(result) => match result.outcome_for_logging() {
+                        ToolOutputOutcome::Skipped => ToolCallOutcome::Skipped,
+                        ToolOutputOutcome::Success => ToolCallOutcome::Completed { success: true },
+                        ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => {
+                            ToolCallOutcome::Completed { success: false }
+                        }
                     },
                     None => ToolCallOutcome::Failed {
                         handler_executed: true,
@@ -756,6 +765,7 @@ async fn handle_any_tool(
     let _tool_execution_timing_guard =
         matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler)
             .then(|| invocation.turn.turn_timing_state.begin_tool_execution());
+    mark_tool_handler_entry();
     let output = tool.handle(invocation.clone()).await?;
     if output.contains_external_context()
         && invocation.turn.config.memories.disable_on_external_context
@@ -808,17 +818,20 @@ fn prepare_model_projection(
         ToolOutputOutcome::Success => OutputOutcome::Success,
         ToolOutputOutcome::Failure => OutputOutcome::Failure,
         ToolOutputOutcome::TimedOut => OutputOutcome::TimedOut,
+        ToolOutputOutcome::Skipped => OutputOutcome::Skipped,
     };
     let diagnostic_class = match metadata.diagnostic_class {
         ToolOutputDiagnosticClass::Normal => OutputDiagnosticClass::Normal,
         ToolOutputDiagnosticClass::HighSignal => OutputDiagnosticClass::HighSignal,
     };
-    let limits = resolve_projected_output_limits(
-        metadata.requested_limit,
-        outcome,
-        diagnostic_class,
-        usize::MAX,
-    );
+    let requested_limit = metadata.requested_limit.or_else(|| {
+        skill_read_projection_limit(
+            flat_tool_name(&invocation.tool_name).as_ref(),
+            &spillable_text,
+        )
+    });
+    let limits =
+        resolve_projected_output_limits(requested_limit, outcome, diagnostic_class, usize::MAX);
     let projected = formatted_truncate_text_with_output_limit(&spillable_text, limits);
     if !projected.was_truncated {
         return None;
@@ -839,6 +852,44 @@ fn prepare_model_projection(
         codex_home: invocation.turn.config.codex_home.to_path_buf(),
         thread_id: invocation.session.thread_id.to_string(),
     })
+}
+
+const COMPLETE_SKILL_READ_TOKEN_LIMIT: usize = 4_000;
+
+fn skill_read_projection_limit(tool_name: &str, output: &str) -> Option<usize> {
+    if !matches!(
+        tool_name,
+        "read_file_span" | "functions.read_file_span" | "functions.exec"
+    ) {
+        return None;
+    }
+
+    let normalized;
+    let output = if tool_name == "functions.exec" && !output.contains("\nSource file evidence:\n") {
+        normalized = output.replace("\\n", "\n");
+        normalized.as_str()
+    } else {
+        output
+    };
+    let evidence = output.strip_prefix("Source file evidence:\n").or_else(|| {
+        output
+            .split_once("\nSource file evidence:\n")
+            .map(|(_, rest)| rest)
+    })?;
+    let mut lines = evidence.lines();
+    let citation = lines.next()?.strip_prefix("citation: ")?;
+    let file_and_span = citation.rsplit(['/', '\\']).next()?;
+    if !file_and_span.starts_with("SKILL.md:") {
+        return None;
+    }
+    let metadata = lines.next()?;
+    if !metadata.starts_with("total_lines: ") || !metadata.contains(" truncated: false") {
+        return None;
+    }
+    lines
+        .next()?
+        .starts_with("source_route: ")
+        .then_some(COMPLETE_SKILL_READ_TOKEN_LIMIT)
 }
 
 async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolProjection> {
@@ -890,6 +941,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             ToolOutputOutcome::Success => "success",
             ToolOutputOutcome::Failure => "failure",
             ToolOutputOutcome::TimedOut => "timeout",
+            ToolOutputOutcome::Skipped => "skipped",
         },
         "essential": essential_inline,
         "original_bytes": spillable_text.len(),

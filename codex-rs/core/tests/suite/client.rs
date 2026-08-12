@@ -1346,7 +1346,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
     let mut prompt = Prompt::default();
-    prompt.input.push(ResponseItem::Message {
+    prompt.input = vec![ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -1354,7 +1354,8 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
-    });
+    }]
+    .into();
 
     let mut stream = client_session
         .stream(
@@ -3015,7 +3016,8 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
-    prompt.input.push(ResponseItem::Reasoning {
+    let mut prompt_input = Vec::new();
+    prompt_input.push(ResponseItem::Reasoning {
         id: Some(ResponseItemId::with_suffix("rs", "reasoning-id")),
         summary: vec![ReasoningItemReasoningSummary::SummaryText {
             text: "summary".into(),
@@ -3026,7 +3028,7 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         encrypted_content: None,
         internal_chat_message_metadata_passthrough: None,
     });
-    prompt.input.push(ResponseItem::Message {
+    prompt_input.push(ResponseItem::Message {
         id: Some(ResponseItemId::with_suffix("msg", "message-id")),
         role: "assistant".into(),
         content: vec![ContentItem::OutputText {
@@ -3035,7 +3037,7 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     });
-    prompt.input.push(ResponseItem::WebSearchCall {
+    prompt_input.push(ResponseItem::WebSearchCall {
         id: Some(ResponseItemId::with_suffix("ws", "web-search-id")),
         status: Some("completed".into()),
         action: Some(WebSearchAction::Search {
@@ -3044,7 +3046,7 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         }),
         internal_chat_message_metadata_passthrough: None,
     });
-    prompt.input.push(ResponseItem::FunctionCall {
+    prompt_input.push(ResponseItem::FunctionCall {
         id: Some(ResponseItemId::with_suffix("fc", "function-id")),
         name: "do_thing".into(),
         namespace: None,
@@ -3052,13 +3054,13 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         call_id: "function-call-id".into(),
         internal_chat_message_metadata_passthrough: None,
     });
-    prompt.input.push(ResponseItem::FunctionCallOutput {
+    prompt_input.push(ResponseItem::FunctionCallOutput {
         id: None,
         call_id: "function-call-id".into(),
         output: FunctionCallOutputPayload::from_text("ok".into()),
         internal_chat_message_metadata_passthrough: None,
     });
-    prompt.input.push(ResponseItem::LocalShellCall {
+    prompt_input.push(ResponseItem::LocalShellCall {
         id: Some(ResponseItemId::with_suffix("lsh", "local-shell-id")),
         call_id: Some("local-shell-call-id".into()),
         status: LocalShellStatus::Completed,
@@ -3071,7 +3073,7 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         }),
         internal_chat_message_metadata_passthrough: None,
     });
-    prompt.input.push(ResponseItem::CustomToolCall {
+    prompt_input.push(ResponseItem::CustomToolCall {
         id: Some(ResponseItemId::with_suffix("ctc", "custom-tool-id")),
         status: Some("completed".into()),
         call_id: "custom-tool-call-id".into(),
@@ -3080,14 +3082,14 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         input: "{}".into(),
         internal_chat_message_metadata_passthrough: None,
     });
-    prompt.input.push(ResponseItem::CustomToolCallOutput {
+    prompt_input.push(ResponseItem::CustomToolCallOutput {
         id: None,
         call_id: "custom-tool-call-id".into(),
         name: None,
         output: FunctionCallOutputPayload::from_text("ok".into()),
         internal_chat_message_metadata_passthrough: None,
     });
-    prompt.input.push(
+    prompt_input.push(
         serde_json::from_value(json!({
             "type": "message",
             "id": "018f9e15-7a6a-7000-8000-000000000001",
@@ -3096,7 +3098,7 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         }))
         .expect("legacy response item should deserialize"),
     );
-    prompt.input.push(
+    prompt_input.push(
         serde_json::from_value(json!({
             "type": "message",
             "id": "",
@@ -3105,6 +3107,8 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         }))
         .expect("response item with an empty id should deserialize"),
     );
+
+    prompt.input = prompt_input.into();
 
     let mut stream = client_session
         .stream(

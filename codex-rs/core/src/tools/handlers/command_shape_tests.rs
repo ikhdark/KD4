@@ -80,6 +80,39 @@ fn argv_mode_accepts_program_and_args_without_script() {
 }
 
 #[test]
+fn structured_native_commands_select_direct_argv() {
+    let cases: [(&str, &[&str]); 6] = [
+        ("git", &["status", "--short"]),
+        ("rg", &["--files"]),
+        ("cargo", &["test", "-p", "codex-core"]),
+        ("node", &["script.js", "--flag"]),
+        ("python", &["-m", "pytest"]),
+        ("kds", &["--help"]),
+    ];
+
+    for (program, args) in cases {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        let invocation = parse(None, Some("argv"), Some(program), Some(&args), None)
+            .expect("structured native command should parse as argv");
+        let mut expected_argv = vec![program.to_string()];
+        expected_argv.extend(args.clone());
+
+        assert_eq!(
+            invocation,
+            CommandInvocation::Argv {
+                program: program.to_string(),
+                args,
+            },
+            "{program} should retain the producer-selected argv representation"
+        );
+        assert_eq!(invocation.to_direct_argv(), Some(expected_argv));
+    }
+}
+
+#[test]
 fn argv_hook_rewrite_preserves_structured_shape() {
     let invocation = parse(
         None,
@@ -89,33 +122,57 @@ fn argv_hook_rewrite_preserves_structured_shape() {
         None,
     )
     .expect("argv should parse");
+    let rewritten_args = vec![
+        "--agent".to_string(),
+        "path with spaces".to_string(),
+        "quote\"inside".to_string(),
+        String::new(),
+        "Grüße 世界".to_string(),
+    ];
+    let expected = CommandInvocation::Argv {
+        program: "kds".to_string(),
+        args: rewritten_args.clone(),
+    };
+    let display_command = expected.display_command();
 
+    let updated = invocation
+        .with_updated_hook_input(
+            "exec_command",
+            &json!({
+                "command": display_command,
+                "kind": "argv",
+                "program": "kds",
+                "args": rewritten_args,
+            }),
+        )
+        .expect("structured argv rewrite should be accepted");
+
+    assert_eq!(updated, expected);
     assert_eq!(
-        invocation
-            .with_updated_hook_input(
-                "exec_command",
-                &json!({
-                    "kind": "argv",
-                    "program": "kds",
-                    "args": ["--agent", "--", "rg", "--files"],
-                }),
-            )
-            .expect("structured argv rewrite should be accepted"),
-        CommandInvocation::Argv {
-            program: "kds".to_string(),
-            args: vec![
-                "--agent".to_string(),
-                "--".to_string(),
-                "rg".to_string(),
-                "--files".to_string(),
-            ],
-        }
+        updated.to_direct_argv(),
+        Some(vec![
+            "kds".to_string(),
+            "--agent".to_string(),
+            "path with spaces".to_string(),
+            "quote\"inside".to_string(),
+            String::new(),
+            "Grüße 世界".to_string(),
+        ])
     );
 }
 
 #[test]
 fn argv_hook_rewrite_rejects_mixed_or_misleading_shapes() {
     let invocation = parse(None, Some("argv"), Some("rg"), None, None).expect("argv should parse");
+
+    let inspected = invocation
+        .with_updated_hook_input(
+            "exec_command",
+            &json!({ "command": invocation.display_command() }),
+        )
+        .expect("an unchanged display-only response should preserve argv");
+    assert_eq!(inspected, invocation);
+    assert_eq!(inspected.to_direct_argv(), Some(vec!["rg".to_string()]));
 
     let changed_text = invocation
         .with_updated_hook_input("exec_command", &json!({ "command": "rg --hidden" }))
@@ -170,6 +227,32 @@ fn tagged_script_and_legacy_shapes_are_explicit() {
         legacy,
         CommandInvocation::Script("Write-Output ok".to_string())
     );
+}
+
+#[test]
+fn shell_semantics_remain_scripts_when_the_producer_selects_script_mode() {
+    let shell_commands = [
+        "Get-ChildItem -Force",
+        "$env:FOO = 'bar'",
+        "rg --files | Select-String rs",
+        "rg --files > files.txt",
+        "git status; rg --files",
+        "dir",
+        "build.cmd /quiet",
+        "build.bat /quiet",
+    ];
+
+    for command in shell_commands {
+        let invocation = parse(Some(command), Some("script"), None, None, None)
+            .expect("producer-selected script should remain a script");
+
+        assert_eq!(
+            invocation,
+            CommandInvocation::Script(command.to_string()),
+            "script mode must preserve the KD4 shell contract for {command}"
+        );
+        assert_eq!(invocation.to_direct_argv(), None);
+    }
 }
 
 #[test]

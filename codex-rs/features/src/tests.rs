@@ -946,8 +946,18 @@ fn unstable_warning_event_resolves_legacy_aliases_to_canonical_keys() {
 }
 
 #[test]
-fn source_tools_are_explicitly_opt_in() {
-    assert_eq!(Feature::SourceTools.stage(), Stage::UnderDevelopment);
-    assert_eq!(Feature::SourceTools.default_enabled(), false);
+fn source_tools_are_enabled_by_default() {
+    assert_eq!(Feature::SourceTools.stage(), Stage::Stable);
+    assert_eq!(Feature::SourceTools.default_enabled(), true);
     assert_eq!(feature_for_key("source_tools"), Some(Feature::SourceTools));
+}
+
+#[test]
+fn known_delta_store_is_enabled_by_default() {
+    assert_eq!(Feature::KnownDeltaStore.stage(), Stage::Stable);
+    assert_eq!(Feature::KnownDeltaStore.default_enabled(), true);
+    assert_eq!(
+        feature_for_key("known_delta_store"),
+        Some(Feature::KnownDeltaStore)
+    );
 }
