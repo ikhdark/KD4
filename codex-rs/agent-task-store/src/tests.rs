@@ -2629,6 +2629,164 @@ async fn directory_changes_and_new_build_configuration_supersede_validation() {
 }
 
 #[tokio::test]
+async fn root_and_foreign_mutation_leases_block_overlapping_claims() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "claim-root";
+    fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: root_session_id.to_string(),
+                actor_id: format!("root:{root_session_id}"),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("root mutation lease");
+    assert!(matches!(
+        fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                worker_draft(root_session_id, "src/lib.rs"),
+            )
+            .await,
+        Err(StoreError::WorkspaceClaimConflict { .. })
+    ));
+
+    let foreign = Fixture::new().await;
+    foreign
+        .store
+        .begin_workspace_mutation(
+            foreign.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: root_session_id.to_string(),
+                actor_id: "legacy:foreign-writer".to_string(),
+                kind: WorkspaceActorKind::Legacy,
+                attempt_id: None,
+                paths: vec!["src/lib.rs".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("foreign mutation lease");
+    assert!(matches!(
+        foreign
+            .store
+            .create_assignment(
+                foreign.repo.path(),
+                worker_draft(root_session_id, "src/lib.rs"),
+            )
+            .await,
+        Err(StoreError::WorkspaceClaimConflict { .. })
+    ));
+
+    let spoofed = Fixture::new().await;
+    spoofed
+        .store
+        .begin_workspace_mutation(
+            spoofed.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: root_session_id.to_string(),
+                actor_id: format!("root:{root_session_id}"),
+                kind: WorkspaceActorKind::Legacy,
+                attempt_id: None,
+                paths: vec!["src/lib.rs".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("spoofed root actor lease");
+    assert!(matches!(
+        spoofed
+            .store
+            .create_assignment(
+                spoofed.repo.path(),
+                worker_draft(root_session_id, "src/lib.rs"),
+            )
+            .await,
+        Err(StoreError::WorkspaceClaimConflict { .. })
+    ));
+}
+
+#[tokio::test]
+async fn same_actor_supersedes_an_overlapping_recovered_mutation_lease() {
+    let fixture = Fixture::new().await;
+    let request = WorkspaceMutationRequest {
+        root_session_id: "recovered-root".to_string(),
+        actor_id: "root".to_string(),
+        kind: WorkspaceActorKind::Root,
+        attempt_id: None,
+        paths: vec!["src/local.rs".to_string()],
+        contracts: Vec::new(),
+        expected_manifest: Vec::new(),
+    };
+    let stale = fixture
+        .store
+        .begin_workspace_mutation(fixture.repo.path(), request.clone())
+        .await
+        .expect("initial mutation lease");
+
+    let recovered = fixture
+        .store
+        .begin_workspace_mutation(fixture.repo.path(), request.clone())
+        .await
+        .expect("the same actor can recover an overlapping mutation lease");
+    assert_ne!(stale.lease_id, recovered.lease_id);
+    assert!(
+        !fixture
+            .store
+            .heartbeat_workspace_mutation(
+                fixture.repo.path(),
+                stale.lease_id.clone(),
+                stale.actor_id.clone(),
+            )
+            .await
+            .expect("stale mutation heartbeat is checked")
+    );
+    assert!(
+        fixture
+            .store
+            .heartbeat_workspace_mutation(
+                fixture.repo.path(),
+                recovered.lease_id.clone(),
+                recovered.actor_id.clone(),
+            )
+            .await
+            .expect("recovered mutation heartbeat is checked")
+    );
+
+    let foreign_error = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                actor_id: "foreign-root".to_string(),
+                ..request
+            },
+        )
+        .await
+        .expect_err("a different actor remains blocked by the recovered lease");
+    assert!(matches!(
+        foreign_error,
+        StoreError::WorkspaceClaimConflict { .. }
+    ));
+
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), recovered)
+        .await
+        .expect("recovered mutation lease releases cleanly");
+}
+
+#[tokio::test]
 async fn typed_claims_block_untyped_writers_and_supporting_reads_enforce_cas() {
     let fixture = Fixture::new().await;
     std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");

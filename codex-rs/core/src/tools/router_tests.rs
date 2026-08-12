@@ -450,7 +450,7 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
             depth: 1,
             agent_path: None,
             agent_nickname: None,
-            agent_role: Some("kd4_reviewer".to_string()),
+            agent_role: Some("reviewer".to_string()),
         }),
     ];
     for source in sources {

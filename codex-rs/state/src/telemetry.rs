@@ -6,6 +6,8 @@ use std::time::Duration;
 use crate::DB_FALLBACK_METRIC;
 use crate::DB_INIT_DURATION_METRIC;
 use crate::DB_INIT_METRIC;
+use crate::DB_LOG_PHASE_DURATION_METRIC;
+use crate::DB_LOG_RETENTION_METRIC;
 use tracing::debug;
 
 /// Low-cardinality sink for SQLite startup and fallback telemetry.
@@ -70,6 +72,27 @@ pub(crate) fn record_init_result<T>(
     ];
     record_counter(telemetry, DB_INIT_METRIC, &tags);
     record_duration(telemetry, DB_INIT_DURATION_METRIC, duration, &tags);
+}
+
+pub(crate) fn record_log_phase<T>(
+    telemetry: Option<&dyn DbTelemetry>,
+    operation: &'static str,
+    phase: &'static str,
+    duration: Duration,
+    result: &anyhow::Result<T>,
+) {
+    let outcome = DbOutcomeTags::from_result(result);
+    let tags = [
+        ("operation", operation),
+        ("phase", phase),
+        ("status", outcome.status),
+        ("error", outcome.error),
+    ];
+    record_duration(telemetry, DB_LOG_PHASE_DURATION_METRIC, duration, &tags);
+}
+
+pub(crate) fn record_log_retention_event(telemetry: Option<&dyn DbTelemetry>, event: &'static str) {
+    record_counter(telemetry, DB_LOG_RETENTION_METRIC, &[("event", event)]);
 }
 
 pub fn record_backfill_gate(

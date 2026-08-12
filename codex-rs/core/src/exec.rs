@@ -7,6 +7,10 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -64,7 +68,6 @@ const SIGKILL_CODE: i32 = 9;
 const TIMEOUT_CODE: i32 = 64;
 const EXIT_CODE_SIGNAL_BASE: i32 = 128; // conventional shell: 128 + signal
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124; // conventional timeout exit code
-#[cfg(not(target_os = "windows"))]
 const CANCELLATION_TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
 
 // I/O buffer sizing
@@ -80,6 +83,37 @@ const EXEC_OUTPUT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 /// Limit the number of ExecCommandOutputDelta events emitted per exec call.
 /// Aggregation still collects full output; only the live event stream is capped.
 pub(crate) const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 10_000;
+pub(crate) const EXEC_OUTPUT_DELTA_CAP_NOTICE: &[u8] =
+    b"\n[command output live updates capped after 10000 deltas; final output continues]\n";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutputDeltaDecision {
+    Emit,
+    EmitCapNotice,
+    Suppress,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OutputDeltaLimiter {
+    emitted: AtomicUsize,
+    cap_notice_emitted: AtomicBool,
+}
+
+impl OutputDeltaLimiter {
+    pub(crate) fn claim(&self) -> OutputDeltaDecision {
+        if self.emitted.fetch_add(1, Ordering::Relaxed) < MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
+            OutputDeltaDecision::Emit
+        } else if self
+            .cap_notice_emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            OutputDeltaDecision::EmitCapNotice
+        } else {
+            OutputDeltaDecision::Suppress
+        }
+    }
+}
 
 // Wait for the stdout/stderr collection tasks but guard against them
 // hanging forever. In the normal case, both pipes are closed once the child
@@ -525,6 +559,7 @@ async fn get_raw_output_result(
     if sandbox == SandboxType::WindowsRestrictedToken {
         return exec_windows_sandbox(
             params,
+            stdout_stream,
             permission_profile,
             windows_sandbox_policy_cwd,
             windows_sandbox_workspace_roots,
@@ -605,14 +640,17 @@ fn record_windows_sandbox_spawn_failure(
 #[cfg(target_os = "windows")]
 async fn exec_windows_sandbox(
     params: ExecParams,
+    stdout_stream: Option<StdoutStream>,
     permission_profile: &PermissionProfile,
     windows_sandbox_policy_cwd: &AbsolutePathBuf,
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
 ) -> Result<RawExecToolCallOutput> {
     use crate::config::find_codex_home;
+    use codex_windows_sandbox::CaptureOutputSink;
+    use codex_windows_sandbox::CaptureOutputStream;
     use codex_windows_sandbox::run_windows_sandbox_capture_for_permission_profile_elevated;
-    use codex_windows_sandbox::run_windows_sandbox_capture_with_filesystem_overrides;
+    use codex_windows_sandbox::run_windows_sandbox_capture_with_filesystem_overrides_and_output_sink;
 
     let ExecParams {
         command,
@@ -667,6 +705,23 @@ async fn exec_windows_sandbox(
     let additional_deny_read_paths = windows_sandbox_filesystem_overrides
         .map(|overrides| overrides.additional_deny_read_paths.clone())
         .unwrap_or_default();
+    let output_sink = stdout_stream.map(|stream| {
+        let limiter = Arc::new(OutputDeltaLimiter::default());
+        Arc::new(move |capture_stream: CaptureOutputStream, chunk: &[u8]| {
+            let chunk = match limiter.claim() {
+                OutputDeltaDecision::Emit => chunk.to_vec(),
+                OutputDeltaDecision::EmitCapNotice => EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(),
+                OutputDeltaDecision::Suppress => return,
+            };
+            let event = output_delta_event(
+                &stream,
+                matches!(capture_stream, CaptureOutputStream::Stderr),
+                chunk,
+            );
+            #[allow(clippy::let_unit_value)]
+            let _ = stream.tx_event.send_blocking(event);
+        }) as CaptureOutputSink
+    });
     let elevated_read_roots_override = windows_sandbox_filesystem_overrides
         .and_then(|overrides| overrides.read_roots_override.clone());
     let elevated_read_roots_include_platform_defaults = windows_sandbox_filesystem_overrides
@@ -693,10 +748,11 @@ async fn exec_windows_sandbox(
                     write_roots_override: elevated_write_roots_override.as_deref(),
                     deny_read_paths_override: &additional_deny_read_paths,
                     deny_write_paths_override: &additional_deny_write_paths,
+                    output_sink: output_sink.clone(),
                 },
             )
         } else {
-            run_windows_sandbox_capture_with_filesystem_overrides(
+            run_windows_sandbox_capture_with_filesystem_overrides_and_output_sink(
                 &permission_profile,
                 workspace_roots.as_slice(),
                 codex_home.as_ref(),
@@ -708,6 +764,7 @@ async fn exec_windows_sandbox(
                 &additional_deny_read_paths,
                 &additional_deny_write_paths,
                 windows_sandbox_private_desktop,
+                output_sink,
             )
         }
     })
@@ -1022,17 +1079,20 @@ async fn consume_output(
     })?;
 
     let retained_bytes_cap = capture_policy.retained_bytes_cap();
+    let output_delta_limiter = Arc::new(OutputDeltaLimiter::default());
     let stdout_handle = tokio::spawn(read_output(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
         /*is_stderr*/ false,
         retained_bytes_cap,
+        output_delta_limiter.clone(),
     ));
     let stderr_handle = tokio::spawn(read_output(
         BufReader::new(stderr_reader),
         stdout_stream.clone(),
         /*is_stderr*/ true,
         retained_bytes_cap,
+        output_delta_limiter,
     ));
 
     let expiration_wait = async {
@@ -1071,7 +1131,14 @@ async fn consume_output(
                     #[cfg(target_os = "windows")]
                     {
                         kill_child_process_tree(&mut child, &managed_root)?;
-                        child.wait().await?;
+                        if let Ok(status) = tokio::time::timeout(
+                            CANCELLATION_TERMINATION_GRACE_PERIOD,
+                            child.wait(),
+                        )
+                        .await
+                        {
+                            status?;
+                        }
                     }
                     #[cfg(not(target_os = "windows"))]
                     {
@@ -1172,6 +1239,7 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     stream: Option<StdoutStream>,
     is_stderr: bool,
     max_bytes: Option<usize>,
+    output_delta_limiter: Arc<OutputDeltaLimiter>,
 ) -> io::Result<StreamOutput<Vec<u8>>> {
     let mut buf = Vec::with_capacity(
         max_bytes.map_or(AGGREGATE_BUFFER_INITIAL_CAPACITY, |max_bytes| {
@@ -1179,7 +1247,7 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         }),
     );
     let mut tmp = [0u8; READ_CHUNK_SIZE];
-    let mut emitted_deltas: usize = 0;
+    let mut live_output_enabled = true;
     let mut pending_delta = Vec::with_capacity(READ_CHUNK_SIZE);
 
     loop {
@@ -1189,15 +1257,19 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         }
 
         if let Some(stream) = &stream
-            && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
+            && live_output_enabled
         {
             pending_delta.extend_from_slice(&tmp[..n]);
-            while emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
-                && let Some(chunk) =
-                    take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ false)
+            while let Some(chunk) =
+                take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ false)
             {
-                send_output_delta(stream, is_stderr, chunk).await;
-                emitted_deltas += 1;
+                live_output_enabled =
+                    send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter)
+                        .await;
+                if !live_output_enabled {
+                    pending_delta.clear();
+                    break;
+                }
             }
         }
 
@@ -1209,13 +1281,15 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         // Continue reading to EOF to avoid back-pressure
     }
 
-    if let Some(stream) = &stream {
-        while emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
-            && let Some(chunk) =
-                take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ true)
+    if let Some(stream) = &stream
+        && live_output_enabled
+    {
+        while let Some(chunk) =
+            take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ true)
         {
-            send_output_delta(stream, is_stderr, chunk).await;
-            emitted_deltas += 1;
+            if !send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter).await {
+                break;
+            }
         }
     }
 
@@ -1261,7 +1335,7 @@ fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
     bytes.len()
 }
 
-async fn send_output_delta(stream: &StdoutStream, is_stderr: bool, chunk: Vec<u8>) {
+fn output_delta_event(stream: &StdoutStream, is_stderr: bool, chunk: Vec<u8>) -> Event {
     let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
         call_id: stream.call_id.clone(),
         stream: if is_stderr {
@@ -1271,12 +1345,27 @@ async fn send_output_delta(stream: &StdoutStream, is_stderr: bool, chunk: Vec<u8
         },
         chunk,
     });
-    let event = Event {
+    Event {
         id: stream.sub_id.clone(),
         msg,
+    }
+}
+
+async fn send_limited_output_delta(
+    stream: &StdoutStream,
+    is_stderr: bool,
+    chunk: Vec<u8>,
+    limiter: &OutputDeltaLimiter,
+) -> bool {
+    let (chunk, continue_streaming) = match limiter.claim() {
+        OutputDeltaDecision::Emit => (chunk, true),
+        OutputDeltaDecision::EmitCapNotice => (EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(), false),
+        OutputDeltaDecision::Suppress => return false,
     };
+    let event = output_delta_event(stream, is_stderr, chunk);
     #[allow(clippy::let_unit_value)]
     let _ = stream.tx_event.send(event).await;
+    continue_streaming
 }
 
 #[cfg(unix)]

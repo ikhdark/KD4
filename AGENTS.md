@@ -58,17 +58,16 @@ instructions.
 
 ## Architect-driven KD4 implementation lane
 
-Ordinary investigation and implementation use the built-in `explorer` and
-`worker`; this lane uses the repo-local typed aliases.
+This lane uses the built-in typed agent roles.
 
 1. The coordinator decides case by case whether a risky task needs this lane.
-2. Spawn `kd4_explorer` with criteria that require the complete runtime and
+2. Spawn `explorer` with criteria that require the complete runtime and
    contract surface plus a single valid-JSON `KD4_ARCHITECT_CONTRACT_V1`
    assignment block.
 3. Wait for the architect's successful sealed receipt and cleared gates.
 4. Copy the architect's `objective`, stable-ID `acceptance_criteria`, `read_scope`,
    `write_scope`, `risk_hints`, `required_evidence`, `prohibited_changes`,
-   `contract_claims`, and `stop_condition` into a `kd4_worker` assignment. Record
+   `contract_claims`, and `stop_condition` into a `worker` assignment. Record
    the architect assignment and receipt version in the coder objective, and make
    the architect assignment a dependency.
 5. Before spawning the coder, compare the copied fields and obligation IDs with

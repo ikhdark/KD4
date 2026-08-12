@@ -79,6 +79,7 @@ pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
 
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
+const TERMINAL_MUTATION_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 const WORKSPACE_FINALIZATION_DISPATCH_SEAL_FAILED_REASON: &str =
     "the workspace finalization fence could not be sealed for terminal dispatch";
@@ -938,10 +939,6 @@ impl Session {
 
     async fn finalize_turn_terminal(self: &Arc<Self>, finalization: &mut TerminalFinalization) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
-        self.services
-            .command_execution
-            .cancel_mutations_for_turn(&turn_context.sub_id)
-            .await;
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
@@ -961,6 +958,27 @@ impl Session {
                 "quiescing task before terminal finalization"
             );
             finalization.task.cancellation_token.cancel();
+        }
+
+        // A mutating command can only finish its ledger cleanup after its task observes
+        // cancellation. Signal the task before waiting for that cleanup, otherwise an
+        // interrupt can deadlock here and the app server never receives TurnAborted.
+        let mutation_cleanup_completed = self
+            .services
+            .command_execution
+            .cancel_mutations_for_turn_with_timeout(
+                &turn_context.sub_id,
+                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+            )
+            .await;
+        if !mutation_cleanup_completed {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                "timed out waiting for turn-owned workspace mutations to finalize"
+            );
+        }
+
+        if requires_abort_cleanup {
             tokio::select! {
                 _ = finalization.task.done.notified() => {},
                 _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
@@ -1066,6 +1084,11 @@ impl Session {
                 ts.completion_review_partial_reasons(),
             )
         };
+        if !mutation_cleanup_completed {
+            completion_review_partial_reasons.push(
+                "turn-owned workspace mutation cleanup exceeded the terminal deadline".to_string(),
+            );
+        }
         // Emit token usage metrics.
         {
             // TODO(jif): drop this
@@ -1755,10 +1778,20 @@ impl Session {
         finalization: &mut TerminalFinalization,
     ) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
-        self.services
+        let mutation_cleanup_completed = self
+            .services
             .command_execution
-            .cancel_mutations_for_turn(&turn_context.sub_id)
+            .cancel_mutations_for_turn_with_timeout(
+                &turn_context.sub_id,
+                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+            )
             .await;
+        if !mutation_cleanup_completed {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                "timed out waiting for turn-owned workspace mutations during fail-safe finalization"
+            );
+        }
         finalization.task.cancellation_token.cancel();
         finalization.task.worker_abort_handle.abort();
         turn_context

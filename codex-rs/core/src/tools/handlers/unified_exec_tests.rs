@@ -8,7 +8,11 @@ use codex_agent_task_store::WorkspaceActorKind;
 use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_exec_server::Environment;
 use codex_git_utils::get_git_repo_root;
+use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_tools::ToolExecutor;
 use codex_tools::UnifiedExecShellMode;
 use codex_tools::ZshForkConfig;
@@ -537,6 +541,79 @@ async fn git_status_bypasses_an_occupied_mutation_lease_but_other_commands_wait(
         .finish_workspace_mutation(&repo_root, lease)
         .await
         .expect("other actor mutation lease finishes");
+}
+
+#[tokio::test]
+async fn legacy_exec_reuses_the_shell_actor_identity_for_the_same_root() {
+    let (session, mut turn) = make_session_and_context().await;
+    let agent_path = AgentPath::try_from("/root/legacy-worker").expect("valid agent path");
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: Some(agent_path.clone()),
+        agent_nickname: None,
+        agent_role: Some("worker".to_string()),
+    });
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let coordinator = session.services.agent_control.task_coordinator().clone();
+    coordinator
+        .initialize_for_workspace_coordination(
+            session.services.state_db.clone(),
+            turn.config.sqlite_home.clone(),
+            turn.config.model_provider_id.clone(),
+            session.services.agent_control.session_id().to_string(),
+        )
+        .await
+        .expect("workspace coordination initializes");
+    let store = coordinator.store().expect("task store initializes");
+    let root_session_id = coordinator
+        .root_session_id()
+        .expect("root task identity initializes");
+    #[allow(deprecated)]
+    let repo_root = get_git_repo_root(turn.cwd.as_path()).expect("test cwd is in a git repository");
+    store
+        .begin_workspace_mutation(
+            &repo_root,
+            WorkspaceMutationRequest {
+                root_session_id: root_session_id.clone(),
+                actor_id: format!("legacy:{root_session_id}:{agent_path}"),
+                kind: WorkspaceActorKind::Legacy,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("shell-shaped legacy mutation lease starts");
+
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "git",
+            "args": ["rev-parse", "--show-toplevel"]
+        })
+        .to_string(),
+    };
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ExecCommandHandler::default().handle(ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "legacy-exec-under-shell-lease".to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        }),
+    )
+    .await
+    .expect("same legacy actor must not stall on its shell-shaped lease")
+    .expect("same legacy actor exec succeeds");
+    assert_eq!(output.code_mode_result(&payload)["exit_code"], 0);
 }
 
 #[tokio::test]

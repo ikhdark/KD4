@@ -54,7 +54,7 @@ pub(crate) fn is_independent_review_source(source: &SessionSource) -> bool {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             agent_role: Some(role),
             ..
-        }) => matches!(role.as_str(), "reviewer" | "kd4_reviewer"),
+        }) => role == "reviewer",
         _ => false,
     }
 }

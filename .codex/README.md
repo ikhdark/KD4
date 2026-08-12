@@ -32,12 +32,6 @@ definitions live in `.codex/agents/`; every `config_file` entry must resolve to
 a tracked, schema-valid role file. Roles inherit parent settings except where
 their role file explicitly overrides a supported configuration key.
 
-The `kd4_explorer`, `kd4_worker`, `kd4_reviewer`, `kd4_verifier`, and
-`kd4_integrator` names are typed-capable aliases for their built-in role kinds.
-The reviewer alias remains mutation-denied while retaining repository reads,
-diffs, proven read-only shell commands, Repo Atlas lookups, and fetch-only
-GitHub inspection.
-
 ## Task Continuity
 
 The synchronous project hooks in [`hooks.json`](hooks.json) invoke the thin
@@ -65,10 +59,10 @@ Desktop-visible completion are intentionally deferred for this phase.
 ## Agent Lanes
 
 Use the built-in `explorer` and `worker` for ordinary investigation and bounded
-implementation. For coordinator-selected risky work, `kd4_explorer` is the
-read-only contract architect and `kd4_worker` is the sole implementation owner
-for the copied architect contract. `kd4_reviewer` and the read-only
-`kd4_verifier` evaluate the coder assignment and final diff. The authoritative
+implementation. For coordinator-selected risky work, `explorer` is the
+read-only contract architect and `worker` is the sole implementation owner for
+the copied architect contract. The built-in `reviewer` and read-only `verifier`
+evaluate the coder assignment and final diff. The authoritative
 routing and shared subagent guardrails live in the root [`AGENTS.md`](../AGENTS.md);
 the durable sequence and enforcement boundary are summarized in
 [`harness/workflow.md`](harness/workflow.md).

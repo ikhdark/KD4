@@ -9782,6 +9782,41 @@ impl SessionTask for NeverEndingTask {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MutationFinalizingOnCancellationTask {
+    process_id: i32,
+}
+
+impl SessionTask for MutationFinalizingOnCancellationTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.mutation_finalizing_on_cancellation"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        assert!(
+            session
+                .clone_session()
+                .services
+                .command_execution
+                .mark_running_process_completed(self.process_id, 130)
+                .await,
+            "the fixture mutation should still be tracked"
+        );
+        Ok(None)
+    }
+}
+
 #[derive(Clone)]
 struct BlockingAbortTask {
     abort_started: Arc<tokio::sync::Notify>,
@@ -10093,6 +10128,90 @@ async fn abort_gracefully_emits_marker_before_turn_aborted() {
     }
     // No extra events should be emitted after an abort.
     assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_cancels_task_before_waiting_for_workspace_mutation_cleanup() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let codex_home = tempfile::TempDir::new().expect("codex home tempdir");
+    let repo = tempfile::TempDir::new().expect("repository tempdir");
+    let state = codex_state::StateRuntime::init(
+        codex_home.path().to_path_buf(),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("state runtime initializes");
+    let store = Arc::new(
+        codex_agent_task_store::LocalAgentTaskStore::initialize(&state)
+            .await
+            .expect("task store initializes"),
+    );
+    let reservation = sess
+        .services
+        .command_execution
+        .reserve_workspace_mutation(repo.path())
+        .await;
+    let lease = codex_agent_task_store::AgentTaskStore::begin_workspace_mutation(
+        store.as_ref(),
+        repo.path(),
+        codex_agent_task_store::WorkspaceMutationRequest {
+            root_session_id: "owner-root".to_string(),
+            actor_id: "root:owner-root".to_string(),
+            kind: codex_agent_task_store::WorkspaceActorKind::Root,
+            attempt_id: None,
+            paths: vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
+            contracts: Vec::new(),
+            expected_manifest: Vec::new(),
+        },
+    )
+    .await
+    .expect("workspace mutation starts");
+    let task_store: Arc<dyn codex_agent_task_store::AgentTaskStore> = store;
+    let mutation = crate::tools::command_execution::RunningWorkspaceMutation::new(
+        task_store,
+        repo.path().to_path_buf(),
+        lease,
+        CancellationToken::new(),
+        reservation,
+    );
+    let process_id = 42_424;
+    sess.services
+        .command_execution
+        .track_running_process(
+            process_id,
+            crate::tools::command_execution::CommandAttemptKey::new(
+                "exec_command",
+                "local",
+                repo.path().display().to_string(),
+                &["long-running-mutation".to_string()],
+            ),
+            crate::tools::command_output_artifact::RawOutputArtifact::unavailable("fixture"),
+            tc.sub_id.clone(),
+            Some(mutation),
+        )
+        .await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        MutationFinalizingOnCancellationTask { process_id },
+    )
+    .await;
+
+    timeout(
+        Duration::from_secs(2),
+        sess.abort_all_tasks(TurnAbortReason::Interrupted),
+    )
+    .await
+    .expect("interrupt should not wait forever for mutating command cleanup");
+
+    let event = recv_terminal_event(&rx, TerminalEventKind::TurnAborted).await;
+    assert!(matches!(
+        event.msg,
+        EventMsg::TurnAborted(TurnAbortedEvent {
+            reason: TurnAbortReason::Interrupted,
+            ..
+        })
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

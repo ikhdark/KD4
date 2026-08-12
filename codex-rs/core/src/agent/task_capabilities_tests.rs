@@ -319,28 +319,26 @@ fn profiles_receive_only_their_declared_tool_classes() {
 }
 
 #[test]
-fn independent_review_sources_include_automatic_and_kd4_reviewers() {
+fn independent_review_sources_include_automatic_and_builtin_reviewers() {
     assert!(is_independent_review_source(&SessionSource::SubAgent(
         SubAgentSource::Review
     )));
-    for role in ["reviewer", "kd4_reviewer"] {
-        assert!(is_independent_review_source(&SessionSource::SubAgent(
-            SubAgentSource::ThreadSpawn {
-                parent_thread_id: ThreadId::new(),
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: Some(role.to_string()),
-            }
-        )));
-    }
+    assert!(is_independent_review_source(&SessionSource::SubAgent(
+        SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("reviewer".to_string()),
+        }
+    )));
     assert!(!is_independent_review_source(&SessionSource::SubAgent(
         SubAgentSource::ThreadSpawn {
             parent_thread_id: ThreadId::new(),
             depth: 1,
             agent_path: None,
             agent_nickname: None,
-            agent_role: Some("kd4_verifier".to_string()),
+            agent_role: Some("verifier".to_string()),
         }
     )));
 }

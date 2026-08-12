@@ -197,6 +197,7 @@ async fn read_output_limits_retained_bytes_for_shell_capture() {
         /*stream*/ None,
         /*is_stderr*/ false,
         Some(EXEC_OUTPUT_MAX_BYTES),
+        Arc::new(OutputDeltaLimiter::default()),
     )
     .await
     .expect("read");
@@ -224,6 +225,7 @@ async fn read_output_preserves_utf8_codepoints_split_across_reads() {
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,
+        Arc::new(OutputDeltaLimiter::default()),
     )
     .await
     .expect("read output");
@@ -262,6 +264,7 @@ async fn read_output_makes_progress_when_pending_exceeds_read_chunk_size() {
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,
+        Arc::new(OutputDeltaLimiter::default()),
     )
     .await
     .expect("read output");
@@ -290,6 +293,7 @@ async fn read_output_flushes_terminal_incomplete_utf8_once() {
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,
+        Arc::new(OutputDeltaLimiter::default()),
     )
     .await
     .expect("read output");
@@ -395,7 +399,11 @@ async fn read_output_retains_all_bytes_for_full_buffer_capture() {
     });
 
     let out = read_output(
-        reader, /*stream*/ None, /*is_stderr*/ false, /*max_bytes*/ None,
+        reader,
+        /*stream*/ None,
+        /*is_stderr*/ false,
+        /*max_bytes*/ None,
+        Arc::new(OutputDeltaLimiter::default()),
     )
     .await
     .expect("read");
@@ -591,6 +599,7 @@ async fn output_drain_timeout_discards_captured_prefix() -> Result<()> {
         None,
         false,
         None,
+        Arc::new(OutputDeltaLimiter::default()),
     ));
     prefix_read.notified().await;
     let stderr = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stderr")) });

@@ -179,7 +179,10 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
         .await
         .expect("second failed attempt");
     ledger.record_exit(&failure_key, 7).await;
-    assert!(ledger.begin_attempt(&failure_key, false).await.is_err());
+    ledger
+        .begin_attempt(&failure_key, false)
+        .await
+        .expect("repeated unclassified failures remain retryable");
 
     let raw_output = (0..1_000)
         .map(|index| {
@@ -225,7 +228,7 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
         },
         "repair_applied": repair.repaired(),
         "mutating_auto_repair": false,
-        "repeated_failure_blocked_on_attempt": 3,
+        "repeated_unclassified_failure_retryable": true,
         "powershell_host": {
             "kind": format!("{host_kind:?}"),
             "path": powershell.shell_path,

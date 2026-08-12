@@ -9,18 +9,10 @@ task_completion_reviewer = true
 [agents]
 max_depth = 1
 
-[agents.kd4_explorer]
-description = "Read-only KD4 contract architect for risky implementation work."
-config_file = "./agents/kd4_explorer.toml"
+[agents.default]
+description = "Default agent."
+config_file = "./agents/default.toml"
 
 [features.multi_agent_v2]
 enabled = true
-max_concurrent_threads_per_session = 4
-
-[reasoning_phase_efforts]
-orient = "high"
-inspect = "high"
-implement = "high"
-diagnose = "high"
-verify = "high"
-finalize = "low"
+max_concurrent_threads_per_session = 2

@@ -5,6 +5,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::Digest;
 use sha2::Sha256;
+use sqlx::Acquire;
 use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -19,6 +20,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::AgentGate;
 use crate::AgentReceipt;
@@ -93,6 +95,45 @@ const COLD_REVIEW_REASON_PREFIX: &str = "cold review required: ";
 // that contention instead of failing an otherwise read-only source inspection.
 const DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
+
+fn sqlite_contention_code(error: &sqlx::Error) -> Option<&str> {
+    let sqlx::Error::Database(error) = error else {
+        return None;
+    };
+    match error.code().as_deref() {
+        Some("5") => Some("busy"),
+        Some("6") => Some("locked"),
+        _ => None,
+    }
+}
+
+fn record_coordination_timing(
+    operation: &'static str,
+    phase: &'static str,
+    started_at: Instant,
+    error: Option<&sqlx::Error>,
+) {
+    let elapsed_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
+    let contention = error.and_then(sqlite_contention_code);
+    tracing::info!(
+        target: "codex_agent_task_store::coordination",
+        operation,
+        phase,
+        elapsed_ms,
+        sqlite_contention = contention,
+        "agent-task coordination timing"
+    );
+    if let Some(sqlite_contention) = contention {
+        tracing::warn!(
+            target: "codex_agent_task_store::coordination",
+            operation,
+            phase,
+            elapsed_ms,
+            sqlite_contention,
+            "agent-task SQLite contention"
+        );
+    }
+}
 const NONEXISTENT_SENTINEL: &[u8] = b"CODEX_AGENT_TASK_STORE_NONEXISTENT\n";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -860,8 +901,49 @@ impl LocalAgentTaskStore {
                 "observation summary cannot be empty".to_string(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
-        lock_attempt_tx(&mut transaction, attempt_id).await?;
+        let acquire_started = Instant::now();
+        let mut connection = self.pool.acquire().await.inspect_err(|error| {
+            record_coordination_timing(
+                "append_observation",
+                "connection_acquire",
+                acquire_started,
+                Some(error),
+            );
+        })?;
+        record_coordination_timing(
+            "append_observation",
+            "connection_acquire",
+            acquire_started,
+            None,
+        );
+        let begin_started = Instant::now();
+        let mut transaction = connection.begin().await.inspect_err(|error| {
+            record_coordination_timing(
+                "append_observation",
+                "transaction_begin",
+                begin_started,
+                Some(error),
+            );
+        })?;
+        record_coordination_timing(
+            "append_observation",
+            "transaction_begin",
+            begin_started,
+            None,
+        );
+        let writer_started = Instant::now();
+        let writer_result = lock_attempt_tx(&mut transaction, attempt_id).await;
+        let writer_error = writer_result.as_ref().err().and_then(|error| match error {
+            StoreError::Sql(error) => Some(error),
+            _ => None,
+        });
+        record_coordination_timing(
+            "append_observation",
+            "writer_lock",
+            writer_started,
+            writer_error,
+        );
+        writer_result?;
         let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
         let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
         let observation = append_observation_tx(
@@ -2342,6 +2424,7 @@ impl LocalAgentTaskStore {
     ) -> StoreResult<MutationEventId> {
         let normalized = normalize_repo_path(repo_root, &path)?;
         let repository = repository_identity(repo_root)?;
+        let transaction_started = Instant::now();
         let mut transaction = self.pool.begin().await?;
         lock_attempt_tx(&mut transaction, attempt_id).await?;
         let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
@@ -2375,8 +2458,15 @@ impl LocalAgentTaskStore {
             );
             let snapshot_name = snapshot_name.to_string_lossy().into_owned();
             let snapshot_path = private_snapshot_path(&self.coordination_root, &snapshot_name)?;
+            let snapshot_started = Instant::now();
             let pre_write =
                 capture_snapshot_atomic(absolute, snapshot_path, normalized.clone()).await?;
+            record_coordination_timing(
+                "begin_mutation",
+                "snapshot_capture",
+                snapshot_started,
+                None,
+            );
             sqlx::query("INSERT INTO mutation_files (attempt_id, assignment_id, path, pre_write_hash, pre_write_existed, attribution_confidence, snapshot_name, snapshot_retained, first_observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)")
                 .bind(attempt_id.to_string())
                 .bind(assignment.assignment_id.to_string())
@@ -2413,7 +2503,14 @@ impl LocalAgentTaskStore {
             None,
         )
         .await?;
-        transaction.commit().await?;
+        let commit_result = transaction.commit().await;
+        record_coordination_timing(
+            "begin_mutation",
+            "write_transaction",
+            transaction_started,
+            commit_result.as_ref().err(),
+        );
+        commit_result?;
         Ok(event_id)
     }
 
@@ -2425,8 +2522,50 @@ impl LocalAgentTaskStore {
     ) -> StoreResult<MutationEvidence> {
         let normalized = normalize_repo_path(repo_root, &path)?;
         let repository = repository_identity(repo_root)?;
-        let mut transaction = self.pool.begin().await?;
-        lock_attempt_tx(&mut transaction, attempt_id).await?;
+        let acquire_started = Instant::now();
+        let mut connection = self.pool.acquire().await.inspect_err(|error| {
+            record_coordination_timing(
+                "finalize_mutation",
+                "connection_acquire",
+                acquire_started,
+                Some(error),
+            );
+        })?;
+        record_coordination_timing(
+            "finalize_mutation",
+            "connection_acquire",
+            acquire_started,
+            None,
+        );
+        let begin_started = Instant::now();
+        let mut transaction = connection.begin().await.inspect_err(|error| {
+            record_coordination_timing(
+                "finalize_mutation",
+                "transaction_begin",
+                begin_started,
+                Some(error),
+            );
+        })?;
+        record_coordination_timing(
+            "finalize_mutation",
+            "transaction_begin",
+            begin_started,
+            None,
+        );
+        let transaction_started = Instant::now();
+        let writer_started = Instant::now();
+        let writer_result = lock_attempt_tx(&mut transaction, attempt_id).await;
+        let writer_error = writer_result.as_ref().err().and_then(|error| match error {
+            StoreError::Sql(error) => Some(error),
+            _ => None,
+        });
+        record_coordination_timing(
+            "finalize_mutation",
+            "writer_lock",
+            writer_started,
+            writer_error,
+        );
+        writer_result?;
         let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
         let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
         require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
@@ -2460,8 +2599,15 @@ impl LocalAgentTaskStore {
         );
         let final_snapshot_name = final_snapshot_name.to_string_lossy().into_owned();
         let snapshot_path = private_snapshot_path(&self.coordination_root, &final_snapshot_name)?;
+        let snapshot_started = Instant::now();
         let final_write =
             capture_snapshot_atomic(absolute, snapshot_path.clone(), normalized.clone()).await?;
+        record_coordination_timing(
+            "finalize_mutation",
+            "snapshot_capture",
+            snapshot_started,
+            None,
+        );
         let finalized_at = Utc::now();
         let updated = sqlx::query("UPDATE mutation_files SET final_hash = ?, final_write_existed = ?, final_snapshot_name = ?, finalized_at = ? WHERE attempt_id = ? AND path = ? AND finalized_at IS NULL")
             .bind(&final_write.hash)
@@ -2480,7 +2626,14 @@ impl LocalAgentTaskStore {
             });
         }
         let evidence = load_mutation_evidence_tx(&mut transaction, attempt_id, &normalized).await?;
-        transaction.commit().await?;
+        let commit_result = transaction.commit().await;
+        record_coordination_timing(
+            "finalize_mutation",
+            "write_transaction",
+            transaction_started,
+            commit_result.as_ref().err(),
+        );
+        commit_result?;
         Ok(evidence)
     }
 

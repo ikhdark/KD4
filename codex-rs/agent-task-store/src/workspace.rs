@@ -1338,6 +1338,9 @@ fn collect_repository_overlay_files_with(
                 continue;
             }
             let path = String::from_utf8_lossy(raw_path).replace('\\', "/");
+            if repository_overlay_path_is_excluded(&path) {
+                continue;
+            }
             let absolute = absolute_repo_path(root, &path);
             if absolute.is_dir() {
                 collect_directory_files(root, &absolute, files)?;
@@ -1349,6 +1352,34 @@ fn collect_repository_overlay_files_with(
     }
 
     collect_repository_files_fallback(root, root, files)
+}
+
+fn repository_overlay_path_is_excluded(path: &str) -> bool {
+    let mut components = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .peekable();
+    let mut parent_components = Vec::new();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        parent_components.push(component);
+        let name = component.to_ascii_lowercase();
+        if name == ".git"
+            || name == "node_modules"
+            || name == ".venv"
+            || name == "venv"
+            || name == "dist"
+            || name == "build"
+            || name.starts_with("target")
+        {
+            return true;
+        }
+    }
+    parent_components.len() >= 2
+        && parent_components[0].eq_ignore_ascii_case(".codex")
+        && parent_components[1].eq_ignore_ascii_case("locks")
 }
 
 fn spawn_repository_overlay_command(root: &Path, args: &[&str]) -> std::io::Result<Child> {
@@ -1723,7 +1754,7 @@ async fn require_no_mutation_lease_overlap_tx(
     contracts: &[String],
 ) -> StoreResult<()> {
     let rows = sqlx::query(
-        "SELECT actor_id, paths_json, contracts_json FROM workspace_mutation_leases
+        "SELECT lease_id, actor_id, paths_json, contracts_json FROM workspace_mutation_leases
          WHERE workspace_id = ? AND root_session_id = ? AND state = 'active'",
     )
     .bind(workspace_id)
@@ -1731,16 +1762,22 @@ async fn require_no_mutation_lease_overlap_tx(
     .fetch_all(&mut **transaction)
     .await?;
     let mut conflicts = Vec::new();
+    let mut superseded_lease_ids = Vec::new();
     for row in rows {
+        let lease_id = row.get::<String, _>("lease_id");
         let existing_actor = row.get::<String, _>("actor_id");
         let existing: Vec<String> = from_json(&row.get::<String, _>("paths_json"))?;
         let existing_contracts: Vec<String> = from_json(&row.get::<String, _>("contracts_json"))?;
+        let mut overlaps = false;
         for requested in paths {
             for claimed in &existing {
                 if path_overlap(requested, claimed) {
-                    conflicts.push(format!(
-                        "{requested} overlaps active mutation {claimed} held by {existing_actor}"
-                    ));
+                    overlaps = true;
+                    if existing_actor != actor_id {
+                        conflicts.push(format!(
+                            "{requested} overlaps active mutation {claimed} held by {existing_actor}"
+                        ));
+                    }
                 }
             }
         }
@@ -1750,13 +1787,32 @@ async fn require_no_mutation_lease_overlap_tx(
             .cloned()
             .collect::<Vec<_>>();
         if !contract_overlap.is_empty() {
-            conflicts.push(format!(
-                "contracts {} overlap an active mutation held by {existing_actor}",
-                contract_overlap.join(", ")
-            ));
+            overlaps = true;
+            if existing_actor != actor_id {
+                conflicts.push(format!(
+                    "contracts {} overlap an active mutation held by {existing_actor}",
+                    contract_overlap.join(", ")
+                ));
+            }
+        }
+        if overlaps && existing_actor == actor_id {
+            superseded_lease_ids.push(lease_id);
         }
     }
     if conflicts.is_empty() {
+        let now = json(&comparison_now())?;
+        for lease_id in superseded_lease_ids {
+            sqlx::query(
+                "UPDATE workspace_mutation_leases
+                 SET state = 'expired', released_at = ?
+                 WHERE lease_id = ? AND workspace_id = ? AND state = 'active'",
+            )
+            .bind(&now)
+            .bind(lease_id)
+            .bind(workspace_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
         Ok(())
     } else {
         Err(StoreError::WorkspaceClaimConflict {
@@ -1975,5 +2031,22 @@ mod overlay_observation_tests {
         assert_eq!(spawn_count.get(), 2);
         assert!(helper_dir.join("tracked").exists());
         assert!(helper_dir.join("untracked").exists());
+    }
+
+    #[test]
+    fn repository_overlay_excludes_generated_directory_contents() {
+        assert!(repository_overlay_path_is_excluded(
+            "target-codex-agent-task-store-lease/debug/deps/store.pdb"
+        ));
+        assert!(repository_overlay_path_is_excluded(
+            "nested/node_modules/package/index.js"
+        ));
+        assert!(repository_overlay_path_is_excluded(
+            ".codex/locks/workspace.lock"
+        ));
+        assert!(!repository_overlay_path_is_excluded(
+            "codex-rs/example/build.rs"
+        ));
+        assert!(!repository_overlay_path_is_excluded("src/targeting.rs"));
     }
 }

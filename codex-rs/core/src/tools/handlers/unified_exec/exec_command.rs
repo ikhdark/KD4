@@ -8,6 +8,7 @@ use crate::maybe_emit_implicit_skill_invocation;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_execution::DeterministicFailureRecord;
 use crate::tools::command_execution::RunningWorkspaceMutation;
 use crate::tools::command_execution::WorkspaceMutationAcquireError;
 use crate::tools::command_execution::acquire_workspace_mutation_lease;
@@ -222,7 +223,6 @@ pub(super) fn attach_powershell_failure_advisory(
 async fn begin_unified_exec_workspace_mutation(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
-    environment_id: &str,
     command_cwd: &std::path::Path,
     owner_cancelled: CancellationToken,
 ) -> Result<RunningWorkspaceMutation, FunctionCallError> {
@@ -264,9 +264,7 @@ async fn begin_unified_exec_workspace_mutation(
     };
     let actor_id = match kind {
         WorkspaceActorKind::Root => format!("root:{root_session_id}"),
-        WorkspaceActorKind::Legacy => {
-            format!("legacy:{root_session_id}:{agent_path}:{environment_id}")
-        }
+        WorkspaceActorKind::Legacy => format!("legacy:{root_session_id}:{agent_path}"),
         WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
     };
     let repo_root = get_git_repo_root(command_cwd).unwrap_or_else(|| command_cwd.to_path_buf());
@@ -275,10 +273,18 @@ async fn begin_unified_exec_workspace_mutation(
         .command_execution
         .reserve_workspace_mutation_until_cancelled(&repo_root, &owner_cancelled)
         .await
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "exec_command mutation-reservation wait was cancelled".to_string(),
-            )
+        .map_err(|error| {
+            use crate::tools::command_execution::WorkspaceMutationReservationAcquireError;
+
+            let message = match error {
+                WorkspaceMutationReservationAcquireError::Cancelled => {
+                    "exec_command mutation-reservation wait was cancelled"
+                }
+                WorkspaceMutationReservationAcquireError::TimedOut => {
+                    "exec_command could not reserve repository-wide mutation execution within 10 seconds"
+                }
+            };
+            FunctionCallError::RespondToModel(message.to_string())
         })?;
     session
         .services
@@ -306,6 +312,12 @@ async fn begin_unified_exec_workspace_mutation(
                 WorkspaceMutationAcquireError::Cancelled => FunctionCallError::RespondToModel(
                     "exec_command mutation-lease wait was cancelled".to_string(),
                 ),
+                WorkspaceMutationAcquireError::TimedOut { details } => {
+                    FunctionCallError::RespondToModel(format!(
+                        "exec_command could not acquire the repository-wide mutation lease within 10 seconds: {}",
+                        details.join("; ")
+                    ))
+                }
                 WorkspaceMutationAcquireError::Store(error) => {
                     FunctionCallError::RespondToModel(format!(
                         "exec_command could not acquire the repository-wide mutation lease: {error}"
@@ -539,6 +551,10 @@ impl ExecCommandHandler {
                 observation: Some(observation),
             }),
         };
+        // Validation admission is the positive structural proof that this command class has a
+        // closed deterministic-input contract. A nonzero exit from any other command remains
+        // intentionally retryable.
+        let has_deterministic_validation_contract = validation_launch.is_some();
         let validation_observation = Arc::new(StdMutex::new(None));
         validate_independent_review_shell(
             &turn.session_source,
@@ -850,7 +866,6 @@ impl ExecCommandHandler {
                 match begin_unified_exec_workspace_mutation(
                     session.as_ref(),
                     turn.as_ref(),
-                    &turn_environment.environment_id,
                     mutation_cwd.as_path(),
                     cancellation_token.clone(),
                 )
@@ -936,11 +951,29 @@ impl ExecCommandHandler {
                         .finish_running_process(process_id, Some(exit_code))
                         .await;
                     if !tracked {
-                        session
-                            .services
-                            .command_execution
-                            .record_exit(&attempt_key, exit_code)
-                            .await;
+                        if exit_code != 0 && has_deterministic_validation_contract {
+                            session
+                                .services
+                                .command_execution
+                                .record_deterministic_failure(
+                                    &attempt_key,
+                                    DeterministicFailureRecord::from_trusted_classification(
+                                        "focused-validation",
+                                        finalized_artifact.clone(),
+                                        exit_code,
+                                        std::time::SystemTime::now(),
+                                        response.wall_time,
+                                        None,
+                                    ),
+                                )
+                                .await;
+                        } else {
+                            session
+                                .services
+                                .command_execution
+                                .record_exit(&attempt_key, exit_code)
+                                .await;
+                        }
                     }
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);

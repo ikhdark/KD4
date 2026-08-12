@@ -1067,7 +1067,7 @@ async fn build_reviewer_config(
 ) -> Result<Config, ()> {
     let mut config = turn_context.config.as_ref().clone();
     let inherited_model_provider = config.model_provider.clone();
-    apply_role_to_config(&mut config, Some("kd4_reviewer"))
+    apply_role_to_config(&mut config, Some("reviewer"))
         .await
         .map_err(|_| ())?;
     config.model_provider = inherited_model_provider;

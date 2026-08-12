@@ -5,6 +5,8 @@ use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::StoreError;
@@ -12,15 +14,17 @@ use codex_agent_task_store::WorkspaceMutationLease;
 use codex_agent_task_store::WorkspaceMutationRequest;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedMutexGuard;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::validation_admission::ValidationLaunchPlan;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
-const MAX_CONSECUTIVE_FAILURES: u8 = 2;
 const WORKSPACE_MUTATION_RETRY_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(250);
+const WORKSPACE_MUTATION_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CommandAttemptKey {
@@ -114,15 +118,53 @@ fn fingerprint_value<T: Hash + ?Sized>(value: &T) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandAttemptBlocked {
     pub(crate) fingerprint: String,
-    pub(crate) consecutive_failures: u8,
+    pub(crate) prior_failure: DeterministicFailureRecord,
 }
 
 impl CommandAttemptBlocked {
     pub(crate) fn render_for_model(&self) -> String {
         format!(
-            "Command blocked: fingerprint `{}` has failed {} consecutive times in this session. Inspect the retained raw-output artifacts or change the command instead of repeating it unchanged.",
-            self.fingerprint, self.consecutive_failures
+            "Command failed: exact repeat of deterministic `{}` failure from the original attempt (fingerprint `{}`, exit code {}, evidence {:?}); execution was suppressed.",
+            self.prior_failure.outcome_class,
+            self.fingerprint,
+            self.prior_failure.exit_code,
+            self.prior_failure.evidence,
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeterministicFailureRecord {
+    pub(crate) outcome_class: String,
+    pub(crate) evidence: RawOutputArtifact,
+    pub(crate) exit_code: i32,
+    pub(crate) execution_started_at: SystemTime,
+    pub(crate) execution_ended_at: SystemTime,
+    pub(crate) execution_duration: Duration,
+    pub(crate) termination_drain_duration: Option<Duration>,
+}
+
+impl DeterministicFailureRecord {
+    pub(crate) fn from_trusted_classification(
+        outcome_class: impl Into<String>,
+        evidence: RawOutputArtifact,
+        exit_code: i32,
+        execution_ended_at: SystemTime,
+        execution_duration: Duration,
+        termination_drain_duration: Option<Duration>,
+    ) -> Self {
+        let execution_started_at = execution_ended_at
+            .checked_sub(execution_duration)
+            .unwrap_or(execution_ended_at);
+        Self {
+            outcome_class: outcome_class.into(),
+            evidence,
+            exit_code,
+            execution_started_at,
+            execution_ended_at,
+            execution_duration,
+            termination_drain_duration,
+        }
     }
 }
 
@@ -132,6 +174,7 @@ struct AttemptEntry {
     repairs: u32,
     consecutive_failures: u8,
     last_exit_code: Option<i32>,
+    deterministic_failure: Option<DeterministicFailureRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +184,8 @@ pub(crate) struct RunningCommand {
     owner_turn_id: String,
     completed_exit_code: Option<i32>,
     workspace_mutation: Option<RunningWorkspaceMutation>,
+    validation_launch: Option<ValidationLaunchPlan>,
+    started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -150,6 +195,12 @@ pub(crate) struct RunningWorkspaceMutation {
 
 pub(crate) struct WorkspaceMutationReservation {
     _guard: OwnedMutexGuard<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceMutationReservationAcquireError {
+    Cancelled,
+    TimedOut,
 }
 
 pub(crate) struct WorkspaceMutationGuard {
@@ -226,6 +277,7 @@ impl Drop for WorkspaceMutationGuard {
 #[derive(Debug)]
 pub(crate) enum WorkspaceMutationAcquireError {
     Cancelled,
+    TimedOut { details: Vec<String> },
     Store(StoreError),
 }
 
@@ -235,6 +287,24 @@ pub(crate) async fn acquire_workspace_mutation_lease(
     request: &WorkspaceMutationRequest,
     cancellation: &CancellationToken,
 ) -> Result<WorkspaceMutationLease, WorkspaceMutationAcquireError> {
+    acquire_workspace_mutation_lease_with_max_wait(
+        store,
+        repo_root,
+        request,
+        cancellation,
+        WORKSPACE_MUTATION_MAX_WAIT,
+    )
+    .await
+}
+
+async fn acquire_workspace_mutation_lease_with_max_wait(
+    store: &dyn AgentTaskStore,
+    repo_root: &Path,
+    request: &WorkspaceMutationRequest,
+    cancellation: &CancellationToken,
+    max_wait: std::time::Duration,
+) -> Result<WorkspaceMutationLease, WorkspaceMutationAcquireError> {
+    let deadline = tokio::time::Instant::now() + max_wait;
     loop {
         if cancellation.is_cancelled() {
             return Err(WorkspaceMutationAcquireError::Cancelled);
@@ -245,10 +315,13 @@ pub(crate) async fn acquire_workspace_mutation_lease(
             .await
         {
             Ok(lease) => return Ok(lease),
-            Err(StoreError::WorkspaceClaimConflict { .. }) => {
+            Err(StoreError::WorkspaceClaimConflict { details }) => {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
                         return Err(WorkspaceMutationAcquireError::Cancelled);
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err(WorkspaceMutationAcquireError::TimedOut { details });
                     }
                     _ = tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL) => {}
                 }
@@ -428,12 +501,36 @@ impl CommandExecutionLedger {
         &self,
         repo_root: &Path,
         cancellation: &CancellationToken,
-    ) -> Option<WorkspaceMutationReservation> {
+    ) -> Result<WorkspaceMutationReservation, WorkspaceMutationReservationAcquireError> {
+        self.reserve_workspace_mutation_with_max_wait(
+            repo_root,
+            cancellation,
+            WORKSPACE_MUTATION_MAX_WAIT,
+        )
+        .await
+    }
+
+    async fn reserve_workspace_mutation_with_max_wait(
+        &self,
+        repo_root: &Path,
+        cancellation: &CancellationToken,
+        max_wait: Duration,
+    ) -> Result<WorkspaceMutationReservation, WorkspaceMutationReservationAcquireError> {
         let gate = self.workspace_mutation_gate(repo_root).await;
+        // A terminated tool call can leave its in-process work pending while the caller is gone.
+        // Do not let that orphaned reservation prevent every later command from reaching the
+        // persistent lease, whose wait is already bounded separately.
         tokio::select! {
             biased;
-            _ = cancellation.cancelled() => None,
-            guard = gate.lock_owned() => Some(WorkspaceMutationReservation { _guard: guard }),
+            _ = cancellation.cancelled() => {
+                Err(WorkspaceMutationReservationAcquireError::Cancelled)
+            }
+            _ = tokio::time::sleep(max_wait) => {
+                Err(WorkspaceMutationReservationAcquireError::TimedOut)
+            }
+            guard = gate.lock_owned() => {
+                Ok(WorkspaceMutationReservation { _guard: guard })
+            }
         }
     }
 
@@ -472,11 +569,11 @@ impl CommandExecutionLedger {
     ) -> Result<(), CommandAttemptBlocked> {
         let mut state = self.state.lock().await;
         if let Some(entry) = state.attempts.get(key)
-            && entry.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+            && let Some(prior_failure) = entry.deterministic_failure.clone()
         {
             return Err(CommandAttemptBlocked {
                 fingerprint: key.fingerprint(),
-                consecutive_failures: entry.consecutive_failures,
+                prior_failure,
             });
         }
 
@@ -493,6 +590,19 @@ impl CommandExecutionLedger {
         record_exit_locked(&mut state, key, exit_code);
     }
 
+    pub(crate) async fn record_deterministic_failure(
+        &self,
+        key: &CommandAttemptKey,
+        failure: DeterministicFailureRecord,
+    ) {
+        let mut state = self.state.lock().await;
+        let entry = attempt_entry_locked(&mut state, key);
+        entry.last_exit_code = Some(failure.exit_code);
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.deterministic_failure = Some(failure);
+    }
+
+    #[cfg(test)]
     pub(crate) async fn track_running_process(
         &self,
         process_id: i32,
@@ -500,6 +610,29 @@ impl CommandExecutionLedger {
         artifact: RawOutputArtifact,
         owner_turn_id: String,
         workspace_mutation: Option<RunningWorkspaceMutation>,
+    ) {
+        self.track_running_process_with_validation_contract(
+            process_id,
+            key,
+            artifact,
+            owner_turn_id,
+            workspace_mutation,
+            None,
+            Instant::now(),
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn track_running_process_with_validation_contract(
+        &self,
+        process_id: i32,
+        key: CommandAttemptKey,
+        artifact: RawOutputArtifact,
+        owner_turn_id: String,
+        workspace_mutation: Option<RunningWorkspaceMutation>,
+        validation_launch: Option<ValidationLaunchPlan>,
+        started_at: Instant,
     ) {
         let mut state = self.state.lock().await;
         if state.running.contains_key(&process_id) {
@@ -515,6 +648,8 @@ impl CommandExecutionLedger {
                 owner_turn_id,
                 completed_exit_code: None,
                 workspace_mutation,
+                validation_launch,
+                started_at,
             },
         );
     }
@@ -541,13 +676,37 @@ impl CommandExecutionLedger {
         }
     }
 
+    pub(crate) async fn cancel_mutations_for_turn_with_timeout(
+        &self,
+        turn_id: &str,
+        timeout: Duration,
+    ) -> bool {
+        tokio::time::timeout(timeout, self.cancel_mutations_for_turn(turn_id))
+            .await
+            .is_ok()
+    }
+
     pub(crate) async fn update_running_artifact(
         &self,
         process_id: i32,
         artifact: RawOutputArtifact,
     ) {
-        if let Some(running) = self.state.lock().await.running.get_mut(&process_id) {
-            running.artifact = artifact;
+        let mut state = self.state.lock().await;
+        let deterministic_completion = state.running.get_mut(&process_id).and_then(|running| {
+            running.artifact = artifact.clone();
+            running
+                .completed_exit_code
+                .filter(|exit_code| *exit_code != 0 && running.validation_launch.is_some())
+                .map(|exit_code| (running.key.clone(), exit_code))
+        });
+        if let Some((key, exit_code)) = deterministic_completion
+            && let Some(failure) = state
+                .attempts
+                .get_mut(&key)
+                .and_then(|entry| entry.deterministic_failure.as_mut())
+            && failure.exit_code == exit_code
+        {
+            failure.evidence = artifact;
         }
     }
 
@@ -565,9 +724,9 @@ impl CommandExecutionLedger {
                 return true;
             }
             running.completed_exit_code = Some(exit_code);
-            let key = running.key.clone();
+            let running = running.clone();
             let workspace_mutation = running.workspace_mutation.clone();
-            record_exit_locked(&mut state, &key, exit_code);
+            record_running_exit_locked(&mut state, &running, exit_code);
             workspace_mutation
         };
         if let Some(workspace_mutation) = workspace_mutation
@@ -610,14 +769,15 @@ impl CommandExecutionLedger {
     ) -> Result<bool, String> {
         let running = {
             let mut state = self.state.lock().await;
-            let Some(running) = state.running.remove(&process_id) else {
+            let Some(mut running) = state.running.remove(&process_id) else {
                 return Ok(false);
             };
             state.running_order.retain(|tracked| *tracked != process_id);
             if running.completed_exit_code.is_none()
                 && let Some(exit_code) = exit_code
             {
-                record_exit_locked(&mut state, &running.key, exit_code);
+                running.completed_exit_code = Some(exit_code);
+                record_running_exit_locked(&mut state, &running, exit_code);
             }
             running
         };
@@ -647,11 +807,37 @@ impl CommandExecutionLedger {
     }
 }
 
+fn record_running_exit_locked(
+    state: &mut CommandExecutionState,
+    running: &RunningCommand,
+    exit_code: i32,
+) {
+    if exit_code != 0 && running.validation_launch.is_some() {
+        let execution_ended_at = SystemTime::now();
+        let execution_duration = Instant::now().saturating_duration_since(running.started_at);
+        let entry = attempt_entry_locked(state, &running.key);
+        entry.last_exit_code = Some(exit_code);
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.deterministic_failure =
+            Some(DeterministicFailureRecord::from_trusted_classification(
+                "focused-validation",
+                running.artifact.clone(),
+                exit_code,
+                execution_ended_at,
+                execution_duration,
+                None,
+            ));
+    } else {
+        record_exit_locked(state, &running.key, exit_code);
+    }
+}
+
 fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey, exit_code: i32) {
     let entry = attempt_entry_locked(state, key);
     entry.last_exit_code = Some(exit_code);
     if exit_code == 0 {
         entry.consecutive_failures = 0;
+        entry.deterministic_failure = None;
     } else {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     }
@@ -740,6 +926,28 @@ mod tests {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
     }
 
+    fn deterministic_failure(class: &str, exit_code: i32) -> DeterministicFailureRecord {
+        DeterministicFailureRecord::from_trusted_classification(
+            class,
+            RawOutputArtifact::unavailable("original deterministic failure fixture"),
+            exit_code,
+            SystemTime::now(),
+            Duration::from_millis(170),
+            None,
+        )
+    }
+
+    fn validation_launch() -> ValidationLaunchPlan {
+        ValidationLaunchPlan {
+            invocation: crate::tools::handlers::command_shape::CommandInvocation::Argv {
+                program: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            },
+            authorization_revision: 1,
+            observation: None,
+        }
+    }
+
     #[tokio::test]
     async fn workspace_mutation_reservations_serialize_per_repository() {
         let ledger = Arc::new(CommandExecutionLedger::default());
@@ -799,10 +1007,36 @@ mod tests {
             .expect("cancellation promptly stops the reservation wait")
             .expect("reservation waiter task succeeds");
         assert!(
-            reservation.is_none(),
+            matches!(
+                reservation,
+                Err(WorkspaceMutationReservationAcquireError::Cancelled)
+            ),
             "cancelled wait acquires no reservation"
         );
         drop(first);
+    }
+
+    #[tokio::test]
+    async fn workspace_mutation_reservation_wait_is_bounded() {
+        let ledger = CommandExecutionLedger::default();
+        let repo = TempDir::new().expect("repository tempdir");
+        let _first = ledger.reserve_workspace_mutation(repo.path()).await;
+
+        let result = ledger
+            .reserve_workspace_mutation_with_max_wait(
+                repo.path(),
+                &CancellationToken::new(),
+                std::time::Duration::from_millis(10),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkspaceMutationReservationAcquireError::TimedOut)
+            ),
+            "occupied reservation must time out"
+        );
     }
 
     #[tokio::test]
@@ -875,13 +1109,14 @@ mod tests {
         let waiter_store: Arc<dyn AgentTaskStore> = store.clone();
         let waiter_repo = repo.path().to_path_buf();
         let cancellation = CancellationToken::new();
+        let cancelled_waiter_request = waiter_request.clone();
         let cancelled_waiter = tokio::spawn({
             let cancellation = cancellation.clone();
             async move {
                 acquire_workspace_mutation_lease(
                     waiter_store.as_ref(),
                     &waiter_repo,
-                    &waiter_request,
+                    &cancelled_waiter_request,
                     &cancellation,
                 )
                 .await
@@ -902,6 +1137,24 @@ mod tests {
             cancelled,
             WorkspaceMutationAcquireError::Cancelled
         ));
+
+        let timed_out = acquire_workspace_mutation_lease_with_max_wait(
+            store.as_ref(),
+            repo.path(),
+            &waiter_request,
+            &CancellationToken::new(),
+            WORKSPACE_MUTATION_RETRY_INTERVAL * 2,
+        )
+        .await
+        .expect_err("a persistent conflicting lease reports a bounded wait");
+        let WorkspaceMutationAcquireError::TimedOut { details } = timed_out else {
+            panic!("persistent conflict should report a timeout, got {timed_out:?}");
+        };
+        assert!(
+            !details.is_empty(),
+            "the timeout must retain the conflict that blocked process launch"
+        );
+
         store
             .finish_workspace_mutation(repo.path(), owner_lease)
             .await
@@ -909,27 +1162,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_third_identical_attempt_after_two_failures() {
+    async fn deterministic_failure_suppresses_every_exact_repeat_until_identity_changes() {
         let ledger = CommandExecutionLedger::default();
-        let key = key("fails.exe");
+        let attempt_key = key("fails.exe").with_repository_epoch(1);
 
         ledger
-            .begin_attempt(&key, false)
+            .begin_attempt(&attempt_key, false)
             .await
             .expect("first attempt");
-        ledger.record_exit(&key, 7).await;
         ledger
-            .begin_attempt(&key, false)
-            .await
-            .expect("second attempt");
-        ledger.record_exit(&key, 7).await;
+            .record_deterministic_failure(
+                &attempt_key,
+                deterministic_failure("focused-validation", 7),
+            )
+            .await;
 
-        let blocked = ledger
-            .begin_attempt(&key, false)
+        for _ in 0..3 {
+            let blocked = ledger
+                .begin_attempt(&attempt_key, false)
+                .await
+                .expect_err("every exact repeat should be suppressed");
+            assert_eq!(blocked.prior_failure.exit_code, 7);
+            assert_eq!(blocked.prior_failure.outcome_class, "focused-validation");
+            assert_eq!(blocked.fingerprint, attempt_key.fingerprint());
+        }
+
+        ledger
+            .begin_attempt(&key("fails.exe --changed").with_repository_epoch(1), false)
             .await
-            .expect_err("third attempt should be blocked");
-        assert_eq!(blocked.consecutive_failures, 2);
-        assert_eq!(blocked.fingerprint, key.fingerprint());
+            .expect("meaningful argument change executes");
+        ledger
+            .begin_attempt(&key("fails.exe").with_repository_epoch(2), false)
+            .await
+            .expect("repository revision change executes");
+    }
+
+    #[tokio::test]
+    async fn unclassified_and_retryable_failures_are_never_suppressed() {
+        let classes = [
+            "unclassified-nonzero",
+            "timeout",
+            "lock",
+            "network",
+            "cancellation",
+            "resource-exhaustion",
+            "uncertain-crash",
+            "flaky",
+            "unknown",
+        ];
+        for class in classes {
+            let ledger = CommandExecutionLedger::default();
+            let key = key(class);
+            ledger.begin_attempt(&key, false).await.expect("first run");
+            ledger.record_exit(&key, 1).await;
+            ledger.begin_attempt(&key, false).await.expect("retry runs");
+            ledger.record_exit(&key, 1).await;
+            ledger
+                .begin_attempt(&key, false)
+                .await
+                .expect("additional retry still runs");
+        }
     }
 
     #[tokio::test]
@@ -989,6 +1281,127 @@ mod tests {
             .begin_attempt(&key, false)
             .await
             .expect("one failure must not block the next attempt");
+    }
+
+    #[tokio::test]
+    async fn tracked_validation_watcher_completion_records_once_and_refreshes_evidence() {
+        let ledger = CommandExecutionLedger::default();
+        let command_key = key("cargo test --test focused");
+        let finalized_artifact = RawOutputArtifact::unavailable("finalized watcher artifact");
+        ledger
+            .begin_attempt(&command_key, false)
+            .await
+            .expect("attempt");
+        ledger
+            .track_running_process_with_validation_contract(
+                42,
+                command_key.clone(),
+                RawOutputArtifact::unavailable("initial watcher artifact"),
+                "turn-1".to_string(),
+                None,
+                Some(validation_launch()),
+                Instant::now() - Duration::from_millis(25),
+            )
+            .await;
+
+        assert!(ledger.mark_running_process_completed(42, 7).await);
+        assert!(ledger.mark_running_process_completed(42, 7).await);
+        ledger
+            .update_running_artifact(42, finalized_artifact.clone())
+            .await;
+        assert!(ledger.finish_running_process(42, Some(7)).await);
+
+        let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
+        assert_eq!(snapshot.consecutive_failures, 1);
+        let failure = snapshot
+            .deterministic_failure
+            .expect("trusted tracked validation is classified");
+        assert_eq!(failure.outcome_class, "focused-validation");
+        assert_eq!(failure.exit_code, 7);
+        assert_eq!(failure.evidence, finalized_artifact);
+        let blocked = ledger
+            .begin_attempt(&command_key, false)
+            .await
+            .expect_err("the exact deterministic repeat is suppressed");
+        assert_eq!(blocked.prior_failure.evidence, finalized_artifact);
+    }
+
+    #[tokio::test]
+    async fn tracked_validation_handler_completion_records_once() {
+        let ledger = CommandExecutionLedger::default();
+        let command_key = key("cargo test --test direct");
+        let finalized_artifact = RawOutputArtifact::unavailable("finalized handler artifact");
+        ledger
+            .begin_attempt(&command_key, false)
+            .await
+            .expect("attempt");
+        ledger
+            .track_running_process_with_validation_contract(
+                43,
+                command_key.clone(),
+                RawOutputArtifact::unavailable("initial handler artifact"),
+                "turn-1".to_string(),
+                None,
+                Some(validation_launch()),
+                Instant::now() - Duration::from_millis(25),
+            )
+            .await;
+        ledger
+            .update_running_artifact(43, finalized_artifact.clone())
+            .await;
+
+        assert_eq!(
+            ledger.finish_running_process_checked(43, Some(9)).await,
+            Ok(true)
+        );
+        assert_eq!(
+            ledger.finish_running_process_checked(43, Some(9)).await,
+            Ok(false)
+        );
+
+        let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
+        assert_eq!(snapshot.consecutive_failures, 1);
+        let failure = snapshot
+            .deterministic_failure
+            .expect("trusted tracked validation is classified");
+        assert_eq!(failure.outcome_class, "focused-validation");
+        assert_eq!(failure.exit_code, 9);
+        assert_eq!(failure.evidence, finalized_artifact);
+    }
+
+    #[tokio::test]
+    async fn tracked_validation_success_clears_prior_deterministic_failure() {
+        let ledger = CommandExecutionLedger::default();
+        let command_key = key("cargo test --test recovered");
+        ledger
+            .record_deterministic_failure(
+                &command_key,
+                deterministic_failure("focused-validation", 7),
+            )
+            .await;
+        ledger
+            .track_running_process_with_validation_contract(
+                44,
+                command_key.clone(),
+                RawOutputArtifact::unavailable("successful validation artifact"),
+                "turn-1".to_string(),
+                None,
+                Some(validation_launch()),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(ledger.mark_running_process_completed(44, 0).await);
+        assert!(ledger.finish_running_process(44, Some(0)).await);
+
+        let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
+        assert_eq!(snapshot.consecutive_failures, 0);
+        assert_eq!(snapshot.last_exit_code, Some(0));
+        assert_eq!(snapshot.deterministic_failure, None);
+        ledger
+            .begin_attempt(&command_key, false)
+            .await
+            .expect("successful tracked validation permits another attempt");
     }
 
     #[tokio::test]
@@ -1119,6 +1532,41 @@ mod tests {
             .await
             .expect("replacement mutation finishes");
         drop(replacement_reservation);
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_mutation_cleanup_can_be_bounded() {
+        let (_codex_home, _repo, _store, ledger, mutation) =
+            running_workspace_mutation(CancellationToken::new()).await;
+        let lease_lost = mutation.lease_lost_token();
+        ledger
+            .track_running_process(
+                42,
+                key("turn-owned-background.exe"),
+                RawOutputArtifact::unavailable("fixture"),
+                "owner-turn".to_string(),
+                Some(mutation.clone()),
+            )
+            .await;
+
+        assert!(
+            !ledger
+                .cancel_mutations_for_turn_with_timeout(
+                    "owner-turn",
+                    std::time::Duration::from_millis(1),
+                )
+                .await,
+            "terminal cleanup must return after its deadline even if process exit is never observed"
+        );
+        assert!(
+            lease_lost.is_cancelled(),
+            "bounded cleanup must still revoke the process mutation authority"
+        );
+
+        mutation
+            .finish()
+            .await
+            .expect("test mutation remains finalizable after bounded cancellation");
     }
 
     #[tokio::test]

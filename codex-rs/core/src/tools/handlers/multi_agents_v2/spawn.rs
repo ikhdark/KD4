@@ -1066,7 +1066,7 @@ async fn construct_and_attach_task_capsule(
 
 fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallError> {
     match agent_type.map(str::trim).filter(|role| !role.is_empty()) {
-        Some(role) => match role.strip_prefix("kd4_").unwrap_or(role) {
+        Some(role) => match role {
             "explorer" => Ok(AgentRole::Explorer),
             "worker" => Ok(AgentRole::Worker),
             "reviewer" => Ok(AgentRole::Reviewer),
@@ -1309,18 +1309,15 @@ mod tests {
     }
 
     #[test]
-    fn kd4_role_configs_are_typed_role_aliases() {
-        for (agent_type, expected) in [
-            ("kd4_explorer", AgentRole::Explorer),
-            ("kd4_worker", AgentRole::Worker),
-            ("kd4_reviewer", AgentRole::Reviewer),
-            ("kd4_verifier", AgentRole::Verifier),
-            ("kd4_integrator", AgentRole::Integrator),
+    fn custom_role_aliases_are_rejected_for_typed_tasks() {
+        for agent_type in [
+            "kd4_explorer",
+            "kd4_worker",
+            "kd4_reviewer",
+            "kd4_verifier",
+            "kd4_integrator",
         ] {
-            assert_eq!(
-                parse_typed_role(Some(agent_type)).expect("KD4 role should support typed tasks"),
-                expected
-            );
+            assert!(parse_typed_role(Some(agent_type)).is_err());
         }
     }
 

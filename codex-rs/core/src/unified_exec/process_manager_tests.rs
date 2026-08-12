@@ -193,6 +193,84 @@ async fn lag_survives_drain_for_finalization_without_duplicate_interim_reports()
     assert_eq!(output_buffer.lock().await.lagged_chunks(), 4);
 }
 
+#[tokio::test(start_paused = true)]
+async fn initial_output_yields_after_meaningful_output_quiet_period() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    output_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+
+    let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(collected, b"ready\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_output_quiet_yield_is_clamped_to_hard_deadline() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    output_buffer.lock().await.push_chunk(b"ready\n".to_vec());
+
+    let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_millis(100),
+    )
+    .await;
+
+    assert_eq!(collected, b"ready\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(100));
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_output_without_meaningful_bytes_waits_for_hard_deadline() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    output_buffer.lock().await.push_chunk(b" \r\n\t".to_vec());
+
+    let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_secs(2),
+    )
+    .await;
+
+    assert_eq!(collected, b" \r\n\t");
+    assert_eq!(Instant::now() - started_at, Duration::from_secs(2));
+}
+
 #[tokio::test]
 async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finalization() {
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(8)));

@@ -124,5 +124,9 @@ pub const DB_METRIC_BACKFILL_DURATION_MS: &str = "codex.db.backfill.duration_ms"
 pub const DB_INIT_METRIC: &str = "codex.sqlite.init.count";
 /// SQLite initialization latency. Tags: [status, phase, db, error]
 pub const DB_INIT_DURATION_METRIC: &str = "codex.sqlite.init.duration_ms";
+/// State-log insertion and retention phase latency. Tags: [operation, phase, status, error]
+pub const DB_LOG_PHASE_DURATION_METRIC: &str = "codex.sqlite.logs.phase.duration_ms";
+/// State-log retention lifecycle events. Tags: [event]
+pub const DB_LOG_RETENTION_METRIC: &str = "codex.sqlite.logs.retention.count";
 /// Rollout fallback attempts. Tags: [caller, reason]
 pub const DB_FALLBACK_METRIC: &str = "codex.sqlite.fallback.count";

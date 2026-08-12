@@ -8,6 +8,14 @@ mod ssh_config_dependencies;
 use std::fmt;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureOutputStream {
+    Stdout,
+    Stderr,
+}
+
+pub type CaptureOutputSink = Arc<dyn Fn(CaptureOutputStream, &[u8]) + Send + Sync + 'static>;
+
 /// Converts an optional millisecond timeout to the Win32 wait representation.
 /// `INFINITE` is reserved for the absence of a deadline, so finite values are
 /// clamped to the largest representable non-infinite timeout.
@@ -387,6 +395,8 @@ pub use windows_impl::run_windows_sandbox_capture;
 #[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides;
 #[cfg(target_os = "windows")]
+pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides_and_output_sink;
+#[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_legacy_preflight;
 #[cfg(target_os = "windows")]
 pub use winutil::quote_windows_arg;
@@ -412,6 +422,8 @@ pub use stub::run_windows_sandbox_legacy_preflight;
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
+    use super::CaptureOutputSink;
+    use super::CaptureOutputStream;
     use super::WindowsSandboxCancellationToken;
     use super::legacy_restricted_token_enforces_delete_child;
     use super::logging::log_failure;
@@ -583,7 +595,12 @@ mod windows_impl {
         }
     }
 
-    fn read_capture_pipe(handle: HANDLE, stop_rx: mpsc::Receiver<()>) -> io::Result<Vec<u8>> {
+    fn read_capture_pipe(
+        handle: HANDLE,
+        stop_rx: mpsc::Receiver<()>,
+        output_sink: Option<CaptureOutputSink>,
+        stream: CaptureOutputStream,
+    ) -> io::Result<Vec<u8>> {
         let _handle = OwnedCapturePipeHandle(handle);
         let mut output = Vec::new();
         let mut tmp = [0u8; 8192];
@@ -616,7 +633,11 @@ mod windows_impl {
                 if read_bytes == 0 {
                     true
                 } else {
-                    output.extend_from_slice(&tmp[..read_bytes as usize]);
+                    let chunk = &tmp[..read_bytes as usize];
+                    output.extend_from_slice(chunk);
+                    if let Some(output_sink) = output_sink.as_ref() {
+                        output_sink(stream, chunk);
+                    }
                     false
                 }
             } else {
@@ -653,9 +674,19 @@ mod windows_impl {
     }
 
     impl CapturePipeReader {
+        #[cfg(test)]
         fn spawn_capture_pipe_reader(handle: HANDLE) -> Self {
+            Self::spawn_capture_pipe_reader_with_sink(handle, None, CaptureOutputStream::Stdout)
+        }
+
+        fn spawn_capture_pipe_reader_with_sink(
+            handle: HANDLE,
+            output_sink: Option<CaptureOutputSink>,
+            stream: CaptureOutputStream,
+        ) -> Self {
             let (stop_tx, stop_rx) = mpsc::sync_channel(1);
-            let join = std::thread::spawn(move || read_capture_pipe(handle, stop_rx));
+            let join =
+                std::thread::spawn(move || read_capture_pipe(handle, stop_rx, output_sink, stream));
             Self {
                 stop_tx,
                 join: Some(join),
@@ -725,12 +756,43 @@ mod windows_impl {
         codex_home: &Path,
         command: Vec<String>,
         cwd: &Path,
+        env_map: HashMap<String, String>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<WindowsSandboxCancellationToken>,
+        additional_deny_read_paths: &[AbsolutePathBuf],
+        additional_deny_write_paths: &[AbsolutePathBuf],
+        use_private_desktop: bool,
+    ) -> Result<CaptureResult> {
+        run_windows_sandbox_capture_with_filesystem_overrides_and_output_sink(
+            permission_profile,
+            workspace_roots,
+            codex_home,
+            command,
+            cwd,
+            env_map,
+            timeout_ms,
+            cancellation,
+            additional_deny_read_paths,
+            additional_deny_write_paths,
+            use_private_desktop,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_windows_sandbox_capture_with_filesystem_overrides_and_output_sink(
+        permission_profile: &PermissionProfile,
+        workspace_roots: &[AbsolutePathBuf],
+        codex_home: &Path,
+        command: Vec<String>,
+        cwd: &Path,
         mut env_map: HashMap<String, String>,
         timeout_ms: Option<u64>,
         cancellation: Option<WindowsSandboxCancellationToken>,
         additional_deny_read_paths: &[AbsolutePathBuf],
         additional_deny_write_paths: &[AbsolutePathBuf],
         use_private_desktop: bool,
+        output_sink: Option<CaptureOutputSink>,
     ) -> Result<CaptureResult> {
         super::ensure_legacy_delete_child_safety(legacy_restricted_token_enforces_delete_child())?;
         let additional_deny_read_paths = additional_deny_read_paths
@@ -830,8 +892,16 @@ mod windows_impl {
             CloseHandle(err_w);
         }
 
-        let stdout_reader = CapturePipeReader::spawn_capture_pipe_reader(out_r);
-        let stderr_reader = CapturePipeReader::spawn_capture_pipe_reader(err_r);
+        let stdout_reader = CapturePipeReader::spawn_capture_pipe_reader_with_sink(
+            out_r,
+            output_sink.clone(),
+            CaptureOutputStream::Stdout,
+        );
+        let stderr_reader = CapturePipeReader::spawn_capture_pipe_reader_with_sink(
+            err_r,
+            output_sink,
+            CaptureOutputStream::Stderr,
+        );
 
         let wait_outcome = wait_for_process(pi.hProcess, timeout_ms, cancellation.as_ref());
         let process_exited = matches!(&wait_outcome, WaitOutcome::Exited);

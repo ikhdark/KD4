@@ -1,19 +1,237 @@
 use super::*;
 
 const LOG_RETENTION_DAYS: i64 = 10;
+const MAX_PENDING_RETENTION_KEYS: usize = 256;
+const RETENTION_QUERY_KEY_BATCH: usize = 200;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LogRetentionScope {
+    reconcile_all: bool,
+    thread_ids: BTreeSet<String>,
+    threadless_process_uuids: BTreeSet<String>,
+    has_threadless_null_process_uuid: bool,
+}
+
+impl LogRetentionScope {
+    pub(crate) fn for_reconciliation() -> Self {
+        Self {
+            reconcile_all: true,
+            ..Self::default()
+        }
+    }
+
+    fn from_entries(entries: &[LogEntry]) -> Self {
+        let mut scope = Self::default();
+        for entry in entries {
+            if let Some(thread_id) = entry.thread_id.as_ref() {
+                scope.thread_ids.insert(thread_id.clone());
+            } else if let Some(process_uuid) = entry.process_uuid.as_ref() {
+                scope.threadless_process_uuids.insert(process_uuid.clone());
+            } else {
+                scope.has_threadless_null_process_uuid = true;
+            }
+        }
+        scope
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        if self.reconcile_all || other.reconcile_all {
+            *self = Self::for_reconciliation();
+            return;
+        }
+        self.thread_ids.extend(other.thread_ids);
+        self.threadless_process_uuids
+            .extend(other.threadless_process_uuids);
+        self.has_threadless_null_process_uuid |= other.has_threadless_null_process_uuid;
+        if self.thread_ids.len() + self.threadless_process_uuids.len() > MAX_PENDING_RETENTION_KEYS
+        {
+            *self = Self::for_reconciliation();
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.reconcile_all
+            && self.thread_ids.is_empty()
+            && self.threadless_process_uuids.is_empty()
+            && !self.has_threadless_null_process_uuid
+    }
+
+    fn into_query_batches(self) -> Vec<Self> {
+        let mut batches = Vec::new();
+        let thread_ids = self.thread_ids.into_iter().collect::<Vec<_>>();
+        for ids in thread_ids.chunks(RETENTION_QUERY_KEY_BATCH) {
+            batches.push(Self {
+                thread_ids: ids.iter().cloned().collect(),
+                ..Self::default()
+            });
+        }
+        let process_uuids = self
+            .threadless_process_uuids
+            .into_iter()
+            .collect::<Vec<_>>();
+        for ids in process_uuids.chunks(RETENTION_QUERY_KEY_BATCH) {
+            batches.push(Self {
+                threadless_process_uuids: ids.iter().cloned().collect(),
+                ..Self::default()
+            });
+        }
+        if self.has_threadless_null_process_uuid {
+            batches.push(Self {
+                has_threadless_null_process_uuid: true,
+                ..Self::default()
+            });
+        }
+        batches
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct LogRetentionTestControl {
+    block_next_deletion: std::sync::atomic::AtomicBool,
+    fail_next_deletion: std::sync::atomic::AtomicBool,
+    active_deletions: std::sync::atomic::AtomicUsize,
+    max_active_deletions: std::sync::atomic::AtomicUsize,
+    deletion_entered: tokio::sync::Notify,
+    deletion_release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for LogRetentionTestControl {
+    fn default() -> Self {
+        Self {
+            block_next_deletion: std::sync::atomic::AtomicBool::default(),
+            fail_next_deletion: std::sync::atomic::AtomicBool::default(),
+            active_deletions: std::sync::atomic::AtomicUsize::default(),
+            max_active_deletions: std::sync::atomic::AtomicUsize::default(),
+            deletion_entered: tokio::sync::Notify::new(),
+            deletion_release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+struct ActiveLogRetentionDeletion<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(test)]
+impl Drop for ActiveLogRetentionDeletion<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl LogRetentionTestControl {
+    pub(crate) fn block_next_deletion(&self) {
+        self.block_next_deletion
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn fail_next_deletion(&self) {
+        self.fail_next_deletion
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) async fn wait_until_deletion_active(&self) {
+        while self
+            .active_deletions
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            self.deletion_entered.notified().await;
+        }
+    }
+
+    pub(crate) fn release_blocked_deletion(&self) {
+        self.deletion_release.add_permits(1);
+    }
+
+    pub(crate) fn max_active_deletions(&self) -> usize {
+        self.max_active_deletions
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn before_deletion(&self) -> anyhow::Result<ActiveLogRetentionDeletion<'_>> {
+        let active = self
+            .active_deletions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max_active_deletions
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+        let active = ActiveLogRetentionDeletion(&self.active_deletions);
+        self.deletion_entered.notify_waiters();
+
+        if self
+            .block_next_deletion
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.deletion_release
+                .acquire()
+                .await
+                .expect("retention test semaphore remains open")
+                .forget();
+        }
+        if self
+            .fail_next_deletion
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected log retention deletion failure");
+        }
+        Ok(active)
+    }
+}
 
 impl StateRuntime {
+    pub(crate) fn record_log_retention_event(&self, event: &'static str) {
+        crate::telemetry::record_log_retention_event(self.db_telemetry.as_deref(), event);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn log_retention_test_control(&self) -> Arc<LogRetentionTestControl> {
+        Arc::clone(&self.log_retention_test_control)
+    }
+
     pub async fn insert_log(&self, entry: &LogEntry) -> anyhow::Result<()> {
         self.insert_logs(std::slice::from_ref(entry)).await
     }
 
     /// Insert a batch of log entries into the logs table.
     pub async fn insert_logs(&self, entries: &[LogEntry]) -> anyhow::Result<()> {
+        let scope = self.insert_logs_deferred_retention(entries).await?;
+        if let Err(_err) = self.prune_log_retention(scope).await {
+            self.record_log_retention_event("cleanup_failed");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn insert_logs_deferred_retention(
+        &self,
+        entries: &[LogEntry],
+    ) -> anyhow::Result<LogRetentionScope> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(LogRetentionScope::default());
         }
 
-        let mut tx = self.logs_pool.begin().await?;
+        let scope = LogRetentionScope::from_entries(entries);
+        let started = Instant::now();
+        let connection_result = self.logs_pool.acquire().await.map_err(anyhow::Error::from);
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "insert",
+            "pool_acquire",
+            started.elapsed(),
+            &connection_result,
+        );
+        let mut connection = connection_result?;
+        let started = Instant::now();
+        let transaction_result = connection.begin().await.map_err(anyhow::Error::from);
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "insert",
+            "transaction_begin",
+            started.elapsed(),
+            &transaction_result,
+        );
+        let mut tx = transaction_result?;
         let mut builder = QueryBuilder::<Sqlite>::new(
             "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, process_uuid, module_path, file, line, estimated_bytes) ",
         );
@@ -40,10 +258,135 @@ impl StateRuntime {
                 .push_bind(entry.line)
                 .push_bind(estimated_bytes);
         });
-        builder.build().execute(&mut *tx).await?;
-        self.prune_logs_after_insert(entries, &mut tx).await?;
-        tx.commit().await?;
-        Ok(())
+        let started = Instant::now();
+        let insert_result = builder
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(anyhow::Error::from);
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "insert",
+            "execute",
+            started.elapsed(),
+            &insert_result,
+        );
+        insert_result?;
+        let started = Instant::now();
+        let commit_result = tx.commit().await.map_err(anyhow::Error::from);
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "insert",
+            "commit",
+            started.elapsed(),
+            &commit_result,
+        );
+        commit_result?;
+        Ok(scope)
+    }
+
+    pub(crate) async fn prune_log_retention(
+        &self,
+        mut scope: LogRetentionScope,
+    ) -> anyhow::Result<()> {
+        let reconcile_all = scope.reconcile_all;
+        let started = Instant::now();
+        let decision_result: anyhow::Result<()> = async {
+            if reconcile_all {
+                scope.thread_ids = sqlx::query_scalar::<_, String>(
+                    "SELECT DISTINCT thread_id FROM logs WHERE thread_id IS NOT NULL",
+                )
+                .fetch_all(self.logs_pool.as_ref())
+                .await?
+                .into_iter()
+                .collect();
+                scope.threadless_process_uuids = sqlx::query_scalar::<_, String>(
+                    "SELECT DISTINCT process_uuid FROM logs WHERE thread_id IS NULL AND process_uuid IS NOT NULL",
+                )
+                .fetch_all(self.logs_pool.as_ref())
+                .await?
+                .into_iter()
+                .collect();
+                scope.has_threadless_null_process_uuid = sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(SELECT 1 FROM logs WHERE thread_id IS NULL AND process_uuid IS NULL)",
+                )
+                .fetch_one(self.logs_pool.as_ref())
+                .await?
+                    != 0;
+                scope.reconcile_all = false;
+            }
+            Ok(())
+        }
+        .await;
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "retention",
+            "decision",
+            started.elapsed(),
+            &decision_result,
+        );
+        decision_result?;
+        if scope.is_empty() && !reconcile_all {
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let connection_result = self.logs_pool.acquire().await.map_err(anyhow::Error::from);
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "retention",
+            "pool_acquire",
+            started.elapsed(),
+            &connection_result,
+        );
+        let mut connection = connection_result?;
+        let started = Instant::now();
+        let transaction_result = connection.begin().await.map_err(anyhow::Error::from);
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "retention",
+            "transaction_begin",
+            started.elapsed(),
+            &transaction_result,
+        );
+        let mut tx = transaction_result?;
+        let started = Instant::now();
+        let deletion_result: anyhow::Result<()> = async {
+            #[cfg(test)]
+            let _active_deletion = self.log_retention_test_control.before_deletion().await?;
+            if let Some(cutoff) = Utc::now()
+                .checked_sub_signed(chrono::Duration::days(LOG_RETENTION_DAYS))
+                .map(|cutoff| cutoff.timestamp())
+            {
+                sqlx::query("DELETE FROM logs WHERE ts < ?")
+                    .bind(cutoff)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            for batch in scope.into_query_batches() {
+                self.prune_logs_for_scope(&batch, &mut tx).await?;
+            }
+            Ok(())
+        }
+        .await;
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "retention",
+            "deletion",
+            started.elapsed(),
+            &deletion_result,
+        );
+        deletion_result?;
+        let started = Instant::now();
+        let commit_result = tx.commit().await.map_err(anyhow::Error::from);
+        crate::telemetry::record_log_phase(
+            self.db_telemetry.as_deref(),
+            "retention",
+            "commit",
+            started.elapsed(),
+            &commit_result,
+        );
+        commit_result
     }
 
     /// Enforce per-partition retained-log-content caps after a successful batch insert.
@@ -57,17 +400,12 @@ impl StateRuntime {
     /// "Threadless" means the log row is not associated with any conversation
     /// thread, so retention is keyed by process identity instead.
     ///
-    /// This runs inside the same transaction as the insert so callers never
-    /// observe "inserted but not yet pruned" rows.
-    async fn prune_logs_after_insert(
+    async fn prune_logs_for_scope(
         &self,
-        entries: &[LogEntry],
+        scope: &LogRetentionScope,
         tx: &mut SqliteConnection,
     ) -> anyhow::Result<()> {
-        let thread_ids: BTreeSet<&str> = entries
-            .iter()
-            .filter_map(|entry| entry.thread_id.as_deref())
-            .collect();
+        let thread_ids: BTreeSet<&str> = scope.thread_ids.iter().map(String::as_str).collect();
         if !thread_ids.is_empty() {
             // Cheap precheck: only run the heavier window-function prune for
             // threads that are currently above the cap.
@@ -142,14 +480,12 @@ WHERE id IN (
             }
         }
 
-        let threadless_process_uuids: BTreeSet<&str> = entries
+        let threadless_process_uuids: BTreeSet<&str> = scope
+            .threadless_process_uuids
             .iter()
-            .filter(|entry| entry.thread_id.is_none())
-            .filter_map(|entry| entry.process_uuid.as_deref())
+            .map(String::as_str)
             .collect();
-        let has_threadless_null_process_uuid = entries
-            .iter()
-            .any(|entry| entry.thread_id.is_none() && entry.process_uuid.is_none());
+        let has_threadless_null_process_uuid = scope.has_threadless_null_process_uuid;
         if !threadless_process_uuids.is_empty() {
             // Threadless logs are budgeted separately per process UUID.
             let mut over_limit_processes_query = QueryBuilder::<Sqlite>::new(
@@ -543,6 +879,8 @@ mod tests {
     use super::StateRuntime;
     use super::format_feedback_log_line;
     use super::test_support::unique_temp_dir;
+    use crate::DB_LOG_PHASE_DURATION_METRIC;
+    use crate::DbTelemetry;
     use crate::LogEntry;
     use crate::LogQuery;
     use crate::logs_db_path;
@@ -554,6 +892,62 @@ mod tests {
     use sqlx::sqlite::SqliteConnectOptions;
     use std::borrow::Cow;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct CapturingTelemetry {
+        phases: Mutex<Vec<(String, String)>>,
+    }
+
+    impl CapturingTelemetry {
+        fn clear(&self) {
+            self.phases.lock().expect("telemetry mutex").clear();
+        }
+
+        fn phases(&self) -> Vec<(String, String)> {
+            self.phases.lock().expect("telemetry mutex").clone()
+        }
+    }
+
+    impl DbTelemetry for CapturingTelemetry {
+        fn counter(&self, _name: &str, _inc: i64, _tags: &[(&str, &str)]) {}
+
+        fn record_duration(&self, name: &str, _duration: Duration, tags: &[(&str, &str)]) {
+            if name != DB_LOG_PHASE_DURATION_METRIC {
+                return;
+            }
+            let operation = tags
+                .iter()
+                .find_map(|(key, value)| (*key == "operation").then(|| (*value).to_string()))
+                .expect("operation tag");
+            let phase = tags
+                .iter()
+                .find_map(|(key, value)| (*key == "phase").then(|| (*value).to_string()))
+                .expect("phase tag");
+            self.phases
+                .lock()
+                .expect("telemetry mutex")
+                .push((operation, phase));
+        }
+    }
+
+    fn test_log(message: &str, thread_id: &str) -> LogEntry {
+        LogEntry {
+            ts: Utc::now().timestamp(),
+            ts_nanos: 0,
+            level: "INFO".to_string(),
+            target: "state-retention-test".to_string(),
+            message: Some(message.to_string()),
+            feedback_log_body: Some(message.to_string()),
+            thread_id: Some(thread_id.to_string()),
+            process_uuid: Some("retention-test-process".to_string()),
+            module_path: None,
+            file: None,
+            line: None,
+        }
+    }
 
     async fn open_db_pool(path: &Path) -> SqlitePool {
         SqlitePool::connect_with(
@@ -573,6 +967,103 @@ mod tests {
             .expect("count log rows");
         pool.close().await;
         count
+    }
+
+    #[tokio::test]
+    async fn deferred_retention_does_not_block_insert_and_failure_preserves_commit() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let control = runtime.log_retention_test_control();
+
+        let blocked_scope = runtime
+            .insert_logs_deferred_retention(&[test_log("before blocked prune", "thread-a")])
+            .await
+            .expect("commit first insertion");
+        control.block_next_deletion();
+        let cleanup_runtime = Arc::clone(&runtime);
+        let cleanup =
+            tokio::spawn(async move { cleanup_runtime.prune_log_retention(blocked_scope).await });
+        control.wait_until_deletion_active().await;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.insert_logs_deferred_retention(&[test_log(
+                "insert while prune blocked",
+                "thread-b",
+            )]),
+        )
+        .await
+        .expect("insertion must not wait for retention deletion")
+        .expect("commit concurrent insertion");
+        control.release_blocked_deletion();
+        cleanup
+            .await
+            .expect("join blocked cleanup")
+            .expect("complete blocked cleanup");
+
+        let failed_scope = runtime
+            .insert_logs_deferred_retention(&[test_log(&"x".repeat(11 * 1024 * 1024), "thread-c")])
+            .await
+            .expect("commit insertion before failed pruning");
+        let retry_scope = failed_scope.clone();
+        control.fail_next_deletion();
+        assert!(runtime.prune_log_retention(failed_scope).await.is_err());
+        assert_eq!(log_row_count(&logs_db_path(&codex_home)).await, 3);
+        runtime
+            .prune_log_retention(retry_scope)
+            .await
+            .expect("retry retention after injected failure");
+        assert_eq!(log_row_count(&logs_db_path(&codex_home)).await, 2);
+    }
+
+    #[tokio::test]
+    async fn log_insert_and_retention_timings_are_independently_attributable() {
+        let codex_home = unique_temp_dir();
+        let telemetry = Arc::new(CapturingTelemetry::default());
+        let runtime = StateRuntime::init_with_telemetry_for_tests(
+            codex_home,
+            "test-provider".to_string(),
+            telemetry.clone(),
+        )
+        .await
+        .expect("initialize runtime");
+        telemetry.clear();
+
+        let scope = runtime
+            .insert_logs_deferred_retention(&[test_log("timed", "timed-thread")])
+            .await
+            .expect("insert timed log");
+        assert_eq!(
+            telemetry.phases(),
+            vec![
+                ("insert".to_string(), "pool_acquire".to_string()),
+                ("insert".to_string(), "transaction_begin".to_string()),
+                ("insert".to_string(), "execute".to_string()),
+                ("insert".to_string(), "commit".to_string()),
+            ],
+            "retention operations must not appear on the insert critical path",
+        );
+
+        runtime
+            .prune_log_retention(scope)
+            .await
+            .expect("run timed retention");
+        assert_eq!(
+            telemetry.phases(),
+            vec![
+                ("insert".to_string(), "pool_acquire".to_string()),
+                ("insert".to_string(), "transaction_begin".to_string()),
+                ("insert".to_string(), "execute".to_string()),
+                ("insert".to_string(), "commit".to_string()),
+                ("retention".to_string(), "decision".to_string()),
+                ("retention".to_string(), "pool_acquire".to_string()),
+                ("retention".to_string(), "transaction_begin".to_string()),
+                ("retention".to_string(), "deletion".to_string()),
+                ("retention".to_string(), "commit".to_string()),
+            ],
+        );
     }
 
     #[tokio::test]

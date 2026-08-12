@@ -109,9 +109,9 @@ blocker; unrelated task roots only warn and do not join this barrier.
 
 ### Architect-Driven Implementation Lane
 
-For risky work selected under root `AGENTS.md`, use `kd4_explorer` as the
+For risky work selected under root `AGENTS.md`, use `explorer` as the
 read-only contract architect, then copy its completed
-`KD4_ARCHITECT_CONTRACT_V1` JSON assignment block into a dependent `kd4_worker`
+`KD4_ARCHITECT_CONTRACT_V1` JSON assignment block into a dependent `worker`
 assignment. Preserve every stable obligation ID and copied typed field exactly.
 If the receipt is ambiguous or cannot be copied without interpretation, the
 coordinator treats the architect assignment as incomplete and does not spawn the

@@ -129,7 +129,7 @@ async fn ultra_reasoning_uses_max_and_proactive_mode() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sol_high_and_xhigh_use_proactive_mode() -> Result<()> {
+async fn sol_high_and_xhigh_require_explicit_request() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -168,7 +168,7 @@ async fn sol_high_and_xhigh_use_proactive_mode() -> Result<()> {
                 count_containing(&texts, NO_SPAWN_TEXT),
                 count_containing(&texts, PROACTIVE_TEXT),
             ),
-            (0, 1)
+            (1, 0)
         );
     }
 

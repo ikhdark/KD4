@@ -20,6 +20,7 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub write_roots_override: Option<&'a [PathBuf]>,
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
     pub deny_write_paths_override: &'a [AbsolutePathBuf],
+    pub output_sink: Option<crate::CaptureOutputSink>,
 }
 
 mod windows_impl {
@@ -115,6 +116,7 @@ mod windows_impl {
             write_roots_override,
             deny_read_paths_override,
             deny_write_paths_override,
+            output_sink,
         } = request;
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
@@ -238,8 +240,18 @@ mod windows_impl {
                     Message::SpawnReady { .. } => {}
                     Message::Output { payload } => match decode_bytes(&payload.data_b64) {
                         Ok(bytes) => match payload.stream {
-                            OutputStream::Stdout => stdout.extend_from_slice(&bytes),
-                            OutputStream::Stderr => stderr.extend_from_slice(&bytes),
+                            OutputStream::Stdout => {
+                                stdout.extend_from_slice(&bytes);
+                                if let Some(output_sink) = output_sink.as_ref() {
+                                    output_sink(crate::CaptureOutputStream::Stdout, &bytes);
+                                }
+                            }
+                            OutputStream::Stderr => {
+                                stderr.extend_from_slice(&bytes);
+                                if let Some(output_sink) = output_sink.as_ref() {
+                                    output_sink(crate::CaptureOutputStream::Stderr, &bytes);
+                                }
+                            }
                         },
                         Err(err) => {
                             break Err(err);

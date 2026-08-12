@@ -33,12 +33,14 @@ use crate::model::epoch_millis_to_datetime;
 use crate::paths::file_modified_time_utc;
 use crate::telemetry::DbKind;
 use crate::telemetry::DbTelemetry;
+use crate::telemetry::DbTelemetryHandle;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
 use log::LevelFilter;
 use serde_json::Value;
+use sqlx::Acquire;
 use sqlx::ConnectOptions;
 use sqlx::QueryBuilder;
 use sqlx::Row;
@@ -69,6 +71,7 @@ mod backfill;
 mod external_agent_config_imports;
 mod goals;
 mod logs;
+pub(crate) use logs::LogRetentionScope;
 mod memories;
 mod recovery;
 mod remote_control;
@@ -165,6 +168,9 @@ pub struct StateRuntime {
     default_provider: String,
     pool: Arc<sqlx::SqlitePool>,
     logs_pool: Arc<sqlx::SqlitePool>,
+    db_telemetry: Option<DbTelemetryHandle>,
+    #[cfg(test)]
+    log_retention_test_control: Arc<logs::LogRetentionTestControl>,
     thread_goals: GoalStore,
     memories: MemoryStore,
     validation_history: crate::ValidationHistoryStore,
@@ -191,7 +197,7 @@ impl StateRuntime {
     pub(crate) async fn init_with_telemetry_for_tests(
         codex_home: PathBuf,
         default_provider: String,
-        telemetry_override: &dyn DbTelemetry,
+        telemetry_override: DbTelemetryHandle,
     ) -> anyhow::Result<Arc<Self>> {
         Self::init_inner(codex_home, default_provider, Some(telemetry_override)).await
     }
@@ -199,7 +205,7 @@ impl StateRuntime {
     async fn init_inner(
         codex_home: PathBuf,
         default_provider: String,
-        telemetry_override: Option<&dyn DbTelemetry>,
+        telemetry_override: Option<DbTelemetryHandle>,
     ) -> anyhow::Result<Arc<Self>> {
         tokio::fs::create_dir_all(&codex_home).await?;
         #[cfg(unix)]
@@ -212,15 +218,15 @@ impl StateRuntime {
         let logs_path = LOGS_DB.path(codex_home.as_path());
         let goals_path = GOALS_DB.path(codex_home.as_path());
         let memories_path = MEMORIES_DB.path(codex_home.as_path());
-        let pool = match open_state_sqlite(&state_path, &state_migrator, telemetry_override).await {
+        let telemetry = telemetry_override.as_deref();
+        let pool = match open_state_sqlite(&state_path, &state_migrator, telemetry).await {
             Ok(db) => Arc::new(db),
             Err(err) => {
                 warn!("failed to open state db at {}: {err}", state_path.display());
                 return Err(err);
             }
         };
-        let logs_pool = match open_logs_sqlite(&logs_path, &logs_migrator, telemetry_override).await
-        {
+        let logs_pool = match open_logs_sqlite(&logs_path, &logs_migrator, telemetry).await {
             Ok(db) => Arc::new(db),
             Err(err) => {
                 warn!("failed to open logs db at {}: {err}", logs_path.display());
@@ -228,36 +234,31 @@ impl StateRuntime {
                 return Err(err);
             }
         };
-        let goals_pool =
-            match open_goals_sqlite(&goals_path, &goals_migrator, telemetry_override).await {
-                Ok(db) => Arc::new(db),
-                Err(err) => {
-                    warn!("failed to open goals db at {}: {err}", goals_path.display());
-                    close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
-                    return Err(err);
-                }
-            };
-        let memories_pool = match open_memories_sqlite(
-            &memories_path,
-            &memories_migrator,
-            telemetry_override,
-        )
-        .await
-        {
+        let goals_pool = match open_goals_sqlite(&goals_path, &goals_migrator, telemetry).await {
             Ok(db) => Arc::new(db),
             Err(err) => {
-                warn!(
-                    "failed to open memories db at {}: {err}",
-                    memories_path.display()
-                );
-                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
+                warn!("failed to open goals db at {}: {err}", goals_path.display());
+                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
                 return Err(err);
             }
         };
+        let memories_pool =
+            match open_memories_sqlite(&memories_path, &memories_migrator, telemetry).await {
+                Ok(db) => Arc::new(db),
+                Err(err) => {
+                    warn!(
+                        "failed to open memories db at {}: {err}",
+                        memories_path.display()
+                    );
+                    close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()])
+                        .await;
+                    return Err(err);
+                }
+            };
         let started = Instant::now();
         let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref()).await;
         crate::telemetry::record_init_result(
-            telemetry_override,
+            telemetry,
             DbKind::State,
             "ensure_backfill_state",
             started.elapsed(),
@@ -286,7 +287,7 @@ SELECT
             .await
             .map_err(anyhow::Error::from);
         crate::telemetry::record_init_result(
-            telemetry_override,
+            telemetry,
             DbKind::State,
             "post_init_query",
             started.elapsed(),
@@ -316,6 +317,9 @@ SELECT
             validation_history,
             pool,
             logs_pool,
+            db_telemetry: telemetry_override,
+            #[cfg(test)]
+            log_retention_test_control: Arc::new(logs::LogRetentionTestControl::default()),
             codex_home,
             default_provider,
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
@@ -593,6 +597,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -739,12 +744,12 @@ mod tests {
     #[tokio::test]
     async fn init_records_successful_sqlite_init_phases_to_explicit_telemetry() {
         let codex_home = unique_temp_dir();
-        let telemetry = TestTelemetry::default();
+        let telemetry = Arc::new(TestTelemetry::default());
 
         let runtime = StateRuntime::init_with_telemetry_for_tests(
             codex_home.clone(),
             "test-provider".to_string(),
-            &telemetry,
+            telemetry.clone(),
         )
         .await
         .expect("state runtime should initialize");

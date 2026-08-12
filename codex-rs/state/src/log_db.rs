@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 use crate::LogEntry;
 use crate::StateRuntime;
+use crate::runtime::LogRetentionScope;
 
 const LOG_QUEUE_CAPACITY: usize = 512;
 const LOG_BATCH_SIZE: usize = 128;
@@ -398,8 +399,12 @@ async fn run_inserter(
 ) {
     let mut buffer = Vec::with_capacity(config.batch_size);
     let mut ticker = tokio::time::interval(config.flush_interval);
+    let mut pending_retention = Some(LogRetentionScope::for_reconciliation());
+    let mut maintenance = None;
+    let mut retry_on_tick = false;
     // Consume the immediate startup tick so entries flush after the interval.
     ticker.tick().await;
+    start_retention_maintenance(&state_db, &mut pending_retention, &mut maintenance);
     loop {
         tokio::select! {
             maybe_command = receiver.recv() => {
@@ -407,32 +412,142 @@ async fn run_inserter(
                     Some(LogDbCommand::Entry(entry)) => {
                         buffer.push(*entry);
                         if buffer.len() >= config.batch_size {
-                            flush(&state_db, &mut buffer).await;
+                            merge_pending_retention(
+                                &state_db,
+                                &mut pending_retention,
+                                flush(&state_db, &mut buffer).await,
+                            );
                         }
                     }
                     Some(LogDbCommand::Flush(reply)) => {
-                        flush(&state_db, &mut buffer).await;
+                        merge_pending_retention(
+                            &state_db,
+                            &mut pending_retention,
+                            flush(&state_db, &mut buffer).await,
+                        );
                         let _ = reply.send(());
                     }
                     None => {
-                        flush(&state_db, &mut buffer).await;
+                        merge_pending_retention(
+                            &state_db,
+                            &mut pending_retention,
+                            flush(&state_db, &mut buffer).await,
+                        );
                         break;
                     }
                 }
             }
             _ = ticker.tick() => {
-                flush(&state_db, &mut buffer).await;
+                retry_on_tick = false;
+                merge_pending_retention(
+                    &state_db,
+                    &mut pending_retention,
+                    flush(&state_db, &mut buffer).await,
+                );
             }
+            maintenance_result = async {
+                if let Some(handle) = maintenance.as_mut() {
+                    Some(handle.await)
+                } else {
+                    None
+                }
+            }, if maintenance.is_some() => {
+                maintenance = None;
+                let Some(maintenance_result) = maintenance_result else {
+                    continue;
+                };
+                match maintenance_result {
+                    Ok((_scope, Ok(()))) => {
+                        state_db.record_log_retention_event("cleanup_completed");
+                    }
+                    Ok((scope, Err(_err))) => {
+                        state_db.record_log_retention_event("cleanup_failed");
+                        state_db.record_log_retention_event("cleanup_retry_pending");
+                        merge_pending_retention(&state_db, &mut pending_retention, Some(scope));
+                        retry_on_tick = true;
+                    }
+                    Err(_join_err) => {
+                        state_db.record_log_retention_event("cleanup_failed");
+                        state_db.record_log_retention_event("cleanup_retry_pending");
+                        pending_retention = Some(LogRetentionScope::for_reconciliation());
+                        retry_on_tick = true;
+                    }
+                }
+            }
+        }
+        if !retry_on_tick {
+            start_retention_maintenance(&state_db, &mut pending_retention, &mut maintenance);
+        }
+    }
+
+    if let Some(handle) = maintenance.take() {
+        match handle.await {
+            Ok((_scope, Ok(()))) => state_db.record_log_retention_event("cleanup_completed"),
+            Ok((scope, Err(_err))) => {
+                state_db.record_log_retention_event("cleanup_failed");
+                merge_pending_retention(&state_db, &mut pending_retention, Some(scope));
+            }
+            Err(_join_err) => {
+                state_db.record_log_retention_event("cleanup_failed");
+                pending_retention = Some(LogRetentionScope::for_reconciliation());
+            }
+        }
+    }
+    if let Some(scope) = pending_retention.take() {
+        state_db.record_log_retention_event("cleanup_started");
+        if state_db.prune_log_retention(scope).await.is_ok() {
+            state_db.record_log_retention_event("cleanup_completed");
+        } else {
+            state_db.record_log_retention_event("cleanup_failed");
         }
     }
 }
 
-async fn flush(state_db: &StateRuntime, buffer: &mut Vec<LogEntry>) {
-    if buffer.is_empty() {
+fn merge_pending_retention(
+    state_db: &StateRuntime,
+    pending: &mut Option<LogRetentionScope>,
+    scope: Option<LogRetentionScope>,
+) {
+    let Some(scope) = scope else {
+        return;
+    };
+    if let Some(pending) = pending.as_mut() {
+        pending.merge(scope);
+        state_db.record_log_retention_event("cleanup_coalesced");
+    } else {
+        *pending = Some(scope);
+    }
+}
+
+fn start_retention_maintenance(
+    state_db: &std::sync::Arc<StateRuntime>,
+    pending: &mut Option<LogRetentionScope>,
+    maintenance: &mut Option<tokio::task::JoinHandle<(LogRetentionScope, anyhow::Result<()>)>>,
+) {
+    if maintenance.is_some() {
         return;
     }
+    let Some(scope) = pending.take() else {
+        return;
+    };
+    state_db.record_log_retention_event("cleanup_started");
+    let retry_scope = scope.clone();
+    let state_db = std::sync::Arc::clone(state_db);
+    *maintenance = Some(tokio::spawn(async move {
+        let result = state_db.prune_log_retention(scope).await;
+        (retry_scope, result)
+    }));
+}
+
+async fn flush(state_db: &StateRuntime, buffer: &mut Vec<LogEntry>) -> Option<LogRetentionScope> {
+    if buffer.is_empty() {
+        return None;
+    }
     let entries = buffer.split_off(0);
-    let _ = state_db.insert_logs(entries.as_slice()).await;
+    state_db
+        .insert_logs_deferred_retention(entries.as_slice())
+        .await
+        .ok()
 }
 
 #[derive(Default)]
@@ -500,6 +615,44 @@ mod tests {
 
     use super::*;
 
+    #[derive(Default)]
+    struct RetentionTelemetry {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl crate::DbTelemetry for RetentionTelemetry {
+        fn counter(&self, name: &str, _inc: i64, tags: &[(&str, &str)]) {
+            if name != crate::DB_LOG_RETENTION_METRIC {
+                return;
+            }
+            if let Some(event) = tags
+                .iter()
+                .find_map(|(key, value)| (*key == "event").then(|| (*value).to_string()))
+            {
+                self.events.lock().expect("telemetry mutex").push(event);
+            }
+        }
+
+        fn record_duration(
+            &self,
+            _name: &str,
+            _duration: std::time::Duration,
+            _tags: &[(&str, &str)],
+        ) {
+        }
+    }
+
+    impl RetentionTelemetry {
+        fn event_count(&self, expected: &str) -> usize {
+            self.events
+                .lock()
+                .expect("telemetry mutex")
+                .iter()
+                .filter(|event| event.as_str() == expected)
+                .count()
+        }
+    }
+
     fn temp_codex_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("codex-state-log-db-{}", Uuid::new_v4()))
     }
@@ -537,6 +690,117 @@ mod tests {
             file: Some("file.rs".to_string()),
             line: Some(7),
         }
+    }
+
+    #[tokio::test]
+    async fn retention_maintenance_coalesces_bursts_with_one_active_cleanup() {
+        let codex_home = temp_codex_home();
+        let telemetry = Arc::new(RetentionTelemetry::default());
+        let runtime = StateRuntime::init_with_telemetry_for_tests(
+            codex_home,
+            "test-provider".to_string(),
+            telemetry.clone(),
+        )
+        .await
+        .expect("initialize runtime");
+        let control = runtime.log_retention_test_control();
+        control.block_next_deletion();
+
+        let (sender, receiver) = mpsc::channel(32);
+        let writer = tokio::spawn(run_inserter(
+            Arc::clone(&runtime),
+            receiver,
+            LogSinkQueueConfig {
+                queue_capacity: 32,
+                batch_size: 1,
+                flush_interval: std::time::Duration::from_millis(10),
+            },
+        ));
+        control.wait_until_deletion_active().await;
+        for index in 0..8 {
+            sender
+                .send(LogDbCommand::Entry(Box::new(test_entry(&format!(
+                    "burst-{index}"
+                )))))
+                .await
+                .expect("queue burst entry");
+        }
+        let (flush_sender, flush_receiver) = oneshot::channel();
+        sender
+            .send(LogDbCommand::Flush(flush_sender))
+            .await
+            .expect("queue flush");
+        flush_receiver.await.expect("flush inserted burst");
+
+        control.fail_next_deletion();
+        control.release_blocked_deletion();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while telemetry.event_count("cleanup_completed") == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed cleanup retried on maintenance cadence");
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("writer shutdown remains bounded")
+            .expect("join writer");
+
+        assert_eq!(control.max_active_deletions(), 1);
+        assert!(telemetry.event_count("cleanup_coalesced") >= 1);
+        assert_eq!(telemetry.event_count("cleanup_failed"), 1);
+        assert_eq!(telemetry.event_count("cleanup_retry_pending"), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_prunes_retention_missed_before_shutdown() {
+        let codex_home = temp_codex_home();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        drop(runtime);
+
+        let logs_path = crate::logs_db_path(&codex_home);
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&logs_path)
+                .create_if_missing(false),
+        )
+        .await
+        .expect("open logs database");
+        sqlx::query(
+            "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, process_uuid, estimated_bytes) VALUES (?, 0, 'INFO', 'recovery-test', 'oversized', 'recovery-thread', 'recovery-process', ?)",
+        )
+        .bind(chrono::Utc::now().timestamp())
+        .bind(11_i64 * 1024 * 1024)
+        .execute(&pool)
+        .await
+        .expect("seed missed retention row");
+        pool.close().await;
+
+        let recovered = StateRuntime::init(codex_home, "test-provider".to_string())
+            .await
+            .expect("reopen runtime");
+        let (sender, receiver) = mpsc::channel(1);
+        let writer = tokio::spawn(run_inserter(
+            Arc::clone(&recovered),
+            receiver,
+            LogSinkQueueConfig {
+                queue_capacity: 1,
+                batch_size: 1,
+                flush_interval: std::time::Duration::from_secs(60),
+            },
+        ));
+        drop(sender);
+        writer.await.expect("finish startup reconciliation");
+        assert!(
+            recovered
+                .query_logs(&crate::LogQuery::default())
+                .await
+                .expect("query reconciled logs")
+                .is_empty()
+        );
     }
 
     #[derive(Clone, Default)]

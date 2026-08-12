@@ -69,16 +69,16 @@ fn completion_review_builder_with_role(register_reviewer_role: bool) -> TestCode
         )
         .expect("write KD4 marker");
         if register_reviewer_role {
-            let reviewer_role = config.codex_home.join("kd4-reviewer-test.toml");
+            let reviewer_role = config.codex_home.join("reviewer-test.toml");
             fs::write(
                 &reviewer_role,
                 "model_reasoning_effort = \"high\"\nsandbox_mode = \"read-only\"\n",
             )
             .expect("write reviewer role");
             config.agent_roles.insert(
-                "kd4_reviewer".to_string(),
+                "reviewer".to_string(),
                 AgentRoleConfig {
-                    description: Some("KD4 completion reviewer".to_string()),
+                    description: Some("Completion reviewer".to_string()),
                     config_file: Some(reviewer_role.to_path_buf()),
                     nickname_candidates: None,
                 },

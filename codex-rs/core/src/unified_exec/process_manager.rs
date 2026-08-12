@@ -88,6 +88,7 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
 const NETWORK_ACCESS_DENIED_MESSAGE: &str =
     "Network access was denied by the Codex sandbox network proxy.";
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
+const INITIAL_OUTPUT_QUIET_PERIOD: Duration = Duration::from_millis(250);
 const INTERRUPT: &str = "\u{3}";
 
 /// Test-only override for deterministic unified exec process IDs.
@@ -809,6 +810,7 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 request.turn_environment.environment_id.clone(),
                 start,
+                request.validation_launch.clone(),
                 request.process_id,
                 process_id_reservation,
                 request.tty,
@@ -851,7 +853,7 @@ impl UnifiedExecProcessManager {
             cancellation_token,
         } = process.output_handles();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected = Self::collect_output_until_deadline(
+        let collected = Self::collect_initial_output_until_deadline(
             &output_buffer,
             &output_notify,
             &output_closed,
@@ -1001,6 +1003,17 @@ impl UnifiedExecProcessManager {
             raw_output_artifact: process.raw_output_artifact().await,
             repair_notice: None,
         };
+
+        if process_started_alive
+            && let Some(finalized_artifact) = response.raw_output_artifact.clone()
+        {
+            context
+                .session
+                .services
+                .command_execution
+                .update_running_artifact(process_id, finalized_artifact)
+                .await;
+        }
 
         if response.process_id.is_none() {
             let duration_ms = u64::try_from(response.wall_time.as_millis()).unwrap_or(u64::MAX);
@@ -1288,6 +1301,7 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         environment_id: String,
         started_at: Instant,
+        validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
         process_id: i32,
         process_id_reservation: &mut ProcessIdReservation,
         tty: bool,
@@ -1348,12 +1362,14 @@ impl UnifiedExecProcessManager {
             .session
             .services
             .command_execution
-            .track_running_process(
+            .track_running_process_with_validation_contract(
                 process_id,
                 attempt_key,
                 raw_output_artifact.clone(),
                 context.turn.sub_id.clone(),
                 registration.workspace_mutation.clone(),
+                validation_launch,
+                started_at,
             )
             .await;
 
@@ -1748,18 +1764,66 @@ impl UnifiedExecProcessManager {
         output_closed: &Arc<AtomicBool>,
         output_closed_notify: &Arc<Notify>,
         cancellation_token: &CancellationToken,
+        pause_state: Option<watch::Receiver<bool>>,
+        deadline: Instant,
+    ) -> Vec<u8> {
+        Self::collect_output_until_deadline_with_quiet_yield(
+            output_buffer,
+            output_notify,
+            output_closed,
+            output_closed_notify,
+            cancellation_token,
+            pause_state,
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    async fn collect_initial_output_until_deadline(
+        output_buffer: &OutputBuffer,
+        output_notify: &Arc<Notify>,
+        output_closed: &Arc<AtomicBool>,
+        output_closed_notify: &Arc<Notify>,
+        cancellation_token: &CancellationToken,
+        pause_state: Option<watch::Receiver<bool>>,
+        deadline: Instant,
+    ) -> Vec<u8> {
+        Self::collect_output_until_deadline_with_quiet_yield(
+            output_buffer,
+            output_notify,
+            output_closed,
+            output_closed_notify,
+            cancellation_token,
+            pause_state,
+            deadline,
+            Some(INITIAL_OUTPUT_QUIET_PERIOD),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn collect_output_until_deadline_with_quiet_yield(
+        output_buffer: &OutputBuffer,
+        output_notify: &Arc<Notify>,
+        output_closed: &Arc<AtomicBool>,
+        output_closed_notify: &Arc<Notify>,
+        cancellation_token: &CancellationToken,
         mut pause_state: Option<watch::Receiver<bool>>,
         mut deadline: Instant,
+        quiet_period: Option<Duration>,
     ) -> Vec<u8> {
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
         let mut lagged_chunks = 0_u64;
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
+        let mut early_yield_deadline: Option<Instant> = None;
         loop {
             Self::extend_deadlines_while_paused(
                 &mut pause_state,
                 &mut deadline,
                 &mut post_exit_deadline,
+                &mut early_yield_deadline,
             )
             .await;
             let drained_chunks: Vec<Vec<u8>>;
@@ -1792,7 +1856,14 @@ impl UnifiedExecProcessManager {
                 {
                     break;
                 }
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                let effective_deadline = if exit_signal_received {
+                    deadline
+                } else {
+                    early_yield_deadline
+                        .map(|early_deadline| early_deadline.min(deadline))
+                        .unwrap_or(deadline)
+                };
+                let remaining = effective_deadline.saturating_duration_since(Instant::now());
                 if remaining == Duration::ZERO {
                     break;
                 }
@@ -1829,12 +1900,28 @@ impl UnifiedExecProcessManager {
                 continue;
             }
 
+            let meaningful_output_arrived = quiet_period.is_some()
+                && drained_chunks
+                    .iter()
+                    .any(|chunk| chunk.iter().any(|byte| !byte.is_ascii_whitespace()));
             for chunk in drained_chunks {
                 collected.extend_from_slice(&chunk);
             }
 
+            if meaningful_output_arrived {
+                let quiet_deadline = Instant::now() + quiet_period.unwrap_or_default();
+                early_yield_deadline = Some(quiet_deadline.min(deadline));
+            }
+
             exit_signal_received |= cancellation_token.is_cancelled();
-            if Instant::now() >= deadline {
+            let effective_deadline = if exit_signal_received {
+                deadline
+            } else {
+                early_yield_deadline
+                    .map(|early_deadline| early_deadline.min(deadline))
+                    .unwrap_or(deadline)
+            };
+            if Instant::now() >= effective_deadline {
                 break;
             }
         }
@@ -1849,6 +1936,7 @@ impl UnifiedExecProcessManager {
         pause_state: &mut Option<watch::Receiver<bool>>,
         deadline: &mut Instant,
         post_exit_deadline: &mut Option<Instant>,
+        early_yield_deadline: &mut Option<Instant>,
     ) {
         let Some(receiver) = pause_state.as_mut() else {
             return;
@@ -1868,6 +1956,9 @@ impl UnifiedExecProcessManager {
         *deadline += paused_for;
         if let Some(post_exit_deadline) = post_exit_deadline.as_mut() {
             *post_exit_deadline += paused_for;
+        }
+        if let Some(early_yield_deadline) = early_yield_deadline.as_mut() {
+            *early_yield_deadline += paused_for;
         }
     }
 

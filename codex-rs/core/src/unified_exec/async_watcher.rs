@@ -11,7 +11,9 @@ use super::UnifiedExecContext;
 use super::UnifiedExecError;
 pub(super) use super::head_tail_buffer::omitted_output_marker;
 use super::process::UnifiedExecProcess;
-use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
+use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
+use crate::exec::OutputDeltaDecision;
+use crate::exec::OutputDeltaLimiter;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::command_output_artifact::append_raw_output_artifact;
@@ -67,7 +69,7 @@ pub(crate) fn start_streaming_output(
         use tokio::sync::broadcast::error::RecvError;
 
         let mut pending = Vec::<u8>::new();
-        let mut emitted_deltas: usize = 0;
+        let emitted_deltas = OutputDeltaLimiter::default();
 
         let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
         let output_closed_notification = output_closed_notify.notified();
@@ -83,7 +85,7 @@ pub(crate) fn start_streaming_output(
                 &call_id,
                 &session_ref,
                 &turn_ref,
-                &mut emitted_deltas,
+                &emitted_deltas,
             )
             .await;
         } else {
@@ -99,7 +101,7 @@ pub(crate) fn start_streaming_output(
                                 &call_id,
                                 &session_ref,
                                 &turn_ref,
-                                &mut emitted_deltas,
+                                &emitted_deltas,
                             ).await;
                             break;
                         }
@@ -122,7 +124,7 @@ pub(crate) fn start_streaming_output(
                             &call_id,
                             &session_ref,
                             &turn_ref,
-                            &mut emitted_deltas,
+                            &emitted_deltas,
                         ).await;
                         break;
                     }
@@ -138,7 +140,7 @@ pub(crate) fn start_streaming_output(
                                     &call_id,
                                     &session_ref,
                                     &turn_ref,
-                                    &mut emitted_deltas,
+                                    &emitted_deltas,
                                 ).await;
                                 continue;
                             },
@@ -153,7 +155,7 @@ pub(crate) fn start_streaming_output(
                             &call_id,
                             &session_ref,
                             &turn_ref,
-                            &mut emitted_deltas,
+                            &emitted_deltas,
                             chunk,
                         ).await;
                     }
@@ -166,7 +168,7 @@ pub(crate) fn start_streaming_output(
             &call_id,
             &session_ref,
             &turn_ref,
-            &mut emitted_deltas,
+            &emitted_deltas,
         )
         .await;
         output_drained.notify_one();
@@ -340,7 +342,7 @@ async fn drain_queued_output(
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
-    emitted_deltas: &mut usize,
+    emitted_deltas: &OutputDeltaLimiter,
 ) {
     use tokio::sync::broadcast::error::TryRecvError;
 
@@ -383,7 +385,7 @@ async fn handle_lagged_output(
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
-    emitted_deltas: &mut usize,
+    emitted_deltas: &OutputDeltaLimiter,
 ) {
     // A lag creates a gap in the byte stream, so an incomplete code point cannot be completed by
     // a later received chunk.
@@ -416,7 +418,7 @@ async fn process_chunk(
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
-    emitted_deltas: &mut usize,
+    emitted_deltas: &OutputDeltaLimiter,
     chunk: Vec<u8>,
 ) {
     pending.extend_from_slice(&chunk);
@@ -438,7 +440,7 @@ async fn flush_pending(
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
-    emitted_deltas: &mut usize,
+    emitted_deltas: &OutputDeltaLimiter,
 ) {
     emit_pending(
         pending,
@@ -459,7 +461,7 @@ async fn emit_pending(
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
-    emitted_deltas: &mut usize,
+    emitted_deltas: &OutputDeltaLimiter,
     flush_incomplete: bool,
 ) {
     while let Some(prefix) = split_valid_utf8_prefix_with_max(
@@ -479,12 +481,14 @@ async fn emit_output_delta(
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
-    emitted_deltas: &mut usize,
+    emitted_deltas: &OutputDeltaLimiter,
     chunk: Vec<u8>,
 ) {
-    if *emitted_deltas >= MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
-        return;
-    }
+    let chunk = match emitted_deltas.claim() {
+        OutputDeltaDecision::Emit => chunk,
+        OutputDeltaDecision::EmitCapNotice => EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(),
+        OutputDeltaDecision::Suppress => return,
+    };
 
     let event = ExecCommandOutputDeltaEvent {
         call_id: call_id.to_string(),
@@ -494,7 +498,6 @@ async fn emit_output_delta(
     session_ref
         .send_event(turn_ref.as_ref(), EventMsg::ExecCommandOutputDelta(event))
         .await;
-    *emitted_deltas += 1;
 }
 
 /// Emit an ExecCommandEnd event for a unified exec session, using the transcript

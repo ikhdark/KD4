@@ -22,14 +22,19 @@ use codex_core::config::StartedNetworkProxy;
 use codex_core::exec::ExecExpiration;
 use codex_core::exec::ExecExpirationOutcome;
 use codex_core::exec::IO_DRAIN_TIMEOUT_MS;
+use codex_core::exec::StdoutStream;
 use codex_core::sandboxing::ExecRequest;
 use codex_protocol::exec_output::bytes_to_string_smart;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecOutputStream;
 use codex_sandboxing::SandboxType;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::ProcessHandle;
 use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::TerminalSize;
 use tokio::sync::Mutex;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -43,6 +48,9 @@ use crate::outgoing_message::OutgoingMessageSender;
 
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;
 const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
+const OUTPUT_DELIVERY_MAX_QUEUED_BYTES: usize = 256 * 1024;
+const OUTPUT_DELIVERY_QUEUE_ITEMS: usize = 256;
+const OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES: usize = 1024;
 
 #[derive(Clone)]
 pub(crate) struct CommandExecManager {
@@ -118,14 +126,24 @@ struct RunCommandParams {
 }
 
 struct SpawnProcessOutputParams {
-    connection_id: ConnectionId,
     process_id: Option<String>,
     output_rx: mpsc::Receiver<Vec<u8>>,
     stdio_timeout_rx: watch::Receiver<bool>,
-    outgoing: Arc<OutgoingMessageSender>,
+    delivery_relay: Option<OutputDeliveryRelay>,
     stream: CommandExecOutputStream,
     stream_output: bool,
     output_bytes_cap: Option<usize>,
+}
+
+#[derive(Clone)]
+struct OutputDeliveryRelay {
+    tx: mpsc::Sender<QueuedOutputDelivery>,
+    byte_budget: Arc<Semaphore>,
+}
+
+struct QueuedOutputDelivery {
+    notification: ServerNotification,
+    _byte_permit: OwnedSemaphorePermit,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -184,9 +202,9 @@ impl CommandExecManager {
         };
 
         if matches!(exec_request.sandbox, SandboxType::WindowsRestrictedToken) {
-            if tty || stream_stdin || stream_stdout_stderr {
+            if tty || stream_stdin {
                 return Err(invalid_request(
-                    "streaming command/exec is not supported with windows sandbox",
+                    "tty and stdin streaming are not supported with windows sandbox",
                 ));
             }
             if output_bytes_cap != Some(DEFAULT_OUTPUT_BYTES_CAP) {
@@ -210,9 +228,75 @@ impl CommandExecManager {
             let sessions = Arc::clone(&self.sessions);
             tokio::spawn(async move {
                 let _started_network_proxy = started_network_proxy;
-                match codex_core::sandboxing::execute_env(exec_request, /*stdout_stream*/ None)
-                    .await
-                {
+                let (delivery_relay, delivery_handle) = if stream_stdout_stderr {
+                    let (relay, handle) = spawn_output_delivery_relay(
+                        Arc::clone(&outgoing),
+                        request_id.connection_id,
+                    );
+                    (Some(relay), Some(handle))
+                } else {
+                    (None, None)
+                };
+                let notification_process_id = match &process_id {
+                    InternalProcessId::Generated(_) => None,
+                    InternalProcessId::Client(id) => Some(id.clone()),
+                };
+                let (stdout_stream, event_relay_handle) =
+                    match (delivery_relay.clone(), notification_process_id) {
+                        (Some(delivery_relay), Some(process_id)) => {
+                            let (tx_event, rx_event) =
+                                async_channel::bounded::<codex_protocol::protocol::Event>(1);
+                            let handle = tokio::spawn(async move {
+                                while let Ok(event) = rx_event.recv().await {
+                                    let EventMsg::ExecCommandOutputDelta(delta) = event.msg else {
+                                        continue;
+                                    };
+                                    let stream = match delta.stream {
+                                        ExecOutputStream::Stdout => CommandExecOutputStream::Stdout,
+                                        ExecOutputStream::Stderr => CommandExecOutputStream::Stderr,
+                                    };
+                                    let delta_base64 = STANDARD.encode(delta.chunk);
+                                    let accounted_payload_bytes =
+                                        accounted_output_delivery_bytes(&delta_base64, &process_id);
+                                    if delivery_relay
+                                        .enqueue(
+                                            ServerNotification::CommandExecOutputDelta(
+                                                CommandExecOutputDeltaNotification {
+                                                    process_id: process_id.clone(),
+                                                    stream,
+                                                    delta_base64,
+                                                    cap_reached: false,
+                                                },
+                                            ),
+                                            accounted_payload_bytes,
+                                        )
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
+                            (
+                                Some(StdoutStream {
+                                    sub_id: String::new(),
+                                    call_id: String::new(),
+                                    tx_event,
+                                }),
+                                Some(handle),
+                            )
+                        }
+                        _ => (None, None),
+                    };
+                let output = codex_core::sandboxing::execute_env(exec_request, stdout_stream).await;
+                if let Some(handle) = event_relay_handle {
+                    let _ = handle.await;
+                }
+                drop(delivery_relay);
+                if let Some(handle) = delivery_handle {
+                    let _ = handle.await;
+                }
+                match output {
                     Ok(output) => {
                         outgoing
                             .send_response(
@@ -506,22 +590,28 @@ async fn run_command(params: RunCommandParams) {
         "stdin streaming is not enabled for this command/exec",
     );
 
+    let (delivery_relay, delivery_handle) = if stream_stdout_stderr {
+        let (relay, handle) =
+            spawn_output_delivery_relay(Arc::clone(&outgoing), request_id.connection_id);
+        (Some(relay), Some(handle))
+    } else {
+        (None, None)
+    };
+
     let stdout_handle = spawn_process_output(SpawnProcessOutputParams {
-        connection_id: request_id.connection_id,
         process_id: process_id.clone(),
         output_rx: stdout_rx,
         stdio_timeout_rx: stdio_timeout_rx.clone(),
-        outgoing: Arc::clone(&outgoing),
+        delivery_relay: delivery_relay.clone(),
         stream: CommandExecOutputStream::Stdout,
         stream_output: stream_stdout_stderr,
         output_bytes_cap,
     });
     let stderr_handle = spawn_process_output(SpawnProcessOutputParams {
-        connection_id: request_id.connection_id,
         process_id: process_id.clone(),
         output_rx: stderr_rx,
         stdio_timeout_rx,
-        outgoing: Arc::clone(&outgoing),
+        delivery_relay: delivery_relay.clone(),
         stream: CommandExecOutputStream::Stderr,
         stream_output: stream_stdout_stderr,
         output_bytes_cap,
@@ -578,6 +668,10 @@ async fn run_command(params: RunCommandParams) {
     let stdout = stdout_handle.await.unwrap_or_default();
     let stderr = stderr_handle.await.unwrap_or_default();
     timeout_handle.abort();
+    drop(delivery_relay);
+    if let Some(delivery_handle) = delivery_handle {
+        let _ = delivery_handle.await;
+    }
 
     outgoing
         .send_response(
@@ -591,13 +685,62 @@ async fn run_command(params: RunCommandParams) {
         .await;
 }
 
+fn spawn_output_delivery_relay(
+    outgoing: Arc<OutgoingMessageSender>,
+    connection_id: ConnectionId,
+) -> (OutputDeliveryRelay, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::channel::<QueuedOutputDelivery>(OUTPUT_DELIVERY_QUEUE_ITEMS);
+    let relay = OutputDeliveryRelay {
+        tx,
+        byte_budget: Arc::new(Semaphore::new(OUTPUT_DELIVERY_MAX_QUEUED_BYTES)),
+    };
+    let handle = tokio::spawn(async move {
+        while let Some(queued) = rx.recv().await {
+            outgoing
+                .send_server_notification_to_connection_and_wait(connection_id, queued.notification)
+                .await;
+        }
+    });
+    (relay, handle)
+}
+
+impl OutputDeliveryRelay {
+    async fn enqueue(
+        &self,
+        notification: ServerNotification,
+        accounted_payload_bytes: usize,
+    ) -> Result<(), ()> {
+        if accounted_payload_bytes > OUTPUT_DELIVERY_MAX_QUEUED_BYTES {
+            return Err(());
+        }
+        let accounted_payload_bytes: u32 = accounted_payload_bytes.try_into().map_err(|_| ())?;
+        let permit = Arc::clone(&self.byte_budget)
+            .acquire_many_owned(accounted_payload_bytes)
+            .await
+            .map_err(|_| ())?;
+        self.tx
+            .send(QueuedOutputDelivery {
+                notification,
+                _byte_permit: permit,
+            })
+            .await
+            .map_err(|_| ())
+    }
+}
+
+fn accounted_output_delivery_bytes(delta_base64: &str, process_id: &str) -> usize {
+    delta_base64
+        .len()
+        .saturating_add(process_id.len())
+        .saturating_add(OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES)
+}
+
 fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHandle<String> {
     let SpawnProcessOutputParams {
-        connection_id,
         process_id,
         mut output_rx,
         mut stdio_timeout_rx,
-        outgoing,
+        mut delivery_relay,
         stream,
         stream_output,
         output_bytes_cap,
@@ -631,19 +774,27 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
             };
             let cap_reached = Some(observed_num_bytes) == output_bytes_cap;
             if let (true, Some(process_id)) = (stream_output, process_id.as_ref()) {
-                outgoing
-                    .send_server_notification_to_connection_and_wait(
-                        connection_id,
-                        ServerNotification::CommandExecOutputDelta(
-                            CommandExecOutputDeltaNotification {
-                                process_id: process_id.clone(),
-                                stream,
-                                delta_base64: STANDARD.encode(capped_chunk),
-                                cap_reached,
-                            },
-                        ),
-                    )
-                    .await;
+                let delta_base64 = STANDARD.encode(capped_chunk);
+                let accounted_payload_bytes =
+                    accounted_output_delivery_bytes(&delta_base64, process_id);
+                if let Some(relay) = delivery_relay.as_ref()
+                    && relay
+                        .enqueue(
+                            ServerNotification::CommandExecOutputDelta(
+                                CommandExecOutputDeltaNotification {
+                                    process_id: process_id.clone(),
+                                    stream,
+                                    delta_base64,
+                                    cap_reached,
+                                },
+                            ),
+                            accounted_payload_bytes,
+                        )
+                        .await
+                        .is_err()
+                {
+                    delivery_relay = None;
+                }
             } else if !stream_output {
                 buffer.extend_from_slice(capped_chunk);
             }
@@ -760,7 +911,12 @@ mod tests {
     fn windows_sandbox_exec_request() -> ExecRequest {
         let cwd = AbsolutePathBuf::current_dir().expect("current dir");
         ExecRequest::new(
-            vec!["cmd".to_string()],
+            vec![
+                "cmd".to_string(),
+                "/c".to_string(),
+                "exit".to_string(),
+                "0".to_string(),
+            ],
             cwd.clone(),
             HashMap::new(),
             /*network*/ None,
@@ -777,10 +933,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn windows_sandbox_streaming_exec_is_rejected() {
+    async fn windows_sandbox_streaming_exec_uses_execution_path() {
         let (tx, _rx) = mpsc::channel(1);
         let manager = CommandExecManager::default();
-        let err = manager
+        manager
             .start(StartCommandExecParams {
                 outgoing: Arc::new(OutgoingMessageSender::new(
                     tx,
@@ -796,17 +952,11 @@ mod tests {
                 tty: false,
                 stream_stdin: false,
                 stream_stdout_stderr: true,
-                output_bytes_cap: None,
+                output_bytes_cap: Some(DEFAULT_OUTPUT_BYTES_CAP),
                 size: None,
             })
             .await
-            .expect_err("streaming windows sandbox exec should be rejected");
-
-        assert_eq!(err.code, INVALID_REQUEST_ERROR_CODE);
-        assert_eq!(
-            err.message,
-            "streaming command/exec is not supported with windows sandbox"
-        );
+            .expect("streaming windows sandbox exec should start");
     }
 
     #[cfg(not(target_os = "windows"))]

@@ -249,10 +249,18 @@ pub(super) async fn run_exec_like_with_exit_code(
             .command_execution
             .reserve_workspace_mutation_until_cancelled(&repo_root, &args.cancellation_token)
             .await
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "shell command mutation-reservation wait was cancelled".to_string(),
-                )
+            .map_err(|error| {
+                use crate::tools::command_execution::WorkspaceMutationReservationAcquireError;
+
+                let message = match error {
+                    WorkspaceMutationReservationAcquireError::Cancelled => {
+                        "shell command mutation-reservation wait was cancelled"
+                    }
+                    WorkspaceMutationReservationAcquireError::TimedOut => {
+                        "shell command could not reserve repository-wide mutation execution within 10 seconds"
+                    }
+                };
+                FunctionCallError::RespondToModel(message.to_string())
             })?;
         if coordinator.store().is_none() {
             coordinator
@@ -321,6 +329,12 @@ pub(super) async fn run_exec_like_with_exit_code(
             WorkspaceMutationAcquireError::Cancelled => FunctionCallError::RespondToModel(
                 "shell command mutation-lease wait was cancelled".to_string(),
             ),
+            WorkspaceMutationAcquireError::TimedOut { details } => {
+                FunctionCallError::RespondToModel(format!(
+                    "shell command could not acquire the repository-wide mutation lease within 10 seconds: {}",
+                    details.join("; ")
+                ))
+            }
             WorkspaceMutationAcquireError::Store(error) => {
                 FunctionCallError::RespondToModel(format!(
                     "shell command could not acquire the repository-wide mutation lease: {error}"
