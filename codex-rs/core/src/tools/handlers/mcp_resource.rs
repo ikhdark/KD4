@@ -14,6 +14,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
@@ -215,43 +216,55 @@ impl ListResourcesPayload {
             omitted_error_count: errors.len(),
         };
         ensure_payload_metadata_fits(&payload, truncation_policy)?;
+        let mut estimated_size = serialized_candidate_cost(&payload, truncation_policy)?;
+        let serialized_budget = conservative_serialized_budget(truncation_policy);
 
         for error in errors {
-            payload.omitted_error_count -= 1;
-            payload.errors.push(error);
-            if !serialized_payload_fits(&payload, truncation_policy)? {
-                payload.errors.pop();
-                payload.omitted_error_count += 1;
+            let candidate_cost =
+                serialized_candidate_cost(&error, truncation_policy)?.saturating_add(16);
+            if estimated_size.saturating_add(candidate_cost) > serialized_budget {
                 break;
             }
+            estimated_size = estimated_size.saturating_add(candidate_cost);
+            payload.omitted_error_count -= 1;
+            payload.errors.push(error);
         }
         for (server, page) in entries {
             let Ok(remaining_index) = payload.remaining_servers.binary_search(&server) else {
                 continue;
             };
-            payload.remaining_servers.remove(remaining_index);
-            let resources_start = payload.resources.len();
             let page_resource_count = page.resources.len();
-            payload.omitted_count -= page_resource_count;
-            for resource in page.resources {
-                payload
-                    .resources
-                    .push(ResourceWithServer::new(server.clone(), resource));
+            let resources: Vec<_> = page
+                .resources
+                .into_iter()
+                .map(|resource| ResourceWithServer::new(server.clone(), resource))
+                .collect();
+            let mut candidate_cost =
+                serialized_candidate_cost(&resources, truncation_policy)?.saturating_add(16);
+            if let Some(next_cursor) = page.next_cursor.as_ref() {
+                candidate_cost = candidate_cost
+                    .saturating_add(serialized_candidate_cost(
+                        &(&server, next_cursor),
+                        truncation_policy,
+                    )?)
+                    .saturating_add(16);
             }
-            if let Some(next_cursor) = page.next_cursor {
-                payload.next_cursors.insert(server.clone(), next_cursor);
+            if estimated_size.saturating_add(candidate_cost) > serialized_budget {
+                continue;
             }
 
-            if !serialized_payload_fits(&payload, truncation_policy)? {
-                payload.resources.truncate(resources_start);
-                payload.next_cursors.remove(&server);
-                payload.remaining_servers.insert(remaining_index, server);
-                payload.omitted_count += page_resource_count;
+            estimated_size = estimated_size.saturating_add(candidate_cost);
+            payload.remaining_servers.remove(remaining_index);
+            payload.omitted_count -= page_resource_count;
+            payload.resources.extend(resources);
+            if let Some(next_cursor) = page.next_cursor {
+                payload.next_cursors.insert(server, next_cursor);
             }
         }
         payload.truncated = payload.omitted_count > 0
             || payload.omitted_error_count > 0
             || !payload.remaining_servers.is_empty();
+        ensure_payload_metadata_fits(&payload, truncation_policy)?;
         Ok(payload)
     }
 }
@@ -362,44 +375,56 @@ impl ListResourceTemplatesPayload {
             omitted_error_count: errors.len(),
         };
         ensure_payload_metadata_fits(&payload, truncation_policy)?;
+        let mut estimated_size = serialized_candidate_cost(&payload, truncation_policy)?;
+        let serialized_budget = conservative_serialized_budget(truncation_policy);
         for error in errors {
-            payload.omitted_error_count -= 1;
-            payload.errors.push(error);
-            if !serialized_payload_fits(&payload, truncation_policy)? {
-                payload.errors.pop();
-                payload.omitted_error_count += 1;
+            let candidate_cost =
+                serialized_candidate_cost(&error, truncation_policy)?.saturating_add(16);
+            if estimated_size.saturating_add(candidate_cost) > serialized_budget {
                 break;
             }
+            estimated_size = estimated_size.saturating_add(candidate_cost);
+            payload.omitted_error_count -= 1;
+            payload.errors.push(error);
         }
 
         for (server, page) in entries {
             let Ok(remaining_index) = payload.remaining_servers.binary_search(&server) else {
                 continue;
             };
-            payload.remaining_servers.remove(remaining_index);
-            let templates_start = payload.resource_templates.len();
             let page_template_count = page.resource_templates.len();
-            payload.omitted_count -= page_template_count;
-            for template in page.resource_templates {
-                payload
-                    .resource_templates
-                    .push(ResourceTemplateWithServer::new(server.clone(), template));
+            let templates: Vec<_> = page
+                .resource_templates
+                .into_iter()
+                .map(|template| ResourceTemplateWithServer::new(server.clone(), template))
+                .collect();
+            let mut candidate_cost =
+                serialized_candidate_cost(&templates, truncation_policy)?.saturating_add(16);
+            if let Some(next_cursor) = page.next_cursor.as_ref() {
+                candidate_cost = candidate_cost
+                    .saturating_add(serialized_candidate_cost(
+                        &(&server, next_cursor),
+                        truncation_policy,
+                    )?)
+                    .saturating_add(16);
             }
-            if let Some(next_cursor) = page.next_cursor {
-                payload.next_cursors.insert(server.clone(), next_cursor);
+            if estimated_size.saturating_add(candidate_cost) > serialized_budget {
+                continue;
             }
 
-            if !serialized_payload_fits(&payload, truncation_policy)? {
-                payload.resource_templates.truncate(templates_start);
-                payload.next_cursors.remove(&server);
-                payload.remaining_servers.insert(remaining_index, server);
-                payload.omitted_count += page_template_count;
+            estimated_size = estimated_size.saturating_add(candidate_cost);
+            payload.remaining_servers.remove(remaining_index);
+            payload.omitted_count -= page_template_count;
+            payload.resource_templates.extend(templates);
+            if let Some(next_cursor) = page.next_cursor {
+                payload.next_cursors.insert(server, next_cursor);
             }
         }
 
         payload.truncated = payload.omitted_count > 0
             || payload.omitted_error_count > 0
             || !payload.remaining_servers.is_empty();
+        ensure_payload_metadata_fits(&payload, truncation_policy)?;
         Ok(payload)
     }
 }
@@ -847,6 +872,26 @@ where
 {
     let content = serialize_resource_payload(payload)?;
     Ok(truncate_text(&content, truncation_policy * 1.2) == content)
+}
+
+fn conservative_serialized_budget(truncation_policy: TruncationPolicy) -> usize {
+    match truncation_policy * 1.2 {
+        TruncationPolicy::Bytes(bytes) | TruncationPolicy::Tokens(bytes) => bytes,
+    }
+}
+
+fn serialized_candidate_cost<T>(
+    candidate: &T,
+    truncation_policy: TruncationPolicy,
+) -> Result<usize, FunctionCallError>
+where
+    T: Serialize,
+{
+    let content = serialize_resource_payload(candidate)?;
+    Ok(match truncation_policy {
+        TruncationPolicy::Bytes(_) => content.len(),
+        TruncationPolicy::Tokens(_) => approx_token_count(&content),
+    })
 }
 
 fn serialize_resource_payload<T>(payload: &T) -> Result<String, FunctionCallError>

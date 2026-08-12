@@ -64,7 +64,7 @@ class ScenarioResult:
 
     @property
     def passed(self) -> bool:
-        return self.status in {"passed", "skipped"}
+        return self.status == "passed"
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -383,6 +383,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--hash-binary", action="store_true")
     parser.add_argument("--allow-failures", action="store_true")
+    parser.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="Allow required scenarios to be skipped without failing the snapshot.",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--model-attempt-jsonl",
@@ -421,14 +426,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"p95={result.p95_ms}ms"
             )
 
-    failed = [result.name for result in results if not result.passed]
+    failed = [result.name for result in results if result.status == "failed"]
+    skipped = [result.name for result in results if result.status == "skipped"]
+    ok = not failed and (not skipped or args.allow_incomplete)
     payload = {
         "schemaVersion": 1,
         "profile": args.profile,
         "environment": environment_metadata(repo_root, hash_binary=args.hash_binary),
         "results": [asdict(result) for result in results],
         "failedScenarios": failed,
-        "ok": not failed,
+        "skippedScenarios": skipped,
+        "incomplete": bool(skipped),
+        "allowIncomplete": args.allow_incomplete,
+        "ok": ok,
     }
     if args.model_attempt_jsonl:
         attempts, exclusions = kd4_model_attempt_analysis.load_jsonl(
@@ -446,7 +456,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_json_atomic(args.output, payload)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
-    return 0 if not failed or args.allow_failures else 1
+    return 0 if ok or args.allow_failures else 1
 
 
 if __name__ == "__main__":

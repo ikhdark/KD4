@@ -4,7 +4,6 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::BorrowedHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::OwnedHandle;
-use std::os::windows::process::CommandExt;
 use std::sync::Arc;
 use std::time::Duration;
 use winapi::um::processthreadsapi::OpenProcess;
@@ -21,10 +20,9 @@ fn managed_job_terminates_root() -> anyhow::Result<()> {
         .args(["-n", "60", "127.0.0.1"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(ManagedRootProcess::WINDOWS_CREATION_FLAGS);
+        .stderr(Stdio::null());
     let mut child = command.spawn()?;
-    managed.attach_and_resume(child.id())?;
+    managed.attach(child.id())?;
     let process =
         unsafe { BorrowedHandle::borrow_raw(child.as_raw_handle()) }.try_clone_to_owned()?;
     let mut terminator = PipeChildTerminator {

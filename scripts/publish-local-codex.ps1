@@ -2883,6 +2883,8 @@ Write-ProofLine "commandRunnerTargetPath" $commandRunnerTargetPath
 Write-ProofLine "targetKind" "local CLI/TUI payload used by Codex Desktop; launching it directly opens a terminal."
 $publishLock = $null
 $desktopRoutingSnapshot = $null
+$publishCommitted = $false
+$restartFailure = $null
 if (-not $DryRun) {
     $publishLock = Enter-CodexLocalPublishMutex
     Write-ProofLine "publishLock" "acquired"
@@ -3232,12 +3234,22 @@ if (-not $binaryChanged) {
             Write-ProofLine "doctorCommand" "<skipped: target already current>"
         }
     }
+    $publishCommitted = $true
+    Write-ProofLine "publishCommitted" "true"
     if ($RestartDesktop) {
-        if ($ConfigureDesktopLocalCli) {
-            Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+        try {
+            if ($ConfigureDesktopLocalCli) {
+                Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+            }
+            else {
+                Restart-CodexDesktop
+            }
+            Write-ProofLine "restartFailed" "false"
         }
-        else {
-            Restart-CodexDesktop
+        catch {
+            $restartFailure = $_.Exception
+            Write-ProofLine "restartFailed" "true"
+            Write-Warning "Publish committed, but restarting Codex Desktop failed: $($restartFailure.Message)"
         }
     }
     exit 0
@@ -3439,12 +3451,22 @@ catch {
     throw $publishError
 }
 
+$publishCommitted = $true
+Write-ProofLine "publishCommitted" "true"
 if ($RestartDesktop) {
-    if ($ConfigureDesktopLocalCli) {
-        Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+    try {
+        if ($ConfigureDesktopLocalCli) {
+            Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+        }
+        else {
+            Restart-CodexDesktop
+        }
+        Write-ProofLine "restartFailed" "false"
     }
-    else {
-        Restart-CodexDesktop
+    catch {
+        $restartFailure = $_.Exception
+        Write-ProofLine "restartFailed" "true"
+        Write-Warning "Publish committed, but restarting Codex Desktop failed: $($restartFailure.Message)"
     }
 }
 
@@ -3452,30 +3474,34 @@ $protectedBackupPath = if ($targetExists) { $backupPath } else { $null }
 $protectedCodeModeHostBackupPath = if ($codeModeHostTargetExists) { $codeModeHostBackupPath } else { $null }
 $protectedWindowsSandboxSetupBackupPath = if ($windowsSandboxSetupTargetExists) { $windowsSandboxSetupBackupPath } else { $null }
 $protectedCommandRunnerBackupPath = if ($commandRunnerTargetExists) { $commandRunnerBackupPath } else { $null }
-Remove-OldCodexBackups `
-    -BackupDir $BackupDir `
-    -ArtifactName "codex" `
-    -ProtectedPath $protectedBackupPath
-Remove-OldCodexBackups `
-    -BackupDir $BackupDir `
-    -ArtifactName "codex-code-mode-host" `
-    -ProtectedPath $protectedCodeModeHostBackupPath
-Remove-OldCodexBackups `
-    -BackupDir $BackupDir `
-    -ArtifactName "codex-windows-sandbox-setup" `
-    -ProtectedPath $protectedWindowsSandboxSetupBackupPath
-Remove-OldCodexBackups `
-    -BackupDir $BackupDir `
-    -ArtifactName "codex-command-runner" `
-    -ProtectedPath $protectedCommandRunnerBackupPath
+$backupPruneSpecs = @(
+    @{ ArtifactName = "codex"; ProtectedPath = $protectedBackupPath },
+    @{ ArtifactName = "codex-code-mode-host"; ProtectedPath = $protectedCodeModeHostBackupPath },
+    @{ ArtifactName = "codex-windows-sandbox-setup"; ProtectedPath = $protectedWindowsSandboxSetupBackupPath },
+    @{ ArtifactName = "codex-command-runner"; ProtectedPath = $protectedCommandRunnerBackupPath }
+)
+foreach ($backupPruneSpec in $backupPruneSpecs) {
+    try {
+        Remove-OldCodexBackups `
+            -BackupDir $BackupDir `
+            -ArtifactName $backupPruneSpec.ArtifactName `
+            -ProtectedPath $backupPruneSpec.ProtectedPath
+    }
+    catch {
+        Write-Warning "Publish committed; could not prune old $($backupPruneSpec.ArtifactName) backups: $($_.Exception.Message)"
+    }
+}
 
 Write-Output "Restart Codex Desktop from the Start menu or run: $(Get-CodexDesktopLaunchCommand)"
 Write-Output "Published codex.exe, codex-code-mode-host.exe, and Windows sandbox helpers as one local runtime bundle."
 Write-Output "Do not launch targetPath directly; it is the CLI/TUI payload and opens a terminal."
+if ($null -ne $restartFailure) {
+    throw "Publish committed but Desktop restart failed (publishCommitted=true, restartFailed=true): $($restartFailure.Message)"
+}
 }
 catch {
     $publishError = $_.Exception
-    if ($null -ne $desktopRoutingSnapshot) {
+    if ((-not $publishCommitted) -and $null -ne $desktopRoutingSnapshot) {
         try {
             Restore-DesktopEnvironmentRouting -Snapshot $desktopRoutingSnapshot
         }

@@ -109,6 +109,27 @@ RUN apt-get update \
 EOF
 }
 
+sha256_file() {
+  local path="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${path}" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${path}" | awk '{print $1}'
+  else
+    python3 - "${path}" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+  fi
+}
+
 start_remote_env_container() {
   local container_name="$1"
   local image_name="$2"
@@ -117,21 +138,57 @@ start_remote_env_container() {
   local host_bind="${CODEX_TEST_REMOTE_ENV_HOST_BIND:-127.0.0.1}"
   local host_port="${CODEX_TEST_REMOTE_ENV_HOST_PORT:-}"
   local binary_dir
+  local binary_sha256
+  local canonical_binary_path
+  local image_id
   local mount_dir="${CODEX_TEST_REMOTE_ENV_BINARY_MOUNT_DIR:-/tmp/codex-remote-env/host-bin}"
+  local mount_binary=0
+  local -a container_labels
+
+  canonical_binary_path="$(cd "$(dirname "${binary_path}")" && pwd)/$(basename "${binary_path}")" || return 1
+  binary_dir="$(dirname "${canonical_binary_path}")"
+  binary_sha256="$(sha256_file "${canonical_binary_path}")" || return 1
+  image_id="$(docker image inspect -f '{{.Id}}' "${image_name}")" || return 1
+  if is_truthy "${CODEX_TEST_REMOTE_ENV_MOUNT_BINARY:-1}"; then
+    mount_binary=1
+  fi
+  container_labels=(
+    --label "io.openai.codex.remote-env.config-version=2"
+    --label "io.openai.codex.remote-env.image-id=${image_id}"
+    --label "io.openai.codex.remote-env.binary-path=${canonical_binary_path}"
+    --label "io.openai.codex.remote-env.binary-sha256=${binary_sha256}"
+    --label "io.openai.codex.remote-env.mount-dir=${mount_dir}"
+    --label "io.openai.codex.remote-env.mount-binary=${mount_binary}"
+    --label "io.openai.codex.remote-env.remote-port=${remote_port}"
+    --label "io.openai.codex.remote-env.host-bind=${host_bind}"
+    --label "io.openai.codex.remote-env.host-port=${host_port}"
+  )
 
   if is_truthy "${CODEX_TEST_REMOTE_ENV_REUSE:-0}" && docker container inspect "${container_name}" >/dev/null 2>&1; then
-    if [[ "$(docker inspect -f '{{.State.Running}}' "${container_name}")" != "true" ]]; then
-      docker start "${container_name}" >/dev/null || return 1
+    if [[ "$(docker inspect -f '{{.Image}}' "${container_name}")" == "${image_id}" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.config-version" }}' "${container_name}")" == "2" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.image-id" }}' "${container_name}")" == "${image_id}" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.binary-path" }}' "${container_name}")" == "${canonical_binary_path}" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.binary-sha256" }}' "${container_name}")" == "${binary_sha256}" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.mount-dir" }}' "${container_name}")" == "${mount_dir}" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.mount-binary" }}' "${container_name}")" == "${mount_binary}" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.remote-port" }}' "${container_name}")" == "${remote_port}" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.host-bind" }}' "${container_name}")" == "${host_bind}" ]] &&
+      [[ "$(docker inspect -f '{{ index .Config.Labels "io.openai.codex.remote-env.host-port" }}' "${container_name}")" == "${host_port}" ]]; then
+      if [[ "$(docker inspect -f '{{.State.Running}}' "${container_name}")" != "true" ]]; then
+        docker start "${container_name}" >/dev/null || return 1
+      fi
+      return 0
     fi
-    return 0
+    echo "recreating ${container_name}: reusable container configuration is stale" >&2
   fi
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
-  binary_dir="$(cd "$(dirname "${binary_path}")" && pwd)" || return 1
 
-  if is_truthy "${CODEX_TEST_REMOTE_ENV_MOUNT_BINARY:-1}"; then
+  if [[ "${mount_binary}" == "1" ]]; then
     if docker run -d \
       --name "${container_name}" \
+      "${container_labels[@]}" \
       --privileged \
       --security-opt seccomp=unconfined \
       -p "${host_bind}:${host_port}:${remote_port}" \
@@ -144,6 +201,7 @@ start_remote_env_container() {
 
   docker run -d \
     --name "${container_name}" \
+    "${container_labels[@]}" \
     --privileged \
     --security-opt seccomp=unconfined \
     -p "${host_bind}:${host_port}:${remote_port}" \
@@ -329,6 +387,9 @@ wait_for_remote_exec_server_port() {
   local quiet="${4:-0}"
 
   if docker exec "${container_name}" python3 - "${port}" >/dev/null 2>&1 <<'PY'; then
+import base64
+import hashlib
+import os
 import socket
 import sys
 import time
@@ -340,9 +401,44 @@ while time.monotonic() < deadline:
     if delay:
         time.sleep(delay)
     try:
-        socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        expected_accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii").lower()
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2) as connection:
+            connection.settimeout(0.5)
+            connection.sendall(
+                (
+                    "GET / HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode("ascii")
+            )
+            response = b""
+            while b"\r\n\r\n" not in response and len(response) < 16384:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        header_lines = response.split(b"\r\n")
+        if not header_lines or not header_lines[0].startswith(b"HTTP/1.1 101"):
+            raise OSError("not a WebSocket endpoint")
+        headers = {}
+        for header_line in header_lines[1:]:
+            if b":" in header_line:
+                name, value = header_line.split(b":", 1)
+                headers[name.strip().lower()] = value.strip().lower()
+        if headers.get(b"upgrade") != b"websocket":
+            raise OSError("missing WebSocket upgrade header")
+        if b"upgrade" not in headers.get(b"connection", b""):
+            raise OSError("missing WebSocket connection header")
+        if headers.get(b"sec-websocket-accept", b"").decode("ascii") != expected_accept:
+            raise OSError("invalid WebSocket accept header")
         raise SystemExit(0)
-    except OSError:
+    except (OSError, UnicodeError):
         delay = 0.025 if delay == 0.0 else min(delay * 2, 0.2)
 raise SystemExit(1)
 PY

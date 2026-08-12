@@ -43,7 +43,7 @@ pub(crate) struct WorkspaceCommand {
     pub(crate) env: HashMap<String, Option<String>>,
     /// Maximum wall-clock duration before app-server cancels the command.
     pub(crate) timeout: Duration,
-    /// Maximum captured stdout/stderr bytes returned by app-server.
+    /// Maximum captured bytes returned by app-server for each of stdout and stderr.
     pub(crate) output_bytes_cap: usize,
     /// Whether app-server should return uncapped stdout/stderr.
     pub(crate) disable_output_cap: bool,
@@ -77,6 +77,12 @@ impl WorkspaceCommand {
     /// Sets the maximum wall-clock duration before app-server cancels the command.
     pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Sets the per-stream stdout/stderr capture cap used when output capping is enabled.
+    pub(crate) fn output_bytes_cap(mut self, output_bytes_cap: usize) -> Self {
+        self.output_bytes_cap = output_bytes_cap;
         self
     }
 

@@ -567,9 +567,9 @@ async fn startup_output_reaches_initial_and_final_transcripts_once() {
     )
     .await;
 
-    let output_drained = process.output_drained_notify();
+    let output_drained = process.output_drained_token();
     process.terminate();
-    tokio::time::timeout(Duration::from_secs(2), output_drained.notified())
+    tokio::time::timeout(Duration::from_secs(2), output_drained.cancelled())
         .await
         .expect("streaming output should drain after process termination");
     let final_output = resolve_aggregated_output(&transcript, String::new()).await;
@@ -599,14 +599,11 @@ async fn closure_before_streaming_subscription_drains_lagged_split_utf8_output()
         Arc::new(turn),
         "closure-before-subscription".to_string(),
     );
-    let output_drained = process.output_drained_notify();
-    let drained = output_drained.notified();
-    tokio::pin!(drained);
-    drained.as_mut().enable();
+    let output_drained = process.output_drained_token();
 
     start_streaming_output(&process, &context, Arc::clone(&transcript))
         .expect("start output streaming");
-    tokio::time::timeout(Duration::from_secs(2), &mut drained)
+    tokio::time::timeout(Duration::from_secs(2), output_drained.cancelled())
         .await
         .expect("pre-observed closure should drain without hanging");
 
@@ -619,7 +616,7 @@ async fn closure_before_streaming_subscription_drains_lagged_split_utf8_output()
 }
 
 #[tokio::test]
-async fn closure_after_streaming_subscription_drains_trailing_split_utf8_once() {
+async fn closure_after_streaming_subscription_wakes_all_drain_waiters() {
     let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
     let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
     let (session, turn) = make_session_and_context().await;
@@ -628,10 +625,7 @@ async fn closure_after_streaming_subscription_drains_trailing_split_utf8_once() 
         Arc::new(turn),
         "closure-after-subscription".to_string(),
     );
-    let output_drained = process.output_drained_notify();
-    let drained = output_drained.notified();
-    tokio::pin!(drained);
-    drained.as_mut().enable();
+    let output_drained = process.output_drained_token();
 
     start_streaming_output(&process, &context, Arc::clone(&transcript))
         .expect("start output streaming");
@@ -639,19 +633,23 @@ async fn closure_after_streaming_subscription_drains_trailing_split_utf8_once() 
     process.publish_output_for_test(b"tail:".to_vec()).await;
     process.publish_output_for_test(vec![0xc3]).await;
     process.publish_output_for_test(vec![0xa9]).await;
+    let initial_response_waiter = output_drained.clone();
+    let exit_finalizer_waiter = output_drained.clone();
     process.terminate();
 
-    tokio::time::timeout(Duration::from_secs(2), &mut drained)
-        .await
-        .expect("post-subscription closure should drain without hanging");
+    tokio::time::timeout(Duration::from_secs(2), async move {
+        tokio::join!(
+            initial_response_waiter.cancelled(),
+            exit_finalizer_waiter.cancelled()
+        );
+    })
+    .await
+    .expect("all output-drain waiters should finish without hanging");
     let final_output = resolve_aggregated_output(&transcript, String::new()).await;
     assert_eq!(final_output, "tail:é");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(150), output_drained.notified())
-            .await
-            .is_err(),
-        "output_drained should be signaled exactly once"
-    );
+    tokio::time::timeout(Duration::from_millis(150), output_drained.cancelled())
+        .await
+        .expect("output drain should remain observable to future waiters");
 }
 
 #[tokio::test]

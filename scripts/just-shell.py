@@ -49,6 +49,9 @@ WINDOWS_MSVC_LINKER_ENV_VAR = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
 WINDOWS_LLVM_LLD_LINK_DEFAULT = Path("C:/Program Files/LLVM/bin/lld-link.exe")
 DISABLE_SCRIPT_VENV_VALUES = frozenset({"1", "true", "yes", "on"})
 TOOL_RUN_RESULTS: dict[tuple[str, ...], bool] = {}
+RUST_COMMAND_PATTERN = re.compile(
+    r"(?<![\w.-])(?:cargo|rustc|rustup)(?![\w.-])", re.IGNORECASE
+)
 
 
 def main() -> int:
@@ -72,16 +75,17 @@ def main() -> int:
         os.environ.update(python_updates)
         os.environ.pop("PYTHONHOME", None)
     which = memoized_which(shutil.which)
-    os.environ.update(
-        rust_tool_env(
-            os.environ,
-            os_name=os.name,
-            which=which,
-            cache_dir=cache_dir,
-            repo_root=repo_root,
+    if command_needs_rust_tooling(command):
+        os.environ.update(
+            rust_tool_env(
+                os.environ,
+                os_name=os.name,
+                which=which,
+                cache_dir=cache_dir,
+                repo_root=repo_root,
+            )
         )
-    )
-    ensure_sccache_server_env(os.environ, which=which, cache_dir=cache_dir)
+        ensure_sccache_server_env(os.environ, which=which, cache_dir=cache_dir)
 
     try:
         if os.name == "nt":
@@ -92,6 +96,16 @@ def main() -> int:
     except ValueError as exc:
         print(f"just shell adapter: {exc}", file=sys.stderr)
         return 1
+
+
+def command_needs_rust_tooling(command: str) -> bool:
+    """Return whether a recipe command needs Rust compiler/cache setup."""
+
+    return bool(
+        RUST_COMMAND_PATTERN.search(command)
+        or "rust_build_status.py" in command
+        or "cargo-lane" in command
+    )
 
 
 def rust_tool_env(

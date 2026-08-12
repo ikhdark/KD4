@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
+use tokio_util::sync::CancellationToken;
 
 use super::UnifiedExecContext;
 use super::UnifiedExecError;
@@ -41,6 +42,18 @@ pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
 /// process arbitrarily large delta payloads.
 const UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES: usize = 8192;
 
+struct OutputDrainedGuard {
+    token: CancellationToken,
+}
+
+impl Drop for OutputDrainedGuard {
+    fn drop(&mut self) {
+        // Latch completion even when a waiter has not started yet. Multiple consumers wait for
+        // output drain on fast commands, so this must wake all current and future waiters.
+        self.token.cancel();
+    }
+}
+
 /// Spawn a background task that continuously reads from the PTY, appends to the
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
 /// boundaries.
@@ -58,7 +71,7 @@ pub(crate) fn start_streaming_output(
     let output_closed = output_handles.output_closed;
     let output_closed_notify = output_handles.output_closed_notify;
     let exit_token = output_handles.cancellation_token;
-    let output_drained = process.output_drained_notify();
+    let output_drained = process.output_drained_token();
     let process_ref = Arc::clone(process);
 
     let session_ref = Arc::clone(&context.session);
@@ -67,6 +80,10 @@ pub(crate) fn start_streaming_output(
 
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
+
+        let _output_drained_guard = OutputDrainedGuard {
+            token: output_drained,
+        };
 
         let mut pending = Vec::<u8>::new();
         let emitted_deltas = OutputDeltaLimiter::default();
@@ -171,7 +188,6 @@ pub(crate) fn start_streaming_output(
             &emitted_deltas,
         )
         .await;
-        output_drained.notify_one();
     });
     Ok(())
 }
@@ -202,7 +218,7 @@ pub(crate) fn spawn_exit_watcher(
     validation_waiter: Option<crate::validation_admission::ValidationLeader>,
 ) {
     let exit_token = process.cancellation_token();
-    let output_drained = process.output_drained_notify();
+    let output_drained = process.output_drained_token();
     if let Some(leader) = validation_leader.as_ref() {
         let validation_cancellation = leader.cancellation_token();
         let process_exit = exit_token.clone();
@@ -225,7 +241,7 @@ pub(crate) fn spawn_exit_watcher(
         let _completion_activity = completion_activity;
         let _validation_waiter = validation_waiter;
         exit_token.cancelled().await;
-        output_drained.notified().await;
+        output_drained.cancelled().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
         let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
@@ -236,7 +252,7 @@ pub(crate) fn spawn_exit_watcher(
                 observation.record_completed(duration_ms).await;
             }
         }
-        let failure_message = process.failure_message();
+        let mut failure_message = process.failure_message();
         let exit_code = if failure_message.is_some() {
             -1
         } else {
@@ -246,11 +262,17 @@ pub(crate) fn spawn_exit_watcher(
         // Process exit is the mutation-safety boundary. Finalize its repository lease before
         // event delivery or artifact work so a completed command cannot retain ownership merely
         // because nobody polls it or its original turn is already idle.
-        session_ref
+        let finalized = session_ref
             .services
             .command_execution
             .mark_running_process_completed(process_id, exit_code)
             .await;
+        if !finalized && failure_message.is_none() {
+            failure_message = Some(
+                "command exited, but Codex could not finalize its mutation-safety state"
+                    .to_string(),
+            );
+        }
 
         if let Some(mut finalized_artifact) = process.raw_output_artifact().await {
             if let Some(message) = failure_message.as_ref() {

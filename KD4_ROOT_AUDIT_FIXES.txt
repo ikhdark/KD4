@@ -1,0 +1,149 @@
+KD4 ROOT FILES AUDIT - VALIDATED REPAIR LEDGER
+Date: 2026-08-12
+Source audit: C:/Users/kuh/Downloads/KD4_root_files_audit_63dde623.txt
+Source SHA-256: 6D783BBC640C700A658544F5FB90E4C18CFE75568F91AEE60D49D813D7EC68AA
+Audited baseline: 63dde623
+
+Purpose
+-------
+This is the implementation-oriented record requested by the user. It contains
+every audit issue that was independently validated as real. "Fixed" means the
+current checkout now has an owning-code or owning-contract repair; final command
+proofs are recorded in the Validation section after the implementation list.
+
+Validated issues and repairs
+----------------------------
+01. ACCEPTED - Private task-evidence runtime state was committed.
+    CURRENT: Already absent from the checkout before this repair pass; added
+    /task-evidence/ to .gitignore to prevent recurrence. Historical removal from
+    existing Git objects is intentionally not attempted without explicit approval
+    for a destructive history rewrite.
+
+02. ACCEPTED - Opaque task-evidence databases were committed.
+    CURRENT: Already absent from the checkout before this repair pass; protected
+    by the same /task-evidence/ ignore rule. The history caveat from issue 01
+    applies.
+
+03. ACCEPTED - WORKTREE_REVIEW.txt presented a frozen verdict as current.
+    FIXED: The file is explicitly labeled historical frozen evidence and its
+    SOURCEMAP entry no longer describes it as a live verdict.
+
+04. ACCEPTED - Missing/ignored kd-ui was declared as a workspace package.
+    FIXED: Removed kd-ui from pnpm-workspace.yaml and removed current-runtime and
+    package ownership claims from SOURCEMAP.md. The absent local directory remains
+    ignored rather than being advertised as shipped source.
+
+05. ACCEPTED - pnpm-lock.yaml retained an orphan kd-ui importer.
+    FIXED: Workspace input was corrected and pnpm-lock.yaml was regenerated with
+    pnpm; the orphan importer and stale build-only dependency entries are gone.
+
+06. ACCEPTED - SOURCEMAP exact inventory validation failed.
+    FIXED: Added omitted tracked root owners (including source_owners.toml), removed
+    absent kd-ui claims, and retained the historical review classification. This
+    untracked working ledger is not represented as already tracked source.
+
+07. ACCEPTED - task-evidence had no ignore protection.
+    FIXED: Added /task-evidence/ to .gitignore.
+
+08. ACCEPTED - A blanket .vscode ignore contradicted tracked workspace settings.
+    FIXED: Ignore .vscode contents by default but allow the four intentional,
+    tracked JSON configuration files.
+
+09. ACCEPTED - The locked Rust overlay could not provide the pinned Rust 1.95
+    toolchain through stable.latest.
+    FIXED IN FLAKE: flake.nix reads codex-rs/rust-toolchain.toml and selects that
+    exact stable version. flake.lock must be refreshed through Nix, never edited
+    manually.
+
+10. ACCEPTED - The Nix shell omitted tools required by root maintenance routes.
+    FIXED: Added just, Python 3, Node.js 22, and pnpm to the dev shell.
+
+11. ACCEPTED - The Node engine floor was below locked dependency requirements.
+    FIXED: Raised the declared floor to Node >=22.22.2.
+
+12. ACCEPTED - Root package scripts assumed a bare `python` executable.
+    FIXED: Added scripts/run-python.js with PYTHON override and platform-aware
+    Python 3 launcher selection; all affected package scripts use it.
+
+13. ACCEPTED - The punycode override was ineffective in its prior location.
+    FIXED: Moved punycode to pnpm-workspace.yaml overrides so pnpm owns it.
+
+14. ACCEPTED - Markdown linting selected only one composer document.
+    FIXED: .markdownlint-cli2.yaml now selects repository Markdown with explicit
+    generated/vendor/audit exclusions.
+
+15. ACCEPTED - markdownlint-cli2 was neither pinned nor exposed by a script.
+    FIXED: Pinned markdownlint-cli2 0.18.1 and added `pnpm lint:markdown`.
+
+16. ACCEPTED - .codespellignore was unwired and preserved the misspelling psuedo.
+    FIXED: Wired the ignore file from .codespellrc and removed psuedo.
+
+17. ACCEPTED - Shell scripts had no repository LF contract.
+    FIXED: Added `*.sh text eol=lf` to .gitattributes.
+
+18. ACCEPTED - Root AGENTS.md embedded machine-local absolute paths.
+    FIXED: Replaced them with repository-root and CODEX_HOME-relative language.
+
+19. ACCEPTED - do-not-code.md mixed a local frozen snapshot with current policy.
+    FIXED: Machine-local target inventories were removed from the current contract,
+    and snapshot-specific statements are isolated under a dated historical record.
+
+20. ACCEPTED - check-kd4-features defaulted to non-strict orphan handling.
+    FIXED: Strict validation is now the default; --no-strict is the explicit opt-out.
+
+21. ACCEPTED - kd4_features.toml upstream_commit was not validated.
+    FIXED: Require a lowercase 40-character SHA and verify the repository manifest
+    resolves to a Git commit; tests cover missing and malformed values.
+
+22. ACCEPTED - source owner validations bypassed shared Rust test policy.
+    FIXED: All source_owners.toml focused Rust validations now route through
+    `just test-fast` from the repository root.
+
+23. ACCEPTED - Just recipes interpolated repository paths without quoting.
+    FIXED: Every justfile_directory() path used as a command or argument is quoted;
+    the unquoted interpolation scan is empty.
+
+24. ACCEPTED - test-fast-nosccache diverged from test-fast beyond sccache behavior.
+    FIXED: It now prepares codex-core helper binaries in its reserved lane and sets
+    the same Rust stack/profile contract while still explicitly disabling sccache.
+
+25. ACCEPTED - Windows test-timings bypassed codex-core helper preparation.
+    FIXED: It now uses _core-test-helpers-if-needed before focused core tests.
+
+26. ACCEPTED - The app-server aggregate ran cargo check three times.
+    FIXED: Public focused recipes retain their checks; the aggregate invokes shared
+    test-only internals and performs one final cargo check.
+
+27. ACCEPTED - deps-duplicates-check could never fail on duplicates.
+    FIXED: scripts/check_duplicate_deps.py preserves Cargo failures and returns 1
+    when cargo tree emits a duplicate report; focused unit tests cover all outcomes.
+
+28. ACCEPTED - test-full documentation promised benchmark coverage it did not run.
+    FIXED: The comment now distinguishes test-full from test-full-with-bench.
+
+29. ACCEPTED - just-shell probed/configured sccache for non-Rust commands.
+    FIXED: Rust environment and sccache setup are conditional on Rust command tokens;
+    focused tests cover Rust and non-Rust command classification.
+
+Validation
+----------
+- Read the complete 1,411-line source audit; its SHA-256 is recorded above.
+- Focused Python contract proof: 9 tests passed (strict feature validation, cached
+  evidence, command classification, and duplicate-dependency outcomes).
+- Python launcher proof: scripts/run-python.js selected the configured Python 3.12.13
+  runtime and exited successfully.
+- pnpm generator/proof: pnpm 11.16.0 regenerated pnpm-lock.yaml; a subsequent frozen,
+  lockfile-only, ignore-scripts install exited successfully.
+- Markdown route proof: markdownlint-cli2 0.18.1 scanned the repository Markdown tree.
+  It exposed 2,184 pre-existing style findings after generated harness state was
+  excluded; unrelated bulk document rewrites were not suppressed or folded into this
+  root-contract repair.
+- The broader 78-test Python run had three pre-existing repository-configuration
+  failures (stale feature evidence and locally changed Cargo/nextest concurrency
+  expectations). A fourth exact-source-map failure identified this new untracked
+  ledger being declared as tracked; that declaration was corrected, and the focused
+  source-map check then exited successfully.
+- Nix/WSL is unavailable in this Windows environment, so flake evaluation and the
+  generator-owned flake.lock refresh could not be run here. flake.nix now selects the
+  exact rust-toolchain.toml channel and supplies the omitted developer tools, but the
+  rust-overlay lock must be refreshed and evaluated from a Nix-capable environment.

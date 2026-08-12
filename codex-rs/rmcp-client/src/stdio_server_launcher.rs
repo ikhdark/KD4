@@ -249,8 +249,6 @@ impl LocalStdioServerLauncher {
         #[cfg(unix)]
         command.process_group(0);
         let managed = Arc::new(ManagedRootProcess::reserve_with_reclaim().await?);
-        #[cfg(windows)]
-        command.creation_flags(ManagedRootProcess::WINDOWS_CREATION_FLAGS);
 
         let (transport, stderr) = TokioChildProcess::builder(command)
             .stderr(Stdio::piped())
@@ -259,7 +257,7 @@ impl LocalStdioServerLauncher {
             .id()
             .ok_or_else(|| io::Error::other("spawned MCP server has no process id"))?;
         #[cfg(windows)]
-        managed.attach_and_resume(process_id)?;
+        managed.attach(process_id)?;
         let process = StdioServerProcessHandle::local(
             program_name.clone(),
             Some(LocalProcessTerminator::new(process_id, managed)),

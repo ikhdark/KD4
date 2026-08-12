@@ -112,6 +112,7 @@ def _validate_expected_findings(case: dict[str, Any]) -> None:
     _require(
         isinstance(findings, list), f"{case_id}: expected_findings must be an array"
     )
+    seen_kinds: set[str] = set()
     for index, finding in enumerate(findings):
         prefix = f"{case_id}: expected_findings[{index}]"
         _require(isinstance(finding, dict), f"{prefix} must be an object")
@@ -123,6 +124,11 @@ def _validate_expected_findings(case: dict[str, Any]) -> None:
             isinstance(finding["kind"], str) and finding["kind"],
             f"{prefix}.kind must be a non-empty string",
         )
+        _require(
+            finding["kind"] not in seen_kinds,
+            f"{prefix}.kind duplicates an earlier expected finding",
+        )
+        seen_kinds.add(finding["kind"])
         locators = finding["required_locators"]
         _require(
             isinstance(locators, list) and locators,
@@ -131,6 +137,10 @@ def _validate_expected_findings(case: dict[str, Any]) -> None:
         _require(
             all(isinstance(locator, str) and locator for locator in locators),
             f"{prefix}.required_locators must contain non-empty strings",
+        )
+        _require(
+            len(set(locators)) == len(locators),
+            f"{prefix}.required_locators must not contain duplicates",
         )
 
 
@@ -158,7 +168,7 @@ def _scan_unified_diff(
     return raw_added, raw_removed, old_paths, new_paths
 
 
-def _validate_patch(patch: Path, *, case_id: str) -> None:
+def _validate_patch(patch: Path, *, case_id: str) -> set[str]:
     patch_text = patch.read_text(encoding="utf-8")
     patch_lines = patch_text.splitlines()
     raw_added, raw_removed, old_paths, new_paths = _scan_unified_diff(patch_lines)
@@ -181,12 +191,42 @@ def _validate_patch(patch: Path, *, case_id: str) -> None:
         )
     with tempfile.TemporaryDirectory(prefix="investigation-eval-index-") as temp_dir:
         temp_root = Path(temp_dir)
+        repo = temp_root / "repo"
         normalized_patch = temp_root / "fixture.patch"
         normalized_patch.write_bytes(patch_text.encode("utf-8"))
 
+        isolated_env = os.environ.copy()
+        isolated_env["GIT_CONFIG_NOSYSTEM"] = "1"
+        isolated_env["GIT_CONFIG_GLOBAL"] = os.devnull
+        initialized = subprocess.run(
+            ["git", "init", "--quiet", str(repo)],
+            cwd=temp_root,
+            env=isolated_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        _require(
+            initialized.returncode == 0,
+            f"{case_id}: could not initialize a disposable validation repository",
+        )
+        empty_index = subprocess.run(
+            ["git", "read-tree", "--empty"],
+            cwd=repo,
+            env=isolated_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        _require(
+            empty_index.returncode == 0,
+            f"{case_id}: could not initialize the disposable validation index",
+        )
+
         numstat = subprocess.run(
             ["git", "apply", "--numstat", str(normalized_patch)],
-            cwd=REPO_ROOT,
+            cwd=repo,
+            env=isolated_env,
             capture_output=True,
             text=True,
             check=False,
@@ -219,21 +259,6 @@ def _validate_patch(patch: Path, *, case_id: str) -> None:
             f"{case_id}: fixtures must not remove existing lines",
         )
 
-        index_path = temp_root / "index"
-        index_env = os.environ.copy()
-        index_env["GIT_INDEX_FILE"] = str(index_path)
-        read_tree = subprocess.run(
-            ["git", "read-tree", "--empty"],
-            cwd=REPO_ROOT,
-            env=index_env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        _require(
-            read_tree.returncode == 0,
-            f"{case_id}: could not initialize a temporary index",
-        )
         result = subprocess.run(
             [
                 "git",
@@ -243,8 +268,8 @@ def _validate_patch(patch: Path, *, case_id: str) -> None:
                 "--whitespace=error-all",
                 str(normalized_patch),
             ],
-            cwd=REPO_ROOT,
-            env=index_env,
+            cwd=repo,
+            env=isolated_env,
             capture_output=True,
             text=True,
             check=False,
@@ -253,10 +278,12 @@ def _validate_patch(patch: Path, *, case_id: str) -> None:
     _require(
         result.returncode == 0, f"{case_id}: patch does not apply cleanly: {detail}"
     )
+    return {path.removeprefix("b/").replace("\\", "/") for path in new_paths}
 
 
 def validate_cases(cases: list[dict[str, Any]]) -> None:
     seen_ids: set[str] = set()
+    fixture_owners: dict[str, str] = {}
     category_counts: Counter[str] = Counter()
 
     for case in cases:
@@ -289,7 +316,13 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
             _require(
                 patch.suffix == ".patch", f"{case_id}: patch must use the .patch suffix"
             )
-            _validate_patch(patch, case_id=case_id)
+            for fixture_path in _validate_patch(patch, case_id=case_id):
+                previous_owner = fixture_owners.get(fixture_path)
+                _require(
+                    previous_owner is None,
+                    f"{case_id}: fixture path {fixture_path!r} is also owned by {previous_owner}",
+                )
+                fixture_owners[fixture_path] = case_id
 
         _validate_expected_findings(case)
         forbidden = case["forbidden_findings"]
@@ -300,6 +333,17 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
         _require(
             all(isinstance(kind, str) and kind for kind in forbidden),
             f"{case_id}: forbidden_findings must contain non-empty strings",
+        )
+        expected_kinds = {finding["kind"] for finding in case["expected_findings"]}
+        forbidden_kinds = set(forbidden)
+        _require(
+            len(forbidden_kinds) == len(forbidden),
+            f"{case_id}: forbidden_findings must not contain duplicates",
+        )
+        contradictory = expected_kinds & forbidden_kinds
+        _require(
+            not contradictory,
+            f"{case_id}: finding kinds cannot be both expected and forbidden: {sorted(contradictory)}",
         )
         _require(isinstance(case["notes"], str), f"{case_id}: notes must be a string")
 

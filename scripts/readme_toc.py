@@ -9,8 +9,10 @@ rewrites the file to update the ToC.
 
 import argparse
 import difflib
+import html
 import re
 import sys
+import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,21 +25,14 @@ DEFAULT_DIFF_MAX_LINES = 200
 HEADING_RE = re.compile(r"^(#{2,6})\s+(.*)$")
 CODE_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 LINE_ENDING_RE = re.compile(r"(\r\n|\r|\n)")
-PUNCT_TRANSLATION = str.maketrans(
-    {
-        chr(value): None
-        for value in range(128)
-        if not chr(value).isalnum() and chr(value) not in " -_"
-    }
-)
-DASH_TRANSLATION = str.maketrans(
-    {
-        "\u00a0": " ",
-        "\u2011": None,
-        "\u2013": None,
-        "\u2014": None,
-    }
-)
+CLOSING_ATX_RE = re.compile(r"[ \t]+#+[ \t]*$")
+INLINE_CODE_RE = re.compile(r"(`+)(.+?)\1")
+INLINE_LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^\n)]*\)")
+REFERENCE_LINK_RE = re.compile(r"!?\[([^\]]*)\](?:\[[^\]]*\])")
+AUTOLINK_RE = re.compile(r"<((?:https?://|mailto:)[^>]+)>", re.IGNORECASE)
+HTML_TAG_RE = re.compile(r"</?[A-Za-z][^>]*>")
+BACKSLASH_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
+INLINE_MARKER_RE = re.compile(r"(?<!\\)[*_~]")
 
 
 @dataclass(frozen=True)
@@ -102,10 +97,11 @@ def generate_toc_lines(lines: Iterable[str]) -> list[str]:
         if not m:
             continue
         level = len(m.group(1))
-        text = m.group(2).strip()
+        text = heading_plain_text(m.group(2))
         indent = "  " * (level - 2)
         slug = disambiguate_slug(slugify_heading(text), used_slugs)
-        toc.append(f"{indent}- [{text}](#{slug})")
+        label = text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+        toc.append(f"{indent}- [{label}](#{slug})")
     return toc
 
 
@@ -136,10 +132,28 @@ def disambiguate_slug(slug: str, used_slugs: dict[str, int]) -> str:
     return f"{slug}-{count}"
 
 
+def heading_plain_text(markdown: str) -> str:
+    """Return the rendered text used by a GFM ATX heading."""
+    text = CLOSING_ATX_RE.sub("", markdown.strip())
+    text = INLINE_CODE_RE.sub(lambda match: match.group(2).strip(), text)
+    text = INLINE_LINK_RE.sub(lambda match: match.group(1), text)
+    text = REFERENCE_LINK_RE.sub(lambda match: match.group(1), text)
+    text = AUTOLINK_RE.sub(lambda match: match.group(1), text)
+    text = HTML_TAG_RE.sub("", text)
+    text = INLINE_MARKER_RE.sub("", text)
+    text = BACKSLASH_ESCAPE_RE.sub(lambda match: match.group(1), text)
+    return html.unescape(text).strip()
+
+
 def slugify_heading(text: str) -> str:
-    slug = text.lower().translate(DASH_TRANSLATION)
-    slug = slug.translate(PUNCT_TRANSLATION)
-    return slug.replace(" ", "-")
+    """Approximate GitHub's rendered-heading slugger for Unicode text."""
+    slug: list[str] = []
+    for character in text.lower():
+        if character.isspace():
+            slug.append("-")
+        elif character == "_" or not unicodedata.category(character).startswith(("C", "P")):
+            slug.append(character)
+    return "".join(slug)
 
 
 def parse_markdown_toc(lines: Sequence[str]) -> TocParseResult | None:

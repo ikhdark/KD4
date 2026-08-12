@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import math
 import re
 import sys
 from datetime import datetime
@@ -67,6 +67,62 @@ def _resolve_results_path(value: str) -> Path:
     return resolved
 
 
+def _binary_sha256(path: Path) -> str:
+    _require(path.is_file(), f"benchmark binary does not exist: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_NON_TOOL_ITEM_TYPES = {"agent_message", "reasoning"}
+_VOLATILE_TOOL_FIELDS = {
+    "aggregated_output",
+    "duration_ms",
+    "error",
+    "exit_code",
+    "id",
+    "output",
+    "result",
+    "status",
+}
+
+
+def _derive_event_metrics(raw_events: list[Any], *, path: Path) -> dict[str, Any]:
+    actions: list[str] = []
+    agent_messages: list[str] = []
+    for index, event in enumerate(raw_events):
+        prefix = f"{path}: raw_events[{index}]"
+        _require(isinstance(event, dict), f"{prefix} must be an object")
+        _require(isinstance(event.get("type"), str), f"{prefix}.type must be a string")
+        if event["type"] != "item.completed":
+            continue
+        item = event.get("item")
+        _require(isinstance(item, dict), f"{prefix}.item must be an object")
+        item_type = item.get("type")
+        _require(isinstance(item_type, str), f"{prefix}.item.type must be a string")
+        if item_type == "agent_message":
+            text = item.get("text")
+            _require(isinstance(text, str), f"{prefix}.item.text must be a string")
+            agent_messages.append(text)
+            continue
+        if item_type in _NON_TOOL_ITEM_TYPES:
+            continue
+        action = {
+            key: value for key, value in item.items() if key not in _VOLATILE_TOOL_FIELDS
+        }
+        actions.append(json.dumps(action, sort_keys=True, separators=(",", ":")))
+
+    _require(agent_messages, f"{path}: raw_events has no completed agent message")
+    repeated = len(actions) - len(set(actions))
+    return {
+        "tool_calls": len(actions),
+        "repeated_equivalent_actions": repeated,
+        "final_message": agent_messages[-1],
+    }
+
+
 def _is_rfc3339_timestamp(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -89,7 +145,7 @@ def _is_rfc3339_timestamp(value: Any) -> bool:
 def _load_result(
     path: Path,
     case: dict[str, Any],
-    expected_binary_sha256: str | None,
+    expected_binary_sha256: str,
 ) -> dict[str, Any]:
     try:
         result = json.loads(path.read_text(encoding="utf-8"))
@@ -104,7 +160,6 @@ def _load_result(
         "execution",
         "final_output",
         "reported_findings",
-        "metrics",
         "raw_events",
     }
     _require(
@@ -128,6 +183,11 @@ def _load_result(
     _require(
         isinstance(result["raw_events"], list), f"{path}: raw_events must be an array"
     )
+    derived_metrics = _derive_event_metrics(result["raw_events"], path=path)
+    _require(
+        derived_metrics["final_message"] == result["final_output"],
+        f"{path}: final_output must exactly match the last completed agent message",
+    )
 
     model = result["model"]
     _require(isinstance(model, dict), f"{path}: model must be an object")
@@ -148,11 +208,10 @@ def _load_result(
         model_settings == FROZEN_MODEL_SETTINGS,
         f"{path}: model settings do not match the frozen corpus",
     )
-    if expected_binary_sha256 is not None:
-        _require(
-            model["binary_sha256"] == expected_binary_sha256,
-            f"{path}: binary_sha256 does not match the expected run binary",
-        )
+    _require(
+        model["binary_sha256"] == expected_binary_sha256,
+        f"{path}: binary_sha256 does not match the hashed benchmark binary",
+    )
 
     execution = result["execution"]
     _require(isinstance(execution, dict), f"{path}: execution must be an object")
@@ -175,8 +234,8 @@ def _load_result(
         )
         _require(finding["status"] in FINDING_STATUSES, f"{prefix}: invalid status")
         _require(
-            isinstance(finding["locators"], list),
-            f"{prefix}: locators must be an array",
+            isinstance(finding["locators"], list) and finding["locators"],
+            f"{prefix}: locators must be a non-empty array",
         )
         _require(
             all(
@@ -184,49 +243,32 @@ def _load_result(
             ),
             f"{prefix}: locators must contain non-empty strings",
         )
-
-    metrics = result["metrics"]
-    _require(isinstance(metrics, dict), f"{path}: metrics must be an object")
-    expected_metric_fields = {
-        "tool_calls",
-        "repeated_equivalent_actions",
-        "premature_completion",
-        "model_cost",
-        "tool_cost",
-    }
-    _require(set(metrics) == expected_metric_fields, f"{path}: invalid metrics fields")
-    for field in ("tool_calls", "repeated_equivalent_actions"):
         _require(
-            isinstance(metrics[field], int)
-            and not isinstance(metrics[field], bool)
-            and metrics[field] >= 0,
-            f"{path}: {field} must be a non-negative integer",
+            len(set(finding["locators"])) == len(finding["locators"]),
+            f"{prefix}: locators must not contain duplicates",
         )
-    _require(
-        isinstance(metrics["premature_completion"], bool),
-        f"{path}: premature_completion must be boolean",
-    )
-    for field in ("model_cost", "tool_cost"):
-        value = metrics[field]
         _require(
-            value is None
-            or (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and math.isfinite(value)
-                and value >= 0
+            all(
+                locator.replace("\\", "/").casefold()
+                in result["final_output"].replace("\\", "/").casefold()
+                for locator in finding["locators"]
             ),
-            f"{path}: {field} must be null or a non-negative finite number",
+            f"{prefix}: every structured locator must appear in final_output",
         )
+    result["_derived_metrics"] = derived_metrics
     return result
 
 
 def _finding_matches(reported: dict[str, Any], expected: dict[str, Any]) -> bool:
     if reported["kind"] != expected["kind"]:
         return False
-    haystack = "\n".join(reported["locators"]).casefold()
+    reported_locators = {
+        locator.strip().replace("\\", "/").casefold()
+        for locator in reported["locators"]
+    }
     return all(
-        locator.casefold() in haystack for locator in expected["required_locators"]
+        locator.strip().replace("\\", "/").casefold() in reported_locators
+        for locator in expected["required_locators"]
     )
 
 
@@ -237,7 +279,7 @@ def _ratio(numerator: int, denominator: int) -> float:
 def score(
     cases: list[dict[str, Any]],
     results_dir: Path,
-    expected_binary_sha256: str | None = None,
+    expected_binary_sha256: str,
 ) -> dict[str, Any]:
     expected_total = 0
     matched_expected = 0
@@ -248,18 +290,12 @@ def score(
     deferred_or_uncertain = 0
     tool_calls = 0
     repeated_actions = 0
-    premature_completion = 0
-    model_costs: list[float] = []
-    tool_costs: list[float] = []
     case_scores: list[dict[str, Any]] = []
-    run_binary_sha256 = expected_binary_sha256
 
     for case in cases:
         result_path = results_dir / f"{case['id']}.json"
         _require(result_path.is_file(), f"missing result: {result_path}")
-        result = _load_result(result_path, case, run_binary_sha256)
-        if run_binary_sha256 is None:
-            run_binary_sha256 = result["model"]["binary_sha256"]
+        result = _load_result(result_path, case, expected_binary_sha256)
         confirmed = [
             finding
             for finding in result["reported_findings"]
@@ -297,14 +333,9 @@ def score(
         if case["category"] == "clean-control":
             clean_control_false_positives += len(confirmed)
 
-        metrics = result["metrics"]
+        metrics = result["_derived_metrics"]
         tool_calls += metrics["tool_calls"]
         repeated_actions += metrics["repeated_equivalent_actions"]
-        premature_completion += int(metrics["premature_completion"])
-        if metrics["model_cost"] is not None:
-            model_costs.append(float(metrics["model_cost"]))
-        if metrics["tool_cost"] is not None:
-            tool_costs.append(float(metrics["tool_cost"]))
 
         case_scores.append(
             {
@@ -319,7 +350,7 @@ def score(
 
     return {
         "cases": len(cases),
-        "binary_sha256": run_binary_sha256,
+        "binary_sha256": expected_binary_sha256,
         "confirmed_finding_recall": _ratio(matched_expected, expected_total),
         "precision": _ratio(matched_confirmed, confirmed_total),
         "expected_findings": expected_total,
@@ -330,9 +361,6 @@ def score(
         "deferred_or_uncertain_findings": deferred_or_uncertain,
         "tool_calls": tool_calls,
         "repeated_equivalent_actions": repeated_actions,
-        "premature_completion_cases": premature_completion,
-        "model_cost": sum(model_costs) if len(model_costs) == len(cases) else None,
-        "tool_cost": sum(tool_costs) if len(tool_costs) == len(cases) else None,
         "case_scores": case_scores,
     }
 
@@ -346,8 +374,9 @@ def _parse_args() -> argparse.Namespace:
         "--cases", default=str(DEFAULT_CASES), help="case manifest JSONL path"
     )
     parser.add_argument(
-        "--binary-sha256",
-        help="optional expected binary SHA-256; otherwise derive it from the first result",
+        "--binary",
+        required=True,
+        help="exact Codex executable used for the run; the scorer hashes it directly",
     )
     return parser.parse_args()
 
@@ -355,17 +384,13 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     try:
-        if args.binary_sha256 is not None:
-            _require(
-                SHA256_RE.fullmatch(args.binary_sha256) is not None,
-                "--binary-sha256 must be a lowercase SHA-256",
-            )
+        binary_sha256 = _binary_sha256(Path(args.binary).resolve())
         cases_path = Path(args.cases)
         if not cases_path.is_absolute():
             cases_path = (REPO_ROOT / cases_path).resolve()
         cases = load_cases(cases_path)
         validate_cases(cases)
-        report = score(cases, _resolve_results_path(args.results), args.binary_sha256)
+        report = score(cases, _resolve_results_path(args.results), binary_sha256)
     except (OSError, ValidationError) as exc:
         print(f"investigation result scoring failed: {exc}", file=sys.stderr)
         return 1

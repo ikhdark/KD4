@@ -112,7 +112,10 @@ const MCP_RESULT_TELEMETRY_SERVER_USER_FLOW_SPAN_ATTR: &str =
     "codex.mcp.server_user_flow.triggered";
 const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
 const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
-const MCP_TOOL_CALL_CANCELLED_MESSAGE: &str = "MCP tool call cancelled";
+// Dropping the in-flight request stops local work, but the MCP transport does not
+// currently provide an acknowledgement that the remote server stopped too.
+const MCP_TOOL_CALL_CANCELLED_MESSAGE: &str =
+    "MCP tool call cancellation requested; remote completion status is unknown";
 const REPO_ATLAS_SERVER_NAME: &str = "repo-atlas";
 const REPO_ATLAS_NORMALIZED_SERVER_NAME: &str = "repo_atlas";
 const REPO_ATLAS_TASK_TOOL_NAME: &str = "task";

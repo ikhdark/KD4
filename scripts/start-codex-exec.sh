@@ -133,7 +133,6 @@ rsync_opts=(
   --human-readable
   --itemize-changes
   --delete-delay
-  --delete-excluded
   --exclude '.git/'
   --exclude 'codex-rs/target/'
   --exclude 'target/'
@@ -246,21 +245,24 @@ mkfifo "${remote_exec_server_ready_path}"
 
 server_started_at="${SECONDS}"
 nohup "${remote_codex_bin}" exec-server --listen ws://127.0.0.1:0 > >(
-  first_line_written=0
+  ready_written=0
   while IFS= read -r line; do
     printf '%s\n' "${line}" >>"${remote_exec_server_log_path}"
-    if (( first_line_written == 0 )); then
+    if (( ready_written == 0 )) && [[ "${line}" =~ ^wss?://[^[:space:]]+$ ]]; then
       printf '%s\n' "${line}" >"${remote_exec_server_ready_path}"
-      first_line_written=1
+      ready_written=1
     fi
   done
+  if (( ready_written == 0 )); then
+    printf '%s\n' '__CODEX_EXEC_SERVER_EXITED__' >"${remote_exec_server_ready_path}"
+  fi
 ) 2>&1 &
 remote_exec_server_pid="$!"
 echo "${remote_exec_server_pid}" >"${remote_exec_server_pid_path}"
 
 exec 3<>"${remote_exec_server_ready_path}"
 if IFS= read -r -t "${remote_exec_server_start_timeout_seconds}" listen_url <&3; then
-  if [[ "${listen_url}" == ws://* ]]; then
+  if [[ "${listen_url}" =~ ^wss?://[^[:space:]]+$ ]]; then
     printf 'remote exec-server readiness: %ss\n' "$((SECONDS - server_started_at))" >&2
     printf 'remote_exec_server_pid=%s\n' "${remote_exec_server_pid}"
     printf 'remote_exec_server_log_path=%s\n' "${remote_exec_server_log_path}"
@@ -269,7 +271,11 @@ if IFS= read -r -t "${remote_exec_server_start_timeout_seconds}" listen_url <&3;
     exit 0
   fi
   cat "${remote_exec_server_log_path}" >&2 || true
-  echo "remote exec server reported an invalid listen URL: ${listen_url}" >&2
+  if [[ "${listen_url}" == '__CODEX_EXEC_SERVER_EXITED__' ]]; then
+    echo "remote exec server exited before reporting a listen URL" >&2
+  else
+    echo "remote exec server reported an invalid listen URL: ${listen_url}" >&2
+  fi
   exit 1
 fi
 

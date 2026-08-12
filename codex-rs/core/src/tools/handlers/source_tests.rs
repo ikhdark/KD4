@@ -1286,7 +1286,7 @@ async fn read_file_span_handler_rejects_symlink_or_junction_escape() {
 }
 
 #[tokio::test]
-async fn global_git_excludes_are_loaded_without_process_environment_mutation() {
+async fn global_git_excludes_are_omitted_with_an_explicit_diagnostic() {
     let (session, mut turn) = make_session_and_context().await;
     let source_dir = tempfile::tempdir().expect("create source temp dir");
     let source_cwd = source_dir.abs();
@@ -1295,39 +1295,39 @@ async fn global_git_excludes_are_loaded_without_process_environment_mutation() {
         .expect("write ignored source");
     std::fs::write(source_cwd.join("visible.rs").as_path(), "needle visible\n")
         .expect("write visible source");
-    replace_primary_environment_cwd(&mut turn, source_cwd.clone());
+    replace_primary_environment_cwd(&mut turn, source_cwd);
     turn.permission_profile = PermissionProfile::Disabled;
-
-    let home = tempfile::tempdir().expect("create home temp dir");
-    let config_root = home.path().join(".config");
-    std::fs::write(
-        home.path().join(".gitconfig"),
-        "[core]\n    excludesfile = ~/.global-ignore\n",
-    )
-    .expect("write git config");
-    std::fs::write(home.path().join(".global-ignore"), "ignored.rs\n")
-        .expect("write global ignore");
-
     let turn = Arc::new(turn);
-    let invocation = ToolInvocation {
-        session: Arc::new(session),
-        step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
-        cancellation_token: tokio_util::sync::CancellationToken::new(),
-        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-        call_id: "call-load-global-git-excludes".to_string(),
-        tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
-        source: ToolCallSource::Direct,
-        payload: ToolPayload::Function {
-            arguments: json!({"query": "needle"}).to_string(),
-        },
+    let payload = ToolPayload::Function {
+        arguments: json!({"query": "needle"}).to_string(),
     };
-    let context = local_source_context(&invocation, None)
+    let output = SearchSourceHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-load-global-git-excludes".to_string(),
+            tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
         .await
-        .expect("resolve local source context");
-    let matcher = SourceIgnoreMatcher::new_preloaded(Some(source_cwd.as_path()));
-    load_global_ignore_rules_from(&context, &matcher, home.path(), &config_root).await;
+        .expect("source search should succeed");
 
-    assert!(matcher.is_ignored(source_cwd.join("ignored.rs").as_path(), false));
-    assert!(!matcher.is_ignored(source_cwd.join("visible.rs").as_path(), false));
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        output.to_response_item("call-load-global-git-excludes", &payload)
+    else {
+        panic!("expected function call output");
+    };
+    let text = output.body.to_text().expect("text output");
+    assert!(text.contains("citation: ignored.rs:1-1"), "{text}");
+    assert!(text.contains("citation: visible.rs:1-1"), "{text}");
+    assert!(
+        text.contains(
+            "diagnostic: global Git ignore rules were omitted because the selected environment does not expose Git config resolution"
+        ),
+        "{text}"
+    );
 }

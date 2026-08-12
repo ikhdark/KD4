@@ -443,9 +443,26 @@ pub(crate) async fn create_raw_output_artifact(
                 )
                 .await;
             }
+            if let Err(err) = file.sync_all().await {
+                let _ = unlock_output_file(file).await;
+                return failed_with_owned_path(
+                    path.clone(),
+                    retained.len() as u64,
+                    format!("failed to sync `{}`: {err}", path.display()),
+                )
+                .await;
+            }
             let file = file.into_std().await;
             let _ = file.unlock();
             let handle = Arc::new(file);
+            if let Err(err) = sync_parent_directory(&path) {
+                return failed_with_owned_path(
+                    path.clone(),
+                    retained.len() as u64,
+                    format!("failed to sync artifact directory: {err}"),
+                )
+                .await;
+            }
             enforce_retention(&directory, &path).await;
             RawOutputArtifact::Stored {
                 id,
@@ -490,6 +507,9 @@ async fn create_evidence_output_artifact_inner(
     let retention_permit = retention_sweep_permit().await;
     std::fs::create_dir_all(&directory)
         .map_err(|err| format!("failed to create `{}`: {err}", directory.display()))?;
+    // Make room before rejecting the reservation. Expired and inactive ordinary command output
+    // should not cause durable evidence creation to fail spuriously.
+    enforce_retention_locked(&directory, Path::new(""), output.len() as u64, 1).await;
     let thread_bytes = log_bytes_in_directory(&directory).await;
     let global_bytes =
         log_bytes_in_tool_output_root(directory.parent().unwrap_or_else(|| Path::new("."))).await;
@@ -532,6 +552,8 @@ async fn create_evidence_output_artifact_inner(
     let marker = evidence_protection_path(&path);
     create_new_evidence_protection_marker(&marker)
         .map_err(|err| format!("failed to protect `{}` as evidence: {err}", path.display()))?;
+    sync_parent_directory(&path)
+        .map_err(|err| format!("failed to sync evidence directory: {err}"))?;
 
     let file = file.into_std().await;
     let _ = file.unlock();
@@ -634,16 +656,18 @@ pub(crate) async fn delete_evidence_artifact(
         .join(format!("{id}.log"));
     let marker = evidence_protection_path(&path);
     let _retention_permit = retention_sweep_permit().await;
+    if !remove_inactive_output_path(path).await {
+        return Err(std::io::Error::other(
+            "evidence artifact is still active and could not be deleted",
+        ));
+    }
+    sync_parent_directory(&marker)?;
     match tokio::fs::remove_file(&marker).await {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    if !remove_inactive_output_path(path).await {
-        return Err(std::io::Error::other(
-            "evidence artifact was unprotected but is still active and could not be deleted",
-        ));
-    }
+    sync_parent_directory(&marker)?;
     Ok(())
 }
 
@@ -1176,18 +1200,37 @@ fn evidence_protection_path(artifact_path: &Path) -> PathBuf {
     artifact_path.with_extension(EVIDENCE_PROTECTION_EXTENSION)
 }
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    // Portable Rust APIs cannot open directory handles on every supported platform. Individual
+    // files are still synced; directory durability is requested where that operation is exposed.
+    Ok(())
+}
+
 async fn evidence_artifact_is_protected(artifact_path: &Path) -> bool {
-    tokio::fs::symlink_metadata(evidence_protection_path(artifact_path))
+    let marker = evidence_protection_path(artifact_path);
+    tokio::task::spawn_blocking(move || evidence_protection_marker_is_valid(&marker))
         .await
-        .is_ok_and(|metadata| metadata.is_file() && !metadata_is_reparse_point(&metadata))
+        .unwrap_or(false)
 }
 
 async fn enforce_retention(directory: &Path, keep_path: &Path) {
     let _retention_permit = retention_sweep_permit().await;
-    enforce_retention_locked(directory, keep_path).await;
+    enforce_retention_locked(directory, keep_path, 0, 0).await;
 }
 
-async fn enforce_retention_locked(directory: &Path, keep_path: &Path) {
+async fn enforce_retention_locked(
+    directory: &Path,
+    keep_path: &Path,
+    reserved_bytes: u64,
+    reserved_artifacts: usize,
+) {
     let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
         return;
     };
@@ -1215,9 +1258,12 @@ async fn enforce_retention_locked(directory: &Path, keep_path: &Path) {
         .iter()
         .filter(|(_, _, protected)| !protected)
         .count()
+        .saturating_add(reserved_artifacts)
         .saturating_sub(max_retained_artifacts_per_thread());
     for (path, bytes, protected) in paths {
-        if remove_count == 0 && total_bytes <= MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD {
+        if remove_count == 0
+            && total_bytes.saturating_add(reserved_bytes) <= MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+        {
             break;
         }
         if path == keep_path || protected {
@@ -1230,17 +1276,28 @@ async fn enforce_retention_locked(directory: &Path, keep_path: &Path) {
     }
 
     if let Some(tool_output_root) = directory.parent() {
-        enforce_global_retention_locked(tool_output_root, keep_path).await;
+        enforce_global_retention_locked(
+            tool_output_root,
+            keep_path,
+            reserved_bytes,
+            reserved_artifacts,
+        )
+        .await;
     }
 }
 
 #[cfg(test)]
 async fn enforce_global_retention(tool_output_root: &Path, keep_path: &Path) {
     let _retention_permit = retention_sweep_permit().await;
-    enforce_global_retention_locked(tool_output_root, keep_path).await;
+    enforce_global_retention_locked(tool_output_root, keep_path, 0, 0).await;
 }
 
-async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Path) {
+async fn enforce_global_retention_locked(
+    tool_output_root: &Path,
+    keep_path: &Path,
+    reserved_bytes: u64,
+    reserved_artifacts: usize,
+) {
     let Ok(mut thread_directories) = tokio::fs::read_dir(tool_output_root).await else {
         return;
     };
@@ -1285,9 +1342,12 @@ async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Pa
         .iter()
         .filter(|(_, _, _, protected)| !protected)
         .count()
+        .saturating_add(reserved_artifacts)
         .saturating_sub(max_retained_artifacts_total());
     for (_, path, bytes, protected) in paths {
-        if remove_count == 0 && total_bytes <= MAX_RETAINED_ARTIFACT_BYTES_TOTAL {
+        if remove_count == 0
+            && total_bytes.saturating_add(reserved_bytes) <= MAX_RETAINED_ARTIFACT_BYTES_TOTAL
+        {
             break;
         }
         if !protected && path != keep_path && remove_inactive_output_path(path).await {

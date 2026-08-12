@@ -39,6 +39,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             textwrap.dedent(
                 f"""
                 schema_version = 1
+                upstream_commit = "1111111111111111111111111111111111111111"
 
                 [[features]]
                 id = "feature"
@@ -248,6 +249,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             textwrap.dedent(
                 """
                 schema_version = 1
+                upstream_commit = "0123456789abcdef0123456789abcdef01234567"
 
                 [[features]]
                 id = "one"
@@ -307,8 +309,8 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         )
         manifest.write_text(text, encoding="utf-8")
 
-        normal = check_kd4_features.validate_manifest(
-            manifest, repo_root=self.repo_root
+        non_strict = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root, strict=False
         )
         strict = check_kd4_features.validate_manifest(
             manifest,
@@ -316,7 +318,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             strict=True,
         )
 
-        self.assertTrue(normal.ok)
+        self.assertTrue(non_strict.ok)
         self.assertFalse(strict.ok)
         self.assertEqual(
             [
@@ -326,6 +328,30 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             ],
             ["error"],
         )
+
+    def test_cli_is_strict_by_default_with_explicit_opt_out(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                'status = "enabled"',
+                'status = "orphaned"',
+            ),
+            encoding="utf-8",
+        )
+        common_args = [
+            "--manifest",
+            str(manifest),
+            "--repo-root",
+            str(self.repo_root),
+            "--json",
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            strict_exit = check_kd4_features.main(common_args)
+            non_strict_exit = check_kd4_features.main([*common_args, "--no-strict"])
+
+        self.assertEqual(strict_exit, 1)
+        self.assertEqual(non_strict_exit, 0)
 
     def test_json_cli_reports_machine_readable_verdict(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())
@@ -345,6 +371,42 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["featureCount"], 1)
+
+    def test_missing_upstream_commit_is_rejected(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                'upstream_commit = "1111111111111111111111111111111111111111"\n', ""
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "invalid-upstream-commit", {finding.code for finding in result.findings}
+        )
+
+    def test_malformed_upstream_commit_is_rejected(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                "1111111111111111111111111111111111111111", "NOT-A-COMMIT"
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "invalid-upstream-commit", {finding.code for finding in result.findings}
+        )
 
 
 if __name__ == "__main__":

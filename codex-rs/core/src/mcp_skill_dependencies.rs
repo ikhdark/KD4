@@ -120,10 +120,17 @@ pub(crate) async fn apply_mcp_dependency_effect(
         turn_context,
         turn_context.config.as_ref(),
         &effect.missing,
+        cancellation_token,
         elicitation_reviewer,
     )
     .await?;
-    if !inventory_contains_expected(sess, &effect.expected_inventory_keys).await {
+    let inventory_matches = tokio::select! {
+        _ = cancellation_token.cancelled() => {
+            return Err("MCP dependency installation was cancelled".to_string());
+        }
+        matches = inventory_contains_expected(sess, &effect.expected_inventory_keys) => matches,
+    };
+    if !inventory_matches {
         return Err(format!(
             "completed MCP dependency effect `{}` was not observable in the refreshed inventory",
             effect.id
@@ -172,12 +179,18 @@ async fn install_planned_mcp_dependencies(
     turn_context: &TurnContext,
     config: &crate::config::Config,
     missing: &HashMap<String, McpServerConfig>,
+    cancellation_token: &CancellationToken,
     elicitation_reviewer: Option<ElicitationReviewerHandle>,
 ) -> Result<(), String> {
     let codex_home = config.codex_home.clone();
-    let mut servers = load_global_mcp_servers(&codex_home).await.map_err(|err| {
-        format!("failed to load MCP servers while installing dependencies: {err}")
-    })?;
+    let mut servers = tokio::select! {
+        _ = cancellation_token.cancelled() => {
+            return Err("MCP dependency installation was cancelled".to_string());
+        }
+        result = load_global_mcp_servers(&codex_home) => result.map_err(|err| {
+            format!("failed to load MCP servers while installing dependencies: {err}")
+        })?,
+    };
     let mut added = Vec::new();
     let mut entries = missing.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(left, _)| *left);
@@ -189,8 +202,35 @@ async fn install_planned_mcp_dependencies(
         added.push((name.clone(), server_config.clone()));
     }
 
+    // Persist the server definitions before starting OAuth. OAuth login writes
+    // credentials as its terminal action, so this ordering guarantees that any
+    // credential created before cancellation or a later failure always has a
+    // matching durable server definition instead of becoming an orphaned
+    // secret. Existing names still win inside the serialized merge.
+    if !added.is_empty() {
+        let additions = added.iter().cloned().collect::<BTreeMap<_, _>>();
+        tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                return Err("MCP dependency installation was cancelled".to_string());
+            }
+            result = ConfigEditsBuilder::new(&codex_home)
+                .merge_mcp_servers(&additions)
+                .apply() => {
+                result.map_err(|err| {
+                    format!("failed to persist planned MCP dependencies: {err}")
+                })?;
+            }
+        }
+    }
+
     for (name, server_config) in &added {
-        let oauth_config = match oauth_login_support(&server_config.transport).await {
+        let oauth_support = tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                return Err("MCP dependency installation was cancelled".to_string());
+            }
+            support = oauth_login_support(&server_config.transport) => support,
+        };
+        let oauth_config = match oauth_support {
             McpOAuthLoginSupport::Supported(config) => config,
             McpOAuthLoginSupport::Unsupported => continue,
             McpOAuthLoginSupport::Unknown(err) => {
@@ -205,57 +245,64 @@ async fn install_planned_mcp_dependencies(
             oauth_config.discovered_scopes.clone(),
         );
         let oauth_client_id = server_config.oauth_client_id();
-        let first_attempt = perform_oauth_login(
-            name,
-            &oauth_config.url,
-            config.mcp_oauth_credentials_store_mode,
-            config.auth_keyring_backend_kind(),
-            oauth_config.http_headers.clone(),
-            oauth_config.env_http_headers.clone(),
-            &resolved_scopes.scopes,
-            oauth_client_id,
-            server_config.oauth_resource.as_deref(),
-            config.mcp_oauth_callback_port,
-            config.mcp_oauth_callback_url.as_deref(),
-        )
-        .await;
+        let first_attempt = tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                return Err("MCP dependency installation was cancelled".to_string());
+            }
+            result = perform_oauth_login(
+                name,
+                &oauth_config.url,
+                config.mcp_oauth_credentials_store_mode,
+                config.auth_keyring_backend_kind(),
+                oauth_config.http_headers.clone(),
+                oauth_config.env_http_headers.clone(),
+                &resolved_scopes.scopes,
+                oauth_client_id,
+                server_config.oauth_resource.as_deref(),
+                config.mcp_oauth_callback_port,
+                config.mcp_oauth_callback_url.as_deref(),
+            ) => result,
+        };
         if let Err(err) = first_attempt {
             if should_retry_without_scopes(&resolved_scopes, &err) {
-                perform_oauth_login(
-                    name,
-                    &oauth_config.url,
-                    config.mcp_oauth_credentials_store_mode,
-                    config.auth_keyring_backend_kind(),
-                    oauth_config.http_headers,
-                    oauth_config.env_http_headers,
-                    &[],
-                    oauth_client_id,
-                    server_config.oauth_resource.as_deref(),
-                    config.mcp_oauth_callback_port,
-                    config.mcp_oauth_callback_url.as_deref(),
-                )
-                .await
-                .map_err(|err| format!("failed to login to MCP dependency {name}: {err}"))?;
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        return Err("MCP dependency installation was cancelled".to_string());
+                    }
+                    result = perform_oauth_login(
+                        name,
+                        &oauth_config.url,
+                        config.mcp_oauth_credentials_store_mode,
+                        config.auth_keyring_backend_kind(),
+                        oauth_config.http_headers,
+                        oauth_config.env_http_headers,
+                        &[],
+                        oauth_client_id,
+                        server_config.oauth_resource.as_deref(),
+                        config.mcp_oauth_callback_port,
+                        config.mcp_oauth_callback_url.as_deref(),
+                    ) => {
+                        result.map_err(|err| {
+                            format!("failed to login to MCP dependency {name}: {err}")
+                        })?;
+                    }
+                }
             } else {
                 return Err(format!("failed to login to MCP dependency {name}: {err}"));
             }
         }
     }
 
-    if !added.is_empty() {
-        let additions = added.iter().cloned().collect::<BTreeMap<_, _>>();
-        ConfigEditsBuilder::new(&codex_home)
-            .merge_mcp_servers(&additions)
-            .apply()
-            .await
-            .map_err(|err| format!("failed to persist planned MCP dependencies: {err}"))?;
-    }
-
-    // OAuth can be interactive. Re-read after the serialized merge so runtime
-    // refresh observes concurrent config edits instead of the stale snapshot.
-    servers = load_global_mcp_servers(&codex_home).await.map_err(|err| {
-        format!("failed to reload MCP servers after installing dependencies: {err}")
-    })?;
+    // OAuth can be interactive. Re-read after it completes so runtime refresh
+    // observes concurrent config edits instead of the stale snapshot.
+    servers = tokio::select! {
+        _ = cancellation_token.cancelled() => {
+            return Err("MCP dependency installation was cancelled".to_string());
+        }
+        result = load_global_mcp_servers(&codex_home) => result.map_err(|err| {
+            format!("failed to reload MCP servers after installing dependencies: {err}")
+        })?,
+    };
 
     let mut refresh_config = config.clone();
     let mut configured_servers = config.mcp_servers.get().clone();
@@ -268,8 +315,16 @@ async fn install_planned_mcp_dependencies(
         .mcp_servers
         .set(configured_servers)
         .map_err(|err| format!("failed to prepare refreshed MCP dependency inventory: {err}"))?;
-    sess.refresh_mcp_servers_now(turn_context, &refresh_config, elicitation_reviewer)
-        .await;
+    tokio::select! {
+        _ = cancellation_token.cancelled() => {
+            return Err("MCP dependency installation was cancelled".to_string());
+        }
+        () = sess.refresh_mcp_servers_now(
+            turn_context,
+            &refresh_config,
+            elicitation_reviewer,
+        ) => {}
+    }
     Ok(())
 }
 

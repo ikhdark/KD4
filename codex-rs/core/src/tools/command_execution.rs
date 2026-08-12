@@ -5,6 +5,8 @@ use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::Weak;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -25,6 +27,8 @@ const MAX_TRACKED_COMMANDS: usize = 128;
 const WORKSPACE_MUTATION_RETRY_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(250);
 const WORKSPACE_MUTATION_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const WORKSPACE_MUTATION_FINALIZATION_MAX_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CommandAttemptKey {
@@ -256,21 +260,71 @@ impl Drop for WorkspaceMutationGuard {
         let lease = self.lease.clone();
         let store = Arc::clone(&self.store);
         let repo_root = self.repo_root.clone();
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::error!(
-                lease_id = %lease.lease_id,
-                "cannot finalize a dropped workspace mutation without a Tokio runtime"
-            );
-            return;
+        let cleanup = DroppedWorkspaceMutationCleanup {
+            store,
+            repo_root,
+            lease,
         };
-        runtime.spawn(async move {
-            if let Err(error) = store.finish_workspace_mutation(&repo_root, lease).await {
-                tracing::error!(
-                    %error,
-                    "failed to finalize a dropped workspace mutation"
-                );
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(finalize_dropped_workspace_mutation(cleanup));
+        } else {
+            enqueue_dropped_workspace_mutation_cleanup(cleanup);
+        }
+    }
+}
+
+struct DroppedWorkspaceMutationCleanup {
+    store: Arc<dyn AgentTaskStore>,
+    repo_root: PathBuf,
+    lease: WorkspaceMutationLease,
+}
+
+async fn finalize_dropped_workspace_mutation(cleanup: DroppedWorkspaceMutationCleanup) {
+    if let Err(error) = cleanup
+        .store
+        .finish_workspace_mutation(&cleanup.repo_root, cleanup.lease)
+        .await
+    {
+        tracing::error!(%error, "failed to finalize a dropped workspace mutation");
+    }
+}
+
+fn enqueue_dropped_workspace_mutation_cleanup(cleanup: DroppedWorkspaceMutationCleanup) {
+    static CLEANUP_SENDER: OnceLock<
+        Option<std::sync::mpsc::Sender<DroppedWorkspaceMutationCleanup>>,
+    > = OnceLock::new();
+    let sender = CLEANUP_SENDER.get_or_init(|| {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(%error, "failed to start workspace mutation cleanup runtime");
+                return None;
             }
-        });
+        };
+        let (sender, receiver) = std::sync::mpsc::channel::<DroppedWorkspaceMutationCleanup>();
+        match std::thread::Builder::new()
+            .name("codex-workspace-mutation-cleanup".to_string())
+            .spawn(move || {
+                while let Ok(cleanup) = receiver.recv() {
+                    runtime.block_on(finalize_dropped_workspace_mutation(cleanup));
+                }
+            }) {
+            Ok(_handle) => Some(sender),
+            Err(error) => {
+                tracing::error!(%error, "failed to spawn workspace mutation cleanup thread");
+                None
+            }
+        }
+    });
+    let Some(sender) = sender else {
+        tracing::error!("workspace mutation cleanup worker is unavailable");
+        return;
+    };
+    if let Err(error) = sender.send(cleanup) {
+        tracing::error!(%error, "failed to queue dropped workspace mutation cleanup");
     }
 }
 
@@ -467,23 +521,24 @@ struct CommandExecutionState {
     running_order: VecDeque<i32>,
     repository_epoch: u64,
     observed_turn_mutation_revisions: HashMap<String, u64>,
-    observed_turn_order: VecDeque<String>,
 }
 
 #[derive(Default)]
 pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
-    workspace_mutation_gates: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    workspace_mutation_gates: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
 }
 
 impl CommandExecutionLedger {
     async fn workspace_mutation_gate(&self, repo_root: &Path) -> Arc<Mutex<()>> {
         let mut gates = self.workspace_mutation_gates.lock().await;
-        Arc::clone(
-            gates
-                .entry(repo_root.to_path_buf())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(repo_root).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(repo_root.to_path_buf(), Arc::downgrade(&gate));
+        gate
     }
 
     #[cfg(test)]
@@ -540,15 +595,6 @@ impl CommandExecutionLedger {
         mutation_revision: u64,
     ) -> u64 {
         let mut state = self.state.lock().await;
-        if !state.observed_turn_mutation_revisions.contains_key(turn_id) {
-            while state.observed_turn_mutation_revisions.len() >= MAX_TRACKED_COMMANDS {
-                let Some(oldest_turn) = state.observed_turn_order.pop_front() else {
-                    break;
-                };
-                state.observed_turn_mutation_revisions.remove(&oldest_turn);
-            }
-            state.observed_turn_order.push_back(turn_id.to_string());
-        }
         let delta = {
             let observed_revision = state
                 .observed_turn_mutation_revisions
@@ -672,7 +718,18 @@ impl CommandExecutionLedger {
             mutation.cancel_owner();
         }
         for mutation in mutations {
-            mutation.wait_until_finalized().await;
+            if tokio::time::timeout(
+                WORKSPACE_MUTATION_FINALIZATION_MAX_WAIT,
+                mutation.wait_until_finalized(),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    turn_id,
+                    "timed out waiting for cancelled workspace mutation finalization"
+                );
+            }
         }
     }
 
@@ -684,6 +741,26 @@ impl CommandExecutionLedger {
         tokio::time::timeout(timeout, self.cancel_mutations_for_turn(turn_id))
             .await
             .is_ok()
+    }
+
+    pub(crate) async fn cancel_mutations_for_terminal_turn_with_timeout(
+        &self,
+        turn_id: &str,
+        timeout: Duration,
+    ) -> bool {
+        let completed = self
+            .cancel_mutations_for_turn_with_timeout(turn_id, timeout)
+            .await;
+        self.forget_turn_repository_revision(turn_id).await;
+        completed
+    }
+
+    async fn forget_turn_repository_revision(&self, turn_id: &str) {
+        self.state
+            .lock()
+            .await
+            .observed_turn_mutation_revisions
+            .remove(turn_id);
     }
 
     pub(crate) async fn update_running_artifact(
@@ -741,6 +818,7 @@ impl CommandExecutionLedger {
                 process_id,
                 "workspace mutation finalization after process exit failed"
             );
+            return false;
         }
         true
     }
@@ -757,7 +835,7 @@ impl CommandExecutionLedger {
             Ok(finished) => finished,
             Err(error) => {
                 tracing::warn!(%error, process_id, "workspace mutation finalization failed");
-                true
+                false
             }
         }
     }
@@ -791,6 +869,10 @@ impl CommandExecutionLedger {
             }
             return Err(error);
         }
+        let mut state = self.state.lock().await;
+        while state.attempts.len() > MAX_TRACKED_COMMANDS
+            && evict_oldest_inactive_attempt_locked(&mut state)
+        {}
         Ok(true)
     }
 
@@ -848,20 +930,38 @@ fn attempt_entry_locked<'a>(
     key: &CommandAttemptKey,
 ) -> &'a mut AttemptEntry {
     if !state.attempts.contains_key(key) {
-        while state.attempts.len() >= MAX_TRACKED_COMMANDS {
-            if let Some(oldest) = state.insertion_order.pop_front() {
-                state.attempts.remove(&oldest);
-                continue;
-            }
-
-            let Some(unordered_key) = state.attempts.keys().next().cloned() else {
-                break;
-            };
-            state.attempts.remove(&unordered_key);
-        }
+        while state.attempts.len() >= MAX_TRACKED_COMMANDS
+            && evict_oldest_inactive_attempt_locked(state)
+        {}
         state.insertion_order.push_back(key.clone());
     }
     state.attempts.entry(key.clone()).or_default()
+}
+
+fn evict_oldest_inactive_attempt_locked(state: &mut CommandExecutionState) -> bool {
+    if let Some(position) = state
+        .insertion_order
+        .iter()
+        .position(|key| !command_attempt_is_active(state, key))
+        && let Some(oldest) = state.insertion_order.remove(position)
+    {
+        state.attempts.remove(&oldest);
+        return true;
+    }
+    let Some(unordered_key) = state
+        .attempts
+        .keys()
+        .find(|key| !command_attempt_is_active(state, key))
+        .cloned()
+    else {
+        return false;
+    };
+    state.attempts.remove(&unordered_key);
+    true
+}
+
+fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttemptKey) -> bool {
+    state.running.values().any(|running| running.key == *key)
 }
 
 #[cfg(test)]
@@ -1548,10 +1648,11 @@ mod tests {
                 Some(mutation.clone()),
             )
             .await;
+        ledger.observe_repository_revision("owner-turn", 1).await;
 
         assert!(
             !ledger
-                .cancel_mutations_for_turn_with_timeout(
+                .cancel_mutations_for_terminal_turn_with_timeout(
                     "owner-turn",
                     std::time::Duration::from_millis(1),
                 )
@@ -1561,6 +1662,15 @@ mod tests {
         assert!(
             lease_lost.is_cancelled(),
             "bounded cleanup must still revoke the process mutation authority"
+        );
+        assert!(
+            !ledger
+                .state
+                .lock()
+                .await
+                .observed_turn_mutation_revisions
+                .contains_key("owner-turn"),
+            "terminal cleanup must forget the revision baseline even after its mutation wait times out"
         );
 
         mutation
@@ -1695,6 +1805,48 @@ mod tests {
         assert_eq!(ledger.observe_repository_revision("turn-2", 0).await, 1);
         assert_eq!(ledger.observe_repository_revision("turn-2", 2).await, 3);
         assert_eq!(ledger.observe_repository_revision("turn-1", 1).await, 3);
+    }
+
+    #[tokio::test]
+    async fn mutation_cancellation_keeps_repository_revision_for_same_turn_retry() {
+        let ledger = CommandExecutionLedger::default();
+
+        assert_eq!(
+            ledger.observe_repository_revision("retrying-turn", 1).await,
+            1
+        );
+        ledger.cancel_mutations_for_turn("retrying-turn").await;
+
+        assert_eq!(
+            ledger.observe_repository_revision("retrying-turn", 1).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_cleanup_forgets_its_observed_repository_revision() {
+        let ledger = CommandExecutionLedger::default();
+
+        ledger.observe_repository_revision("finished-turn", 1).await;
+        ledger.observe_repository_revision("active-turn", 2).await;
+        ledger
+            .cancel_mutations_for_terminal_turn_with_timeout(
+                "finished-turn",
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+
+        let state = ledger.state.lock().await;
+        assert!(
+            !state
+                .observed_turn_mutation_revisions
+                .contains_key("finished-turn")
+        );
+        assert!(
+            state
+                .observed_turn_mutation_revisions
+                .contains_key("active-turn")
+        );
     }
 
     #[tokio::test]

@@ -29,7 +29,22 @@ class GitDoctorReport:
     unreadable_pytest_caches: tuple[str, ...]
     status_seconds: float | None
     status_timed_out: bool
+    status_failed: bool
+    status_return_code: int | None
+    status_error: str | None
     recommendations: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GitStatusResult:
+    elapsed_seconds: float | None
+    timed_out: bool
+    return_code: int | None
+    error: str | None
+
+    @property
+    def failed(self) -> bool:
+        return not self.timed_out and self.return_code != 0
 
 
 def run_git(
@@ -77,18 +92,38 @@ def fsmonitor_enabled(value: str | None) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-def timed_status(timeout: float) -> tuple[float | None, bool]:
+def git_boolean_enabled(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def bounded_error(stderr: str, *, limit: int = 500) -> str | None:
+    message = " ".join(stderr.split())
+    if not message:
+        return None
+    if len(message) <= limit:
+        return message
+    return f"{message[: limit - 3]}..."
+
+
+def timed_status(timeout: float) -> GitStatusResult:
     started = time.monotonic()
     try:
         completed = run_git(
             ["status", "--short", "--untracked-files=no"], timeout=timeout
         )
-    except subprocess.TimeoutExpired:
-        return None, True
+    except subprocess.TimeoutExpired as exc:
+        return GitStatusResult(None, True, None, bounded_error(str(exc)))
+    except OSError as exc:
+        return GitStatusResult(time.monotonic() - started, False, None, str(exc))
     elapsed = time.monotonic() - started
-    if completed.returncode != 0:
-        return elapsed, False
-    return elapsed, False
+    return GitStatusResult(
+        elapsed,
+        False,
+        completed.returncode,
+        bounded_error(completed.stderr),
+    )
 
 
 def directory_is_readable(path: Path) -> bool:
@@ -122,7 +157,7 @@ def recommendations(
         items.append(
             "Enable Git FSMonitor for this repo: `git config core.fsmonitor true`."
         )
-    if untracked_cache != "true":
+    if not git_boolean_enabled(untracked_cache):
         items.append(
             "Enable the untracked cache: `git config core.untrackedCache true`."
         )
@@ -151,13 +186,16 @@ def build_report(timeout: float) -> GitDoctorReport:
     fsmonitor = git_config("core.fsmonitor")
     untracked_cache = git_config("core.untrackedCache")
     unreadable_pytest_caches = unreadable_pytest_cache_dirs(Path(root))
-    seconds, timed_out = timed_status(timeout)
+    status = timed_status(timeout)
     recs = recommendations(kind, fsmonitor, untracked_cache, unreadable_pytest_caches)
-    if timed_out:
+    if status.timed_out:
         recs = (
             *recs,
             f"`git status --short --untracked-files=no` exceeded {timeout:g}s.",
         )
+    elif status.failed:
+        detail = f": {status.error}" if status.error else ""
+        recs = (*recs, f"`git status --short --untracked-files=no` failed{detail}.")
     return GitDoctorReport(
         repo_root=root,
         platform=platform.platform(),
@@ -165,8 +203,11 @@ def build_report(timeout: float) -> GitDoctorReport:
         fsmonitor=fsmonitor,
         untracked_cache=untracked_cache,
         unreadable_pytest_caches=unreadable_pytest_caches,
-        status_seconds=seconds,
-        status_timed_out=timed_out,
+        status_seconds=status.elapsed_seconds,
+        status_timed_out=status.timed_out,
+        status_failed=status.failed,
+        status_return_code=status.return_code,
+        status_error=status.error,
         recommendations=recs,
     )
 
@@ -183,6 +224,14 @@ def print_report(report: GitDoctorReport) -> None:
         )
     if report.status_timed_out:
         print("- status check: timed out")
+    elif report.status_failed:
+        code = (
+            f" (exit {report.status_return_code})"
+            if report.status_return_code is not None
+            else ""
+        )
+        detail = f": {report.status_error}" if report.status_error else ""
+        print(f"- status check: failed{code}{detail}")
     elif report.status_seconds is not None:
         print(f"- status check: {report.status_seconds:.2f}s")
     if report.recommendations:
@@ -210,7 +259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(asdict(report), indent=2))
     else:
         print_report(report)
-    return 1 if report.status_timed_out else 0
+    return 1 if report.status_timed_out or report.status_failed else 0
 
 
 if __name__ == "__main__":

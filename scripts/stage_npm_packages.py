@@ -582,6 +582,13 @@ def install_from_workflow_artifacts(
     max_download_workers: int | None = None,
     vendor_copy_mode: str = "auto",
 ) -> None:
+    unknown_components = sorted(
+        set(components) - {codex_package_component()} - set(BINARY_COMPONENTS)
+    )
+    if unknown_components:
+        raise ValueError(
+            "unregistered native component(s): " + ", ".join(unknown_components)
+        )
     artifacts = select_target_artifacts(workflow_id, github_repo, components, targets)
     download_artifacts(
         workflow_id, github_repo, artifacts_dir, artifacts, max_download_workers
@@ -1050,6 +1057,58 @@ def stage_packages(
     return [results_by_package[package] for package in packages]
 
 
+def commit_staged_packages(
+    results: Sequence[StagePackageResult], output_dir: Path
+) -> list[StagePackageResult]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    committed: list[tuple[Path, Path | None, Path]] = []
+    try:
+        for result in results:
+            source = result.pack_output
+            destination = output_dir / source.name
+            backup = output_dir / f".{source.name}.{uuid.uuid4().hex}.old"
+            existing_backup: Path | None = None
+            if destination.exists():
+                destination.replace(backup)
+                existing_backup = backup
+            try:
+                source.replace(destination)
+            except Exception:
+                if existing_backup is not None and not destination.exists():
+                    existing_backup.replace(destination)
+                raise
+            committed.append((destination, existing_backup, source))
+    except Exception:
+        for destination, backup, source in reversed(committed):
+            if destination.exists():
+                destination.replace(source)
+            if backup is not None and backup.exists():
+                backup.replace(destination)
+        raise
+
+    for _destination, backup, _source in committed:
+        if backup is None or not backup.exists():
+            continue
+        try:
+            backup.unlink()
+        except OSError as error:
+            print(
+                f"warning: package activation succeeded, but backup cleanup failed "
+                f"for {backup}: {error}",
+                file=sys.stderr,
+            )
+
+    destinations = {destination.name: destination for destination, _backup, _source in committed}
+    return [
+        StagePackageResult(
+            package=result.package,
+            pack_output=destinations[result.pack_output.name],
+            log=result.log,
+        )
+        for result in results
+    ]
+
+
 def main() -> int:
     args = parse_args()
 
@@ -1093,6 +1152,7 @@ def main() -> int:
     vendor_src_by_native_key: dict[tuple[tuple[str, ...], tuple[str, ...]], Path] = {}
     vendor_temp_roots: list[Path] = []
     artifacts_temp_root: Path | None = None
+    staged_output_root: Path | None = None
     cleanup_artifacts_root = False
     resolved_head_sha: str | None = None
 
@@ -1161,21 +1221,21 @@ def main() -> int:
                     vendor_temp_root / "vendor"
                 )
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        for result in stage_packages(
+        staged_output_root = Path(
+            tempfile.mkdtemp(prefix="npm-output-", dir=runner_temp)
+        )
+        staged_results = stage_packages(
             packages,
             args.release_version,
-            output_dir,
+            staged_output_root,
             runner_temp,
             vendor_src_by_native_key,
             args.keep_staging_dirs,
             args.max_stage_workers,
-        ):
-            final_messages.append(f"Staged {result.package} at {result.pack_output}")
+        )
 
         if resolved_head_sha:
-            owned_paths = [output_dir]
+            owned_paths = []
             if artifacts_temp_root is not None:
                 owned_paths.append(artifacts_temp_root)
             ensure_source_matches_workflow(
@@ -1183,12 +1243,17 @@ def main() -> int:
                 allow_mismatch=args.allow_source_native_mismatch,
                 owned_paths=owned_paths,
             )
+
+        for result in commit_staged_packages(staged_results, output_dir):
+            final_messages.append(f"Staged {result.package} at {result.pack_output}")
     finally:
         if not args.keep_staging_dirs:
             for vendor_temp_root in vendor_temp_roots:
                 shutil.rmtree(vendor_temp_root, ignore_errors=True)
         if cleanup_artifacts_root and artifacts_temp_root is not None:
             shutil.rmtree(artifacts_temp_root, ignore_errors=True)
+        if staged_output_root is not None:
+            shutil.rmtree(staged_output_root, ignore_errors=True)
 
     for msg in final_messages:
         print(msg, flush=True)

@@ -1204,7 +1204,7 @@ secondary doc"#,
 }
 
 #[tokio::test]
-async fn independent_environment_reads_overlap_and_preserve_selection_order() {
+async fn independent_environment_reads_are_budgeted_sequentially_and_preserve_selection_order() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
     let primary_doc = primary.path().join("AGENTS.md");
@@ -1257,13 +1257,22 @@ async fn independent_environment_reads_overlap_and_preserve_selection_order() {
     )
     .await
     .expect("primary read should start");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            secondary_control.stream_started.notified(),
+        )
+        .await
+        .is_err(),
+        "secondary read must wait for the primary read to consume its budget"
+    );
+    primary_control.stream_release.notify_one();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         secondary_control.stream_started.notified(),
     )
     .await
-    .expect("secondary read should start while primary is blocked");
-    primary_control.stream_release.notify_one();
+    .expect("secondary read should start after the primary read completes");
 
     let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), load)
         .await
@@ -1345,9 +1354,24 @@ async fn primary_only_project_doc_preserves_legacy_layout_with_multiple_bound_en
 async fn project_doc_byte_limit_is_shared_across_environments() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
-    fs::write(primary.path().join("AGENTS.md"), "ABCDE").unwrap();
-    fs::write(secondary.path().join("AGENTS.md"), "VWXYZ").unwrap();
-    let config = make_config(&primary, /*limit*/ 3, /*instructions*/ None).await;
+    let primary_doc = "ABCDE";
+    let secondary_doc = "V".repeat(1_000);
+    let secondary_doc_path = secondary.path().join("AGENTS.md");
+    fs::write(primary.path().join("AGENTS.md"), primary_doc).unwrap();
+    fs::write(&secondary_doc_path, &secondary_doc).unwrap();
+    let secondary_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&secondary_doc_path.abs()),
+        secondary_doc.len() as u64,
+        /*retained_bytes*/ 0,
+    );
+    let secondary_budget = secondary_notice.len() + 16;
+    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
+    let secondary_label = format!(
+        "\n\nfor `secondary` with root {}\n\n",
+        secondary.path().display()
+    );
+    let limit = primary_label.len() + primary_doc.len() + secondary_label.len() + secondary_budget;
+    let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
         ("secondary", secondary.abs()),
@@ -1358,37 +1382,28 @@ async fn project_doc_byte_limit_is_shared_across_environments() {
         .await
         .loaded
         .expect("instructions expected");
-    let primary_notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&primary.path().join("AGENTS.md").abs()),
-        /*original_bytes*/ 5,
-        /*retained_bytes*/ 3,
+    assert_eq!(loaded.entries.len(), 2);
+    assert_eq!(loaded.entries[0].contents, primary_doc);
+    assert!(loaded.entries[1].contents.len() <= secondary_budget);
+    assert!(
+        loaded.entries[1]
+            .contents
+            .contains("Project documentation truncation notice")
     );
-    let secondary_notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&secondary.path().join("AGENTS.md").abs()),
-        /*original_bytes*/ 5,
-        /*retained_bytes*/ 0,
-    );
-
-    assert_eq!(
-        loaded.text(),
-        format!(
-            "for `primary` with root {}\n\nABC\n\n{primary_notice}\n\nfor `secondary` with root {}\n\n{secondary_notice}",
-            primary.path().display(),
-            secondary.path().display()
-        )
-    );
+    assert!(loaded.text().len() <= limit);
 }
 
 #[tokio::test]
 async fn aggregate_project_doc_limit_prefers_environment_selection_order() {
-    const LIMIT: usize = 8;
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
-    let primary_doc = "P".repeat(LIMIT);
-    let secondary_doc = "S".repeat(LIMIT);
+    let primary_doc = "P".repeat(32);
+    let secondary_doc = "S".repeat(32);
     fs::write(primary.path().join("AGENTS.md"), &primary_doc).unwrap();
     fs::write(secondary.path().join("AGENTS.md"), &secondary_doc).unwrap();
-    let config = make_config(&primary, LIMIT, /*instructions*/ None).await;
+    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
+    let limit = primary_label.len() + primary_doc.len();
+    let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
         ("secondary", secondary.abs()),
@@ -1402,35 +1417,37 @@ async fn aggregate_project_doc_limit_prefers_environment_selection_order() {
     .await
     .loaded
     .expect("instructions expected");
-    let secondary_notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&secondary.path().join("AGENTS.md").abs()),
-        /*original_bytes*/ LIMIT as u64,
-        /*retained_bytes*/ 0,
-    );
-
-    assert_eq!(loaded.entries.len(), 2);
+    assert_eq!(loaded.entries.len(), 1);
     assert_eq!(loaded.entries[0].contents, primary_doc);
-    assert_eq!(loaded.entries[1].contents, secondary_notice);
     assert!(!loaded.text().contains(&secondary_doc));
+    assert!(loaded.text().len() <= limit);
 }
 
 #[tokio::test]
-async fn aggregate_budget_passes_utf8_boundary_slack_to_a_broader_doc() {
-    const LIMIT: usize = 8;
+async fn aggregate_budget_keeps_a_truncated_secondary_doc_utf8_valid() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
-    fs::write(primary.path().join("AGENTS.md"), "12345").unwrap();
-    fs::create_dir(secondary.path().join(".git")).unwrap();
-    let secondary_root_doc = secondary.path().join("AGENTS.md");
-    fs::write(&secondary_root_doc, "ROOT").unwrap();
-    let secondary_nested = secondary.path().join("nested");
-    fs::create_dir(&secondary_nested).unwrap();
-    let secondary_nested_doc = secondary_nested.join("AGENTS.md");
-    fs::write(&secondary_nested_doc, "🦀tail").unwrap();
-    let config = make_config(&primary, LIMIT, /*instructions*/ None).await;
+    let primary_doc = "12345";
+    let secondary_doc = "🦀".repeat(100);
+    let secondary_doc_path = secondary.path().join("AGENTS.md");
+    fs::write(primary.path().join("AGENTS.md"), primary_doc).unwrap();
+    fs::write(&secondary_doc_path, &secondary_doc).unwrap();
+    let secondary_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&secondary_doc_path.abs()),
+        secondary_doc.len() as u64,
+        /*retained_bytes*/ 0,
+    );
+    let secondary_budget = secondary_notice.len() + 16;
+    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
+    let secondary_label = format!(
+        "\n\nfor `secondary` with root {}\n\n",
+        secondary.path().display()
+    );
+    let limit = primary_label.len() + primary_doc.len() + secondary_label.len() + secondary_budget;
+    let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
-        ("secondary", secondary_nested.abs()),
+        ("secondary", secondary.abs()),
     ]);
 
     let loaded = load_project_instructions(
@@ -1441,21 +1458,16 @@ async fn aggregate_budget_passes_utf8_boundary_slack_to_a_broader_doc() {
     .await
     .loaded
     .expect("instructions expected");
-    let root_notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&secondary_root_doc.abs()),
-        /*original_bytes*/ 4,
-        /*retained_bytes*/ 3,
+    assert_eq!(loaded.entries.len(), 2);
+    assert_eq!(loaded.entries[0].contents, primary_doc);
+    assert!(loaded.entries[1].contents.len() <= secondary_budget);
+    assert!(
+        loaded.entries[1]
+            .contents
+            .contains("Project documentation truncation notice")
     );
-    let nested_notice = project_doc_truncation_notice(
-        &PathUri::from_abs_path(&secondary_nested_doc.abs()),
-        /*original_bytes*/ 8,
-        /*retained_bytes*/ 0,
-    );
-
-    assert_eq!(loaded.entries.len(), 3);
-    assert_eq!(loaded.entries[0].contents, "12345");
-    assert_eq!(loaded.entries[1].contents, format!("ROO\n\n{root_notice}"));
-    assert_eq!(loaded.entries[2].contents, nested_notice);
+    assert!(!loaded.entries[1].contents.contains('\u{FFFD}'));
+    assert!(loaded.text().len() <= limit);
 }
 
 #[tokio::test]

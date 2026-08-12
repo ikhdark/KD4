@@ -1111,8 +1111,7 @@ impl LocalAgentTaskStore {
                            ON assignment_repositories.assignment_id = attempts.assignment_id
                          WHERE assignment_repositories.workspace_id = ?
                            AND validation_calls.status = ?
-                         ORDER BY validation_calls.recorded_at DESC
-                         LIMIT 64",
+                         ORDER BY validation_calls.recorded_at DESC",
                     )
                     .bind(&workspace_id)
                     .bind(encode(&crate::ValidationCallStatus::Succeeded)?)

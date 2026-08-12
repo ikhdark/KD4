@@ -21,6 +21,18 @@ from codex_package.targets import TARGET_SPECS
 
 
 class SourceBinariesForTargetTest(unittest.TestCase):
+    def setUp(self) -> None:
+        command_identity = mock.patch.object(
+            cargo_module,
+            "command_identity",
+            side_effect=lambda command, *_args: {
+                "path": command,
+                "version": f"{command} test",
+            },
+        )
+        command_identity.start()
+        self.addCleanup(command_identity.stop)
+
     def test_macos_package_with_prebuilt_entrypoint_builds_nothing(self) -> None:
         self.assertEqual(
             source_binaries_for_target(
@@ -348,33 +360,36 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             )
             source = fixed_source_fingerprint()
 
-            with mock.patch.object(cargo_module, "CODEX_RS_ROOT", codex_rs):
-                with mock.patch.dict(os.environ, {}, clear=True):
-                    with mock.patch.object(
-                        cargo_module,
-                        "source_tree_fingerprint",
-                        return_value=source,
-                    ):
-                        cargo_module.write_source_build_stamp(
-                            target_dir,
-                            spec=TARGET_SPECS["x86_64-pc-windows-msvc"],
-                            profile="release",
-                            variant=PACKAGE_VARIANTS["codex"],
-                            outputs=outputs,
-                        )
-                        with mock.patch("subprocess.run") as run:
-                            actual_outputs = build_source_binaries(
-                                TARGET_SPECS["x86_64-pc-windows-msvc"],
-                                PACKAGE_VARIANTS["codex"],
-                                cargo="cargo",
-                                profile="release",
-                                entrypoint_bin=None,
-                                code_mode_host_bin=None,
-                                bwrap_bin=None,
-                                codex_command_runner_bin=None,
-                                codex_windows_sandbox_setup_bin=None,
-                                reuse_existing=True,
-                            )
+            with (
+                mock.patch.object(cargo_module, "CODEX_RS_ROOT", codex_rs),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    cargo_module,
+                    "source_tree_fingerprint",
+                    return_value=source,
+                ),
+            ):
+                cargo_module.write_source_build_stamp(
+                    target_dir,
+                    spec=TARGET_SPECS["x86_64-pc-windows-msvc"],
+                    profile="release",
+                    variant=PACKAGE_VARIANTS["codex"],
+                    outputs=outputs,
+                    cargo="custom-cargo",
+                )
+                with mock.patch("subprocess.run") as run:
+                    actual_outputs = build_source_binaries(
+                        TARGET_SPECS["x86_64-pc-windows-msvc"],
+                        PACKAGE_VARIANTS["codex"],
+                        cargo="custom-cargo",
+                        profile="release",
+                        entrypoint_bin=None,
+                        code_mode_host_bin=None,
+                        bwrap_bin=None,
+                        codex_command_runner_bin=None,
+                        codex_windows_sandbox_setup_bin=None,
+                        reuse_existing=True,
+                    )
 
         run.assert_not_called()
         self.assertEqual(actual_outputs.entrypoint_bin, output_dir / "codex.exe")
@@ -649,7 +664,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
 
         self.assertFalse(matched)
 
-    def test_source_output_match_uses_stamp_metadata_without_rehashing(self) -> None:
+    def test_source_output_match_rehashes_cached_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = touch_file(Path(temp_dir) / "codex.exe")
             fingerprint = cargo_module.source_output_fingerprint(path)
@@ -657,14 +672,15 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             with mock.patch.object(
                 cargo_module,
                 "source_output_fingerprint",
-                side_effect=AssertionError("output hash should be cached"),
-            ):
+                wraps=cargo_module.source_output_fingerprint,
+            ) as source_output_fingerprint:
                 matched = cargo_module.source_output_matches_fingerprint(
                     path,
                     fingerprint,
                 )
 
         self.assertTrue(matched)
+        source_output_fingerprint.assert_called_once_with(path)
 
     def test_force_rebuild_ignores_reusable_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

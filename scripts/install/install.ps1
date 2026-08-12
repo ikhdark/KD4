@@ -206,11 +206,13 @@ function Prepend-PathEntry {
 function Invoke-WithInstallLock {
     param(
         [string]$LockPath,
-        [scriptblock]$Script
+        [scriptblock]$Script,
+        [int]$TimeoutSeconds = 120
     )
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LockPath) | Out-Null
     $lock = $null
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ($null -eq $lock) {
         try {
             $lock = [System.IO.File]::Open(
@@ -220,6 +222,9 @@ function Invoke-WithInstallLock {
                 [System.IO.FileShare]::None
             )
         } catch [System.IO.IOException] {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "Timed out after $TimeoutSeconds seconds waiting for the Codex install lock: $LockPath"
+            }
             Start-Sleep -Milliseconds 250
         }
     }
@@ -273,12 +278,18 @@ function Get-VersionFromBinary {
     # healthy binary must not discard the version it printed to stdout.
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
+    $versionExitCode = $null
     try {
         $versionOutput = & $CodexPath --version 2>$null
+        $versionExitCode = $LASTEXITCODE
     } catch {
         return $null
     } finally {
         $ErrorActionPreference = $oldErrorActionPreference
+    }
+
+    if ($versionExitCode -ne 0) {
+        return $null
     }
 
     $versionLine = @($versionOutput) |
@@ -563,6 +574,46 @@ function Ensure-Junction {
     }
 
     throw "Refusing to replace file at $LinkPath with a junction."
+}
+
+function Get-JunctionSnapshot {
+    param(
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [PSCustomObject]@{ Exists = $false; IsJunction = $false; Target = $null }
+    }
+
+    $item = Get-Item -LiteralPath $Path -Force
+    $isJunction = Test-IsJunction -Path $Path
+    return [PSCustomObject]@{
+        Exists = $true
+        IsJunction = $isJunction
+        Target = if ($isJunction) { [string]$item.Target } else { $null }
+    }
+}
+
+function Restore-JunctionSnapshot {
+    param(
+        [string]$Path,
+        [PSCustomObject]$Snapshot
+    )
+
+    if ($Snapshot.IsJunction) {
+        if (-not (Test-IsJunction -Path $Path)) {
+            throw "Cannot restore the prior junction because the path was replaced: $Path"
+        }
+        Set-JunctionTarget -LinkPath $Path -TargetPath $Snapshot.Target
+        return
+    }
+
+    if (Test-IsJunction -Path $Path) {
+        Remove-Item -LiteralPath $Path -Force
+    }
+    if ($Snapshot.Exists -and -not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path | Out-Null
+    }
 }
 
 function Test-PackageContentsAreComplete {
@@ -977,28 +1028,35 @@ try {
             Move-Item -LiteralPath $stagingDir -Destination $releaseDir
         }
 
-        New-Item -ItemType Directory -Force -Path $standaloneRoot | Out-Null
-        Ensure-Junction -LinkPath $currentDir -TargetPath $releaseDir -InstallerOwnedTargetPrefix $releasesDir
-
-        $visibleParent = Split-Path -Parent $visibleBinDir
-        $currentBinDir = if ($installLayout -eq "Package") {
-            Join-Path $currentDir "bin"
-        } else {
-            $currentDir
-        }
-        New-Item -ItemType Directory -Force -Path $visibleParent | Out-Null
-        $oldStandaloneBackup = Move-OldStandaloneBinIfApproved -VisibleBinDir $visibleBinDir -DefaultVisibleBinDir $defaultVisibleBinDir
+        $currentSnapshot = Get-JunctionSnapshot -Path $currentDir
+        $visibleSnapshot = Get-JunctionSnapshot -Path $visibleBinDir
+        $oldStandaloneBackup = $null
         try {
+            New-Item -ItemType Directory -Force -Path $standaloneRoot | Out-Null
+            Ensure-Junction -LinkPath $currentDir -TargetPath $releaseDir -InstallerOwnedTargetPrefix $releasesDir
+
+            $visibleParent = Split-Path -Parent $visibleBinDir
+            $currentBinDir = if ($installLayout -eq "Package") {
+                Join-Path $currentDir "bin"
+            } else {
+                $currentDir
+            }
+            New-Item -ItemType Directory -Force -Path $visibleParent | Out-Null
+            $oldStandaloneBackup = Move-OldStandaloneBinIfApproved -VisibleBinDir $visibleBinDir -DefaultVisibleBinDir $defaultVisibleBinDir
             Ensure-Junction -LinkPath $visibleBinDir -TargetPath $currentBinDir -InstallerOwnedTargetPrefix $standaloneRoot
             Test-VisibleCodexCommand -VisibleBinDir $visibleBinDir
         } catch {
+            $activationError = $_
             if ($null -ne $oldStandaloneBackup -and (Test-Path -LiteralPath $oldStandaloneBackup)) {
                 if (Test-Path -LiteralPath $visibleBinDir) {
                     Remove-Item -LiteralPath $visibleBinDir -Recurse -Force
                 }
                 Move-Item -LiteralPath $oldStandaloneBackup -Destination $visibleBinDir
+            } else {
+                Restore-JunctionSnapshot -Path $visibleBinDir -Snapshot $visibleSnapshot
             }
-            throw
+            Restore-JunctionSnapshot -Path $currentDir -Snapshot $currentSnapshot
+            throw $activationError
         }
         if ($null -ne $oldStandaloneBackup) {
             Remove-Item -LiteralPath $oldStandaloneBackup -Recurse -Force

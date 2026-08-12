@@ -16,10 +16,51 @@ use crate::session::step_context::StepContext;
 #[cfg(test)]
 use crate::session::turn_context::TurnContext;
 use codex_api::OPENAI_FILE_UPLOAD_LIMIT_BYTES;
+use codex_api::delete_openai_file;
 use codex_api::upload_openai_file;
+#[cfg(test)]
 use codex_login::CodexAuth;
-use codex_utils_path_uri::PathUri;
+use codex_utils_path_uri::PathConvention;
 use serde_json::Value as JsonValue;
+
+struct StagedOpenAiFile {
+    field_name: String,
+    index: Option<usize>,
+    file_path: String,
+    file_name: String,
+    contents: Vec<u8>,
+}
+
+enum StagedOpenAiArgument {
+    Single(StagedOpenAiFile),
+    Array(Vec<StagedOpenAiFile>),
+}
+
+#[derive(Default)]
+struct OpenAiFileStagingBudget {
+    staged_bytes: u64,
+}
+
+impl OpenAiFileStagingBudget {
+    fn remaining_bytes(&self) -> u64 {
+        OPENAI_FILE_UPLOAD_LIMIT_BYTES.saturating_sub(self.staged_bytes)
+    }
+
+    fn record_file(&mut self, file_size_bytes: usize) -> Result<(), String> {
+        let file_size_bytes = u64::try_from(file_size_bytes).map_err(|error| error.to_string())?;
+        let staged_bytes = self
+            .staged_bytes
+            .checked_add(file_size_bytes)
+            .ok_or_else(|| "total staged file size overflowed".to_string())?;
+        if staged_bytes > OPENAI_FILE_UPLOAD_LIMIT_BYTES {
+            return Err(format!(
+                "total staged file size exceeds the limit of {OPENAI_FILE_UPLOAD_LIMIT_BYTES} bytes"
+            ));
+        }
+        self.staged_bytes = staged_bytes;
+        Ok(())
+    }
+}
 
 pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     sess: &Session,
@@ -37,46 +78,118 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     let Some(arguments) = arguments_value.as_object() else {
         return Ok(Some(arguments_value));
     };
-    let auth = sess.services.auth_manager.auth().await;
-    let mut rewritten_arguments = arguments.clone();
-
+    let mut staged_arguments = Vec::new();
+    let mut staging_budget = OpenAiFileStagingBudget::default();
     for field_name in openai_file_input_params {
         let Some(value) = arguments.get(field_name) else {
             continue;
         };
-        let Some(uploaded_value) =
-            rewrite_argument_value_for_openai_files(step_context, auth.as_ref(), field_name, value)
-                .await?
+        let Some(staged_value) = stage_argument_value_for_openai_files(
+            step_context,
+            field_name,
+            value,
+            &mut staging_budget,
+        )
+        .await?
         else {
             continue;
         };
-        rewritten_arguments.insert(field_name.clone(), uploaded_value);
+        staged_arguments.push((field_name.clone(), staged_value));
+    }
+    if staged_arguments.is_empty() {
+        return Ok(Some(arguments_value));
     }
 
-    if rewritten_arguments == *arguments {
-        return Ok(Some(arguments_value));
+    let auth = sess.services.auth_manager.auth().await;
+    let Some(auth) = auth.as_ref().filter(|auth| auth.uses_codex_backend()) else {
+        return Err("ChatGPT auth is required to upload files for Codex Apps tools".to_string());
+    };
+    let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
+    let turn_context = step_context.turn.as_ref();
+    let http_client_factory = turn_context.config.http_client_factory();
+    let base_url = turn_context.config.chatgpt_base_url.trim_end_matches('/');
+    let mut uploaded_file_ids = Vec::new();
+    let mut rewritten_arguments = arguments.clone();
+
+    for (field_name, staged_argument) in staged_arguments {
+        let staged_files = match staged_argument {
+            StagedOpenAiArgument::Single(staged) => vec![staged],
+            StagedOpenAiArgument::Array(staged) => staged,
+        };
+        let is_array = matches!(
+            arguments.get(field_name.as_str()),
+            Some(JsonValue::Array(_))
+        );
+        let mut rewritten_values = Vec::with_capacity(staged_files.len());
+        for staged in staged_files {
+            match upload_staged_openai_file(
+                base_url,
+                upload_auth.as_ref(),
+                &http_client_factory,
+                staged,
+            )
+            .await
+            {
+                Ok((rewritten, file_id)) => {
+                    uploaded_file_ids.push(file_id);
+                    rewritten_values.push(rewritten);
+                }
+                Err(error) => {
+                    let mut rollback_errors = Vec::new();
+                    for file_id in uploaded_file_ids.iter().rev() {
+                        if let Err(rollback_error) = delete_openai_file(
+                            base_url,
+                            upload_auth.as_ref(),
+                            &http_client_factory,
+                            file_id,
+                        )
+                        .await
+                        {
+                            rollback_errors.push(format!("{file_id}: {rollback_error}"));
+                        }
+                    }
+                    if rollback_errors.is_empty() {
+                        return Err(error);
+                    }
+                    return Err(format!(
+                        "{error}; rollback also failed for {}",
+                        rollback_errors.join(", ")
+                    ));
+                }
+            }
+        }
+        let rewritten = if is_array {
+            JsonValue::Array(rewritten_values)
+        } else {
+            rewritten_values
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("no staged value was produced for `{field_name}`"))?
+        };
+        rewritten_arguments.insert(field_name, rewritten);
     }
 
     Ok(Some(JsonValue::Object(rewritten_arguments)))
 }
 
-async fn rewrite_argument_value_for_openai_files(
+async fn stage_argument_value_for_openai_files(
     step_context: &StepContext,
-    auth: Option<&CodexAuth>,
     field_name: &str,
     value: &JsonValue,
-) -> Result<Option<JsonValue>, String> {
+    staging_budget: &mut OpenAiFileStagingBudget,
+) -> Result<Option<StagedOpenAiArgument>, String> {
     match value {
         JsonValue::String(file_path) => {
-            let rewritten = build_uploaded_argument_value(
+            let staged = stage_openai_file(
                 step_context,
-                auth,
                 field_name,
                 /*index*/ None,
                 file_path,
+                staging_budget.remaining_bytes(),
             )
             .await?;
-            Ok(Some(rewritten))
+            staging_budget.record_file(staged.contents.len())?;
+            Ok(Some(StagedOpenAiArgument::Single(staged)))
         }
         JsonValue::Array(values) => {
             let Some(file_paths) = values
@@ -86,24 +199,173 @@ async fn rewrite_argument_value_for_openai_files(
             else {
                 return Ok(None);
             };
-            let mut rewritten_values = Vec::with_capacity(file_paths.len());
+            let mut staged_files = Vec::with_capacity(file_paths.len());
             for (index, file_path) in file_paths.into_iter().enumerate() {
-                let rewritten = build_uploaded_argument_value(
+                let staged = stage_openai_file(
                     step_context,
-                    auth,
                     field_name,
                     Some(index),
                     file_path,
+                    staging_budget.remaining_bytes(),
                 )
                 .await?;
-                rewritten_values.push(rewritten);
+                staging_budget.record_file(staged.contents.len())?;
+                staged_files.push(staged);
             }
-            Ok(Some(JsonValue::Array(rewritten_values)))
+            Ok(Some(StagedOpenAiArgument::Array(staged_files)))
         }
         _ => Ok(None),
     }
 }
 
+async fn stage_openai_file(
+    step_context: &StepContext,
+    field_name: &str,
+    index: Option<usize>,
+    file_path: &str,
+    remaining_upload_bytes: u64,
+) -> Result<StagedOpenAiFile, String> {
+    let contextualize_error = |error: String| match index {
+        Some(index) => {
+            format!("failed to upload `{file_path}` for `{field_name}[{index}]`: {error}")
+        }
+        None => format!("failed to upload `{file_path}` for `{field_name}`: {error}"),
+    };
+    let Some(turn_environment) = step_context.environments.primary() else {
+        return Err(contextualize_error(
+            "no primary sampling-step environment is available".to_string(),
+        ));
+    };
+    validate_relative_file_path(turn_environment.cwd(), file_path).map_err(contextualize_error)?;
+    let path_uri = turn_environment
+        .cwd()
+        .join(file_path)
+        .map_err(|error| contextualize_error(error.to_string()))?;
+    if !path_uri.starts_with(turn_environment.cwd()) {
+        return Err(contextualize_error(
+            "file path resolves outside the selected environment working directory".to_string(),
+        ));
+    }
+    let fs = turn_environment.environment.get_filesystem();
+    let sandbox = step_context
+        .turn
+        .file_system_sandbox_context(/*additional_permissions*/ None, turn_environment.cwd());
+    let contents = fs
+        .read_file_bounded_confined(
+            &path_uri,
+            turn_environment.cwd(),
+            usize::try_from(remaining_upload_bytes).unwrap_or(usize::MAX),
+            Some(&sandbox),
+        )
+        .await
+        .map_err(|error| contextualize_error(error.to_string()))?
+        .ok_or_else(|| {
+            let message = if remaining_upload_bytes < OPENAI_FILE_UPLOAD_LIMIT_BYTES {
+                format!(
+                    "file is too large, changed while being read, or would make total staged file size exceed the limit of {OPENAI_FILE_UPLOAD_LIMIT_BYTES} bytes"
+                )
+            } else {
+                format!(
+                    "file is too large or changed while being read; limit is {OPENAI_FILE_UPLOAD_LIMIT_BYTES} bytes"
+                )
+            };
+            contextualize_error(message)
+        })?;
+    let file_name = file_path
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
+        .unwrap_or("file")
+        .to_string();
+
+    Ok(StagedOpenAiFile {
+        field_name: field_name.to_string(),
+        index,
+        file_path: file_path.to_string(),
+        file_name,
+        contents,
+    })
+}
+
+fn validate_relative_file_path(
+    cwd: &codex_utils_path_uri::PathUri,
+    file_path: &str,
+) -> Result<(), String> {
+    if file_path.is_empty() {
+        return Err("file path must not be empty".to_string());
+    }
+    let convention = cwd
+        .infer_path_convention()
+        .ok_or_else(|| "selected environment has an unsupported path convention".to_string())?;
+    let is_absolute = match convention {
+        PathConvention::Posix => file_path.starts_with('/'),
+        PathConvention::Windows => {
+            file_path.starts_with('/')
+                || file_path.starts_with('\\')
+                || matches!(file_path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+        }
+    };
+    if is_absolute {
+        return Err(
+            "file path must be relative to the selected environment working directory".to_string(),
+        );
+    }
+    let has_parent_component = match convention {
+        PathConvention::Posix => file_path.split('/').any(|component| component == ".."),
+        PathConvention::Windows => file_path
+            .split(['/', '\\'])
+            .any(|component| component == ".."),
+    };
+    if has_parent_component {
+        return Err("file path must not contain parent-directory components".to_string());
+    }
+    Ok(())
+}
+
+async fn upload_staged_openai_file(
+    base_url: &str,
+    auth: &dyn codex_api::AuthProvider,
+    http_client_factory: &codex_http_client::HttpClientFactory,
+    staged: StagedOpenAiFile,
+) -> Result<(JsonValue, String), String> {
+    let StagedOpenAiFile {
+        field_name,
+        index,
+        file_path,
+        file_name,
+        contents,
+    } = staged;
+    let contextualize_error = |error: String| match index {
+        Some(index) => {
+            format!("failed to upload `{file_path}` for `{field_name}[{index}]`: {error}")
+        }
+        None => format!("failed to upload `{file_path}` for `{field_name}`: {error}"),
+    };
+    let file_size_bytes =
+        u64::try_from(contents.len()).map_err(|error| contextualize_error(error.to_string()))?;
+    let contents = futures::stream::once(async move { Ok::<_, std::io::Error>(contents.into()) });
+    let uploaded = upload_openai_file(
+        base_url,
+        auth,
+        http_client_factory,
+        file_name,
+        file_size_bytes,
+        contents,
+    )
+    .await
+    .map_err(|error| contextualize_error(error.to_string()))?;
+    let file_id = uploaded.file_id.clone();
+    Ok((
+        serde_json::json!({
+            "download_url": uploaded.download_url,
+            "file_id": uploaded.file_id,
+            "mime_type": uploaded.mime_type,
+            "file_name": uploaded.file_name,
+        }),
+        file_id,
+    ))
+}
+
+#[cfg(test)]
 async fn build_uploaded_argument_value(
     step_context: &StepContext,
     auth: Option<&CodexAuth>,
@@ -111,78 +373,27 @@ async fn build_uploaded_argument_value(
     index: Option<usize>,
     file_path: &str,
 ) -> Result<JsonValue, String> {
-    let contextualize_error = |error: String| match index {
-        Some(index) => {
-            format!("failed to upload `{file_path}` for `{field_name}[{index}]`: {error}")
-        }
-        None => format!("failed to upload `{file_path}` for `{field_name}`: {error}"),
-    };
-    let Some(auth) = auth else {
+    let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) else {
         return Err("ChatGPT auth is required to upload files for Codex Apps tools".to_string());
     };
-    if !auth.uses_codex_backend() {
-        return Err("ChatGPT auth is required to upload files for Codex Apps tools".to_string());
-    }
-    let Some(turn_environment) = step_context.environments.primary() else {
-        return Err(contextualize_error(
-            "no primary sampling-step environment is available".to_string(),
-        ));
-    };
-    // TODO(anp): Resolve app tool file arguments using the selected environment's native path
-    // convention so uploads can read relative paths from foreign environments.
-    let native_environment_cwd = turn_environment
-        .cwd()
-        .to_abs_path()
-        .map_err(|error| contextualize_error(error.to_string()))?;
-    let resolved_path = native_environment_cwd.join(file_path);
-    let path_uri = PathUri::from_abs_path(&resolved_path);
-    let fs = turn_environment.environment.get_filesystem();
-    let metadata = fs
-        .get_metadata(&path_uri, /*sandbox*/ None)
-        .await
-        .map_err(|error| contextualize_error(error.to_string()))?;
-    if !metadata.is_file {
-        return Err(contextualize_error(format!(
-            "path `{}` is not a file",
-            resolved_path.display()
-        )));
-    }
-    if metadata.size > OPENAI_FILE_UPLOAD_LIMIT_BYTES {
-        return Err(contextualize_error(format!(
-            "file `{}` is too large: {} bytes exceeds the limit of {} bytes",
-            resolved_path.display(),
-            metadata.size,
-            OPENAI_FILE_UPLOAD_LIMIT_BYTES,
-        )));
-    }
-    let contents = fs
-        .read_file_stream(&path_uri, /*sandbox*/ None)
-        .await
-        .map_err(|error| contextualize_error(error.to_string()))?;
-    let file_name = resolved_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("file")
-        .to_string();
+    let staged = stage_openai_file(
+        step_context,
+        field_name,
+        index,
+        file_path,
+        OPENAI_FILE_UPLOAD_LIMIT_BYTES,
+    )
+    .await?;
     let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
     let turn_context = step_context.turn.as_ref();
-    let http_client_factory = turn_context.config.http_client_factory();
-    let uploaded = upload_openai_file(
+    upload_staged_openai_file(
         turn_context.config.chatgpt_base_url.trim_end_matches('/'),
         upload_auth.as_ref(),
-        &http_client_factory,
-        file_name,
-        metadata.size,
-        contents,
+        &turn_context.config.http_client_factory(),
+        staged,
     )
     .await
-    .map_err(|error| contextualize_error(error.to_string()))?;
-    Ok(serde_json::json!({
-        "download_url": uploaded.download_url,
-        "file_id": uploaded.file_id,
-        "mime_type": uploaded.mime_type,
-        "file_name": uploaded.file_name,
-    }))
+    .map(|(rewritten, _file_id)| rewritten)
 }
 
 #[cfg(test)]
@@ -210,6 +421,40 @@ mod tests {
             Arc::clone(&primary.environment),
             PathUri::from_abs_path(&cwd),
             primary.shell.clone(),
+        );
+    }
+
+    #[test]
+    fn openai_file_paths_must_be_confined_relative_paths() {
+        let dir = tempdir().expect("temp dir");
+        let cwd = AbsolutePathBuf::try_from(dir.path()).expect("absolute path");
+        let cwd = PathUri::from_abs_path(&cwd);
+
+        assert!(validate_relative_file_path(&cwd, "nested/report.csv").is_ok());
+        assert!(validate_relative_file_path(&cwd, "../secret.txt").is_err());
+        assert!(validate_relative_file_path(&cwd, "nested/../../secret.txt").is_err());
+        let absolute = match cwd.infer_path_convention().expect("path convention") {
+            PathConvention::Posix => "/etc/passwd",
+            PathConvention::Windows => r"C:\\Windows\\win.ini",
+        };
+        assert!(validate_relative_file_path(&cwd, absolute).is_err());
+    }
+
+    #[test]
+    fn openai_file_staging_budget_rejects_an_aggregate_over_the_upload_limit() {
+        let mut budget = OpenAiFileStagingBudget {
+            staged_bytes: OPENAI_FILE_UPLOAD_LIMIT_BYTES - 1,
+        };
+
+        let error = budget
+            .record_file(/*file_size_bytes*/ 2)
+            .expect_err("aggregate staging must stay bounded");
+
+        assert!(error.contains("total staged file size exceeds"));
+        assert_eq!(
+            budget.staged_bytes,
+            OPENAI_FILE_UPLOAD_LIMIT_BYTES - 1,
+            "a rejected reservation must not consume budget"
         );
     }
 
@@ -336,11 +581,11 @@ mod tests {
         .expect_err("oversized file should be rejected");
 
         assert!(error.contains("is too large"));
-        assert!(error.contains(&(OPENAI_FILE_UPLOAD_LIMIT_BYTES + 1).to_string()));
+        assert!(error.contains(&OPENAI_FILE_UPLOAD_LIMIT_BYTES.to_string()));
     }
 
     #[tokio::test]
-    async fn rewrite_argument_value_for_openai_files_rewrites_scalar_path() {
+    async fn rewrite_mcp_tool_arguments_for_openai_files_rewrites_scalar_path() {
         use wiremock::Mock;
         use wiremock::MockServer;
         use wiremock::ResponseTemplate;
@@ -384,8 +629,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_, mut turn_context) = make_session_and_context().await;
-        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        session.services.auth_manager = crate::test_support::auth_manager_from_auth(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        );
         let dir = tempdir().expect("temp dir");
         let local_path = dir.path().join("file_report.csv");
         tokio::fs::write(&local_path, b"hello")
@@ -397,11 +644,11 @@ mod tests {
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
         turn_context.config = Arc::new(config);
         let step_context = StepContext::for_test(Arc::new(turn_context));
-        let rewritten = rewrite_argument_value_for_openai_files(
+        let rewritten = rewrite_mcp_tool_arguments_for_openai_files(
+            &session,
             &step_context,
-            Some(&auth),
-            "file",
-            &serde_json::json!("file_report.csv"),
+            Some(serde_json::json!({"file": "file_report.csv"})),
+            Some(&["file".to_string()]),
         )
         .await
         .expect("rewrite should succeed");
@@ -409,16 +656,18 @@ mod tests {
         assert_eq!(
             rewritten,
             Some(serde_json::json!({
-                "download_url": format!("{}/download/file_123", server.uri()),
-                "file_id": "file_123",
-                "mime_type": "text/csv",
-                "file_name": "file_report.csv",
+                "file": {
+                    "download_url": format!("{}/download/file_123", server.uri()),
+                    "file_id": "file_123",
+                    "mime_type": "text/csv",
+                    "file_name": "file_report.csv",
+                }
             }))
         );
     }
 
     #[tokio::test]
-    async fn rewrite_argument_value_for_openai_files_rewrites_array_paths() {
+    async fn rewrite_mcp_tool_arguments_for_openai_files_rewrites_array_paths() {
         use wiremock::Mock;
         use wiremock::MockServer;
         use wiremock::ResponseTemplate;
@@ -495,8 +744,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_, mut turn_context) = make_session_and_context().await;
-        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        session.services.auth_manager = crate::test_support::auth_manager_from_auth(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        );
         let dir = tempdir().expect("temp dir");
         tokio::fs::write(dir.path().join("one.csv"), b"one")
             .await
@@ -510,32 +761,125 @@ mod tests {
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
         turn_context.config = Arc::new(config);
         let step_context = StepContext::for_test(Arc::new(turn_context));
-        let rewritten = rewrite_argument_value_for_openai_files(
+        let rewritten = rewrite_mcp_tool_arguments_for_openai_files(
+            &session,
             &step_context,
-            Some(&auth),
-            "files",
-            &serde_json::json!(["one.csv", "two.csv"]),
+            Some(serde_json::json!({"files": ["one.csv", "two.csv"]})),
+            Some(&["files".to_string()]),
         )
         .await
         .expect("rewrite should succeed");
 
         assert_eq!(
             rewritten,
-            Some(serde_json::json!([
-                {
-                    "download_url": format!("{}/download/file_1", server.uri()),
-                    "file_id": "file_1",
-                    "mime_type": "text/csv",
-                    "file_name": "one.csv",
-                },
-                {
-                    "download_url": format!("{}/download/file_2", server.uri()),
-                    "file_id": "file_2",
-                    "mime_type": "text/csv",
-                    "file_name": "two.csv",
-                }
-            ]))
+            Some(serde_json::json!({
+                "files": [
+                    {
+                        "download_url": format!("{}/download/file_1", server.uri()),
+                        "file_id": "file_1",
+                        "mime_type": "text/csv",
+                        "file_name": "one.csv",
+                    },
+                    {
+                        "download_url": format!("{}/download/file_2", server.uri()),
+                        "file_id": "file_2",
+                        "mime_type": "text/csv",
+                        "file_name": "two.csv",
+                    }
+                ]
+            }))
         );
+    }
+
+    #[tokio::test]
+    async fn rewrite_rolls_back_prior_uploads_when_a_later_upload_fails() {
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::body_json;
+        use wiremock::matchers::header;
+        use wiremock::matchers::method;
+        use wiremock::matchers::path;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .and(body_json(serde_json::json!({
+                "file_name": "one.csv",
+                "file_size": 3,
+                "use_case": "codex",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file_1",
+                "upload_url": format!("{}/upload/file_1", server.uri()),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload/file_1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files/file_1/uploaded"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "download_url": format!("{}/download/file_1", server.uri()),
+                "file_name": "one.csv",
+                "mime_type": "text/csv",
+                "file_size_bytes": 3,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .and(body_json(serde_json::json!({
+                "file_name": "two.csv",
+                "file_size": 3,
+                "use_case": "codex",
+            })))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/backend-api/files/file_1"))
+            .and(header("chatgpt-account-id", "account_id"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        session.services.auth_manager = crate::test_support::auth_manager_from_auth(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        );
+        let dir = tempdir().expect("temp dir");
+        tokio::fs::write(dir.path().join("one.csv"), b"one")
+            .await
+            .expect("write first local file");
+        tokio::fs::write(dir.path().join("two.csv"), b"two")
+            .await
+            .expect("write second local file");
+        set_primary_environment_cwd(&mut turn_context, dir.path());
+        let mut config = (*turn_context.config).clone();
+        config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+        turn_context.config = Arc::new(config);
+        let step_context = StepContext::for_test(Arc::new(turn_context));
+
+        let error = rewrite_mcp_tool_arguments_for_openai_files(
+            &session,
+            &step_context,
+            Some(serde_json::json!({"files": ["one.csv", "two.csv"]})),
+            Some(&["files".to_string()]),
+        )
+        .await
+        .expect_err("second upload should fail");
+
+        assert!(error.contains("500"));
     }
 
     #[tokio::test]
@@ -549,14 +893,17 @@ mod tests {
             &session,
             &step_context,
             Some(serde_json::json!({
-                "file": "/definitely/missing/file.csv",
+                "file": "definitely/missing/file.csv",
             })),
             Some(&["file".to_string()]),
         )
         .await
         .expect_err("missing file should fail");
 
-        assert!(error.contains("failed to upload"));
+        assert!(
+            error.contains("failed to upload"),
+            "unexpected error: {error}"
+        );
         assert!(error.contains("file"));
     }
 }

@@ -3,4 +3,10 @@ config:
     line_length: 100
 
 globs:
-  - "docs/tui-chat-composer.md"
+  - "**/*.md"
+  - "!**/node_modules/**"
+  - "!**/target/**"
+  - "!.codex/**"
+  - "!.worktrees/**"
+  - "!codex-rs/vendor/**"
+  - "!docs/audits/**"

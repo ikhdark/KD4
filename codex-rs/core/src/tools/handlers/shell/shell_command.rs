@@ -357,6 +357,11 @@ impl ShellCommandHandler {
             exec_params.network,
         );
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+        let repository_epoch = session
+            .services
+            .command_execution
+            .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
+            .await;
         let ValidationRegistrationRoles {
             execution: validation_leader,
             worker_waiter: validation_waiter,
@@ -372,7 +377,7 @@ impl ShellCommandHandler {
                 &command_invocation,
                 environment,
                 toolchain,
-                observed_mutation_revision,
+                repository_epoch,
             );
             validation_registration_roles(
                 register_if_absent(
@@ -386,11 +391,6 @@ impl ShellCommandHandler {
         } else {
             ValidationRegistrationRoles::default()
         };
-        let repository_epoch = session
-            .services
-            .command_execution
-            .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
-            .await;
         let attempt_key = CommandAttemptKey::new(
             tool_name.name.as_str(),
             &turn_environment.environment_id,

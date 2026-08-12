@@ -31,6 +31,53 @@ struct PendingSpawnCleanup {
     armed: bool,
 }
 
+struct PendingSpawnCleanupJob {
+    control: AgentControl,
+    child_thread: Arc<crate::CodexThread>,
+    child_thread_id: ThreadId,
+}
+
+static PENDING_SPAWN_CLEANUP_SENDER: std::sync::OnceLock<
+    Option<std::sync::mpsc::Sender<PendingSpawnCleanupJob>>,
+> = std::sync::OnceLock::new();
+
+fn pending_spawn_cleanup_sender() -> Option<&'static std::sync::mpsc::Sender<PendingSpawnCleanupJob>>
+{
+    PENDING_SPAWN_CLEANUP_SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<PendingSpawnCleanupJob>();
+            let worker = std::thread::Builder::new()
+                .name("codex-spawn-cleanup".to_string())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            warn!(%error, "failed to create agent spawn cleanup runtime");
+                            return;
+                        }
+                    };
+                    while let Ok(job) = receiver.recv() {
+                        let _ = runtime.block_on(job.control.rollback_failed_initial_submission(
+                            job.child_thread.as_ref(),
+                            job.child_thread_id,
+                            CodexErr::TurnAborted,
+                        ));
+                    }
+                });
+            match worker {
+                Ok(_) => Some(sender),
+                Err(error) => {
+                    warn!(%error, "failed to start agent spawn cleanup worker");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 impl PendingSpawnCleanup {
     fn new(
         control: AgentControl,
@@ -68,25 +115,26 @@ impl Drop for PendingSpawnCleanup {
         if !self.armed {
             return;
         }
-        let control = self.control.clone();
-        let child_thread = Arc::clone(&self.child_thread);
-        let child_thread_id = self.child_thread_id;
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        let Some(sender) = pending_spawn_cleanup_sender() else {
             warn!(
-                %child_thread_id,
-                "unable to schedule cleanup for cancelled agent spawn without a Tokio runtime"
+                child_thread_id = %self.child_thread_id,
+                "unable to schedule cleanup for cancelled agent spawn"
             );
             return;
         };
-        drop(runtime.spawn(async move {
-            let _ = control
-                .rollback_failed_initial_submission(
-                    child_thread.as_ref(),
-                    child_thread_id,
-                    CodexErr::TurnAborted,
-                )
-                .await;
-        }));
+        if sender
+            .send(PendingSpawnCleanupJob {
+                control: self.control.clone(),
+                child_thread: Arc::clone(&self.child_thread),
+                child_thread_id: self.child_thread_id,
+            })
+            .is_err()
+        {
+            warn!(
+                child_thread_id = %self.child_thread_id,
+                "agent spawn cleanup worker stopped before cleanup could be scheduled"
+            );
+        }
     }
 }
 

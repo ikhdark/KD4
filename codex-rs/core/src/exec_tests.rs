@@ -489,6 +489,45 @@ async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_direct_exec_completes_for_trivial_command() -> Result<()> {
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        exec(
+            ExecParams {
+                command: vec![
+                    "cmd.exe".to_string(),
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "exit 0".to_string(),
+                ],
+                cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
+                expiration: ExecExpiration::Timeout(Duration::from_secs(5)),
+                capture_policy: ExecCapturePolicy::FullBuffer,
+                env,
+                network: None,
+                network_environment_id: None,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                windows_sandbox_private_desktop: false,
+                justification: None,
+                arg0: None,
+            },
+            NetworkSandboxPolicy::Enabled,
+            /*stdout_stream*/ None,
+            /*after_spawn*/ None,
+        ),
+    )
+    .await
+    .expect("trivial Windows command should not hang")?;
+
+    assert_eq!(output.exit_status.code(), Some(0));
+    assert!(!output.timed_out);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_pipe_open()

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
@@ -60,6 +61,23 @@ pub(crate) async fn run_command(
     input_json: &str,
     cwd: &Path,
 ) -> CommandRunResult {
+    run_command_with_reservation(
+        shell,
+        handler,
+        input_json,
+        cwd,
+        codex_utils_pty::ManagedRootProcess::reserve_with_reclaim(),
+    )
+    .await
+}
+
+async fn run_command_with_reservation(
+    shell: &CommandShell,
+    handler: &ConfiguredHandler,
+    input_json: &str,
+    cwd: &Path,
+    reservation: impl Future<Output = io::Result<codex_utils_pty::ManagedRootProcess>>,
+) -> CommandRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
     let timeout_duration = Duration::from_secs(handler.timeout_sec);
@@ -72,6 +90,35 @@ pub(crate) async fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            codex_utils_pty::process_group::detach_from_tty()?;
+            Ok(())
+        });
+    }
+
+    let managed = match timeout_at(timeout_deadline, reservation).await {
+        Ok(Ok(managed)) => managed,
+        Ok(Err(err)) => {
+            return finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(format!("failed to reserve hook process containment: {err}")),
+                    outcome: "spawn_error",
+                },
+            );
+        }
+        Err(_) => return finish_timeout(started_at, started, handler.timeout_sec),
+    };
+
+    if tokio::time::Instant::now() >= timeout_deadline {
+        return finish_timeout(started_at, started, handler.timeout_sec);
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -89,10 +136,46 @@ pub(crate) async fn run_command(
             );
         }
     };
+    #[cfg(windows)]
+    {
+        let Some(process_id) = child.id() else {
+            terminate_command_tree(&mut child, &managed).await;
+            return finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some("spawned hook process has no process id".to_string()),
+                    outcome: "spawn_error",
+                },
+            );
+        };
+        if let Err(err) = managed.attach(process_id) {
+            terminate_command_tree(&mut child, &managed).await;
+            return finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(format!("failed to contain hook process: {err}")),
+                    outcome: "spawn_error",
+                },
+            );
+        }
+    }
+
+    if tokio::time::Instant::now() >= timeout_deadline {
+        terminate_command_tree(&mut child, &managed).await;
+        return finish_timeout(started_at, started, handler.timeout_sec);
+    }
 
     let stdin = child.stdin.take();
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
+        terminate_command_tree(&mut child, &managed).await;
         return finish_command_run(
             started_at,
             started,
@@ -106,7 +189,7 @@ pub(crate) async fn run_command(
         );
     };
     let Some(stderr) = child.stderr.take() else {
-        let _ = child.kill().await;
+        terminate_command_tree(&mut child, &managed).await;
         return finish_command_run(
             started_at,
             started,
@@ -168,7 +251,7 @@ pub(crate) async fn run_command(
             )
         }
         Ok(Err(err)) => {
-            let _ = child.kill().await;
+            terminate_command_tree(&mut child, &managed).await;
             let (error, outcome) = match err {
                 CommandRunError::Stdin(err) => {
                     (format!("failed to write hook stdin: {err}"), "stdin_error")
@@ -188,19 +271,32 @@ pub(crate) async fn run_command(
             )
         }
         Err(_) => {
-            let _ = child.kill().await;
-            finish_command_run(
-                started_at,
-                started,
-                CommandRunCompletion {
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    error: Some(format!("hook timed out after {}s", handler.timeout_sec)),
-                    outcome: "timeout",
-                },
-            )
+            terminate_command_tree(&mut child, &managed).await;
+            finish_timeout(started_at, started, handler.timeout_sec)
         }
+    }
+}
+
+async fn terminate_command_tree(
+    child: &mut tokio::process::Child,
+    managed: &codex_utils_pty::ManagedRootProcess,
+) {
+    #[cfg(windows)]
+    if let Err(err) = managed.terminate() {
+        tracing::warn!("failed to terminate hook process Job Object: {err:?}");
+    }
+    #[cfg(not(windows))]
+    let _ = managed;
+    if let Some(process_group_id) = child.id()
+        && let Err(err) = codex_utils_pty::process_group::kill_process_group(process_group_id)
+    {
+        tracing::warn!("failed to kill hook process group {process_group_id}: {err:?}");
+    }
+    if let Err(err) = child.kill().await
+        && err.kind() != io::ErrorKind::InvalidInput
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to kill hook process: {err:?}");
     }
 }
 
@@ -300,6 +396,20 @@ fn finish_command_run(
         stderr: completion.stderr,
         error: completion.error,
     }
+}
+
+fn finish_timeout(started_at: i64, started: Instant, timeout_sec: u64) -> CommandRunResult {
+    finish_command_run(
+        started_at,
+        started,
+        CommandRunCompletion {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(format!("hook timed out after {timeout_sec}s")),
+            outcome: "timeout",
+        },
+    )
 }
 
 fn build_command(shell: &CommandShell, handler: &ConfiguredHandler) -> Command {
@@ -417,6 +527,77 @@ mod tests {
         assert_eq!(result.stdout, "");
         assert_eq!(result.stderr, "");
         assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
+    }
+
+    #[tokio::test]
+    async fn timeout_covers_process_admission_before_spawn() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let marker = temp_dir.path().join("spawned-after-admission-timeout.txt");
+        let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
+        #[cfg(windows)]
+        let command = {
+            let marker = marker.to_string_lossy().replace('\'', "''");
+            format!("Set-Content -LiteralPath '{marker}' -Value spawned")
+        };
+        #[cfg(not(windows))]
+        let command = {
+            let marker = marker.to_string_lossy().replace('\'', "'\\''");
+            format!("printf spawned > '{marker}'")
+        };
+        let handler = test_handler(command, 1, &cwd);
+        let blocked_admission =
+            std::future::pending::<io::Result<codex_utils_pty::ManagedRootProcess>>();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_command_with_reservation(
+                &explicit_test_shell(),
+                &handler,
+                "{}",
+                cwd.as_path(),
+                blocked_admission,
+            ),
+        )
+        .await
+        .expect("run_command should enforce its timeout during process admission");
+
+        assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
+        assert!(!marker.exists(), "the hook spawned after its deadline");
+    }
+
+    #[tokio::test]
+    async fn timeout_terminates_descendant_processes() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let marker = temp_dir.path().join("escaped-descendant.txt");
+        let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
+        #[cfg(windows)]
+        let command = {
+            let marker = marker.to_string_lossy().replace('\'', "''");
+            format!(
+                "Start-Job -ScriptBlock {{ Start-Sleep -Seconds 3; Set-Content -LiteralPath '{marker}' -Value done }} | Out-Null; Start-Sleep -Seconds 60"
+            )
+        };
+        #[cfg(not(windows))]
+        let command = {
+            let marker = marker.to_string_lossy().replace('\'', "'\\''");
+            format!("(sleep 3; printf done > '{marker}') & sleep 60")
+        };
+        let handler = test_handler(command, 1, &cwd);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_command(&explicit_test_shell(), &handler, 0, "{}", cwd.as_path()),
+        )
+        .await
+        .expect("run_command should enforce its timeout");
+
+        assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !marker.exists(),
+            "a descendant survived the hook timeout and wrote {}",
+            marker.display()
+        );
     }
 
     #[tokio::test]

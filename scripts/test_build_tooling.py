@@ -33,6 +33,35 @@ def pwsh_only() -> str | None:
     return shutil.which("pwsh")
 
 
+def bash_executable() -> str | None:
+    if os.name != "nt":
+        return shutil.which("bash")
+
+    git = shutil.which("git")
+    if git is not None:
+        completed = subprocess.run(
+            [git, "--exec-path"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if completed.returncode == 0:
+            exec_path = Path(completed.stdout.strip())
+            if len(exec_path.parents) >= 3:
+                candidate = exec_path.parents[2] / "bin" / "bash.exe"
+                if candidate.is_file():
+                    return str(candidate)
+
+    # System32's bash.exe is a WSL launcher, not a standalone Bash runtime.
+    candidate = shutil.which("bash")
+    system32 = Path(os.environ["SystemRoot"]) / "System32"
+    if candidate is not None and Path(candidate).parent != system32:
+        return candidate
+    return None
+
+
 def ps_single_quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -72,6 +101,16 @@ def load_toml(path: Path):
 
 
 class BuildToolingEnvironmentTest(unittest.TestCase):
+    def test_just_shell_limits_rust_setup_to_rust_commands(self) -> None:
+        just_shell = load_just_shell_module()
+
+        self.assertFalse(just_shell.command_needs_rust_tooling("pnpm lint:markdown"))
+        self.assertFalse(just_shell.command_needs_rust_tooling("python tool.py"))
+        self.assertTrue(just_shell.command_needs_rust_tooling("cargo test -p codex-core"))
+        self.assertTrue(
+            just_shell.command_needs_rust_tooling("python rust_build_status.py run-lane")
+        )
+
     def test_local_just_shell_sets_sccache_without_probe(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -992,6 +1031,101 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertIn("via codex-rs/.cargo/config.toml", publish_entrypoint)
         self.assertNotIn("CARGO_TARGET_*_RUSTFLAGS", publish_entrypoint)
         self.assertNotIn("$env:RUSTFLAGS", publish_entrypoint)
+
+    def test_publish_commit_state_covers_changed_binary_restart_failures(self) -> None:
+        publish_script = (
+            REPO_ROOT / "scripts" / "publish-local-codex.ps1"
+        ).read_text(encoding="utf-8")
+
+        state_start = publish_script.index("$publishCommitted = $false")
+        outer_try = publish_script.index("try {", state_start)
+        self.assertIn("$restartFailure = $null", publish_script[state_start:outer_try])
+
+        commit_markers = [
+            index
+            for index in range(len(publish_script))
+            if publish_script.startswith("$publishCommitted = $true", index)
+        ]
+        self.assertEqual(len(commit_markers), 2)
+        changed_publish_commit = commit_markers[1]
+        changed_publish_restart = publish_script.index(
+            "if ($RestartDesktop) {", changed_publish_commit
+        )
+        backup_cleanup = publish_script.index(
+            "$protectedBackupPath =", changed_publish_restart
+        )
+        self.assertLess(changed_publish_commit, changed_publish_restart)
+        self.assertLess(changed_publish_restart, backup_cleanup)
+        restart_block = publish_script[changed_publish_restart:backup_cleanup]
+        self.assertIn("$restartFailure = $_.Exception", restart_block)
+        self.assertIn('Write-ProofLine "restartFailed" "true"', restart_block)
+        self.assertIn(
+            "if ((-not $publishCommitted) -and $null -ne $desktopRoutingSnapshot)",
+            publish_script,
+        )
+
+    def test_remote_env_missing_container_cleanup_is_idempotent(self) -> None:
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("standalone bash is required")
+
+        remote_env_script = (
+            REPO_ROOT / "scripts" / "test-remote-env.sh"
+        ).read_text(encoding="utf-8")
+        definitions = "is_sourced() {" + remote_env_script.split(
+            "is_sourced() {", 1
+        )[1].split("\nif ! is_sourced; then", 1)[0]
+        harness = definitions + r'''
+set -euo pipefail
+test_root="$(mktemp -d)"
+trap 'rm -rf "${test_root}"' EXIT
+binary_path="${test_root}/codex"
+docker_log="${test_root}/docker.log"
+printf 'codex' >"${binary_path}"
+
+docker() {
+  printf '%s\n' "$*" >>"${docker_log}"
+  if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+    printf 'sha256:test-image\n'
+    return 0
+  fi
+  if [[ "$1" == "rm" && "$2" == "-f" ]]; then
+    return 1
+  fi
+  if [[ "$1" == "run" && "$2" == "-d" ]]; then
+    printf 'test-container\n'
+    return 0
+  fi
+  return 99
+}
+
+CODEX_TEST_REMOTE_ENV_MOUNT_BINARY=0
+CODEX_TEST_REMOTE_ENV_REUSE=0
+start_remote_env_container missing-container test-image "${binary_path}" 4321
+grep -q '^rm -f missing-container$' "${docker_log}"
+grep -q '^run -d ' "${docker_log}"
+'''
+
+        completed = subprocess.run(
+            [bash, "-s"],
+            input=harness,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=REPO_ROOT,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+
+    def test_dependency_policy_dispatches_duplicate_check_recipe(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        recipe = justfile.split("deps-policy-check *args:", 1)[1].split(
+            "\n\n", 1
+        )[0]
+
+        self.assertIn("just deps-duplicates-check {args}", recipe)
+        self.assertNotIn("just deps-duplicates {args}", recipe)
 
 
 if __name__ == "__main__":

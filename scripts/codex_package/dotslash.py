@@ -238,8 +238,6 @@ def archive_is_valid(
 ) -> bool:
     if not archive_path.is_file():
         return False
-    if verified_archive_stamp_matches(archive_path, artifact):
-        return True
     try:
         verify_archive(archive_path, artifact, artifact_label)
     except RuntimeError:
@@ -292,20 +290,6 @@ def download_archive(url: str, archive_path: Path) -> None:
         temp_path.unlink(missing_ok=True)
 
 
-def verified_archive_stamp_matches(
-    archive_path: Path,
-    artifact: DotSlashArtifact,
-) -> bool:
-    stamp = read_json_stamp(verified_archive_stamp_path(archive_path))
-    return stamp == {
-        "kind": "dotslash-archive",
-        "url": artifact.url,
-        "size": artifact.size,
-        "digest": artifact.digest,
-        "file": file_stamp(archive_path),
-    }
-
-
 def write_verified_archive_stamp(
     archive_path: Path,
     artifact: DotSlashArtifact,
@@ -330,14 +314,18 @@ def extracted_member_is_valid(dest: Path, artifact: DotSlashArtifact) -> bool:
     if not dest.is_file():
         return False
     stamp = read_json_stamp(extracted_member_stamp_path(dest))
-    return stamp == {
+    if not isinstance(stamp, dict):
+        return False
+    expected = {
         "kind": "dotslash-extracted-member",
         "archive_digest": artifact.digest,
         "archive_format": artifact.archive_format,
         "archive_member": artifact.archive_member,
         "url": artifact.url,
-        "file": file_stamp(dest),
     }
+    return all(stamp.get(key) == value for key, value in expected.items()) and stamp.get(
+        "sha256"
+    ) == sha256_file(dest)
 
 
 def write_extracted_member_stamp(dest: Path, artifact: DotSlashArtifact) -> None:
@@ -349,6 +337,7 @@ def write_extracted_member_stamp(dest: Path, artifact: DotSlashArtifact) -> None
             "archive_format": artifact.archive_format,
             "archive_member": artifact.archive_member,
             "url": artifact.url,
+            "sha256": sha256_file(dest),
             "file": file_stamp(dest),
         },
     )
@@ -364,6 +353,14 @@ def file_stamp(path: Path) -> dict[str, int]:
         "size": stat_result.st_size,
         "mtime_ns": stat_result.st_mtime_ns,
     }
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def stamp_cache_key(path: Path) -> tuple[int, int] | None:

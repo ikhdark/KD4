@@ -615,6 +615,12 @@ async fn try_create_creates_and_deletes_snapshot_file() -> Result<()> {
     .expect("snapshot should be created");
     let path = snapshot.path.clone();
     assert!(path.exists());
+    let snapshot_dir_mode = fs::metadata(dir.path().join(SNAPSHOT_DIR))
+        .await?
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(snapshot_dir_mode, 0o700);
 
     drop(snapshot);
 

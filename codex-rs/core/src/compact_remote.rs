@@ -253,7 +253,11 @@ async fn run_remote_compact_task_inner_impl(
             );
             match fallback_result {
                 Ok(attempt) => (attempt, fallback_turn_context),
-                Err(_) => return Err(error),
+                Err(fallback_error) => {
+                    return Err(CodexErr::Fatal(format!(
+                        "remote compaction failed with the previous model: {error}; retry with the current model also failed: {fallback_error}"
+                    )));
+                }
             }
         }
     };

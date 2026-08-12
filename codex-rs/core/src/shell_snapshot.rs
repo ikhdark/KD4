@@ -7,6 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use crate::StateDbHandle;
 use crate::rollout::list::find_thread_path_by_id_str;
 use crate::session::turn_context::TurnEnvironment;
@@ -22,6 +27,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::fs;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -45,7 +51,7 @@ pub(crate) struct ShellSnapshotFile {
 }
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
-const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3); // 3 days retention.
+const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24);
 const SNAPSHOT_DIR: &str = "shell_snapshots";
 const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
 pub(crate) const POSIX_SNAPSHOT_FORMAT_HEADER: &str = "# Codex shell snapshot format: 3";
@@ -234,12 +240,34 @@ async fn write_shell_snapshot(
         fs::create_dir_all(&parent)
             .await
             .with_context(|| format!("Failed to create snapshot parent {parent_display}"))?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&parent)
+                .await
+                .with_context(|| format!("Failed to read snapshot parent {parent_display}"))?
+                .permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&parent, permissions)
+                .await
+                .with_context(|| format!("Failed to secure snapshot parent {parent_display}"))?;
+        }
     }
 
     let snapshot_path = output_path.display();
-    fs::write(output_path, snapshot)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(output_path)
+        .await
+        .with_context(|| format!("Failed to create snapshot at {snapshot_path}"))?;
+    file.write_all(snapshot.as_bytes())
         .await
         .with_context(|| format!("Failed to write snapshot to {snapshot_path}"))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("Failed to persist snapshot to {snapshot_path}"))?;
 
     Ok(())
 }
@@ -426,8 +454,14 @@ async fn run_script_with_timeout_with_args(
             }
             drop(stdout);
             drop(stderr);
-            if let Err(err) = child.wait().await {
-                tracing::warn!("Failed to reap timed-out snapshot shell: {err:?}");
+            match timeout(Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!("Failed to reap timed-out snapshot shell: {err:?}");
+                }
+                Err(_) => {
+                    tracing::warn!("Timed out reaping killed snapshot shell");
+                }
             }
             return Err(anyhow!("Snapshot command timed out for {shell_name}"));
         }

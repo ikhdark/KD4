@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -213,10 +214,11 @@ def install_single_codex_package_archive(
     *,
     vendor_copy_mode: str = "auto",
 ) -> Path:
-    artifact_subdir = artifact_dir_for_target(artifacts_dir, target)
-    archive_path = artifact_subdir / f"codex-package-{target}.tar.gz"
-    if not archive_path.exists():
-        raise FileNotFoundError(f"Expected package archive not found: {archive_path}")
+    archive_name = f"codex-package-{target}.tar.gz"
+    artifact_subdir = artifact_dir_for_target(
+        artifacts_dir, target, expected_names=(archive_name,)
+    )
+    archive_path = artifact_subdir / archive_name
 
     dest_dir = vendor_dir / target
     vendor_dir.mkdir(parents=True, exist_ok=True)
@@ -238,8 +240,6 @@ def install_single_codex_package_archive(
         if dest_dir.exists():
             dest_dir.replace(backup_dir)
         temp_dir.replace(dest_dir)
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir)
     except Exception:
         if not dest_dir.exists() and backup_dir.exists():
             backup_dir.replace(dest_dir)
@@ -247,8 +247,16 @@ def install_single_codex_package_archive(
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
+
+    if backup_dir.exists():
+        try:
+            shutil.rmtree(backup_dir)
+        except OSError as error:
+            print(
+                f"warning: installed {dest_dir}, but could not remove backup "
+                f"{backup_dir}: {error}",
+                file=sys.stderr,
+            )
 
     return dest_dir
 
@@ -480,7 +488,17 @@ def install_single_binary(
     target: str,
     component: BinaryComponent,
 ) -> Path:
-    artifact_subdir = artifact_dir_for_target(artifacts_dir, target)
+    expected_names = [archive_name_for_target(component.artifact_prefix, target)]
+    fallback_expected_names = [
+        *expected_names,
+        archive_name_for_target(component.artifact_prefix, f"{target}-unsigned"),
+    ]
+    artifact_subdir = artifact_dir_for_target(
+        artifacts_dir,
+        target,
+        expected_names=expected_names,
+        fallback_expected_names=fallback_expected_names,
+    )
     archive_path = _runtime().binary_archive_path(
         artifact_subdir, component.artifact_prefix, target
     )
@@ -507,13 +525,18 @@ def binary_archive_path(artifact_dir: Path, artifact_prefix: str, target: str) -
             archive_name_for_target(artifact_prefix, f"{target}-unsigned")
         )
 
-    for archive_name in archive_names:
-        archive_path = artifact_dir / archive_name
-        if archive_path.exists():
-            return archive_path
+    checked = [artifact_dir / archive_name for archive_name in archive_names]
+    matches = [archive_path for archive_path in checked if archive_path.is_file()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "Ambiguous duplicate artifacts: " + ", ".join(str(path) for path in matches)
+        )
 
     raise FileNotFoundError(
-        f"Expected artifact not found: {artifact_dir / archive_names[0]}"
+        "Expected artifact not found; checked: "
+        + ", ".join(str(path) for path in checked)
     )
 
 
@@ -523,13 +546,35 @@ def archive_name_for_target(artifact_prefix: str, target: str) -> str:
     return f"{artifact_prefix}-{target}.zst"
 
 
-def artifact_dir_for_target(artifacts_dir: Path, target: str) -> Path:
-    for artifact_name in [target, f"{target}-unsigned"]:
-        artifact_dir = artifacts_dir / artifact_name
-        if artifact_dir.is_dir():
-            return artifact_dir
-
-    return artifacts_dir / target
+def artifact_dir_for_target(
+    artifacts_dir: Path,
+    target: str,
+    *,
+    expected_names: Sequence[str],
+    fallback_expected_names: Sequence[str] | None = None,
+) -> Path:
+    fallback_names = fallback_expected_names or expected_names
+    candidates = [
+        (artifacts_dir / target, expected_names),
+        (artifacts_dir / f"{target}-unsigned", fallback_names),
+    ]
+    checked = [directory / name for directory, names in candidates for name in names]
+    matches = [
+        directory
+        for directory, names in candidates
+        if any((directory / name).is_file() for name in names)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Ambiguous artifact directories for {target}: "
+            + ", ".join(str(path) for path in matches)
+        )
+    raise FileNotFoundError(
+        f"Expected artifact for {target} not found; checked: "
+        + ", ".join(str(path) for path in checked)
+    )
 
 
 def extract_zstd_archive(archive_path: Path, dest: Path) -> None:

@@ -36,7 +36,7 @@ use codex_file_search::source_search::validate_read_file_span_bounds;
 use codex_file_search::task_locator::LOCATE_TASK_MAX_FILES;
 use codex_file_search::task_locator::LOCATE_TASK_MAX_SOURCE_BYTES;
 use codex_file_search::task_locator::LocateTaskRequest;
-use codex_file_search::task_locator::locate_task;
+use codex_file_search::task_locator::locate_task_cancellable;
 use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FileMetadata;
 use codex_file_system::FileSystemSandboxContext;
@@ -54,6 +54,8 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::warn;
@@ -309,27 +311,42 @@ async fn handle_locate_task(
     let path_anchor = args.path_anchor;
     let symbol_anchor = args.symbol_anchor;
     let force_fresh = args.force_fresh;
-    let output = tokio::task::spawn_blocking(move || {
-        locate_task(&LocateTaskRequest {
-            repository_root: &repository_root,
-            cache_root: &cache_root,
-            manifest_path: &manifest_path,
-            environment_id: environment_id.as_deref(),
-            task: &task,
-            path_anchor: path_anchor.as_deref(),
-            symbol_anchor: symbol_anchor.as_deref(),
-            max_files,
-            max_source_bytes,
-            force_fresh,
-        })
-    })
-    .await
-    .map_err(|err| {
-        FunctionCallError::RespondToModel(format!("locate_task indexing task failed: {err}"))
-    })?
-    .map_err(|err| {
-        FunctionCallError::RespondToModel(format!("locate_task query failed: {err:#}"))
-    })?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let blocking_cancelled = Arc::clone(&cancelled);
+    let mut indexing_task = tokio::task::spawn_blocking(move || {
+        locate_task_cancellable(
+            &LocateTaskRequest {
+                repository_root: &repository_root,
+                cache_root: &cache_root,
+                manifest_path: &manifest_path,
+                environment_id: environment_id.as_deref(),
+                task: &task,
+                path_anchor: path_anchor.as_deref(),
+                symbol_anchor: symbol_anchor.as_deref(),
+                max_files,
+                max_source_bytes,
+                force_fresh,
+            },
+            &blocking_cancelled,
+        )
+    });
+    let indexing_result = tokio::select! {
+        result = &mut indexing_task => result,
+        _ = invocation.cancellation_token.cancelled() => {
+            cancelled.store(true, Ordering::Release);
+            let _ = indexing_task.await;
+            return Err(FunctionCallError::RespondToModel(
+                "locate_task was cancelled".to_string(),
+            ));
+        }
+    };
+    let output = indexing_result
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!("locate_task indexing task failed: {err}"))
+        })?
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!("locate_task query failed: {err:#}"))
+        })?;
 
     let supporting_entries = output
         .supporting_reads
@@ -387,7 +404,11 @@ async fn handle_search_source(
             .then_some(source_context.repo_root_abs.as_path()),
     );
     load_repository_exclude_rules(&source_context, &ignore_matcher).await?;
-    load_global_ignore_rules(&source_context, &ignore_matcher).await;
+    // The filesystem executor does not currently expose the selected
+    // environment's Git configuration or home directory. Reading the host's
+    // values here mixes environments and can incorrectly hide results, so omit
+    // global excludes explicitly until that contract is available.
+    let omitted_global_ignore = source_context.is_git_repository;
     let mut observed_entries = BTreeMap::new();
     let traversal_started = Instant::now();
     let scan_result = scan_source_roots(
@@ -427,8 +448,14 @@ async fn handle_search_source(
         .collect::<Result<Vec<_>, _>>()?;
     record_supporting_source_reads(&invocation, &source_context, supporting_entries).await?;
 
+    let mut rendered = render_search_output(&output);
+    if omitted_global_ignore {
+        rendered.push_str(
+            "\ndiagnostic: global Git ignore rules were omitted because the selected environment does not expose Git config resolution\n",
+        );
+    }
     Ok(boxed_tool_output(FunctionToolOutput::from_text(
-        render_search_output(&output),
+        rendered,
         Some(true),
     )))
 }
@@ -872,8 +899,13 @@ async fn load_repository_exclude_rules(
         .await
     {
         Ok(metadata) if metadata.is_directory => Some(dot_git),
-        Ok(metadata) if metadata.is_file => resolve_git_common_directory(context, &dot_git).await,
-        Ok(_) | Err(_) => None,
+        Ok(metadata) if metadata.is_file => resolve_git_common_directory(context, &dot_git).await?,
+        Ok(_) => None,
+        Err(err) => {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "unable to inspect repository ignore metadata `{dot_git}`: {err}"
+            )));
+        }
     };
     let Some(git_common_directory) = git_common_directory else {
         return Ok(());
@@ -881,7 +913,7 @@ async fn load_repository_exclude_rules(
     let Some(exclude_path) = git_common_directory.join("info/exclude").ok() else {
         return Ok(());
     };
-    let Some(contents) = read_optional_ignore_text(context, &exclude_path).await else {
+    let Some(contents) = read_optional_ignore_text(context, &exclude_path).await? else {
         return Ok(());
     };
     let source_path = exclude_path.to_abs_path().map_err(|err| {
@@ -897,113 +929,61 @@ async fn load_repository_exclude_rules(
     Ok(())
 }
 
-async fn load_global_ignore_rules(
-    context: &LocalSourceContext,
-    ignore_matcher: &SourceIgnoreMatcher,
-) {
-    if !context.is_git_repository {
-        return;
-    }
-    let Some(home) = dirs::home_dir() else {
-        return;
-    };
-    let config_root = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    load_global_ignore_rules_from(context, ignore_matcher, &home, &config_root).await;
-}
-
-async fn load_global_ignore_rules_from(
-    context: &LocalSourceContext,
-    ignore_matcher: &SourceIgnoreMatcher,
-    home: &Path,
-    config_root: &Path,
-) {
-    let config_paths = [home.join(".gitconfig"), config_root.join("git/config")];
-    let mut ignore_path = None;
-    for config_path in config_paths {
-        let Some(contents) = read_optional_host_ignore_text(context, &config_path).await else {
-            continue;
-        };
-        if let Some(configured_path) = parse_global_excludes_path(&contents, home) {
-            ignore_path = Some(configured_path);
-            break;
-        }
-    }
-    let ignore_path = ignore_path.unwrap_or_else(|| config_root.join("git/ignore"));
-    let Some(contents) = read_optional_host_ignore_text(context, &ignore_path).await else {
-        return;
-    };
-    ignore_matcher.set_global_gitignore(context.repo_root_abs.as_path(), &ignore_path, &contents);
-}
-
-fn parse_global_excludes_path(contents: &str, home: &Path) -> Option<PathBuf> {
-    let value = contents.lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        key.trim()
-            .eq_ignore_ascii_case("excludesfile")
-            .then(|| value.trim().trim_matches('"'))
-    })?;
-    if value.is_empty() {
-        return None;
-    }
-    if value == "~" {
-        return Some(home.to_path_buf());
-    }
-    if let Some(relative) = value
-        .strip_prefix("~/")
-        .or_else(|| value.strip_prefix("~\\"))
-    {
-        return Some(home.join(relative));
-    }
-    let path = PathBuf::from(value);
-    path.is_absolute().then_some(path)
-}
-
-async fn read_optional_host_ignore_text(
-    context: &LocalSourceContext,
-    path: &Path,
-) -> Option<String> {
-    let path = AbsolutePathBuf::from_absolute_path(path).ok()?;
-    let path = PathUri::from_abs_path(&path);
-    read_optional_ignore_text(context, &path).await
-}
-
 async fn resolve_git_common_directory(
     context: &LocalSourceContext,
     dot_git: &PathUri,
-) -> Option<PathUri> {
-    let contents = read_optional_ignore_text(context, dot_git).await?;
-    let git_dir_target = contents.strip_prefix("gitdir:")?.trim();
+) -> Result<Option<PathUri>, FunctionCallError> {
+    let Some(contents) = read_optional_ignore_text(context, dot_git).await? else {
+        return Ok(None);
+    };
+    let Some(git_dir_target) = contents.strip_prefix("gitdir:").map(str::trim) else {
+        return Ok(None);
+    };
     if git_dir_target.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let git_directory = context.repo_root.join(git_dir_target).ok()?;
+    let git_directory = context.repo_root.join(git_dir_target).map_err(|err| {
+        FunctionCallError::RespondToModel(format!("unable to resolve Git directory: {err}"))
+    })?;
     let git_directory = context
         .fs
         .canonicalize(&git_directory, Some(&context.sandbox))
         .await
-        .ok()?;
-    let common_dir_path = git_directory.join("commondir").ok()?;
-    let Some(common_dir) = read_optional_ignore_text(context, &common_dir_path).await else {
-        return Some(git_directory);
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "unable to canonicalize Git directory: {err}"
+            ))
+        })?;
+    let common_dir_path = git_directory.join("commondir").map_err(|err| {
+        FunctionCallError::RespondToModel(format!("unable to resolve Git common directory: {err}"))
+    })?;
+    let Some(common_dir) = read_optional_ignore_text(context, &common_dir_path).await? else {
+        return Ok(Some(git_directory));
     };
     let common_dir = common_dir.trim();
     if common_dir.is_empty() {
-        return Some(git_directory);
+        return Ok(Some(git_directory));
     }
-    let common_directory = git_directory.join(common_dir).ok()?;
-    context
+    let common_directory = git_directory.join(common_dir).map_err(|err| {
+        FunctionCallError::RespondToModel(format!("unable to resolve Git common directory: {err}"))
+    })?;
+    let common_directory = context
         .fs
         .canonicalize(&common_directory, Some(&context.sandbox))
         .await
-        .ok()
-        .or(Some(git_directory))
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "unable to canonicalize Git common directory: {err}"
+            ))
+        })?;
+    Ok(Some(common_directory))
 }
 
-async fn read_optional_ignore_text(context: &LocalSourceContext, path: &PathUri) -> Option<String> {
-    let bytes = if path.starts_with(&context.repo_root) {
+async fn read_optional_ignore_text(
+    context: &LocalSourceContext,
+    path: &PathUri,
+) -> Result<Option<String>, FunctionCallError> {
+    let read_result = if path.starts_with(&context.repo_root) {
         context
             .fs
             .read_file_bounded_confined(
@@ -1013,15 +993,29 @@ async fn read_optional_ignore_text(context: &LocalSourceContext, path: &PathUri)
                 Some(&context.sandbox),
             )
             .await
-            .ok()??
     } else {
         context
             .fs
             .read_file_bounded(path, SOURCE_SEARCH_MAX_FILE_BYTES, Some(&context.sandbox))
             .await
-            .ok()??
     };
-    String::from_utf8(bytes).ok()
+    let bytes = match read_result {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "unable to read optional source ignore file `{path}`: {err}"
+            )));
+        }
+    };
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes).map(Some).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "optional source ignore file `{path}` is not UTF-8: {err}"
+        ))
+    })
 }
 
 async fn load_directory_ignore_rules(
@@ -1043,8 +1037,8 @@ async fn load_directory_ignore_rules(
     let git_ignore_path = directory.join(".gitignore").map_err(|err| {
         FunctionCallError::RespondToModel(format!("unable to resolve .gitignore path: {err}"))
     })?;
-    let ignore_contents = read_optional_ignore_text(context, &ignore_path).await;
-    let git_ignore_contents = read_optional_ignore_text(context, &git_ignore_path).await;
+    let ignore_contents = read_optional_ignore_text(context, &ignore_path).await?;
+    let git_ignore_contents = read_optional_ignore_text(context, &git_ignore_path).await?;
     ignore_matcher.add_directory_rules(
         directory_path.as_path(),
         ignore_contents.as_deref(),

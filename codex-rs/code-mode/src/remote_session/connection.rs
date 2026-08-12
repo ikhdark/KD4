@@ -107,8 +107,6 @@ impl Connection {
                 .await
                 .map_err(|err| format!("failed to reserve code-mode host process: {err}"))?,
         );
-        #[cfg(windows)]
-        command.creation_flags(ManagedRootProcess::WINDOWS_CREATION_FLAGS);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -125,7 +123,7 @@ impl Connection {
             .id()
             .ok_or_else(|| "spawned code-mode host has no process id".to_string())?;
         #[cfg(windows)]
-        if let Err(err) = managed.attach_and_resume(process_id) {
+        if let Err(err) = managed.attach(process_id) {
             kill_and_reap(&mut child, &managed).await;
             return Err(format!(
                 "failed to contain code-mode host {}: {err}",

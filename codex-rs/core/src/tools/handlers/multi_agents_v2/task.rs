@@ -46,9 +46,11 @@ use similar::ChangeTag;
 use similar::TextDiff;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 const GET_AGENT_TASK_TOOL: &str = "get_agent_task";
 const SUBMIT_AGENT_RECEIPT_TOOL: &str = "submit_agent_receipt";
+const MUTATION_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SET_AGENT_GATE_TOOL: &str = "set_agent_gate";
 const AMEND_AGENT_TASK_TOOL: &str = "amend_agent_task";
 const WAIVE_AGENT_GATE_TOOL: &str = "waive_agent_gate";
@@ -233,11 +235,16 @@ async fn handle_submit_agent_receipt(
     // A sealed receipt makes task completion visible to other turns. Ensure any
     // command-level workspace mutation owned by this turn has terminated and
     // released both its persisted lease and its local reservation first.
-    session
+    let mutations_stopped = session
         .services
         .command_execution
-        .cancel_mutations_for_turn(&turn.sub_id)
+        .cancel_mutations_for_turn_with_timeout(&turn.sub_id, MUTATION_CANCELLATION_TIMEOUT)
         .await;
+    if !mutations_stopped {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{SUBMIT_AGENT_RECEIPT_TOOL}: timed out waiting for active workspace mutations to stop"
+        )));
+    }
     store
         .finalize_pending_mutations(binding.attempt_id)
         .await

@@ -68,6 +68,15 @@ pub enum OpenAiFileError {
     UploadNotReady { file_id: String },
     #[error("OpenAI file upload for `{file_id}` failed: {message}")]
     UploadFailed { file_id: String, message: String },
+    #[error(
+        "{source}; additionally failed to delete remote file `{file_id}` during rollback: {rollback}"
+    )]
+    RollbackFailed {
+        file_id: String,
+        #[source]
+        source: Box<OpenAiFileError>,
+        rollback: Box<OpenAiFileError>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -88,6 +97,55 @@ struct DownloadLinkResponse {
 
 pub fn openai_file_uri(file_id: &str) -> String {
     format!("{OPENAI_FILE_URI_PREFIX}{file_id}")
+}
+
+/// Deletes a previously created OpenAI file.
+///
+/// This is intentionally idempotent so callers can use it for best-effort rollback after a
+/// multi-file upload fails partway through.
+pub async fn delete_openai_file(
+    base_url: &str,
+    auth: &dyn AuthProvider,
+    http_client_factory: &HttpClientFactory,
+    file_id: &str,
+) -> Result<(), OpenAiFileError> {
+    let encoded_file_id = percent_encode_path_segment(file_id);
+    let delete_url = format!("{}/files/{encoded_file_id}", base_url.trim_end_matches('/'));
+    let response = authorized_request(
+        http_client_factory,
+        auth,
+        reqwest::Method::DELETE,
+        &delete_url,
+    )?
+    .send()
+    .await
+    .map_err(|source| OpenAiFileError::Request {
+        url: delete_url.clone(),
+        source,
+    })?;
+    let status = response.status();
+    if status.is_success() || status == StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(OpenAiFileError::UnexpectedStatus {
+        url: delete_url,
+        status,
+        body,
+    })
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 
 pub async fn upload_openai_file(
@@ -138,95 +196,113 @@ pub async fn upload_openai_file(
             url: create_url.clone(),
             source,
         })?;
-
-    let upload_response = build_reqwest_client(http_client_factory, &create_payload.upload_url)?
-        .put(&create_payload.upload_url)
-        .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
-        .header("x-ms-blob-type", "BlockBlob")
-        .header(CONTENT_LENGTH, file_size_bytes)
-        .body(reqwest::Body::wrap_stream(contents))
-        .send()
-        .await
-        .map_err(|source| OpenAiFileError::Request {
-            url: create_payload.upload_url.clone(),
-            source,
-        })?;
-    let upload_status = upload_response.status();
-    let upload_body = upload_response.text().await.unwrap_or_default();
-    if !upload_status.is_success() {
-        return Err(OpenAiFileError::UnexpectedStatus {
-            url: create_payload.upload_url.clone(),
-            status: upload_status,
-            body: upload_body,
-        });
-    }
-
-    let finalize_url = format!(
-        "{}/files/{}/uploaded",
-        base_url.trim_end_matches('/'),
-        create_payload.file_id,
-    );
-    let finalize_started_at = Instant::now();
-    loop {
-        let finalize_response = authorized_request(
-            http_client_factory,
-            auth,
-            reqwest::Method::POST,
-            &finalize_url,
-        )?
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .map_err(|source| OpenAiFileError::Request {
-            url: finalize_url.clone(),
-            source,
-        })?;
-        let finalize_status = finalize_response.status();
-        let finalize_body = finalize_response.text().await.unwrap_or_default();
-        if !finalize_status.is_success() {
+    let file_id = create_payload.file_id.clone();
+    let upload_result: Result<UploadedOpenAiFile, OpenAiFileError> = async {
+        let upload_response =
+            build_reqwest_client(http_client_factory, &create_payload.upload_url)?
+                .put(&create_payload.upload_url)
+                .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
+                .header("x-ms-blob-type", "BlockBlob")
+                .header(CONTENT_LENGTH, file_size_bytes)
+                .body(reqwest::Body::wrap_stream(contents))
+                .send()
+                .await
+                .map_err(|source| OpenAiFileError::Request {
+                    url: create_payload.upload_url.clone(),
+                    source,
+                })?;
+        let upload_status = upload_response.status();
+        let upload_body = upload_response.text().await.unwrap_or_default();
+        if !upload_status.is_success() {
             return Err(OpenAiFileError::UnexpectedStatus {
-                url: finalize_url.clone(),
-                status: finalize_status,
-                body: finalize_body,
+                url: create_payload.upload_url.clone(),
+                status: upload_status,
+                body: upload_body,
             });
         }
-        let finalize_payload: DownloadLinkResponse =
-            serde_json::from_str(&finalize_body).map_err(|source| OpenAiFileError::Decode {
+
+        let finalize_url = format!(
+            "{}/files/{}/uploaded",
+            base_url.trim_end_matches('/'),
+            create_payload.file_id,
+        );
+        let finalize_started_at = Instant::now();
+        loop {
+            let finalize_response = authorized_request(
+                http_client_factory,
+                auth,
+                reqwest::Method::POST,
+                &finalize_url,
+            )?
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|source| OpenAiFileError::Request {
                 url: finalize_url.clone(),
                 source,
             })?;
-
-        match finalize_payload.status.as_str() {
-            "success" => {
-                return Ok(UploadedOpenAiFile {
-                    file_id: create_payload.file_id.clone(),
-                    uri: openai_file_uri(&create_payload.file_id),
-                    download_url: finalize_payload.download_url.ok_or_else(|| {
-                        OpenAiFileError::UploadFailed {
-                            file_id: create_payload.file_id.clone(),
-                            message: "missing download_url".to_string(),
-                        }
-                    })?,
-                    file_name: finalize_payload.file_name.unwrap_or(file_name),
-                    file_size_bytes,
-                    mime_type: finalize_payload.mime_type,
+            let finalize_status = finalize_response.status();
+            let finalize_body = finalize_response.text().await.unwrap_or_default();
+            if !finalize_status.is_success() {
+                return Err(OpenAiFileError::UnexpectedStatus {
+                    url: finalize_url.clone(),
+                    status: finalize_status,
+                    body: finalize_body,
                 });
             }
-            "retry" => {
-                if finalize_started_at.elapsed() >= OPENAI_FILE_FINALIZE_TIMEOUT {
-                    return Err(OpenAiFileError::UploadNotReady {
-                        file_id: create_payload.file_id,
+            let finalize_payload: DownloadLinkResponse = serde_json::from_str(&finalize_body)
+                .map_err(|source| OpenAiFileError::Decode {
+                    url: finalize_url.clone(),
+                    source,
+                })?;
+
+            match finalize_payload.status.as_str() {
+                "success" => {
+                    return Ok(UploadedOpenAiFile {
+                        file_id: create_payload.file_id.clone(),
+                        uri: openai_file_uri(&create_payload.file_id),
+                        download_url: finalize_payload.download_url.ok_or_else(|| {
+                            OpenAiFileError::UploadFailed {
+                                file_id: create_payload.file_id.clone(),
+                                message: "missing download_url".to_string(),
+                            }
+                        })?,
+                        file_name: finalize_payload.file_name.unwrap_or(file_name),
+                        file_size_bytes,
+                        mime_type: finalize_payload.mime_type,
                     });
                 }
-                tokio::time::sleep(OPENAI_FILE_FINALIZE_RETRY_DELAY).await;
+                "retry" => {
+                    if finalize_started_at.elapsed() >= OPENAI_FILE_FINALIZE_TIMEOUT {
+                        return Err(OpenAiFileError::UploadNotReady {
+                            file_id: create_payload.file_id.clone(),
+                        });
+                    }
+                    tokio::time::sleep(OPENAI_FILE_FINALIZE_RETRY_DELAY).await;
+                }
+                _ => {
+                    return Err(OpenAiFileError::UploadFailed {
+                        file_id: create_payload.file_id.clone(),
+                        message: finalize_payload
+                            .error_message
+                            .unwrap_or_else(|| "upload finalization returned an error".to_string()),
+                    });
+                }
             }
-            _ => {
-                return Err(OpenAiFileError::UploadFailed {
-                    file_id: create_payload.file_id,
-                    message: finalize_payload
-                        .error_message
-                        .unwrap_or_else(|| "upload finalization returned an error".to_string()),
-                });
+        }
+    }
+    .await;
+
+    match upload_result {
+        Ok(uploaded) => Ok(uploaded),
+        Err(source) => {
+            match delete_openai_file(base_url, auth, http_client_factory, &file_id).await {
+                Ok(()) => Err(source),
+                Err(rollback) => Err(OpenAiFileError::RollbackFailed {
+                    file_id,
+                    source: Box::new(source),
+                    rollback: Box::new(rollback),
+                }),
             }
         }
     }
@@ -317,6 +393,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_openai_file_encodes_the_id_and_accepts_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/backend-api/files/file%2Fwith%20spaces"))
+            .and(header("chatgpt-account-id", "account_id"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        delete_openai_file(
+            &base_url_for(&server),
+            &chatgpt_auth(),
+            &default_http_client_factory(),
+            "file/with spaces",
+        )
+        .await
+        .expect("not-found deletion is idempotent");
+    }
+
+    #[tokio::test]
     async fn upload_openai_file_returns_canonical_uri() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -385,5 +482,47 @@ mod tests {
         assert_eq!(uploaded.file_name, "hello.txt");
         assert_eq!(uploaded.mime_type, Some("text/plain".to_string()));
         assert_eq!(finalize_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn upload_openai_file_deletes_the_created_file_when_upload_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file_rollback",
+                "upload_url": format!("{}/upload/file_rollback", server.uri()),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload/file_rollback"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upload failed"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/backend-api/files/file_rollback"))
+            .and(header("chatgpt-account-id", "account_id"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let contents =
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"hello"))]);
+        let error = upload_openai_file(
+            &base_url_for(&server),
+            &chatgpt_auth(),
+            &default_http_client_factory(),
+            "hello.txt".to_string(),
+            /*file_size_bytes*/ 5,
+            contents,
+        )
+        .await
+        .expect_err("the failed upload must be reported");
+
+        assert!(error.to_string().contains("500 Internal Server Error"));
     }
 }

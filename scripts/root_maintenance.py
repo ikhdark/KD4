@@ -226,6 +226,10 @@ def python_lint_targets(changed: Sequence[str]) -> list[str]:
     return sorted(dict.fromkeys(selected))
 
 
+class ChangedPathDiscoveryError(RuntimeError):
+    """Raised when an implicit --changed selection cannot be determined safely."""
+
+
 def git_changed_paths() -> list[str]:
     commands = (
         [
@@ -265,16 +269,15 @@ def git_changed_paths() -> list[str]:
                 check=False,
             )
         except OSError as error:
-            print(f"Could not inspect changed paths with git: {error}", file=sys.stderr)
-            return []
+            raise ChangedPathDiscoveryError(
+                f"could not inspect changed paths with git: {error}"
+            ) from error
         if result.returncode != 0:
             detail = result.stderr.strip()
             suffix = f": {detail}" if detail else ""
-            print(
-                f"Could not inspect changed paths with git{suffix}",
-                file=sys.stderr,
+            raise ChangedPathDiscoveryError(
+                f"could not inspect changed paths with git{suffix}"
             )
-            return []
         delimiter = "\0" if "\0" in result.stdout else "\n"
         paths.extend(path for path in result.stdout.split(delimiter) if path)
     return list(dict.fromkeys(paths))
@@ -291,6 +294,14 @@ def expand_changed_paths(changed: Sequence[str | None]) -> list[str]:
     if needs_git:
         expanded.extend(git_changed_paths())
     return expanded
+
+
+def resolved_changed_paths(changed: Sequence[str | None]) -> list[str] | None:
+    try:
+        return expand_changed_paths(changed)
+    except ChangedPathDiscoveryError as error:
+        print(f"Changed-path discovery failed: {error}", file=sys.stderr)
+        return None
 
 
 def test_modules_for_changed_path(path_text: str) -> tuple[str, ...]:
@@ -843,7 +854,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         command = [*UV_RUN_SCRIPTS, "ruff", "format"]
         if not args.write:
             command.append("--check")
-        changed_paths = expand_changed_paths(args.changed)
+        changed_paths = resolved_changed_paths(args.changed)
+        if changed_paths is None:
+            return 2
         targets = (
             python_lint_targets(changed_paths)
             if changed_paths or not args.changed
@@ -858,7 +871,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         command = [*UV_RUN_SCRIPTS, "ruff", "check"]
         if args.fix:
             command.append("--fix")
-        changed_paths = expand_changed_paths(args.changed)
+        changed_paths = resolved_changed_paths(args.changed)
+        if changed_paths is None:
+            return 2
         targets = (
             python_lint_targets(changed_paths)
             if changed_paths or not args.changed
@@ -870,7 +885,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run([*command, *targets])
 
     if args.command == "test-python":
-        changed_paths = expand_changed_paths(args.changed)
+        changed_paths = resolved_changed_paths(args.changed)
+        if changed_paths is None:
+            return 2
         targets = (
             python_test_targets(args.module, changed_paths)
             if changed_paths or not args.changed or args.module

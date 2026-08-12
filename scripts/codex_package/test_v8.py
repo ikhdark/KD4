@@ -82,7 +82,7 @@ class V8ArtifactCacheTest(unittest.TestCase):
         ):
             self.assertEqual(v8.resolve_codex_v8_cargo_env(spec, environ={}), {})
 
-    def test_verified_checksum_stamp_skips_warm_cache_hash(self) -> None:
+    def test_cached_checksum_is_reverified(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact = Path(temp_dir) / "artifact"
             content = b"v8"
@@ -90,12 +90,8 @@ class V8ArtifactCacheTest(unittest.TestCase):
             digest = hashlib.sha256(content).hexdigest()
 
             self.assertTrue(v8.has_checksum(artifact, digest))
-            with mock.patch.object(
-                v8.hashlib,
-                "sha256",
-                side_effect=AssertionError("warm cache should use stamp"),
-            ):
-                self.assertTrue(v8.has_checksum(artifact, digest))
+            artifact.write_bytes(b"xx")
+            self.assertFalse(v8.has_checksum(artifact, digest))
 
     def test_ensure_valid_artifact_removes_invalid_download(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

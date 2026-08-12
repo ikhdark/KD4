@@ -6,8 +6,13 @@
 //! repository, the function returns `Ok((false, String::new()))`.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::ffi::OsString;
 
 use crate::workspace_command::WorkspaceCommand;
 use crate::workspace_command::WorkspaceCommandExecutor;
@@ -27,6 +32,8 @@ const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
 };
 const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|process)$";
 const MAX_UNTRACKED_FILE_DIFFS: usize = 50;
+const MAX_UNTRACKED_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_UNTRACKED_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OMITTED_UNTRACKED_PATHS: usize = 50;
 const MAX_OMITTED_UNTRACKED_PATH_CHARS: usize = 200;
 
@@ -87,7 +94,13 @@ pub(crate) async fn get_git_diff(
             runner,
             cwd,
             fsmonitor,
-            &["ls-files", "-z", "--others", "--exclude-standard"]
+            &[
+                "-c",
+                "core.quotePath=true",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+            ]
         ),
     );
     let tracked_diff = tracked_diff_res?;
@@ -101,14 +114,53 @@ pub(crate) async fn get_git_diff(
     };
 
     let null_path = null_device.to_str().unwrap_or("/dev/null");
-    let untracked_files = parse_untracked_files(&untracked_output);
+    let untracked_files = parse_untracked_files(&untracked_output)?;
     let (files_to_diff, omitted_files) =
         untracked_files.split_at(untracked_files.len().min(MAX_UNTRACKED_FILE_DIFFS));
+    let fallback_deadline = tokio::time::Instant::now() + DIFF_COMMAND_TIMEOUT;
+    let mut untracked_budget_used = 0_u64;
     for file in files_to_diff {
-        if let Ok(diff) = render_local_untracked_file(cwd, file) {
-            untracked_diff.push_str(&diff);
-            continue;
+        match render_local_untracked_file(
+            cwd,
+            file,
+            MAX_UNTRACKED_TOTAL_BYTES.saturating_sub(untracked_budget_used),
+        ) {
+            Ok(Some((diff, bytes))) => {
+                untracked_budget_used = untracked_budget_used.saturating_add(bytes);
+                untracked_diff.push_str(&diff);
+                continue;
+            }
+            Ok(None) => {
+                untracked_diff.push_str(&format!(
+                    "# Untracked file diff omitted because it exceeds the bounded read budget: {}\n",
+                    escaped_path_for_notice(file)
+                ));
+                continue;
+            }
+            Err(_) => {}
         }
+
+        let Some(file_arg) = file.to_str() else {
+            untracked_diff.push_str(&format!(
+                "# Remote untracked file diff omitted because its path is not UTF-8: {}\n",
+                escaped_path_for_notice(file)
+            ));
+            continue;
+        };
+
+        let remaining_response_budget =
+            MAX_UNTRACKED_TOTAL_BYTES.saturating_sub(untracked_budget_used);
+        if remaining_response_budget <= 1 {
+            untracked_diff.push_str(
+                "# Remaining untracked file diffs omitted after bounded response budget\n",
+            );
+            break;
+        }
+        // App-server does not report whether output hit its cap. Reserve one sentinel byte so a
+        // response larger than `complete_output_budget` can be discarded as a whole instead of
+        // presenting a silently truncated diff hunk.
+        let complete_output_budget =
+            MAX_UNTRACKED_FILE_BYTES.min(remaining_response_budget.saturating_sub(1)) as usize;
 
         // Remote workspace runners do not expose a file-read API. Preserve the existing
         // executor-backed Git path when the file is not locally readable rather than widening
@@ -123,19 +175,55 @@ pub(crate) async fn get_git_diff(
             "--no-index",
             "--",
             null_path,
-            file,
+            file_arg,
         ];
-        let diff =
-            run_git_capture_diff(runner, cwd, fsmonitor, &diff_config_overrides, &args).await?;
-        untracked_diff.push_str(&diff);
+        let remaining = fallback_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            untracked_diff.push_str("# Remaining untracked file diffs omitted after deadline\n");
+            break;
+        }
+        let diff = match tokio::time::timeout(
+            remaining,
+            run_git_capture_diff_bounded(
+                runner,
+                cwd,
+                fsmonitor,
+                &diff_config_overrides,
+                &args,
+                complete_output_budget,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                untracked_diff
+                    .push_str("# Remaining untracked file diffs omitted after deadline\n");
+                break;
+            }
+        };
+        untracked_budget_used = untracked_budget_used.saturating_add(diff.captured_bytes as u64);
+        if let Some(output) = diff.output {
+            untracked_diff.push_str(&output);
+        } else {
+            untracked_diff.push_str(&format!(
+                "# Remote untracked file diff omitted because its complete output exceeds the bounded response budget: {}\n",
+                escaped_path_for_notice(file)
+            ));
+        }
     }
     append_omitted_untracked_diff_notice(&mut untracked_diff, omitted_files);
 
     Ok((true, format!("{tracked_diff}{untracked_diff}")))
 }
 
-fn render_local_untracked_file(cwd: &Path, file: &str) -> std::io::Result<String> {
-    let path = cwd.join(file);
+fn render_local_untracked_file(
+    cwd: &Path,
+    file: &Path,
+    remaining_budget: u64,
+) -> std::io::Result<Option<(String, u64)>> {
+    let root = cwd.canonicalize()?;
+    let path = root.join(file);
     let metadata = fs::symlink_metadata(&path)?;
     let (contents, mode) = if metadata.file_type().is_symlink() {
         (
@@ -146,7 +234,20 @@ fn render_local_untracked_file(cwd: &Path, file: &str) -> std::io::Result<String
             "120000",
         )
     } else if metadata.is_file() {
-        (fs::read(&path)?, untracked_file_mode(&metadata))
+        let limit = MAX_UNTRACKED_FILE_BYTES.min(remaining_budget);
+        let opened = codex_file_system::open_confined_file(&root, &path)?;
+        let opened_metadata = opened.metadata()?;
+        if opened_metadata.len() > limit {
+            return Ok(None);
+        }
+        let mut contents = Vec::with_capacity(opened_metadata.len() as usize);
+        opened
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        if contents.len() as u64 > limit {
+            return Ok(None);
+        }
+        (contents, untracked_file_mode(&opened_metadata))
     } else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -154,7 +255,11 @@ fn render_local_untracked_file(cwd: &Path, file: &str) -> std::io::Result<String
         ));
     };
 
-    Ok(render_untracked_new_file(file, mode, &contents))
+    let bytes = contents.len() as u64;
+    Ok(Some((
+        render_untracked_new_file(&file.to_string_lossy(), mode, &contents),
+        bytes,
+    )))
 }
 
 #[cfg(unix)]
@@ -271,16 +376,83 @@ fn quote_diff_path(path: &str) -> String {
     quoted
 }
 
-fn parse_untracked_files(output: &str) -> Vec<&str> {
+fn parse_untracked_files(output: &str) -> Result<Vec<PathBuf>, String> {
     let mut files = output
-        .split_terminator('\0')
+        .lines()
         .filter(|path| !path.is_empty())
-        .collect::<Vec<_>>();
+        .map(decode_git_quoted_path)
+        .collect::<Result<Vec<_>, _>>()?;
     files.sort_unstable();
-    files
+    Ok(files)
 }
 
-fn append_omitted_untracked_diff_notice(diff: &mut String, omitted_files: &[&str]) {
+fn decode_git_quoted_path(path: &str) -> Result<PathBuf, String> {
+    let Some(quoted) = path.strip_prefix('"') else {
+        return git_path_from_bytes(path.as_bytes().to_vec());
+    };
+    let quoted = quoted
+        .strip_suffix('"')
+        .ok_or_else(|| "unterminated quoted path from git ls-files".to_string())?;
+    let bytes = quoted.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let escaped = *bytes
+            .get(index)
+            .ok_or_else(|| "trailing escape in quoted git path".to_string())?;
+        index += 1;
+        match escaped {
+            b'a' => decoded.push(0x07),
+            b'b' => decoded.push(0x08),
+            b't' => decoded.push(b'\t'),
+            b'n' => decoded.push(b'\n'),
+            b'v' => decoded.push(0x0b),
+            b'f' => decoded.push(0x0c),
+            b'r' => decoded.push(b'\r'),
+            b'\\' | b'"' => decoded.push(escaped),
+            b'0'..=b'7' => {
+                let mut value = escaped - b'0';
+                for _ in 0..2 {
+                    let Some(next @ b'0'..=b'7') = bytes.get(index).copied() else {
+                        break;
+                    };
+                    value = value.saturating_mul(8).saturating_add(next - b'0');
+                    index += 1;
+                }
+                decoded.push(value);
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported escape in quoted git path: \\{}",
+                    char::from(escaped)
+                ));
+            }
+        }
+    }
+    git_path_from_bytes(decoded)
+}
+
+#[cfg(unix)]
+fn git_path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn git_path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
+    String::from_utf8(bytes)
+        .map(PathBuf::from)
+        .map_err(|_| "git returned a path that is not valid UTF-8 on this platform".to_string())
+}
+
+fn append_omitted_untracked_diff_notice(diff: &mut String, omitted_files: &[PathBuf]) {
     if omitted_files.is_empty() {
         return;
     }
@@ -310,8 +482,9 @@ fn append_omitted_untracked_diff_notice(diff: &mut String, omitted_files: &[&str
     }
 }
 
-fn escaped_path_for_notice(path: &str) -> String {
-    let mut chars = path.chars();
+fn escaped_path_for_notice(path: &Path) -> String {
+    let rendered = path.to_string_lossy();
+    let mut chars = rendered.chars();
     let mut escaped = chars
         .by_ref()
         .take(MAX_OMITTED_UNTRACKED_PATH_CHARS)
@@ -352,6 +525,42 @@ async fn run_git_capture_diff(
     args: &[&str],
 ) -> Result<String, String> {
     let output = run_git_command(runner, cwd, fsmonitor, config_overrides, args).await?;
+    capture_diff_output(output, args)
+}
+
+/// Executes a Git diff with a bounded response for executor-backed untracked-file fallbacks.
+async fn run_git_capture_diff_bounded(
+    runner: &dyn WorkspaceCommandExecutor,
+    cwd: &Path,
+    fsmonitor: FsmonitorOverride,
+    config_overrides: &[(String, String)],
+    args: &[&str],
+    complete_output_budget: usize,
+) -> Result<BoundedDiffCapture, String> {
+    let response_cap = complete_output_budget.saturating_add(1);
+    let output = run_git_command_with_output_cap(
+        runner,
+        cwd,
+        fsmonitor,
+        config_overrides,
+        args,
+        Some(response_cap),
+    )
+    .await?;
+    let output = capture_diff_output(output, args)?;
+    let captured_bytes = output.len().min(response_cap);
+    Ok(BoundedDiffCapture {
+        output: (output.len() <= complete_output_budget).then_some(output),
+        captured_bytes,
+    })
+}
+
+struct BoundedDiffCapture {
+    output: Option<String>,
+    captured_bytes: usize,
+}
+
+fn capture_diff_output(output: WorkspaceCommandOutput, args: &[&str]) -> Result<String, String> {
     if output.success() || output.exit_code == 1 {
         Ok(output.stdout)
     } else {
@@ -433,6 +642,25 @@ async fn run_git_command(
     config_overrides: &[(String, String)],
     args: &[&str],
 ) -> Result<WorkspaceCommandOutput, String> {
+    run_git_command_with_output_cap(
+        runner,
+        cwd,
+        fsmonitor,
+        config_overrides,
+        args,
+        /*output_bytes_cap*/ None,
+    )
+    .await
+}
+
+async fn run_git_command_with_output_cap(
+    runner: &dyn WorkspaceCommandExecutor,
+    cwd: &Path,
+    fsmonitor: FsmonitorOverride,
+    config_overrides: &[(String, String)],
+    args: &[&str],
+    output_bytes_cap: Option<usize>,
+) -> Result<WorkspaceCommandOutput, String> {
     let argv = [
         "git",
         "-c",
@@ -444,8 +672,11 @@ async fn run_git_command(
     .chain(args.iter().copied());
     let mut command = WorkspaceCommand::new(argv)
         .cwd(cwd.to_path_buf())
-        .timeout(DIFF_COMMAND_TIMEOUT)
-        .disable_output_cap();
+        .timeout(DIFF_COMMAND_TIMEOUT);
+    command = match output_bytes_cap {
+        Some(output_bytes_cap) => command.output_bytes_cap(output_bytes_cap),
+        None => command.disable_output_cap(),
+    };
     if !config_overrides.is_empty() {
         command = command.env("GIT_CONFIG_COUNT", config_overrides.len().to_string());
         for (index, (key, value)) in config_overrides.iter().enumerate() {
@@ -554,10 +785,16 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                    &[
+                        "-c",
+                        "core.quotePath=true",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                    ],
                 ),
                 /*exit_code*/ 0,
-                "new.txt\0",
+                "new.txt\n",
             ),
             response(
                 git_command(
@@ -587,6 +824,156 @@ mod tests {
         assert_command_metadata(&commands, &cwd);
         assert_eq!(commands[4].env, filter_override_env("filter.evil"));
         assert_eq!(commands[6].env, filter_override_env("filter.evil"));
+    }
+
+    #[tokio::test]
+    async fn bounded_remote_diff_discards_output_that_reaches_the_sentinel() {
+        let cwd = PathBuf::from("/workspace");
+        let args = ["diff", "--no-index"];
+        let complete_output_budget = 8;
+        let runner = FakeRunner::new(vec![response(
+            git_command(FsmonitorOverride::Disabled, &args),
+            /*exit_code*/ 1,
+            "123456789",
+        )]);
+
+        let capture = run_git_capture_diff_bounded(
+            &runner,
+            &cwd,
+            FsmonitorOverride::Disabled,
+            &[],
+            &args,
+            complete_output_budget,
+        )
+        .await
+        .expect("bounded diff response");
+
+        assert!(capture.output.is_none());
+        assert_eq!(capture.captured_bytes, complete_output_budget + 1);
+        let commands = runner.commands();
+        assert_eq!(commands[0].output_bytes_cap, complete_output_budget + 1);
+    }
+
+    #[tokio::test]
+    async fn remote_untracked_fallback_enforces_the_total_capture_budget() {
+        let cwd = PathBuf::from("/workspace");
+        let files = (0..5)
+            .map(|index| format!("remote-{index}.txt"))
+            .collect::<Vec<_>>();
+        let untracked_output = format!("{}\n", files.join("\n"));
+        let mut responses = vec![
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &["rev-parse", "--is-inside-work-tree"],
+                ),
+                /*exit_code*/ 0,
+                "true\n",
+            ),
+            response(
+                git_probe_command(&["config", "--null", "--get", "core.fsmonitor"]),
+                /*exit_code*/ 1,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "config",
+                        "--null",
+                        "--name-only",
+                        "--get-regexp",
+                        EXECUTABLE_FILTER_CONFIG_PATTERN,
+                    ],
+                ),
+                /*exit_code*/ 1,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "diff",
+                        "--no-textconv",
+                        "--no-ext-diff",
+                        "--submodule=short",
+                        "--ignore-submodules=dirty",
+                        "--color",
+                    ],
+                ),
+                /*exit_code*/ 0,
+                "",
+            ),
+            response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "-c",
+                        "core.quotePath=true",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                    ],
+                ),
+                /*exit_code*/ 0,
+                &untracked_output,
+            ),
+        ];
+        let mut remaining_budget = MAX_UNTRACKED_TOTAL_BYTES as usize;
+        let mut expected_caps = Vec::new();
+        for file in files.iter().take(4) {
+            let response_cap = (MAX_UNTRACKED_FILE_BYTES as usize + 1).min(remaining_budget);
+            expected_caps.push(response_cap);
+            let capped_output = "z".repeat(response_cap);
+            responses.push(response(
+                git_command(
+                    FsmonitorOverride::Disabled,
+                    &[
+                        "diff",
+                        "--no-textconv",
+                        "--no-ext-diff",
+                        "--submodule=short",
+                        "--ignore-submodules=dirty",
+                        "--color",
+                        "--no-index",
+                        "--",
+                        null_device(),
+                        file,
+                    ],
+                ),
+                /*exit_code*/ 1,
+                &capped_output,
+            ));
+            remaining_budget -= response_cap;
+        }
+        assert_eq!(remaining_budget, 0);
+        let runner = FakeRunner::new(responses);
+
+        let (_, diff) = get_git_diff(&runner, &cwd)
+            .await
+            .expect("bounded remote untracked diff");
+
+        assert_eq!(
+            diff.matches(
+                "# Remote untracked file diff omitted because its complete output exceeds the bounded response budget:"
+            )
+            .count(),
+            4
+        );
+        assert!(
+            diff.contains(
+                "# Remaining untracked file diffs omitted after bounded response budget\n"
+            )
+        );
+        assert!(!diff.contains("zzzzzzzz"));
+        let commands = runner.commands();
+        let response_caps = commands
+            .iter()
+            .filter(|command| command.argv.iter().any(|arg| arg == "--no-index"))
+            .map(|command| command.output_bytes_cap)
+            .collect::<Vec<_>>();
+        assert_eq!(response_caps, expected_caps);
+        assert_eq!(commands.len(), 5 + expected_caps.len());
     }
 
     #[tokio::test]
@@ -643,10 +1030,16 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::BuiltIn,
-                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                    &[
+                        "-c",
+                        "core.quotePath=true",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                    ],
                 ),
                 /*exit_code*/ 0,
-                "new.txt\0",
+                "new.txt\n",
             ),
             response(
                 git_command(
@@ -724,7 +1117,13 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                    &[
+                        "-c",
+                        "core.quotePath=true",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                    ],
                 ),
                 /*exit_code*/ 0,
                 "",
@@ -743,7 +1142,7 @@ mod tests {
         let untracked_files = (0..MAX_UNTRACKED_FILE_DIFFS + 2)
             .map(|index| format!("new-{index:02}.txt"))
             .collect::<Vec<_>>();
-        let untracked_output = format!("{}\0", untracked_files.join("\0"));
+        let untracked_output = format!("{}\n", untracked_files.join("\n"));
         let mut responses = vec![
             response(
                 git_command(
@@ -790,7 +1189,13 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                    &[
+                        "-c",
+                        "core.quotePath=true",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                    ],
                 ),
                 /*exit_code*/ 0,
                 &untracked_output,
@@ -888,7 +1293,13 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                    &[
+                        "-c",
+                        "core.quotePath=true",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                    ],
                 ),
                 /*exit_code*/ 0,
                 "",
@@ -907,11 +1318,23 @@ mod tests {
     }
 
     #[test]
-    fn nul_delimited_untracked_paths_preserve_whitespace_and_newlines() {
+    fn git_quoted_untracked_paths_preserve_whitespace_and_newlines() {
         assert_eq!(
-            parse_untracked_files(" leading\nname.txt \0trailing-space.txt \0"),
-            vec![" leading\nname.txt ", "trailing-space.txt "]
+            parse_untracked_files("\" leading\\nname.txt \"\n\"trailing-space.txt \"\n"),
+            Ok(vec![
+                PathBuf::from(" leading\nname.txt "),
+                PathBuf::from("trailing-space.txt "),
+            ])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_quoted_untracked_paths_preserve_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let decoded = decode_git_quoted_path("\"dir/non-utf8-\\377.txt\"").unwrap();
+        assert_eq!(decoded.as_os_str().as_bytes(), b"dir/non-utf8-\xff.txt");
     }
 
     #[test]
@@ -919,7 +1342,7 @@ mod tests {
         let paths = (0..MAX_OMITTED_UNTRACKED_PATHS + 2)
             .map(|index| format!("path-{index:02}\n{}.txt", "x".repeat(250)))
             .collect::<Vec<_>>();
-        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let path_refs = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
         let mut notice = String::new();
 
         append_omitted_untracked_diff_notice(&mut notice, &path_refs);
@@ -973,7 +1396,10 @@ mod tests {
         for (path, contents) in cases {
             fs::write(cwd.join(path), contents).expect("write golden input");
             assert_eq!(
-                render_local_untracked_file(cwd, path).expect("render untracked file"),
+                render_local_untracked_file(cwd, Path::new(path), MAX_UNTRACKED_TOTAL_BYTES)
+                    .expect("render untracked file")
+                    .expect("file within budget")
+                    .0,
                 git_untracked_new_file_diff(cwd, path),
                 "renderer differs from git for {path:?}"
             );
@@ -1004,7 +1430,10 @@ mod tests {
 
         for path in [executable, link, quoted] {
             assert_eq!(
-                render_local_untracked_file(cwd, path).expect("render untracked file"),
+                render_local_untracked_file(cwd, Path::new(path), MAX_UNTRACKED_TOTAL_BYTES)
+                    .expect("render untracked file")
+                    .expect("file within budget")
+                    .0,
                 git_untracked_new_file_diff(cwd, path),
                 "renderer differs from git for {path:?}"
             );
@@ -1023,7 +1452,7 @@ mod tests {
         }
         let untracked_output = files
             .iter()
-            .map(|file| format!("{file}\0"))
+            .map(|file| format!("{file}\n"))
             .collect::<String>();
         let runner = FakeRunner::new(vec![
             response(
@@ -1071,7 +1500,13 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                    &[
+                        "-c",
+                        "core.quotePath=true",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                    ],
                 ),
                 0,
                 &untracked_output,
@@ -1351,6 +1786,11 @@ mod tests {
                 assert_eq!(command.env, HashMap::new());
                 assert_eq!(command.timeout, Duration::from_secs(/*secs*/ 5));
                 assert_eq!(command.output_bytes_cap, 64 * 1024);
+                assert_eq!(command.disable_output_cap, false);
+            } else if command.argv.iter().any(|arg| arg == "--no-index") {
+                assert_eq!(command.timeout, DIFF_COMMAND_TIMEOUT);
+                assert!(command.output_bytes_cap > 0);
+                assert!(command.output_bytes_cap <= MAX_UNTRACKED_FILE_BYTES as usize + 1);
                 assert_eq!(command.disable_output_cap, false);
             } else {
                 assert_eq!(command.timeout, DIFF_COMMAND_TIMEOUT);

@@ -12,8 +12,13 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::sync::watch;
+use tokio::time::timeout;
 use tracing::warn;
+
+const RESIDENCY_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+const RESIDENCY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub(super) struct V2Residency {
@@ -172,13 +177,36 @@ impl V2Residency {
                 claim.restore();
                 continue;
             }
-            candidate_thread.ensure_rollout_materialized().await;
-            if let Err(err) = candidate_thread.shutdown_and_wait().await {
-                warn!(
-                    "failed to shut down v2 resident thread before unloading {candidate_thread_id}: {err}"
-                );
+            if timeout(
+                RESIDENCY_MATERIALIZE_TIMEOUT,
+                candidate_thread.ensure_rollout_materialized(),
+            )
+            .await
+            .is_err()
+            {
+                warn!("timed out materializing v2 resident thread {candidate_thread_id}");
                 claim.restore();
                 continue;
+            }
+            match timeout(
+                RESIDENCY_SHUTDOWN_TIMEOUT,
+                candidate_thread.shutdown_and_wait(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!(
+                        "failed to shut down v2 resident thread before unloading {candidate_thread_id}: {err}"
+                    );
+                    claim.restore();
+                    continue;
+                }
+                Err(_) => {
+                    warn!("timed out shutting down v2 resident thread {candidate_thread_id}");
+                    claim.restore();
+                    continue;
+                }
             }
             if manager
                 .remove_thread_if_same(&candidate_thread_id, &candidate_thread)

@@ -69,8 +69,6 @@ pub struct ManagedRootProcess {
     id: u64,
     #[cfg(windows)]
     job: crate::win::JobObject,
-    #[cfg(windows)]
-    process: std::sync::Mutex<Option<std::os::windows::io::OwnedHandle>>,
 }
 
 impl ManagedRootProcess {
@@ -114,8 +112,6 @@ impl ManagedRootProcess {
             id: NEXT_MANAGED_ROOT_ID.fetch_add(1, Ordering::Relaxed),
             #[cfg(windows)]
             job,
-            #[cfg(windows)]
-            process: std::sync::Mutex::new(None),
         })
     }
 
@@ -170,51 +166,24 @@ impl ManagedRootProcess {
         self.id
     }
 
+    /// Open a normally running Windows root by PID and attach it to the Job.
+    ///
+    /// Do not pair this with `CREATE_SUSPENDED`: Tokio does not retain the
+    /// primary thread handle needed for a reliable `ResumeThread` call.
     #[cfg(windows)]
-    pub const WINDOWS_CREATION_FLAGS: u32 = winapi::um::winbase::CREATE_SUSPENDED;
-
-    /// Attach a suspended Windows root to the Job before allowing it to run.
-    #[cfg(windows)]
-    pub fn attach_and_resume(&self, pid: u32) -> io::Result<()> {
+    pub fn attach(&self, pid: u32) -> io::Result<()> {
         use std::os::windows::io::FromRawHandle;
         use std::os::windows::io::OwnedHandle;
         use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
         use winapi::um::winnt::PROCESS_SET_QUOTA;
         use winapi::um::winnt::PROCESS_TERMINATE;
-        use winapi::um::winnt::SYNCHRONIZE;
 
-        // PROCESS_SUSPEND_RESUME is not exposed by every winapi feature set.
-        const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
-        let raw = unsafe {
-            OpenProcess(
-                PROCESS_SET_QUOTA
-                    | PROCESS_TERMINATE
-                    | PROCESS_SUSPEND_RESUME
-                    | PROCESS_QUERY_LIMITED_INFORMATION
-                    | SYNCHRONIZE,
-                0,
-                pid,
-            )
-        };
+        let raw = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
         if raw.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
-        self.job.assign_process(raw.cast())?;
-
-        let status = unsafe { NtResumeProcess(raw) };
-        if status < 0 {
-            let _ = self.job.terminate();
-            return Err(io::Error::other(format!(
-                "NtResumeProcess failed with NTSTATUS {status:#x}"
-            )));
-        }
-        *self
-            .process
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(process);
-        Ok(())
+        let _process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+        self.job.assign_process(raw.cast())
     }
 
     #[cfg(windows)]
@@ -236,12 +205,6 @@ impl Drop for ManagedRootProcess {
             self.id
         );
     }
-}
-
-#[cfg(windows)]
-#[link(name = "ntdll")]
-unsafe extern "system" {
-    fn NtResumeProcess(process_handle: winapi::um::winnt::HANDLE) -> i32;
 }
 
 #[cfg(test)]

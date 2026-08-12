@@ -15,8 +15,8 @@ tests = ["codex-rs/app-server/tests"]
 
 [[owners.validation]]
 id = "app-server-focused"
-cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-app-server"]
+cwd = "."
+argv = ["just", "test-fast", "-p", "codex-app-server"]
 role = "focused_tests"
 
 [[owners]]
@@ -34,8 +34,8 @@ tests = ["codex-rs/cli/tests"]
 
 [[owners.validation]]
 id = "cli-focused"
-cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-cli"]
+cwd = "."
+argv = ["just", "test-fast", "-p", "codex-cli"]
 role = "focused_tests"
 
 [[owners]]
@@ -53,8 +53,8 @@ tests = ["codex-rs/core/tests"]
 
 [[owners.validation]]
 id = "core-focused"
-cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-core"]
+cwd = "."
+argv = ["just", "test-fast", "-p", "codex-core"]
 role = "focused_tests"
 
 [[owners]]
@@ -72,8 +72,8 @@ tests = ["codex-rs/features/src/tests.rs"]
 
 [[owners.validation]]
 id = "features-focused"
-cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-features"]
+cwd = "."
+argv = ["just", "test-fast", "-p", "codex-features"]
 role = "focused_tests"
 
 [[owners]]
@@ -103,12 +103,12 @@ tests = [
 
 [[owners.validation]]
 id = "file-search-locator-focused"
-cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-file-search", "task_locator"]
+cwd = "."
+argv = ["just", "test-fast", "-p", "codex-file-search", "task_locator"]
 role = "focused_tests"
 
 [[owners.validation]]
 id = "core-source-tools-focused"
-cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-core", "source_tools"]
+cwd = "."
+argv = ["just", "test-fast", "-p", "codex-core", "source_tools"]
 role = "focused_tests"

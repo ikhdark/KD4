@@ -135,23 +135,31 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(
                     cli, "package_entries", return_value=archive_entries
                 ) as entries,
-                mock.patch.object(cli, "write_archive") as write_archive,
+                mock.patch.object(
+                    cli,
+                    "write_archive",
+                    side_effect=create_staged_archive,
+                ) as write_archive,
                 mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
                 mock.patch.object(
                     cli, "resolve_rg_bin", return_value=target_dir / "rg.exe"
                 ) as resolve_rg_bin,
                 mock.patch.object(cli, "resolve_zsh_bin", return_value=None),
+                mock.patch.object(
+                    cli, "source_build_stamp_matches", return_value=True
+                ),
             ):
                 rc = cli.main()
 
             self.assertEqual(rc, 0)
             build_source_binaries.assert_not_called()
+            staged_package_dir = prepare_package_dir.call_args.args[0]
             prepare_package_dir.assert_called_once_with(
-                package_dir, force=True, reuse=True
+                staged_package_dir, force=True, reuse=True
             )
             build_package_dir.assert_called_once()
             validate_package_dir.assert_called_once_with(
-                package_dir,
+                staged_package_dir,
                 cli.PACKAGE_VARIANTS["codex"],
                 cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
                 expected_version="1.2.3",
@@ -185,6 +193,9 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             outputs.entrypoint_bin.chmod(0o755)
             outputs.code_mode_host_bin.write_text("host", encoding="utf-8")
             outputs.code_mode_host_bin.chmod(0o755)
+            rg = out / "rg"
+            rg.write_text("rg", encoding="utf-8")
+            rg.chmod(0o755)
 
             with (
                 mock.patch.object(
@@ -217,7 +228,11 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(
                     cli, "build_source_binaries", return_value=outputs
                 ) as build,
-                mock.patch.object(cli, "prepare_package_dir"),
+                mock.patch.object(
+                    cli,
+                    "prepare_package_dir",
+                    side_effect=create_staged_package_dir,
+                ),
                 mock.patch.object(cli, "build_package_dir"),
                 mock.patch.object(cli, "validate_package_dir") as validate,
                 mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
@@ -250,6 +265,9 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             outputs.entrypoint_bin.chmod(0o755)
             outputs.code_mode_host_bin.write_text("host", encoding="utf-8")
             outputs.code_mode_host_bin.chmod(0o755)
+            rg = out / "rg"
+            rg.write_text("rg", encoding="utf-8")
+            rg.chmod(0o755)
 
             with (
                 mock.patch.object(
@@ -282,7 +300,11 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(
                     cli, "build_source_binaries", return_value=outputs
                 ) as build,
-                mock.patch.object(cli, "prepare_package_dir"),
+                mock.patch.object(
+                    cli,
+                    "prepare_package_dir",
+                    side_effect=create_staged_package_dir,
+                ),
                 mock.patch.object(cli, "build_package_dir") as build_package_dir,
                 mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
                 mock.patch.object(cli, "resolve_rg_bin", return_value=out / "rg"),
@@ -352,7 +374,11 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 mock.patch.object(
                     cli, "build_source_binaries", return_value=outputs
                 ) as build,
-                mock.patch.object(cli, "prepare_package_dir"),
+                mock.patch.object(
+                    cli,
+                    "prepare_package_dir",
+                    side_effect=create_staged_package_dir,
+                ),
                 mock.patch.object(cli, "build_package_dir"),
                 mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
                 mock.patch.object(cli, "resolve_rg_bin", return_value=out / "rg.exe"),
@@ -424,6 +450,14 @@ class CliPreflightTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "compression 'none'"),
             ):
                 cli.main()
+
+
+def create_staged_package_dir(path: Path, **_kwargs) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def create_staged_archive(_package_dir: Path, archive_path: Path, **_kwargs) -> None:
+    archive_path.write_bytes(b"archive")
 
 
 def request_args(**overrides) -> cli.argparse.Namespace:

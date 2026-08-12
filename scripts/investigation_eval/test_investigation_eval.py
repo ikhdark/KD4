@@ -43,14 +43,12 @@ class InvestigationEvalTests(unittest.TestCase):
             "execution": FROZEN_EXECUTION,
             "final_output": "No findings.",
             "reported_findings": [],
-            "metrics": {
-                "tool_calls": 0,
-                "repeated_equivalent_actions": 0,
-                "premature_completion": False,
-                "model_cost": None,
-                "tool_cost": None,
-            },
-            "raw_events": [],
+            "raw_events": [
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_0", "type": "agent_message", "text": "No findings."},
+                }
+            ],
         }
         (results_dir / f"{case['id']}.json").write_text(
             json.dumps(result),
@@ -95,14 +93,14 @@ new file mode 100644
 
             _validate_patch(patch, case_id="crlf-content")
 
-    def test_scorer_derives_binary_hash_from_results(self) -> None:
+    def test_scorer_requires_independently_hashed_binary(self) -> None:
         case = load_cases()[0]
         binary_sha256 = "a" * 64
         with tempfile.TemporaryDirectory() as temp_dir:
             results_dir = Path(temp_dir)
             self._write_result(results_dir, case, binary_sha256)
 
-            report = score([case], results_dir)
+            report = score([case], results_dir, binary_sha256)
 
         self.assertEqual(report["binary_sha256"], binary_sha256)
 
@@ -115,9 +113,9 @@ new file mode 100644
 
             with self.assertRaisesRegex(
                 ValidationError,
-                "binary_sha256 does not match the expected run binary",
+                "binary_sha256 does not match the hashed benchmark binary",
             ):
-                score(cases, results_dir)
+                score(cases, results_dir, "a" * 64)
 
 
 if __name__ == "__main__":

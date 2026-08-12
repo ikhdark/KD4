@@ -9,6 +9,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_protocol::CurrentTimeReadParams;
 use codex_app_server_protocol::CurrentTimeReadResponse;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_core::SleepFuture;
 use codex_core::TimeFuture;
@@ -69,16 +70,68 @@ impl TimeProvider for AppServerTimeProvider {
                 )
                 .context("external sleep deadline is outside the supported range")?;
 
+            let mut current = started_at;
             loop {
-                tokio::time::sleep(CURRENT_TIME_POLL_INTERVAL).await;
-                if request_current_time(outgoing.clone(), thread_state_manager.clone(), thread_id)
-                    .await?
-                    >= wake_at
-                {
+                if current >= wake_at {
                     return Ok(());
                 }
+                let remaining = (wake_at - current)
+                    .to_std()
+                    .context("external sleep remaining duration is outside the supported range")?;
+                tokio::time::sleep(remaining.min(CURRENT_TIME_POLL_INTERVAL)).await;
+                current =
+                    request_current_time(outgoing.clone(), thread_state_manager.clone(), thread_id)
+                        .await?;
             }
         })
+    }
+}
+
+struct PendingCurrentTimeRequest {
+    outgoing: Arc<OutgoingMessageSender>,
+    request_id: Option<RequestId>,
+}
+
+impl PendingCurrentTimeRequest {
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+
+    async fn cancel(&mut self) {
+        if let Some(request_id) = self.request_id.take() {
+            let _canceled = self.outgoing.cancel_request(&request_id).await;
+        }
+    }
+}
+
+impl Drop for PendingCurrentTimeRequest {
+    fn drop(&mut self) {
+        let Some(request_id) = self.request_id.take() else {
+            return;
+        };
+        let outgoing = self.outgoing.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _canceled = outgoing.cancel_request(&request_id).await;
+            });
+        } else {
+            // A request future can be stored and dropped after its originating
+            // runtime has shut down. Use a short-lived cleanup runtime rather
+            // than leaving the callback entry permanently registered.
+            let _cleanup = std::thread::Builder::new()
+                .name("codex-current-time-cleanup".to_string())
+                .spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let _canceled = outgoing.cancel_request(&request_id).await;
+                    });
+                });
+        }
     }
 }
 
@@ -113,8 +166,16 @@ async fn request_current_time(
             Some(thread_id),
         )
         .await;
+    let mut pending_request = PendingCurrentTimeRequest {
+        outgoing: outgoing.clone(),
+        request_id: Some(request_id.clone()),
+    };
 
-    let result = match timeout_at(deadline, rx).await {
+    let response = timeout_at(deadline, rx).await;
+    if response.is_ok() {
+        pending_request.disarm();
+    }
+    let result = match response {
         Ok(Ok(Ok(result))) => result,
         Ok(Ok(Err(err))) => {
             bail!(
@@ -125,7 +186,7 @@ async fn request_current_time(
         }
         Ok(Err(err)) => bail!("current-time request was canceled: {err}"),
         Err(_) => {
-            let _canceled = outgoing.cancel_request(&request_id).await;
+            pending_request.cancel().await;
             bail!(
                 "current-time request timed out after {}s",
                 CURRENT_TIME_REQUEST_TIMEOUT.as_secs()

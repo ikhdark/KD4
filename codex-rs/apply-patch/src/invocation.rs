@@ -44,6 +44,7 @@ pub enum MaybeApplyPatch {
 
 #[derive(Debug, PartialEq)]
 pub enum ExtractHeredocError {
+    UnsupportedShell,
     CommandDidNotStartWithApplyPatch,
     FailedToLoadBashGrammar(LanguageError),
     HeredocNotUtf8(Utf8Error),
@@ -102,8 +103,9 @@ fn extract_apply_patch_from_shell(
     script: &str,
 ) -> std::result::Result<(String, Option<String>), ExtractHeredocError> {
     match shell {
-        ApplyPatchShell::Unix | ApplyPatchShell::PowerShell | ApplyPatchShell::Cmd => {
-            extract_apply_patch_from_bash(script)
+        ApplyPatchShell::Unix => extract_apply_patch_from_bash(script),
+        ApplyPatchShell::PowerShell | ApplyPatchShell::Cmd => {
+            Err(ExtractHeredocError::UnsupportedShell)
         }
     }
 }
@@ -127,9 +129,10 @@ pub fn maybe_parse_apply_patch(argv: &[String], cwd: &PathUri) -> MaybeApplyPatc
                     }
                     Err(e) => MaybeApplyPatch::PatchParseError(e),
                 },
-                Err(ExtractHeredocError::CommandDidNotStartWithApplyPatch) => {
-                    MaybeApplyPatch::NotApplyPatch
-                }
+                Err(
+                    ExtractHeredocError::CommandDidNotStartWithApplyPatch
+                    | ExtractHeredocError::UnsupportedShell,
+                ) => MaybeApplyPatch::NotApplyPatch,
                 Err(e) => MaybeApplyPatch::ShellParseError(e),
             },
             None => MaybeApplyPatch::NotApplyPatch,
@@ -245,7 +248,8 @@ async fn try_verify_apply_patch_args(
         };
 
         for path in std::iter::once(source_path).chain(move_path) {
-            if !mutation_endpoints.insert(path.clone()) {
+            let identity = mutation_endpoint_identity(fs, &path, sandbox).await?;
+            if !mutation_endpoints.insert(identity) {
                 return Err(ParseError::InvalidPatchError(format!(
                     "path '{}' is mutated more than once in the same patch",
                     path.inferred_native_path_string()
@@ -296,6 +300,69 @@ async fn try_verify_apply_patch_args(
         changes,
         patch,
         cwd: effective_cwd,
+    })
+}
+
+/// Resolve existing endpoints through links and resolve the closest existing
+/// ancestor of prospective endpoints. This prevents differently-spelled paths
+/// from bypassing the one-mutation-per-endpoint invariant.
+async fn mutation_endpoint_identity(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
+) -> Result<String, ApplyPatchError> {
+    let mut candidate = path.clone();
+    let mut missing_segments = Vec::new();
+    let mut resolved = loop {
+        match fs.canonicalize(&candidate, sandbox).await {
+            Ok(resolved) => break resolved,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                let segment = candidate.basename().ok_or_else(|| {
+                    ApplyPatchError::IoError(IoError {
+                        context: format!(
+                            "Failed to resolve mutation endpoint {}",
+                            path.inferred_native_path_string()
+                        ),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no existing ancestor for mutation endpoint",
+                        ),
+                    })
+                })?;
+                missing_segments.push(segment);
+                candidate = candidate.parent().ok_or_else(|| {
+                    ApplyPatchError::IoError(IoError {
+                        context: format!(
+                            "Failed to resolve mutation endpoint {}",
+                            path.inferred_native_path_string()
+                        ),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no existing ancestor for mutation endpoint",
+                        ),
+                    })
+                })?;
+            }
+            Err(source) => {
+                return Err(ApplyPatchError::IoError(IoError {
+                    context: format!(
+                        "Failed to resolve mutation endpoint {}",
+                        path.inferred_native_path_string()
+                    ),
+                    source,
+                }));
+            }
+        }
+    };
+
+    for segment in missing_segments.iter().rev() {
+        resolved = resolved.join(segment)?;
+    }
+
+    let identity = resolved.inferred_native_path_string();
+    Ok(match resolved.infer_path_convention() {
+        Some(PathConvention::Windows) => identity.to_lowercase(),
+        _ => identity,
     })
 }
 
@@ -566,6 +633,13 @@ mod tests {
         );
     }
 
+    fn assert_shell_not_intercepted(args: Vec<String>, cwd: &PathUri) {
+        assert_matches!(
+            maybe_parse_apply_patch(&args, cwd),
+            MaybeApplyPatch::NotApplyPatch
+        );
+    }
+
     #[tokio::test]
     async fn test_implicit_patch_single_arg_is_error() {
         let patch = "*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch".to_string();
@@ -702,26 +776,32 @@ PATCH"#,
     #[tokio::test]
     async fn test_powershell_heredoc() {
         let script = heredoc_script("");
-        assert_match_args(args_powershell(&script), /*expected_workdir*/ None);
+        assert_shell_not_intercepted(
+            args_powershell(&script),
+            &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
+        );
     }
     #[tokio::test]
     async fn test_powershell_heredoc_no_profile() {
         let script = heredoc_script("");
-        assert_match_args(
+        assert_shell_not_intercepted(
             args_powershell_no_profile(&script),
-            /*expected_workdir*/ None,
+            &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
         );
     }
     #[tokio::test]
     async fn test_pwsh_heredoc() {
         let script = heredoc_script("");
-        assert_match_args(args_pwsh(&script), /*expected_workdir*/ None);
+        assert_shell_not_intercepted(
+            args_pwsh(&script),
+            &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
+        );
     }
 
     #[tokio::test]
     async fn test_apply_patch_interception_uses_cwd_convention_for_windows_pwsh_path() {
         let script = heredoc_script("");
-        assert_match_args_with_cwd(
+        assert_shell_not_intercepted(
             strs_to_strings(&[
                 r"C:\Program Files\PowerShell\7\pwsh.exe",
                 "-NoProfile",
@@ -729,14 +809,16 @@ PATCH"#,
                 &script,
             ]),
             &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
-            /*expected_workdir*/ None,
         );
     }
 
     #[tokio::test]
     async fn test_cmd_heredoc_with_cd() {
         let script = heredoc_script("cd foo && ");
-        assert_match_args(args_cmd(&script), Some("foo"));
+        assert_shell_not_intercepted(
+            args_cmd(&script),
+            &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
+        );
     }
 
     #[tokio::test]

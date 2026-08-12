@@ -966,7 +966,7 @@ impl Session {
         let mutation_cleanup_completed = self
             .services
             .command_execution
-            .cancel_mutations_for_turn_with_timeout(
+            .cancel_mutations_for_terminal_turn_with_timeout(
                 &turn_context.sub_id,
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
             )
@@ -977,7 +977,6 @@ impl Session {
                 "timed out waiting for turn-owned workspace mutations to finalize"
             );
         }
-
         if requires_abort_cleanup {
             tokio::select! {
                 _ = finalization.task.done.notified() => {},
@@ -1781,7 +1780,7 @@ impl Session {
         let mutation_cleanup_completed = self
             .services
             .command_execution
-            .cancel_mutations_for_turn_with_timeout(
+            .cancel_mutations_for_terminal_turn_with_timeout(
                 &turn_context.sub_id,
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
             )

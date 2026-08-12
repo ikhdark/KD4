@@ -840,8 +840,31 @@ def _cargo_command_with_target_dir(
     if len(result) < 2 or Path(result[0]).stem.lower() != "cargo":
         return result
     subcommand_index = 1
-    while subcommand_index < len(result) and result[subcommand_index].startswith("-"):
+    if (
+        subcommand_index < len(result)
+        and result[subcommand_index].startswith("+")
+        and len(result[subcommand_index]) > 1
+    ):
         subcommand_index += 1
+    global_options_with_values = {"--color", "--config", "--explain", "-Z"}
+    while subcommand_index < len(result):
+        argument = result[subcommand_index]
+        if argument == "--":
+            subcommand_index += 1
+            break
+        if argument in global_options_with_values:
+            subcommand_index += 2
+            continue
+        if any(
+            argument.startswith(f"{option}=")
+            for option in {"--color", "--config", "--explain"}
+        ) or (argument.startswith("-Z") and argument != "-Z"):
+            subcommand_index += 1
+            continue
+        if argument.startswith("-"):
+            subcommand_index += 1
+            continue
+        break
     if subcommand_index >= len(result):
         return result
     subcommand = result[subcommand_index]
@@ -918,7 +941,10 @@ def run_in_cargo_lane(
                 file=sys.stderr,
             )
         child_env = os.environ.copy()
-        child_env.pop("CARGO_TARGET_DIR", None)
+        # The environment is the isolation backstop for nested Cargo launches,
+        # including cargo-watch --shell/-s commands that cannot be rewritten
+        # safely as argv.
+        child_env["CARGO_TARGET_DIR"] = str(target_dir)
         child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
         child_command = _cargo_command_with_target_dir(command, target_dir)
         if os.name == "nt" and not Path(child_command[0]).parent.name:
@@ -1321,6 +1347,7 @@ def prune_stale_lanes(
                     f"warning: lane moved to deferred cleanup path {trash_path}: {exc}",
                     file=sys.stderr,
                 )
+                continue
         removed.append(path)
     return removed
 

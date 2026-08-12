@@ -1,0 +1,71 @@
+KD4 SCRIPTS REVIEW: VALIDATED ISSUES AND IMPLEMENTATION MAP
+Source review: C:\Users\kuh\Downloads\kd4_scripts_full_review_63dde623.txt
+Reviewed commit: 63dde623c690207e5eef5dd7d9b6b36f47e32152
+Current baseline: d38181185e3f23b24d6015bfc710c198d5206752
+
+Status meaning:
+  VALIDATED/FIXED  confirmed against current source and repaired; tests intentionally not run
+
+F01 VALIDATED/FIXED | scripts/git_doctor.py | Diagnostic false success
+F02 VALIDATED/FIXED | scripts/git_doctor.py | Incorrect configuration diagnosis
+F03 VALIDATED/FIXED | scripts/investigation_evidence_smoke.py | Fingerprint and staged evidence disagree
+F04 VALIDATED/FIXED | scripts/kd4_perf_snapshot.py | Skipped benchmarks reported as success
+F05 VALIDATED/FIXED | scripts/root_maintenance.py | Changed-file discovery fails open
+F06 VALIDATED/FIXED | scripts/rust_build_status.py | Cargo-watch commands escape the build lane
+F07 VALIDATED/FIXED | scripts/rust_build_status.py | Cargo global-option prefixes are misparsed
+F08 VALIDATED/FIXED | scripts/rust_build_status.py | Deferred target prune reported as complete
+F09 VALIDATED/FIXED | scripts/stage_npm_archives.py | Artifact fallback selection bug
+F10 VALIDATED/FIXED | scripts/stage_npm_archives.py | Post-commit cleanup failure is misclassified
+F11 VALIDATED/FIXED | scripts/stage_npm_packages.py | Unknown components are silently dropped
+F12 VALIDATED/FIXED | scripts/stage_npm_packages.py | Batch staging is non-transactional
+F13 VALIDATED/FIXED | scripts/start-codex-exec.sh | Remote cache is destructively synchronized
+F14 VALIDATED/FIXED | scripts/start-codex-exec.sh | Remote readiness detection is brittle
+F15 VALIDATED/FIXED | scripts/test-remote-env.sh | Readiness checks the wrong service contract
+F16 VALIDATED/FIXED | scripts/test-remote-env.sh | Stale containers and binaries are reused
+F17 VALIDATED/FIXED | scripts/readme_toc.py | Incorrect Markdown anchors
+F18 VALIDATED/FIXED | scripts/publish-local-codex.ps1 | Ambiguous publish commit boundary
+F19 VALIDATED/FIXED | scripts/codex_package/cargo.py | Build cache integrity bypass
+F20 VALIDATED/FIXED | scripts/codex_package/cargo.py | Malformed cache crashes instead of missing
+F21 VALIDATED/FIXED | scripts/codex_package/cargo.py | Incomplete build cache key
+F22 VALIDATED/FIXED | scripts/codex_package/cli.py | Stale binary packaging mode
+F23 VALIDATED/FIXED | scripts/codex_package/dotslash.py | Downloaded archive integrity is not rechecked
+F24 VALIDATED/FIXED | scripts/codex_package/dotslash.py | Extracted executable integrity is not checked
+F25 VALIDATED/FIXED | scripts/codex_package/v8.py | V8 cache trusts metadata without content validation
+F26 VALIDATED/FIXED | scripts/codex_package/cli.py | Existing package replacement is destructive
+F27 VALIDATED/FIXED | scripts/codex_package/layout.py | Invalid role aliases are accepted
+F28 VALIDATED/FIXED | scripts/codex_package/multiarchive.py | Multi-archive output can be partially committed
+F29 VALIDATED/FIXED | scripts/install/install.ps1 | Failing binary can pass version validation
+F30 VALIDATED/FIXED | scripts/install/install.ps1 | Activation failure has no rollback
+F31 VALIDATED/FIXED | scripts/install/install.ps1 | Install lock wait is unbounded
+F32 VALIDATED/FIXED | scripts/install/install.sh | Failing binary can pass version validation
+F33 VALIDATED/FIXED | scripts/install/install.sh | Non-portable cleanup and activation commands
+F34 VALIDATED/FIXED | scripts/install/install.ps1; scripts/install/install.sh | Incomplete release can be activated
+F35 VALIDATED/FIXED | scripts/install/install.sh | Parallel download workers can leak
+F36 VALIDATED/FIXED | scripts/install/install.sh | Activation failure has no rollback
+F37 VALIDATED/FIXED | scripts/install/install.sh | Lock timeout can silently bypass locking
+F38 VALIDATED/FIXED | scripts/investigation_eval/validate_cases.py | Fixture validation is not isolated
+F39 VALIDATED/FIXED | scripts/investigation_eval/validate_cases.py | Contradictory evaluation manifest accepted
+F40 VALIDATED/FIXED | scripts/investigation_eval/score_results.py | Unproven benchmark provenance
+F41 VALIDATED/FIXED | scripts/investigation_eval/score_results.py | Self-reported efficiency metrics
+F42 VALIDATED/FIXED | scripts/investigation_eval/score_results.py | Findings can contradict model output
+F43 VALIDATED/FIXED | scripts/investigation_eval/score_results.py | False-positive locator matching
+
+IMPLEMENTATION NOTES
+F01-F10: repaired diagnostic exit propagation, Git boolean parsing, evidence-set consistency,
+  incomplete benchmark handling, fail-closed discovery, Rust lane command construction,
+  truthful pruning, exact artifact selection, and post-commit cleanup reporting.
+F11-F18: made staging transactional and strict, preserved remote caches, strengthened remote
+  identity/readiness checks, corrected anchor generation, and separated publish commit from restart.
+F19-F28: added content-addressed cache validation, complete build recipes, explicit output-role
+  validation, staged package/archive activation, and rollback for partial output replacement.
+F29-F37: made version probes honor process exit status, bounded locks, cancelled download workers,
+  verified complete releases, improved POSIX portability, and added activation rollback.
+F38-F43: isolated patch validation in disposable repositories, rejected manifest contradictions,
+  hashed the actual benchmark binary, derived tool metrics from raw events, reconciled final output,
+  and changed locator matching from concatenated substrings to normalized exact entries.
+
+VALIDATION CONSTRAINT
+The user explicitly prohibited test execution. No issue status in this ledger claims a test run.
+Completion is based on the full source-review file, current-source inspection, and non-test static
+or syntax checks only.
+

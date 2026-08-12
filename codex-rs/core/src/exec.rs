@@ -1,8 +1,7 @@
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
-
 use std::collections::HashMap;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 #[cfg(target_os = "windows")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -1009,11 +1008,11 @@ async fn exec(
         stdio_policy: StdioPolicy::RedirectForShellTool,
         env,
         #[cfg(windows)]
-        creation_flags: ManagedRootProcess::WINDOWS_CREATION_FLAGS,
+        creation_flags: 0,
     })
     .await?;
     #[cfg(target_os = "windows")]
-    if let Err(err) = managed_root.attach_and_resume(
+    if let Err(err) = managed_root.attach(
         child
             .id()
             .ok_or_else(|| io::Error::other("missing child process id"))?,

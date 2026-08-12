@@ -17,8 +17,12 @@ use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tempfile::NamedTempFile;
 use tree_sitter::Language;
 use tree_sitter::Node;
@@ -36,8 +40,7 @@ const CACHE_SCHEMA_VERSION: u32 = 1;
 const PARSER_VERSIONS: &str =
     "tree-sitter-rust/0.24.2;tree-sitter-javascript/0.25.0;tree-sitter-typescript/0.23.2";
 
-static CACHE_GUARDS: OnceLock<Mutex<BTreeMap<PathBuf, std::sync::Arc<Mutex<()>>>>> =
-    OnceLock::new();
+static CACHE_GUARDS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 
 #[cfg(test)]
 type BeforeFinalVerifyHook = Box<dyn FnOnce() + Send>;
@@ -600,6 +603,21 @@ fn validate_entry_symbol(
 }
 
 pub fn locate_task(request: &LocateTaskRequest<'_>) -> Result<LocateTaskOutput> {
+    locate_task_inner(request, None)
+}
+
+pub fn locate_task_cancellable(
+    request: &LocateTaskRequest<'_>,
+    cancelled: &AtomicBool,
+) -> Result<LocateTaskOutput> {
+    locate_task_inner(request, Some(cancelled))
+}
+
+fn locate_task_inner(
+    request: &LocateTaskRequest<'_>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<LocateTaskOutput> {
+    check_cancelled(cancelled)?;
     let root = request
         .repository_root
         .canonicalize()
@@ -610,20 +628,45 @@ pub fn locate_task(request: &LocateTaskRequest<'_>) -> Result<LocateTaskOutput> 
         let mut guards = guards
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guards
-            .entry(cache_key.clone())
-            .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
-            .clone()
+        guards.retain(|_, guard| guard.strong_count() > 0);
+        if let Some(guard) = guards.get(&cache_key).and_then(Weak::upgrade) {
+            guard
+        } else {
+            let guard = Arc::new(Mutex::new(()));
+            guards.insert(cache_key.clone(), Arc::downgrade(&guard));
+            guard
+        }
     };
-    let _guard = guard
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match locate_once(request, &root, &cache_key) {
+    let _guard = lock_cache_guard(&guard, cancelled)?;
+    match locate_once(request, &root, &cache_key, cancelled) {
         Ok(output) => Ok(output),
         Err(error) if error.to_string().contains("source_changed_during_query") => {
-            locate_once(request, &root, &cache_key)
+            locate_once(request, &root, &cache_key, cancelled)
         }
         Err(error) => Err(error),
+    }
+}
+
+fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        anyhow::bail!("locate_task_cancelled");
+    }
+    Ok(())
+}
+
+fn lock_cache_guard<'a>(
+    guard: &'a Mutex<()>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<std::sync::MutexGuard<'a, ()>> {
+    loop {
+        match guard.try_lock() {
+            Ok(locked) => return Ok(locked),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                check_cancelled(cancelled)?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 }
 
@@ -631,7 +674,9 @@ fn locate_once(
     request: &LocateTaskRequest<'_>,
     root: &Path,
     cache_path: &Path,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<LocateTaskOutput> {
+    check_cancelled(cancelled)?;
     let repository_identity = repository_identity(root);
     let mut cache = if request.force_fresh {
         CacheLayer::default()
@@ -675,6 +720,7 @@ fn locate_once(
     let mut changed_contributors = Vec::new();
     let mut reparsed = manifest_reparsed;
     for relative in &candidate_paths {
+        check_cancelled(cancelled)?;
         let absolute = confined_join(root, relative)?;
         let bytes = match fs::read(&absolute) {
             Ok(bytes) => bytes,
@@ -793,6 +839,7 @@ fn locate_once(
             reparsed,
         },
     );
+    check_cancelled(cancelled)?;
     let rendered = render_bounded(&mut result)?;
     #[cfg(test)]
     run_before_final_verify_hook(root);
@@ -800,6 +847,7 @@ fn locate_once(
     if let Some(path) = expected_missing_manifest {
         verify_absent(root, &path)?;
     }
+    check_cancelled(cancelled)?;
     persist_cache(cache_path, &cache);
     let rendered_bytes = rendered.len();
     let supporting_reads = fingerprints

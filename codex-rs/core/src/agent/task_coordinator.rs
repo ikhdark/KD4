@@ -41,8 +41,6 @@ use tracing::warn;
 use super::task_metrics::TaskMetricRuntime;
 use super::task_metrics::terminal_metrics_ready;
 
-const MAX_RESTART_BINDINGS: usize = 256;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FocusedValidationToken {
     assignment_id: AssignmentId,
@@ -117,10 +115,7 @@ impl AgentTaskCoordinator {
             ));
         }
         let persisted = store
-            .list_agent_task_bindings(
-                initialized_root_session_id.clone(),
-                Some(MAX_RESTART_BINDINGS),
-            )
+            .list_agent_task_bindings(initialized_root_session_id.clone(), /*limit*/ None)
             .await?;
         let mut bindings = self
             .bindings
@@ -409,6 +404,9 @@ impl AgentTaskCoordinator {
         if task.current_attempt.attempt_id != token.attempt_id {
             return Err(StoreError::AttemptNotActive(token.attempt_id));
         }
+        let mut evidence = token.evidence;
+        evidence.retained_output_ref = retained_output_ref;
+        evidence.output_summary = output_summary;
         store
             .record_validation_call(ValidationCall {
                 call_id: token.call_id,
@@ -416,11 +414,7 @@ impl AgentTaskCoordinator {
                 command_summary: token.command_summary,
                 resolved_executable: Some(token.resolved_executable),
                 proof_kind: ValidationProofKind::Focused,
-                evidence: ValidationEvidence {
-                    retained_output_ref,
-                    output_summary,
-                    ..ValidationEvidence::default()
-                },
+                evidence,
                 status,
                 recorded_at: Utc::now(),
             })

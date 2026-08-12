@@ -1,7 +1,9 @@
 """Command-line interface for building Codex package directories."""
 
 import argparse
+import shutil
 import tempfile
+import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -15,11 +17,14 @@ from .cargo import SourceBuildOutputs
 from .cargo import build_source_binaries
 from .cargo import cargo_package_target_dir
 from .cargo import cargo_profile_output_dir
+from .cargo import source_build_stamp_matches
 from .cargo import validate_source_outputs
 from .layout import build_package_dir
 from .layout import prepare_package_dir
+from .layout import remove_tree_allow_readonly
 from .layout import validate_package_dir_destination
 from .layout import validate_package_dir
+from .layout import validate_package_input_roles
 from .ripgrep import resolve_rg_bin
 from .targets import PACKAGE_VARIANTS
 from .targets import SUPPORTED_TARGETS
@@ -221,42 +226,166 @@ def main() -> int:
     timings = getattr(args, "timings", False)
     with timed_step("inputs", timings):
         version, inputs = resolve_package_inputs(args, spec, variant)
-    with timed_step("package-dir", timings):
-        prepare_package_dir(
-            package_dir,
-            force=args.force,
-            reuse=getattr(args, "reuse_package_dir", False),
-        )
-        build_package_dir(package_dir, version, variant, spec, inputs)
-    if not getattr(args, "skip_validate", False):
-        with timed_step("validate", timings):
-            validate_package_dir(
-                package_dir,
-                variant,
-                spec,
-                expected_version=version,
-                include_zsh=inputs.zsh_bin is not None,
-                fast=getattr(args, "fast_validate", False),
+        validate_package_input_roles(inputs)
+    reuse_package_dir = getattr(args, "reuse_package_dir", False)
+    with staged_package_destination(
+        package_dir, reuse_existing=reuse_package_dir
+    ) as staged_package_dir:
+        with timed_step("package-dir", timings):
+            prepare_package_dir(
+                staged_package_dir,
+                force=True,
+                reuse=reuse_package_dir,
             )
+            build_package_dir(staged_package_dir, version, variant, spec, inputs)
+        if not getattr(args, "skip_validate", False):
+            with timed_step("validate", timings):
+                validate_package_dir(
+                    staged_package_dir,
+                    variant,
+                    spec,
+                    expected_version=version,
+                    include_zsh=inputs.zsh_bin is not None,
+                    fast=getattr(args, "fast_validate", False),
+                )
 
     archive_entries = None
     if args.archive_output:
         with timed_step("archive-entries", timings):
             archive_entries = package_entries(package_dir)
-    for archive_output in args.archive_output:
-        archive_path = archive_output.resolve()
-        with timed_step(f"archive {archive_path.name}", timings):
-            write_archive(
+    archive_paths = [output.resolve() for output in args.archive_output]
+    if archive_paths:
+        with timed_step("archives", timings):
+            write_archives_atomically(
                 package_dir,
-                archive_path,
+                archive_paths,
                 force=args.force,
                 entries=archive_entries,
                 compression=getattr(args, "archive_compression", "default"),
             )
+    for archive_path in archive_paths:
         print(f"Built Codex package archive at {archive_path}")
 
     print(f"Built Codex package directory at {package_dir}")
     return 0
+
+
+@contextmanager
+def staged_package_destination(
+    package_dir: Path, *, reuse_existing: bool
+) -> Iterator[Path]:
+    """Build beside the destination and activate only after successful validation."""
+    package_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix=f".{package_dir.name}.staging-", dir=package_dir.parent
+        )
+    )
+    staged_dir = staging_root / package_dir.name
+    backup_dir: Path | None = None
+    committed = False
+    try:
+        if reuse_existing and package_dir.exists():
+            shutil.copytree(package_dir, staged_dir)
+        yield staged_dir
+
+        if package_dir.exists():
+            backup_dir = package_dir.with_name(
+                f".{package_dir.name}.backup-{uuid.uuid4().hex}"
+            )
+            package_dir.replace(backup_dir)
+        try:
+            staged_dir.replace(package_dir)
+        except BaseException:
+            if backup_dir is not None and backup_dir.exists():
+                backup_dir.replace(package_dir)
+            raise
+        committed = True
+        if backup_dir is not None and backup_dir.exists():
+            try:
+                remove_tree_allow_readonly(backup_dir)
+            except OSError as exc:
+                print(
+                    f"warning: package was committed but backup cleanup failed: "
+                    f"{backup_dir}: {exc}"
+                )
+    finally:
+        if staging_root.exists():
+            try:
+                remove_tree_allow_readonly(staging_root)
+            except OSError as exc:
+                if not committed:
+                    raise
+                print(f"warning: staging cleanup failed: {staging_root}: {exc}")
+
+
+def write_archives_atomically(
+    package_dir: Path,
+    archive_paths: list[Path],
+    *,
+    force: bool,
+    entries: list[Path] | None,
+    compression: str,
+) -> None:
+    """Generate every archive before replacing any requested destination."""
+    staged: list[tuple[Path, Path, Path]] = []
+    backups: list[tuple[Path, Path]] = []
+    activated: list[tuple[Path, Path]] = []
+    try:
+        for archive_path in archive_paths:
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            staging_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{archive_path.name}.staging-", dir=archive_path.parent
+                )
+            )
+            staged_path = staging_root / archive_path.name
+            staged.append((archive_path, staged_path, staging_root))
+            write_archive(
+                package_dir,
+                staged_path,
+                force=True,
+                entries=entries,
+                compression=compression,
+            )
+
+        for archive_path, staged_path, _ in staged:
+            if archive_path.exists():
+                if not force:
+                    raise RuntimeError(
+                        f"Archive output already exists: {archive_path}"
+                    )
+                backup_path = archive_path.with_name(
+                    f".{archive_path.name}.backup-{uuid.uuid4().hex}"
+                )
+                archive_path.replace(backup_path)
+                backups.append((archive_path, backup_path))
+            staged_path.replace(archive_path)
+            activated.append((archive_path, staged_path))
+    except BaseException:
+        for archive_path, staged_path in reversed(activated):
+            if archive_path.exists():
+                archive_path.replace(staged_path)
+        for archive_path, backup_path in reversed(backups):
+            if backup_path.exists():
+                backup_path.replace(archive_path)
+        raise
+    else:
+        for _, backup_path in backups:
+            try:
+                backup_path.unlink(missing_ok=True)
+            except OSError as exc:
+                print(
+                    f"warning: archives were committed but backup cleanup failed: "
+                    f"{backup_path}: {exc}"
+                )
+    finally:
+        for _, _, staging_root in staged:
+            if staging_root.exists():
+                try:
+                    remove_tree_allow_readonly(staging_root)
+                except OSError as exc:
+                    print(f"warning: archive staging cleanup failed: {staging_root}: {exc}")
 
 
 def resolve_package_inputs(
@@ -390,6 +519,20 @@ def resolve_source_outputs(
     if getattr(args, "skip_build_if_present", False):
         outputs = source_outputs_from_existing(spec, variant, args.cargo_profile)
         validate_source_outputs(outputs)
+        target_dir = cargo_package_target_dir(spec, args.cargo_profile)
+        if not source_build_stamp_matches(
+            target_dir,
+            spec=spec,
+            profile=args.cargo_profile,
+            variant=variant,
+            outputs=outputs,
+            cargo=args.cargo,
+        ):
+            raise RuntimeError(
+                "--skip-build-if-present found binaries, but their content or "
+                "source-build recipe stamp is missing or stale. Rebuild without "
+                "--skip-build-if-present."
+            )
         return outputs
 
     return build_source_binaries(

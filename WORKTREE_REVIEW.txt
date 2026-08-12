@@ -1,207 +1,347 @@
-KD4 WORKTREE REVIEW
-===================
+KD4 WORKTREE REVIEW - INITIAL FROZEN LEDGER (PRE-REPAIR)
+========================================================
 
-Review baseline
----------------
-Frozen: 2026-08-12T02:45:07.0703952-05:00
-Repository: C:\Users\kuh\Desktop\kd4
+Review state
+------------
+Frozen on 2026-08-12 in C:\Users\kuh\Desktop\kd4.
 Branch: main
-HEAD: 63dde623c690207e5eef5dd7d9b6b36f47e32152
+HEAD: d38181185e3f23b24d6015bfc710c198d5206752
 Staged paths: 0
-Git-status tracked paths: 40 (36 substantive content diffs, one of them deleted; 4 normalization-only status entries with no Git content diff)
-Untracked Git-visible paths: 12,143 (one durable configuration file and 12,142 generated Cargo-output paths)
-Renames/type changes/unmerged paths/submodule changes: 0
-Ignored files: excluded as required.
+Tracked status paths: 87 modified (86 content diffs and one normalization-only path)
+Untracked paths: 7
+Deleted, renamed, copied, type-changed, unmerged, and submodule paths: 0
+Total frozen paths: 94
 
-Scope decision
---------------
-The user's explicit boundary is KD4 and "do not go broad." Every substantive source/configuration change is reviewed file by file with its direct contracts and tests. The three root-level Cargo target trees are generated/binary material, so they are represented below as three provenance units rather than pretending to line-review 12,142 compiler artifacts. Their complete sorted Git-visible path manifests were counted and hashed. This is the only inventory grouping; the durable untracked file is reviewed in full.
+This is the required initial ledger. Every frozen path was read through EOF and
+its complete worktree diff was inspected before this ledger was written. Direct
+owners, callers, tests, manifests, and generated-contract routes were traced where
+needed. No implementation repair has been made yet. The only post-freeze edit is
+replacement of the stale historical WORKTREE_REVIEW.txt with this audit artifact.
 
-Applicable instructions and routing read in full
-------------------------------------------------
+Instructions and routing read
+-----------------------------
 C:\Users\kuh\.codex\skills\worktree-review\SKILL.md
+C:\Users\kuh\.codex\plugins\cache\repo-atlas-local\repo-atlas\6.0.1\skills\repo-atlas\SKILL.md
 AGENTS.md
-.codex\AGENTS.md
-codex-rs\AGENTS.md
-codex-rs\core\AGENTS.md
 SOURCEMAP.md
 do-not-code.md
-
-Repository routing result: the changed agent-task-store, app-server, core, state, and windows-sandbox-rs paths are fork-local editable implementation/test surfaces. Cargo.lock is generated from Cargo manifests. No generated protocol/schema contract is changed. Source changes do not hot-apply to Codex Desktop, and publishing/installing/restarting is outside this review.
-
-Initial evidence-backed findings (recorded before repairs)
----------------------------------------------------------
-F001 CONFIRMED - codex-rs/windows-sandbox-rs/src/lib.rs derives Clone, Copy, Debug, Eq, and PartialEq twice on CaptureOutputStream. Rust emits conflicting trait implementations, so this is a compile blocker. Disposition: remove the duplicate derive set and compile/test the crate.
-
-F002 CONFIRMED - codex-rs/state/src/log_db.rs startup_reconciliation_prunes_retention_missed_before_shutdown inserts a seed row into logs.message after StateRuntime has migrated the current schema to logs.feedback_log_body. The test fails at its seed statement with "no such column: message." Disposition: seed feedback_log_body and run the focused state test.
-
-F003 CONFIRMED - codex-rs/agent-task-store/src/local.rs append_observation_impl records its connection-acquire, transaction-begin, and writer-lock timing under operation="begin_mutation". That makes append-observation contention indistinguishable from mutation startup. Disposition: use operation="append_observation" for all three phases and run focused task-store tests plus Clippy.
-
-F004 CONFIRMED - unchanged direct contract test codex-rs/core/src/tools/handlers/command_windows_corpus_tests.rs still expects the third identical unclassified nonzero exit to be suppressed. The changed command ledger intentionally suppresses only failures backed by a deterministic validation-admission contract. Disposition: update the stale corpus expectation while preserving unclassified retries.
-
-F005 CONFIRMED - codex-rs/app-server/src/command_exec.rs test windows_sandbox_streaming_exec_is_rejected contradicts the changed implementation, which now supports stdout/stderr streaming for Windows-sandbox execution. Its current parameters first fail the unrelated custom-output-cap check, so its expected rejection message is also unreachable. Disposition: convert the test into an acceptance/start-path assertion with the supported default cap.
-
-F006 CONFIRMED - deterministic focused-validation failure classification is lost whenever unified exec stores a live process before its initial wait. exec_command only records DeterministicFailureRecord when finish_running_process says the process was not tracked; the exit watcher and tracked-process finalizer currently record a generic exit. This defeats exact-repeat suppression for normally yielded or background validation commands. Disposition: carry the trusted deterministic contract and start time in running-command bookkeeping, record it exactly once at every tracked terminal path, refresh its evidence after artifact finalization, and add focused tests.
-
-Findings discovered during repair and validation
-------------------------------------------------
-F007 CONFIRMED - codex-rs/state/src/runtime.rs test code uses Arc for the explicit telemetry sink without importing it. The state test target does not compile. Repaired by adding the test-only import.
-
-F008 CONFIRMED - codex-rs/state/src/runtime/logs.rs derives Default for LogRetentionTestControl even though tokio::sync::Semaphore does not implement Default. The state test target does not compile. Repaired with an explicit constructor-equivalent Default implementation.
-
-F009 CONFIRMED - LogRetentionTestControl was visible only to its parent module while StateRuntime exposed and used the concrete type from a sibling test module. Rust rejects the private type crossing that boundary. Repaired by making the test-only control crate-visible, matching its crate-local use.
-
-F010 CONFIRMED - the new app-server Windows-sandbox streaming test leaves its async event-channel item type unconstrained after the expected rejection path is removed. Type inference fails before the test can exercise process startup. Repaired by explicitly selecting codex_protocol::protocol::Event.
-
-F011 CONFIRMED - CapturePipeReader::spawn_capture_pipe_reader became a compatibility helper used only by tests after production moved to the sink-aware constructor. Leaving it in production creates dead-code noise. Repaired with a test-only cfg gate; the sink-aware production path remains unchanged.
-
-F012 CONFIRMED - a newly affected session test exhaustively matches TurnAbortedEvent without accounting for its additional timing/turn fields. The core test target does not compile. Repaired with an explicit rest pattern because the assertion is only about reason.
-
-F013 CONFIRMED - six direct core exec tests still call read_output with four arguments after P015 added the shared OutputDeltaLimiter parameter. The core test target does not compile. Repaired by passing a fresh limiter in each unchanged direct test.
-
-F014 CONFIRMED - Clippy's denied expect_used lint rejects a guarded maintenance Option expect in the changed state log writer. Repaired with an if-let await and let-else continuation so the proven optional state remains explicit without a panic path.
-
-F015 CONFIRMED - four new task-store telemetry error hooks use map_err solely for observation and then return the unchanged error, which triggers Clippy's manual_inspect lint. Repaired with inspect_err at append-observation and mutation-finalization acquire/begin phases; error propagation is unchanged.
-
-F016 CONFIRMED - the trusted tracked-process registration helper necessarily carries process identity, ownership, artifact, timing, and validation-contract fields and triggers Clippy's too_many_arguments lint. The arguments form one cohesive registration contract and splitting it would add an unrelated data-model refactor. Repaired with the repository's narrow function-local lint allowance.
-
-F017 CONFIRMED - workspace_mutation_claim_conflicts_tx exempts a live canonical Root lease from an overlapping typed assignment in the same root session. That breaks the symmetric claim/lease exclusion contract and lets a child writer race its still-active root writer. Two existing safety tests fail individually, so this is not parallel-test interference. Repaired by removing the exemption and converting the new contradictory test into canonical-root, foreign, and spoofed-identity blocking coverage. The complete task-store library suite then passes.
-
-R001 REVIEWED, NOT A DEFECT - the fail-safe task terminal finalizer can wait for mutation cleanup before explicit task cancellation, unlike the normal path. The wait is bounded to one second and the mutation owner carries its own cancellation authority. No unbounded deadlock or authority leak was established, so no speculative redesign is authorized.
-
-R002 PUBLISH/HYGIENE RISK - .codex/agents/default.toml is the target of the new checked-in config declaration but is currently untracked. The configuration is internally valid, but omitting the file from a future commit would break role loading. Disposition: keep it in the reviewed change set and report the commit-readiness dependency; do not stage or commit.
-
-R003 PUBLISH/HYGIENE RISK - three root-level target-* build trees expose 12,142 untracked paths and about 7.7 GB of generated output because the root .gitignore does not cover them. They are not source and show normal Cargo/rustc provenance. Deleting user data or broadening ignore policy is not authorized. Disposition: leave them untouched and explicitly exclude them from any future commit.
-
-Frozen inventory ledger (one primary entry per tracked path or approved generated unit)
--------------------------------------------------------------------------------------
-P001 .codex/README.md [modified] - Reviewed full file and diff. Removes obsolete kd4_* aliases and documents built-in explorer/worker/reviewer/verifier routing. Consistent with config and role discovery. No defect.
-
-P002 .codex/agents/kd4_explorer.toml [deleted] - Reviewed base content and all direct references. Deletion removes the obsolete custom explorer definition; no live reference remains. No defect.
-
-P003 .codex/config.toml [modified] - Reviewed full file and role-loading owner. Removes obsolete role declarations, declares agents.default at ./agents/default.toml, and lowers max_threads to 2. Valid, with untracked-file dependency R002.
-
-P004 .codex/harness/workflow.md [modified] - Reviewed full diff and workflow references. Replaces kd4_* role names with built-in typed roles. No defect.
-
-P005 AGENTS.md [modified] - Reviewed full repository policy. Architect lane now names explorer/worker built-ins and retains receipt/dependency requirements. No implementation defect.
-
-P006 codex-rs/Cargo.lock [modified/generated lock] - Reviewed exact lock diff and manifest provenance. The only change adds tracing to codex-agent-task-store dependencies, matching P007. Regeneration is coherent.
-
-P007 codex-rs/agent-task-store/Cargo.toml [modified] - Reviewed full manifest and lock consumer. Adds workspace tracing dependency used by new timing instrumentation. No dependency defect; cargo-shear passes.
-
-P008 codex-rs/agent-task-store/src/local.rs [modified] - Reviewed changed implementations and transaction/telemetry callers. Lease/contention logic is bounded and transaction ownership is coherent after repairing F003, F015, and the one-sided lease exemption in F017.
-
-P009 codex-rs/agent-task-store/src/tests.rs [modified] - Reviewed added contention/lease tests and helpers. F017 exposed a contradiction with two established safety tests; the new regression now verifies that canonical-root, foreign, and spoofed leases all block overlapping typed claims.
-
-P010 codex-rs/agent-task-store/src/workspace.rs [modified] - Reviewed full changed workspace-lease state transitions and direct local-store consumers. Renewal, cancellation, and finalization ownership are consistently wired. No defect.
-
-P011 codex-rs/app-server/src/command_exec.rs [modified] - Reviewed Windows-sandbox bridge, bounded output-delivery relay, final response ordering, and direct tests. Delivery is byte/item bounded and drains before response. F005 and F010 repaired; the production library compiles, while its full test target has baseline blocker B001 below.
-
-P012 codex-rs/core/src/agent/task_capabilities.rs [modified] - Reviewed full small diff and capability tests. Built-in role name change is consistent. No defect.
-
-P013 codex-rs/core/src/agent/task_capabilities_tests.rs [modified] - Reviewed full changed tests. Expectations match built-in role policy. No defect.
-
-P014 codex-rs/core/src/context/multi_agent_mode_instructions.rs [normalization-only status] - Git status lists the path, but normalized worktree hash, index hash, and HEAD hash are identical and git diff is empty. No content to repair.
-
-P015 codex-rs/core/src/exec.rs [modified] - Reviewed Windows-sandbox execution bridge, capture sink, cancellation grace, and direct consumers. Shared delta limiting and termination behavior are bounded. Its direct unchanged tests required F013.
-
-P016 codex-rs/core/src/session/multi_agents.rs [modified] - Reviewed full diff and role/config owners. Removes obsolete custom kd4 routing. No defect.
-
-P017 codex-rs/core/src/session/tests.rs [modified] - Reviewed added session/mutation completion tests. They cover bounded cleanup and terminal-state behavior. F012 repaired; R001 rejected as speculative.
-
-P018 codex-rs/core/src/tasks/completion_review_v2.rs [modified] - Reviewed full one-line role update and task caller. Uses built-in reviewer consistently. No defect.
-
-P019 codex-rs/core/src/tasks/mod.rs [modified] - Reviewed terminal cleanup/cancellation ordering and direct session tests. Normal path cancels before bounded mutation cleanup; fail-safe remains bounded. No confirmed defect.
-
-P020 codex-rs/core/src/tools/code_mode/wait_handler.rs [normalization-only status] - Normalized worktree/index/HEAD hashes are identical and git diff is empty. No content to repair.
-
-P021 codex-rs/core/src/tools/command_execution.rs [modified] - Reviewed complete ledger state transitions and direct tests. Deterministic failures suppress exact repeats while generic failures remain retryable. F004, F006, and F016 repaired with focused ledger regressions.
-
-P022 codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs [modified] - Reviewed built-in role validation and config resolution. It rejects removed kd4 aliases and accepts the declared default role. No defect.
-
-P023 codex-rs/core/src/tools/handlers/shell.rs [modified] - Reviewed reservation/lease timeout mapping and command-ledger interactions. Error mapping preserves cancellation versus timeout. No defect.
-
-P024 codex-rs/core/src/tools/handlers/source.rs [normalization-only status] - Normalized worktree/index/HEAD hashes are identical and git diff is empty. No content to repair.
-
-P025 codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs [modified] - Reviewed validation admission, process launch, foreground/background completion, artifact replacement, and error paths. F006 is repaired across tracked and nontracked terminal branches.
-
-P026 codex-rs/core/src/tools/handlers/unified_exec_tests.rs [modified] - Reviewed added mutation reservation and completion tests. Coverage is coherent; supplemental tracked deterministic-failure coverage for F006 was added at the owning command ledger.
-
-P027 codex-rs/core/src/tools/router_tests.rs [modified] - Reviewed role-name expectation update. No defect.
-
-P028 codex-rs/core/src/unified_exec/async_watcher.rs [modified] - Reviewed exit/output-drain ordering, mutation release, artifact finalization, validation observation, and event delivery. F006 is repaired by exact-once trusted classification followed by evidence-only artifact refresh.
-
-P029 codex-rs/core/src/unified_exec/process_manager.rs [modified] - Reviewed process registration, initial meaningful-output wait, pruning, cleanup, watcher wiring, and mutation ownership. F006 repaired by carrying the trusted validation launch and original start time into tracked bookkeeping.
-
-P030 codex-rs/core/src/unified_exec/process_manager_tests.rs [modified] - Reviewed added timing and process cleanup tests. They validate the 250 ms quiet period and bounded initial waits. No separate defect; F006 regression coverage is present at the owning command-ledger layer.
-
-P031 codex-rs/core/tests/suite/completion_review.rs [modified] - Reviewed role-name updates in integration fixtures. No defect.
-
-P032 codex-rs/core/tests/suite/multi_agent_mode.rs [modified] - Reviewed role-name updates and built-in-mode assertions. No defect.
-
-P033 codex-rs/models-manager/prompts/gpt-5.6.md [normalization-only status] - Normalized worktree/index/HEAD hashes are identical and git diff is empty. No content to repair.
-
-P034 codex-rs/state/src/lib.rs [modified] - Reviewed logs-database exports and runtime callers. New telemetry/runtime types are exported coherently. No defect.
-
-P035 codex-rs/state/src/log_db.rs [modified] - Reviewed queueing, retry/coalescing, startup reconciliation, and all new tests. F002 and F014 repaired; focused reconciliation and coalescing tests pass.
-
-P036 codex-rs/state/src/runtime.rs [modified] - Reviewed initialization/migration ordering and logs-runtime ownership. Startup reconciliation is wired after schema setup. F007 repaired.
-
-P037 codex-rs/state/src/runtime/logs.rs [modified] - Reviewed schema migration, insert/query columns, retention reconciliation, feedback-log export, and tests. feedback_log_body is the current canonical column and directly proves F002. F008 and F009 repaired.
-
-P038 codex-rs/state/src/telemetry.rs [modified] - Reviewed new cleanup event/counter interface and call sites. Event names and outcome dimensions are coherent. No defect.
-
-P039 codex-rs/windows-sandbox-rs/src/elevated_impl.rs [modified] - Reviewed stdout/stderr capture sink threading, forwarding, and direct API caller. The sink is optional and stream identity is preserved. No defect separate from P040 compilation.
-
-P040 codex-rs/windows-sandbox-rs/src/lib.rs [modified] - Reviewed public capture types, cross-platform stubs, timeout conversion, implementation dispatch, and tests. F001 and F011 repaired; all library tests pass.
-
-P041 .codex/agents/default.toml [untracked] - Reviewed full file. Defines a valid gpt-5.6-terra/max default role and is deliberately excluded from duplicate discovery by explicit config declaration. R002 is the only risk.
-
-P042 target-codex-agent-task-store-contention-fix/ [untracked generated unit; 4,053 Git-visible paths] - Sorted path-manifest SHA-256 8e9a17f9bbcd74cff84b43467b08eec8d3d713edc7c453747d32865fc4cb6373. Cargo CACHEDIR.TAG and rustc metadata identify disposable build output; filesystem tree is about 3.02 GB. No source finding; R003 applies.
-
-P043 target-codex-agent-task-store-lease/ [untracked generated unit; 4,054 Git-visible paths] - Sorted path-manifest SHA-256 01a2a68beaac4cf668eb2a1bb08428c3fbf5b53f99d63538914ec221b0d6f824. Cargo CACHEDIR.TAG and rustc metadata identify disposable build output; filesystem tree is about 3.02 GB. No source finding; R003 applies.
-
-P044 target-codex-state-task1/ [untracked generated unit; 4,035 Git-visible paths] - Sorted path-manifest SHA-256 09d4c56b1ea50f8d6ceef080aa4b4e6131be1416fd3d5bcd5a3a9db6d1222e49. Cargo CACHEDIR.TAG and rustc metadata identify disposable build output; filesystem tree is about 1.69 GB. No source finding; R003 applies.
-
-Direct affected paths outside the frozen inventory
---------------------------------------------------
-codex-rs/core/src/tools/handlers/command_windows_corpus_tests.rs is unchanged in the initial worktree but directly tests P021 and contains F004. It is authorized only for the narrow expectation repair.
-codex-rs/core/src/exec_tests.rs is unchanged in the initial worktree but directly tests P015 and contains F013. It is authorized only for the six limiter-argument repairs.
-WORKTREE_REVIEW.txt is the review artifact required by the selected skill and was unchanged at freeze time; this current report replaces the prior stale review.
-
-Repair summary
---------------
-All seventeen confirmed findings were repaired within the frozen source set or its two direct unchanged test contracts. The repairs restore compilation, schema-correct state reconciliation, attributable telemetry, bounded Windows-sandbox streaming coverage, exact-once tracked validation classification, symmetric task-store claim/lease exclusion, and clean changed-path lints. R001 remains deliberately unchanged because no defect was established. R002 and R003 remain user-owned publish-hygiene risks and were not deleted, ignored, staged, or committed.
-
-Validation evidence
--------------------
-PASS - codex-state focused startup reconciliation test.
-PASS - codex-state retention/coalescing and telemetry-focused tests, including a final post-Clippy run of retention_maintenance_coalesces_bursts_with_one_active_cleanup (1 passed).
-PASS - codex-windows-sandbox library suite (127 passed, 2 ignored).
-PASS - codex-agent-task-store four initially focused contention/lease regressions (4 passed), followed after F017 by the complete library suite (58 passed, 1 intentionally ignored).
-PASS - codex-app-server production library check.
-PASS - codex-core production library check with no changed-path warnings.
-PASS - codex-core tracked-validation filter (3 passed), generic-retry regression (1 passed), background exact-once regression (1 passed), and Windows command-corpus regression (1 passed).
-PASS - cargo clippy --keep-going --all-targets --all-features -p codex-agent-task-store after the final lease repair.
-PASS - just cargo-shear: no issues found.
-PASS - rustup run nightly-2025-09-18 cargo fmt --check.
-PASS - just --unstable --fmt --check.
-PASS - git diff --check; only informational LF-to-CRLF working-copy notices were emitted.
-
-B001 BASELINE BLOCKER - the focused codex-app-server unit test and the required dead-code matrix both compile the unchanged app-server test module config_manager_service_tests.rs. Ten assertions access .config, .origins, or .layers directly even though the unchanged helper returns (ConfigReadResponse, Features). Git diff and HEAD inspection confirm both sides of this drift predate the reviewed change. The production app-server library check passes. This unrelated test contract was not repaired under the user's narrow boundary.
-
-B002 BASELINE BLOCKER - the required package-bounded Clippy invocation used --keep-going, all targets, and all features for codex-agent-task-store, codex-app-server, codex-core, codex-state, and codex-windows-sandbox. After every changed-path warning was repaired, it stops only on twenty denied lints in unchanged codex-rs/core/src/client.rs and codex-rs/core/src/task_evidence.rs, plus warnings in unchanged known_delta_store.rs and validation_admission.rs. The final changed task-store package Clippy pass is green. These unrelated baseline lints were not repaired.
-
-B003 TOOLING NOTE - just fmt-check-fast invokes cargo +nightly, which the installed Scoop cargo shim does not support. The pinned direct equivalent, rustup run nightly-2025-09-18 cargo fmt --check, passes, as does the Justfile format check.
-
-Required analyzer disposition
------------------------------
-The Clippy workflow was run with Cargo --keep-going and was bounded to the five affected packages; B002 is its only remaining stop. cargo-shear completed cleanly. The repository rust-dead-code-matrix was run with the same five package filters, --all-features, --all-targets (added by the recipe), and --keep-going; it emitted no changed-path dead-code finding before B001 stopped the app-server test target. No workspace-wide repair or unrelated baseline cleanup was attempted.
-
-Final inventory snapshot
-------------------------
-Branch and HEAD remain main at 63dde623c690207e5eef5dd7d9b6b36f47e32152. Staged paths remain 0. Git status now has 43 tracked entries: the frozen 40 plus this report and the two authorized direct test contracts; 39 have substantive content diffs and four remain normalization-only. The untracked count remains 12,143. The durable default agent file and all three generated target trees remain present and untouched.
-
-Review conclusion
------------------
-Every frozen path/unit and authorized direct contract was inspected and classified. No confirmed defect remains in the reviewed changed-path surface after F001-F017. Remaining limitations are B001/B002 baseline validation blockers and R002/R003 publish hygiene. No publish, staging, commit, push, install, binary replacement, Desktop restart, generated-tree deletion, or ignore-policy expansion was performed.
+.codex/README.md
+codex-rs/AGENTS.md
+codex-rs/core/AGENTS.md
+scripts/AGENTS.md
+scripts/codex_package/AGENTS.md
+scripts/install/AGENTS.md
+
+No changed Rust source path is classified as an exact protected upstream mirror.
+Publishing, installing, replacing binaries, restarting Desktop, staging, committing,
+and pushing are outside this review.
+
+Initial findings (no repairs yet)
+--------------------------------
+F001 CONFIRMED / COMPILE BLOCKER - codex-rs/code-mode/src/remote_session/connection.rs
+still uses ManagedRootProcess::WINDOWS_CREATION_FLAGS and attach_and_resume after
+the changed PTY API replaced suspended launch with attach(pid). A keep-going
+codex-core test check fails on these two missing API items.
+
+F002 CONFIRMED / TEST COMPILE BLOCKER - codex-rs/core/src/mcp_openai_file.rs tests
+still call the removed rewrite_argument_value_for_openai_files helper instead of
+the new staged/uploaded path.
+
+F003 CONFIRMED / STALE ASSERTION - the MCP oversized-file test expects an exact
+limit+1 byte count although the bounded reader deliberately reports only that the
+file is too large or changed and names the limit.
+
+F004 CONFIRMED / REMOTE RESOURCE LEAK - codex-rs/codex-api/src/files.rs creates a
+remote file, then returns directly on upload or finalize failure without deleting
+that newly created file. The core rollback can delete only previously completed
+uploads and cannot recover this current ID.
+
+F005 POTENTIAL / RESOURCE BOUND - MCP file staging preloads every declared file in
+memory with a per-file 512 MiB cap but no aggregate cap. This can multiply memory
+use by the argument count. Confirm an aggregate contract and add focused coverage.
+
+F006 CONFIRMED / TEST-CONTRACT DRIFT - codex-rs/core/src/agents_md.rs now performs
+nearest-first sequential budgeted reads and guarantees the fully rendered project
+instructions fit the configured budget, but unchanged tests still require overlap
+and content/notices beyond that rendered cap.
+
+F007 CONFIRMED / OUTPUT BOUND BYPASS - codex-rs/tui/src/get_git_diff.rs bounds
+local untracked reads, but the remote fallback uses the shared Git capture helper
+with output caps disabled, allowing a large untracked file to bypass the new limit.
+
+F008 CONFIRMED / UNBOUNDED STATE - codex-rs/core/src/tools/command_execution.rs
+removed the incorrect 128-entry revision eviction but added no definitive terminal
+removal. observed_turn_mutation_revisions can now retain one entry per turn for the
+session lifetime. Clear only after terminal mutation cancellation is complete.
+
+F009 CONFIRMED / RECOVERY CONTRACT - codex-rs/state/src/validation_history.rs
+rate-limits static error and timeout warnings forever. Successful persistence does
+not reset the class or emit recovery, so a later regression is silent.
+
+F010 CONFIRMED / UNIX PRIVACY - codex-rs/core/src/shell_snapshot.rs creates private
+0600 snapshot files but does not enforce 0700 on their parent directory.
+
+F011 CONFIRMED / WINDOWS DESCENDANT CLEANUP - codex-rs/hooks/src/engine/command_runner.rs
+uses a Unix process group but reserves no Windows ManagedRootProcess job. Hook
+timeout/cancellation therefore does not implement the stated process-group/job
+descendant cleanup on Windows.
+
+F012 CONFIRMED / FORMAT GATE - cargo fmt --all -- --check reports formatting diffs
+throughout changed Rust. The stable formatter also notes that the configured import
+granularity option requires nightly.
+
+F013 CONFIRMED / STALE ROUTING DOC - SOURCEMAP.md still sends custom-renderer
+validation to removed workspace package @kd4/ui even though this change removes
+kd-ui from current workspace and ownership routing.
+
+F014 CONFIRMED / CONTRADICTORY AUDIT RECORD -
+KD4_codex-rs_validated_bug_fix_ledger_2026-08-12.txt defines CONFIRMED to mean a
+defect remains in current source, labels every item CONFIRMED, and later states all
+items were implemented and fixed.
+
+F015 CONFIRMED / CUSTOM TOOLCHAIN REUSE - scripts/codex_package/cargo.py writes
+source-build stamps using the requested custom Cargo executable but recomputes the
+reuse fingerprint with default cargo. --reuse-source-builds cannot reuse output
+created through a Cargo wrapper.
+
+F016 CONFIRMED / LOCAL PUBLISH FAILURE - scripts/publish-local-codex.ps1 does not
+initialize restartFailure or set publishCommitted=true on the changed-binary success
+path. Under StrictMode the later restartFailure read terminates every real publish
+after binary replacement, and outer rollback can restore Desktop routing while
+leaving the new binaries installed.
+
+F017 CONFIRMED / REMOTE ENV STARTUP FAILURE - scripts/test-remote-env.sh treats
+docker rm -f of the fresh randomized, normally nonexistent container as fatal, so
+ordinary first use returns before docker run.
+
+F018 CONFIRMED / POLICY GATE NOT WIRED - justfile recipe deps-policy-check invokes
+display-only deps-duplicates rather than the new failing deps-duplicates-check.
+Duplicate versions therefore cannot fail the advertised policy gate.
+
+F019 CONFIRMED / TEST-CONTRACT REGRESSION - focused codex_package tests currently
+produce 3 failures and 12 errors after hashing, identity, and strict-input behavior
+changed without corresponding fixture/caller updates. Classify each as stale test
+or implementation defect before repair.
+
+F020 CONFIRMED / DEAD CODE - obsolete hashing helpers remain in
+scripts/codex_package/dotslash.py and scripts/codex_package/v8.py after all callers
+moved to unconditional hashing.
+
+F021 POTENTIAL / PNPM CONFIG - pnpm-workspace.yaml contains
+allowBuilds.esbuild: "set this to true or false", which appears to be a migration
+placeholder rather than the required Boolean policy. Validate with the installed
+pnpm schema and choose the behavior matching the former esbuild allowance.
+
+F022 POTENTIAL / GENERATED-SOURCE SYNC - verify flake.nix, package.json,
+pnpm-workspace.yaml, and pnpm-lock.yaml describe one coherent reduced workspace and
+that no removed kd-ui package remains in generated/runtime routes.
+
+Frozen inventory and initial disposition
+----------------------------------------
+P001 M .codespellignore - Fully read and diffed. Narrow generated/vendor spelling
+exclusion changes are coherent; no defect confirmed.
+P002 M .codespellrc - Fully read and diffed. Dictionary/config routing is coherent;
+no defect confirmed.
+P003 M .gitattributes - Fully read and diffed. Text/binary attribution is coherent;
+no defect confirmed.
+P004 M .gitignore - Fully read and diffed. New local/generated exclusions match
+the changed tooling; no defect confirmed.
+P005 M .markdownlint-cli2.yaml - Fully read and diffed. Markdown exclusions and
+rules match current generated/audit artifacts; no defect confirmed.
+P006 M AGENTS.md - Fully read and diffed. Repository policy is internally coherent
+and was applied to this review; no implementation defect.
+P007 M SOURCEMAP.md - Fully read and diffed. F013 confirmed; other ownership and
+runtime routes are coherent.
+P008 M WORKTREE_REVIEW.txt - Fully read before replacement. It described an older
+44-unit worktree and was stale for this 94-path snapshot; replaced only with this
+required pre-repair ledger.
+P009 M codex-rs/Cargo.lock - Fully read/diffed as generated lock provenance.
+Dependency additions match changed manifests; broader build validation pending.
+P010 M codex-rs/agent-task-store/src/local.rs - Fully read and diffed with store
+callers. Unlimited evidence retrieval preserves records as intended; no defect.
+P011 M codex-rs/app-server/src/bespoke_event_handling.rs - Fully read. Git status
+is normalization-only and git diff is empty; no content finding.
+P012 M codex-rs/app-server/src/current_time.rs - Fully read/diffed. Bounded sleep,
+drop cleanup, and tests are coherent; focused validation pending.
+P013 M codex-rs/app-server/src/outgoing_message.rs - Fully read/diffed. Shared
+callback state, RAII cleanup, and success retention are coherent.
+P014 M codex-rs/apply-patch/src/invocation.rs - Fully read/diffed. Shell heredoc
+rejection and canonical path/ancestor checks are coherent.
+P015 M codex-rs/codex-api/src/files.rs - Fully read/diffed. F004 confirmed.
+P016 M codex-rs/codex-api/src/lib.rs - Fully read/diffed. File API exports match
+the changed module; no separate defect.
+P017 M codex-rs/codex-mcp/src/connection_manager.rs - Fully read/diffed. Bounded
+graceful/forced shutdown, client forcing, concurrent listing, and caps are coherent.
+P018 M codex-rs/core/src/agent/control/residency.rs - Fully read/diffed. Timeout
+and rollback ownership are coherent.
+P019 M codex-rs/core/src/agent/control/spawn.rs - Fully read/diffed. Global cleanup
+worker and failure handling are coherent.
+P020 M codex-rs/core/src/agent/task_coordinator.rs - Fully read/diffed. Evidence is
+no longer silently capped at 256; no defect confirmed.
+P021 M codex-rs/core/src/agents_md.rs - Fully read/diffed with tests. F006 confirmed.
+P022 M codex-rs/core/src/compact_remote.rs - Fully read/diffed. Both relevant
+remote error paths retain diagnostics; no defect.
+P023 M codex-rs/core/src/compact_remote_v2.rs - Fully read/diffed. V2 matches the
+same error-retention contract; no defect.
+P024 M codex-rs/core/src/context_manager/history.rs - Fully read/diffed. No-op
+correction behavior is intentional and coherent.
+P025 M codex-rs/core/src/context_manager/history_tests.rs - Fully read/diffed.
+Coverage matches P024; no defect.
+P026 M codex-rs/core/src/exec.rs - Fully read/diffed. Normal-running Windows attach
+API is coherent; F001 is the missed external caller.
+P027 M codex-rs/core/src/exec_tests.rs - Fully read/diffed. New attach behavior is
+covered; no separate defect.
+P028 M codex-rs/core/src/mcp_openai_file.rs - Fully read/diffed with upload API and
+tests. F002, F003, and F005 apply.
+P029 M codex-rs/core/src/mcp_skill_dependencies.rs - Fully read/diffed. Cancellation
+and config-before-OAuth transaction ordering are coherent.
+P030 M codex-rs/core/src/mcp_tool_call.rs - Fully read/diffed. Error wording matches
+the changed source contract; no defect.
+P031 M codex-rs/core/src/shell_snapshot.rs - Fully read/diffed. F010 confirmed;
+retention, file privacy, and reap deadline otherwise coherent.
+P032 M codex-rs/core/src/tools/command_execution.rs - Fully read/diffed with terminal
+callers. F008 confirmed; other weak gates, artifact finalization, and mutation
+classification are coherent.
+P033 M codex-rs/core/src/tools/command_output_artifact.rs - Fully read/diffed.
+Parent fsync, reclaim, and marker consistency are coherent.
+P034 M codex-rs/core/src/tools/handlers/mcp_resource.rs - Fully read/diffed.
+Incremental response caps and pagination are coherent.
+P035 M codex-rs/core/src/tools/handlers/multi_agents_v2/task.rs - Fully read/diffed.
+Bounded cleanup behavior is coherent.
+P036 M codex-rs/core/src/tools/handlers/shell/shell_command.rs - Fully read/diffed.
+Repository epoch ordering is coherent.
+P037 M codex-rs/core/src/tools/handlers/source.rs - Fully read/diffed. Cancellation
+and ignore diagnostics are coherent.
+P038 M codex-rs/core/src/tools/known_delta_store.rs - Fully read/diffed. Backup and
+restore sequencing are coherent.
+P039 M codex-rs/core/src/unified_exec/async_watcher.rs - Fully read/diffed.
+Cancellation and terminal cleanup are coherent.
+P040 M codex-rs/core/src/unified_exec/process.rs - Fully read/diffed. Aggregate
+cleanup wiring is coherent.
+P041 M codex-rs/core/src/unified_exec/process_manager.rs - Fully read/diffed. Global
+cleanup worker and process ownership are coherent.
+P042 M codex-rs/core/src/unified_exec/process_tests.rs - Fully read/diffed. Coverage
+matches P040-P041; no separate defect.
+P043 M codex-rs/core/src/validation_admission.rs - Fully read/diffed. Wrapper
+prohibition, publish-before-unlink, batch, and timeout bounds are coherent.
+P044 M codex-rs/file-search/src/task_locator.rs - Fully read/diffed. Weak guards and
+cancellation checks are coherent.
+P045 M codex-rs/hooks/Cargo.toml - Fully read/diffed. PTY dependency supports the
+intended job ownership, but F011 remains unwired.
+P046 M codex-rs/hooks/src/engine/command_runner.rs - Fully read/diffed. F011
+confirmed; Unix process-group behavior otherwise coherent.
+P047 M codex-rs/rmcp-client/src/stdio_server_launcher.rs - Fully read/diffed.
+Updated process launch API is coherent.
+P048 M codex-rs/state/src/validation_history.rs - Fully read/diffed. F009 confirmed;
+atomic key installation otherwise coherent.
+P049 M codex-rs/tui/Cargo.toml - Fully read/diffed. Dependency additions match the
+new Git-diff implementation.
+P050 M codex-rs/tui/src/get_git_diff.rs - Fully read/diffed. F007 confirmed; local
+bounded and non-UTF8 handling otherwise coherent.
+P051 M codex-rs/utils/pty/src/managed_process.rs - Fully read/diffed. New reserve
+then attach API is coherent; F001 and F011 are caller-wiring gaps.
+P052 M codex-rs/utils/pty/src/pipe.rs - Fully read/diffed. Pipe finish behavior is
+coherent.
+P053 M codex-rs/utils/pty/src/pipe_tests.rs - Fully read/diffed. Coverage matches
+P052; no defect.
+P054 M codex-rs/utils/pty/src/process.rs - Fully read/diffed. Process attachment
+and cleanup behavior are coherent.
+P055 M do-not-code.md - Fully read/diffed. Rust classification and generator
+exceptions are coherent; no changed exact-mirror violation.
+P056 M flake.nix - Fully read/diffed. Reduced package inputs appear coherent;
+F022 validation remains.
+P057 M justfile - Fully read/diffed. F018 confirmed; other recipe changes route to
+existing scripts and owners.
+P058 M package.json - Fully read/diffed. Removed kd-ui scripts/packages match the
+reduced workspace; F022 validation remains.
+P059 M pnpm-lock.yaml - Fully read/diffed as generated lock data. Removed importer
+and dependency sections match package removal; F022 validation remains.
+P060 M pnpm-workspace.yaml - Fully read/diffed. F021 and F022 apply.
+P061 M scripts/check_kd4_features.py - Fully read/diffed. Feature-policy checks and
+error paths are coherent.
+P062 M scripts/codex_package/cargo.py - Fully read/diffed. F015 confirmed; F019
+also affects its test surface.
+P063 M scripts/codex_package/cli.py - Fully read/diffed. Strict-input and identity
+changes are intentional at production level; F019 requires caller/fixture repair.
+P064 M scripts/codex_package/dotslash.py - Fully read/diffed. F020 applies; changed
+hashing contract participates in F019.
+P065 M scripts/codex_package/layout.py - Fully read/diffed. Layout identity and
+archive routing are coherent.
+P066 M scripts/codex_package/v8.py - Fully read/diffed. F020 applies.
+P067 M scripts/git_doctor.py - Fully read/diffed. Repository diagnosis and cleanup
+reporting are coherent with its new focused tests.
+P068 M scripts/install/install.ps1 - Fully read/diffed under install policy.
+Strict download/hash/install handling is coherent.
+P069 M scripts/install/install.sh - Fully read/diffed under install policy.
+Portable download/hash/install handling is coherent.
+P070 M scripts/investigation_eval/README.md - Fully read/diffed. Documented case
+and scoring contracts match implementation.
+P071 M scripts/investigation_eval/score_results.py - Fully read/diffed. Scoring,
+normalization, and error handling are coherent.
+P072 M scripts/investigation_eval/test_investigation_eval.py - Fully read/diffed.
+Focused coverage matches the changed evaluator.
+P073 M scripts/investigation_eval/validate_cases.py - Fully read/diffed. Schema
+validation and diagnostics are coherent.
+P074 M scripts/investigation_evidence_smoke.py - Fully read/diffed. Smoke evidence
+checks match current output contracts.
+P075 M scripts/just-shell.py - Fully read/diffed. Cross-platform Just shell routing
+and status propagation are coherent.
+P076 M scripts/kd4_perf_snapshot.py - Fully read/diffed. Snapshot inputs and output
+normalization are coherent.
+P077 M scripts/publish-local-codex.ps1 - Fully read/diffed with commit/rollback and
+restart paths. F016 confirmed.
+P078 M scripts/readme_toc.py - Fully read/diffed. TOC generation and validation
+paths are coherent.
+P079 M scripts/root_maintenance.py - Fully read/diffed. Root policy checks and
+reporting are coherent.
+P080 M scripts/rust_build_status.py - Fully read/diffed. Cargo status parsing and
+bounded diagnostics are coherent.
+P081 M scripts/stage_npm_archives.py - Fully read/diffed. Archive staging,
+validation, and collision behavior are coherent.
+P082 M scripts/stage_npm_packages.py - Fully read/diffed. Package staging and
+identity checks are coherent.
+P083 M scripts/start-codex-exec.sh - Fully read/diffed. Environment setup and exec
+handoff are coherent.
+P084 M scripts/test-remote-env.sh - Fully read/diffed. F017 confirmed.
+P085 M scripts/test_build_tooling.py - Fully read/diffed. F019 exposes stale
+codex_package expectations in this broader test surface.
+P086 M scripts/test_check_kd4_features.py - Fully read/diffed. Coverage matches P061.
+P087 M source_owners.toml - Fully read/diffed. Removed kd-ui ownership and current
+script/Rust ownership are coherent except stale documentation F013.
+P088 ?? KD4_ROOT_AUDIT_FIXES.txt - Fully read as an untracked audit record. It is
+evidence, not executable source; claims require independent validation.
+P089 ?? KD4_codex-rs_validated_bug_fix_ledger_2026-08-12.txt - Fully read. F014
+confirmed; claimed fixes and unrun validation cannot both establish completion.
+P090 ?? kd4_scripts_validated_issues.txt - Fully read as an untracked scripts audit
+record. It is evidence, not executable source; each claim was checked against code.
+P091 ?? scripts/check_duplicate_deps.py - Fully read. The checker fails on
+non-allowlisted duplicate dependency versions as intended; F018 is its missed gate.
+P092 ?? scripts/run-python.js - Fully read. Node-to-Python launcher forwards
+arguments and status coherently.
+P093 ?? scripts/test_check_duplicate_deps.py - Fully read. Focused checker coverage
+is coherent.
+P094 ?? scripts/test_git_doctor.py - Fully read. Focused git-doctor coverage is
+coherent.
+
+Pre-repair validation evidence
+------------------------------
+PASS - exact frozen inventory captured with git status/diff/untracked/submodule
+queries; there are no staged changes, renames, deletions, or submodule changes.
+PASS - cargo metadata resolves changed Rust package names and manifests.
+PASS - git diff --check (only informational LF-to-CRLF working-copy notices).
+FAIL - cargo fmt --all -- --check; F012.
+FAIL - cargo check --tests --keep-going -p codex-core; F001 stops code-mode
+compilation before the full test target can be assessed.
+FAIL - focused codex_package tests: 3 failures and 12 errors; F019.
+PENDING - focused tests for every repair.
+PENDING - mandatory Clippy with keep-going.
+PENDING - cargo-shear.
+PENDING - repository rust-dead-code workflow.
+PENDING - final diff, inventory, and full-ledger reread.
+
+Repair boundary
+---------------
+Repair every confirmed defect and every potential defect that focused evidence
+confirms. Preserve unrelated user changes. Directly affected unchanged callers or
+tests may be edited only where needed to restore the changed contract. Generated
+locks must be regenerated through their owner. No publish action is authorized.

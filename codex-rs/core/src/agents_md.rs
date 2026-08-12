@@ -44,7 +44,6 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 /// When both user and project AGENTS.md docs are present, they will be
 /// concatenated with the following separator.
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
-const MAX_CONCURRENT_ENVIRONMENT_LOADS: usize = 4;
 const MAX_CONCURRENT_DIRECTORY_SEARCHES: usize = 8;
 const MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES: usize = 3;
 
@@ -99,43 +98,73 @@ pub(crate) async fn load_project_instructions(
         };
     }
 
-    let max_total = config.project_doc_max_bytes;
-    let mut environment_loads = Vec::with_capacity(environments.turn_environments.len());
-    for (environment_index, turn_environment) in environments.turn_environments.iter().enumerate() {
+    let mut discoveries = Vec::with_capacity(environments.turn_environments.len());
+    for turn_environment in &environments.turn_environments {
         let environment_id = turn_environment.environment_id.clone();
         let environment = turn_environment.environment.clone();
         let cwd = turn_environment.cwd().clone();
-        let prefetch_utf8_boundary_slack = environment_index > 0;
-        environment_loads.push(async move {
-            let filesystem = environment.get_filesystem();
-            let result = async {
-                let candidates = agents_md_paths(config, &cwd, filesystem.as_ref()).await?;
-                read_discovered_project_docs(
+        let filesystem = environment.get_filesystem();
+        let result = agents_md_paths(config, &cwd, filesystem.as_ref()).await;
+        discoveries.push((environment_id, cwd, filesystem, result));
+    }
+
+    let contributing_environments = discoveries
+        .iter()
+        .filter(|(_, _, _, result)| matches!(result, Ok(paths) if !paths.is_empty()))
+        .count();
+    let mut first_project_environment = true;
+    for (environment_id, cwd, filesystem, result) in discoveries {
+        match result {
+            Ok(candidates) if !candidates.is_empty() => {
+                let mut generated_overhead = 0usize;
+                if first_project_environment && loaded.user_instructions.is_some() {
+                    generated_overhead += AGENTS_MD_SEPARATOR.len();
+                }
+                if contributing_environments > 1 {
+                    if !first_project_environment {
+                        generated_overhead += 2;
+                    }
+                    generated_overhead += format!(
+                        "for `{}` with root {}\n\n",
+                        environment_id,
+                        cwd.inferred_native_path_string()
+                    )
+                    .len();
+                }
+                if generated_overhead >= remaining {
+                    remaining = 0;
+                    first_project_environment = false;
+                    continue;
+                }
+                remaining -= generated_overhead;
+
+                let project_docs = match read_discovered_project_docs(
                     filesystem.as_ref(),
                     candidates,
-                    max_total,
-                    prefetch_utf8_boundary_slack,
+                    remaining,
+                    /*prefetch_utf8_boundary_slack*/ false,
                 )
                 .await
-            }
-            .await;
-            (environment_id, cwd, result)
-        });
-    }
-    // Independent environment discovery and file reads overlap, while `buffered` preserves
-    // selection order for the aggregate-budget allocation below.
-    let mut environment_loads =
-        futures::stream::iter(environment_loads).buffered(MAX_CONCURRENT_ENVIRONMENT_LOADS);
-    while let Some((environment_id, cwd, result)) = environment_loads.next().await {
-        match result {
-            Ok(project_docs) => {
+                {
+                    Ok(project_docs) => project_docs,
+                    Err(err) => {
+                        complete = false;
+                        error!(
+                            environment_id,
+                            "error trying to read AGENTS.md docs: {err:#}"
+                        );
+                        continue;
+                    }
+                };
                 let environment_load =
                     render_project_docs(&environment_id, &cwd, project_docs, remaining);
                 remaining = remaining.saturating_sub(environment_load.retained_bytes);
                 if let Some(docs) = environment_load.loaded {
                     loaded.entries.extend(docs.entries);
                 }
+                first_project_environment = false;
             }
+            Ok(_) => {}
             Err(err) => {
                 complete = false;
                 error!(
@@ -260,20 +289,16 @@ fn render_project_docs(
         mut read,
     } in project_docs.into_iter().rev()
     {
-        truncate_project_doc_to_budget(&mut read, remaining);
-        let retained_bytes = read.retained_data.len();
+        let separator_bytes = usize::from(!entries.is_empty()) * 2;
+        let Some((text, retained_bytes)) = render_project_doc_to_budget(
+            &mut read,
+            &candidate.path,
+            remaining.saturating_sub(separator_bytes),
+        ) else {
+            continue;
+        };
         let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
-        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
-
         if omitted_bytes > 0 {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str(&project_doc_truncation_notice(
-                &candidate.path,
-                read.original_bytes,
-                retained_bytes,
-            ));
             tracing::warn!(
                 path = %candidate.path,
                 original_bytes = read.original_bytes,
@@ -283,6 +308,7 @@ fn render_project_docs(
             );
         }
 
+        let rendered_bytes = text.len();
         entries.push(InstructionEntry {
             contents: text,
             provenance: InstructionProvenance::Project {
@@ -291,7 +317,7 @@ fn render_project_docs(
                 cwd: cwd.clone(),
             },
         });
-        remaining = remaining.saturating_sub(retained_bytes);
+        remaining = remaining.saturating_sub(rendered_bytes + separator_bytes);
     }
     entries.reverse();
     loaded.entries.extend(entries);
@@ -299,6 +325,37 @@ fn render_project_docs(
     EnvironmentProjectInstructions {
         loaded: (!loaded.is_empty()).then_some(loaded),
         retained_bytes: max_total.saturating_sub(remaining),
+    }
+}
+
+fn render_project_doc_to_budget(
+    read: &mut ProjectDocRead,
+    path: &PathUri,
+    max_bytes: usize,
+) -> Option<(String, usize)> {
+    truncate_project_doc_to_budget(read, max_bytes);
+    loop {
+        let retained_bytes = read.retained_data.len();
+        let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
+        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
+        if omitted_bytes > 0 {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&project_doc_truncation_notice(
+                path,
+                read.original_bytes,
+                retained_bytes,
+            ));
+        }
+        if text.len() <= max_bytes {
+            return Some((text, retained_bytes));
+        }
+        if retained_bytes == 0 {
+            return None;
+        }
+        let excess = text.len().saturating_sub(max_bytes).max(1);
+        truncate_project_doc_to_budget(read, retained_bytes.saturating_sub(excess));
     }
 }
 

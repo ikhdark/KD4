@@ -334,6 +334,16 @@ pub(crate) fn prohibited_skip_for(
     authorization: &ValidationAuthorization,
     invocation: &CommandInvocation,
 ) -> Option<ValidationSkippedToolOutput> {
+    if let Some(descriptor) = validation_like_wrapper_descriptor(invocation)
+        && authorization.decision_for(
+            descriptor.operation,
+            descriptor.ecosystem,
+            descriptor.breadth,
+            descriptor.selector.as_deref(),
+        ) == ValidationAuthorizationMatch::Prohibited
+    {
+        return Some(ValidationSkippedToolOutput::prohibited(&descriptor));
+    }
     let ValidationClassification::Validation { leaves, .. } = classify_validation(invocation)
     else {
         return None;
@@ -349,6 +359,92 @@ pub(crate) fn prohibited_skip_for(
             ) == ValidationAuthorizationMatch::Prohibited
         })
         .map(ValidationSkippedToolOutput::prohibited)
+}
+
+fn validation_like_wrapper_descriptor(
+    invocation: &CommandInvocation,
+) -> Option<ValidationCommandDescriptor> {
+    match invocation {
+        CommandInvocation::Argv { program, args } => wrapper_descriptor(program, args),
+        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => script
+            .replace("&&", ";")
+            .replace("||", ";")
+            .replace(['\r', '\n'], ";")
+            .split(';')
+            .filter_map(shlex::split)
+            .find_map(|words| wrapper_descriptor(words.first()?, &words[1..])),
+    }
+}
+
+fn wrapper_descriptor(program: &str, args: &[String]) -> Option<ValidationCommandDescriptor> {
+    let binary = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    let selector = match binary.as_str() {
+        "make" | "just" | "task" => wrapper_recipe_argument(args),
+        "npm" | "pnpm" => args
+            .first()
+            .filter(|arg| arg.as_str() == "run")
+            .and_then(|_| args.get(1))
+            .map(String::as_str),
+        "yarn" => match args.first().map(String::as_str) {
+            Some("run") => args.get(1).map(String::as_str),
+            Some(script) if !script.starts_with('-') => Some(script),
+            _ => None,
+        },
+        _ => None,
+    }?;
+    let operation = wrapper_recipe_operation(selector)?;
+    let ecosystem = ValidationEcosystem::Other;
+    let breadth = ValidationBreadth::Unknown;
+    Some(ValidationCommandDescriptor {
+        operation,
+        ecosystem,
+        breadth,
+        selector: Some(selector.to_string()),
+        command_family: format!("{ecosystem:?}:{operation:?}:{breadth:?}"),
+    })
+}
+
+fn wrapper_recipe_argument(args: &[String]) -> Option<&str> {
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "-C" | "-f" | "--directory" | "--file" | "--justfile" | "--working-directory"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') || arg.contains('=') {
+            continue;
+        }
+        if wrapper_recipe_operation(arg).is_some() {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+fn wrapper_recipe_operation(selector: &str) -> Option<ValidationOperation> {
+    selector
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find_map(|component| match component {
+            "test" | "tests" | "testing" => Some(ValidationOperation::Test),
+            "check" | "checks" => Some(ValidationOperation::Check),
+            "lint" | "lints" | "clippy" => Some(ValidationOperation::Lint),
+            "bench" | "benchmark" | "benchmarks" => Some(ValidationOperation::Bench),
+            "fuzz" | "fuzzing" => Some(ValidationOperation::Fuzz),
+            _ => None,
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +596,10 @@ impl ValidationLeaderOwnership {
     }
 
     pub(crate) async fn complete(mut self, result: ReusableValidationResult) {
+        // Publish before unlinking the flight. Otherwise a new caller can
+        // become leader in the gap while existing followers still have no
+        // result to observe.
+        *self.flight.result.lock().await = Some(result);
         {
             let mut registry = self.registry.lock().await;
             if registry
@@ -509,7 +609,6 @@ impl ValidationLeaderOwnership {
                 registry.remove(&self.identity);
             }
         }
-        *self.flight.result.lock().await = Some(result);
         self.flight.notify.notify_waiters();
         self.committed = true;
     }
@@ -758,12 +857,11 @@ impl ValidationObservationToken {
         if !self.armed.load(Ordering::Acquire) || self.recorded.swap(true, Ordering::AcqRel) {
             return;
         }
-        for key in &self.plan.keys {
-            self.state
-                .validation_history()
-                .record(history_key(key), observation)
-                .await;
-        }
+        let keys = self.plan.keys.iter().map(history_key).collect::<Vec<_>>();
+        self.state
+            .validation_history()
+            .record_batch(&keys, observation)
+            .await;
     }
 }
 
@@ -823,8 +921,13 @@ fn prediction_from_aggregate(
     minimum: u64,
     scope: codex_state::ValidationHistoryScope,
 ) -> Option<ValidationPrediction> {
-    let effective = aggregate.completed_count + aggregate.censored_above_count;
-    if effective < minimum || aggregate.censored_below_count > 0 || aggregate.completed_count < 2 {
+    // Censored observations do not carry enough information to estimate the
+    // duration variance. Do not advertise a confidence level unless the sample
+    // consists entirely of completed observations.
+    if aggregate.completed_count < minimum
+        || aggregate.censored_below_count > 0
+        || aggregate.censored_above_count > 0
+    {
         return None;
     }
     let n = aggregate.completed_count as f64;
@@ -832,7 +935,11 @@ fn prediction_from_aggregate(
     let variance = ((aggregate.duration_sum_squares_ms - aggregate.duration_sum_ms * mean)
         / (n - 1.0))
         .max(0.0);
-    let lower = (mean - 1.645 * variance.sqrt() * (1.0 + 1.0 / n).sqrt()).max(0.0);
+    let lower = (mean
+        - one_sided_student_t_95(aggregate.completed_count - 1)
+            * variance.sqrt()
+            * (1.0 + 1.0 / n).sqrt())
+    .max(0.0);
     Some(ValidationPrediction {
         tier: match scope {
             codex_state::ValidationHistoryScope::RepositoryFingerprint => "repository_fingerprint",
@@ -843,8 +950,25 @@ fn prediction_from_aggregate(
         predicted_duration_ms: mean.round() as u64,
         predictive_lower_bound_ms: lower.floor() as u64,
         confidence: MIN_SKIP_CONFIDENCE,
-        effective_sample_count: effective,
+        effective_sample_count: aggregate.completed_count,
     })
+}
+
+/// Conservative one-sided 95% Student-t critical values.
+///
+/// The admission thresholds require at least eight observations, so a compact
+/// upper-envelope table is enough and avoids treating estimated variance as if
+/// it were known. Each bucket uses the critical value at its smallest degree of
+/// freedom and is therefore conservative for the rest of the bucket.
+fn one_sided_student_t_95(degrees_of_freedom: u64) -> f64 {
+    match degrees_of_freedom {
+        0..=7 => 1.895,
+        8..=15 => 1.860,
+        16..=31 => 1.746,
+        32..=63 => 1.694,
+        64..=127 => 1.669,
+        _ => 1.658,
+    }
 }
 
 fn history_key(key: &ValidationObservationKey) -> codex_state::ValidationHistoryKey<'_> {
@@ -936,8 +1060,7 @@ fn classify_script(script: &str, depth: usize) -> ValidationClassification {
     let normalized = script
         .replace("&&", ";")
         .replace("||", ";")
-        .replace('\r', ";")
-        .replace('\n', ";");
+        .replace(['\r', '\n'], ";");
     for leaf in normalized.split(';') {
         let leaf_is_dynamic = leaf.contains("$(") || leaf.contains('`') || leaf.contains("${");
         let Some(words) = shlex::split(leaf) else {
@@ -1155,6 +1278,49 @@ fn descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prohibited_validation_wrappers_fail_closed() {
+        let mut authorization = ValidationAuthorization::default();
+        assert!(authorization.update_from_user_input("Do not run tests."));
+
+        for invocation in [
+            CommandInvocation::Argv {
+                program: "just".into(),
+                args: vec!["test".into()],
+            },
+            CommandInvocation::Argv {
+                program: "make".into(),
+                args: vec!["-C".into(), "codex-rs".into(), "integration-tests".into()],
+            },
+            CommandInvocation::Script("echo preparing; task test:focused".into()),
+            CommandInvocation::PowerShellScript("Write-Host preparing; yarn run test:unit".into()),
+        ] {
+            assert!(
+                prohibited_skip_for(&authorization, &invocation).is_some(),
+                "validation wrapper should be blocked: {invocation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_wrapper_guard_does_not_block_unprohibited_recipes() {
+        let mut authorization = ValidationAuthorization::default();
+        assert!(authorization.update_from_user_input("Do not run tests."));
+
+        for invocation in [
+            CommandInvocation::Argv {
+                program: "just".into(),
+                args: vec!["build".into()],
+            },
+            CommandInvocation::Argv {
+                program: "task".into(),
+                args: vec!["check".into()],
+            },
+        ] {
+            assert!(prohibited_skip_for(&authorization, &invocation).is_none());
+        }
+    }
 
     #[test]
     fn focused_grant_and_workspace_denial_coexist() {

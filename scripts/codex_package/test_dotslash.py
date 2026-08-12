@@ -56,7 +56,7 @@ class DotSlashCacheStampTest(unittest.TestCase):
             self.assertEqual(first["name"], "first")
             self.assertEqual(second["name"], "second")
 
-    def test_verified_archive_stamp_skips_warm_cache_hash(self) -> None:
+    def test_cached_archive_is_reverified(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = Path(temp_dir) / "rg.zip"
             content = b"archive"
@@ -73,9 +73,10 @@ class DotSlashCacheStampTest(unittest.TestCase):
             with mock.patch.object(
                 dotslash,
                 "verify_archive",
-                side_effect=AssertionError("warm cache should use stamp"),
-            ):
+                wraps=dotslash.verify_archive,
+            ) as verify_archive:
                 self.assertTrue(dotslash.archive_is_valid(archive_path, artifact, "rg"))
+                verify_archive.assert_called_once_with(archive_path, artifact, "rg")
 
     def test_invalid_cached_archive_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

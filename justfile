@@ -47,7 +47,7 @@ exec *args:
 [positional-arguments]
 [unix]
 tui-with-exec-server *args:
-    {{ justfile_directory() }}/scripts/run_tui_with_exec_server.sh "$@"
+    "{{ justfile_directory() }}/scripts/run_tui_with_exec_server.sh" "$@"
 
 # Run the CLI version of the file-search crate.
 file-search *args:
@@ -81,7 +81,7 @@ fmt:
 
 # Check the high-frequency local formatter set without modifying files.
 fmt-check-fast:
-    {{ python }} {{ justfile_directory() }}/scripts/format.py --check --fast-local
+    {{ python }} "{{ justfile_directory() }}/scripts/format.py" --check --fast-local
 
 # Format the justfile, Rust, Prettier targets, Python SDK code, and Python scripts.
 fmt-full:
@@ -93,31 +93,31 @@ fmt-check:
 
 [no-cd]
 check-kd4-features *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/check_kd4_features.py {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/check_kd4_features.py" {args}
 
 [no-cd]
 kd4-sync-audit *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/kd4_sync_audit.py {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/kd4_sync_audit.py" {args}
 
 [no-cd]
 kd4-perf-snapshot *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/kd4_perf_snapshot.py {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/kd4_perf_snapshot.py" {args}
 
 [no-cd]
 audit-scripts *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/root_maintenance.py audit-scripts {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/root_maintenance.py" audit-scripts {args}
 
 [no-cd]
 dev-env-doctor *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/dev_env_doctor.py {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/dev_env_doctor.py" {args}
 
 [no-cd]
 git-doctor *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/git_doctor.py {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/git_doctor.py" {args}
 
 [no-cd]
 vscode-runtime-proof *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/vscode_runtime_proof.py {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/vscode_runtime_proof.py" {args}
 
 [no-cd]
 dead-code *args:
@@ -268,7 +268,7 @@ _core-test-helpers-windows-sandbox target_dir:
 
 [windows]
 test-fast-nosccache *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $env:NEXTEST_PROFILE = "fast"; $command_args = @("cargo", "nextest", "run") + $forwarded_args; & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -NoSccache -CargoTargetLane "perf-nextest-nosccache" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = "{{ justfile_directory() }}\codex-rs\target\lanes\perf-nextest-nosccache"; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; $command_args = @("cargo", "nextest", "run") + $forwarded_args; & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -NoSccache -CargoTargetLane "perf-nextest-nosccache" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
 
 [windows]
 test-compile *args:
@@ -282,7 +282,7 @@ test-windows-sandbox-processes *args:
 test-windows-sandbox-processes *args:
     $forwarded_args = @($args | Select-Object -Skip 1); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS = "1"; cargo nextest run --no-tests=fail -p codex-utils-pty -E 'test(terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty) | test(normal_exit_preserves_descendants_for_pipe_and_conpty) | test(conpty_delivers_input_to_foreground_children) | test(conpty_ctrl_c_interrupts_powershell_foreground_child) | test(required_process_test_prerequisites_report_unverified_coverage)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --no-tests=fail -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --no-tests=fail -p codex-core direct_exec_cancellation_terminates_windows_descendants @forwarded_args
 
-# Full local gate with benchmark startup smoke coverage.
+# Full local test gate; use test-full-with-bench when benchmark startup smoke is required.
 test-full *args:
     just test {args}
 
@@ -348,7 +348,7 @@ test-timings *args:
 
 [windows]
 test-timings *args:
-    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast --timings=html,json @($args | Select-Object -Skip 1)
+    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed "target" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast --timings=html,json @forwarded_args
 
 # Focused crate test without repo-wide formatting.
 validate-crate-focused crate:
@@ -393,28 +393,28 @@ test-github-scripts: test-release-tooling
 
 [no-cd]
 rust-build-doctor:
-    @{{ python }} {{ justfile_directory() }}/scripts/rust_build_status.py doctor
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" doctor
 
 [no-cd]
 target-disk:
-    @{{ python }} {{ justfile_directory() }}/scripts/rust_build_status.py disk
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" disk
 
 [no-cd]
 target-prune *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/rust_build_status.py prune {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" prune {args}
 
 # Preview target cache cleanup with `just target-optimize-dry-run` before pruning.
 [no-cd]
 target-optimize *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/rust_build_status.py optimize --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" optimize --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
 
 [no-cd]
 target-optimize-dry-run *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/rust_build_status.py optimize --dry-run --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" optimize --dry-run --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
 
 [no-cd]
 lanes:
-    @{{ python }} {{ justfile_directory() }}/scripts/rust_build_status.py lanes
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" lanes
 
 [unix]
 test-lane-package package *args:
@@ -519,7 +519,7 @@ mcp-server-run *args:
 [no-cd]
 [unix]
 generate-config-proto *args:
-    {{ justfile_directory() }}/codex-rs/config/scripts/generate-proto.sh "$@"
+    "{{ justfile_directory() }}/codex-rs/config/scripts/generate-proto.sh" "$@"
 
 [no-cd]
 [windows]
@@ -530,7 +530,7 @@ generate-config-proto *args:
 [no-cd]
 [unix]
 generate-config-proto-check:
-    {{ justfile_directory() }}/codex-rs/config/scripts/generate-proto.sh --check
+    "{{ justfile_directory() }}/codex-rs/config/scripts/generate-proto.sh" --check
 
 [no-cd]
 [windows]
@@ -539,7 +539,7 @@ generate-config-proto-check:
 
 # Regenerate config.schema.json through the serialized generated-output lane.
 write-config-schema:
-    {{ python }} {{ justfile_directory() }}/scripts/config_schema_check.py --mode force --owner "manual:write-config-schema"
+    {{ python }} "{{ justfile_directory() }}/scripts/config_schema_check.py" --mode force --owner "manual:write-config-schema"
 
 # Run focused config schema fixture validation without regenerating schemas.
 config-schema-protocol-check:
@@ -548,12 +548,12 @@ config-schema-protocol-check:
 # Check config schema freshness without modifying generated output.
 [no-cd]
 config-schema-check:
-    {{ python }} {{ justfile_directory() }}/scripts/config_schema_check.py --mode check
+    {{ python }} "{{ justfile_directory() }}/scripts/config_schema_check.py" --mode check
 
 # Explicitly regenerate config schema under the repository generation lock.
 [no-cd]
 config-schema-regenerate owner:
-    {{ python }} {{ justfile_directory() }}/scripts/config_schema_check.py --mode force --owner "{{ owner }}"
+    {{ python }} "{{ justfile_directory() }}/scripts/config_schema_check.py" --mode force --owner "{{ owner }}"
 
 # Compatibility name for explicit, owner-attributed regeneration.
 [no-cd]
@@ -562,13 +562,14 @@ config-schema-check-force owner:
 
 # Regenerate vendored app-server schemas through the serialized generation lane.
 write-app-server-schema experimental="":
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode force --owner "manual:write-app-server-schema" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("write-app-server-schema only accepts --experimental") } }}
+    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode force --owner "manual:write-app-server-schema" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("write-app-server-schema only accepts --experimental") } }}
 
 # Run focused app-server runtime validation without regenerating schemas.
 app-server-runtime-check:
-    just app-server-command-exec-check
-    just app-server-process-exec-check
-    just app-server-thread-status-check
+    just _app-server-command-exec-tests
+    just _app-server-process-exec-tests
+    just _app-server-thread-status-tests
+    cargo check -p codex-app-server
 
 # Validate the source map and its material repository inventories.
 source-map-check:
@@ -587,7 +588,7 @@ tui-large-widget-check:
     cargo check -p codex-tui
 
 deps-duplicates-check *args:
-    just deps-duplicates {args}
+    {{ python }} "{{ justfile_directory() }}/scripts/check_duplicate_deps.py" {args}
 
 # Refresh the advisory database and audit the locked dependency graph.
 deps-audit:
@@ -598,7 +599,7 @@ deps-audit:
 # stay in the separate `deps-audit` gate configured by .cargo/audit.toml.
 deps-policy-check *args:
     just _cargo-deny-installed
-    just deps-duplicates {args}
+    just deps-duplicates-check {args}
     cargo deny check bans sources licenses
 
 [unix]
@@ -627,19 +628,28 @@ codex-cli-wrapper-check:
     node --check "{{ justfile_directory() }}/codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js"
 
 app-server-command-exec-check:
+    just _app-server-command-exec-tests
+    cargo check -p codex-app-server
+
+_app-server-command-exec-tests:
     cargo nextest run -p codex-app-server-protocol -E 'test(command_exec_response_round_trips_runtime_status)'
     cargo nextest run -p codex-app-server -E 'test(suite::v2::command_exec::command_exec_non_streaming_respects_output_cap)'
-    cargo check -p codex-app-server
 
 app-server-process-exec-check:
-    cargo nextest run -p codex-app-server-protocol -E 'test(process_notifications_round_trip)'
-    cargo nextest run -p codex-app-server -E 'test(process_spawn_reports_buffered_output_cap_reached)'
+    just _app-server-process-exec-tests
     cargo check -p codex-app-server
 
+_app-server-process-exec-tests:
+    cargo nextest run -p codex-app-server-protocol -E 'test(process_notifications_round_trip)'
+    cargo nextest run -p codex-app-server -E 'test(process_spawn_reports_buffered_output_cap_reached)'
+
 app-server-thread-status-check:
+    just _app-server-thread-status-tests
+    cargo check -p codex-app-server
+
+_app-server-thread-status-tests:
     cargo nextest run -p codex-core -E 'test(validated_invalidated_tracker_still_requests_diff_fallback)'
     cargo nextest run -p codex-app-server -E 'test(thread_status::tests::stale_active_running_thread_resume_clears_watch_status) | test(thread_status::tests::stale_active_repair_preserves_pending_approval_status)'
-    cargo check -p codex-app-server
 
 app-server-schema-protocol-check:
     cargo nextest run -p codex-app-server-protocol -E 'test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated)'
@@ -647,12 +657,12 @@ app-server-schema-protocol-check:
 # Check app-server schema fixtures without modifying generated output.
 [no-cd]
 app-server-schema-check:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode check
+    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check
 
 # Explicitly regenerate app-server schemas under the repository generation lock.
 [no-cd]
 app-server-schema-regenerate owner:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode force --owner "{{ owner }}"
+    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode force --owner "{{ owner }}"
 
 # Compatibility name for explicit, owner-attributed regeneration.
 [no-cd]
@@ -662,52 +672,52 @@ app-server-schema-check-force owner:
 # Compatibility wrapper for callers that still want schema and runtime proof together.
 [no-cd]
 app-server-schema-runtime-check:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode check --runtime
+    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check --runtime
 
 [no-cd]
 app-server-schema-runtime-check-with-runtime:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode check --runtime
+    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check --runtime
 
 # Compatibility wrapper for forced schema regeneration plus runtime proof.
 [no-cd]
 app-server-schema-runtime-check-force owner:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode force --owner "{{ owner }}" --runtime
+    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode force --owner "{{ owner }}" --runtime
 
 # Validate and resolve a shared-worktree preflight manifest.
 [no-cd]
 workflow-preflight manifest output:
-    {{ python }} {{ justfile_directory() }}/scripts/workflow_preflight.py "{{ manifest }}" --output "{{ output }}"
+    {{ python }} "{{ justfile_directory() }}/scripts/workflow_preflight.py" "{{ manifest }}" --output "{{ output }}"
 
 # Release a terminal assignment from the active workflow-preflight registry.
 [no-cd]
 workflow-preflight-release assignment_id:
-    {{ python }} {{ justfile_directory() }}/scripts/workflow_preflight.py --release "{{ assignment_id }}" --repository-root "{{ justfile_directory() }}"
+    {{ python }} "{{ justfile_directory() }}/scripts/workflow_preflight.py" --release "{{ assignment_id }}" --repository-root "{{ justfile_directory() }}"
 
 # Regenerate hook schema artifacts through the Rust workspace from any cwd.
 [no-cd]
 write-hooks-schema:
-    cargo run --manifest-path {{ justfile_directory() }}/codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures
+    cargo run --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-hooks --bin write_hooks_schema_fixtures
 
 # Run the argument-comment Dylint checks across codex-rs.
 [no-cd]
 [unix]
 argument-comment-lint *args:
-    {{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py "$@"
+    "{{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py" "$@"
 
 [no-cd]
 [windows]
 argument-comment-lint *args:
-    $forwarded_args = {args}; {{ python }} {{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py @forwarded_args
+    $forwarded_args = {args}; {{ python }} "{{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py" @forwarded_args
 
 [no-cd]
 [unix]
 argument-comment-lint-from-source *args:
-    {{ justfile_directory() }}/tools/argument-comment-lint/run.py "$@"
+    "{{ justfile_directory() }}/tools/argument-comment-lint/run.py" "$@"
 
 [no-cd]
 [windows]
 argument-comment-lint-from-source *args:
-    $forwarded_args = {args}; {{ python }} {{ justfile_directory() }}/tools/argument-comment-lint/run.py @forwarded_args
+    $forwarded_args = {args}; {{ python }} "{{ justfile_directory() }}/tools/argument-comment-lint/run.py" @forwarded_args
 
 # Tail logs from the state SQLite database
 [unix]

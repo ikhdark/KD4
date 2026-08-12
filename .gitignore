@@ -20,7 +20,11 @@ codex-cli/README.md
 result
 
 # editor
-.vscode/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
 .idea/
 .history/
 .zed/
@@ -69,6 +73,7 @@ coverage/
 # personal files
 personal/
 /kd-ui/
+/task-evidence/
 .codex/harness/runs/
 .codex/evals/investigation/
 .codex/locks/

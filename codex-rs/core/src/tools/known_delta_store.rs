@@ -390,10 +390,28 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Option<()> {
     }
     drop(file);
     if tokio::fs::rename(&temporary, path).await.is_err() {
-        let _ = tokio::fs::remove_file(path).await;
+        // Windows does not replace an existing destination with `rename`. Move
+        // the old record aside first, but keep it until the new record is in
+        // place so an interrupted or failed replacement cannot destroy the
+        // last valid cache entry.
+        let backup = parent.join(format!(".{}.backup", Uuid::new_v4()));
+        let had_previous = match tokio::fs::rename(path, &backup).await {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return None;
+            }
+        };
         if tokio::fs::rename(&temporary, path).await.is_err() {
+            if had_previous {
+                let _ = tokio::fs::rename(&backup, path).await;
+            }
             let _ = tokio::fs::remove_file(&temporary).await;
             return None;
+        }
+        if had_previous {
+            let _ = tokio::fs::remove_file(&backup).await;
         }
     }
     Some(())
@@ -464,7 +482,7 @@ async fn git_resolve_blob(cwd: &Path, spec: &str) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
-    let mut fields = stdout.trim().split_whitespace();
+    let mut fields = stdout.split_whitespace();
     let object = fields.next()?;
     let object_type = fields.next()?;
     if fields.next().is_some() || object_type != "blob" || !is_resolved_object(object) {

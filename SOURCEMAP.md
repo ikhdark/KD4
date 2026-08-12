@@ -130,10 +130,10 @@ below.
 | `.npmrc` | npm and pnpm behavior used by the JavaScript workspace |
 | `AGENTS.md`, `SOURCEMAP.md` | Repository-wide editing policy and this cross-cutting ownership contract |
 | `do-not-code.md` | Complete `codex-rs` protected/editable/mixed classification, exact upstream-mirror boundary, and generator-managed exceptions |
-| `WORKTREE_REVIEW.txt` | Plain-text audit ledger for the current whole-worktree review workflow |
+| `WORKTREE_REVIEW.txt` | Historical, frozen whole-worktree review evidence; not a current-checkout verdict |
 | `CHANGELOG.md`, `LICENSE`, `NOTICE` | Release history and legal notices |
 | `flake.nix`, `flake.lock` | Nix development/build environment and its locked inputs |
-| `justfile`, `kd4_features.toml` | Preferred command router and KD4 feature inventory |
+| `justfile`, `kd4_features.toml`, `source_owners.toml` | Preferred command router, KD4 feature inventory, and machine-readable source ownership routing |
 | `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` | Root maintenance commands, JavaScript dependency state, and workspace membership |
 
 ## Instruction scopes
@@ -162,7 +162,6 @@ below.
 | Interactive TUI | `codex-rs/tui/src/main.rs` | `codex-rs/tui/src/lib.rs`, app/session routing, chat widget, bottom pane, core/protocol |
 | Headless execution | `codex-rs/exec/src/main.rs` | `codex-rs/exec`, core, protocol, JSONL/event output |
 | App server | `codex-rs/app-server/src/main.rs` | app-server library, protocol, transport, daemon, core |
-| KD4 custom renderer | `kd-ui/src/main/main.ts`, `kd-ui/src/renderer/main.tsx` | external `codex app-server --listen stdio://`, generated protocol adapter, secure preload IPC, Electron window |
 | App-server exec transport | `codex-rs/app-server/src/bin/exec_server.rs` | app-server transport and process execution wiring |
 | App-server test client | `codex-rs/app-server-test-client/src/main.rs` | app-server protocol/transport smoke paths |
 | MCP server | `codex-rs/mcp-server/src/main.rs` | MCP server library, core, RMCP client, protocol |
@@ -210,7 +209,6 @@ below.
 | `.devcontainer/codex-install/package.json` | Dev-container Codex installation helper |
 | `codex-cli/package.json` | Published npm CLI wrapper |
 | `codex-rs/responses-api-proxy/npm/package.json` | npm wrapper for the Responses API proxy |
-| `kd-ui/package.json` | Private `@kd4/ui` Electron/React renderer and package-local build, test, launch, and unpacked-package scripts |
 | `sdk/typescript/package.json` | TypeScript SDK package |
 | `scripts/pyproject.toml` | Python script linting, formatting, and test environment |
 | `sdk/python/pyproject.toml` | Python SDK package |
@@ -302,7 +300,6 @@ owner must trace every reader and writer before completion.
 | Canonical package archives | `scripts/codex_package` | package-local tests and archive/content checks |
 | Standalone installers | `scripts/install/install.sh`, `scripts/install/install.ps1` | installer tests, digest/layout/locking/PATH/migration behavior |
 | TypeScript SDK | `sdk/typescript` | `just sdk-ts-check` and package-facing type/tests |
-| KD4 custom renderer | `kd-ui/package.json`, `kd-ui/vite.config.ts`, `kd-ui/scripts` | package-local typecheck/tests, production renderer and Electron bundles, unpacked Windows package inspection, unpacked executable smoke test |
 | Python SDK | `sdk/python` | focused `uv run pytest` and `uv run ruff check .` |
 | Python runtime package | `sdk/python-runtime` | focused runtime-package tests and lint |
 | Nix environment | `flake.nix`, `flake.lock` | Nix evaluation/build appropriate to the changed input |
@@ -327,7 +324,6 @@ remain required.
 | Thread-config protobuf | `just generate-config-proto-check` |
 | Hooks/schema | focused hook tests; run `just write-hooks-schema` only for intentional regeneration |
 | TypeScript SDK | `just sdk-ts-check` |
-| KD4 custom renderer | `pnpm --filter @kd4/ui typecheck`, `pnpm --filter @kd4/ui test`, `pnpm --filter @kd4/ui build`, `pnpm --filter @kd4/ui package:dir`, `pnpm --filter @kd4/ui inspect:package`, then the unpacked Windows executable smoke test |
 | Python SDK | focused `uv run pytest` and `uv run ruff check .` |
 | Package/archive flow | package-local tests followed by the relevant staging or dry-run proof |
 | Local publish wiring | `just publish-local-codex-final -DryRun`; installed replacement requires `just publish-local-codex-final` |

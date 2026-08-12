@@ -201,9 +201,6 @@ def ensure_valid_artifact(artifact: Path, checksum: str, url: str) -> None:
 def has_checksum(path: Path, expected: str) -> bool:
     if not path.is_file():
         return False
-    if verified_checksum_stamp_matches(path, expected):
-        return True
-
     digest = hashlib.sha256()
     with path.open("rb") as artifact:
         for chunk in iter(lambda: artifact.read(HASH_CHUNK_BYTES), b""):
@@ -230,15 +227,6 @@ def download_file(url: str, dest: Path) -> None:
         temp_path.replace(dest)
     finally:
         temp_path.unlink(missing_ok=True)
-
-
-def verified_checksum_stamp_matches(path: Path, expected: str) -> bool:
-    stamp = read_json_stamp(verified_checksum_stamp_path(path))
-    return stamp == {
-        "kind": "v8-artifact-checksum",
-        "digest": expected,
-        "file": file_stamp(path),
-    }
 
 
 def write_verified_checksum_stamp(path: Path, expected: str) -> None:

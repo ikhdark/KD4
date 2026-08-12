@@ -268,7 +268,7 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
         .await
         .expect("write apps.app1.default_tools_approval_mode succeeds");
 
-    let read = service
+    let (read, _) = service
         .read(ConfigReadParams {
             include_layers: false,
             cwd: None,
@@ -321,7 +321,7 @@ async fn write_value_supports_custom_mcp_server_default_tool_approval_mode() -> 
     let contents = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))?;
     assert!(contents.contains("default_tools_approval_mode = \"approve\""));
 
-    let read = service
+    let (read, _) = service
         .read(ConfigReadParams {
             include_layers: false,
             cwd: None,
@@ -359,7 +359,7 @@ async fn read_includes_origins_and_layers() {
         CloudConfigBundleLoader::default(),
     );
 
-    let response = service
+    let (response, _) = service
         .read(ConfigReadParams {
             include_layers: true,
             cwd: None,
@@ -489,7 +489,7 @@ async fn write_value_reports_override() {
         .await
         .expect("result");
 
-    let read_after = service
+    let (read_after, _) = service
         .read(ConfigReadParams {
             include_layers: true,
             cwd: None,
@@ -766,7 +766,7 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
         CloudConfigBundleLoader::default(),
     );
 
-    let response = service
+    let (response, _) = service
         .read(ConfigReadParams {
             include_layers: true,
             cwd: None,

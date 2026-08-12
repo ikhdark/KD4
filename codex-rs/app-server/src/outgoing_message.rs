@@ -56,6 +56,8 @@ const NO_INITIALIZED_CONNECTIONS_ERROR: &str =
     "client request canceled because no initialized connections are available";
 const ALL_AUTHORIZED_CONNECTIONS_DISCONNECTED_ERROR: &str =
     "client request canceled because all authorized connections disconnected";
+const ALL_AUTHORIZED_CONNECTION_SENDS_FAILED_ERROR: &str =
+    "client request canceled because delivery failed for all authorized connections";
 
 /// Stable identifier for a client request scoped to a transport connection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -116,7 +118,7 @@ pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
     active_connections: Arc<Mutex<HashMap<ConnectionId, Arc<AtomicBool>>>>,
-    request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
+    request_id_to_callback: Arc<Mutex<HashMap<RequestId, PendingCallbackEntry>>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
     /// disconnect cleanup all get handled.
@@ -141,6 +143,31 @@ struct PendingCallbackEntry {
     request: ServerRequest,
     /// Connections that received this request and may resolve its callback.
     connection_ids: HashSet<ConnectionId>,
+}
+
+struct PendingCallbackRegistration {
+    callbacks: Arc<Mutex<HashMap<RequestId, PendingCallbackEntry>>>,
+    request_id: Option<RequestId>,
+}
+
+impl PendingCallbackRegistration {
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for PendingCallbackRegistration {
+    fn drop(&mut self) {
+        let Some(request_id) = self.request_id.take() else {
+            return;
+        };
+        let callbacks = Arc::clone(&self.callbacks);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                callbacks.lock().await.remove(&request_id);
+            });
+        }
+    }
 }
 
 enum TakeCallbackResult {
@@ -336,7 +363,7 @@ impl OutgoingMessageSender {
             next_server_request_id: AtomicI64::new(0),
             sender,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
-            request_id_to_callback: Mutex::new(HashMap::new()),
+            request_id_to_callback: Arc::new(Mutex::new(HashMap::new())),
             request_contexts: Mutex::new(HashMap::new()),
             analytics_events_client,
             delivery_tasks: TaskTracker::new(),
@@ -513,10 +540,18 @@ impl OutgoingMessageSender {
                 },
             );
         }
+        // From registration until this method returns, every await is a
+        // cancellation point. Remove the callback if the send future is
+        // dropped before its receiver can take ownership of that cleanup.
+        let mut pending_registration = PendingCallbackRegistration {
+            callbacks: Arc::clone(&self.request_id_to_callback),
+            request_id: Some(outgoing_message_id.clone()),
+        };
         drop(active_connections);
 
         let outgoing_message = OutgoingMessage::Request(request.clone());
         let mut send_error = None;
+        let mut sent_connection_ids = HashSet::new();
         for connection_id in target_connection_ids {
             if let Err(err) = self
                 .sender
@@ -530,6 +565,7 @@ impl OutgoingMessageSender {
                 send_error = Some(err);
                 break;
             } else {
+                sent_connection_ids.insert(connection_id);
                 self.analytics_events_client
                     .track_server_request(connection_id.0, request.clone());
             }
@@ -542,8 +578,23 @@ impl OutgoingMessageSender {
         if let Err(err) = send_result {
             warn!("failed to send request {outgoing_message_id:?} to client: {err:?}");
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
-            request_id_to_callback.remove(&outgoing_message_id);
+            if let Some(entry) = request_id_to_callback.get_mut(&outgoing_message_id) {
+                entry
+                    .connection_ids
+                    .retain(|connection_id| sent_connection_ids.contains(connection_id));
+            }
+            let undelivered_entry = sent_connection_ids
+                .is_empty()
+                .then(|| request_id_to_callback.remove(&outgoing_message_id))
+                .flatten();
+            drop(request_id_to_callback);
+            if let Some(entry) = undelivered_entry {
+                let _ = entry.callback.send(Err(internal_error(
+                    ALL_AUTHORIZED_CONNECTION_SENDS_FAILED_ERROR,
+                )));
+            }
         }
+        pending_registration.disarm();
         (outgoing_message_id, rx_approve)
     }
 
@@ -2292,6 +2343,122 @@ mod tests {
         assert_eq!(error.message, NO_ACTIVE_AUTHORIZED_CONNECTIONS_ERROR);
         assert!(rx.try_recv().is_err(), "no request envelope may be emitted");
         assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn partial_multi_connection_send_keeps_the_delivered_request_callback() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let first_connection = ConnectionId(60);
+        let second_connection = ConnectionId(61);
+        for connection_id in [first_connection, second_connection] {
+            outgoing
+                .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                .await;
+        }
+        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: "turn-partial".to_string(),
+            call_id: "call-partial".to_string(),
+            namespace: None,
+            tool: "test_tool".to_string(),
+            arguments: json!({}),
+        });
+
+        let send_outgoing = Arc::clone(&outgoing);
+        let send_task = tokio::spawn(async move {
+            send_outgoing
+                .send_request_to_connections(
+                    Some(&[first_connection, second_connection]),
+                    request,
+                    /*thread_id*/ None,
+                )
+                .await
+        });
+        let first_delivery = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first delivery should not time out")
+            .expect("first delivery should be queued");
+        let delivered_connection = match first_delivery {
+            OutgoingEnvelope::ToConnection { connection_id, .. } => connection_id,
+            envelope => panic!("unexpected first delivery: {envelope:?}"),
+        };
+        assert!([first_connection, second_connection].contains(&delivered_connection));
+        drop(rx);
+
+        let (request_id, wait_for_result) = timeout(Duration::from_secs(1), send_task)
+            .await
+            .expect("send should finish after the receiver closes")
+            .expect("send task should not panic");
+        assert_eq!(outgoing.pending_callback_count().await, 1);
+
+        let expected_result = json!({"contentItems": [], "success": true});
+        outgoing
+            .notify_client_response(delivered_connection, request_id, expected_result.clone())
+            .await;
+        assert_eq!(
+            timeout(Duration::from_secs(1), wait_for_result)
+                .await
+                .expect("delivered request should resolve promptly")
+                .expect("callback sender should remain live"),
+            Ok(expected_result)
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn canceled_multi_connection_send_removes_registered_callback() {
+        let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let first_connection = ConnectionId(62);
+        let second_connection = ConnectionId(63);
+        for connection_id in [first_connection, second_connection] {
+            outgoing
+                .connection_opened(connection_id, Arc::new(AtomicBool::new(true)))
+                .await;
+        }
+        let request = ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: "turn-canceled-send".to_string(),
+            call_id: "call-canceled-send".to_string(),
+            namespace: None,
+            tool: "test_tool".to_string(),
+            arguments: json!({}),
+        });
+
+        let send_outgoing = Arc::clone(&outgoing);
+        let send_task = tokio::spawn(async move {
+            send_outgoing
+                .send_request_to_connections(
+                    Some(&[first_connection, second_connection]),
+                    request,
+                    /*thread_id*/ None,
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while outgoing.pending_callback_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request callback should be registered before cancellation");
+
+        send_task.abort();
+        let _canceled = send_task.await;
+        timeout(Duration::from_secs(1), async {
+            while outgoing.pending_callback_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled send should remove its request callback");
     }
 
     #[tokio::test]

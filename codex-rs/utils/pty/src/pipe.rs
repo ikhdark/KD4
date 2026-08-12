@@ -219,7 +219,6 @@ async fn spawn_process_with_stdin_mode(
         // ensures that a child returned after this future times out is terminated when the
         // detached spawn result is discarded.
         command.kill_on_drop(true);
-        command.creation_flags(ManagedRootProcess::WINDOWS_CREATION_FLAGS);
         run_windows_spawn_operation(WINDOWS_PROCESS_SPAWN_TIMEOUT, move || command.spawn()).await?
     };
     #[cfg(not(windows))]
@@ -229,7 +228,7 @@ async fn spawn_process_with_stdin_mode(
         let pid = child
             .id()
             .ok_or_else(|| io::Error::other("missing child pid"))?;
-        if let Err(error) = managed.attach_and_resume(pid) {
+        if let Err(error) = managed.attach(pid) {
             let _ = child.start_kill();
             let _ = child.wait().await;
             return Err(error.into());

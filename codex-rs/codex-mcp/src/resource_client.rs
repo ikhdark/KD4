@@ -129,6 +129,17 @@ impl McpResourceClient {
     }
 }
 
+fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource> {
+    let value = serde_json::to_value(resource).context("failed to serialize MCP resource")?;
+    Resource::from_mcp_value(value).context("failed to convert MCP resource")
+}
+
+fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> Result<ResourceContent> {
+    let value =
+        serde_json::to_value(content).context("failed to serialize MCP resource content")?;
+    serde_json::from_value(value).context("failed to convert MCP resource content")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,15 +158,4 @@ mod tests {
                 .is_err()
         );
     }
-}
-
-fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource> {
-    let value = serde_json::to_value(resource).context("failed to serialize MCP resource")?;
-    Resource::from_mcp_value(value).context("failed to convert MCP resource")
-}
-
-fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> Result<ResourceContent> {
-    let value =
-        serde_json::to_value(content).context("failed to serialize MCP resource content")?;
-    serde_json::from_value(value).context("failed to convert MCP resource content")
 }

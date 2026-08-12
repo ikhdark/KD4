@@ -104,40 +104,42 @@ The result wrapper is:
       "locators": ["repository-relative path or symbol"]
     }
   ],
-  "metrics": {
-    "tool_calls": 0,
-    "repeated_equivalent_actions": 0,
-    "premature_completion": false,
-    "model_cost": null,
-    "tool_cost": null
-  },
-  "raw_events": []
+  "raw_events": [
+    {
+      "type": "item.completed",
+      "item": {
+        "id": "item_0",
+        "type": "agent_message",
+        "text": "verbatim final model response"
+      }
+    }
+  ]
 }
 ```
 
 `reported_findings` is a human classification of the preserved final output,
 not a replacement for it. A finding may be mapped to an expected stable kind
 only when the final output identifies the same violated invariant and causal
-path. Uncertain language must remain `uncertain` or `deferred`.
+path. Every structured locator must occur in the final output, and
+`final_output` must exactly equal the last completed agent-message event.
+Uncertain language must remain `uncertain` or `deferred`.
+
+The scorer derives tool-call and repeated-equivalent-action counts from the
+preserved event stream. Do not add hand-entered metric totals: semantic
+premature-completion judgements and monetary costs are not scored without an
+independently generated evidence format.
 
 ## Score a run
 
 ```text
 python scripts/investigation_eval/score_results.py \
-  --results .codex/evals/investigation/baseline
+  --results .codex/evals/investigation/baseline \
+  --binary <exact-codex-executable-used-for-the-run>
 ```
 
-By default, the scorer derives the binary SHA-256 from the first wrapper and
-requires every other wrapper in the run to match it. To assert a particular
-binary explicitly, pass its SHA-256:
-
-```text
-python scripts/investigation_eval/score_results.py \
-  --results .codex/evals/investigation/after \
-  --binary-sha256 <resulting-binary-sha256>
-```
+The scorer hashes `--binary` itself and requires every result wrapper to match
+that digest. A wrapper-provided digest alone is never accepted as provenance.
 
 The scorer reports confirmed-finding recall, precision, clean-control false
-positives, deferred or uncertain findings, tool calls, repeated equivalent
-actions, premature completion, and model/tool cost when present. Missing costs
-remain unavailable rather than being treated as zero.
+positives, deferred or uncertain findings, and event-derived tool calls and
+repeated equivalent actions.

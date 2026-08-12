@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import tomllib
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -23,6 +24,7 @@ ALLOWED_CAPABILITY_KINDS = frozenset({"runtime", "workflow", "library", "guidanc
 ALLOWED_EVIDENCE_KINDS = frozenset(
     {"entrypoint", "module", "registration", "config", "protocol", "test", "workflow"}
 )
+COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True)
@@ -285,7 +287,7 @@ def validate_manifest(
     manifest_path: Path = DEFAULT_MANIFEST,
     *,
     repo_root: Path = REPO_ROOT,
-    strict: bool = False,
+    strict: bool = True,
 ) -> CheckResult:
     findings: list[Finding] = []
     try:
@@ -308,6 +310,37 @@ def validate_manifest(
                 f"expected schema_version {SCHEMA_VERSION}, found {schema_version!r}",
             )
         )
+
+    upstream_commit = manifest.get("upstream_commit")
+    if not isinstance(upstream_commit, str) or not COMMIT_SHA_PATTERN.fullmatch(
+        upstream_commit
+    ):
+        findings.append(
+            Finding(
+                "error",
+                "invalid-upstream-commit",
+                "upstream_commit must be a lowercase 40-character Git commit SHA",
+            )
+        )
+    elif (
+        repo_root.resolve() == REPO_ROOT.resolve()
+        and manifest_path.resolve() == DEFAULT_MANIFEST.resolve()
+    ):
+        resolved = subprocess.run(
+            ["git", "cat-file", "-e", f"{upstream_commit}^{{commit}}"],
+            cwd=repo_root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if resolved.returncode != 0:
+            findings.append(
+                Finding(
+                    "error",
+                    "unknown-upstream-commit",
+                    "upstream_commit does not resolve to a commit in this repository",
+                )
+            )
 
     features = manifest.get("features")
     if not isinstance(features, list):
@@ -527,7 +560,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument(
-        "--strict", action="store_true", help="Fail on orphaned features."
+        "--strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail on orphaned features (default: enabled).",
     )
     parser.add_argument(
         "--json", action="store_true", help="Emit one JSON result object."

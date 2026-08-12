@@ -15,13 +15,15 @@ use sqlx::Row;
 use tokio::sync::Mutex;
 
 const KEY_FILE: &str = "validation-history.key";
+const KEY_LOCK_FILE: &str = "validation-history.key.lock";
 const KEY_VERSION: i64 = 1;
 const CACHE_CAPACITY: usize = 256;
 const MAX_PERSISTED_ROWS: i64 = 8_192;
 const FINE_GRAINED_EXPIRY_SECONDS: i64 = 30 * 24 * 60 * 60;
 const READ_TIMEOUT: Duration = Duration::from_millis(40);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
-static WRITE_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+static WRITE_ERROR_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+static WRITE_TIMEOUT_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(i64)]
@@ -165,8 +167,21 @@ WHERE scope_kind = ? AND repository_id = ? AND fingerprint_id = ?
         input: ValidationHistoryKey<'_>,
         observation: ValidationHistoryObservation,
     ) {
-        let key = match self.stored_key(input) {
-            Ok(key) => key,
+        self.record_batch(std::slice::from_ref(&input), observation)
+            .await;
+    }
+
+    pub async fn record_batch(
+        &self,
+        inputs: &[ValidationHistoryKey<'_>],
+        observation: ValidationHistoryObservation,
+    ) {
+        let keys = match inputs
+            .iter()
+            .map(|input| self.stored_key(input.clone()))
+            .collect::<anyhow::Result<Vec<_>>>()
+        {
+            Ok(keys) => keys,
             Err(error) => {
                 tracing::warn!(%error, "validation history fingerprint failed");
                 return;
@@ -183,8 +198,11 @@ WHERE scope_kind = ? AND repository_id = ? AND fingerprint_id = ?
             } if elapsed_ms >= threshold_ms => (0, 0, 1, 0.0, 0.0),
             ValidationHistoryObservation::Cancelled { .. } => (0, 1, 0, 0.0, 0.0),
         };
-        let query = sqlx::query(
-            r#"
+        let write = async {
+            let mut transaction = self.pool.begin().await?;
+            for key in &keys {
+                sqlx::query(
+                    r#"
 INSERT INTO validation_history_aggregates (
     scope_kind, repository_id, fingerprint_id, operation, ecosystem, breadth,
     model_version, key_version, completed_count, censored_below_count,
@@ -197,31 +215,47 @@ ON CONFLICT DO UPDATE SET
     duration_sum_ms = duration_sum_ms + excluded.duration_sum_ms,
     duration_sum_squares_ms = duration_sum_squares_ms + excluded.duration_sum_squares_ms,
     updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(key.scope)
-        .bind(&key.repository_id)
-        .bind(&key.fingerprint_id)
-        .bind(key.operation)
-        .bind(key.ecosystem)
-        .bind(key.breadth)
-        .bind(key.model_version)
-        .bind(key.key_version)
-        .bind(completed)
-        .bind(below)
-        .bind(above)
-        .bind(sum)
-        .bind(squares)
-        .execute(self.pool.as_ref());
-        match tokio::time::timeout(WRITE_TIMEOUT, query).await {
+                    "#,
+                )
+                .bind(key.scope)
+                .bind(&key.repository_id)
+                .bind(&key.fingerprint_id)
+                .bind(key.operation)
+                .bind(key.ecosystem)
+                .bind(key.breadth)
+                .bind(key.model_version)
+                .bind(key.key_version)
+                .bind(completed)
+                .bind(below)
+                .bind(above)
+                .bind(sum)
+                .bind(squares)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await
+        };
+        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
             Ok(Ok(_)) => {
-                self.invalidate_cache(&key).await;
+                let (write_error_recovered, write_timeout_recovered) = clear_write_warnings(
+                    &WRITE_ERROR_WARNING_EMITTED,
+                    &WRITE_TIMEOUT_WARNING_EMITTED,
+                );
+                if write_error_recovered {
+                    tracing::info!("validation history writes recovered after an earlier error");
+                }
+                if write_timeout_recovered {
+                    tracing::info!("validation history writes recovered after an earlier timeout");
+                }
+                for key in &keys {
+                    self.invalidate_cache(key).await;
+                }
                 self.prune_persisted_rows().await;
             }
-            Ok(Err(error)) if !WRITE_WARNING_EMITTED.swap(true, Ordering::Relaxed) => {
+            Ok(Err(error)) if !WRITE_ERROR_WARNING_EMITTED.swap(true, Ordering::Relaxed) => {
                 tracing::warn!(%error, "validation history write failed")
             }
-            Err(_) if !WRITE_WARNING_EMITTED.swap(true, Ordering::Relaxed) => {
+            Err(_) if !WRITE_TIMEOUT_WARNING_EMITTED.swap(true, Ordering::Relaxed) => {
                 tracing::warn!("validation history write timed out")
             }
             Ok(Err(_)) | Err(_) => {}
@@ -298,6 +332,13 @@ WHERE (scope_kind = ? AND updated_at < unixepoch() - ?)
     }
 }
 
+fn clear_write_warnings(error_warning: &AtomicBool, timeout_warning: &AtomicBool) -> (bool, bool) {
+    (
+        error_warning.swap(false, Ordering::Relaxed),
+        timeout_warning.swap(false, Ordering::Relaxed),
+    )
+}
+
 #[cfg(test)]
 fn install_lookup_before_cache_insert_hook(
     key: StoredKey,
@@ -341,15 +382,13 @@ fn keyed_identifier(secret: &[u8; 32], domain: &[u8], value: &[u8]) -> anyhow::R
 async fn load_or_create_key(codex_home: &Path) -> anyhow::Result<[u8; 32]> {
     let path = codex_home.join(KEY_FILE);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            return bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid key length"));
-        }
+        Ok(bytes) => return key_from_bytes(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     let secret = rand::random::<[u8; 32]>();
+    let temporary_path =
+        codex_home.join(format!(".{KEY_FILE}.{:032x}.tmp", rand::random::<u128>()));
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -357,27 +396,174 @@ async fn load_or_create_key(codex_home: &Path) -> anyhow::Result<[u8; 32]> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    match options.open(&path).await {
-        Ok(mut file) => {
-            use tokio::io::AsyncWriteExt;
-            file.write_all(&secret).await?;
-            file.sync_all().await?;
-            Ok(secret)
-        }
+    let mut file = options.open(&temporary_path).await?;
+    use tokio::io::AsyncWriteExt;
+    if let Err(error) = async {
+        file.write_all(&secret).await?;
+        file.sync_all().await
+    }
+    .await
+    {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(error.into());
+    }
+    drop(file);
+
+    let install_result = tokio::fs::hard_link(&temporary_path, &path).await;
+    let result = match install_result {
+        Ok(()) => Ok(secret),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let bytes = tokio::fs::read(path).await?;
-            bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid key length"))
+            key_from_bytes(bytes)
+        }
+        Err(error) if should_fallback_from_hard_link(error.kind()) => {
+            install_key_with_locked_rename(codex_home, &temporary_path, &path, secret).await
         }
         Err(error) => Err(error.into()),
-    }
+    };
+    let _ = tokio::fs::remove_file(&temporary_path).await;
+    result
+}
+
+fn key_from_bytes(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid key length"))
+}
+
+fn should_fallback_from_hard_link(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+async fn install_key_with_locked_rename(
+    codex_home: &Path,
+    temporary_path: &Path,
+    path: &Path,
+    secret: [u8; 32],
+) -> anyhow::Result<[u8; 32]> {
+    let lock_path = codex_home.join(KEY_LOCK_FILE);
+    let temporary_path = temporary_path.to_path_buf();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock_file = options
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        lock_file
+            .lock()
+            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+
+        match std::fs::read(&path) {
+            Ok(bytes) => return key_from_bytes(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::rename(&temporary_path, &path).with_context(|| {
+            format!(
+                "failed to atomically install {} as {}",
+                temporary_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(secret)
+    })
+    .await
+    .context("validation history key install task failed")?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn successful_write_clears_each_warning_class_for_future_failures() {
+        let error_warning = AtomicBool::new(true);
+        let timeout_warning = AtomicBool::new(true);
+
+        assert_eq!(
+            clear_write_warnings(&error_warning, &timeout_warning),
+            (true, true)
+        );
+        assert!(!error_warning.load(Ordering::Relaxed));
+        assert!(!timeout_warning.load(Ordering::Relaxed));
+        assert_eq!(
+            clear_write_warnings(&error_warning, &timeout_warning),
+            (false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_key_creation_never_exposes_a_partial_key() {
+        let codex_home = tempfile::tempdir().expect("temporary codex home");
+        let (left, right) = tokio::join!(
+            load_or_create_key(codex_home.path()),
+            load_or_create_key(codex_home.path())
+        );
+        let left = left.expect("left key");
+        let right = right.expect("right key");
+        assert_eq!(left, right);
+        assert_eq!(
+            tokio::fs::read(codex_home.path().join(KEY_FILE))
+                .await
+                .expect("installed key"),
+            left
+        );
+    }
+
+    #[test]
+    fn hard_link_portability_errors_use_the_locked_rename_fallback() {
+        assert!(should_fallback_from_hard_link(
+            std::io::ErrorKind::Unsupported
+        ));
+        assert!(should_fallback_from_hard_link(
+            std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!should_fallback_from_hard_link(
+            std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(!should_fallback_from_hard_link(std::io::ErrorKind::Other));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn locked_rename_fallback_installs_one_complete_key_concurrently() {
+        let codex_home = tempfile::tempdir().expect("temporary codex home");
+        let path = codex_home.path().join(KEY_FILE);
+        let left_temporary = codex_home.path().join("left-key.tmp");
+        let right_temporary = codex_home.path().join("right-key.tmp");
+        let left_secret = [1; 32];
+        let right_secret = [2; 32];
+        tokio::fs::write(&left_temporary, left_secret)
+            .await
+            .expect("write left temporary key");
+        tokio::fs::write(&right_temporary, right_secret)
+            .await
+            .expect("write right temporary key");
+
+        let (left, right) = tokio::join!(
+            install_key_with_locked_rename(codex_home.path(), &left_temporary, &path, left_secret,),
+            install_key_with_locked_rename(
+                codex_home.path(),
+                &right_temporary,
+                &path,
+                right_secret,
+            )
+        );
+        let left = left.expect("left fallback result");
+        let right = right.expect("right fallback result");
+
+        assert_eq!(left, right);
+        assert_eq!(tokio::fs::read(&path).await.expect("installed key"), left);
+    }
 
     fn history_key() -> ValidationHistoryKey<'static> {
         ValidationHistoryKey {

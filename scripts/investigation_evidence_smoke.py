@@ -569,23 +569,28 @@ def git_output(
     return completed.stdout
 
 
-def tracked_paths(
+def provider_source_paths(
     provider_root: Path,
     *,
     env: dict[str, str],
     redactor: Redactor,
 ) -> list[Path]:
-    output = git_output(provider_root, ["ls-files", "-z"], env=env, redactor=redactor)
+    output = git_output(
+        provider_root,
+        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        env=env,
+        redactor=redactor,
+    )
     paths: list[Path] = []
     for raw in output.split(b"\0"):
         if not raw:
             continue
         relative = Path(os.fsdecode(raw))
         if relative.is_absolute() or ".." in relative.parts:
-            raise SmokeFailure("provider Git index returned an unsafe tracked path")
+            raise SmokeFailure("provider Git manifest returned an unsafe source path")
         paths.append(relative)
     if not paths:
-        raise SmokeFailure("provider checkout has no tracked files")
+        raise SmokeFailure("provider checkout has no source files")
     return sorted(paths, key=lambda path: path.as_posix())
 
 
@@ -602,17 +607,9 @@ def source_fingerprint(
     env: dict[str, str],
     redactor: Redactor,
 ) -> str:
-    listed = git_output(
-        provider_root,
-        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-        env=env,
-        redactor=redactor,
-    )
     digest = hashlib.sha256()
-    for raw in sorted(item for item in listed.split(b"\0") if item):
-        relative = Path(os.fsdecode(raw))
-        if relative.is_absolute() or ".." in relative.parts:
-            raise SmokeFailure("provider fingerprint received an unsafe path")
+    for relative in provider_source_paths(provider_root, env=env, redactor=redactor):
+        raw = os.fsencode(relative)
         path = provider_root / relative
         digest.update(raw)
         digest.update(b"\0")
@@ -645,7 +642,7 @@ def stage_provider(
     redactor: Redactor,
 ) -> None:
     destination.mkdir(parents=True, exist_ok=False)
-    for relative in tracked_paths(provider_root, env=env, redactor=redactor):
+    for relative in provider_source_paths(provider_root, env=env, redactor=redactor):
         source = provider_root / relative
         if not source.exists():
             continue

@@ -1,6 +1,7 @@
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Notify;
@@ -387,22 +388,72 @@ impl Drop for PendingProcessRegistration {
             workspace_mutation.cancel_owner();
         }
         let cleanup = self.cleanup_payload();
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::error!(
-                process_id = self.process_id,
-                "cannot clean up cancelled unified exec startup without a Tokio runtime"
-            );
-            return;
-        };
         for pending_process in &cleanup.processes {
             pending_process.process.terminate();
         }
-        runtime.spawn(async move {
-            if let Err(error) = cleanup_pending_process_registration(cleanup).await {
-                tracing::error!(%error, "failed to clean up cancelled unified exec startup");
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = cleanup_pending_process_registration(cleanup).await {
+                    tracing::error!(%error, "failed to clean up cancelled unified exec startup");
+                }
+            });
+        } else if let Some(sender) = pending_process_cleanup_sender() {
+            if let Err(error) = sender.send(cleanup) {
+                tracing::error!(
+                    process_id = self.process_id,
+                    %error,
+                    "cannot enqueue cancelled unified exec startup cleanup"
+                );
             }
-        });
+        } else {
+            tracing::error!(
+                process_id = self.process_id,
+                "unified exec cleanup worker is unavailable"
+            );
+        }
     }
+}
+
+fn pending_process_cleanup_sender()
+-> Option<&'static std::sync::mpsc::Sender<PendingProcessCleanup>> {
+    static SENDER: OnceLock<Option<std::sync::mpsc::Sender<PendingProcessCleanup>>> =
+        OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(%error, "failed to build unified exec cleanup runtime");
+                    return None;
+                }
+            };
+            let (sender, receiver) = std::sync::mpsc::channel::<PendingProcessCleanup>();
+            match std::thread::Builder::new()
+                .name("codex-unified-exec-cleanup".to_string())
+                .spawn(move || {
+                    while let Ok(cleanup) = receiver.recv() {
+                        runtime.block_on(async move {
+                            if let Err(error) = cleanup_pending_process_registration(cleanup).await
+                            {
+                                tracing::error!(
+                                    %error,
+                                    "failed to clean up cancelled unified exec startup"
+                                );
+                            }
+                        });
+                    }
+                }) {
+                Ok(_handle) => Some(sender),
+                Err(error) => {
+                    tracing::error!(%error, "failed to spawn unified exec cleanup worker");
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 async fn cleanup_pending_process_registration(
@@ -411,14 +462,18 @@ async fn cleanup_pending_process_registration(
     if let Some(workspace_mutation) = cleanup.workspace_mutation.as_ref() {
         workspace_mutation.cancel_owner();
     }
+    let mut first_termination_error = None;
     for pending_process in &cleanup.processes {
-        if pending_process.requires_confirmed_termination {
-            pending_process
-                .process
-                .terminate_confirmed()
-                .await
-                .map_err(|error| format!("process termination was not confirmed: {error}"))?;
+        if pending_process.requires_confirmed_termination
+            && let Err(error) = pending_process.process.terminate_confirmed().await
+            && first_termination_error.is_none()
+        {
+            first_termination_error =
+                Some(format!("process termination was not confirmed: {error}"));
         }
+    }
+    if let Some(error) = first_termination_error {
+        return Err(error);
     }
 
     let (removed_entry, process_id_conflict) = {
@@ -864,7 +919,7 @@ impl UnifiedExecProcessManager {
         )
         .await;
         if !process_started_alive {
-            process.output_drained_notify().notified().await;
+            process.output_drained_token().cancelled().await;
         }
         drop(tool_execution_timing_guard);
         let wall_time = Instant::now().saturating_duration_since(start);

@@ -7,6 +7,7 @@
 //! `codex-core`.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
@@ -88,6 +89,8 @@ const MCP_UI_META_KEY: &str = "ui";
 const MCP_UI_VISIBILITY_META_KEY: &str = "visibility";
 const MCP_UI_MODEL_VISIBILITY: &str = "model";
 const MAX_MCP_SERVER_COLLECTION_ERROR_CHARS: usize = 240;
+const MAX_MCP_COLLECTION_PAGES: usize = 100;
+const MAX_MCP_COLLECTION_ITEMS: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpServerCollectionError {
@@ -188,31 +191,52 @@ async fn shutdown_clients_with_deadline<T, G, GFut, F, FFut>(
     FFut: Future<Output = ()> + Send + 'static,
 {
     let mut shutdowns = JoinSet::new();
+    let mut graceful_clients = HashMap::new();
     for client in &clients {
-        shutdowns.spawn(graceful_shutdown(client.clone()));
+        let abort_handle = shutdowns.spawn(graceful_shutdown(client.clone()));
+        graceful_clients.insert(abort_handle.id(), client.clone());
     }
 
-    let graceful = tokio::time::timeout(grace_period, async {
-        while let Some(result) = shutdowns.join_next().await {
-            if let Err(error) = result {
-                warn!("MCP client graceful shutdown failed: {error}");
+    let mut failed_clients = Vec::new();
+    let graceful_timed_out = tokio::time::timeout(grace_period, async {
+        while let Some(result) = shutdowns.join_next_with_id().await {
+            match result {
+                Ok((id, ())) => {
+                    graceful_clients.remove(&id);
+                }
+                Err(error) => {
+                    warn!("MCP client graceful shutdown failed: {error}");
+                    if let Some(client) = graceful_clients.remove(&error.id()) {
+                        failed_clients.push(client);
+                    }
+                }
             }
         }
     })
-    .await;
+    .await
+    .is_err();
 
-    if graceful.is_err() {
+    if graceful_timed_out {
         shutdowns.abort_all();
-        while shutdowns.join_next().await.is_some() {}
+        failed_clients.extend(graceful_clients.into_values());
+    }
 
+    if !failed_clients.is_empty() {
         let mut forced = JoinSet::new();
-        for client in clients {
+        for client in failed_clients {
             forced.spawn(force_shutdown(client));
         }
-        while let Some(result) = forced.join_next().await {
-            if let Err(error) = result {
-                warn!("MCP client forced shutdown failed: {error}");
+        let forced_result = tokio::time::timeout(grace_period, async {
+            while let Some(result) = forced.join_next().await {
+                if let Err(error) = result {
+                    warn!("MCP client forced shutdown failed: {error}");
+                }
             }
+        })
+        .await;
+        if forced_result.is_err() {
+            warn!("MCP client forced shutdown exceeded its deadline");
+            forced.abort_all();
         }
     }
 }
@@ -606,22 +630,40 @@ impl McpConnectionManager {
         let mut tools = Vec::new();
         let mut available_server_count = 0;
         let mut unavailable_server_count = 0;
+        let mut listings = JoinSet::new();
         for (server_name, managed_client) in &self.clients {
-            managed_client.reconnect_failed_startup().await;
-            let has_cached_tools = managed_client.has_cached_tools();
-            let startup_complete = managed_client
-                .startup_complete
-                .load(std::sync::atomic::Ordering::Acquire);
-            let Some(server_tools) = managed_client
-                .listed_tools()
-                .instrument(trace_span!(
-                    "list_tools_for_server",
-                    server_name = %server_name,
+            let server_name = server_name.clone();
+            let managed_client = managed_client.clone();
+            listings.spawn(async move {
+                managed_client.reconnect_failed_startup().await;
+                let has_cached_tools = managed_client.has_cached_tools();
+                let startup_complete = managed_client
+                    .startup_complete
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let server_tools = managed_client
+                    .listed_tools()
+                    .instrument(trace_span!(
+                        "list_tools_for_server",
+                        server_name = %server_name,
+                        has_cached_tools,
+                        startup_complete
+                    ))
+                    .await;
+                (
+                    server_name,
                     has_cached_tools,
-                    startup_complete
-                ))
-                .await
-            else {
+                    startup_complete,
+                    server_tools,
+                )
+            });
+        }
+        while let Some(result) = listings.join_next().await {
+            let Ok((server_name, has_cached_tools, startup_complete, server_tools)) = result else {
+                unavailable_server_count += 1;
+                warn!("MCP server tool listing task failed");
+                continue;
+            };
+            let Some(server_tools) = server_tools else {
                 unavailable_server_count += 1;
                 trace!(
                     server_name = %server_name,
@@ -762,8 +804,17 @@ impl McpConnectionManager {
             let abort_handle = join_set.spawn(async move {
                 let mut collected: Vec<Resource> = Vec::new();
                 let mut cursor: Option<String> = None;
+                let mut seen_cursors = HashSet::new();
+                let mut page_count = 0usize;
 
                 loop {
+                    page_count += 1;
+                    if page_count > MAX_MCP_COLLECTION_PAGES {
+                        return (
+                            server_name,
+                            Err(anyhow!("resources/list exceeded page limit")),
+                        );
+                    }
                     let params = cursor.as_ref().map(|next| {
                         PaginatedRequestParams::default().with_cursor(Some(next.clone()))
                     });
@@ -772,14 +823,22 @@ impl McpConnectionManager {
                         Err(err) => return (server_name, Err(err)),
                     };
 
+                    if collected.len().saturating_add(response.resources.len())
+                        > MAX_MCP_COLLECTION_ITEMS
+                    {
+                        return (
+                            server_name,
+                            Err(anyhow!("resources/list exceeded item limit")),
+                        );
+                    }
                     collected.extend(response.resources);
 
                     match response.next_cursor {
                         Some(next) => {
-                            if cursor.as_ref() == Some(&next) {
+                            if !seen_cursors.insert(next.clone()) {
                                 return (
                                     server_name,
-                                    Err(anyhow!("resources/list returned duplicate cursor")),
+                                    Err(anyhow!("resources/list returned a repeated cursor")),
                                 );
                             }
                             cursor = Some(next);
@@ -933,8 +992,17 @@ impl McpConnectionManager {
             let abort_handle = join_set.spawn(async move {
                 let mut collected: Vec<ResourceTemplate> = Vec::new();
                 let mut cursor: Option<String> = None;
+                let mut seen_cursors = HashSet::new();
+                let mut page_count = 0usize;
 
                 loop {
+                    page_count += 1;
+                    if page_count > MAX_MCP_COLLECTION_PAGES {
+                        return (
+                            server_name,
+                            Err(anyhow!("resources/templates/list exceeded page limit")),
+                        );
+                    }
                     let params = cursor.as_ref().map(|next| {
                         PaginatedRequestParams::default().with_cursor(Some(next.clone()))
                     });
@@ -943,15 +1011,25 @@ impl McpConnectionManager {
                         Err(err) => return (server_name, Err(err)),
                     };
 
+                    if collected
+                        .len()
+                        .saturating_add(response.resource_templates.len())
+                        > MAX_MCP_COLLECTION_ITEMS
+                    {
+                        return (
+                            server_name,
+                            Err(anyhow!("resources/templates/list exceeded item limit")),
+                        );
+                    }
                     collected.extend(response.resource_templates);
 
                     match response.next_cursor {
                         Some(next) => {
-                            if cursor.as_ref() == Some(&next) {
+                            if !seen_cursors.insert(next.clone()) {
                                 return (
                                     server_name,
                                     Err(anyhow!(
-                                        "resources/templates/list returned duplicate cursor"
+                                        "resources/templates/list returned a repeated cursor"
                                     )),
                                 );
                             }

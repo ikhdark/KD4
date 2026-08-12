@@ -241,6 +241,22 @@ impl ProcessHandle {
     pub fn terminate(&self) {
         self.request_terminate();
 
+        self.finish();
+    }
+
+    /// Releases a finished child without signalling it and aborts helper tasks.
+    ///
+    /// This is used after the root process has already exited. In particular,
+    /// pipe descendants may intentionally outlive the root while retaining an
+    /// inherited output handle, so waiting for the reader tasks to observe EOF
+    /// would retain the otherwise-finished process indefinitely.
+    pub fn finish(&self) {
+        self.close_stdin();
+
+        if let Ok(mut killer_opt) = self.killer.lock() {
+            killer_opt.take();
+        }
+
         if let Ok(mut h) = self.reader_handle.lock()
             && let Some(handle) = h.take()
         {
@@ -261,12 +277,76 @@ impl ProcessHandle {
         {
             handle.abort();
         }
+        if let Ok(mut handles) = self._pty_handles.lock() {
+            handles.take();
+        }
+        if let Ok(mut resizer) = self.resizer.lock() {
+            resizer.take();
+        }
     }
 }
 
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct TestTerminator {
+        dropped: Arc<AtomicBool>,
+        killed: Arc<AtomicBool>,
+    }
+
+    impl ChildTerminator for TestTerminator {
+        fn signal(&mut self, _signal: ProcessSignal) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Drop for TestTerminator {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_releases_terminator_without_killing_child() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicBool::new(false));
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let idle_task = || tokio::spawn(std::future::pending::<()>());
+        let handle = ProcessHandle::new(
+            writer_tx,
+            Box::new(TestTerminator {
+                dropped: Arc::clone(&dropped),
+                killed: Arc::clone(&killed),
+            }),
+            idle_task(),
+            Vec::new(),
+            idle_task(),
+            idle_task(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(StdMutex::new(Some(0))),
+            None,
+            None,
+        );
+
+        handle.finish();
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(!killed.load(Ordering::SeqCst));
+        assert!(handle.writer_sender().is_closed());
     }
 }
 

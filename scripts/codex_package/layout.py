@@ -88,6 +88,31 @@ def rmtree_supports_onexc() -> bool:
     return "onexc" in inspect.signature(shutil.rmtree).parameters
 
 
+def validate_package_input_roles(inputs: PackageInputs) -> None:
+    """Reject one executable being assigned to multiple package roles."""
+    role_paths = (
+        ("entrypoint", inputs.entrypoint_bin),
+        ("code-mode host", inputs.code_mode_host_bin),
+        ("ripgrep", inputs.rg_bin),
+        ("zsh", inputs.zsh_bin),
+        ("bwrap", inputs.bwrap_bin),
+        ("Windows command runner", inputs.codex_command_runner_bin),
+        ("Windows sandbox setup", inputs.codex_windows_sandbox_setup_bin),
+    )
+    resolved: list[tuple[str, Path]] = []
+    for role, path in role_paths:
+        if path is None:
+            continue
+        canonical = path.resolve(strict=True)
+        for prior_role, prior_path in resolved:
+            if canonical == prior_path or canonical.samefile(prior_path):
+                raise RuntimeError(
+                    f"Package roles must use distinct executables: {role} and "
+                    f"{prior_role} both resolve to {canonical}"
+                )
+        resolved.append((role, canonical))
+
+
 def build_package_dir(
     package_dir: Path,
     version: str,
@@ -95,6 +120,7 @@ def build_package_dir(
     spec: TargetSpec,
     inputs: PackageInputs,
 ) -> None:
+    validate_package_input_roles(inputs)
     bin_dir = package_dir / "bin"
     resources_dir = package_dir / "codex-resources"
     path_dir = package_dir / "codex-path"

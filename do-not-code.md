@@ -101,8 +101,9 @@ though the crate is security-sensitive.
 
 ## Complete top-level classification
 
-This inventory covers all 123 immediate entries observed under `codex-rs` at
-the time of the audit.
+This inventory covers checked-in immediate entries under `codex-rs`. Ignored
+build outputs and machine-local directories are not enumerated; they remain
+workflow-managed regardless of their local names.
 
 ### Protected - exact upstream mirror
 
@@ -115,12 +116,6 @@ the time of the audit.
 
 - `codex-rs/Cargo.lock`
 - `codex-rs/target/`
-- `codex-rs/target-compact-activity-a/`
-- `codex-rs/target-compact-activity-b-dev/`
-- `codex-rs/target-compact-activity-b-final/`
-- `codex-rs/target-compact-activity-dev/`
-- `codex-rs/target-kd4-workspace-reliability/`
-- `codex-rs/target-token-budget-agent/`
 
 ### Mixed
 
@@ -239,7 +234,11 @@ the time of the audit.
 - `codex-rs/windows-sandbox-rs/`
 - `codex-rs/workspace-coordinator/`
 
-## Upstream synchronization and validation record
+## Historical upstream synchronization record (2026-08-12)
+
+This section is frozen evidence for the synchronization described below, not a
+claim about the current checkout. New synchronization evidence belongs in a
+dated audit artifact rather than in the current classification above.
 
 Completed against OpenAI Codex `main` commit
 [`646f7c0a91b8e327d263335da68ae8ef212895ce`](https://github.com/openai/codex/tree/646f7c0a91b8e327d263335da68ae8ef212895ce/codex-rs).

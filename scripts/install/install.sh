@@ -29,6 +29,7 @@ release_json_cache=""
 release_json_version=""
 resolved_version_result=""
 visible_command_preverified="false"
+download_pids=""
 
 step() {
   printf '==> %s\n' "$1"
@@ -168,10 +169,28 @@ wait_for_download() {
   pid="$1"
   asset="$2"
 
+  remaining_pids=""
+  for active_pid in $download_pids; do
+    if [ "$active_pid" != "$pid" ]; then
+      remaining_pids="$remaining_pids $active_pid"
+    fi
+  done
+  download_pids="$remaining_pids"
   if ! wait "$pid"; then
     echo "Failed to download $asset." >&2
-    exit 1
+    cancel_downloads
+    return 1
   fi
+}
+
+cancel_downloads() {
+  for pid in $download_pids; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in $download_pids; do
+    wait "$pid" 2>/dev/null || true
+  done
+  download_pids=""
 }
 
 require_command() {
@@ -365,7 +384,11 @@ acquire_install_lock() {
 
   if command -v flock >/dev/null 2>&1; then
     exec 9>"$LOCK_FILE"
-    flock 9
+    if ! flock -w "$LOCK_WAIT_SECS" 9; then
+      echo "Timed out waiting for the Codex install lock at $LOCK_FILE." >&2
+      exec 9>&-
+      return 1
+    fi
     lock_kind="flock"
     return
   fi
@@ -425,23 +448,13 @@ remove_matching_children() {
   kind="$3"
 
   [ -d "$directory" ] || return 0
-  found="false"
   for path in "$directory"/$pattern; do
-    if [ -e "$path" ] || [ -L "$path" ]; then
-      found="true"
-      break
-    fi
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    case "$kind" in
+      directory) rm -rf "$path" ;;
+      *) rm -f "$path" ;;
+    esac
   done
-  [ "$found" = "true" ] || return 0
-
-  case "$kind" in
-    directory)
-      find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" -exec rm -rf {} +
-      ;;
-    *)
-      find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" -exec rm -f {} +
-      ;;
-  esac
 }
 
 replace_path_with_symlink() {
@@ -471,7 +484,12 @@ version_from_binary() {
     return 1
   fi
 
-  "$codex_path" --version 2>/dev/null | sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1
+  if ! version_output="$("$codex_path" --version 2>/dev/null)"; then
+    return 1
+  fi
+  printf '%s\n' "$version_output" |
+    sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' |
+    sed -n '1p'
 }
 
 current_installed_version() {
@@ -897,6 +915,68 @@ update_visible_command() {
   replace_path_with_symlink "$BIN_PATH" "$CURRENT_LINK/$codex_relative_path" "$tmp_link"
 }
 
+backup_activation_path() {
+  activation_path="$1"
+  activation_backup="$2"
+  activation_path_existed="false"
+
+  rm -rf "$activation_backup"
+  if [ -e "$activation_path" ] || [ -L "$activation_path" ]; then
+    mv "$activation_path" "$activation_backup"
+    activation_path_existed="true"
+  fi
+}
+
+restore_activation_path() {
+  activation_path="$1"
+  activation_backup="$2"
+  activation_had_backup="$3"
+
+  if [ -e "$activation_path" ] || [ -L "$activation_path" ]; then
+    rm -rf "$activation_path"
+  fi
+  if [ "$activation_had_backup" = "true" ]; then
+    mv "$activation_backup" "$activation_path"
+  fi
+}
+
+activate_install_links() {
+  release_dir="$1"
+  current_backup="$STANDALONE_ROOT/.current.backup.$$"
+  visible_backup="$BIN_DIR/.codex.backup.$$"
+  current_had_backup="false"
+  visible_had_backup="false"
+
+  if [ -e "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
+    echo "Refusing to replace non-symlink current install path: $CURRENT_LINK" >&2
+    return 1
+  fi
+
+  backup_activation_path "$CURRENT_LINK" "$current_backup" || return 1
+  current_had_backup="$activation_path_existed"
+  if ! update_current_link "$release_dir"; then
+    restore_activation_path "$CURRENT_LINK" "$current_backup" "$current_had_backup"
+    return 1
+  fi
+
+  if ! mkdir -p "$BIN_DIR"; then
+    restore_activation_path "$CURRENT_LINK" "$current_backup" "$current_had_backup"
+    return 1
+  fi
+  backup_activation_path "$BIN_PATH" "$visible_backup" || {
+    restore_activation_path "$CURRENT_LINK" "$current_backup" "$current_had_backup"
+    return 1
+  }
+  visible_had_backup="$activation_path_existed"
+  if ! update_visible_command "$release_dir" || ! verify_visible_command; then
+    restore_activation_path "$BIN_PATH" "$visible_backup" "$visible_had_backup"
+    restore_activation_path "$CURRENT_LINK" "$current_backup" "$current_had_backup"
+    return 1
+  fi
+
+  rm -rf "$current_backup" "$visible_backup"
+}
+
 verify_visible_command() {
   "$BIN_PATH" --version >/dev/null
 }
@@ -1007,6 +1087,7 @@ detect_conflicting_install
 
 tmp_dir="$(mktemp -d)"
 cleanup() {
+  cancel_downloads
   release_install_lock
   if [ -n "$tmp_dir" ]; then
     rm -rf "$tmp_dir"
@@ -1031,8 +1112,10 @@ if ! release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target"
     ensure_downloader
     download_file "$checksum_url" "$checksum_path" &
     checksum_download_pid="$!"
+    download_pids="$download_pids $checksum_download_pid"
     download_file "$download_url" "$archive_path" &
     archive_download_pid="$!"
+    download_pids="$download_pids $archive_download_pid"
     wait_for_download "$checksum_download_pid" "$checksum_asset"
     verify_archive_digest "$checksum_path" "$checksum_digest"
     expected_digest="$(package_archive_digest "$asset" "$checksum_path")"
@@ -1041,6 +1124,7 @@ if ! release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target"
     expected_digest="$(release_asset_digest "$asset" "$resolved_version")"
     download_file "$download_url" "$archive_path" &
     archive_download_pid="$!"
+    download_pids="$download_pids $archive_download_pid"
     wait_for_download "$archive_download_pid" "$asset"
   fi
   verify_archive_digest "$archive_path" "$expected_digest"
@@ -1051,11 +1135,16 @@ if ! release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target"
   else
     install_legacy_platform_npm_release "$release_dir" "$archive_path" "$vendor_target" "$resolved_version" "$install_layout"
   fi
+  if ! release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target" "$install_layout"; then
+    echo "Installed Codex release failed the completeness check: $release_dir" >&2
+    exit 1
+  fi
 fi
-update_current_link "$release_dir"
-update_visible_command "$release_dir"
+if ! activate_install_links "$release_dir"; then
+  echo "Failed to activate Codex; the previous command links were restored." >&2
+  exit 1
+fi
 add_to_path
-verify_visible_command
 release_install_lock
 handle_conflicting_install
 

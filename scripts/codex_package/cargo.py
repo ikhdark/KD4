@@ -108,6 +108,7 @@ def build_source_binaries(
         profile=profile,
         reuse_existing=reuse_existing,
         force_rebuild=force_rebuild,
+        cargo=cargo,
     )
     if requested_binaries and not binaries:
         print(
@@ -135,6 +136,7 @@ def build_source_binaries(
             profile=profile,
             variant=variant,
             outputs=outputs,
+            cargo=cargo,
         )
     return outputs
 
@@ -248,21 +250,34 @@ def validate_explicit_output_paths(
     codex_windows_sandbox_setup_bin: Path | None,
 ) -> None:
     explicit_paths = [
-        ("prebuilt entrypoint executable", entrypoint_bin),
-        ("prebuilt code-mode host executable", code_mode_host_bin),
-        ("prebuilt Linux bwrap executable", bwrap_bin),
+        ("--entrypoint-bin", "prebuilt entrypoint executable", entrypoint_bin),
+        ("--code-mode-host-bin", "prebuilt code-mode host executable", code_mode_host_bin),
+        ("--bwrap-bin", "prebuilt Linux bwrap executable", bwrap_bin),
         (
+            "--codex-command-runner-bin",
             "prebuilt Windows codex-command-runner.exe executable",
             codex_command_runner_bin,
         ),
         (
+            "--codex-windows-sandbox-setup-bin",
             "prebuilt Windows codex-windows-sandbox-setup.exe executable",
             codex_windows_sandbox_setup_bin,
         ),
     ]
-    for description, path in explicit_paths:
+    resolved: list[tuple[str, Path]] = []
+    for flag, description, path in explicit_paths:
         if path is not None and not path.is_file():
             raise RuntimeError(f"{description} does not exist: {path}")
+        if path is None:
+            continue
+        canonical = path.resolve(strict=True)
+        for prior_flag, prior_path in resolved:
+            if canonical == prior_path or canonical.samefile(prior_path):
+                raise RuntimeError(
+                    f"{flag} and {prior_flag} must refer to distinct executables; "
+                    f"both resolve to {canonical}"
+                )
+        resolved.append((flag, canonical))
 
 
 def resolve_output_path(
@@ -421,6 +436,7 @@ def binaries_missing_for_reuse(
     profile: str,
     reuse_existing: bool,
     force_rebuild: bool,
+    cargo: str = "cargo",
 ) -> list[str]:
     if force_rebuild or not reuse_existing:
         return binaries
@@ -431,6 +447,7 @@ def binaries_missing_for_reuse(
         spec=spec,
         profile=profile,
         variant=variant,
+        cargo=cargo,
     ):
         return binaries
 
@@ -520,9 +537,10 @@ def read_source_build_stamp(target_dir: Path) -> dict | None:
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        stamp = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    return stamp if isinstance(stamp, dict) else None
 
 
 def write_source_build_stamp(
@@ -532,11 +550,15 @@ def write_source_build_stamp(
     profile: str,
     variant: PackageVariant,
     outputs: SourceBuildOutputs,
+    cargo: str = "cargo",
 ) -> None:
     stamp = {
         "target": spec.target,
         "profile": profile,
         "variant": variant.name,
+        "build_recipe": build_recipe_fingerprint(
+            spec=spec, profile=profile, cargo=cargo
+        ),
         "source": source_tree_fingerprint(),
         "outputs": source_output_fingerprints(outputs),
     }
@@ -554,6 +576,7 @@ def source_build_stamp_matches(
     profile: str,
     variant: PackageVariant,
     outputs: SourceBuildOutputs,
+    cargo: str = "cargo",
 ) -> bool:
     stamp = read_source_build_stamp(target_dir)
     if stamp is None:
@@ -564,6 +587,7 @@ def source_build_stamp_matches(
         spec=spec,
         profile=profile,
         variant=variant,
+        cargo=cargo,
     ):
         return False
 
@@ -579,12 +603,96 @@ def source_build_stamp_metadata_matches(
     spec: TargetSpec,
     profile: str,
     variant: PackageVariant,
+    cargo: str = "cargo",
 ) -> bool:
     return (
         stamp.get("target") == spec.target
         and stamp.get("profile") == profile
         and stamp.get("variant") == variant.name
+        and stamp.get("build_recipe")
+        == build_recipe_fingerprint(spec=spec, profile=profile, cargo=cargo)
     )
+
+
+def build_recipe_fingerprint(
+    *, spec: TargetSpec, profile: str, cargo: str = "cargo"
+) -> dict[str, object]:
+    """Capture toolchain and environment inputs that can change Cargo output."""
+    rustc = os.environ.get("RUSTC", "rustc")
+    environment_names = {
+        name
+        for name in os.environ
+        if name.startswith("CARGO_PROFILE_")
+        or name.startswith("CARGO_TARGET_")
+        or "V8" in name
+    }
+    environment_names.update(
+        {
+            "AR",
+            "CARGO",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CC",
+            "CXX",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTFLAGS",
+        }
+    )
+    environment: dict[str, object] = {}
+    for name in sorted(environment_names):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        candidate = Path(value).expanduser()
+        environment[name] = (
+            source_output_fingerprint(candidate) if candidate.is_file() else value
+        )
+
+    return {
+        "target": spec.target,
+        "profile": profile,
+        "cargo": command_identity(cargo, "--version", "--verbose"),
+        "rustc": command_identity(rustc, "-Vv"),
+        "environment": environment,
+        "profile_config": files_fingerprint(
+            (
+                REPO_ROOT / "Cargo.toml",
+                REPO_ROOT / "codex-rs" / "Cargo.toml",
+                REPO_ROOT / ".cargo" / "config",
+                REPO_ROOT / ".cargo" / "config.toml",
+                REPO_ROOT / "codex-rs" / ".cargo" / "config",
+                REPO_ROOT / "codex-rs" / ".cargo" / "config.toml",
+            )
+        ),
+    }
+
+
+def command_identity(command: str, *args: str) -> dict[str, object]:
+    executable = shutil.which(command) or command
+    try:
+        completed = subprocess.run(
+            [executable, *args],
+            check=True,
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        return {"path": executable, "status": "unavailable", "error": str(error)}
+    return {
+        "path": str(Path(executable).resolve()),
+        "version": completed.stdout.strip(),
+    }
+
+
+def files_fingerprint(paths: tuple[Path, ...]) -> dict[str, object]:
+    return {
+        str(path.relative_to(REPO_ROOT)): source_output_fingerprint(path)
+        for path in paths
+        if path.is_file()
+    }
 
 
 def source_build_stamp_source_matches(stamp: dict) -> bool:
@@ -702,15 +810,4 @@ def source_output_matches_fingerprint(path: Path | None, fingerprint: object) ->
         return fingerprint is None
     if not isinstance(fingerprint, dict) or not path.is_file():
         return False
-    try:
-        stat = path.stat()
-    except OSError:
-        return False
-    if (
-        fingerprint.get("path") == str(path)
-        and fingerprint.get("size") == stat.st_size
-        and fingerprint.get("mtime_ns") == stat.st_mtime_ns
-        and isinstance(fingerprint.get("sha256"), str)
-    ):
-        return True
     return fingerprint == source_output_fingerprint(path)

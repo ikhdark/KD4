@@ -120,6 +120,12 @@ class CopyFileForStagingTest(unittest.TestCase):
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
+            for path in (
+                inputs.entrypoint_bin,
+                inputs.code_mode_host_bin,
+                inputs.rg_bin,
+            ):
+                path.write_text("bin", encoding="utf-8")
 
             with mock.patch.object(layout, "copy_executable") as copy_executable:
                 layout.build_package_dir(

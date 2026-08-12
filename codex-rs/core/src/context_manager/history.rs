@@ -372,7 +372,6 @@ impl ContextManager {
         let snapshot = self.items.clone();
         let user_positions = user_message_positions(&snapshot);
         let Some(&first_instruction_turn_idx) = user_positions.first() else {
-            self.replace(Arc::unwrap_or_clone(snapshot));
             return;
         };
 

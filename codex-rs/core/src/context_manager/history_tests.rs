@@ -1255,6 +1255,18 @@ fn drop_last_n_user_turns_preserves_prefix() {
 }
 
 #[test]
+fn drop_last_n_user_turns_without_user_turns_is_a_true_noop() {
+    let items = vec![assistant_msg("session prefix item")];
+    let mut history = create_history_with_items(items.clone());
+    let previous_history_version = history.history_version();
+
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    assert_eq!(history.raw_items(), items);
+    assert_eq!(history.history_version(), previous_history_version);
+}
+
+#[test]
 fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
     let items = vec![
         user_input_text_msg("<environment_context>ctx</environment_context>"),
