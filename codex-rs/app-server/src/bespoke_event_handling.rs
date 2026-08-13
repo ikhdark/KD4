@@ -3688,6 +3688,7 @@ mod tests {
                     generated_artifacts: Vec::new(),
                     risks: Vec::new(),
                     requires_desktop_activation: false,
+                    validation_route: None,
                 },
                 PlanItemArg {
                     id: Some("second".to_string()),
@@ -3699,6 +3700,7 @@ mod tests {
                     generated_artifacts: Vec::new(),
                     risks: Vec::new(),
                     requires_desktop_activation: false,
+                    validation_route: None,
                 },
             ],
         };

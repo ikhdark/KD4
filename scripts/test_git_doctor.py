@@ -15,6 +15,17 @@ def completed(returncode: int, *, stdout: str = "", stderr: str = ""):
 
 
 class GitDoctorTest(unittest.TestCase):
+    def test_repository_root_probe_failure_is_fatal(self) -> None:
+        with mock.patch.object(
+            git_doctor,
+            "run_git",
+            return_value=completed(128, stderr="fatal: not a git repository\n"),
+        ):
+            with self.assertRaisesRegex(
+                git_doctor.RepositoryProbeError, "not a git repository"
+            ):
+                git_doctor.build_report(1.0)
+
     def test_nonzero_status_is_reported_and_main_fails(self) -> None:
         def run_git(args, *, timeout=5.0):
             del timeout
@@ -63,9 +74,7 @@ class GitDoctorTest(unittest.TestCase):
                 self.assertFalse(
                     any(
                         "untracked cache" in item
-                        for item in git_doctor.recommendations(
-                            "linux", "true", value
-                        )
+                        for item in git_doctor.recommendations("linux", "true", value)
                     )
                 )
         for value in ("false", "no", "off", "0", None, "invalid"):
@@ -74,9 +83,7 @@ class GitDoctorTest(unittest.TestCase):
                 self.assertTrue(
                     any(
                         "untracked cache" in item
-                        for item in git_doctor.recommendations(
-                            "linux", "true", value
-                        )
+                        for item in git_doctor.recommendations("linux", "true", value)
                     )
                 )
 

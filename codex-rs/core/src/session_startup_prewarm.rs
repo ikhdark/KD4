@@ -31,7 +31,6 @@ use codex_protocol::models::BaseInstructions;
 pub(crate) struct SessionStartupPrewarmHandle {
     task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
     started_at: Instant,
-    timeout: Duration,
 }
 
 pub(crate) struct SessionStartupTransportHandle {
@@ -56,12 +55,10 @@ impl SessionStartupPrewarmHandle {
     pub(crate) fn new(
         task: JoinHandle<CodexResult<ModelClientSession>>,
         started_at: Instant,
-        timeout: Duration,
     ) -> Self {
         Self {
             task: AbortOnDropHandle::new(task),
             started_at,
-            timeout,
         }
     }
 
@@ -71,7 +68,7 @@ impl SessionStartupPrewarmHandle {
     }
 
     #[instrument(name = "startup_prewarm.resolve", level = "trace", skip_all)]
-    async fn resolve(
+    pub(crate) async fn resolve(
         self,
         session_telemetry: &SessionTelemetry,
         startup_timing: &Arc<StartupTimingState>,
@@ -79,49 +76,41 @@ impl SessionStartupPrewarmHandle {
     ) -> SessionStartupPrewarmResolution {
         let _startup_wait = startup_timing.begin_phase(StartupPhase::FirstTurnPrewarmWait);
         let resolve_started_at = Instant::now();
-        let Self {
-            mut task,
-            started_at,
-            timeout,
-        } = self;
+        let Self { task, started_at } = self;
         let age_at_first_turn = started_at.elapsed();
-        let remaining = timeout.saturating_sub(age_at_first_turn);
 
-        let resolution = if task.is_finished() {
+        let resolution = if cancellation_token.is_cancelled() {
+            task.abort();
+            let _ = task.await;
+            session_telemetry.record_startup_phase(
+                "startup_prewarm_resolve",
+                resolve_started_at.elapsed(),
+                Some("cancelled"),
+            );
+            session_telemetry.record_duration(
+                STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC,
+                age_at_first_turn,
+                &[("status", "cancelled")],
+            );
+            session_telemetry.record_duration(
+                STARTUP_PREWARM_DURATION_METRIC,
+                started_at.elapsed(),
+                &[("status", "cancelled")],
+            );
+            return SessionStartupPrewarmResolution::Cancelled;
+        } else if task.is_finished() {
             Self::resolution_from_join_result(task.await, started_at)
         } else {
-            match tokio::select! {
-                _ = cancellation_token.cancelled() => None,
-                result = tokio::time::timeout(remaining, &mut task) => Some(result),
-            } {
-                Some(Ok(result)) => Self::resolution_from_join_result(result, started_at),
-                Some(Err(_elapsed)) => {
-                    task.abort();
-                    info!("startup websocket prewarm timed out before the first turn could use it");
-                    SessionStartupPrewarmResolution::Unavailable {
-                        status: "timed_out",
-                        prewarm_duration: Some(started_at.elapsed()),
-                    }
-                }
-                None => {
-                    task.abort();
-                    session_telemetry.record_startup_phase(
-                        "startup_prewarm_resolve",
-                        resolve_started_at.elapsed(),
-                        Some("cancelled"),
-                    );
-                    session_telemetry.record_duration(
-                        STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC,
-                        age_at_first_turn,
-                        &[("status", "cancelled")],
-                    );
-                    session_telemetry.record_duration(
-                        STARTUP_PREWARM_DURATION_METRIC,
-                        started_at.elapsed(),
-                        &[("status", "cancelled")],
-                    );
-                    return SessionStartupPrewarmResolution::Cancelled;
-                }
+            // The regular turn owns the transport once it starts. Revoke the speculative
+            // task without joining it so first-send preparation can continue immediately.
+            // Startup sessions are non-publishing by construction, so dropping the result handle
+            // also prevents the losing transport from entering the shared cache.
+            task.abort();
+            drop(task);
+            info!("startup websocket prewarm was not ready when the first turn started");
+            SessionStartupPrewarmResolution::Unavailable {
+                status: "not_ready",
+                prewarm_duration: Some(started_at.elapsed()),
             }
         };
         let status = match &resolution {
@@ -255,7 +244,7 @@ impl Session {
         );
         let task = tokio::spawn(async move {
             let _preconnect = startup_timing.begin_phase(StartupPhase::TransportPreconnect);
-            let mut client_session = model_client.new_session();
+            let mut client_session = model_client.new_speculative_session();
             let result = client_session
                 .preconnect_websocket(&session_telemetry, &responses_metadata)
                 .await;
@@ -282,7 +271,6 @@ impl Session {
         }
 
         let session_telemetry = self.services.session_telemetry.clone();
-        let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
         let startup_transport = self.take_session_startup_transport().await;
@@ -324,11 +312,11 @@ impl Session {
         self.set_session_startup_prewarm(SessionStartupPrewarmHandle::new(
             startup_prewarm,
             started_at,
-            websocket_connect_timeout,
         ))
         .await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn consume_startup_prewarm_for_regular_turn(
         &self,
         cancellation_token: &CancellationToken,
@@ -388,6 +376,7 @@ async fn schedule_startup_prewarm_inner(
     let startup_router = built_tools(
         session.as_ref(),
         step_context.as_ref(),
+        &[],
         &startup_cancellation_token,
     )
     .await?;
@@ -418,8 +407,8 @@ async fn schedule_startup_prewarm_inner(
             window_id,
             CodexResponsesRequestKind::Prewarm,
         );
-    let mut client_session =
-        preconnected_session.unwrap_or_else(|| session.services.model_client.new_session());
+    let mut client_session = preconnected_session
+        .unwrap_or_else(|| session.services.model_client.new_speculative_session());
     let websocket_warmup_started_at = Instant::now();
     drop(_preparation);
     let _prewarm_request = session

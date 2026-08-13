@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -14,21 +16,70 @@ use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::WorkspaceMutationLease;
 use codex_agent_task_store::WorkspaceMutationRequest;
+use codex_protocol::plan_tool::ValidationRoute;
+use codex_protocol::validation::ValidationFreshness;
+use codex_protocol::validation::ValidationProofKey;
+use codex_protocol::validation::ValidationResult;
+use codex_protocol::validation::ValidationTerminalStatus;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedMutexGuard;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use crate::git_workspace::GitWorkspaceCache;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::validation_admission::ValidationLaunchPlan;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
+const MAX_COMPLETED_VALIDATION_PROOFS: usize = 128;
 const WORKSPACE_MUTATION_RETRY_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(250);
 const WORKSPACE_MUTATION_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const WORKSPACE_MUTATION_FINALIZATION_MAX_WAIT: std::time::Duration =
     std::time::Duration::from_secs(10);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceMutationScope {
+    None,
+    ExactPaths(Vec<String>),
+    Repository,
+}
+
+impl WorkspaceMutationScope {
+    pub(crate) fn for_shell(
+        typed_binding: bool,
+        independent_review: bool,
+        inspection_command: bool,
+        intercepted_apply_patch: bool,
+        admitted_nonmutating_validation: bool,
+    ) -> Self {
+        if typed_binding
+            || independent_review
+            || inspection_command
+            || intercepted_apply_patch
+            || admitted_nonmutating_validation
+        {
+            Self::None
+        } else {
+            Self::Repository
+        }
+    }
+
+    pub(crate) fn exact_paths(paths: Vec<String>) -> Self {
+        Self::ExactPaths(paths)
+    }
+
+    pub(crate) fn into_paths(self) -> Option<Vec<String>> {
+        match self {
+            Self::None => None,
+            Self::ExactPaths(paths) => Some(paths),
+            Self::Repository => Some(vec![
+                codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string(),
+            ]),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CommandAttemptKey {
@@ -99,6 +150,7 @@ impl CommandAttemptKey {
         self.with_context_fingerprint("repository_epoch", &epoch)
     }
 
+    #[cfg(test)]
     pub(crate) fn fingerprint(&self) -> String {
         format!("{:016x}", fingerprint_value(self))
     }
@@ -179,6 +231,7 @@ struct AttemptEntry {
     consecutive_failures: u8,
     last_exit_code: Option<i32>,
     deterministic_failure: Option<DeterministicFailureRecord>,
+    last_diagnosis_identity: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +243,35 @@ pub(crate) struct RunningCommand {
     workspace_mutation: Option<RunningWorkspaceMutation>,
     validation_launch: Option<ValidationLaunchPlan>,
     started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BoundAutoValidationLeaf {
+    pub(crate) step_id: String,
+    pub(crate) implementation_revision: u64,
+    pub(crate) implementation_identity: String,
+    pub(crate) repository: PathBuf,
+    pub(crate) route: ValidationRoute,
+    pub(crate) leaf_index: usize,
+}
+
+impl BoundAutoValidationLeaf {
+    pub(crate) fn leaf(&self) -> Option<&codex_protocol::plan_tool::ValidationRouteLeaf> {
+        self.route.leaves.get(self.leaf_index)
+    }
+
+    pub(crate) fn leaf_route(&self) -> Option<ValidationRoute> {
+        self.leaf().cloned().map(|leaf| ValidationRoute {
+            leaves: vec![leaf],
+            ordering: self.route.ordering,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompletedValidationProof {
+    result: ValidationResult,
+    artifact: RawOutputArtifact,
 }
 
 #[derive(Clone)]
@@ -212,10 +294,12 @@ pub(crate) struct WorkspaceMutationGuard {
     repo_root: PathBuf,
     lease: WorkspaceMutationLease,
     finalized: bool,
+    git_workspace_cache: Option<Arc<GitWorkspaceCache>>,
     _reservation: WorkspaceMutationReservation,
 }
 
 impl WorkspaceMutationGuard {
+    #[cfg(test)]
     pub(crate) fn new(
         store: Arc<dyn AgentTaskStore>,
         repo_root: PathBuf,
@@ -227,6 +311,24 @@ impl WorkspaceMutationGuard {
             repo_root,
             lease,
             finalized: false,
+            git_workspace_cache: None,
+            _reservation: reservation,
+        }
+    }
+
+    pub(crate) fn new_with_cache(
+        store: Arc<dyn AgentTaskStore>,
+        repo_root: PathBuf,
+        lease: WorkspaceMutationLease,
+        reservation: WorkspaceMutationReservation,
+        git_workspace_cache: Arc<GitWorkspaceCache>,
+    ) -> Self {
+        Self {
+            store,
+            repo_root,
+            lease,
+            finalized: false,
+            git_workspace_cache: Some(git_workspace_cache),
             _reservation: reservation,
         }
     }
@@ -244,9 +346,13 @@ impl WorkspaceMutationGuard {
     }
 
     pub(crate) async fn finish(mut self) -> Result<(), StoreError> {
-        self.store
-            .finish_workspace_mutation(&self.repo_root, self.lease.clone())
-            .await?;
+        finish_workspace_mutation_and_seed(
+            self.store.as_ref(),
+            &self.repo_root,
+            self.lease.clone(),
+            self.git_workspace_cache.as_deref(),
+        )
+        .await?;
         self.finalized = true;
         Ok(())
     }
@@ -264,6 +370,7 @@ impl Drop for WorkspaceMutationGuard {
             store,
             repo_root,
             lease,
+            git_workspace_cache: self.git_workspace_cache.clone(),
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(finalize_dropped_workspace_mutation(cleanup));
@@ -277,13 +384,17 @@ struct DroppedWorkspaceMutationCleanup {
     store: Arc<dyn AgentTaskStore>,
     repo_root: PathBuf,
     lease: WorkspaceMutationLease,
+    git_workspace_cache: Option<Arc<GitWorkspaceCache>>,
 }
 
 async fn finalize_dropped_workspace_mutation(cleanup: DroppedWorkspaceMutationCleanup) {
-    if let Err(error) = cleanup
-        .store
-        .finish_workspace_mutation(&cleanup.repo_root, cleanup.lease)
-        .await
+    if let Err(error) = finish_workspace_mutation_and_seed(
+        cleanup.store.as_ref(),
+        &cleanup.repo_root,
+        cleanup.lease,
+        cleanup.git_workspace_cache.as_deref(),
+    )
+    .await
     {
         tracing::error!(%error, "failed to finalize a dropped workspace mutation");
     }
@@ -335,6 +446,7 @@ pub(crate) enum WorkspaceMutationAcquireError {
     Store(StoreError),
 }
 
+#[cfg(test)]
 pub(crate) async fn acquire_workspace_mutation_lease(
     store: &dyn AgentTaskStore,
     repo_root: &Path,
@@ -351,6 +463,95 @@ pub(crate) async fn acquire_workspace_mutation_lease(
     .await
 }
 
+pub(crate) async fn acquire_workspace_mutation_lease_cached(
+    store: &dyn AgentTaskStore,
+    git_workspace_cache: &GitWorkspaceCache,
+    repo_root: &Path,
+    request: &WorkspaceMutationRequest,
+    cancellation: &CancellationToken,
+) -> Result<WorkspaceMutationLease, WorkspaceMutationAcquireError> {
+    let deadline = tokio::time::Instant::now() + WORKSPACE_MUTATION_MAX_WAIT;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(WorkspaceMutationAcquireError::Cancelled);
+        }
+        let prepared = git_workspace_cache
+            .prepare_repository_manifest(store, repo_root)
+            .await
+            .map_err(WorkspaceMutationAcquireError::Store)?;
+        let lease = if let Some(prepared) = prepared {
+            store
+                .begin_workspace_mutation_prepared(repo_root, request.clone(), prepared)
+                .await
+        } else {
+            store
+                .begin_workspace_mutation(repo_root, request.clone())
+                .await
+        };
+
+        match lease {
+            Ok(lease) => return Ok(lease),
+            Err(StoreError::WorkspaceClaimConflict { details }) => {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(WorkspaceMutationAcquireError::Cancelled);
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err(WorkspaceMutationAcquireError::TimedOut { details });
+                    }
+                    _ = tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL) => {}
+                }
+            }
+            Err(StoreError::WorkspaceCasMismatch { .. }) => {
+                // The next iteration performs one fresh preparation because the
+                // narrow workspace epoch no longer matches the cached receipt.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(WorkspaceMutationAcquireError::TimedOut {
+                        details: vec![
+                            "workspace manifest remained stale during admission".to_string(),
+                        ],
+                    });
+                }
+            }
+            Err(error) => return Err(WorkspaceMutationAcquireError::Store(error)),
+        }
+    }
+}
+
+async fn finish_workspace_mutation_and_seed(
+    store: &dyn AgentTaskStore,
+    repo_root: &Path,
+    lease: WorkspaceMutationLease,
+    git_workspace_cache: Option<&GitWorkspaceCache>,
+) -> Result<(), StoreError> {
+    let Some(cache) = git_workspace_cache else {
+        store.finish_workspace_mutation(repo_root, lease).await?;
+        return Ok(());
+    };
+    let finalization_guard = cache
+        .begin_repository_manifest_finalization(repo_root)
+        .await;
+    let outcome = store
+        .finish_workspace_mutation_with_receipt(repo_root, lease)
+        .await?;
+    cache.record_final_manifest_work(outcome.work());
+    cache.note_host_workspace_mutation();
+    if let (Some(prepared), Some(finalization_guard)) =
+        (outcome.final_manifest(), finalization_guard)
+    {
+        cache
+            .publish_final_repository_manifest(
+                store,
+                repo_root,
+                prepared.clone(),
+                finalization_guard,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 async fn acquire_workspace_mutation_lease_with_max_wait(
     store: &dyn AgentTaskStore,
     repo_root: &Path,
@@ -395,6 +596,7 @@ struct RunningWorkspaceMutationInner {
     finalization_complete: CancellationToken,
     reservation: Mutex<Option<WorkspaceMutationReservation>>,
     _heartbeat_task: AbortOnDropHandle<()>,
+    git_workspace_cache: Option<Arc<GitWorkspaceCache>>,
 }
 
 impl std::fmt::Debug for RunningWorkspaceMutation {
@@ -408,12 +610,42 @@ impl std::fmt::Debug for RunningWorkspaceMutation {
 }
 
 impl RunningWorkspaceMutation {
+    #[cfg(test)]
     pub(crate) fn new(
         store: Arc<dyn AgentTaskStore>,
         repo_root: PathBuf,
         lease: WorkspaceMutationLease,
         owner_cancelled: CancellationToken,
         reservation: WorkspaceMutationReservation,
+    ) -> Self {
+        Self::new_inner(store, repo_root, lease, owner_cancelled, reservation, None)
+    }
+
+    pub(crate) fn new_with_cache(
+        store: Arc<dyn AgentTaskStore>,
+        repo_root: PathBuf,
+        lease: WorkspaceMutationLease,
+        owner_cancelled: CancellationToken,
+        reservation: WorkspaceMutationReservation,
+        git_workspace_cache: Arc<GitWorkspaceCache>,
+    ) -> Self {
+        Self::new_inner(
+            store,
+            repo_root,
+            lease,
+            owner_cancelled,
+            reservation,
+            Some(git_workspace_cache),
+        )
+    }
+
+    fn new_inner(
+        store: Arc<dyn AgentTaskStore>,
+        repo_root: PathBuf,
+        lease: WorkspaceMutationLease,
+        owner_cancelled: CancellationToken,
+        reservation: WorkspaceMutationReservation,
+        git_workspace_cache: Option<Arc<GitWorkspaceCache>>,
     ) -> Self {
         let stop = CancellationToken::new();
         let heartbeat_stop = stop.clone();
@@ -478,6 +710,7 @@ impl RunningWorkspaceMutation {
                 finalization_complete: CancellationToken::new(),
                 reservation: Mutex::new(Some(reservation)),
                 _heartbeat_task: heartbeat_task,
+                git_workspace_cache,
             }),
         }
     }
@@ -496,11 +729,14 @@ impl RunningWorkspaceMutation {
         if *finalized {
             return Ok(());
         }
-        self.inner
-            .store
-            .finish_workspace_mutation(&self.inner.repo_root, self.inner.lease.clone())
-            .await
-            .map_err(|error| error.to_string())?;
+        finish_workspace_mutation_and_seed(
+            self.inner.store.as_ref(),
+            &self.inner.repo_root,
+            self.inner.lease.clone(),
+            self.inner.git_workspace_cache.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         *finalized = true;
         self.inner.stop.cancel();
         self.inner.reservation.lock().await.take();
@@ -521,15 +757,154 @@ struct CommandExecutionState {
     running_order: VecDeque<i32>,
     repository_epoch: u64,
     observed_turn_mutation_revisions: HashMap<String, u64>,
+    completed_validations: HashMap<ValidationProofKey, CompletedValidationProof>,
+    completed_validation_order: VecDeque<ValidationProofKey>,
+    validation_results_by_call: HashMap<String, ValidationResult>,
+    validation_result_call_order: VecDeque<String>,
 }
 
 #[derive(Default)]
 pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
     workspace_mutation_gates: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    bound_auto_validations: Mutex<HashMap<String, BoundAutoValidationLeaf>>,
+    workspace_lease_diagnostics: WorkspaceLeaseDiagnostics,
+}
+
+#[derive(Default)]
+struct WorkspaceLeaseDiagnostics {
+    logical_requests: AtomicU64,
+    skipped_read_only: AtomicU64,
+    exact_path_leases: AtomicU64,
+    repository_wide_leases: AtomicU64,
 }
 
 impl CommandExecutionLedger {
+    pub(crate) fn record_workspace_mutation_scope(
+        &self,
+        scope: &WorkspaceMutationScope,
+        skipped_read_only: bool,
+    ) {
+        self.workspace_lease_diagnostics
+            .logical_requests
+            .fetch_add(1, Ordering::Relaxed);
+        match scope {
+            WorkspaceMutationScope::None if skipped_read_only => {
+                self.workspace_lease_diagnostics
+                    .skipped_read_only
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            WorkspaceMutationScope::ExactPaths(_) => {
+                self.workspace_lease_diagnostics
+                    .exact_path_leases
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            WorkspaceMutationScope::Repository => {
+                self.workspace_lease_diagnostics
+                    .repository_wide_leases
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            WorkspaceMutationScope::None => {}
+        }
+    }
+
+    pub(crate) async fn bind_auto_validation_leaf(
+        &self,
+        call_id: String,
+        binding: BoundAutoValidationLeaf,
+    ) -> bool {
+        self.bound_auto_validations
+            .lock()
+            .await
+            .insert(call_id, binding)
+            .is_none()
+    }
+
+    pub(crate) async fn auto_validation_leaf(
+        &self,
+        call_id: &str,
+    ) -> Option<BoundAutoValidationLeaf> {
+        self.bound_auto_validations
+            .lock()
+            .await
+            .get(call_id)
+            .cloned()
+    }
+
+    pub(crate) async fn clear_auto_validation_leaf(&self, call_id: &str) {
+        self.bound_auto_validations.lock().await.remove(call_id);
+    }
+
+    pub(crate) async fn reusable_validation(
+        &self,
+        key: &ValidationProofKey,
+    ) -> Option<ValidationResult> {
+        let proof = self
+            .state
+            .lock()
+            .await
+            .completed_validations
+            .get(key)
+            .cloned()?;
+        let Some((artifact_ref, artifact_sha256)) = proof.artifact.validation_integrity().await
+        else {
+            let mut state = self.state.lock().await;
+            state.completed_validations.remove(key);
+            state
+                .completed_validation_order
+                .retain(|entry| entry != key);
+            return None;
+        };
+        if proof.result.raw_artifact_ref.as_deref() != Some(artifact_ref.as_str())
+            || proof.result.raw_artifact_sha256.as_deref() != Some(artifact_sha256.as_str())
+        {
+            let mut state = self.state.lock().await;
+            state.completed_validations.remove(key);
+            state
+                .completed_validation_order
+                .retain(|entry| entry != key);
+            return None;
+        }
+        let mut result = proof.result;
+        result.freshness = ValidationFreshness::Reused;
+        Some(result)
+    }
+
+    pub(crate) async fn validation_result_for_call(
+        &self,
+        call_id: &str,
+    ) -> Option<ValidationResult> {
+        self.state
+            .lock()
+            .await
+            .validation_results_by_call
+            .get(call_id)
+            .cloned()
+    }
+
+    pub(crate) async fn supersede_validation_result_for_call(
+        &self,
+        call_id: &str,
+    ) -> Option<ValidationResult> {
+        let mut state = self.state.lock().await;
+        let proof_key = state
+            .validation_results_by_call
+            .get(call_id)?
+            .proof_key
+            .clone();
+        state.completed_validations.remove(&proof_key);
+        state
+            .completed_validation_order
+            .retain(|entry| entry != &proof_key);
+        let result = state.validation_results_by_call.get_mut(call_id)?;
+        result.status = ValidationTerminalStatus::Superseded;
+        result.freshness = ValidationFreshness::Superseded;
+        result.summary = Some(
+            "focused validation was superseded by a newer relevant implementation".to_string(),
+        );
+        Some(result.clone())
+    }
+
     async fn workspace_mutation_gate(&self, repo_root: &Path) -> Arc<Mutex<()>> {
         let mut gates = self.workspace_mutation_gates.lock().await;
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -614,21 +989,42 @@ impl CommandExecutionLedger {
         repaired: bool,
     ) -> Result<(), CommandAttemptBlocked> {
         let mut state = self.state.lock().await;
-        if let Some(entry) = state.attempts.get(key)
-            && let Some(prior_failure) = entry.deterministic_failure.clone()
-        {
-            return Err(CommandAttemptBlocked {
-                fingerprint: key.fingerprint(),
-                prior_failure,
-            });
-        }
-
         let entry = attempt_entry_locked(&mut state, key);
         entry.attempts = entry.attempts.saturating_add(1);
         if repaired {
             entry.repairs = entry.repairs.saturating_add(1);
         }
         Ok(())
+    }
+
+    /// Claims one diagnosis for an exact deterministic failure and selected
+    /// hypothesis/recovery identity. This suppresses only duplicate diagnosis;
+    /// `begin_attempt` always leaves command execution to its normal owner.
+    #[cfg(test)]
+    pub(crate) async fn claim_failure_diagnosis(
+        &self,
+        key: &CommandAttemptKey,
+        selected_hypothesis_recovery_identity: &str,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(entry) = state.attempts.get_mut(key) else {
+            return false;
+        };
+        let Some(failure) = entry.deterministic_failure.as_ref() else {
+            return false;
+        };
+        let diagnosis_identity = format!(
+            "{}:{}:{}:{}",
+            key.fingerprint(),
+            failure.outcome_class,
+            failure.exit_code,
+            selected_hypothesis_recovery_identity,
+        );
+        if entry.last_diagnosis_identity.as_deref() == Some(&diagnosis_identity) {
+            return false;
+        }
+        entry.last_diagnosis_identity = Some(diagnosis_identity);
+        true
     }
 
     pub(crate) async fn record_exit(&self, key: &CommandAttemptKey, exit_code: i32) {
@@ -768,23 +1164,26 @@ impl CommandExecutionLedger {
         process_id: i32,
         artifact: RawOutputArtifact,
     ) {
-        let mut state = self.state.lock().await;
-        let deterministic_completion = state.running.get_mut(&process_id).and_then(|running| {
-            running.artifact = artifact.clone();
-            running
-                .completed_exit_code
-                .filter(|exit_code| *exit_code != 0 && running.validation_launch.is_some())
-                .map(|exit_code| (running.key.clone(), exit_code))
-        });
-        if let Some((key, exit_code)) = deterministic_completion
-            && let Some(failure) = state
-                .attempts
-                .get_mut(&key)
-                .and_then(|entry| entry.deterministic_failure.as_mut())
-            && failure.exit_code == exit_code
         {
-            failure.evidence = artifact;
+            let mut state = self.state.lock().await;
+            let deterministic_completion = state.running.get_mut(&process_id).and_then(|running| {
+                running.artifact = artifact.clone();
+                running
+                    .completed_exit_code
+                    .filter(|exit_code| *exit_code != 0 && running.validation_launch.is_some())
+                    .map(|exit_code| (running.key.clone(), exit_code))
+            });
+            if let Some((key, exit_code)) = deterministic_completion
+                && let Some(failure) = state
+                    .attempts
+                    .get_mut(&key)
+                    .and_then(|entry| entry.deterministic_failure.as_mut())
+                && failure.exit_code == exit_code
+            {
+                failure.evidence = artifact;
+            }
         }
+        self.publish_completed_validation_if_ready(process_id).await;
     }
 
     pub(crate) async fn mark_running_process_completed(
@@ -820,6 +1219,147 @@ impl CommandExecutionLedger {
             );
             return false;
         }
+        self.publish_completed_validation_if_ready(process_id).await;
+        true
+    }
+
+    async fn publish_completed_validation_if_ready(&self, process_id: i32) {
+        let candidate = {
+            let state = self.state.lock().await;
+            let Some(running) = state.running.get(&process_id) else {
+                return;
+            };
+            let Some(exit_code) = running.completed_exit_code else {
+                return;
+            };
+            let Some(launch) = running.validation_launch.as_ref() else {
+                return;
+            };
+            let (Some(proof_key), Some(route), Some(call_id)) = (
+                launch.proof_key.clone(),
+                launch.structured_route.clone(),
+                launch.validation_call_id.clone(),
+            ) else {
+                return;
+            };
+            (
+                proof_key,
+                route,
+                call_id,
+                running.artifact.clone(),
+                running.started_at,
+                exit_code,
+            )
+        };
+        let (proof_key, route, call_id, artifact, started_at, exit_code) = candidate;
+        self.publish_completed_validation(
+            proof_key,
+            route,
+            call_id,
+            artifact,
+            started_at,
+            exit_code,
+            Some(process_id.to_string()),
+        )
+        .await;
+    }
+
+    pub(crate) async fn publish_inline_validation(
+        &self,
+        launch: &ValidationLaunchPlan,
+        artifact: RawOutputArtifact,
+        started_at: Instant,
+        exit_code: i32,
+    ) -> bool {
+        let (Some(proof_key), Some(route), Some(call_id)) = (
+            launch.proof_key.clone(),
+            launch.structured_route.clone(),
+            launch.validation_call_id.clone(),
+        ) else {
+            return false;
+        };
+        self.publish_completed_validation(
+            proof_key, route, call_id, artifact, started_at, exit_code, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_completed_validation(
+        &self,
+        proof_key: ValidationProofKey,
+        route: ValidationRoute,
+        call_id: String,
+        artifact: RawOutputArtifact,
+        started_at: Instant,
+        exit_code: i32,
+        process_id: Option<String>,
+    ) -> bool {
+        let Some((artifact_ref, artifact_sha256)) = artifact.validation_integrity().await else {
+            return false;
+        };
+        let succeeded = exit_code == 0;
+        let result = ValidationResult {
+            proof_key: proof_key.clone(),
+            route,
+            call_id: call_id.clone(),
+            process_id,
+            status: if succeeded {
+                ValidationTerminalStatus::Succeeded
+            } else {
+                ValidationTerminalStatus::Failed
+            },
+            duration_ms: u64::try_from(
+                Instant::now()
+                    .saturating_duration_since(started_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            summary: Some(if succeeded {
+                "focused validation succeeded".to_string()
+            } else {
+                format!("focused validation exited with code {exit_code}")
+            }),
+            failure_excerpt: (!succeeded).then(|| {
+                format!(
+                    "validation exited with code {exit_code}; exact output is retained in the immutable artifact"
+                )
+            }),
+            raw_artifact_ref: Some(artifact_ref),
+            raw_artifact_sha256: Some(artifact_sha256),
+            freshness: ValidationFreshness::Executed,
+        };
+        let mut state = self.state.lock().await;
+        if state.validation_results_by_call.contains_key(&call_id) {
+            return true;
+        }
+        while state.validation_results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+            let Some(oldest) = state.validation_result_call_order.pop_front() else {
+                break;
+            };
+            state.validation_results_by_call.remove(&oldest);
+        }
+        state
+            .validation_result_call_order
+            .push_back(call_id.clone());
+        state
+            .validation_results_by_call
+            .insert(call_id, result.clone());
+        if !succeeded || state.completed_validations.contains_key(&proof_key) {
+            return true;
+        }
+        while state.completed_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+            let Some(oldest) = state.completed_validation_order.pop_front() else {
+                break;
+            };
+            state.completed_validations.remove(&oldest);
+        }
+        state
+            .completed_validation_order
+            .push_back(proof_key.clone());
+        state
+            .completed_validations
+            .insert(proof_key, CompletedValidationProof { result, artifact });
         true
     }
 
@@ -920,6 +1460,7 @@ fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey
     if exit_code == 0 {
         entry.consecutive_failures = 0;
         entry.deterministic_failure = None;
+        entry.last_diagnosis_identity = None;
     } else {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     }
@@ -1045,6 +1586,9 @@ mod tests {
             },
             authorization_revision: 1,
             observation: None,
+            proof_key: None,
+            structured_route: None,
+            validation_call_id: None,
         }
     }
 
@@ -1262,7 +1806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_failure_suppresses_every_exact_repeat_until_identity_changes() {
+    async fn deterministic_failure_suppresses_only_duplicate_diagnosis_and_never_command_retry() {
         let ledger = CommandExecutionLedger::default();
         let attempt_key = key("fails.exe").with_repository_epoch(1);
 
@@ -1277,15 +1821,27 @@ mod tests {
             )
             .await;
 
+        assert!(
+            ledger
+                .claim_failure_diagnosis(&attempt_key, "hypothesis-a/recovery-a")
+                .await
+        );
+        assert!(
+            !ledger
+                .claim_failure_diagnosis(&attempt_key, "hypothesis-a/recovery-a")
+                .await
+        );
         for _ in 0..3 {
-            let blocked = ledger
+            ledger
                 .begin_attempt(&attempt_key, false)
                 .await
-                .expect_err("every exact repeat should be suppressed");
-            assert_eq!(blocked.prior_failure.exit_code, 7);
-            assert_eq!(blocked.prior_failure.outcome_class, "focused-validation");
-            assert_eq!(blocked.fingerprint, attempt_key.fingerprint());
+                .expect("normal owner must execute every requested retry");
         }
+        assert!(
+            ledger
+                .claim_failure_diagnosis(&attempt_key, "hypothesis-b/recovery-b")
+                .await
+        );
 
         ledger
             .begin_attempt(&key("fails.exe --changed").with_repository_epoch(1), false)
@@ -1934,5 +2490,45 @@ mod tests {
         );
         assert!(ledger.snapshot(&keys[0]).await.is_some());
         assert!(ledger.snapshot(&keys[1]).await.is_none());
+    }
+
+    #[test]
+    fn workspace_lease_diagnostics_separate_read_only_exact_and_repository_paths() {
+        let ledger = CommandExecutionLedger::default();
+        ledger.record_workspace_mutation_scope(&WorkspaceMutationScope::None, true);
+        ledger.record_workspace_mutation_scope(
+            &WorkspaceMutationScope::exact_paths(vec!["one.txt".to_string()]),
+            false,
+        );
+        ledger.record_workspace_mutation_scope(&WorkspaceMutationScope::Repository, false);
+
+        assert_eq!(
+            ledger
+                .workspace_lease_diagnostics
+                .logical_requests
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(
+            ledger
+                .workspace_lease_diagnostics
+                .skipped_read_only
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            ledger
+                .workspace_lease_diagnostics
+                .exact_path_leases
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            ledger
+                .workspace_lease_diagnostics
+                .repository_wide_leases
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 }

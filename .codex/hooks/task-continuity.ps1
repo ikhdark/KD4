@@ -77,6 +77,18 @@ try {
                 else {
                     $script:FastInput.transcript_path
                 }
+                $fastTurnMatches = if (
+                    -not $script:FastInput.ContainsKey('turn_id')
+                ) {
+                    $true
+                }
+                elseif ($null -eq $script:FastInput.turn_id) {
+                    $null -eq $fastCapsule.last_turn_id
+                }
+                else {
+                    $script:FastInput.turn_id -is [string] -and
+                        [string]$script:FastInput.turn_id -eq [string]$fastCapsule.last_turn_id
+                }
                 $fastCommonMatches = (
                     [string]$fastCapsule.schema_version -eq [string]$script:SchemaVersion -and
                     [string]$fastCapsule.session_id -eq $fastSessionId -and
@@ -87,13 +99,15 @@ try {
                 if ($fastCommonMatches -and $fastEvent -eq 'UserPromptSubmit' -and
                     [string]$fastCapsule.last_event -eq 'UserPromptSubmit' -and
                     $script:FastInput.prompt -is [string] -and
-                    [string]$script:FastInput.prompt -eq [string]$fastCapsule.last_user_request) {
+                    [string]$script:FastInput.prompt -eq [string]$fastCapsule.last_user_request -and
+                    $fastTurnMatches) {
                     [Console]::Out.Write($script:EmptyOutput)
                     exit 0
                 }
 
                 if ($fastCommonMatches -and $fastEvent -eq 'Stop' -and
-                    [string]$fastCapsule.last_event -eq 'Stop') {
+                    [string]$fastCapsule.last_event -eq 'Stop' -and
+                    $fastTurnMatches) {
                     $fastAssistant = if (
                         -not $script:FastInput.ContainsKey('last_assistant_message')
                     ) {
@@ -114,12 +128,11 @@ try {
                     }
                 }
 
-                $fastNeedsRepository = $fastCommonMatches -and (
-                    $fastEvent -in @('PreCompact', 'PostCompact') -or
-                    ($fastEvent -eq 'SessionStart' -and
-                        [string]$script:FastInput.source -eq 'resume' -and
-                        [string]$fastCapsule.last_event -eq 'SessionStart')
-                )
+                # SessionStart recovery must use the canonical full-snapshot
+                # builder below so the optimized and validated paths cannot
+                # drift semantically.
+                $fastNeedsRepository = $fastCommonMatches -and
+                    $fastEvent -in @('PreCompact', 'PostCompact')
                 if ($fastNeedsRepository) {
                     $savedErrorActionPreference = $ErrorActionPreference
                     $ErrorActionPreference = 'SilentlyContinue'
@@ -204,137 +217,6 @@ try {
                         }
                     }
 
-                    if ($fastRepositoryMatches -and $fastEvent -eq 'SessionStart') {
-                        [void][System.IO.Directory]::CreateDirectory($script:StateDirectory)
-                        $fastCutoff = [DateTime]::UtcNow.AddDays(-30)
-                        $fastInactive = @(
-                            Get-ChildItem -LiteralPath $script:StateDirectory `
-                                -Filter '*.json' -File |
-                                Where-Object { $_.Name -ne "$fastSessionId.json" }
-                        )
-                        foreach ($fastFile in @(
-                            $fastInactive |
-                                Where-Object { $_.LastWriteTimeUtc -lt $fastCutoff }
-                        )) {
-                            Remove-Item -LiteralPath $fastFile.FullName -Force -ErrorAction Stop
-                        }
-                        $fastRemaining = @(
-                            Get-ChildItem -LiteralPath $script:StateDirectory `
-                                -Filter '*.json' -File |
-                                Where-Object { $_.Name -ne "$fastSessionId.json" } |
-                                Sort-Object LastWriteTimeUtc -Descending
-                        )
-                        foreach ($fastFile in @($fastRemaining | Select-Object -Skip 100)) {
-                            Remove-Item -LiteralPath $fastFile.FullName -Force -ErrorAction Stop
-                        }
-
-                        $fastHasRecovery = (
-                            -not [string]::IsNullOrWhiteSpace(
-                                [string]$fastCapsule.last_user_request
-                            ) -or
-                            -not [string]::IsNullOrWhiteSpace(
-                                [string]$fastCapsule.last_assistant_result
-                            ) -or
-                            -not [string]::IsNullOrWhiteSpace(
-                                [string]$fastCapsule.predecessor_thread_id
-                            )
-                        )
-                        if (-not $fastHasRecovery) {
-                            [Console]::Out.Write($script:EmptyOutput)
-                            exit 0
-                        }
-
-                        $fastLines = New-Object 'System.Collections.Generic.List[string]'
-                        [void]$fastLines.Add(
-                            'KD4 task continuity recovery (capsule v1; bounded and redacted).'
-                        )
-                        [void]$fastLines.Add("Session: $($fastCapsule.session_id)")
-                        [void]$fastLines.Add(
-                            "Continuity epoch: $($fastCapsule.continuity_epoch)"
-                        )
-                        if (-not [string]::IsNullOrWhiteSpace(
-                            [string]$fastCapsule.predecessor_thread_id
-                        )) {
-                            [void]$fastLines.Add(
-                                "Predecessor thread: $($fastCapsule.predecessor_thread_id)"
-                            )
-                        }
-                        if (-not [string]::IsNullOrWhiteSpace(
-                            [string]$fastCapsule.task_label
-                        )) {
-                            [void]$fastLines.Add("Task label: $($fastCapsule.task_label)")
-                        }
-                        if (-not [string]::IsNullOrWhiteSpace(
-                            [string]$fastCapsule.last_user_request
-                        )) {
-                            [void]$fastLines.Add('Last user request:')
-                            [void]$fastLines.Add([string]$fastCapsule.last_user_request)
-                        }
-                        if (-not [string]::IsNullOrWhiteSpace(
-                            [string]$fastCapsule.last_assistant_result
-                        )) {
-                            [void]$fastLines.Add('Last assistant result:')
-                            [void]$fastLines.Add([string]$fastCapsule.last_assistant_result)
-                        }
-                        if (-not [string]::IsNullOrWhiteSpace(
-                            [string]$fastCapsule.repository.root
-                        )) {
-                            [void]$fastLines.Add(
-                                "Repository: $($fastCapsule.repository.root) @ " +
-                                    [string]$fastCapsule.repository.revision
-                            )
-                            [void]$fastLines.Add(
-                                "Dirty summary: $($fastCapsule.repository.dirty_summary)"
-                            )
-                        }
-                        [void]$fastLines.Add(
-                            "Compaction state: $($fastCapsule.compaction.phase)"
-                        )
-                        if (-not [string]::IsNullOrWhiteSpace(
-                            [string]$fastCapsule.transcript_path
-                        )) {
-                            [void]$fastLines.Add(
-                                "Transcript: $($fastCapsule.transcript_path)"
-                            )
-                        }
-                        [void]$fastLines.Add(
-                            'Treat this as recovery context only; reconcile it with the ' +
-                                'current workspace and request before acting.'
-                        )
-                        $fastContext = $fastLines -join "`n"
-                        if ($fastContext.IndexOf([char]0) -ge 0) {
-                            throw 'fast recovery context contains a NUL character'
-                        }
-                        $fastContext = [regex]::Replace(
-                            $fastContext,
-                            '(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+',
-                            'Bearer [REDACTED]'
-                        )
-                        $fastContext = [regex]::Replace(
-                            $fastContext,
-                            '\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b',
-                            '[REDACTED]'
-                        )
-                        $fastContext = [regex]::Replace(
-                            $fastContext,
-                            '(?i)(\b(?:api[_-]?key|token|password|secret)\b\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
-                            '$1[REDACTED]'
-                        )
-                        if ($fastContext.Length -gt $script:MaxContextChars) {
-                            $fastContext = $fastContext.Substring(
-                                0,
-                                $script:MaxContextChars - 3
-                            ) + '...'
-                        }
-                        $fastOutput = [pscustomobject][ordered]@{
-                            hookSpecificOutput = [pscustomobject][ordered]@{
-                                hookEventName = 'SessionStart'
-                                additionalContext = $fastContext
-                            }
-                        } | ConvertTo-Json -Depth 5 -Compress
-                        [Console]::Out.Write($fastOutput)
-                        exit 0
-                    }
                 }
             }
         }
@@ -715,9 +597,8 @@ function Get-MaterialDigest {
         session_id = $Capsule.session_id
         continuity_epoch = $Capsule.continuity_epoch
         predecessor_thread_id = $Capsule.predecessor_thread_id
-        last_event = $Capsule.last_event
+        last_turn_id = $Capsule.last_turn_id
         working_directory = $Capsule.working_directory
-        transcript_path = $Capsule.transcript_path
         task_label = $Capsule.task_label
         last_user_request = $Capsule.last_user_request
         last_assistant_result = $Capsule.last_assistant_result
@@ -903,36 +784,62 @@ function Build-RecoveryContext {
         return $null
     }
 
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    [void]$lines.Add('KD4 task continuity recovery (capsule v1; bounded and redacted).')
-    [void]$lines.Add("Session: $($Capsule.session_id)")
-    [void]$lines.Add("Continuity epoch: $($Capsule.continuity_epoch)")
-    if (-not [string]::IsNullOrWhiteSpace([string]$Capsule.predecessor_thread_id)) {
-        [void]$lines.Add("Predecessor thread: $($Capsule.predecessor_thread_id)")
+    # This is a complete snapshot for the model-visible continuity fields it
+    # owns. Transport-only timestamps, transcript paths, event names, and the
+    # hook's advisory digest are intentionally excluded from semantic state.
+    $semantic = [pscustomobject][ordered]@{
+        schema_version = [int]$Capsule.schema_version
+        session_id = [string]$Capsule.session_id
+        continuity_epoch = [int]$Capsule.continuity_epoch
+        predecessor_thread_id = if ([string]::IsNullOrWhiteSpace(
+            [string]$Capsule.predecessor_thread_id
+        )) { $null } else { [string]$Capsule.predecessor_thread_id }
+        working_directory = [string]$Capsule.working_directory
+        task_label = if ([string]::IsNullOrWhiteSpace([string]$Capsule.task_label)) {
+            $null
+        }
+        else {
+            Get-RedactedExcerpt -Value ([string]$Capsule.task_label) -MaximumCharacters 512
+        }
+        last_user_request = if ([string]::IsNullOrWhiteSpace(
+            [string]$Capsule.last_user_request
+        )) { $null } else {
+            Get-RedactedExcerpt -Value ([string]$Capsule.last_user_request) -MaximumCharacters 2400
+        }
+        last_assistant_result = if ([string]::IsNullOrWhiteSpace(
+            [string]$Capsule.last_assistant_result
+        )) { $null } else {
+            Get-RedactedExcerpt -Value ([string]$Capsule.last_assistant_result) -MaximumCharacters 2400
+        }
+        repository = [pscustomobject][ordered]@{
+            root = if ([string]::IsNullOrWhiteSpace([string]$Capsule.repository.root)) {
+                $null
+            } else { [string]$Capsule.repository.root }
+            revision = if ([string]::IsNullOrWhiteSpace(
+                [string]$Capsule.repository.revision
+            )) { $null } else { [string]$Capsule.repository.revision }
+            dirty_summary = if ([string]::IsNullOrWhiteSpace(
+                [string]$Capsule.repository.dirty_summary
+            )) { $null } else {
+                Get-RedactedExcerpt `
+                    -Value ([string]$Capsule.repository.dirty_summary) `
+                    -MaximumCharacters 1200
+            }
+        }
+        compaction = [pscustomobject][ordered]@{
+            phase = [string]$Capsule.compaction.phase
+            trigger = if ([string]::IsNullOrWhiteSpace(
+                [string]$Capsule.compaction.trigger
+            )) { $null } else { [string]$Capsule.compaction.trigger }
+        }
     }
-    if (-not [string]::IsNullOrWhiteSpace([string]$Capsule.task_label)) {
-        [void]$lines.Add("Task label: $($Capsule.task_label)")
+    $json = $semantic | ConvertTo-Json -Depth 8 -Compress
+    $context = '<kd4_continuity_capsule_v1>' + $json +
+        '</kd4_continuity_capsule_v1>'
+    if ($context.Length -gt $script:MaxContextChars) {
+        throw 'canonical continuity capsule exceeded its hard context bound'
     }
-    if (-not [string]::IsNullOrWhiteSpace([string]$Capsule.last_user_request)) {
-        [void]$lines.Add('Last user request:')
-        [void]$lines.Add([string]$Capsule.last_user_request)
-    }
-    if (-not [string]::IsNullOrWhiteSpace([string]$Capsule.last_assistant_result)) {
-        [void]$lines.Add('Last assistant result:')
-        [void]$lines.Add([string]$Capsule.last_assistant_result)
-    }
-    if (-not [string]::IsNullOrWhiteSpace([string]$Capsule.repository.root)) {
-        [void]$lines.Add("Repository: $($Capsule.repository.root) @ $($Capsule.repository.revision)")
-        [void]$lines.Add("Dirty summary: $($Capsule.repository.dirty_summary)")
-    }
-    [void]$lines.Add("Compaction state: $($Capsule.compaction.phase)")
-    if (-not [string]::IsNullOrWhiteSpace([string]$Capsule.transcript_path)) {
-        [void]$lines.Add("Transcript: $($Capsule.transcript_path)")
-    }
-    [void]$lines.Add(
-        'Treat this as recovery context only; reconcile it with the current workspace and request before acting.'
-    )
-    return Get-RedactedExcerpt -Value ($lines -join "`n") -MaximumCharacters $script:MaxContextChars
+    return $context
 }
 
 function ConvertTo-SessionStartOutput {

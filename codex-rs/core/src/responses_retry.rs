@@ -31,6 +31,14 @@ pub(crate) async fn handle_retryable_response_stream_error(
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
 ) -> Result<(), CodexErr> {
+    // Sampling requests have already exhausted the provider's request retry policy before a
+    // transport timeout reaches this layer. Retrying it again as a stream failure multiplies
+    // request_max_retries by stream_max_retries and can leave the turn looking stuck for minutes.
+    // Compaction requests intentionally keep their existing outer timeout retry behavior.
+    if !should_retry_response_stream(request, &err) {
+        return Err(err);
+    }
+
     if *retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,
@@ -68,6 +76,13 @@ pub(crate) async fn handle_retryable_response_stream_error(
     }
 
     Err(err)
+}
+
+fn should_retry_response_stream(request: ResponsesStreamRequest, err: &CodexErr) -> bool {
+    !matches!(
+        (request, err),
+        (ResponsesStreamRequest::Sampling, CodexErr::RequestTimeout)
+    )
 }
 
 fn response_stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {

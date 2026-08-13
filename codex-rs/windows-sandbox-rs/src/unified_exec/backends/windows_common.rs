@@ -109,17 +109,27 @@ pub(crate) fn start_runner_stdout_reader(
 
             match msg.message {
                 Message::Output { payload } => {
-                    if let Ok(data) = decode_bytes(&payload.data_b64) {
-                        match payload.stream {
-                            OutputStream::Stdout => {
+                    let data = match decode_bytes(&payload.data_b64) {
+                        Ok(data) => data,
+                        Err(err) => {
+                            send_runner_error(
+                                &format!("runner sent invalid output payload: {err}"),
+                                &stdout_tx,
+                                stderr_tx.as_ref(),
+                            );
+                            let _ = exit_tx.send(-1);
+                            break;
+                        }
+                    };
+                    match payload.stream {
+                        OutputStream::Stdout => {
+                            let _ = stdout_tx.send(data);
+                        }
+                        OutputStream::Stderr => {
+                            if let Some(stderr_tx) = stderr_tx.as_ref() {
+                                let _ = stderr_tx.send(data);
+                            } else {
                                 let _ = stdout_tx.send(data);
-                            }
-                            OutputStream::Stderr => {
-                                if let Some(stderr_tx) = stderr_tx.as_ref() {
-                                    let _ = stderr_tx.send(data);
-                                } else {
-                                    let _ = stdout_tx.send(data);
-                                }
                             }
                         }
                     }
@@ -133,12 +143,15 @@ pub(crate) fn start_runner_stdout_reader(
                     let _ = exit_tx.send(-1);
                     break;
                 }
-                Message::SpawnReady { .. }
-                | Message::Stdin { .. }
-                | Message::CloseStdin { .. }
-                | Message::Resize { .. }
-                | Message::SpawnRequest { .. }
-                | Message::Terminate { .. } => {}
+                other => {
+                    send_runner_error(
+                        &format!("unexpected runner message after startup: {other:?}"),
+                        &stdout_tx,
+                        stderr_tx.as_ref(),
+                    );
+                    let _ = exit_tx.send(-1);
+                    break;
+                }
             }
         }
     });
@@ -172,5 +185,54 @@ fn send_runner_error(
         let _ = stderr_tx.send(formatted);
     } else {
         let _ = stdout_tx.send(formatted);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::start_runner_stdout_reader;
+    use crate::ipc_framed::FramedMessage;
+    use crate::ipc_framed::IPC_PROTOCOL_VERSION;
+    use crate::ipc_framed::Message;
+    use crate::ipc_framed::OutputPayload;
+    use crate::ipc_framed::OutputStream;
+    use crate::ipc_framed::write_frame;
+    use std::io::Seek;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn invalid_output_payload_fails_the_runner_session() -> anyhow::Result<()> {
+        let mut pipe_read = tempfile::tempfile()?;
+        write_frame(
+            &mut pipe_read,
+            &FramedMessage {
+                version: IPC_PROTOCOL_VERSION,
+                message: Message::Output {
+                    payload: OutputPayload {
+                        data_b64: "not base64".to_string(),
+                        stream: OutputStream::Stdout,
+                    },
+                },
+            },
+        )?;
+        pipe_read.rewind()?;
+
+        let (stdout_tx, mut stdout_rx) = broadcast::channel(1);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        start_runner_stdout_reader(pipe_read, stdout_tx, None, exit_tx);
+
+        let exit_code = tokio::time::timeout(Duration::from_secs(2), exit_rx)
+            .await
+            .expect("runner stdout reader must finish")?;
+        assert_eq!(exit_code, -1);
+        let error = stdout_rx.recv().await?;
+        assert!(
+            String::from_utf8_lossy(&error).contains("runner sent invalid output payload"),
+            "unexpected runner error: {}",
+            String::from_utf8_lossy(&error)
+        );
+        Ok(())
     }
 }

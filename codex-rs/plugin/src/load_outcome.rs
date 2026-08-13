@@ -9,6 +9,7 @@ use crate::AppDeclaration;
 use crate::PluginCapabilitySummary;
 use crate::PluginHookSource;
 use crate::app_connector_ids_from_declarations;
+use crate::manifest::PluginToolExposure;
 
 const MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN: usize = 1024;
 
@@ -19,6 +20,7 @@ pub struct LoadedPlugin<M> {
     pub manifest_name: Option<String>,
     pub plugin_namespace: Option<String>,
     pub manifest_description: Option<String>,
+    pub tool_exposure: Option<PluginToolExposure>,
     pub root: AbsolutePathBuf,
     pub enabled: bool,
     pub skill_roots: Vec<AbsolutePathBuf>,
@@ -230,6 +232,7 @@ mod tests {
                     .to_string(),
             ),
             manifest_description: None,
+            tool_exposure: None,
             root: test_path(config_name),
             enabled: true,
             skill_roots,

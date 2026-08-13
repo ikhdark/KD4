@@ -1,3 +1,4 @@
+use crate::command_safety::is_safe_command::is_exact_version_probe;
 use crate::command_safety::is_safe_command::is_safe_git_command;
 use crate::command_safety::is_trusted_powershell_host;
 use crate::command_safety::powershell_parser::PowershellParseAnalysis;
@@ -119,6 +120,10 @@ pub(crate) fn is_safe_powershell_words(words: &[String]) -> bool {
     if words.is_empty() {
         // Examples rejected here: "pwsh -Command ''" and "pwsh -Command \"\"".
         return false;
+    }
+
+    if is_exact_version_probe(words) {
+        return true;
     }
 
     // Reject nested unsafe cmdlets inside parentheses or arguments
@@ -257,6 +262,42 @@ mod tests {
                 "-Command".to_string(),
                 "Get-ChildItem".to_string(),
             ]));
+        }
+    }
+
+    #[test]
+    fn admits_only_scalar_local_constant_bindings() {
+        let Some(powershell) = windows_powershell_path() else {
+            return;
+        };
+        let invoke = |script: &str| {
+            is_safe_command_windows(&vec_str(&[
+                powershell.as_str(),
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ]))
+        };
+
+        assert!(invoke("$path = 'Cargo.toml'; Get-Content -Path $path"));
+        assert!(invoke(
+            "$count = 5; Get-Content Cargo.toml | Select-Object -First $count"
+        ));
+
+        for script in [
+            "$env:path = 'x'; Get-Content $env:path",
+            "$global:path = 'x'; Get-Content $global:path",
+            "$path = Get-Location; Get-Content $path",
+            "$path = $(Get-Location); Get-Content $path",
+            "$path = @('a', 'b'); Get-Content $path",
+            "$path = 'x'; & Get-Content $path",
+            "$path = 'x'; Get-Content $unknown",
+            "$path = 'x'; Get-Content $path > output.txt",
+            "foreach ($path in '.') { Get-Content $path }",
+            "& { Get-Content Cargo.toml }",
+        ] {
+            assert!(!invoke(script), "expected unsafe: {script}");
         }
     }
 

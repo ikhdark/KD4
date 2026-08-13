@@ -763,6 +763,39 @@ fn typed_assignment_schema() -> JsonSchema {
         ]),
         Some(false.into()),
     );
+    let architecture_contract_ref = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "architect_assignment_id".to_string(),
+                JsonSchema::string(Some(
+                    "Architect assignment owning the sealed receipt.".to_string(),
+                )),
+            ),
+            (
+                "architect_attempt_id".to_string(),
+                JsonSchema::string(Some(
+                    "Exact successful Architect attempt owning the receipt.".to_string(),
+                )),
+            ),
+            (
+                "contract_version".to_string(),
+                JsonSchema::integer(Some("ArchitectureContractV1 version.".to_string())),
+            ),
+            (
+                "contract_sha256".to_string(),
+                JsonSchema::string(Some(
+                    "Canonical SHA-256 from the immutable Architect receipt.".to_string(),
+                )),
+            ),
+        ]),
+        Some(vec![
+            "architect_assignment_id".to_string(),
+            "architect_attempt_id".to_string(),
+            "contract_version".to_string(),
+            "contract_sha256".to_string(),
+        ]),
+        Some(false.into()),
+    );
     let file_handle = JsonSchema::object(
         BTreeMap::from([
             (
@@ -897,6 +930,10 @@ fn typed_assignment_schema() -> JsonSchema {
                 ),
             ),
             ("relation".to_string(), relation),
+            (
+                "architecture_contract_ref".to_string(),
+                architecture_contract_ref,
+            ),
         ]),
         Some(vec![
             "objective".to_string(),

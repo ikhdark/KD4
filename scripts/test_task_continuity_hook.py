@@ -80,42 +80,42 @@ def recovery_context(capsule: dict[str, Any]) -> str | None:
         )
     ):
         return None
-    lines = [
-        "KD4 task continuity recovery (capsule v1; bounded and redacted).",
-        f"Session: {capsule['session_id']}",
-        f"Continuity epoch: {capsule['continuity_epoch']}",
-    ]
-    if capsule.get("predecessor_thread_id"):
-        lines.append(f"Predecessor thread: {capsule['predecessor_thread_id']}")
-    if capsule.get("task_label"):
-        lines.append(f"Task label: {capsule['task_label']}")
-    if capsule.get("last_user_request"):
-        lines.extend(["Last user request:", capsule["last_user_request"]])
-    if capsule.get("last_assistant_result"):
-        lines.extend(["Last assistant result:", capsule["last_assistant_result"]])
-    repository = capsule["repository"]
-    if repository.get("root"):
-        lines.extend(
-            [
-                f"Repository: {repository['root']} @ {repository['revision']}",
-                f"Dirty summary: {repository['dirty_summary']}",
-            ]
-        )
-    lines.append(f"Compaction state: {capsule['compaction']['phase']}")
-    if capsule.get("transcript_path"):
-        lines.append(f"Transcript: {capsule['transcript_path']}")
-    lines.append(
-        "Treat this as recovery context only; reconcile it with the current "
-        "workspace and request before acting."
+    semantic = {
+        "schema_version": int(capsule["schema_version"]),
+        "session_id": capsule["session_id"],
+        "continuity_epoch": int(capsule["continuity_epoch"]),
+        "predecessor_thread_id": capsule.get("predecessor_thread_id"),
+        "working_directory": capsule["working_directory"],
+        "task_label": capsule.get("task_label"),
+        "last_user_request": capsule.get("last_user_request"),
+        "last_assistant_result": capsule.get("last_assistant_result"),
+        "repository": {
+            "root": capsule["repository"].get("root"),
+            "revision": capsule["repository"].get("revision"),
+            "dirty_summary": capsule["repository"].get("dirty_summary"),
+        },
+        "compaction": {
+            "phase": capsule["compaction"]["phase"],
+            "trigger": capsule["compaction"].get("trigger"),
+        },
+    }
+    value = (
+        "<kd4_continuity_capsule_v1>"
+        + compact_json(semantic)
+        + "</kd4_continuity_capsule_v1>"
     )
-    value = "\n".join(lines)
-    return value if len(value) <= 8000 else value[:7997] + "..."
+    if len(value) > 8000:
+        raise AssertionError("canonical continuity fixture exceeded its hard bound")
+    return value
 
 
 def exact_injection(capsule: dict[str, Any]) -> str:
     context = recovery_context(capsule)
     if context is None:
         return "{}"
+    # Windows PowerShell's ConvertTo-Json escapes the marker delimiters in the
+    # outer wire object. Keep the byte-for-byte assertion so fast and slow hook
+    # entrypoints must continue to canonicalize identically.
     return compact_json(
         {
             "hookSpecificOutput": {
@@ -123,7 +123,7 @@ def exact_injection(capsule: dict[str, Any]) -> str:
                 "additionalContext": context,
             }
         }
-    )
+    ).replace("<", "\\u003c").replace(">", "\\u003e")
 
 
 def invoke_helper(
@@ -976,6 +976,24 @@ if ($errors.Count -ne 0) {
         self.assertNotIn("hunter2", compact_json(capsule))
         self.assertEqual(len(capsule["material_digest"]), 64)
 
+    def test_changed_turn_id_updates_material_identity(self) -> None:
+        session_id = self.sandbox.session_id()
+        payload = self.sandbox.payload(
+            "UserPromptSubmit",
+            session_id,
+            prompt="same request",
+            turn_id="turn-1",
+        )
+        self.invoke_empty(payload)
+        before = self.sandbox.capsule(session_id)
+
+        payload["turn_id"] = "turn-2"
+        self.invoke_empty(payload)
+        after = self.sandbox.capsule(session_id)
+
+        self.assertEqual(after["last_turn_id"], "turn-2")
+        self.assertNotEqual(after["material_digest"], before["material_digest"])
+
     def test_all_handled_error_fixtures_emit_exact_empty_object(self) -> None:
         fixtures: list[tuple[str, dict[str, Any] | str]] = [
             ("empty input", ""),
@@ -1202,7 +1220,6 @@ if ($errors.Count -ne 0) {
         capsule_path = self.sandbox.capsule_path(session_id)
         before_bytes = capsule_path.read_bytes()
         before_mtime = capsule_path.stat().st_mtime_ns
-        stop["turn_id"] = "turn-2"
         self.invoke_empty(stop)
         self.assertEqual(capsule_path.read_bytes(), before_bytes)
         self.assertEqual(capsule_path.stat().st_mtime_ns, before_mtime)

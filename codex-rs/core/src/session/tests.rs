@@ -416,7 +416,7 @@ fn skill_message(text: &str) -> ResponseItem {
 }
 
 #[tokio::test]
-async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_startup_prewarm() {
+async fn regular_turn_cancels_unfinished_startup_prewarm_without_waiting() {
     let _trace_test_context = install_test_tracing("codex-core-tests");
     let request_parent = W3cTraceContext {
         traceparent: Some("00-00000000000000000000000000000011-0000000000000022-01".into()),
@@ -434,7 +434,7 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
         tc.trace_id.as_deref(),
         Some("00000000000000000000000000000011")
     );
-    let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let (mut startup_prewarm_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
         Ok(test_model_client_session())
@@ -444,7 +444,6 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
         crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
             handle,
             std::time::Instant::now(),
-            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
         ),
     )
     .await;
@@ -464,8 +463,90 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
     };
     assert_eq!(turn_started.turn_id, tc.sub_id);
     assert_eq!(turn_started.trace_id, tc.trace_id);
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        startup_prewarm_tx.closed(),
+    )
+    .await
+    .expect("expected regular turn to cancel unfinished startup prewarm");
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn unfinished_startup_prewarm_falls_back_without_join_or_handle_reuse() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::task::spawn_blocking(move || {
+        started_tx
+            .send(())
+            .expect("startup prewarm test should observe task start");
+        release_rx
+            .recv()
+            .expect("startup prewarm test should release blocked task");
+        let result = Ok(test_model_client_session());
+        let _ = completed_tx.send(());
+        result
+    });
+    started_rx
+        .await
+        .expect("startup prewarm task should start before being claimed");
+    sess.set_session_startup_prewarm(
+        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            handle,
+            std::time::Instant::now(),
+        ),
+    )
+    .await;
+
+    let resolution = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        sess.consume_startup_prewarm_for_regular_turn(&CancellationToken::new()),
+    )
+    .await
+    .expect("ordinary dispatch should not join an unfinished startup prewarm");
+    assert!(matches!(
+        resolution,
+        crate::session_startup_prewarm::SessionStartupPrewarmResolution::Unavailable {
+            status: "not_ready",
+            ..
+        }
+    ));
+
+    release_tx
+        .send(())
+        .expect("startup prewarm test should release blocked task");
+    tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx)
+        .await
+        .expect("detached startup prewarm should be allowed to finish")
+        .expect("detached startup prewarm should report completion");
+    assert!(sess.take_session_startup_prewarm().await.is_none());
+}
+
+#[tokio::test]
+async fn completed_startup_prewarm_is_reused() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let handle = tokio::spawn(async { Ok(test_model_client_session()) });
+    while !handle.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    sess.set_session_startup_prewarm(
+        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            handle,
+            std::time::Instant::now(),
+        ),
+    )
+    .await;
+
+    let resolution = sess
+        .consume_startup_prewarm_for_regular_turn(&CancellationToken::new())
+        .await;
+    assert!(matches!(
+        resolution,
+        crate::session_startup_prewarm::SessionStartupPrewarmResolution::Ready(_)
+    ));
 }
 
 #[tokio::test]
@@ -506,9 +587,9 @@ async fn request_mcp_server_elicitation_auto_accepts_when_auto_deny_is_enabled()
 }
 
 #[tokio::test]
-async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted() {
+async fn interrupting_regular_turn_after_startup_prewarm_fallback_emits_turn_aborted() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
-    let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let (mut startup_prewarm_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
         Ok(test_model_client_session())
@@ -518,7 +599,6 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
         crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
             handle,
             std::time::Instant::now(),
-            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
         ),
     )
     .await;
@@ -537,6 +617,12 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
         first.msg,
         EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) if turn_id == tc.sub_id
     ));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        startup_prewarm_tx.closed(),
+    )
+    .await
+    .expect("expected regular turn to cancel unfinished startup prewarm");
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 
@@ -725,6 +811,7 @@ fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> T
             deferred_mcp_tools: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
         },
         &Default::default(),
     ));
@@ -5727,6 +5814,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
+        terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
@@ -7873,6 +7961,7 @@ where
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
+        terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
@@ -8108,6 +8197,7 @@ async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
     let router = crate::session::turn::built_tools(
         session.as_ref(),
         step_context.as_ref(),
+        &[],
         &CancellationToken::new(),
     )
     .await?;
@@ -11338,6 +11428,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
             mcp_tools: Some(tools),
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
         },
         &Default::default(),
     );

@@ -4,6 +4,7 @@ use codex_extension_api::FunctionCallError;
 use codex_extension_api::JsonToolOutput;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolExecutor;
+use codex_extension_api::ToolExposure;
 use codex_extension_api::ToolName;
 use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolSpec;
@@ -145,6 +146,13 @@ impl ToolExecutor<ToolCall> for GoalToolExecutor {
             GoalToolKind::Get => create_get_goal_tool(),
             GoalToolKind::Create => create_create_goal_tool(),
             GoalToolKind::Update => create_update_goal_tool(),
+        }
+    }
+
+    fn exposure(&self) -> ToolExposure {
+        match (self.accounting_state.has_active_goal(), self.kind) {
+            (true, GoalToolKind::Get | GoalToolKind::Update) => ToolExposure::Direct,
+            _ => ToolExposure::Deferred,
         }
     }
 

@@ -1,4 +1,7 @@
+use crate::context::CompletionCheckpointContext;
 use crate::context::ContextualUserFragment;
+use crate::context::PromptProvenanceSidecar;
+use crate::context::is_startup_contextual_user_fragment;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::normalize;
@@ -6,6 +9,13 @@ use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::turn_context::TurnContext;
+use crate::stable_context::StableContextManifest;
+use crate::stable_context::StableContextTarget;
+use crate::stable_context::project_stable_context;
+use crate::tool_history::ModelGenerationId;
+use crate::tool_history::ToolHistoryCandidate;
+use crate::tool_history::ToolHistoryState;
+use crate::tool_history::ToolHistoryTokenAccounting;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::BaseInstructions;
@@ -32,6 +42,7 @@ use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use codex_utils_output_truncation::truncate_text;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
@@ -39,20 +50,25 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 
-const PREPARED_HISTORY_POLICY_VERSION: u16 = 1;
-const PREPARED_HISTORY_HASH_DOMAIN: &[u8] = b"codex.pending-turn.prepared-history.v1";
+const PREPARED_HISTORY_POLICY_VERSION: u16 = 4;
+const PREPARED_HISTORY_HASH_DOMAIN: &[u8] = b"codex.pending-turn.prepared-history.v4";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedHistoryPolicy {
     version: u16,
     supports_images: bool,
+    stable_context_target: StableContextTarget,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedPromptInput {
     items: Arc<[ResponseItem]>,
+    fallback_items: Arc<[ResponseItem]>,
+    stable_context_manifest: StableContextManifest,
+    prompt_provenance: PromptProvenanceSidecar,
     fingerprint: Option<[u8; 32]>,
     policy: PreparedHistoryPolicy,
+    tool_history_accounting: ToolHistoryTokenAccounting,
 }
 
 impl PreparedPromptInput {
@@ -62,6 +78,18 @@ impl PreparedPromptInput {
 
     pub(crate) fn shared_items(&self) -> Arc<[ResponseItem]> {
         Arc::clone(&self.items)
+    }
+
+    pub(crate) fn shared_fallback_items(&self) -> Arc<[ResponseItem]> {
+        Arc::clone(&self.fallback_items)
+    }
+
+    pub(crate) fn stable_context_manifest(&self) -> &StableContextManifest {
+        &self.stable_context_manifest
+    }
+
+    pub(crate) fn prompt_provenance(&self) -> &PromptProvenanceSidecar {
+        &self.prompt_provenance
     }
 
     pub(crate) fn fingerprint(&self) -> Option<[u8; 32]> {
@@ -86,6 +114,7 @@ pub(crate) struct ContextManager {
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
     projection_revision: u64,
+    tool_history: Arc<ToolHistoryState>,
     prepared_history: Arc<StdMutex<Option<PreparedHistoryCacheEntry>>>,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
@@ -109,6 +138,7 @@ impl ContextManager {
             items: Arc::new(Vec::new()),
             history_version: 0,
             projection_revision: 0,
+            tool_history: Arc::new(ToolHistoryState::default()),
             prepared_history: Arc::new(StdMutex::new(None)),
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
@@ -120,6 +150,10 @@ impl ContextManager {
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
         self.token_info.clone()
+    }
+
+    pub(crate) fn contains_model_generated_item(&self) -> bool {
+        self.items.iter().any(is_model_generated_item)
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -197,12 +231,33 @@ impl ContextManager {
     }
 
     pub(crate) fn prepare_for_prompt(
+        self,
+        input_modalities: &[InputModality],
+    ) -> PreparedPromptInput {
+        self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen)
+    }
+
+    /// Sampling-only preparation entrypoint. Callers must select the target
+    /// explicitly so generic and compaction preparation cannot accidentally
+    /// enable logical projection.
+    pub(crate) fn prepare_for_sampling_prompt(
+        self,
+        input_modalities: &[InputModality],
+        target: StableContextTarget,
+    ) -> PreparedPromptInput {
+        debug_assert_eq!(target, StableContextTarget::Sampling);
+        self.prepare_for_prompt_target(input_modalities, target)
+    }
+
+    fn prepare_for_prompt_target(
         mut self,
         input_modalities: &[InputModality],
+        stable_context_target: StableContextTarget,
     ) -> PreparedPromptInput {
         let policy = PreparedHistoryPolicy {
             version: PREPARED_HISTORY_POLICY_VERSION,
             supports_images: input_modalities.contains(&InputModality::Image),
+            stable_context_target,
         };
         let source_items = Arc::clone(&self.items);
         if crate::latency_switches::history_identity_enabled()
@@ -216,20 +271,35 @@ impl ContextManager {
                         && entry.projection_revision == self.projection_revision
                         && entry.prepared.policy == policy
                 })
-                .map(|entry| entry.prepared.clone())
+                .map(|entry| {
+                    let mut prepared = entry.prepared.clone();
+                    prepared.stable_context_manifest = prepared
+                        .stable_context_manifest
+                        .with_local_reused(/*local_reused*/ true);
+                    prepared
+                })
         {
             return prepared;
         }
         evict_resolved_reasoning(Arc::make_mut(&mut self.items));
         self.normalize_history(input_modalities);
-        let items: Arc<[ResponseItem]> = Arc::from(Arc::unwrap_or_clone(self.items));
+        crate::continuity::deduplicate_prepared_capsules(Arc::make_mut(&mut self.items));
+        let normalized_items: Arc<[ResponseItem]> = Arc::from(Arc::unwrap_or_clone(self.items));
+        let projection = project_stable_context(normalized_items, stable_context_target);
+        let items = projection.items;
+        let prompt_provenance =
+            PromptProvenanceSidecar::from_assembled_items(&items, &projection.manifest);
         let fingerprint = crate::latency_switches::history_identity_enabled()
-            .then(|| prepared_history_fingerprint(&items, policy).ok())
+            .then(|| prepared_history_fingerprint(&items, &projection.manifest, policy).ok())
             .flatten();
         let prepared = PreparedPromptInput {
             items,
+            fallback_items: projection.fallback_items,
+            stable_context_manifest: projection.manifest,
+            prompt_provenance,
             fingerprint,
             policy,
+            tool_history_accounting: ToolHistoryTokenAccounting::default(),
         };
         if crate::latency_switches::history_identity_enabled() && prepared.fingerprint.is_some() {
             *self
@@ -243,6 +313,130 @@ impl ContextManager {
                 });
         }
         prepared
+    }
+
+    pub(crate) fn prepare_for_sampling_prompt_with_completed_tool_projection(
+        self,
+        input_modalities: &[InputModality],
+        target: StableContextTarget,
+    ) -> PreparedPromptInput {
+        debug_assert_eq!(target, StableContextTarget::Sampling);
+        self.prepare_for_prompt_with_completed_tool_projection_target(input_modalities, target)
+    }
+
+    fn prepare_for_prompt_with_completed_tool_projection_target(
+        self,
+        input_modalities: &[InputModality],
+        target: StableContextTarget,
+    ) -> PreparedPromptInput {
+        let tool_history = Arc::clone(&self.tool_history);
+        let mut prepared = self.prepare_for_prompt_target(input_modalities, target);
+        let (items, accounting) = tool_history.project(Arc::clone(&prepared.items));
+        let (fallback_items, _) = tool_history.project(Arc::clone(&prepared.fallback_items));
+        prepared.items = items;
+        prepared.fallback_items = fallback_items;
+        prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
+            &prepared.items,
+            &prepared.stable_context_manifest,
+        );
+        prepared.fingerprint = crate::latency_switches::history_identity_enabled()
+            .then(|| {
+                prepared_history_fingerprint(
+                    &prepared.items,
+                    &prepared.stable_context_manifest,
+                    prepared.policy,
+                )
+                .ok()
+            })
+            .flatten();
+        prepared.tool_history_accounting = accounting;
+        prepared
+    }
+
+    pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
+        self.tool_history = Arc::new(state);
+        self.projection_revision = self.projection_revision.saturating_add(1);
+        self.invalidate_prepared_history();
+    }
+
+    pub(crate) fn tool_history_state(&self) -> ToolHistoryState {
+        (*self.tool_history).clone()
+    }
+
+    pub(crate) fn register_tool_history_candidate(&mut self, candidate: ToolHistoryCandidate) {
+        Arc::make_mut(&mut self.tool_history).register(candidate);
+        self.projection_revision = self.projection_revision.saturating_add(1);
+        self.invalidate_prepared_history();
+    }
+
+    pub(crate) fn mark_tool_history_consumed(
+        &mut self,
+        input: &[ResponseItem],
+        generation: ModelGenerationId,
+    ) -> bool {
+        let changed = Arc::make_mut(&mut self.tool_history).mark_consumed(input, generation);
+        if changed {
+            self.projection_revision = self.projection_revision.saturating_add(1);
+            self.invalidate_prepared_history();
+        }
+        changed
+    }
+
+    /// Prepares the bounded prompt used by completion finalization from this
+    /// immutable history snapshot. Ordinary history, compaction, and persistence
+    /// are untouched: the selected items are normalized and fingerprinted by the
+    /// same `PreparedPromptInput` path as every other model request.
+    pub(crate) fn prepare_for_finalization(
+        &self,
+        input_modalities: &[InputModality],
+        checkpoint: CompletionCheckpointContext,
+        requested_artifact_call_ids: &BTreeSet<String>,
+    ) -> PreparedPromptInput {
+        let exact_artifact_call_ids = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name
+                        == crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME
+                        && requested_artifact_call_ids.contains(call_id) =>
+                {
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+
+        let mut projected = ContextManager::new();
+        let startup = self.items.iter().filter(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "user" => {
+                !content.is_empty() && content.iter().all(is_startup_contextual_user_fragment)
+            }
+            _ => false,
+        });
+        projected.record_items(startup, TruncationPolicy::Bytes(usize::MAX));
+        projected.record_items(
+            [ResponseItem::Message {
+                id: None,
+                role: checkpoint.role().to_string(),
+                content: vec![ContentItem::InputText {
+                    text: checkpoint.render(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }]
+            .iter(),
+            TruncationPolicy::Bytes(usize::MAX),
+        );
+        let exact_artifacts = self.items.iter().filter(|item| match item {
+            ResponseItem::FunctionCall { call_id, .. } => exact_artifact_call_ids.contains(call_id),
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                exact_artifact_call_ids.contains(call_id)
+            }
+            _ => false,
+        });
+        projected.record_items(exact_artifacts, TruncationPolicy::Bytes(usize::MAX));
+        projected.prepare_for_prompt(input_modalities)
     }
 
     /// Returns raw items in the history.
@@ -302,6 +496,7 @@ impl ContextManager {
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
+        Arc::make_mut(&mut self.tool_history).retain_for_history(&items);
         self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);
         self.invalidate_prepared_history();
@@ -594,16 +789,31 @@ impl ContextManager {
         let mut items = entry.prepared.items.to_vec();
         items.extend_from_slice(appended);
         let items: Arc<[ResponseItem]> = items.into();
-        let Ok(fingerprint) = prepared_history_fingerprint(&items, entry.prepared.policy) else {
+        let mut fallback_items = entry.prepared.fallback_items.to_vec();
+        fallback_items.extend_from_slice(appended);
+        let fallback_items: Arc<[ResponseItem]> = fallback_items.into();
+        let Ok(fingerprint) = prepared_history_fingerprint(
+            &items,
+            &entry.prepared.stable_context_manifest,
+            entry.prepared.policy,
+        ) else {
             return;
         };
+        let prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
+            &items,
+            &entry.prepared.stable_context_manifest,
+        );
         *cache = Some(PreparedHistoryCacheEntry {
             source_items: Arc::clone(&self.items),
             projection_revision: self.projection_revision,
             prepared: PreparedPromptInput {
                 items,
+                fallback_items,
+                stable_context_manifest: entry.prepared.stable_context_manifest,
+                prompt_provenance,
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
+                tool_history_accounting: entry.prepared.tool_history_accounting,
             },
         });
     }
@@ -619,12 +829,18 @@ impl ContextManager {
 
 fn prepared_history_fingerprint(
     items: &[ResponseItem],
+    manifest: &StableContextManifest,
     policy: PreparedHistoryPolicy,
 ) -> serde_json::Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(PREPARED_HISTORY_HASH_DOMAIN);
     hasher.update(policy.version.to_be_bytes());
     hasher.update([u8::from(policy.supports_images)]);
+    hasher.update([match policy.stable_context_target {
+        StableContextTarget::Sampling => 1,
+        StableContextTarget::FailOpen => 0,
+    }]);
+    hasher.update(manifest.fingerprint());
     for item in items {
         let encoded = serde_json::to_vec(item)?;
         hasher.update((encoded.len() as u64).to_be_bytes());

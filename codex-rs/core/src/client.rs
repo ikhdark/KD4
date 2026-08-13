@@ -23,6 +23,7 @@
 //! WebSocket prewarm is treated as the first websocket connection attempt for a turn. If it
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -73,14 +74,19 @@ use codex_login::RefreshTokenError;
 use codex_login::UnauthorizedRecovery;
 use codex_login::default_client::create_client_for_route;
 use codex_otel::ModelAttemptOutcome;
+use codex_otel::ModelAttemptProviderBaseline;
 use codex_otel::ModelAttemptRequestKind;
 use codex_otel::ModelAttemptRetryReason;
 use codex_otel::ModelAttemptTelemetry;
 use codex_otel::ModelAttemptTransport;
+use codex_otel::ModelContextComponentTelemetry;
+use codex_otel::ModelPromptContextCategoryTelemetry;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::auth::AuthMode;
 
+use crate::stable_context::StableContextManifest;
+use crate::stable_context::short_hash;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
@@ -118,16 +124,23 @@ use tracing::trace;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::amplification::Kd4DispatchTelemetryContext;
+use crate::amplification::RootAmplificationTelemetry;
 use crate::attestation::AttestationContext;
 use crate::attestation::AttestationProvider;
 use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::context::PromptContextBreakdown;
+use crate::context::PromptContextCategory;
+use crate::context::PromptContextMeasurement;
+use crate::context::PromptProvenanceSidecar;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::turn_timing::TurnLocalPhase;
+use crate::turn_timing::TurnTimingGuard;
 use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::response_event_records_model_output;
 use crate::turn_timing::response_event_records_visible_output;
@@ -141,8 +154,6 @@ use codex_model_provider::AgentIdentitySessionFallback;
 use codex_model_provider::ProviderAuthScope;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
-#[cfg(test)]
-use codex_model_provider_info::DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::error::CodexErr;
@@ -176,15 +187,11 @@ const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
 // period between stream events.
 const COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER: u32 = 4;
 const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
-#[cfg(test)]
-pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
-    Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
-
 /// Independent component serialization adds small JSON wrappers that are represented as envelope
 /// overhead in the final request. This is a diagnostic bound, not a request-building requirement.
 const MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES: i64 = 256;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ModelRequestMeasurements {
     tool_token_count: i64,
     wire_request_bytes: u64,
@@ -199,10 +206,50 @@ struct ModelRequestMeasurements {
     other_injected_context_bytes: u64,
     envelope_overhead_bytes: u64,
     reconciliation_residual_bytes: i64,
+    prompt_context_categories: Vec<PromptContextMeasurement>,
+    fixed_prefix_reuse_eligible: bool,
+    root_task_id: Option<String>,
+    local_projected_occupancy: Option<i64>,
+    effective_provider_occupancy: Option<i64>,
+    estimate_basis: Option<&'static str>,
+    estimate_complete: Option<bool>,
+    checkpoint_tokens: i64,
+    completed_tool_receipt_tokens: i64,
+    raw_tool_output_tokens: i64,
+    completed_call_tokens: i64,
+    continuity_tokens: i64,
+    unique_new_tokens: Option<i64>,
+    amplification_measurement_complete: bool,
+    amplification_null_reason: Option<&'static str>,
+    soft_floor_status: Option<&'static str>,
+    compactions: u64,
+    stable_context_manifest: StableContextManifest,
+    logical_context_tokens: i64,
+    active_component_bytes: u64,
+    local_constructed_bytes: u64,
+    local_reused_bytes: u64,
+    component_cache_hits: u64,
+    baseline_generation: Option<u64>,
+    provider_baseline: ModelAttemptProviderBaseline,
+    previous_response_id_present: bool,
+    projection_savings_eligible: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PromptContextBaseline {
+    prompt_cache_key: Option<String>,
+    category_hashes: BTreeMap<&'static str, [u8; 32]>,
+    ordered_fixed_hashes: Vec<(&'static str, [u8; 32])>,
 }
 
 impl ModelRequestMeasurements {
-    fn for_responses_request(request: &ResponsesApiRequest) -> serde_json::Result<Self> {
+    fn for_responses_request(
+        request: &ResponsesApiRequest,
+        provenance: &PromptProvenanceSidecar,
+        amplification: Option<&Arc<RootAmplificationTelemetry>>,
+        kd4_context: Option<&Kd4DispatchTelemetryContext>,
+        root_task_id: Option<&str>,
+    ) -> serde_json::Result<Self> {
         let logical_request_bytes = serialized_len(request)?;
         let base_instructions_bytes = serialized_len(&request.instructions)?;
         let serialized_tools = request
@@ -213,12 +260,35 @@ impl ModelRequestMeasurements {
         let tool_schemas_bytes = serialized_tools
             .as_ref()
             .map_or(0, |tools| u64::try_from(tools.len()).unwrap_or(u64::MAX));
-        // Response items are intentionally flattened before this boundary. Keep their complete,
-        // mutually-exclusive byte count rather than refactoring construction for provenance.
-        let other_injected_context_bytes = serialized_len(&request.input)?;
-        let classified_and_other = base_instructions_bytes
-            .saturating_add(tool_schemas_bytes)
-            .saturating_add(other_injected_context_bytes);
+        let mut context = PromptContextBreakdown::from_response_items(&request.input, provenance)?;
+        context.record_serialized(
+            PromptContextCategory::BaseSystem,
+            &serde_json::to_vec(&request.instructions)?,
+        );
+        if let Some(serialized_tools) = serialized_tools.as_deref() {
+            context.record_serialized(
+                PromptContextCategory::ToolSchemas,
+                serialized_tools.as_bytes(),
+            );
+        }
+        let conversation_history_bytes = context.bytes(PromptContextCategory::History);
+        let current_input_bytes = context.bytes(PromptContextCategory::TaskInput);
+        let repository_context_bytes = context.bytes(PromptContextCategory::Repository);
+        let memory_bytes = 0;
+        let skills_bytes = context.bytes(PromptContextCategory::Skills);
+        let other_injected_context_bytes = [
+            PromptContextCategory::AgentRole,
+            PromptContextCategory::Plugins,
+            PromptContextCategory::AppDesktop,
+            PromptContextCategory::Collaboration,
+            PromptContextCategory::EnvironmentPermissions,
+            PromptContextCategory::OtherInjected,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, category| {
+            total.saturating_add(context.bytes(category))
+        });
+        let classified_and_other = context.total_bytes();
         let envelope_overhead_bytes = logical_request_bytes.saturating_sub(classified_and_other);
         let reconciliation_residual_bytes = i128::from(logical_request_bytes)
             .saturating_sub(i128::from(classified_and_other))
@@ -229,6 +299,11 @@ impl ModelRequestMeasurements {
             reconciliation_residual_bytes.abs() <= MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES
         );
 
+        let categories = model_visible_category_tokens(&request.input)?;
+        let unique_material = amplification
+            .map(|runtime| measure_unique_request_material(runtime, request))
+            .transpose()?;
+
         Ok(Self {
             tool_token_count: serialized_tools.as_deref().map_or(0, |tools| {
                 i64::try_from(approx_token_count(tools)).unwrap_or(i64::MAX)
@@ -237,16 +312,204 @@ impl ModelRequestMeasurements {
             logical_request_bytes,
             base_instructions_bytes,
             tool_schemas_bytes,
-            conversation_history_bytes: 0,
-            current_input_bytes: 0,
-            repository_context_bytes: 0,
-            memory_bytes: 0,
-            skills_bytes: 0,
+            conversation_history_bytes,
+            current_input_bytes,
+            repository_context_bytes,
+            memory_bytes,
+            skills_bytes,
             other_injected_context_bytes,
             envelope_overhead_bytes,
             reconciliation_residual_bytes,
+            prompt_context_categories: context.measurements(),
+            fixed_prefix_reuse_eligible: false,
+            root_task_id: root_task_id.map(str::to_owned),
+            local_projected_occupancy: kd4_context.map(|context| context.local_projected_occupancy),
+            effective_provider_occupancy: kd4_context
+                .and_then(|context| context.effective_provider_occupancy),
+            estimate_basis: kd4_context.map(|context| context.estimate_basis),
+            estimate_complete: kd4_context.map(|context| context.estimate_complete),
+            checkpoint_tokens: categories.checkpoint_tokens,
+            completed_tool_receipt_tokens: categories.completed_tool_receipt_tokens,
+            raw_tool_output_tokens: categories.raw_tool_output_tokens,
+            completed_call_tokens: categories.completed_call_tokens,
+            continuity_tokens: categories.continuity_tokens,
+            unique_new_tokens: unique_material
+                .as_ref()
+                .and_then(|measurement| measurement.unique_new_tokens),
+            amplification_measurement_complete: unique_material
+                .as_ref()
+                .is_some_and(|measurement| measurement.measurement_complete),
+            amplification_null_reason: unique_material
+                .as_ref()
+                .and_then(|measurement| measurement.null_reason),
+            soft_floor_status: kd4_context.map(|context| context.soft_floor_status),
+            compactions: kd4_context.map_or(0, |context| context.compactions),
+            stable_context_manifest: StableContextManifest::default(),
+            logical_context_tokens: 0,
+            active_component_bytes: 0,
+            local_constructed_bytes: 0,
+            local_reused_bytes: 0,
+            component_cache_hits: 0,
+            baseline_generation: None,
+            provider_baseline: ModelAttemptProviderBaseline::StatelessFull,
+            previous_response_id_present: false,
+            projection_savings_eligible: false,
         })
     }
+
+    fn compare_and_remember_prompt_context(
+        &mut self,
+        baseline: &mut Option<PromptContextBaseline>,
+        prompt_cache_key: Option<&str>,
+    ) {
+        if let Some(previous) = baseline.as_ref() {
+            for measurement in &mut self.prompt_context_categories {
+                measurement.unchanged_from_previous_request = previous
+                    .category_hashes
+                    .get(measurement.category)
+                    .is_some_and(|hash| *hash == measurement.hash);
+            }
+        }
+        let category_hashes = self
+            .prompt_context_categories
+            .iter()
+            .map(|measurement| (measurement.category, measurement.hash))
+            .collect::<BTreeMap<_, _>>();
+        let ordered_fixed_hashes = PromptContextCategory::FIXED_PREFIX
+            .into_iter()
+            .filter_map(|category| {
+                category_hashes
+                    .get(category.as_str())
+                    .copied()
+                    .map(|hash| (category.as_str(), hash))
+            })
+            .collect::<Vec<_>>();
+        self.fixed_prefix_reuse_eligible = baseline.as_ref().is_some_and(|previous| {
+            previous.prompt_cache_key.as_deref() == prompt_cache_key
+                && previous.ordered_fixed_hashes == ordered_fixed_hashes
+        });
+        *baseline = Some(PromptContextBaseline {
+            prompt_cache_key: prompt_cache_key.map(str::to_string),
+            category_hashes,
+            ordered_fixed_hashes,
+        });
+    }
+
+    fn record_stable_context(
+        &mut self,
+        manifest: &StableContextManifest,
+        baseline_generation: Option<u64>,
+        provider_baseline: ModelAttemptProviderBaseline,
+        previous_response_id_present: bool,
+    ) {
+        self.stable_context_manifest = manifest.clone();
+        self.logical_context_tokens = manifest.projected_tokens();
+        self.active_component_bytes = manifest.projected_bytes();
+        self.local_constructed_bytes = manifest
+            .components()
+            .iter()
+            .filter(|component| component.active && !component.local_reused)
+            .map(|component| component.identity.serialized_bytes)
+            .fold(0_u64, u64::saturating_add);
+        self.local_reused_bytes = manifest
+            .components()
+            .iter()
+            .filter(|component| component.active && component.local_reused)
+            .map(|component| component.identity.serialized_bytes)
+            .fold(0_u64, u64::saturating_add);
+        self.component_cache_hits = u64::try_from(
+            manifest
+                .components()
+                .iter()
+                .filter(|component| component.active && component.local_reused)
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        self.baseline_generation = baseline_generation;
+        self.provider_baseline = provider_baseline;
+        self.previous_response_id_present = previous_response_id_present;
+        self.projection_savings_eligible = manifest.projection_enabled()
+            && !manifest.fail_open()
+            && provider_baseline != ModelAttemptProviderBaseline::FailOpenStaleRetained;
+    }
+}
+
+#[derive(Debug, Default)]
+struct ModelVisibleCategoryTokens {
+    checkpoint_tokens: i64,
+    completed_tool_receipt_tokens: i64,
+    raw_tool_output_tokens: i64,
+    completed_call_tokens: i64,
+    continuity_tokens: i64,
+}
+
+fn model_visible_category_tokens(
+    input: &[ResponseItem],
+) -> serde_json::Result<ModelVisibleCategoryTokens> {
+    let mut totals = ModelVisibleCategoryTokens::default();
+    for item in input {
+        let encoded = serde_json::to_string(item)?;
+        let tokens = i64::try_from(approx_token_count(&encoded)).unwrap_or(i64::MAX);
+        if encoded.contains("<task_checkpoint_v1>") {
+            totals.checkpoint_tokens = totals.checkpoint_tokens.saturating_add(tokens);
+        }
+        if encoded.contains("<kd4_continuity_capsule_v1>") {
+            totals.continuity_tokens = totals.continuity_tokens.saturating_add(tokens);
+        }
+        if matches!(
+            item,
+            ResponseItem::FunctionCall { .. }
+                | ResponseItem::CustomToolCall { .. }
+                | ResponseItem::LocalShellCall { .. }
+                | ResponseItem::ToolSearchCall { .. }
+        ) {
+            totals.completed_call_tokens = totals.completed_call_tokens.saturating_add(tokens);
+        }
+        if matches!(
+            item,
+            ResponseItem::FunctionCallOutput { .. }
+                | ResponseItem::CustomToolCallOutput { .. }
+                | ResponseItem::ToolSearchOutput { .. }
+        ) {
+            if model_visible_output_is_receipt(&encoded) {
+                totals.completed_tool_receipt_tokens =
+                    totals.completed_tool_receipt_tokens.saturating_add(tokens);
+            } else {
+                totals.raw_tool_output_tokens =
+                    totals.raw_tool_output_tokens.saturating_add(tokens);
+            }
+        }
+    }
+    Ok(totals)
+}
+
+fn model_visible_output_is_receipt(encoded: &str) -> bool {
+    encoded.contains("exact output retained as artifact")
+        || encoded.contains("artifact_ref")
+        || encoded.contains("artifactReference")
+        || encoded.contains("projection_receipt")
+}
+
+fn measure_unique_request_material(
+    runtime: &RootAmplificationTelemetry,
+    request: &ResponsesApiRequest,
+) -> serde_json::Result<crate::amplification::UniqueMaterialMeasurement> {
+    let instructions = serde_json::to_vec(&request.instructions)?;
+    let input = request
+        .input
+        .iter()
+        .map(serde_json::to_vec)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let tools = request.tools.as_ref().map(serde_json::to_vec).transpose()?;
+    let text = serde_json::to_vec(&request.text)?;
+    let mut units = Vec::with_capacity(input.len().saturating_add(3));
+    units.push(("base_instructions", instructions.as_slice()));
+    units.extend(input.iter().map(|item| ("response_item", item.as_slice())));
+    if let Some(tools) = tools.as_ref() {
+        units.push(("tool_schemas", tools.as_slice()));
+    }
+    units.push(("output_schema", text.as_slice()));
+    Ok(runtime.measure_units(units))
 }
 
 fn serialized_len(value: &impl serde::Serialize) -> serde_json::Result<u64> {
@@ -289,13 +552,16 @@ impl ModelAttemptClock {
     }
 
     fn mark_dispatch_ready(&self) {
-        self.offsets.lock().unwrap().dispatch_ready_us = self.elapsed_us();
+        self.offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dispatch_ready_us = self.elapsed_us();
     }
 
     fn mark_stream_established(&self) {
         self.offsets
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stream_established_us
             .get_or_insert_with(|| self.elapsed_us());
     }
@@ -303,7 +569,7 @@ impl ModelAttemptClock {
     fn mark_first_provider_event(&self) {
         self.offsets
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .first_provider_event_us
             .get_or_insert_with(|| self.elapsed_us());
     }
@@ -311,7 +577,7 @@ impl ModelAttemptClock {
     fn mark_first_model_output(&self) {
         self.offsets
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .first_model_output_us
             .get_or_insert_with(|| self.elapsed_us());
     }
@@ -319,7 +585,7 @@ impl ModelAttemptClock {
     fn mark_first_visible_output(&self) {
         self.offsets
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .first_visible_output_us
             .get_or_insert_with(|| self.elapsed_us());
     }
@@ -335,10 +601,14 @@ struct ModelAttemptGuard {
     transport: ModelAttemptTransport,
     measurements: ModelRequestMeasurements,
     clock: ModelAttemptClock,
+    fresh_response_id_established: bool,
     emitted: bool,
 }
 
 impl ModelAttemptGuard {
+    // These fields are the complete dimensions of one attempt telemetry event;
+    // grouping them would only obscure their call-site correspondence.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_telemetry: SessionTelemetry,
         sampling_request_id: &str,
@@ -359,6 +629,7 @@ impl ModelAttemptGuard {
             transport,
             measurements,
             clock,
+            fresh_response_id_established: false,
             emitted: false,
         }
     }
@@ -369,6 +640,12 @@ impl ModelAttemptGuard {
 
     fn tool_token_count(&self) -> i64 {
         self.measurements.tool_token_count
+    }
+
+    fn mark_fresh_response_id_established(&mut self, response_id: &str) {
+        self.fresh_response_id_established = !response_id.is_empty()
+            && self.transport == ModelAttemptTransport::ResponsesWebsocket
+            && self.measurements.provider_baseline == ModelAttemptProviderBaseline::FreshFullReplay;
     }
 
     fn finish(
@@ -385,8 +662,14 @@ impl ModelAttemptGuard {
             .zip(cached_input_tokens)
             .and_then(|(input, cached)| input.checked_sub(cached))
             .filter(|uncached| *uncached >= 0);
-        let offsets = self.clock.offsets.lock().unwrap();
+        let offsets = self
+            .clock
+            .offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let completed_us = self.clock.elapsed_us();
+        let fresh_response_id_established =
+            outcome == ModelAttemptOutcome::Success && self.fresh_response_id_established;
         debug_assert!(attempt_offsets_are_nondecreasing(&offsets, completed_us));
         self.session_telemetry
             .model_attempt_completed(&ModelAttemptTelemetry {
@@ -397,6 +680,11 @@ impl ModelAttemptGuard {
                 outcome,
                 request_kind: self.request_kind,
                 transport: self.transport,
+                baseline_generation: self.measurements.baseline_generation,
+                provider_baseline: self.measurements.provider_baseline,
+                previous_response_id_present: self.measurements.previous_response_id_present,
+                projection_savings_eligible: self.measurements.projection_savings_eligible,
+                fresh_response_id_established,
                 input_tokens,
                 cached_input_tokens,
                 uncached_input_tokens,
@@ -413,6 +701,47 @@ impl ModelAttemptGuard {
                 other_injected_context_bytes: self.measurements.other_injected_context_bytes,
                 envelope_overhead_bytes: self.measurements.envelope_overhead_bytes,
                 reconciliation_residual_bytes: self.measurements.reconciliation_residual_bytes,
+                prompt_context_categories: self
+                    .measurements
+                    .prompt_context_categories
+                    .iter()
+                    .map(|measurement| ModelPromptContextCategoryTelemetry {
+                        category: measurement.category.to_string(),
+                        serialized_bytes: measurement.serialized_bytes,
+                        approx_tokens: measurement.estimated_tokens,
+                        sha256: measurement.sha256.clone(),
+                        unchanged_from_previous_request: measurement
+                            .unchanged_from_previous_request,
+                    })
+                    .collect(),
+                fixed_prefix_reuse_eligible: self.measurements.fixed_prefix_reuse_eligible,
+                logical_context_tokens: self.measurements.logical_context_tokens,
+                active_component_bytes: self.measurements.active_component_bytes,
+                local_constructed_bytes: self.measurements.local_constructed_bytes,
+                local_reused_bytes: self.measurements.local_reused_bytes,
+                component_cache_hits: self.measurements.component_cache_hits,
+                root_task_id: self.measurements.root_task_id.clone(),
+                measurement_window_id: self.sampling_request_id.clone(),
+                local_projected_occupancy: self.measurements.local_projected_occupancy,
+                effective_provider_occupancy: self.measurements.effective_provider_occupancy,
+                estimate_basis: self.measurements.estimate_basis.map(str::to_owned),
+                estimate_complete: self.measurements.estimate_complete,
+                checkpoint_tokens: self.measurements.checkpoint_tokens,
+                completed_tool_receipt_tokens: self.measurements.completed_tool_receipt_tokens,
+                raw_tool_output_tokens: self.measurements.raw_tool_output_tokens,
+                completed_call_tokens: self.measurements.completed_call_tokens,
+                schema_tokens: self.measurements.tool_token_count,
+                continuity_tokens: self.measurements.continuity_tokens,
+                unique_new_tokens: self.measurements.unique_new_tokens,
+                amplification_measurement_complete: self
+                    .measurements
+                    .amplification_measurement_complete,
+                amplification_null_reason: self
+                    .measurements
+                    .amplification_null_reason
+                    .map(str::to_owned),
+                soft_floor_status: self.measurements.soft_floor_status.map(str::to_owned),
+                compactions: self.measurements.compactions,
                 dispatch_ready_us: offsets.dispatch_ready_us,
                 stream_established_us: offsets.stream_established_us,
                 first_provider_event_us: offsets.first_provider_event_us,
@@ -420,6 +749,28 @@ impl ModelAttemptGuard {
                 first_visible_output_us: offsets.first_visible_output_us,
                 completed_us,
             });
+        for component in self.measurements.stable_context_manifest.components() {
+            self.session_telemetry
+                .model_context_component(&ModelContextComponentTelemetry {
+                    sampling_request_id: self.sampling_request_id.clone(),
+                    attempt_id: self.attempt_id.clone(),
+                    retry_index: self.retry_index,
+                    kind: component.kind.as_str().to_string(),
+                    contract_version: component.identity.contract_version,
+                    semantic_id: component.identity.semantic_id.clone(),
+                    content_hash: short_hash(&component.identity.content_hash),
+                    serialized_bytes: component.identity.serialized_bytes,
+                    approx_tokens: component.identity.approx_tokens,
+                    active: component.active,
+                    disposition: component.disposition.as_str().to_string(),
+                    local_reused: component.local_reused,
+                    baseline_generation: self.measurements.baseline_generation,
+                    provider_baseline: self.measurements.provider_baseline,
+                    previous_response_id_present: self.measurements.previous_response_id_present,
+                    projection_savings_eligible: self.measurements.projection_savings_eligible,
+                    fresh_response_id_established,
+                });
+        }
     }
 }
 
@@ -511,8 +862,33 @@ struct ModelClientState {
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
-    cached_websocket_session: StdMutex<WebsocketSession>,
+    cached_websocket_transport: StdMutex<WebsocketTransportCache>,
     request_schema_cache: StdMutex<RequestSchemaSerializationCache>,
+}
+
+#[derive(Debug, Default)]
+struct WebsocketTransportCache {
+    epoch: u64,
+    session: Option<WebsocketSession>,
+}
+
+impl WebsocketTransportCache {
+    fn publish_if_current(
+        &mut self,
+        permit: WebsocketCachePublicationPermit,
+        websocket_session: WebsocketSession,
+    ) -> bool {
+        if self.epoch != permit.epoch || self.session.is_some() {
+            return false;
+        }
+        self.session = Some(websocket_session);
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WebsocketCachePublicationPermit {
+    epoch: u64,
 }
 
 const REQUEST_SCHEMA_CACHE_CAPACITY: usize = 8;
@@ -615,10 +991,15 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    websocket_cache_publication: Option<WebsocketCachePublicationPermit>,
+    prepared_startup_websocket_attempt: Option<PreparedStartupWebsocketAttempt>,
     /// Whether the stream currently handled by this session used the WebSocket transport.
     last_stream_was_websocket: bool,
     turn_timing: Option<Arc<TurnTimingState>>,
     logical_sampling_request_count: u32,
+    amplification_telemetry: Option<Arc<RootAmplificationTelemetry>>,
+    kd4_dispatch_telemetry: Option<Kd4DispatchTelemetryContext>,
+    prompt_context_baseline: Option<PromptContextBaseline>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -641,6 +1022,7 @@ struct LastResponse {
 const WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION: u16 = 1;
 const WEBSOCKET_HISTORY_HASH_DOMAIN: &[u8] = b"codex.websocket.history.v1";
 const WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN: &[u8] = b"codex.websocket.request-properties.v1";
+const WEBSOCKET_SETUP_FINGERPRINT_DOMAIN: &[u8] = b"codex.websocket.setup.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CanonicalPrefixHash {
@@ -689,18 +1071,31 @@ struct WebsocketHistoryBaseline {
     generation: u64,
     request_prefix: CanonicalPrefixHash,
     request_properties_fingerprint: [u8; 32],
+    stable_context_fingerprint: [u8; 32],
+    provider_response_id_established: bool,
     normalization_policy_version: u16,
 }
 
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    setup_fingerprint: Option<WebsocketSetupFingerprint>,
     last_request: Option<ResponsesApiRequest>,
     last_request_history: Option<WebsocketHistoryBaseline>,
     next_history_generation: u64,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
     connection_reused: StdMutex<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WebsocketSetupFingerprint([u8; 32]);
+
+struct PreparedStartupWebsocketAttempt {
+    client_setup: CurrentClientSetup,
+    request: ResponsesApiRequest,
+    transport_readiness_guard: Option<TurnTimingGuard>,
+    request_transformation_guard: Option<TurnTimingGuard>,
 }
 
 fn responses_request_properties_fingerprint(
@@ -720,6 +1115,34 @@ fn responses_request_properties_fingerprint(
     hasher.update((serialized.len() as u64).to_be_bytes());
     hasher.update(serialized);
     Ok(hasher.finalize().into())
+}
+
+fn websocket_setup_fingerprint(
+    provider: &ApiProvider,
+    api_auth: &dyn AuthProvider,
+) -> Option<WebsocketSetupFingerprint> {
+    let websocket_url = provider.websocket_url_for_path("responses").ok()?;
+    let mut headers = provider.headers.clone();
+    api_auth.add_auth_headers(&mut headers);
+    let mut canonical_headers = headers
+        .iter()
+        .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    canonical_headers.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    hasher.update(WEBSOCKET_SETUP_FINGERPRINT_DOMAIN);
+    hasher.update((provider.name.len() as u64).to_be_bytes());
+    hasher.update(provider.name.as_bytes());
+    hasher.update((websocket_url.as_str().len() as u64).to_be_bytes());
+    hasher.update(websocket_url.as_str().as_bytes());
+    for (name, value) in canonical_headers {
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name);
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    Some(WebsocketSetupFingerprint(hasher.finalize().into()))
 }
 
 // This is intentionally not a `PartialEq` implementation: request equality includes `input` and
@@ -781,6 +1204,48 @@ fn responses_request_properties_match(
 }
 
 impl WebsocketSession {
+    async fn is_compatible_startup_prewarm(
+        &self,
+        setup_fingerprint: Option<WebsocketSetupFingerprint>,
+        request: &ResponsesApiRequest,
+        stable_context_fingerprint: [u8; 32],
+    ) -> bool {
+        let (Some(setup_fingerprint), Some(connection), Some(previous_request), Some(baseline)) = (
+            setup_fingerprint,
+            self.connection.as_ref(),
+            self.last_request.as_ref(),
+            self.last_request_history.as_ref(),
+        ) else {
+            return false;
+        };
+        if self.setup_fingerprint != Some(setup_fingerprint)
+            || connection.is_closed().await
+            || !self.last_response_from_untraced_warmup
+            || self.last_response_rx.is_none()
+            || baseline.normalization_policy_version
+                != WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION
+            || baseline.stable_context_fingerprint != stable_context_fingerprint
+            || !responses_request_properties_match(previous_request, request)
+            || responses_request_properties_fingerprint(request).ok()
+                != Some(baseline.request_properties_fingerprint)
+            || request.input.len() < baseline.request_prefix.item_count
+        {
+            return false;
+        }
+        CanonicalPrefixHash::from_items(&request.input[..baseline.request_prefix.item_count]).ok()
+            == Some(baseline.request_prefix)
+    }
+
+    fn into_transport_only(mut self) -> Self {
+        self.last_request = None;
+        self.last_request_history = None;
+        self.next_history_generation = 0;
+        self.last_response_rx = None;
+        self.last_response_from_untraced_warmup = false;
+        self.set_connection_reused(/*connection_reused*/ false);
+        self
+    }
+
     fn set_connection_reused(&self, connection_reused: bool) {
         *self
             .connection_reused
@@ -872,7 +1337,7 @@ impl ModelClient {
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
-                cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                cached_websocket_transport: StdMutex::new(WebsocketTransportCache::default()),
                 request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
             }),
             agent_identity_policy,
@@ -900,12 +1365,37 @@ impl ModelClient {
     /// This constructor does not perform network I/O itself; the session opens a websocket lazily
     /// when the first stream request is issued.
     pub fn new_session(&self) -> ModelClientSession {
+        let (websocket_session, websocket_cache_publication) =
+            self.take_cached_websocket_transport();
         ModelClientSession {
             client: self.clone(),
-            websocket_session: self.take_cached_websocket_session(),
+            websocket_session,
+            websocket_cache_publication: Some(websocket_cache_publication),
+            prepared_startup_websocket_attempt: None,
             last_stream_was_websocket: false,
             turn_timing: None,
             logical_sampling_request_count: 0,
+            amplification_telemetry: None,
+            kd4_dispatch_telemetry: None,
+            prompt_context_baseline: None,
+            turn_state: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Creates a session whose transport may only become reusable by being adopted by a normal
+    /// turn-scoped session. A losing or cancelled speculative owner must never publish on drop.
+    pub(crate) fn new_speculative_session(&self) -> ModelClientSession {
+        ModelClientSession {
+            client: self.clone(),
+            websocket_session: WebsocketSession::default(),
+            websocket_cache_publication: None,
+            prepared_startup_websocket_attempt: None,
+            last_stream_was_websocket: false,
+            turn_timing: None,
+            logical_sampling_request_count: 0,
+            amplification_telemetry: None,
+            kd4_dispatch_telemetry: None,
+            prompt_context_baseline: None,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -914,21 +1404,36 @@ impl ModelClient {
         self.state.provider.auth_manager()
     }
 
-    fn take_cached_websocket_session(&self) -> WebsocketSession {
-        let mut cached_websocket_session = self
+    fn take_cached_websocket_transport(
+        &self,
+    ) -> (WebsocketSession, WebsocketCachePublicationPermit) {
+        let mut cache = self
             .state
-            .cached_websocket_session
+            .cached_websocket_transport
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *cached_websocket_session)
+        (
+            cache.session.take().unwrap_or_default(),
+            WebsocketCachePublicationPermit { epoch: cache.epoch },
+        )
     }
 
-    fn store_cached_websocket_session(&self, websocket_session: WebsocketSession) {
-        *self
+    fn try_store_cached_websocket_transport(
+        &self,
+        permit: WebsocketCachePublicationPermit,
+        websocket_session: WebsocketSession,
+    ) -> bool {
+        if websocket_session.connection.is_none()
+            || self.state.disable_websockets.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let mut cache = self
             .state
-            .cached_websocket_session
+            .cached_websocket_transport
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.publish_if_current(permit, websocket_session.into_transport_only())
     }
 
     pub(crate) fn force_http_fallback(&self, session_telemetry: &SessionTelemetry) -> bool {
@@ -944,7 +1449,13 @@ impl ModelClient {
             );
         }
 
-        self.store_cached_websocket_session(WebsocketSession::default());
+        let mut cache = self
+            .state
+            .cached_websocket_transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.epoch = cache.epoch.wrapping_add(1);
+        cache.session = None;
         activated
     }
 
@@ -1327,7 +1838,35 @@ impl ModelClient {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<ResponsesApiRequest> {
-        let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+        self.build_responses_request_with_input(
+            provider,
+            prompt,
+            model_info,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            /* use_stable_context_fallback */ false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_responses_request_with_input(
+        &self,
+        provider: &codex_api::Provider,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        use_stable_context_fallback: bool,
+    ) -> Result<ResponsesApiRequest> {
+        let mut input = if use_stable_context_fallback {
+            prompt.get_formatted_fallback_input_for_request(model_info.use_responses_lite)
+        } else {
+            prompt.get_formatted_input_for_request(model_info.use_responses_lite)
+        };
         let is_openai = self.state.provider.info().is_openai();
         if !is_openai {
             Arc::make_mut(&mut input)
@@ -1619,15 +2158,117 @@ impl ModelClient {
 
 impl Drop for ModelClientSession {
     fn drop(&mut self) {
+        let Some(permit) = self.websocket_cache_publication.take() else {
+            return;
+        };
         let websocket_session = std::mem::take(&mut self.websocket_session);
         self.client
-            .store_cached_websocket_session(websocket_session);
+            .try_store_cached_websocket_transport(permit, websocket_session);
     }
 }
 
 impl ModelClientSession {
+    pub(crate) fn set_kd4_dispatch_telemetry(
+        &mut self,
+        runtime: Arc<RootAmplificationTelemetry>,
+        context: Kd4DispatchTelemetryContext,
+    ) {
+        self.amplification_telemetry = Some(runtime);
+        self.kd4_dispatch_telemetry = Some(context);
+    }
+
+    pub(crate) fn clear_kd4_dispatch_telemetry(&mut self) {
+        self.amplification_telemetry = None;
+        self.kd4_dispatch_telemetry = None;
+    }
+
+    pub(crate) fn provider_history_baseline_generation(&self) -> Option<u64> {
+        self.websocket_session
+            .last_request_history
+            .as_ref()
+            .filter(|baseline| baseline.provider_response_id_established)
+            .map(|baseline| baseline.generation)
+    }
+
+    pub(crate) fn provider_history_local_occupancy_baseline(&self) -> Option<i64> {
+        self.websocket_session
+            .last_request_history
+            .as_ref()
+            .filter(|baseline| baseline.provider_response_id_established)?;
+        self.kd4_dispatch_telemetry
+            .as_ref()
+            .map(|context| context.local_projected_occupancy)
+    }
+
+    pub(crate) fn revoke_cache_publication(&mut self) {
+        self.websocket_cache_publication = None;
+    }
+
     pub(crate) fn set_turn_timing(&mut self, turn_timing: Arc<TurnTimingState>) {
         self.turn_timing = Some(turn_timing);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_startup_prewarm(
+        &mut self,
+        mut prewarmed_session: ModelClientSession,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> Result<bool> {
+        prewarmed_session.revoke_cache_publication();
+        if !Arc::ptr_eq(&self.client.state, &prewarmed_session.client.state)
+            || !self.client.responses_websocket_enabled()
+        {
+            return Ok(false);
+        }
+
+        let transport_readiness_guard = self
+            .turn_timing
+            .as_ref()
+            .map(|timing| timing.begin_local_phase(TurnLocalPhase::TransportReadiness));
+        let client_setup = self.client.current_client_setup().await?;
+        let request_transformation_guard = self
+            .turn_timing
+            .as_ref()
+            .map(|timing| timing.begin_local_phase(TurnLocalPhase::RequestTransformation));
+        let request = self.client.build_responses_request(
+            &client_setup.api_provider,
+            prompt,
+            model_info,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+        )?;
+        let setup_fingerprint =
+            websocket_setup_fingerprint(&client_setup.api_provider, client_setup.api_auth.as_ref());
+        let compatible = prewarmed_session
+            .websocket_session
+            .is_compatible_startup_prewarm(
+                setup_fingerprint,
+                &request,
+                prompt.stable_context_manifest.fingerprint(),
+            )
+            .await;
+
+        self.prepared_startup_websocket_attempt = Some(PreparedStartupWebsocketAttempt {
+            client_setup,
+            request,
+            transport_readiness_guard,
+            request_transformation_guard,
+        });
+        if !compatible {
+            return Ok(false);
+        }
+
+        let adopted_session = std::mem::take(&mut prewarmed_session.websocket_session);
+        let replaced_session = std::mem::replace(&mut self.websocket_session, adopted_session);
+        drop(replaced_session);
+        Ok(true)
     }
 
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
@@ -1636,6 +2277,7 @@ impl ModelClientSession {
 
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
+        self.websocket_session.setup_fingerprint = None;
         self.invalidate_incremental_history("websocket reset");
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
@@ -1665,7 +2307,11 @@ impl ModelClientSession {
             .max(1);
     }
 
-    fn remember_request_history(&mut self, request: &ResponsesApiRequest) {
+    fn remember_request_history(
+        &mut self,
+        request: &ResponsesApiRequest,
+        stable_context_fingerprint: [u8; 32],
+    ) {
         let request_prefix = CanonicalPrefixHash::from_items(&request.input);
         let request_properties_fingerprint = responses_request_properties_fingerprint(request);
         self.websocket_session.next_history_generation = self
@@ -1681,6 +2327,8 @@ impl ModelClientSession {
                         generation,
                         request_prefix,
                         request_properties_fingerprint,
+                        stable_context_fingerprint,
+                        provider_response_id_established: false,
                         normalization_policy_version:
                             WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION,
                     })
@@ -1879,20 +2527,45 @@ impl ModelClientSession {
     }
 
     fn get_last_response(&mut self) -> Option<LastResponse> {
-        self.websocket_session
+        let response = self
+            .websocket_session
             .last_response_rx
             .take()
             .and_then(|mut receiver| match receiver.try_recv() {
                 Ok(last_response) => Some(last_response),
                 Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => None,
-            })
+            });
+        if response
+            .as_ref()
+            .is_some_and(|last_response| !last_response.response_id.is_empty())
+            && let Some(baseline) = self.websocket_session.last_request_history.as_mut()
+        {
+            baseline.provider_response_id_established = true;
+        }
+        response
     }
 
     fn prepare_websocket_request(
         &mut self,
         payload: ResponseCreateWsRequest,
         request: &ResponsesApiRequest,
+        stable_context_fingerprint: [u8; 32],
     ) -> (ResponsesWsRequest, bool) {
+        let baseline_is_stale = self
+            .websocket_session
+            .last_request
+            .as_ref()
+            .is_some_and(|_| {
+                self.websocket_session
+                    .last_request_history
+                    .as_ref()
+                    .is_none_or(|baseline| {
+                        baseline.stable_context_fingerprint != stable_context_fingerprint
+                    })
+            });
+        if baseline_is_stale {
+            self.invalidate_incremental_history("stable context changed");
+        }
         let Some(last_response) = self.get_last_response() else {
             return (ResponsesWsRequest::ResponseCreate(payload), false);
         };
@@ -1941,6 +2614,8 @@ impl ModelClientSession {
                 "failed to build websocket prewarm client setup: {err}"
             ))
         })?;
+        let setup_fingerprint =
+            websocket_setup_fingerprint(&client_setup.api_provider, client_setup.api_auth.as_ref());
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             client_setup.api_auth.as_ref(),
@@ -1969,6 +2644,7 @@ impl ModelClientSession {
             Err(err) => return Err(err),
         };
         self.websocket_session.connection = Some(connection);
+        self.websocket_session.setup_fingerprint = setup_fingerprint;
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
         Ok(())
@@ -1998,8 +2674,13 @@ impl ModelClientSession {
             auth_context,
             request_route_telemetry,
         } = params;
+        let setup_fingerprint = websocket_setup_fingerprint(&api_provider, api_auth.as_ref());
         let needs_new = match self.websocket_session.connection.as_ref() {
-            Some(conn) => conn.is_closed().await,
+            Some(conn) => {
+                setup_fingerprint.is_none()
+                    || self.websocket_session.setup_fingerprint != setup_fingerprint
+                    || conn.is_closed().await
+            }
             None => true,
         };
 
@@ -2026,6 +2707,7 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.setup_fingerprint = setup_fingerprint;
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
         } else {
@@ -2070,7 +2752,7 @@ impl ModelClientSession {
         )
     )]
     async fn stream_responses_api(
-        &self,
+        &mut self,
         prompt: &Prompt,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
@@ -2140,7 +2822,23 @@ impl ModelClientSession {
             drop(request_transformation_guard);
             let request_session_telemetry =
                 session_telemetry_for_request(session_telemetry, &request);
-            let measurements = ModelRequestMeasurements::for_responses_request(&request)?;
+            let mut measurements = ModelRequestMeasurements::for_responses_request(
+                &request,
+                &prompt.prompt_provenance,
+                self.amplification_telemetry.as_ref(),
+                self.kd4_dispatch_telemetry.as_ref(),
+                Some(&responses_metadata.session_id),
+            )?;
+            measurements.record_stable_context(
+                &prompt.stable_context_manifest,
+                /*baseline_generation*/ None,
+                ModelAttemptProviderBaseline::StatelessFull,
+                /*previous_response_id_present*/ false,
+            );
+            measurements.compare_and_remember_prompt_context(
+                &mut self.prompt_context_baseline,
+                request.prompt_cache_key.as_deref(),
+            );
             let mut attempt = ModelAttemptGuard::new(
                 request_session_telemetry.clone(),
                 sampling_request_id,
@@ -2271,30 +2969,56 @@ impl ModelClientSession {
         loop {
             // `generate=false` warmup is transport setup rather than a sampling attempt.
             let attempt_clock = (!warmup).then(ModelAttemptClock::new);
-            let transport_readiness_guard = self
-                .turn_timing
-                .as_ref()
-                .map(|timing| timing.begin_local_phase(TurnLocalPhase::TransportReadiness));
-            let client_setup = self.client.current_client_setup().await?;
+            let prepared_attempt = if warmup {
+                None
+            } else {
+                self.prepared_startup_websocket_attempt.take()
+            };
+            let (client_setup, request, transport_readiness_guard, request_transformation_guard) =
+                match prepared_attempt {
+                    Some(PreparedStartupWebsocketAttempt {
+                        client_setup,
+                        request,
+                        transport_readiness_guard,
+                        request_transformation_guard,
+                    }) => (
+                        client_setup,
+                        request,
+                        transport_readiness_guard,
+                        request_transformation_guard,
+                    ),
+                    None => {
+                        let transport_readiness_guard = self.turn_timing.as_ref().map(|timing| {
+                            timing.begin_local_phase(TurnLocalPhase::TransportReadiness)
+                        });
+                        let client_setup = self.client.current_client_setup().await?;
+                        let request_transformation_guard =
+                            self.turn_timing.as_ref().map(|timing| {
+                                timing.begin_local_phase(TurnLocalPhase::RequestTransformation)
+                            });
+                        let request = self.client.build_responses_request(
+                            &client_setup.api_provider,
+                            prompt,
+                            model_info,
+                            effort.clone(),
+                            summary,
+                            service_tier.clone(),
+                            responses_metadata,
+                        )?;
+                        (
+                            client_setup,
+                            request,
+                            transport_readiness_guard,
+                            request_transformation_guard,
+                        )
+                    }
+                };
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
             );
-            let request_transformation_guard = self
-                .turn_timing
-                .as_ref()
-                .map(|timing| timing.begin_local_phase(TurnLocalPhase::RequestTransformation));
-            let request = self.client.build_responses_request(
-                &client_setup.api_provider,
-                prompt,
-                model_info,
-                effort.clone(),
-                summary,
-                service_tier.clone(),
-                responses_metadata,
-            )?;
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
                 session_telemetry.clone()
@@ -2322,7 +3046,7 @@ impl ModelClientSession {
             match self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
-                    api_provider: client_setup.api_provider,
+                    api_provider: client_setup.api_provider.clone(),
                     api_auth: client_setup.api_auth,
                     responses_metadata,
                     auth_context: request_auth_context,
@@ -2359,8 +3083,60 @@ impl ModelClientSession {
                 .turn_timing
                 .as_ref()
                 .map(|timing| timing.begin_local_phase(TurnLocalPhase::RequestTransformation));
-            let (mut ws_request, previous_response_id_from_untraced_warmup) =
-                self.prepare_websocket_request(ws_payload, &request);
+            let (mut ws_request, previous_response_id_from_untraced_warmup) = self
+                .prepare_websocket_request(
+                    ws_payload,
+                    &request,
+                    prompt.stable_context_manifest.fingerprint(),
+                );
+            let inherited_stable_context_matches = self
+                .websocket_session
+                .last_request_history
+                .as_ref()
+                .is_some_and(|baseline| {
+                    baseline.stable_context_fingerprint
+                        == prompt.stable_context_manifest.fingerprint()
+                });
+            let ResponsesWsRequest::ResponseCreate(final_payload) = &mut ws_request;
+            if final_payload.previous_response_id.is_some() && !inherited_stable_context_matches {
+                trace!("discarding unproven provider inheritance before stable-context dispatch");
+                self.invalidate_incremental_history("stable context inheritance unproven");
+                final_payload.previous_response_id = None;
+                let mut fallback_request = self.client.build_responses_request_with_input(
+                    &client_setup.api_provider,
+                    prompt,
+                    model_info,
+                    effort.clone(),
+                    summary,
+                    service_tier.clone(),
+                    responses_metadata,
+                    /* use_stable_context_fallback */ true,
+                )?;
+                self.client.prepare_response_items_for_request(
+                    &mut fallback_request.input,
+                    fallback_request.store,
+                );
+                final_payload.input = fallback_request.input;
+            }
+            // `prepare_websocket_request` may invalidate a superseded stable
+            // context baseline. Read the generation only after that decision
+            // so a fresh full replay is never attributed to the stale provider
+            // generation it replaced.
+            let baseline_generation = self
+                .websocket_session
+                .last_request_history
+                .as_ref()
+                .map(|baseline| baseline.generation);
+            let previous_response_id_present = match &ws_request {
+                ResponsesWsRequest::ResponseCreate(payload) => {
+                    payload.previous_response_id.is_some()
+                }
+            };
+            let provider_baseline = if previous_response_id_present {
+                ModelAttemptProviderBaseline::ExactPrefixInherited
+            } else {
+                ModelAttemptProviderBaseline::FreshFullReplay
+            };
             let inference_trace_attempt = if warmup {
                 // Prewarm sends `generate=false`; it is connection setup, not a
                 // model inference attempt that should appear in rollout traces.
@@ -2382,9 +3158,24 @@ impl ModelClientSession {
                 let logical_store = logical_request.store;
                 self.client
                     .prepare_response_items_for_request(&mut logical_request.input, logical_store);
-                let mut measurements =
-                    ModelRequestMeasurements::for_responses_request(&logical_request)?;
+                let mut measurements = ModelRequestMeasurements::for_responses_request(
+                    &logical_request,
+                    &prompt.prompt_provenance,
+                    self.amplification_telemetry.as_ref(),
+                    self.kd4_dispatch_telemetry.as_ref(),
+                    Some(&responses_metadata.session_id),
+                )?;
                 measurements.wire_request_bytes = serialized_len(&ws_request)?;
+                measurements.record_stable_context(
+                    &prompt.stable_context_manifest,
+                    baseline_generation,
+                    provider_baseline,
+                    previous_response_id_present,
+                );
+                measurements.compare_and_remember_prompt_context(
+                    &mut self.prompt_context_baseline,
+                    logical_request.prompt_cache_key.as_deref(),
+                );
                 Some(measurements)
             };
             drop(request_transformation_guard);
@@ -2396,27 +3187,27 @@ impl ModelClientSession {
             } else {
                 inference_trace_attempt.record_started(&ws_request);
             }
-            self.remember_request_history(&request);
-            self.websocket_session.last_request = Some(request);
-            self.websocket_session.last_response_from_untraced_warmup = warmup;
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
                     self.client.state.provider.map_api_error(ApiError::Stream(
                         "websocket connection is unavailable".to_string(),
                     ))
                 })?;
-            let mut attempt = request_measurements.map(|measurements| {
-                ModelAttemptGuard::new(
-                    request_session_telemetry.clone(),
-                    sampling_request_id,
-                    0,
-                    ModelAttemptRetryReason::None,
-                    request_kind,
-                    ModelAttemptTransport::ResponsesWebsocket,
-                    measurements,
-                    attempt_clock.expect("non-warmup request has an attempt clock"),
-                )
-            });
+            let mut attempt =
+                request_measurements
+                    .zip(attempt_clock)
+                    .map(|(measurements, attempt_clock)| {
+                        ModelAttemptGuard::new(
+                            request_session_telemetry.clone(),
+                            sampling_request_id,
+                            0,
+                            ModelAttemptRetryReason::None,
+                            request_kind,
+                            ModelAttemptTransport::ResponsesWebsocket,
+                            measurements,
+                            attempt_clock,
+                        )
+                    });
             let attempt_clock = attempt.as_ref().map(ModelAttemptGuard::clock);
             let turn_timing = self.turn_timing.clone();
             let serialization_timing_guard = self
@@ -2457,6 +3248,9 @@ impl ModelClientSession {
                     return Err(err);
                 }
             };
+            self.remember_request_history(&request, prompt.stable_context_manifest.fingerprint());
+            self.websocket_session.last_request = Some(request);
+            self.websocket_session.last_response_from_untraced_warmup = warmup;
             if let Some(attempt) = attempt.as_ref() {
                 attempt.clock().mark_stream_established();
             }
@@ -2797,18 +3591,18 @@ where
             let Some(event) = event else {
                 break;
             };
-            if let Ok(response_event) = &event {
-                if let Some(attempt) = attempt.as_ref() {
-                    let clock = attempt.clock();
-                    clock.mark_first_provider_event();
-                    if response_event_records_model_output(response_event) {
-                        clock.mark_first_model_output();
-                    }
+            if let Ok(response_event) = &event
+                && let Some(attempt) = attempt.as_ref()
+            {
+                let clock = attempt.clock();
+                clock.mark_first_provider_event();
+                if response_event_records_model_output(response_event) {
+                    clock.mark_first_model_output();
                 }
             }
             let records_visible_output = event
                 .as_ref()
-                .is_ok_and(|event| response_event_records_visible_output(event));
+                .is_ok_and(response_event_records_visible_output);
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     items_added.push(item.clone());
@@ -2848,6 +3642,7 @@ where
                         );
                     }
                     if let Some(attempt) = attempt.as_mut() {
+                        attempt.mark_fresh_response_id_established(&response_id);
                         attempt.finish(
                             ModelAttemptOutcome::Success,
                             token_usage.as_ref().map(|usage| usage.input_tokens),

@@ -48,7 +48,7 @@ impl RepoFixture {
         };
         let target = AssignmentId::new();
         let (write_scope, dependencies, relation) = match role {
-            AgentRole::Explorer => (Vec::new(), Vec::new(), None),
+            AgentRole::Explorer | AgentRole::Architect => (Vec::new(), Vec::new(), None),
             AgentRole::Worker => (write_scope, Vec::new(), None),
             AgentRole::Reviewer => (
                 Vec::new(),
@@ -94,6 +94,7 @@ impl RepoFixture {
             contract_claims: Vec::new(),
             workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
             relation,
+            architecture_contract_ref: None,
         }
         .normalize(self.path())
         .expect("valid assignment fixture");

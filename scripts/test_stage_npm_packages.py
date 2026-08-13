@@ -735,6 +735,14 @@ class StageNpmPackagesTests(unittest.TestCase):
         dest = self.root / "vendor" / target / "codex" / "codex"
         dest.parent.mkdir(parents=True)
         dest.write_bytes(b"existing")
+        artifact = (
+            self.root
+            / "artifacts"
+            / target
+            / stage.archive_name_for_target(component.artifact_prefix, target)
+        )
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"invalid archive")
 
         with (
             mock.patch.object(

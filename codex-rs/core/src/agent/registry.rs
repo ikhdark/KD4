@@ -181,6 +181,18 @@ impl AgentRegistry {
             .collect()
     }
 
+    pub(crate) fn has_live_agents(&self) -> bool {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agent_tree
+            .values()
+            .any(|metadata| {
+                metadata.agent_id.is_some()
+                    && !metadata.agent_path.as_ref().is_some_and(AgentPath::is_root)
+            })
+    }
+
     pub(crate) fn update_last_task_message(&self, thread_id: ThreadId, last_task_message: String) {
         let mut active_agents = self
             .active_agents

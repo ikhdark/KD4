@@ -33,6 +33,7 @@ fn assignment_draft() -> AssignmentDraft {
         contract_claims: Vec::new(),
         workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
         relation: None,
+        architecture_contract_ref: None,
     }
 }
 
@@ -81,6 +82,46 @@ async fn initialized_coordinator() -> (AgentTaskCoordinator, TempDir, TempDir) {
         .await
         .expect("task coordinator initializes");
     (coordinator, codex_home, repository)
+}
+
+#[test]
+fn bounded_diagnostics_deduplicate_progress_and_root_evidence_hydration() {
+    let coordinator = AgentTaskCoordinator::default();
+    let telemetry = test_session_telemetry();
+    let attempt_id = AttemptId::new();
+
+    assert!(!coordinator.record_first_meaningful_progress_once(
+        attempt_id,
+        ObservationKind::Starting,
+        &telemetry,
+    ));
+    assert!(coordinator.record_first_meaningful_progress_once(
+        attempt_id,
+        ObservationKind::Reading,
+        &telemetry,
+    ));
+    assert!(!coordinator.record_first_meaningful_progress_once(
+        attempt_id,
+        ObservationKind::Mutation,
+        &telemetry,
+    ));
+    assert!(coordinator.record_root_receipt_hydration_once(attempt_id, &telemetry));
+    assert!(!coordinator.record_root_receipt_hydration_once(attempt_id, &telemetry));
+
+    let mut metrics = coordinator
+        .metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    metrics.first_progress_attempts.clear();
+    metrics
+        .first_progress_attempts
+        .extend(std::iter::repeat_with(AttemptId::new).take(MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES));
+    drop(metrics);
+    assert!(!coordinator.record_first_meaningful_progress_once(
+        AttemptId::new(),
+        ObservationKind::Validating,
+        &telemetry,
+    ));
 }
 
 #[tokio::test]
@@ -312,6 +353,7 @@ async fn terminal_emission_uses_the_reserved_event_at_the_recorder_boundary() {
                 blockers: vec!["completion requires the main agent".to_string()],
                 risks: Vec::new(),
                 next_action: None,
+                architecture_contract: None,
             },
         )
         .await

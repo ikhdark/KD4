@@ -125,6 +125,7 @@ impl ChatWidget {
                             generated_artifacts: step.generated_artifacts,
                             risks: step.risks,
                             requires_desktop_activation: step.requires_desktop_activation,
+                            validation_route: None,
                         })
                         .collect(),
                 })

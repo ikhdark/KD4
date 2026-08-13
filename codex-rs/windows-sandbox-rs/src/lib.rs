@@ -284,6 +284,8 @@ pub use ipc_framed::SpawnReady;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::SpawnRequest;
 #[cfg(target_os = "windows")]
+pub use ipc_framed::StdinPayload;
+#[cfg(target_os = "windows")]
 pub use ipc_framed::decode_bytes;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::encode_bytes;

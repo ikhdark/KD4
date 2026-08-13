@@ -10,6 +10,11 @@ use crate::agent::task_capabilities::authorize_typed_tool;
 use crate::agent::task_capabilities::normalize_absolute_repo_path;
 use crate::exec::is_likely_sandbox_denied;
 use crate::session::turn_context::TurnEnvironment;
+use crate::task_evidence::OwnerPacketBinding;
+use crate::task_evidence::OwnerPacketChangeRegion;
+use crate::task_evidence::OwnerPacketPostMutationPath;
+use crate::task_evidence::TaskEvidenceLedger;
+use crate::tools::command_execution::WorkspaceMutationScope;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
@@ -25,11 +30,13 @@ use crate::tools::sandboxing::with_cached_approval;
 use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::AttributionConfidence;
+use codex_agent_task_store::StoreError;
 use codex_agent_task_store::WorkspaceActorKind;
 use codex_agent_task_store::WorkspaceMutationLease;
 use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchAction;
+use codex_apply_patch::ApplyPatchFileChange;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
@@ -45,6 +52,9 @@ use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -76,6 +86,7 @@ pub struct ApplyPatchRuntime {
         PathBuf,
         WorkspaceMutationLease,
     )>,
+    owner_packets: Option<(TaskEvidenceLedger, Vec<OwnerPacketBinding>)>,
 }
 
 #[derive(Debug)]
@@ -96,6 +107,7 @@ impl ApplyPatchRuntime {
     async fn begin_workspace_mutations(
         &mut self,
         req: &ApplyPatchRequest,
+        attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<(), ToolError> {
         if self.typed_mutations_started {
@@ -196,6 +208,25 @@ impl ApplyPatchRuntime {
         } else {
             repo_paths
         };
+        let (packet_ledger, _) = ctx
+            .session
+            .services
+            .agent_control
+            .completion_evidence_target(
+                &ctx.turn.session_source,
+                ctx.session.thread_id,
+                &ctx.session.services.task_evidence,
+            )
+            .await;
+        let owner_regions = owner_change_regions(req, &repo_root)?;
+        let packet_bindings = packet_ledger
+            .prepare_owner_patch(&owner_regions)
+            .await
+            .map_err(|reason| {
+                let reason = serde_json::to_string(&reason)
+                    .unwrap_or_else(|_| "{\"kind\":\"packet_not_ready\"}".to_string());
+                ToolError::Rejected(format!("apply_patch: {reason}"))
+            })?;
         if binding.is_none() {
             ctx.session
                 .services
@@ -233,8 +264,18 @@ impl ApplyPatchRuntime {
         } else {
             (WorkspaceActorKind::Root, format!("root:{root_session_id}"))
         };
+        let mutation_scope = WorkspaceMutationScope::exact_paths(normalized_repo_paths);
+        ctx.session
+            .services
+            .command_execution
+            .record_workspace_mutation_scope(&mutation_scope, false);
+        let mutation_paths = mutation_scope.into_paths().ok_or_else(|| {
+            ToolError::Rejected(
+                "apply_patch: exact mutation scope unexpectedly lacked paths".to_string(),
+            )
+        })?;
         let expected_manifest = store
-            .supporting_read_manifest(&repo_root, actor_id.clone(), normalized_repo_paths.clone())
+            .supporting_read_manifest(&repo_root, actor_id.clone(), mutation_paths.clone())
             .await
             .map_err(|error| {
                 ToolError::Rejected(format!(
@@ -246,10 +287,10 @@ impl ApplyPatchRuntime {
                 &repo_root,
                 WorkspaceMutationRequest {
                     root_session_id,
-                    actor_id,
+                    actor_id: actor_id.clone(),
                     kind,
                     attempt_id: binding.as_ref().map(|binding| binding.attempt_id),
-                    paths: normalized_repo_paths,
+                    paths: mutation_paths,
                     contracts: task
                         .as_ref()
                         .map(|task| task.assignment.contract_claims.clone())
@@ -257,12 +298,39 @@ impl ApplyPatchRuntime {
                     expected_manifest,
                 },
             )
-            .await
-            .map_err(|error| {
-                ToolError::Rejected(format!(
+            .await;
+        let lease = match lease {
+            Ok(lease) => lease,
+            Err(StoreError::WorkspaceCasMismatch { details }) => {
+                let self_owned = !details.is_empty()
+                    && details
+                        .iter()
+                        .all(|detail| detail.last_writer.as_deref() == Some(actor_id.as_str()));
+                let paths = details
+                    .iter()
+                    .map(|detail| detail.path.clone())
+                    .collect::<Vec<_>>();
+                packet_ledger
+                    .record_owner_cas_failure(&paths, self_owned)
+                    .await;
+                ctx.turn.session_telemetry.counter(
+                    "codex.owner_packet.cas_failure",
+                    1,
+                    &[(("ownership"), if self_owned { "self" } else { "external" })],
+                );
+                let diagnostic =
+                    cas_mismatch_diagnostic(req, attempt, &repo_root, &owner_regions, &details)
+                        .await;
+                return Err(ToolError::Rejected(format!(
+                    "apply_patch: workspace_cas_mismatch {diagnostic}"
+                )));
+            }
+            Err(error) => {
+                return Err(ToolError::Rejected(format!(
                     "apply_patch: workspace mutation was rejected: {error}"
-                ))
-            })?;
+                )));
+            }
+        };
         if let Some(binding) = &binding {
             for path in &lease.paths {
                 if let Err(error) = store
@@ -290,22 +358,63 @@ impl ApplyPatchRuntime {
             }
         }
         self.workspace_mutation = Some((store, repo_root, lease));
+        self.owner_packets = Some((packet_ledger, packet_bindings));
         self.typed_mutations_started = true;
         Ok(())
     }
 
-    async fn finish_workspace_mutation(&mut self) -> Result<(), ToolError> {
+    async fn finish_workspace_mutation(
+        &mut self,
+        req: &ApplyPatchRequest,
+        attempt: &SandboxAttempt<'_>,
+        ctx: &ToolCtx,
+    ) -> Result<(), ToolError> {
         let Some((store, repo_root, lease)) = self.workspace_mutation.take() else {
             self.typed_mutations_started = false;
             return Ok(());
         };
-        let result = store.finish_workspace_mutation(&repo_root, lease).await;
+        let result = store
+            .finish_workspace_mutation_with_receipt(&repo_root, lease)
+            .await;
         self.typed_mutations_started = false;
-        result.map(|_| ()).map_err(|error| {
-            ToolError::Rejected(format!(
-                "apply_patch: workspace mutation finalization failed: {error}"
-            ))
-        })
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some((ledger, bindings)) = self.owner_packets.take() {
+                    let metrics = ledger
+                        .record_owner_patch_finalization(&ctx.call_id, &bindings, &[])
+                        .await;
+                    emit_owner_packet_transition_metrics(&ctx.turn.session_telemetry, &metrics);
+                }
+                return Err(ToolError::Rejected(format!(
+                    "apply_patch: workspace mutation finalization failed: {error}"
+                )));
+            }
+        };
+        ctx.session
+            .services
+            .git_workspace
+            .record_final_manifest_work(outcome.work());
+        ctx.session
+            .services
+            .git_workspace
+            .note_host_workspace_mutation();
+        if let Some((ledger, bindings)) = self.owner_packets.take() {
+            let post_paths = collect_post_mutation_paths(
+                req,
+                attempt,
+                &repo_root,
+                outcome
+                    .final_manifest()
+                    .map(|manifest| manifest.receipt().entries()),
+            )
+            .await;
+            let metrics = ledger
+                .record_owner_patch_finalization(&ctx.call_id, &bindings, &post_paths)
+                .await;
+            emit_owner_packet_transition_metrics(&ctx.turn.session_telemetry, &metrics);
+        }
+        Ok(())
     }
 
     fn build_guardian_review_request(
@@ -350,6 +459,242 @@ impl ApplyPatchRuntime {
             use_legacy_landlock: attempt.use_legacy_landlock,
         })
     }
+}
+
+fn emit_owner_packet_transition_metrics(
+    telemetry: &codex_otel::SessionTelemetry,
+    metrics: &crate::task_evidence::OwnerPacketTransitionMetrics,
+) {
+    for (name, value) in [
+        ("codex.owner_packet.edits", metrics.edits),
+        (
+            "codex.owner_packet.same_region_revisits",
+            metrics.same_region_revisits,
+        ),
+        ("codex.owner_packet.caller_repairs", metrics.caller_repairs),
+        (
+            "codex.owner_packet.acceptance_repairs",
+            metrics.acceptance_repairs,
+        ),
+        (
+            "codex.owner_packet.lifecycle_repairs",
+            metrics.lifecycle_repairs,
+        ),
+        (
+            "codex.owner_packet.formatting_only_repairs",
+            metrics.formatting_only_repairs,
+        ),
+        ("codex.owner_packet.other_repairs", metrics.other_repairs),
+        (
+            "codex.owner_packet.identity_refreshes",
+            metrics.identity_refreshes,
+        ),
+        (
+            "codex.owner_packet.interval_invalidations",
+            metrics.interval_invalidations,
+        ),
+        ("codex.owner_packet.span_refreshes", metrics.span_refreshes),
+    ] {
+        if value > 0 {
+            telemetry.counter(name, i64::try_from(value).unwrap_or(i64::MAX), &[]);
+        }
+    }
+}
+
+fn owner_change_regions(
+    req: &ApplyPatchRequest,
+    repo_root: &std::path::Path,
+) -> Result<Vec<OwnerPacketChangeRegion>, ToolError> {
+    let mut regions = Vec::new();
+    for (path, change) in req.action.changes() {
+        let absolute = path.to_abs_path().map_err(|error| {
+            ToolError::Rejected(format!(
+                "apply_patch: packet path is not local and cannot be bound: {error}"
+            ))
+        })?;
+        let normalized =
+            normalize_absolute_repo_path(repo_root, absolute.as_path()).map_err(|error| {
+                ToolError::Rejected(format!("apply_patch: packet path is invalid: {error}"))
+            })?;
+        let (start_line, end_line) = match change {
+            ApplyPatchFileChange::Add { content } | ApplyPatchFileChange::Delete { content } => {
+                (1, content.lines().count().max(1))
+            }
+            ApplyPatchFileChange::Update {
+                unified_diff,
+                new_content,
+                ..
+            } => changed_line_range(unified_diff)
+                .unwrap_or_else(|| (1, new_content.lines().count().max(1))),
+        };
+        regions.push(OwnerPacketChangeRegion {
+            path: normalized,
+            start_line,
+            end_line,
+        });
+        if let ApplyPatchFileChange::Update {
+            move_path: Some(move_path),
+            new_content,
+            ..
+        } = change
+        {
+            let absolute = move_path.to_abs_path().map_err(|error| {
+                ToolError::Rejected(format!(
+                    "apply_patch: moved packet path is not local: {error}"
+                ))
+            })?;
+            let normalized =
+                normalize_absolute_repo_path(repo_root, absolute.as_path()).map_err(|error| {
+                    ToolError::Rejected(format!(
+                        "apply_patch: moved packet path is invalid: {error}"
+                    ))
+                })?;
+            regions.push(OwnerPacketChangeRegion {
+                path: normalized,
+                start_line: 1,
+                end_line: new_content.lines().count().max(1),
+            });
+        }
+    }
+    regions.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+    Ok(regions)
+}
+
+fn changed_line_range(unified_diff: &str) -> Option<(usize, usize)> {
+    let mut first = None::<usize>;
+    let mut last = 0usize;
+    for line in unified_diff.lines().filter(|line| line.starts_with("@@ ")) {
+        let new_range = line.split_whitespace().nth(2)?.strip_prefix('+')?;
+        let (start, count) = new_range
+            .split_once(',')
+            .map_or((new_range, "1"), |(start, count)| (start, count));
+        let start = start.parse::<usize>().ok()?.max(1);
+        let count = count.parse::<usize>().ok()?;
+        first = Some(first.map_or(start, |current| current.min(start)));
+        last = last.max(start.saturating_add(count.saturating_sub(1)).max(start));
+    }
+    first.map(|first| (first, last.max(first)))
+}
+
+async fn cas_mismatch_diagnostic(
+    req: &ApplyPatchRequest,
+    attempt: &SandboxAttempt<'_>,
+    repo_root: &std::path::Path,
+    regions: &[OwnerPacketChangeRegion],
+    details: &[codex_agent_task_store::WorkspaceCasMismatchDetail],
+) -> String {
+    let fs = req.turn_environment.environment.get_filesystem();
+    let sandbox = ApplyPatchRuntime::file_system_sandbox_context_for_attempt(req, attempt);
+    let root_uri = PathUri::from_host_native_path(repo_root).ok();
+    let action_paths = req
+        .action
+        .changes()
+        .keys()
+        .filter_map(|path| {
+            let absolute = path.to_abs_path().ok()?;
+            let normalized = normalize_absolute_repo_path(repo_root, absolute.as_path()).ok()?;
+            Some((normalized, path.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut rendered = Vec::new();
+    for detail in details.iter().take(8) {
+        let excerpt = match (action_paths.get(&detail.path), root_uri.as_ref()) {
+            (Some(path), Some(root_uri)) => fs
+                .read_file_bounded_confined(path, root_uri, 4 * 1024 * 1024, sandbox.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|bytes| {
+                    let region = regions.iter().find(|region| region.path == detail.path)?;
+                    current_excerpt(&bytes, region.start_line, region.end_line)
+                }),
+            _ => None,
+        };
+        rendered.push(serde_json::json!({
+            "path": detail.path,
+            "expected": detail.expected.as_ref().map(|entry| serde_json::json!({
+                "exists": entry.existed,
+                "sha256": entry.content_hash,
+            })),
+            "current": detail.current.as_ref().map(|entry| serde_json::json!({
+                "exists": entry.existed,
+                "sha256": entry.content_hash,
+            })),
+            "current_epoch": detail.current_epoch,
+            "last_writer": detail.last_writer,
+            "current_excerpt": excerpt,
+        }));
+    }
+    serde_json::to_string(&serde_json::json!({ "details": rendered }))
+        .unwrap_or_else(|_| "{\"details\":[]}".to_string())
+}
+
+fn current_excerpt(bytes: &[u8], start_line: usize, end_line: usize) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let excerpt_start = start_line.saturating_sub(5).max(1);
+    let excerpt_end = end_line.saturating_add(5).min(lines.len());
+    if excerpt_start > excerpt_end {
+        return None;
+    }
+    let mut excerpt = lines[excerpt_start - 1..excerpt_end].join("\n");
+    if excerpt.len() > 4096 {
+        excerpt.truncate(4096);
+    }
+    Some(excerpt)
+}
+
+async fn collect_post_mutation_paths(
+    req: &ApplyPatchRequest,
+    attempt: &SandboxAttempt<'_>,
+    repo_root: &std::path::Path,
+    entries: Option<&[codex_agent_task_store::WorkspaceManifestEntry]>,
+) -> Vec<OwnerPacketPostMutationPath> {
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+    let fs = req.turn_environment.environment.get_filesystem();
+    let sandbox = ApplyPatchRuntime::file_system_sandbox_context_for_attempt(req, attempt);
+    let root_uri = PathUri::from_host_native_path(repo_root).ok();
+    let action_paths = req
+        .file_paths
+        .iter()
+        .filter_map(|path| {
+            let absolute = path.to_abs_path().ok()?;
+            let normalized = normalize_absolute_repo_path(repo_root, absolute.as_path()).ok()?;
+            Some((normalized, path.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut post_paths = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let content = if entry.existed {
+            match (action_paths.get(&entry.path), root_uri.as_ref()) {
+                (Some(path), Some(root_uri)) => fs
+                    .read_file_bounded_confined(path, root_uri, 4 * 1024 * 1024, sandbox.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|bytes| {
+                        entry.content_hash.as_deref()
+                            == Some(format!("{:x}", Sha256::digest(bytes)).as_str())
+                    }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        post_paths.push(OwnerPacketPostMutationPath {
+            path: entry.path.clone(),
+            existed: entry.existed,
+            file_sha256: entry.content_hash.clone(),
+            content,
+        });
+    }
+    post_paths
 }
 
 impl Sandboxable for ApplyPatchRuntime {
@@ -468,7 +813,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
-        self.begin_workspace_mutations(req, ctx).await?;
+        self.begin_workspace_mutations(req, attempt, ctx).await?;
         let heartbeat_stop = CancellationToken::new();
         let heartbeat_task = self
             .workspace_mutation
@@ -551,13 +896,13 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             duration: started_at.elapsed(),
             timed_out: false,
         };
+        self.finish_workspace_mutation(req, attempt, ctx).await?;
         if failed && is_likely_sandbox_denied(attempt.sandbox, &output) {
             return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                 output: Box::new(output),
                 network_policy_decision: None,
             })));
         }
-        self.finish_workspace_mutation().await?;
         Ok(ApplyPatchRuntimeOutput {
             exec_output: output,
             delta: self.committed_delta.clone(),

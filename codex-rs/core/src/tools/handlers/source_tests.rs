@@ -8,12 +8,17 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_core_skills::SkillLoadOutcome;
 use codex_core_skills::SkillMetadata;
+use codex_core_skills::skill_catalog_id;
 use codex_exec_server::Environment;
 use codex_exec_server::LocalFileSystem;
 use codex_features::Feature;
+use codex_file_search::source_search::SOURCE_READ_MAX_LINES;
+use codex_file_search::source_search::SOURCE_SEARCH_MAX_CONTEXT_LINES;
+use codex_file_search::source_search::SOURCE_SEARCH_MAX_MATCHES;
 use codex_file_search::source_search::SourceLine;
 use codex_file_search::source_search::SourceSearchCoverage;
 use codex_file_search::source_search::SourceSearchDiagnostics;
+use codex_file_search::source_search::SourceSearchHydrationStatus;
 use codex_file_search::source_search::SourceSearchMatch;
 use codex_file_search::source_search::SourceTruncatedReason;
 use codex_file_system::CopyOptions;
@@ -233,19 +238,31 @@ fn sample_search_output(text: String) -> SourceSearchOutput {
             max_bytes: 16 * 1024 * 1024,
             max_file_bytes: 2 * 1024 * 1024,
             max_result_bytes: 512 * 1024,
+            index_complete: true,
+            context_complete: true,
+            indexed_matches: 1,
+            omitted_contexts: 0,
+            result_cap_reached: false,
         },
         matches: vec![SourceSearchMatch {
+            id: "match:fixture".to_string(),
+            file_id: "file:fixture".to_string(),
             path: "src/lib.rs".to_string(),
+            source_revision: "revision".to_string(),
             source_map_route: Some("src".to_string()),
             line_number: 8,
+            matched_content: "needle".to_string(),
             start_line: 7,
             end_line: 9,
+            context_complete: true,
             lines: vec![SourceLine {
                 line_number: 8,
                 text,
                 text_truncated: false,
             }],
         }],
+        hydration_status: SourceSearchHydrationStatus::SkippedObservationUnavailable,
+        hydrated_span: None,
         diagnostics: SourceSearchDiagnostics::default(),
     }
 }
@@ -257,6 +274,50 @@ fn search_render_includes_explicit_line_span_evidence() {
     let rendered = render_search_output(&output);
     assert!(rendered.contains("citation: src/lib.rs:7-9 (match line 8)"));
     assert!(rendered.contains("     8 | needle"));
+}
+
+#[tokio::test]
+async fn source_read_canonicalizes_exact_content_before_bounded_rendering() {
+    let content = (1..=126)
+        .map(|line| format!("line {line}\r\n"))
+        .collect::<String>();
+    let output = read_file_span_from_bytes(
+        "src/fixture.rs".to_string(),
+        content.as_bytes().to_vec(),
+        1,
+        126,
+    )
+    .expect("source fixture");
+    let (_session, turn) = make_session_and_context().await;
+    let tool_output = source_read_tool_output(
+        output,
+        "bounded renderer output".to_string(),
+        serde_json::json!({ "kind": "source_evidence" }),
+        None,
+        &turn.turn_timing_state,
+    );
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+
+    let canonical = tool_output
+        .canonical_result(&payload)
+        .expect("canonical source result");
+    assert_eq!(canonical.bytes, content.as_bytes());
+    assert_eq!(
+        canonical.sha256,
+        format!("{:x}", Sha256::digest(content.as_bytes()))
+    );
+    let projection = tool_output
+        .projection_metadata()
+        .expect("typed source projection");
+    assert_eq!(projection.fragments.len(), 4);
+    assert!(projection.fragments.iter().all(|fragment| {
+        fragment
+            .id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("src:"))
+    }));
 }
 
 #[test]
@@ -316,6 +377,11 @@ fn read_render_is_capped_below_model_context_limit() {
             text: "x".repeat(SOURCE_TOOL_MAX_RENDERED_BYTES * 2),
             text_truncated: false,
         }],
+        full_file_sha256: String::new(),
+        requested_content_sha256: String::new(),
+        requested_bytes: SOURCE_TOOL_MAX_RENDERED_BYTES * 2,
+        exact_content: String::new(),
+        chunks: Vec::new(),
     };
 
     let rendered = render_read_output(&output);
@@ -387,6 +453,7 @@ async fn source_scan_preserves_partial_results_across_filesystem_failures() {
             repo_root: root.clone(),
             repo_root_abs: repo_root_abs.clone(),
             is_git_repository: false,
+            environment_id: "local".to_string(),
         };
         let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
         let mut accumulator =
@@ -442,6 +509,7 @@ async fn source_scan_rejects_a_root_directory_read_failure() {
         repo_root: root.clone(),
         repo_root_abs: repo_root_abs.clone(),
         is_git_repository: false,
+        environment_id: "local".to_string(),
     };
     let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
     let mut accumulator = SourceSearchAccumulator::new(&options).expect("source accumulator");
@@ -499,6 +567,7 @@ async fn explicit_source_roots_preserve_partial_results_when_one_root_inspect_or
             repo_root: PathUri::from_abs_path(&repo_root_abs),
             repo_root_abs: repo_root_abs.clone(),
             is_git_repository: false,
+            environment_id: "local".to_string(),
         };
         let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
         let mut accumulator = SourceSearchAccumulator::new(&options).expect("source accumulator");
@@ -635,6 +704,135 @@ async fn search_handler_reads_through_selected_local_filesystem() {
     assert_eq!(manifest[0].path, "src/lib.rs");
     assert!(manifest[0].existed);
     assert!(manifest[0].content_hash.is_some());
+}
+
+#[tokio::test]
+async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_lines() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let source_cwd = source_dir.abs();
+    std::fs::create_dir(source_cwd.join(".git").as_path()).expect("create git marker");
+    std::fs::create_dir(source_cwd.join("src").as_path()).expect("create src");
+    std::fs::write(
+        source_cwd.join("src/lib.rs").as_path(),
+        "one\ntwo\nthree\nfour\nfive\n",
+    )
+    .expect("write source");
+    replace_primary_environment_cwd(&mut turn, source_cwd);
+    turn.permission_profile = PermissionProfile::Disabled;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+    let first_payload = ToolPayload::Function {
+        arguments: json!({
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "line_count": 3
+        })
+        .to_string(),
+    };
+    let first = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::clone(&tracker),
+            call_id: "source-coverage-first".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: first_payload,
+        })
+        .await
+        .expect("first read");
+    assert!(first.deterministic_continuation_receipts().is_empty());
+
+    let partial_payload = ToolPayload::Function {
+        arguments: json!({
+            "path": "src/lib.rs",
+            "start_line": 2,
+            "line_count": 4
+        })
+        .to_string(),
+    };
+    let partial = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::clone(&tracker),
+            call_id: "source-coverage-partial".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: partial_payload.clone(),
+        })
+        .await
+        .expect("partial read");
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        partial.to_response_item("source-coverage-partial", &partial_payload)
+    else {
+        panic!("expected partial function output");
+    };
+    let partial_text = output.body.to_text().expect("partial text");
+    assert!(
+        partial_text.contains("reused_intervals: 2-3"),
+        "{partial_text}"
+    );
+    assert!(!partial_text.contains("     2 | two"), "{partial_text}");
+    assert!(!partial_text.contains("     3 | three"), "{partial_text}");
+    assert!(partial_text.contains("     4 | four"), "{partial_text}");
+    assert!(partial_text.contains("     5 | five"), "{partial_text}");
+    let partial_receipts = partial.deterministic_continuation_receipts();
+    assert_eq!(partial_receipts.len(), 1);
+    assert_eq!(
+        partial_receipts[0].class,
+        DeterministicContinuationClass::SourceCoverage
+    );
+    assert_eq!(
+        partial_receipts[0].host_action,
+        DeterministicContinuationHostAction::ReadMissingRanges
+    );
+
+    let full_payload = ToolPayload::Function {
+        arguments: json!({
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "line_count": 5
+        })
+        .to_string(),
+    };
+    let full = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker,
+            call_id: "source-coverage-full".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: full_payload.clone(),
+        })
+        .await
+        .expect("full overlap read");
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        full.to_response_item("source-coverage-full", &full_payload)
+    else {
+        panic!("expected full function output");
+    };
+    let full_text = output.body.to_text().expect("full text");
+    assert!(
+        full_text.contains("already present in current context"),
+        "{full_text}"
+    );
+    let full_receipts = full.deterministic_continuation_receipts();
+    assert_eq!(full_receipts.len(), 1);
+    assert_eq!(
+        full_receipts[0].host_action,
+        DeterministicContinuationHostAction::ReuseCoveredSpan
+    );
 }
 
 #[tokio::test]
@@ -851,6 +1049,75 @@ async fn read_file_span_handler_reads_exact_loaded_skill_path() {
 }
 
 #[tokio::test]
+async fn read_file_span_handler_resolves_opaque_skill_locator_and_cites_canonical_source() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    replace_primary_environment_cwd(&mut turn, source_dir.abs());
+    turn.permission_profile = PermissionProfile::Disabled;
+
+    let skill_dir = tempfile::tempdir().expect("create skill temp dir");
+    let skill_path = skill_dir.abs().join("SKILL.md");
+    std::fs::write(
+        skill_path.as_path(),
+        "first\nfull selected skill contents\nthird\n",
+    )
+    .expect("write installed skill");
+    let skill = SkillMetadata {
+        name: "opaque-installed-test".to_string(),
+        description: "test opaque installed skill".to_string(),
+        short_description: None,
+        interface: None,
+        dependencies: None,
+        policy: None,
+        path_to_skills_md: skill_path.clone(),
+        scope: SkillScope::User,
+        plugin_id: Some("test-plugin".to_string()),
+    };
+    let locator = format!("skill:{}", skill_catalog_id(&skill));
+    let mut outcome = SkillLoadOutcome::default();
+    outcome.skills = vec![skill];
+    turn.turn_skills = crate::session::turn_context::TurnSkillsContext::new(
+        HostSkillsSnapshot::new(Arc::new(outcome)),
+    );
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "path": locator,
+            "start_line": 1,
+            "line_count": 3
+        })
+        .to_string(),
+    };
+
+    let output = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-opaque-skill".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
+        .await
+        .expect("opaque loaded skill read should succeed");
+
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        output.to_response_item("call-read-opaque-skill", &payload)
+    else {
+        panic!("expected function call output");
+    };
+    let text = output.body.to_text().expect("text output");
+    assert!(text.contains("full selected skill contents"), "{text}");
+    assert!(
+        text.contains(&skill_path.to_string_lossy().replace('\\', "/")),
+        "canonical source citation missing from {text}"
+    );
+}
+
+#[tokio::test]
 async fn read_file_span_handler_rejects_unloaded_path_outside_repository() {
     let (session, mut turn) = make_session_and_context().await;
     let source_dir = tempfile::tempdir().expect("create source temp dir");
@@ -942,8 +1209,8 @@ async fn search_handler_honors_repository_gitignore_rules() {
 async fn source_handlers_validate_bounds_before_environment_resolution() {
     let (search_session, search_turn) = make_session_and_context().await;
     let search_turn = Arc::new(search_turn);
-    let search_result = SearchSourceHandler::new(true)
-        .handle(ToolInvocation {
+    let (search_result, search_observation) = test_observation::observe(
+        SearchSourceHandler::new(true).handle(ToolInvocation {
             session: Arc::new(search_session),
             step_context: StepContext::for_test(Arc::clone(&search_turn)),
             turn: search_turn,
@@ -960,18 +1227,21 @@ async fn source_handlers_validate_bounds_before_environment_resolution() {
                 })
                 .to_string(),
             },
-        })
-        .await;
+        }),
+    )
+    .await;
     let Err(FunctionCallError::RespondToModel(search_message)) = search_result else {
         panic!("expected search bound validation error");
     };
-    assert!(search_message.contains("max_matches must be between 1 and 500"));
+    assert!(search_message.contains("does not match its emitted schema"));
+    assert!(search_message.contains("minimum"), "{search_message}");
     assert!(!search_message.contains("environment"), "{search_message}");
+    assert_eq!(search_observation.runtime_entries, 0);
 
     let (read_session, read_turn) = make_session_and_context().await;
     let read_turn = Arc::new(read_turn);
-    let read_result = ReadFileSpanHandler::new(true)
-        .handle(ToolInvocation {
+    let (read_result, read_observation) = test_observation::observe(
+        ReadFileSpanHandler::new(true).handle(ToolInvocation {
             session: Arc::new(read_session),
             step_context: StepContext::for_test(Arc::clone(&read_turn)),
             turn: read_turn,
@@ -988,13 +1258,122 @@ async fn source_handlers_validate_bounds_before_environment_resolution() {
                 })
                 .to_string(),
             },
-        })
-        .await;
+        }),
+    )
+    .await;
     let Err(FunctionCallError::RespondToModel(read_message)) = read_result else {
         panic!("expected read bound validation error");
     };
-    assert!(read_message.contains("line_count must be between 1 and 400"));
+    assert!(read_message.contains("does not match its emitted schema"));
+    assert!(read_message.contains("maximum"), "{read_message}");
     assert!(!read_message.contains("environment"), "{read_message}");
+    assert_eq!(read_observation.runtime_entries, 0);
+}
+
+#[test]
+fn source_preflight_uses_the_emitted_schema_for_every_numeric_boundary() {
+    fn assert_cases(
+        tool_name: &str,
+        contract: &SourceToolContract,
+        cases: impl IntoIterator<Item = (serde_json::Value, bool)>,
+    ) {
+        let ToolSpec::Function(tool) = &contract.spec else {
+            panic!("source tool must be a function");
+        };
+        let emitted_schema = serde_json::to_value(&tool.parameters).expect("serialize schema");
+        let emitted_validator =
+            jsonschema::validator_for(&emitted_schema).expect("compile emitted schema");
+        for (arguments, expected_valid) in cases {
+            let payload = ToolPayload::Function {
+                arguments: arguments.to_string(),
+            };
+            assert_eq!(
+                emitted_validator.is_valid(&arguments),
+                expected_valid,
+                "{tool_name}: emitted schema disagreed for {arguments}"
+            );
+            assert_eq!(
+                contract.validate(tool_name, &payload).is_ok(),
+                expected_valid,
+                "{tool_name}: stored preflight disagreed for {arguments}"
+            );
+        }
+    }
+
+    let search = SearchSourceHandler::new(false);
+    assert_cases(
+        SEARCH_SOURCE_TOOL_NAME,
+        &search.contract,
+        [
+            (json!({"query": "x", "max_results": 0}), false),
+            (json!({"query": "x", "max_results": 1}), true),
+            (
+                json!({"query": "x", "max_results": SOURCE_SEARCH_MAX_MATCHES}),
+                true,
+            ),
+            (
+                json!({"query": "x", "max_results": SOURCE_SEARCH_MAX_MATCHES + 1}),
+                false,
+            ),
+            (json!({"query": "x", "context_lines": 0}), true),
+            (
+                json!({"query": "x", "context_lines": SOURCE_SEARCH_MAX_CONTEXT_LINES}),
+                true,
+            ),
+            (
+                json!({"query": "x", "context_lines": SOURCE_SEARCH_MAX_CONTEXT_LINES + 1}),
+                false,
+            ),
+        ],
+    );
+
+    let locate = LocateTaskHandler::new(false);
+    assert_cases(
+        LOCATE_TASK_TOOL_NAME,
+        &locate.contract,
+        [
+            (json!({"task": "x", "max_files": 0}), false),
+            (json!({"task": "x", "max_files": 1}), true),
+            (
+                json!({"task": "x", "max_files": LOCATE_TASK_MAX_FILES}),
+                true,
+            ),
+            (
+                json!({"task": "x", "max_files": LOCATE_TASK_MAX_FILES + 1}),
+                false,
+            ),
+            (json!({"task": "x", "max_source_bytes": 0}), false),
+            (json!({"task": "x", "max_source_bytes": 1}), true),
+            (
+                json!({"task": "x", "max_source_bytes": LOCATE_TASK_MAX_SOURCE_BYTES}),
+                true,
+            ),
+            (
+                json!({"task": "x", "max_source_bytes": LOCATE_TASK_MAX_SOURCE_BYTES + 1}),
+                false,
+            ),
+        ],
+    );
+
+    let read = ReadFileSpanHandler::new(false);
+    assert_cases(
+        READ_FILE_SPAN_TOOL_NAME,
+        &read.contract,
+        [
+            (json!({"path": "src/lib.rs", "start_line": 0}), false),
+            (json!({"path": "src/lib.rs", "start_line": 1}), true),
+            (json!({"path": "src/lib.rs", "line_count": 0}), false),
+            (json!({"path": "src/lib.rs", "line_count": 1}), true),
+            (
+                json!({"path": "src/lib.rs", "line_count": SOURCE_READ_MAX_LINES}),
+                true,
+            ),
+            (
+                json!({"path": "src/lib.rs", "line_count": SOURCE_READ_MAX_LINES + 1}),
+                false,
+            ),
+        ],
+    );
 }
 
 #[tokio::test]
@@ -1019,7 +1398,8 @@ async fn source_handlers_reject_unknown_argument_names() {
     let Err(FunctionCallError::RespondToModel(search_message)) = search_result else {
         panic!("expected search parse error");
     };
-    assert!(search_message.contains("unknown field `context_line`"));
+    assert!(search_message.contains("does not match its emitted schema"));
+    assert!(search_message.contains("context_line"));
 
     let (read_session, read_turn) = make_session_and_context().await;
     let read_turn = Arc::new(read_turn);
@@ -1041,7 +1421,8 @@ async fn source_handlers_reject_unknown_argument_names() {
     let Err(FunctionCallError::RespondToModel(read_message)) = read_result else {
         panic!("expected read parse error");
     };
-    assert!(read_message.contains("unknown field `environment_ide`"));
+    assert!(read_message.contains("does not match its emitted schema"));
+    assert!(read_message.contains("environment_ide"));
 }
 
 #[tokio::test]
@@ -1070,7 +1451,8 @@ async fn source_handlers_reject_environment_id_when_not_advertised() {
     let Err(FunctionCallError::RespondToModel(search_message)) = search_result else {
         panic!("expected search parse error");
     };
-    assert!(search_message.contains("unknown field `environment_id`"));
+    assert!(search_message.contains("does not match its emitted schema"));
+    assert!(search_message.contains("environment_id"));
 
     let (read_session, read_turn) = make_session_and_context().await;
     let read_turn = Arc::new(read_turn);
@@ -1096,7 +1478,8 @@ async fn source_handlers_reject_environment_id_when_not_advertised() {
     let Err(FunctionCallError::RespondToModel(read_message)) = read_result else {
         panic!("expected read parse error");
     };
-    assert!(read_message.contains("unknown field `environment_id`"));
+    assert!(read_message.contains("does not match its emitted schema"));
+    assert!(read_message.contains("environment_id"));
 }
 
 #[tokio::test]
@@ -1330,4 +1713,198 @@ async fn global_git_excludes_are_omitted_with_an_explicit_diagnostic() {
         ),
         "{text}"
     );
+}
+
+#[test]
+fn owner_and_closure_states_gate_only_ready_bundles_for_implementation() {
+    assert_eq!(
+        directive_for_bundle_states(
+            OwnerEvidenceOwnerState::OwnerUnresolved,
+            OwnerEvidenceClosureState::BundleIncomplete,
+        ),
+        "focused_evidence_followup"
+    );
+    assert_eq!(
+        directive_for_bundle_states(
+            OwnerEvidenceOwnerState::OwnerResolved,
+            OwnerEvidenceClosureState::BundleIncomplete,
+        ),
+        "focused_evidence_followup"
+    );
+    assert_eq!(
+        directive_for_bundle_states(
+            OwnerEvidenceOwnerState::OwnerUnresolved,
+            OwnerEvidenceClosureState::BundleReady,
+        ),
+        "owner_resolution_followup"
+    );
+    assert_eq!(
+        directive_for_bundle_states(
+            OwnerEvidenceOwnerState::OwnerResolved,
+            OwnerEvidenceClosureState::BundleReady,
+        ),
+        "implementation_phase"
+    );
+}
+
+#[test]
+fn instruction_freshness_joins_validated_core_and_locator_snapshot_identities() {
+    let captured = codex_file_search::task_locator::LocateTaskSourceIdentity {
+        path: "AGENTS.md".to_string(),
+        content_hash: "hash-a".to_string(),
+        source_snapshot_identity: "snapshot-a".to_string(),
+    };
+    assert!(validated_instruction_identity_is_current(
+        Some(&captured),
+        "snapshot-a",
+        "hash-a",
+        Some("hash-a"),
+    ));
+    assert!(!validated_instruction_identity_is_current(
+        Some(&captured),
+        "snapshot-b",
+        "hash-a",
+        Some("hash-a"),
+    ));
+    assert!(!validated_instruction_identity_is_current(
+        Some(&captured),
+        "snapshot-a",
+        "hash-b",
+        Some("hash-a"),
+    ));
+    assert!(!validated_instruction_identity_is_current(
+        None,
+        "snapshot-a",
+        "hash-a",
+        Some("hash-a"),
+    ));
+}
+
+#[test]
+fn bundle_receipt_identity_uses_only_stable_contract_inputs() {
+    let first = stable_bundle_receipt_id("epoch-7", Some("owner"), "snapshot", "closure-v2");
+    let second = stable_bundle_receipt_id("epoch-7", Some("owner"), "snapshot", "closure-v2");
+    assert_eq!(first, second);
+    assert_ne!(
+        first,
+        stable_bundle_receipt_id("epoch-8", Some("owner"), "snapshot", "closure-v2")
+    );
+    assert_ne!(
+        first,
+        stable_bundle_receipt_id("epoch-7", Some("owner"), "snapshot-2", "closure-v2")
+    );
+}
+
+#[test]
+fn canonical_bundle_artifact_contains_every_materialized_section_and_no_false_range() {
+    let snapshot = "snapshot-a";
+    let primary_text = "fn primary() {}\n";
+    let primary_hash = sha256_text(primary_text);
+    let primary_file_hash = "primary-file-hash".to_string();
+    let missing_file_hash = "missing-file-hash".to_string();
+    let output = LocateTaskOutput {
+        request_identity: "locator-request".to_string(),
+        rendered: String::new(),
+        supporting_reads: vec![
+            codex_file_search::task_locator::SupportingRead {
+                path: "src/main.rs".to_string(),
+                content_hash: primary_file_hash.clone(),
+            },
+            codex_file_search::task_locator::SupportingRead {
+                path: "tests/main.rs".to_string(),
+                content_hash: missing_file_hash.clone(),
+            },
+        ],
+        snapshot_id: snapshot.to_string(),
+        decision_facts: LocateTaskDecisionFacts {
+            repository_identity: "repository".to_string(),
+            source_snapshot_identity: snapshot.to_string(),
+            owner_manifest_revision: "manifest".to_string(),
+            closure_contract_revision: "source_closure_v2".to_string(),
+            completeness: "complete".to_string(),
+            selected_owner: Some("owner".to_string()),
+            authoritative_owner: None,
+            owner_candidates: Vec::new(),
+            primary_path: Some("src/main.rs".to_string()),
+            primary_symbol: Some("primary".to_string()),
+            primary_span: None,
+            source_relationships: Vec::new(),
+            located_contracts: Vec::new(),
+            located_tests: vec![codex_file_search::task_locator::LocateTaskLocatedPath {
+                path: "tests/main.rs".to_string(),
+                role: "test".to_string(),
+            }],
+            captured_instruction_sources: Vec::new(),
+            captured_source_sections: vec![
+                LocateTaskSourceSection {
+                    section_id: "primary-section".to_string(),
+                    kind: LocateTaskSourceSectionKind::PrimaryImplementation,
+                    state: LocateTaskSourceSectionState::Materialized,
+                    path: "src/main.rs".to_string(),
+                    span: None,
+                    content_hash: Some(primary_hash.clone()),
+                    file_content_hash: Some(primary_file_hash),
+                    source_snapshot_identity: snapshot.to_string(),
+                    text: Some(primary_text.to_string()),
+                    provenance: "test".to_string(),
+                },
+                LocateTaskSourceSection {
+                    section_id: "missing-test-section".to_string(),
+                    kind: LocateTaskSourceSectionKind::Test,
+                    state: LocateTaskSourceSectionState::NotMaterialized,
+                    path: "tests/main.rs".to_string(),
+                    span: None,
+                    content_hash: None,
+                    file_content_hash: Some(missing_file_hash),
+                    source_snapshot_identity: snapshot.to_string(),
+                    text: None,
+                    provenance: "test".to_string(),
+                },
+            ],
+            candidate_validation_routes: Vec::new(),
+            source_gaps: Vec::new(),
+            unresolved_source_ambiguity: Vec::new(),
+            truncated: false,
+        },
+        owner_packet_seed: None,
+        files_inspected: 2,
+        files_reparsed: 2,
+        rendered_bytes: 0,
+    };
+
+    let bundle = assemble_owner_evidence_bundle_v2(output, "epoch", None, None, &BTreeMap::new());
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        bundle.to_response_item("call", &payload)
+    else {
+        panic!("expected bundle function output");
+    };
+    let artifact = output.body.to_text().expect("bundle artifact text");
+    let lines = artifact.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "OWNER_EVIDENCE_BUNDLE_V2");
+    let metadata: serde_json::Value = serde_json::from_str(lines[1]).expect("bundle metadata");
+    let manifest = metadata["section_manifest"]
+        .as_array()
+        .expect("section manifest");
+    let primary = manifest
+        .iter()
+        .find(|entry| entry["section_id"] == "primary-section")
+        .expect("primary manifest entry");
+    let primary_line = primary["artifact_line_range"]["start_line"]
+        .as_u64()
+        .expect("primary artifact line") as usize;
+    assert_eq!(primary["artifact_line_range"]["end_line"], primary_line);
+    let primary_record: serde_json::Value =
+        serde_json::from_str(lines[primary_line - 1]).expect("primary artifact record");
+    assert_eq!(primary_record["exact_text"], primary_text);
+    assert_eq!(primary_record["content_hash"], primary_hash);
+
+    let missing = manifest
+        .iter()
+        .find(|entry| entry["section_id"] == "missing-test-section")
+        .expect("missing manifest entry");
+    assert_eq!(missing["state"], "not_materialized");
+    assert!(missing["artifact_line_range"].is_null());
 }

@@ -5,6 +5,109 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use ts_rs::TS;
 
+pub const MAX_STRUCTURED_VALIDATION_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRouteOrdering {
+    #[default]
+    StopOnFailure,
+    RunAll,
+}
+
+/// A predeclared validation command. `argv` is deliberately structured so the
+/// host never needs to reinterpret shell text at the auto-launch boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationRouteLeaf {
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub covered_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub covered_contracts: Vec<String>,
+    pub timeout_ms: u64,
+    /// Most timeouts are execution policy rather than proof semantics. Set this
+    /// only when the validation contract explicitly defines the timeout as part
+    /// of what the command proves.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub semantic_timeout: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationRoute {
+    pub leaves: Vec<ValidationRouteLeaf>,
+    #[serde(default)]
+    pub ordering: ValidationRouteOrdering,
+}
+
+impl<'de> Deserialize<'de> for ValidationRouteLeaf {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            argv: Vec<String>,
+            #[serde(default)]
+            covered_paths: Vec<String>,
+            #[serde(default)]
+            covered_contracts: Vec<String>,
+            timeout_ms: u64,
+            #[serde(default)]
+            semantic_timeout: bool,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.argv.is_empty() || raw.argv.iter().any(String::is_empty) {
+            return Err(serde::de::Error::custom(
+                "validation route argv must contain a non-empty program and non-empty arguments",
+            ));
+        }
+        validate_nonblank_values("validation covered path", &raw.covered_paths)
+            .map_err(serde::de::Error::custom)?;
+        validate_nonblank_values("validation covered contract", &raw.covered_contracts)
+            .map_err(serde::de::Error::custom)?;
+        if raw.timeout_ms == 0 || raw.timeout_ms > MAX_STRUCTURED_VALIDATION_TIMEOUT_MS {
+            return Err(serde::de::Error::custom(format!(
+                "validation route timeout_ms must be between 1 and {MAX_STRUCTURED_VALIDATION_TIMEOUT_MS}"
+            )));
+        }
+        Ok(Self {
+            argv: raw.argv,
+            covered_paths: raw.covered_paths,
+            covered_contracts: raw.covered_contracts,
+            timeout_ms: raw.timeout_ms,
+            semantic_timeout: raw.semantic_timeout,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidationRoute {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            leaves: Vec<ValidationRouteLeaf>,
+            #[serde(default)]
+            ordering: ValidationRouteOrdering,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.leaves.is_empty() {
+            return Err(serde::de::Error::custom(
+                "validation route must contain at least one direct-argv leaf",
+            ));
+        }
+        Ok(Self {
+            leaves: raw.leaves,
+            ordering: raw.ordering,
+        })
+    }
+}
+
 // Types for the TODO tool arguments matching codex-vscode/todo-mcp/src/main.rs
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +148,11 @@ pub struct PlanItemArg {
     pub risks: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_desktop_activation: bool,
+    /// Optional deterministic validation bound to this work unit. Absence keeps
+    /// the existing model-selected validation path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub validation_route: Option<ValidationRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema, TS)]
@@ -80,6 +188,8 @@ impl<'de> Deserialize<'de> for PlanItemArg {
             risks: Vec<String>,
             #[serde(default)]
             requires_desktop_activation: bool,
+            #[serde(default)]
+            validation_route: Option<ValidationRoute>,
         }
 
         let raw = RawPlanItemArg::deserialize(deserializer)?;
@@ -105,6 +215,7 @@ impl<'de> Deserialize<'de> for PlanItemArg {
             generated_artifacts: raw.generated_artifacts,
             risks: raw.risks,
             requires_desktop_activation: raw.requires_desktop_activation,
+            validation_route: raw.validation_route,
         })
     }
 }

@@ -154,6 +154,18 @@ function Test-CargoLanesRootMarker {
     }
 }
 
+function Test-CargoLanesRootReparsePoint {
+    param(
+        [string]$LanesRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $LanesRoot)) {
+        return $false
+    }
+    $rootItem = Get-Item -LiteralPath $LanesRoot -Force -ErrorAction Stop
+    return ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+}
+
 function Test-CargoLanesRootForPrune {
     param(
         [string]$RepoRoot,
@@ -161,6 +173,9 @@ function Test-CargoLanesRootForPrune {
     )
 
     if (-not (Test-Path -LiteralPath $LanesRoot -PathType Container)) {
+        return $false
+    }
+    if (Test-CargoLanesRootReparsePoint -LanesRoot $LanesRoot) {
         return $false
     }
     $defaultLanesRoot = Join-Path $RepoRoot "codex-rs\target\lanes"
@@ -175,6 +190,10 @@ function Initialize-CargoLanesRoot {
         [string]$RepoRoot,
         [string]$LanesRoot
     )
+
+    if (Test-CargoLanesRootReparsePoint -LanesRoot $LanesRoot) {
+        throw "Cargo lanes root must not be a reparse point or junction: $LanesRoot"
+    }
 
     if (Test-CargoLanesRootMarker -LanesRoot $LanesRoot) {
         return
@@ -254,8 +273,7 @@ function Normalize-RequestedLaneName {
         return "auto"
     }
 
-    $safe = ConvertTo-SafeLaneName $Value
-    return ($safe -replace "-\d{14}$", "")
+    return ConvertTo-SafeLaneName $Value
 }
 
 function Get-StableCommandHash {
@@ -411,16 +429,25 @@ function Test-ExclusiveLaneFileBusy {
         return $false
     }
     catch [System.IO.IOException] {
-        return $true
-    }
-    catch [System.UnauthorizedAccessException] {
-        return $true
+        if (Test-IsCargoLaneLockContention -Exception $_.Exception) {
+            return $true
+        }
+        throw
     }
     finally {
         if ($null -ne $stream) {
             $stream.Dispose()
         }
     }
+}
+
+function Test-IsCargoLaneLockContention {
+    param(
+        [System.IO.IOException]$Exception
+    )
+
+    $nativeCode = $Exception.HResult -band 0xFFFF
+    return $nativeCode -eq 32 -or $nativeCode -eq 33
 }
 
 function Get-EnvIntValue {
@@ -702,6 +729,9 @@ function Acquire-CargoLaneReservation {
             )
         }
         catch [IO.IOException] {
+            if (-not (Test-IsCargoLaneLockContention -Exception $_.Exception)) {
+                throw
+            }
             if ([DateTime]::UtcNow -ge $coordinationDeadline) {
                 throw "Timed out waiting for Cargo lane coordination lock."
             }
@@ -739,10 +769,19 @@ function Acquire-CargoLaneReservation {
                     Stream = $stream
                 }
             }
+            catch [IO.IOException] {
+                if ($null -ne $stream) {
+                    $stream.Dispose()
+                }
+                if (-not (Test-IsCargoLaneLockContention -Exception $_.Exception)) {
+                    throw
+                }
+            }
             catch {
                 if ($null -ne $stream) {
                     $stream.Dispose()
                 }
+                throw
             }
         }
 

@@ -945,6 +945,10 @@ pub struct Config {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
+    /// Project consumed completed textual tool outputs into retrievable receipts
+    /// for manually managed history. Canonical rollout items are never changed.
+    pub completed_tool_history_projection: bool,
+
     /// User-configured maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
     /// Maximum runtime in seconds for agent job workers before they are failed.
@@ -3994,6 +3998,9 @@ impl Config {
                 })
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
+            completed_tool_history_projection: cfg
+                .completed_tool_history_projection
+                .unwrap_or(true),
             agent_max_threads,
             agent_max_depth,
             agent_roles,

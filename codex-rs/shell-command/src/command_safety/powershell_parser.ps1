@@ -73,9 +73,18 @@ function Invoke-ParseRequest {
     # Only accept AST shapes we can flatten into a list of argv-like command words.
     # Anything more dynamic than that becomes "unsupported" instead of being guessed at.
     $commands = [System.Collections.ArrayList]::new()
+    $localConstants = @{}
 
     foreach ($statement in $ast.EndBlock.Statements) {
-        if (-not (Add-CommandsFromPipelineBase $statement $commands)) {
+        if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+            if (-not (Add-LocalScalarConstant $statement $localConstants)) {
+                $commands = $null
+                break
+            }
+            continue
+        }
+
+        if (-not (Add-CommandsFromPipelineBase $statement $commands $localConstants)) {
             $commands = $null
             break
         }
@@ -209,8 +218,64 @@ function Resolve-ApplicationAgainstState {
     }
 }
 
-function Convert-CommandElement {
+function Convert-ScalarConstantExpression {
     param($element)
+
+    if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        return @($element.Value)
+    }
+
+    if ($element -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+        if ($element.NestedExpressions.Count -gt 0) {
+            return $null
+        }
+        return @($element.Value)
+    }
+
+    if ($element -is [System.Management.Automation.Language.ConstantExpressionAst]) {
+        if ($element.Value -eq $null -or $element.Value -isnot [System.ValueType]) {
+            return $null
+        }
+        return @($element.Value.ToString())
+    }
+
+    return $null
+}
+
+function Add-LocalScalarConstant {
+    param($assignment, $localConstants)
+
+    if (
+        -not ($assignment.Left -is [System.Management.Automation.Language.VariableExpressionAst]) -or
+        $assignment.Left.Splatted -or
+        -not $assignment.Left.VariablePath.IsUnscopedVariable
+    ) {
+        return $false
+    }
+
+    $name = $assignment.Left.VariablePath.UserPath
+    if ([string]::IsNullOrEmpty($name) -or $name.Contains(':')) {
+        return $false
+    }
+
+    $commandExpression = $assignment.Right
+    if (-not ($commandExpression -is [System.Management.Automation.Language.CommandExpressionAst])) {
+        return $false
+    }
+    if ($commandExpression.Redirections.Count -gt 0) {
+        return $false
+    }
+    $value = Convert-ScalarConstantExpression $commandExpression.Expression
+    if ($value -eq $null -or $value.Count -ne 1) {
+        return $false
+    }
+
+    $localConstants[$name.ToLowerInvariant()] = $value[0]
+    return $true
+}
+
+function Convert-CommandElement {
+    param($element, $localConstants)
 
     # Accept only literal-ish command elements. Variable expansion, subexpressions, splats,
     # and other dynamic forms return $null so the whole request becomes unsupported.
@@ -242,7 +307,30 @@ function Convert-CommandElement {
             return @('-' + $element.ParameterName, $element.Argument.Value.ToString())
         }
 
+        if ($element.Argument -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            $value = Convert-CommandElement $element.Argument $localConstants
+            if ($value -eq $null -or $value.Count -ne 1) {
+                return $null
+            }
+            return @('-' + $element.ParameterName, $value[0])
+        }
+
         return $null
+    }
+
+    if ($element -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        if ($element.Splatted -or -not $element.VariablePath.IsUnscopedVariable) {
+            return $null
+        }
+        $name = $element.VariablePath.UserPath
+        if ([string]::IsNullOrEmpty($name) -or $name.Contains(':')) {
+            return $null
+        }
+        $key = $name.ToLowerInvariant()
+        if (-not $localConstants.ContainsKey($key)) {
+            return $null
+        }
+        return @($localConstants[$key])
     }
 
     return $null
@@ -325,7 +413,7 @@ function Get-DirectArgvCandidate {
 }
 
 function Convert-PipelineElement {
-    param($element)
+    param($element, $localConstants)
 
     if ($element -is [System.Management.Automation.Language.CommandAst]) {
         # Redirections and invocation operators make the command harder to classify safely,
@@ -343,7 +431,7 @@ function Convert-PipelineElement {
 
         $parts = @()
         foreach ($commandElement in $element.CommandElements) {
-            $converted = Convert-CommandElement $commandElement
+            $converted = Convert-CommandElement $commandElement $localConstants
             if ($converted -eq $null) {
                 return $null
             }
@@ -362,7 +450,7 @@ function Convert-PipelineElement {
         if ($element.Expression -is [System.Management.Automation.Language.ParenExpressionAst]) {
             $innerPipeline = $element.Expression.Pipeline
             if ($innerPipeline -and $innerPipeline.PipelineElements.Count -eq 1) {
-                return Convert-PipelineElement $innerPipeline.PipelineElements[0]
+                return Convert-PipelineElement $innerPipeline.PipelineElements[0] $localConstants
             }
         }
 
@@ -373,14 +461,14 @@ function Convert-PipelineElement {
 }
 
 function Add-CommandsFromPipelineAst {
-    param($pipeline, $commands)
+    param($pipeline, $commands, $localConstants)
 
     if ($pipeline.PipelineElements.Count -eq 0) {
         return $false
     }
 
     foreach ($element in $pipeline.PipelineElements) {
-        $words = Convert-PipelineElement $element
+        $words = Convert-PipelineElement $element $localConstants
         if ($words -eq $null -or $words.Count -eq 0) {
             return $false
         }
@@ -391,13 +479,13 @@ function Add-CommandsFromPipelineAst {
 }
 
 function Add-CommandsFromPipelineChain {
-    param($chain, $commands)
+    param($chain, $commands, $localConstants)
 
-    if (-not (Add-CommandsFromPipelineBase $chain.LhsPipelineChain $commands)) {
+    if (-not (Add-CommandsFromPipelineBase $chain.LhsPipelineChain $commands $localConstants)) {
         return $false
     }
 
-    if (-not (Add-CommandsFromPipelineAst $chain.RhsPipeline $commands)) {
+    if (-not (Add-CommandsFromPipelineAst $chain.RhsPipeline $commands $localConstants)) {
         return $false
     }
 
@@ -405,16 +493,16 @@ function Add-CommandsFromPipelineChain {
 }
 
 function Add-CommandsFromPipelineBase {
-    param($pipeline, $commands)
+    param($pipeline, $commands, $localConstants)
 
     if ($pipeline -is [System.Management.Automation.Language.PipelineAst]) {
-        return Add-CommandsFromPipelineAst $pipeline $commands
+        return Add-CommandsFromPipelineAst $pipeline $commands $localConstants
     }
 
     # Windows PowerShell 5.1 does not define PipelineChainAst, so avoid a direct type
     # reference here and instead check the runtime type name.
     if ($pipeline.GetType().FullName -eq 'System.Management.Automation.Language.PipelineChainAst') {
-        return Add-CommandsFromPipelineChain $pipeline $commands
+        return Add-CommandsFromPipelineChain $pipeline $commands $localConstants
     }
 
     return $false

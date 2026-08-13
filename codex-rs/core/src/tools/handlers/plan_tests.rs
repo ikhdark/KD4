@@ -122,10 +122,11 @@ async fn invoke_normalized_plan_update(
 fn unchanged_plan_output_remains_compact() {
     let output = PlanToolOutput {
         normalized_plan: None,
-        governor_plan: UpdatePlanArgs {
+        governor_plan: Some(UpdatePlanArgs {
             explanation: None,
             plan: Vec::new(),
-        },
+        }),
+        validation_results: Vec::new(),
     };
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -162,6 +163,72 @@ fn generated_artifact_schema_requires_repository_relative_paths() {
     assert!(description.contains("Repository-relative"));
     assert!(description.contains("remain inside the repository"));
     assert!(item_description.contains("repository-relative"));
+}
+
+#[test]
+fn focused_plan_arguments_require_one_atomic_work_unit_and_reasoned_removals() {
+    let focused = parse_update_plan_arguments(
+        &serde_json::json!({
+            "tier": "focused",
+            "source_owner": "codex-core",
+            "implementation_surfaces": ["core/src/task_evidence.rs"],
+            "mutation_obligations": [{
+                "id": "mutation",
+                "description": "edit the owner",
+                "paths": ["core/src/task_evidence.rs"]
+            }],
+            "validation_disposition": "not_required",
+            "plan": []
+        })
+        .to_string(),
+    )
+    .expect("focused work unit");
+    assert_eq!(focused.tier, Some(PlanningTier::Focused));
+    assert!(focused.plan.is_empty());
+
+    for invalid in [
+        serde_json::json!({
+            "tier": "focused",
+            "plan": [{"id": "step", "step": "not atomic", "status": "pending"}]
+        }),
+        serde_json::json!({
+            "tier": "focused",
+            "mutation_obligations": [
+                {"id": "one", "description": "one"},
+                {"id": "two", "description": "two"}
+            ],
+            "plan": []
+        }),
+        serde_json::json!({
+            "removed_steps": [{"id": "step", "reason": ""}],
+            "plan": []
+        }),
+    ] {
+        assert!(parse_update_plan_arguments(&invalid.to_string()).is_err());
+    }
+}
+
+#[test]
+fn default_mode_complexity_selects_only_the_complex_internal_tier() {
+    let parsed = parse_update_plan_arguments(
+        &serde_json::json!({
+            "tier": "complex",
+            "plan": [{
+                "id": "architecture",
+                "step": "Resolve the cross-owner architecture contract",
+                "status": "in_progress",
+                "risks": ["generated contract compatibility"]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("complex internal representation");
+    assert_eq!(parsed.tier, Some(PlanningTier::Complex));
+
+    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    let description = tool["description"].as_str().expect("tool description");
+    assert!(description.contains("Default mode upgrades only this representation"));
+    assert!(description.contains("never changes collaboration mode"));
 }
 
 #[tokio::test]

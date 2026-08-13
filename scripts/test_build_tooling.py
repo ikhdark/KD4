@@ -106,9 +106,13 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         self.assertFalse(just_shell.command_needs_rust_tooling("pnpm lint:markdown"))
         self.assertFalse(just_shell.command_needs_rust_tooling("python tool.py"))
-        self.assertTrue(just_shell.command_needs_rust_tooling("cargo test -p codex-core"))
         self.assertTrue(
-            just_shell.command_needs_rust_tooling("python rust_build_status.py run-lane")
+            just_shell.command_needs_rust_tooling("cargo test -p codex-core")
+        )
+        self.assertTrue(
+            just_shell.command_needs_rust_tooling(
+                "python rust_build_status.py run-lane"
+            )
         )
 
     def test_local_just_shell_sets_sccache_without_probe(self) -> None:
@@ -453,10 +457,21 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
     def test_local_just_shell_limits_python_to_thirty_logical_cpus(self) -> None:
         just_shell = load_just_shell_module()
 
-        self.assertEqual(
-            just_shell.python_cpu_env({}),
-            {"PYTHON_CPU_COUNT": "30"},
-        )
+        with mock.patch.object(just_shell.os, "cpu_count", return_value=8):
+            self.assertEqual(
+                just_shell.python_cpu_env({}),
+                {"PYTHON_CPU_COUNT": "8"},
+            )
+        with mock.patch.object(just_shell.os, "cpu_count", return_value=64):
+            self.assertEqual(
+                just_shell.python_cpu_env({}),
+                {"PYTHON_CPU_COUNT": "30"},
+            )
+        with mock.patch.object(just_shell.os, "cpu_count", return_value=None):
+            self.assertEqual(
+                just_shell.python_cpu_env({}),
+                {"PYTHON_CPU_COUNT": "1"},
+            )
         self.assertEqual(
             just_shell.python_cpu_env({"PYTHON_CPU_COUNT": "8"}),
             {},
@@ -787,7 +802,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast',
             justfile,
         )
-        self.assertEqual(nextest["profile"]["default"]["test-threads"], 16)
+        self.assertEqual(nextest["profile"]["default"]["test-threads"], 4)
         local_profile = nextest["profile"]["local"]
         self.assertEqual(local_profile["inherits"], "default")
         fast_profile = nextest["profile"]["fast"]
@@ -844,7 +859,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         cargo_config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-        self.assertEqual(cargo_config["build"]["jobs"], 16)
+        self.assertEqual(cargo_config["build"]["jobs"], 8)
         self.assertEqual(
             cargo_config["env"]["RUST_TEST_THREADS"],
             {"value": "16", "force": False},
@@ -1033,9 +1048,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertNotIn("$env:RUSTFLAGS", publish_entrypoint)
 
     def test_publish_commit_state_covers_changed_binary_restart_failures(self) -> None:
-        publish_script = (
-            REPO_ROOT / "scripts" / "publish-local-codex.ps1"
-        ).read_text(encoding="utf-8")
+        publish_script = (REPO_ROOT / "scripts" / "publish-local-codex.ps1").read_text(
+            encoding="utf-8"
+        )
 
         state_start = publish_script.index("$publishCommitted = $false")
         outer_try = publish_script.index("try {", state_start)
@@ -1069,13 +1084,18 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         if bash is None:
             self.skipTest("standalone bash is required")
 
-        remote_env_script = (
-            REPO_ROOT / "scripts" / "test-remote-env.sh"
-        ).read_text(encoding="utf-8")
-        definitions = "is_sourced() {" + remote_env_script.split(
-            "is_sourced() {", 1
-        )[1].split("\nif ! is_sourced; then", 1)[0]
-        harness = definitions + r'''
+        remote_env_script = (REPO_ROOT / "scripts" / "test-remote-env.sh").read_text(
+            encoding="utf-8"
+        )
+        definitions = (
+            "is_sourced() {"
+            + remote_env_script.split("is_sourced() {", 1)[1].split(
+                "\nif ! is_sourced; then", 1
+            )[0]
+        )
+        harness = (
+            definitions
+            + r"""
 set -euo pipefail
 test_root="$(mktemp -d)"
 trap 'rm -rf "${test_root}"' EXIT
@@ -1104,7 +1124,8 @@ CODEX_TEST_REMOTE_ENV_REUSE=0
 start_remote_env_container missing-container test-image "${binary_path}" 4321
 grep -q '^rm -f missing-container$' "${docker_log}"
 grep -q '^run -d ' "${docker_log}"
-'''
+"""
+        )
 
         completed = subprocess.run(
             [bash, "-s"],
@@ -1120,9 +1141,7 @@ grep -q '^run -d ' "${docker_log}"
 
     def test_dependency_policy_dispatches_duplicate_check_recipe(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        recipe = justfile.split("deps-policy-check *args:", 1)[1].split(
-            "\n\n", 1
-        )[0]
+        recipe = justfile.split("deps-policy-check *args:", 1)[1].split("\n\n", 1)[0]
 
         self.assertIn("just deps-duplicates-check {args}", recipe)
         self.assertNotIn("just deps-duplicates {args}", recipe)

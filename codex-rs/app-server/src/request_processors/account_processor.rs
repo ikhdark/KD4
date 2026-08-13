@@ -710,6 +710,9 @@ impl AccountRequestProcessor {
             .await;
     }
 
+    // Login completion must carry both the transport dependencies and the
+    // complete outcome payload into the detached notification task.
+    #[allow(clippy::too_many_arguments)]
     async fn send_chatgpt_login_completion_notifications(
         outgoing: &OutgoingMessageSender,
         config_manager: ConfigManager,

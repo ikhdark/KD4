@@ -167,6 +167,55 @@ pub enum ModelAttemptTransport {
     ResponsesWebsocket,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAttemptProviderBaseline {
+    ExactPrefixInherited,
+    FreshFullReplay,
+    StatelessFull,
+    FailOpenStaleRetained,
+}
+
+impl ModelAttemptProviderBaseline {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactPrefixInherited => "exact_prefix_inherited",
+            Self::FreshFullReplay => "fresh_full_replay",
+            Self::StatelessFull => "stateless_full",
+            Self::FailOpenStaleRetained => "fail_open_stale_retained",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelContextComponentTelemetry {
+    pub sampling_request_id: String,
+    pub attempt_id: String,
+    pub retry_index: u32,
+    pub kind: String,
+    pub contract_version: u16,
+    pub semantic_id: String,
+    pub content_hash: String,
+    pub serialized_bytes: u64,
+    pub approx_tokens: i64,
+    pub active: bool,
+    pub disposition: String,
+    pub local_reused: bool,
+    pub baseline_generation: Option<u64>,
+    pub provider_baseline: ModelAttemptProviderBaseline,
+    pub previous_response_id_present: bool,
+    pub projection_savings_eligible: bool,
+    pub fresh_response_id_established: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelPromptContextCategoryTelemetry {
+    pub category: String,
+    pub serialized_bytes: u64,
+    pub approx_tokens: u64,
+    pub sha256: String,
+    pub unchanged_from_previous_request: bool,
+}
+
 impl ModelAttemptTransport {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -185,6 +234,11 @@ pub struct ModelAttemptTelemetry {
     pub outcome: ModelAttemptOutcome,
     pub request_kind: ModelAttemptRequestKind,
     pub transport: ModelAttemptTransport,
+    pub baseline_generation: Option<u64>,
+    pub provider_baseline: ModelAttemptProviderBaseline,
+    pub previous_response_id_present: bool,
+    pub projection_savings_eligible: bool,
+    pub fresh_response_id_established: bool,
     pub input_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
     pub uncached_input_tokens: Option<i64>,
@@ -201,6 +255,30 @@ pub struct ModelAttemptTelemetry {
     pub other_injected_context_bytes: u64,
     pub envelope_overhead_bytes: u64,
     pub reconciliation_residual_bytes: i64,
+    pub prompt_context_categories: Vec<ModelPromptContextCategoryTelemetry>,
+    pub fixed_prefix_reuse_eligible: bool,
+    pub logical_context_tokens: i64,
+    pub active_component_bytes: u64,
+    pub local_constructed_bytes: u64,
+    pub local_reused_bytes: u64,
+    pub component_cache_hits: u64,
+    pub root_task_id: Option<String>,
+    pub measurement_window_id: String,
+    pub local_projected_occupancy: Option<i64>,
+    pub effective_provider_occupancy: Option<i64>,
+    pub estimate_basis: Option<String>,
+    pub estimate_complete: Option<bool>,
+    pub checkpoint_tokens: i64,
+    pub completed_tool_receipt_tokens: i64,
+    pub raw_tool_output_tokens: i64,
+    pub completed_call_tokens: i64,
+    pub schema_tokens: i64,
+    pub continuity_tokens: i64,
+    pub unique_new_tokens: Option<i64>,
+    pub amplification_measurement_complete: bool,
+    pub amplification_null_reason: Option<String>,
+    pub soft_floor_status: Option<String>,
+    pub compactions: u64,
     pub dispatch_ready_us: u64,
     pub stream_established_us: Option<u64>,
     pub first_provider_event_us: Option<u64>,
@@ -218,6 +296,25 @@ fn normalized_model_attempt_label(value: &str) -> Option<&str> {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+    .then_some(value)
+}
+
+fn normalized_context_component_hash(value: &str) -> Option<&str> {
+    (value.len() == 24 && value.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(value)
+}
+
+fn normalized_context_component_semantic_id(value: &str) -> Option<&str> {
+    let mut parts = value.split(':');
+    let (Some(kind), Some(version), Some(hash), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    (normalized_model_attempt_label(kind).is_some()
+        && version.strip_prefix('v').is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && normalized_context_component_hash(hash).is_some())
     .then_some(value)
 }
 
@@ -1045,6 +1142,8 @@ impl SessionTelemetry {
 
     /// Emits only the explicit allowlist in [`ModelAttemptTelemetry`].
     pub fn model_attempt_completed(&self, record: &ModelAttemptTelemetry) {
+        let prompt_context_categories = serde_json::to_string(&record.prompt_context_categories)
+            .unwrap_or_else(|_| "[]".to_string());
         let provider = self
             .metadata
             .service_name
@@ -1067,6 +1166,11 @@ impl SessionTelemetry {
                 outcome = record.outcome.as_str(),
                 request_kind = record.request_kind.as_str(),
                 transport = record.transport.as_str(),
+                baseline_generation = record.baseline_generation,
+                provider_baseline = record.provider_baseline.as_str(),
+                previous_response_id_present = record.previous_response_id_present,
+                projection_savings_eligible = record.projection_savings_eligible,
+                fresh_response_id_established = record.fresh_response_id_established,
                 provider = provider,
                 model = model,
                 service_tier = service_tier,
@@ -1086,12 +1190,67 @@ impl SessionTelemetry {
                 other_injected_context_bytes = record.other_injected_context_bytes,
                 envelope_overhead_bytes = record.envelope_overhead_bytes,
                 reconciliation_residual_bytes = record.reconciliation_residual_bytes,
+                prompt_context_categories = %prompt_context_categories,
+                fixed_prefix_reuse_eligible = record.fixed_prefix_reuse_eligible,
+                logical_context_tokens = record.logical_context_tokens,
+                active_component_bytes = record.active_component_bytes,
+                local_constructed_bytes = record.local_constructed_bytes,
+                local_reused_bytes = record.local_reused_bytes,
+                component_cache_hits = record.component_cache_hits,
+                root_task_id = record.root_task_id.as_deref(),
+                measurement_window_id = %record.measurement_window_id,
+                local_projected_occupancy = record.local_projected_occupancy,
+                effective_provider_occupancy = record.effective_provider_occupancy,
+                estimate_basis = record.estimate_basis.as_deref(),
+                estimate_complete = record.estimate_complete,
+                checkpoint_tokens = record.checkpoint_tokens,
+                completed_tool_receipt_tokens = record.completed_tool_receipt_tokens,
+                raw_tool_output_tokens = record.raw_tool_output_tokens,
+                completed_call_tokens = record.completed_call_tokens,
+                schema_tokens = record.schema_tokens,
+                continuity_tokens = record.continuity_tokens,
+                unique_new_tokens = record.unique_new_tokens,
+                amplification_measurement_complete = record.amplification_measurement_complete,
+                amplification_null_reason = record.amplification_null_reason.as_deref(),
+                soft_floor_status = record.soft_floor_status.as_deref(),
+                compactions = record.compactions,
                 dispatch_ready_us = record.dispatch_ready_us,
                 stream_established_us = record.stream_established_us,
                 first_provider_event_us = record.first_provider_event_us,
                 first_model_output_us = record.first_model_output_us,
                 first_visible_output_us = record.first_visible_output_us,
                 completed_us = record.completed_us,
+        );
+    }
+
+    /// Emits bounded component metadata. Text and filesystem provenance are
+    /// intentionally absent; identities are opaque, versioned digests.
+    pub fn model_context_component(&self, record: &ModelContextComponentTelemetry) {
+        let kind = normalized_model_attempt_label(&record.kind);
+        let semantic_id = normalized_context_component_semantic_id(&record.semantic_id);
+        let content_hash = normalized_context_component_hash(&record.content_hash);
+        let disposition = normalized_model_attempt_label(&record.disposition);
+        tracing::event!(
+            target: crate::targets::OTEL_LOG_ONLY_TARGET,
+            tracing::Level::INFO,
+            event.name = "codex.model_context_component",
+            sampling_request_id = %record.sampling_request_id,
+            attempt_id = %record.attempt_id,
+            retry_index = record.retry_index,
+            component_kind = kind,
+            contract_version = record.contract_version,
+            semantic_id = semantic_id,
+            content_hash = content_hash,
+            serialized_bytes = record.serialized_bytes,
+            approx_tokens = record.approx_tokens,
+            active = record.active,
+            disposition = disposition,
+            local_reused = record.local_reused,
+            baseline_generation = record.baseline_generation,
+            provider_baseline = record.provider_baseline.as_str(),
+            previous_response_id_present = record.previous_response_id_present,
+            projection_savings_eligible = record.projection_savings_eligible,
+            fresh_response_id_established = record.fresh_response_id_established,
         );
     }
 
@@ -1412,6 +1571,8 @@ fn duration_from_ms_value(value: Option<&serde_json::Value>) -> Option<Duration>
 
 #[cfg(test)]
 mod model_attempt_privacy_tests {
+    use super::normalized_context_component_hash;
+    use super::normalized_context_component_semantic_id;
     use super::normalized_model_attempt_label;
 
     #[test]
@@ -1430,5 +1591,25 @@ mod model_attempt_privacy_tests {
         );
         assert_eq!(normalized_model_attempt_label("provider with spaces"), None);
         assert_eq!(normalized_model_attempt_label(&"x".repeat(97)), None);
+    }
+
+    #[test]
+    fn context_component_ids_accept_only_bounded_opaque_hashes() {
+        assert_eq!(
+            normalized_context_component_semantic_id("repository:v1:0123456789abcdef01234567"),
+            Some("repository:v1:0123456789abcdef01234567")
+        );
+        assert_eq!(
+            normalized_context_component_hash("abcdef012345abcdef012345"),
+            Some("abcdef012345abcdef012345")
+        );
+        assert_eq!(
+            normalized_context_component_semantic_id(r#"repository:v1:C:\secret\AGENTS.md"#),
+            None
+        );
+        assert_eq!(
+            normalized_context_component_hash("prompt text or a filesystem path"),
+            None
+        );
     }
 }

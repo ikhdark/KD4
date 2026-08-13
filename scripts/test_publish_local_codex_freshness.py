@@ -26,7 +26,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             target = install_dir / "codex.exe"
             target.write_bytes(fake_codex.read_bytes())
             os.utime(target, (source_timestamp, source_timestamp))
-            self.install_matching_code_mode_host(install_dir)
+            self.install_matching_publish_helpers(install_dir)
 
             result = self.run_script(
                 "-SkipBuild",
@@ -751,7 +751,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             target = install_dir / "codex.exe"
             target.write_bytes(fake_codex.read_bytes())
             os.utime(target, (source_timestamp, source_timestamp))
-            self.install_matching_code_mode_host(install_dir)
+            self.install_matching_publish_helpers(install_dir)
 
             result = self.run_script(
                 "-DryRun",
@@ -789,7 +789,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             target = install_dir / "codex.exe"
             target.write_bytes(fake_codex.read_bytes())
             os.utime(target, (source_timestamp, source_timestamp))
-            self.install_matching_code_mode_host(install_dir)
+            self.install_matching_publish_helpers(install_dir)
 
             result = self.run_script(
                 "-SkipBuild",

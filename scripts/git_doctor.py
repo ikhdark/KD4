@@ -19,6 +19,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTEST_CACHE_DIRS = (Path(".pytest_cache"), Path("sdk/python/.pytest_cache"))
 
 
+class RepositoryProbeError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class GitDoctorReport:
     repo_root: str
@@ -177,11 +181,15 @@ def recommendations(
 
 def build_report(timeout: float) -> GitDoctorReport:
     try:
-        root = run_git(["rev-parse", "--show-toplevel"]).stdout.strip() or str(
-            REPO_ROOT
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        root = str(REPO_ROOT)
+        root_probe = run_git(["rev-parse", "--show-toplevel"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RepositoryProbeError(
+            f"could not discover repository root: {exc}"
+        ) from exc
+    root = root_probe.stdout.strip()
+    if root_probe.returncode != 0 or not root:
+        detail = bounded_error(root_probe.stderr) or "git returned no repository root"
+        raise RepositoryProbeError(f"could not discover repository root: {detail}")
     kind = path_kind(Path(root))
     fsmonitor = git_config("core.fsmonitor")
     untracked_cache = git_config("core.untrackedCache")
@@ -252,7 +260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         report = build_report(args.timeout)
-    except OSError as exc:
+    except (OSError, RepositoryProbeError) as exc:
         print(f"git doctor failed: {exc}", file=sys.stderr)
         return 2
     if args.json:

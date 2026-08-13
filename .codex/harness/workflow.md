@@ -6,15 +6,17 @@ without redefining repository implementation policy.
 
 ## Ownership Boundaries
 
-- Root `AGENTS.md` owns task lanes, repository inspection, implementation
-  discipline, validation selection, completion status, and final reporting.
+- Root `AGENTS.md` owns repository inspection, implementation discipline,
+  validation selection, completion status, and final reporting.
 - `.codex/harness` owns optional durable task artifacts and lifecycle guidance.
+- This file owns delegated-role and architect-lane procedure; load it only when
+  such a workflow is active.
 - Give every mutating root task and subagent a durable identity. One owner holds
   each path and named-contract claim at a time in a shared worktree.
 
 ## Phase 1: Intake
 
-1. Confirm the concrete objective and choose the lane from root `AGENTS.md`.
+1. Confirm the concrete objective and choose the smallest sufficient workflow.
 2. Identify the owner directory, nearest scoped instructions, and validation
    route.
 3. Decide whether durable state will materially help.
@@ -106,6 +108,14 @@ Before root completion, linked assignments, validations, gates, and claims must
 be terminal, and no linked workspace mutation lease may remain active. Root
 completion rechecks sealed receipt evidence so later relevant drift remains a
 blocker; unrelated task roots only warn and do not join this barrier.
+
+Investigation agents remain read-only, load root and nearest scoped
+instructions, inspect the smallest owner/caller/test/contract surface, separate
+evidence from inference, and report dependencies, validation implications, and
+a stop condition. Implementation agents reinspect their focused diff before
+editing, preserve unrelated work, stop on competing ownership or unfinished
+dependencies, and report changed paths, validation, runtime wiring, and risk.
+Subagents do not mutate shared harness state or stage, commit, push, or publish.
 
 ### Architect-Driven Implementation Lane
 

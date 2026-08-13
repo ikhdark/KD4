@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
+import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
-
+from pathlib import Path
 
 INSTALL_SCRIPT = Path(__file__).with_name("install.sh")
 BUNDLE_SCRIPT = Path(__file__).with_name("build_install_sh.py")
@@ -108,11 +108,37 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(requests.count(checksum_url), 1)
         self.assertIn(f"Resolved version: {VERSION}", result.stdout)
 
+    def test_corrupted_same_version_sidecar_is_reinstalled(self) -> None:
+        intact_result, intact_requests = run_installer(
+            VERSION,
+            seed_existing_release=True,
+        )
+        result, requests = run_installer(
+            VERSION,
+            seed_existing_release=True,
+            corrupt_sidecar=True,
+        )
+
+        self.assertEqual(intact_result.returncode, 0, intact_result.stderr)
+        self.assertEqual(intact_requests, [])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Found incomplete existing release",
+            result.stderr,
+        )
+        self.assertIn(
+            "https://github.com/openai/codex/releases/download/"
+            f"rust-v{VERSION}/codex-package-x86_64-unknown-linux-musl.tar.gz",
+            requests,
+        )
+
 
 def run_installer(
     release: str,
     *,
     metadata_failure: bool = False,
+    seed_existing_release: bool = False,
+    corrupt_sidecar: bool = False,
     install_script: Path = INSTALL_SCRIPT,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -175,6 +201,11 @@ def run_installer(
             capture_output=True,
             text=True,
         ).stdout.strip()
+        if seed_existing_release:
+            seed_package_release(
+                root / "codex-home",
+                corrupt_sidecar=corrupt_sidecar,
+            )
         env = os.environ.copy()
         env.update(
             {
@@ -209,6 +240,56 @@ def run_installer(
             else []
         )
         return result, requests
+
+
+def seed_package_release(codex_home: Path, *, corrupt_sidecar: bool) -> None:
+    target = "x86_64-unknown-linux-musl"
+    release_dir = codex_home / "packages" / "standalone" / "releases" / f"{VERSION}-{target}"
+    managed_files = {
+        "codex-package.json": json.dumps(
+            {
+                "layoutVersion": 1,
+                "version": VERSION,
+                "target": target,
+                "variant": "codex",
+                "entrypoint": "bin/codex",
+                "resourcesDir": "codex-resources",
+                "pathDir": "codex-path",
+            },
+            indent=2,
+        ).encode(),
+        "bin/codex": f"#!/bin/sh\nprintf 'codex-cli {VERSION}\\n'\n".encode(),
+        "bin/codex-code-mode-host": b"#!/bin/sh\nexit 0\n",
+        "codex-path/rg": b"#!/bin/sh\nexit 0\n",
+        "codex-resources/bwrap": b"#!/bin/sh\nexit 0\n",
+        "codex-resources/zsh/bin/zsh": b"#!/bin/sh\nexit 0\n",
+    }
+    manifest_lines = []
+    for relative_path, contents in managed_files.items():
+        path = release_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+        path.chmod(0o755)
+        digest = hashlib.sha256(contents).hexdigest()
+        manifest_lines.append(f"{digest}  {relative_path}\n")
+
+    tree_sha256 = hashlib.sha256("".join(manifest_lines).encode()).hexdigest()
+    (release_dir / "codex-install.env").write_text(
+        f"version={VERSION}\n"
+        f"target={target}\n"
+        "layout=package\n"
+        f"tree_sha256={tree_sha256}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    (release_dir / "codex").symlink_to("bin/codex")
+
+    if corrupt_sidecar:
+        (release_dir / "bin" / "codex-code-mode-host").write_text(
+            "#!/bin/sh\necho corrupted\n",
+            encoding="utf-8",
+            newline="\n",
+        )
 
 
 def release_metadata() -> str:

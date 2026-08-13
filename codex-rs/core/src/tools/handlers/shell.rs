@@ -1,5 +1,4 @@
 use chrono::Utc;
-use codex_agent_task_store::REPOSITORY_WIDE_PATH;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
 use codex_agent_task_store::WorkspaceActorKind;
@@ -10,7 +9,9 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value as JsonValue;
+use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -31,9 +32,11 @@ use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_execution::WorkspaceMutationAcquireError;
 use crate::tools::command_execution::WorkspaceMutationGuard;
-use crate::tools::command_execution::acquire_workspace_mutation_lease;
+use crate::tools::command_execution::WorkspaceMutationScope;
+use crate::tools::command_execution::acquire_workspace_mutation_lease_cached;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::EffectiveAdditionalPermissions;
@@ -55,11 +58,16 @@ use crate::tools::sandboxing::ToolError;
 #[cfg(any(windows, test))]
 use crate::tools::sandboxing::same_exec_authorization_envelope;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::plan_tool::ValidationRouteLeaf;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 #[cfg(windows)]
 use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
+use codex_tools::CanonicalToolResult;
 use codex_tools::ToolName;
+use codex_tools::ToolOutputProjectionFragment;
+use codex_tools::ToolOutputProjectionFragmentKind;
+use codex_tools::ToolOutputProjectionMetadata;
 use codex_utils_path_uri::PathUri;
 
 mod shell_command;
@@ -68,6 +76,44 @@ pub use shell_command::ShellCommandHandler;
 pub(crate) use shell_command::ShellCommandHandlerOptions;
 
 const MAX_FOCUSED_VALIDATION_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+
+#[derive(Debug, Serialize)]
+struct FocusedValidationViolation {
+    code: &'static str,
+    message: String,
+    constraint: JsonValue,
+}
+
+#[derive(Debug, Serialize)]
+struct FocusedValidationCapabilityDenied {
+    kind: &'static str,
+    violations: Vec<FocusedValidationViolation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_permitted_command: Option<String>,
+}
+
+impl FocusedValidationCapabilityDenied {
+    fn render(self) -> String {
+        match serde_json::to_string(&self) {
+            Ok(encoded) => format!("FocusedValidationCapabilityDenied: {encoded}"),
+            Err(error) => format!(
+                "FocusedValidationCapabilityDenied: failed to encode structured denial: {error}"
+            ),
+        }
+    }
+}
+
+fn focused_validation_violation(
+    code: &'static str,
+    message: impl Into<String>,
+    constraint: JsonValue,
+) -> FocusedValidationViolation {
+    FocusedValidationViolation {
+        code,
+        message: message.into(),
+        constraint,
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ShellCommandHookArgs {
@@ -137,6 +183,125 @@ pub(super) struct RunExecLikeResult {
     pub(super) output: FunctionToolOutput,
     pub(super) exit_code: Option<i32>,
     pub(super) validation_reuse_success: Option<bool>,
+    pub(super) canonical_output: Option<Vec<u8>>,
+}
+
+pub(super) struct LegacyShellToolOutput {
+    pub(super) inner: FunctionToolOutput,
+    pub(super) canonical_output: Option<Vec<u8>>,
+    pub(super) exit_code: Option<i32>,
+    pub(super) call_id: String,
+}
+
+impl ToolOutput for LegacyShellToolOutput {
+    fn log_preview(&self) -> String {
+        self.inner.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.inner.success_for_logging()
+    }
+
+    fn outcome_for_logging(&self) -> codex_tools::ToolOutputOutcome {
+        self.inner.outcome_for_logging()
+    }
+
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        self.inner.sampling_request_signal()
+    }
+
+    fn deterministic_continuation_receipts(
+        &self,
+    ) -> Vec<codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt> {
+        self.inner.deterministic_continuation_receipts()
+    }
+
+    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        self.canonical_output
+            .clone()
+            .map(CanonicalToolResult::bytes)
+            .or_else(|| self.inner.canonical_result(payload))
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        let mut metadata = self.inner.projection_metadata()?;
+        metadata.fragments.insert(
+            0,
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ProcessFinalStatus,
+                format!("process final status: exit_code={:?}", self.exit_code),
+            ),
+        );
+        metadata.essential_inline["exit_code"] = serde_json::json!(self.exit_code);
+        metadata.essential_inline["call_id"] = serde_json::json!(&self.call_id);
+        Some(metadata)
+    }
+
+    fn to_response_item(
+        &self,
+        call_id: &str,
+        payload: &ToolPayload,
+    ) -> codex_protocol::models::ResponseInputItem {
+        self.inner.to_response_item(call_id, payload)
+    }
+
+    fn post_tool_use_response(&self, call_id: &str, payload: &ToolPayload) -> Option<JsonValue> {
+        self.inner.post_tool_use_response(call_id, payload)
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
+        self.inner.code_mode_result(payload)
+    }
+}
+
+/// RAII ownership for one admitted bounded operation.
+///
+/// The durable validation call owns cross-turn state; this guard owns only the local cancellation
+/// handle and hard deadline. Dropping it before a terminal durable update invokes the command's
+/// existing cancellation path and never extends the underlying timeout.
+struct OwnedOperationLease {
+    call_id: String,
+    cancellation: CancellationToken,
+    hard_deadline: chrono::DateTime<Utc>,
+    progress_revision: u64,
+    terminal: bool,
+}
+
+impl OwnedOperationLease {
+    fn new(
+        call_id: String,
+        cancellation: CancellationToken,
+        hard_deadline: chrono::DateTime<Utc>,
+    ) -> Self {
+        Self {
+            call_id,
+            cancellation,
+            hard_deadline,
+            progress_revision: 0,
+            terminal: false,
+        }
+    }
+
+    fn record_progress(&mut self) -> bool {
+        if Utc::now() > self.hard_deadline {
+            return false;
+        }
+        self.progress_revision = self.progress_revision.saturating_add(1);
+        true
+    }
+
+    fn complete(&mut self) {
+        let _ = (&self.call_id, self.progress_revision);
+        self.terminal = true;
+    }
+}
+
+impl Drop for OwnedOperationLease {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.cancellation.cancel();
+        }
+    }
 }
 
 impl RunExecLikeResult {
@@ -148,8 +313,22 @@ impl RunExecLikeResult {
 
 pub(super) async fn run_exec_like(
     args: RunExecLikeArgs,
-) -> Result<FunctionToolOutput, FunctionCallError> {
-    Ok(run_exec_like_with_exit_code(args).await?.output)
+) -> Result<LegacyShellToolOutput, FunctionCallError> {
+    let call_id = args.call_id.clone();
+    let result = run_exec_like_with_exit_code(args).await?;
+    Ok(LegacyShellToolOutput {
+        inner: result.output,
+        canonical_output: result.canonical_output,
+        exit_code: result.exit_code,
+        call_id,
+    })
+}
+
+fn operation_lease_deadline(hard_deadline: Option<chrono::DateTime<Utc>>) -> chrono::DateTime<Utc> {
+    hard_deadline.unwrap_or_else(|| {
+        Utc::now()
+            + chrono::Duration::seconds(codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS)
+    })
 }
 
 pub(super) async fn run_exec_like_with_exit_code(
@@ -161,6 +340,7 @@ pub(super) async fn run_exec_like_with_exit_code(
         .agent_control
         .task_coordinator()
         .clone();
+    let validation_session = args.session.clone();
     let session_source = args.turn.session_source.clone();
     let typed_binding = coordinator.binding_for_source(&session_source);
     let independent_review = is_independent_review_source(&session_source);
@@ -236,13 +416,23 @@ pub(super) async fn run_exec_like_with_exit_code(
         .as_ref()
         .is_some_and(Result::is_ok);
     let mut workspace_mutation = None;
-    if requires_repository_wide_mutation_lease(
+    let workspace_mutation_scope = WorkspaceMutationScope::for_shell(
         typed_binding.is_some(),
         independent_review,
         inspection_command,
         intercepted_apply_patch,
         admitted_nonmutating_validation,
-    ) {
+    );
+    if !intercepted_apply_patch {
+        args.session
+            .services
+            .command_execution
+            .record_workspace_mutation_scope(
+                &workspace_mutation_scope,
+                inspection_command || admitted_nonmutating_validation,
+            );
+    }
+    if let Some(mutation_paths) = workspace_mutation_scope.into_paths() {
         let reservation = args
             .session
             .services
@@ -314,12 +504,13 @@ pub(super) async fn run_exec_like_with_exit_code(
             actor_id,
             kind,
             attempt_id: None,
-            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+            paths: mutation_paths,
             contracts: Vec::new(),
             expected_manifest: Vec::new(),
         };
-        let lease = acquire_workspace_mutation_lease(
+        let lease = acquire_workspace_mutation_lease_cached(
             store.as_ref(),
+            args.session.services.git_workspace.as_ref(),
             &repo_root,
             &request,
             &args.cancellation_token,
@@ -341,11 +532,12 @@ pub(super) async fn run_exec_like_with_exit_code(
                 ))
             }
         })?;
-        workspace_mutation = Some(WorkspaceMutationGuard::new(
+        workspace_mutation = Some(WorkspaceMutationGuard::new_with_cache(
             store,
             repo_root.clone(),
             lease,
             reservation,
+            Arc::clone(&args.session.services.git_workspace),
         ));
     }
     let focused_validation_command = if typed_binding.is_some() && !inspection_command {
@@ -379,11 +571,17 @@ pub(super) async fn run_exec_like_with_exit_code(
     };
     let call_id = args.call_id.clone();
     let retained_output_ref = format!("tool-call:{}:{call_id}", args.session.thread_id);
-    let focused_validation = if let Some((command_summary, resolved_executable)) =
+    let operation_hard_deadline = match &args.exec_params.expiration {
+        crate::exec::ExecExpiration::Timeout(timeout) => chrono::Duration::from_std(*timeout)
+            .ok()
+            .map(|timeout| Utc::now() + timeout),
+        _ => None,
+    };
+    let mut owned_operation = None;
+    let mut focused_validation = if let Some((command_summary, resolved_executable)) =
         focused_validation_command
     {
-        let lease_expires_at = Utc::now()
-            + chrono::Duration::seconds(codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS);
+        let lease_expires_at = operation_lease_deadline(operation_hard_deadline);
         let toolchain = child_env_value(&args.exec_params.env, "RUSTUP_TOOLCHAIN")
             .map(|value| value.to_string_lossy().into_owned())
             .or_else(|| args.safety_command.first().cloned());
@@ -413,6 +611,13 @@ pub(super) async fn run_exec_like_with_exit_code(
                 "focused validation lost its typed assignment binding before execution".to_string(),
             ));
         };
+        owned_operation = operation_hard_deadline.map(|hard_deadline| {
+            OwnedOperationLease::new(
+                call_id.clone(),
+                args.cancellation_token.clone(),
+                hard_deadline,
+            )
+        });
         if let Some(leader_call_id) = token.shared_from_call_id().map(str::to_string) {
             let leader = loop {
                 if args.cancellation_token.is_cancelled() {
@@ -449,12 +654,12 @@ pub(super) async fn run_exec_like_with_exit_code(
                 if leader.status.is_terminal() {
                     break leader;
                 }
-                if leader
+                let deadline = leader
                     .evidence
                     .lease_expires_at
                     .or_else(|| token.lease_expires_at())
-                    .is_some_and(|deadline| deadline <= Utc::now())
-                {
+                    .unwrap_or_else(|| operation_lease_deadline(operation_hard_deadline));
+                if deadline <= Utc::now() {
                     let mut expired = leader;
                     expired.status = ValidationCallStatus::Cancelled;
                     expired.recorded_at = Utc::now();
@@ -468,7 +673,7 @@ pub(super) async fn run_exec_like_with_exit_code(
                         .record_validation_call(expired)
                         .await;
                     match recovery {
-                        Ok(()) => {}
+                        Ok(()) => coordinator.notify_validation_call(&leader_call_id),
                         Err(codex_agent_task_store::StoreError::ValidationCallImmutable(_)) => {
                             let refreshed = coordinator
                                 .get_validation_call(leader_call_id.clone())
@@ -495,17 +700,33 @@ pub(super) async fn run_exec_like_with_exit_code(
                     }
                     continue;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                match coordinator
+                    .wait_for_validation_call_terminal(
+                        &leader_call_id,
+                        &args.cancellation_token,
+                        deadline,
+                    )
+                    .await
+                    .map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "shared validation leader could not be awaited: {error}"
+                        ))
+                    })? {
+                    Some(settled) if settled.status.is_terminal() => break settled,
+                    Some(_) | None => continue,
+                }
             };
             let status = leader.status;
             let leader_output_ref = leader.evidence.retained_output_ref.clone();
             let leader_output_summary = leader.evidence.output_summary.clone();
+            let leader_validation_result = leader.evidence.validation_result.clone();
             coordinator
-                .finish_focused_validation_with_output(
+                .finish_focused_validation_with_result(
                     token,
                     status,
                     leader_output_ref.clone(),
                     leader_output_summary.clone(),
+                    leader_validation_result,
                 )
                 .await
                 .map_err(|error| {
@@ -513,6 +734,22 @@ pub(super) async fn run_exec_like_with_exit_code(
                         "shared validation result could not be persisted: {error}"
                     ))
                 })?;
+            if let Some(operation) = owned_operation.as_mut() {
+                operation.record_progress();
+                operation.complete();
+            }
+            args.turn.session_telemetry.counter(
+                "codex.multi_agent.validation_proof",
+                1,
+                &[(
+                    "disposition",
+                    if status.is_success() {
+                        "fresh_reuse"
+                    } else {
+                        "shared_non_success"
+                    },
+                )],
+            );
             let output_reference = leader_output_ref
                 .as_deref()
                 .unwrap_or("no retained output reference");
@@ -530,9 +767,12 @@ pub(super) async fn run_exec_like_with_exit_code(
                     ],
                     success: Some(status.is_success()),
                     post_tool_use_response: None,
+                    sampling_request_signal: None,
+                    deterministic_continuation_receipts: Vec::new(),
                 },
                 exit_code: Some(if status.is_success() { 0 } else { 1 }),
                 validation_reuse_success: None,
+                canonical_output: None,
             });
         }
         Some(token)
@@ -562,6 +802,49 @@ pub(super) async fn run_exec_like_with_exit_code(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         let text = result.value.get("text").cloned().unwrap_or_default();
+        let validation_result = result
+            .value
+            .get("validation_result")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<codex_protocol::validation::ValidationResult>(value).ok()
+            })
+            .map(|mut result| {
+                result.freshness = codex_protocol::validation::ValidationFreshness::Joined;
+                result
+            });
+        if let Some(token) = focused_validation.take() {
+            let status = if success {
+                ValidationCallStatus::Succeeded
+            } else {
+                ValidationCallStatus::Failed
+            };
+            coordinator
+                .finish_focused_validation_with_result(
+                    token,
+                    status,
+                    Some(retained_output_ref),
+                    None,
+                    validation_result
+                        .as_ref()
+                        .and_then(|result| serde_json::to_value(result).ok()),
+                )
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "joined validation result could not be persisted: {error}"
+                    ))
+                })?;
+            if let Some(operation) = owned_operation.as_mut() {
+                operation.record_progress();
+                operation.complete();
+            }
+            args.turn.session_telemetry.counter(
+                "codex.multi_agent.validation_proof",
+                1,
+                &[("disposition", "fresh_reuse")],
+            );
+        }
         return Ok(RunExecLikeResult {
             output: shell_command::validation_structured_output(serde_json::json!({
                 "call_id": args.call_id.clone(),
@@ -569,9 +852,11 @@ pub(super) async fn run_exec_like_with_exit_code(
                 "shared_from_call_id": shared_from_call_id,
                 "text": text,
                 "success": success,
+                "validation_result": validation_result,
             })),
             exit_code: Some(if success { 0 } else { 1 }),
             validation_reuse_success: None,
+            canonical_output: None,
         });
     }
     let heartbeat_stop = CancellationToken::new();
@@ -584,10 +869,7 @@ pub(super) async fn run_exec_like_with_exit_code(
                 tokio::select! {
                     _ = heartbeat_stop.cancelled() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        let lease_expires_at = Utc::now()
-                            + chrono::Duration::seconds(
-                                codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS,
-                            );
+                        let lease_expires_at = operation_lease_deadline(operation_hard_deadline);
                         match coordinator
                             .heartbeat_validation_call(call_id.clone(), lease_expires_at)
                             .await
@@ -650,8 +932,23 @@ pub(super) async fn run_exec_like_with_exit_code(
         }))
     });
     let cancellation_token = args.cancellation_token.clone();
+    if focused_validation.is_some() {
+        args.turn.session_telemetry.counter(
+            "codex.multi_agent.validation_proof",
+            1,
+            &[("disposition", "stale_or_unknown_rerun")],
+        );
+    }
     let validation_leader = args.validation_leader.take();
     let result = run_exec_like_with_exit_code_inner(args, focused_validation.is_some()).await;
+    if let Some(operation) = owned_operation.as_mut() {
+        operation.record_progress();
+    }
+    let terminal_validation_result = validation_session
+        .services
+        .command_execution
+        .validation_result_for_call(&call_id)
+        .await;
     if let Some(leader) = validation_leader {
         match &result {
             Ok(result) => {
@@ -663,6 +960,7 @@ pub(super) async fn run_exec_like_with_exit_code(
                                 _ => None,
                             }).collect::<Vec<_>>().join("\n"),
                             "success": result.validation_reuse_succeeded(),
+                            "validation_result": terminal_validation_result.clone(),
                         }),
                     })
                     .await;
@@ -717,14 +1015,29 @@ pub(super) async fn run_exec_like_with_exit_code(
         (Err(_), false) => ValidationCallStatus::Failed,
     };
     let output_summary = validation_output_summary(&result);
+    let structured_validation_result =
+        terminal_validation_result.and_then(|result| serde_json::to_value(result).ok());
     let record_result = coordinator
-        .finish_focused_validation_with_output(
+        .finish_focused_validation_with_result(
             token,
             status,
             Some(retained_output_ref),
             output_summary,
+            structured_validation_result,
         )
         .await;
+    if record_result.is_ok()
+        && let Some(operation) = owned_operation.as_mut()
+    {
+        operation.complete();
+    }
+    if status == ValidationCallStatus::Cancelled {
+        validation_session.services.session_telemetry.counter(
+            "codex.multi_agent.bounded_operation",
+            1,
+            &[("outcome", "cancelled")],
+        );
+    }
     match (result, record_result) {
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(error)) => Err(FunctionCallError::RespondToModel(format!(
@@ -882,49 +1195,195 @@ fn focused_validation_command_summary(
     additional_permissions: bool,
     prefix_rule: bool,
 ) -> Result<String, String> {
+    let mut violations = Vec::new();
     if !direct_argv {
-        return Err("the command must use direct argv mode".to_string());
-    }
-    if cwd != repo_root {
-        return Err("the command cwd must be the repository root".to_string());
-    }
-    let timeout_ms = match expiration {
-        ExecExpiration::Timeout(timeout) => {
-            u64::try_from(timeout.as_millis()).map_err(|_| "timeout is too large".to_string())?
-        }
-        ExecExpiration::DefaultTimeout => {
-            return Err("timeout_ms must be supplied explicitly".to_string());
-        }
-        ExecExpiration::Cancellation(_) | ExecExpiration::TimeoutOrCancellation { .. } => {
-            return Err("focused validation requires an explicit bounded timeout".to_string());
-        }
-    };
-    if timeout_ms == 0 || timeout_ms > MAX_FOCUSED_VALIDATION_TIMEOUT_MS {
-        return Err(format!(
-            "timeout_ms must be between 1 and {MAX_FOCUSED_VALIDATION_TIMEOUT_MS}"
+        violations.push(focused_validation_violation(
+            "direct_argv_required",
+            "the command must use direct argv mode",
+            json!({"mode": "direct_argv"}),
         ));
     }
+    if cwd != repo_root {
+        violations.push(focused_validation_violation(
+            "repository_root_cwd_required",
+            "the command cwd must be the repository root",
+            json!({"cwd": "repository_root"}),
+        ));
+    }
+    match expiration {
+        ExecExpiration::Timeout(timeout) => match u64::try_from(timeout.as_millis()) {
+            Ok(timeout_ms) if timeout_ms == 0 || timeout_ms > MAX_FOCUSED_VALIDATION_TIMEOUT_MS => {
+                violations.push(focused_validation_violation(
+                    "bounded_timeout_required",
+                    format!("timeout_ms must be between 1 and {MAX_FOCUSED_VALIDATION_TIMEOUT_MS}"),
+                    json!({"minimum_ms": 1, "maximum_ms": MAX_FOCUSED_VALIDATION_TIMEOUT_MS}),
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => violations.push(focused_validation_violation(
+                "bounded_timeout_required",
+                "timeout is too large",
+                json!({"minimum_ms": 1, "maximum_ms": MAX_FOCUSED_VALIDATION_TIMEOUT_MS}),
+            )),
+        },
+        ExecExpiration::DefaultTimeout => violations.push(focused_validation_violation(
+            "explicit_timeout_required",
+            "timeout_ms must be supplied explicitly",
+            json!({"explicit": true}),
+        )),
+        ExecExpiration::Cancellation(_) | ExecExpiration::TimeoutOrCancellation { .. } => {
+            violations.push(focused_validation_violation(
+                "bounded_timeout_required",
+                "focused validation requires an explicit bounded timeout",
+                json!({"explicit": true, "bounded": true}),
+            ));
+        }
+    }
     if sandbox_override || additional_permissions || prefix_rule {
-        return Err(
-            "sandbox overrides, additional permissions, and prefix rules are not allowed"
-                .to_string(),
-        );
+        violations.push(focused_validation_violation(
+            "default_permissions_required",
+            "sandbox overrides, additional permissions, and prefix rules are not allowed",
+            json!({
+                "sandbox_override": false,
+                "additional_permissions": false,
+                "prefix_rule": false
+            }),
+        ));
     }
     let Some((program, args)) = command.split_first() else {
-        return Err("the command argv cannot be empty".to_string());
+        violations.push(focused_validation_violation(
+            "nonempty_argv_required",
+            "the command argv cannot be empty",
+            json!({"minimum_items": 1}),
+        ));
+        return Err(FocusedValidationCapabilityDenied {
+            kind: "focused_validation_capability_denied",
+            violations,
+            canonical_permitted_command: None,
+        }
+        .render());
     };
-    validate_focused_validation_argv(program, args, repo_root)?;
+    let argv_violations = collect_focused_validation_argv_violations(program, args, repo_root);
+    let argv_is_permitted = argv_violations.is_empty();
+    violations.extend(argv_violations);
     let canonical = CommandInvocation::Argv {
         program: program.clone(),
         args: args.to_vec(),
     }
     .display_command();
     if canonical != command_summary {
-        return Err("command summary is not the canonical direct-argv rendering".to_string());
+        violations.push(focused_validation_violation(
+            "canonical_summary_required",
+            "command summary is not the canonical direct-argv rendering",
+            json!({"rendering": "canonical_direct_argv"}),
+        ));
+    }
+    if !violations.is_empty() {
+        return Err(FocusedValidationCapabilityDenied {
+            kind: "focused_validation_capability_denied",
+            violations,
+            canonical_permitted_command: (direct_argv && argv_is_permitted).then_some(canonical),
+        }
+        .render());
     }
     Ok(canonical)
 }
 
+/// Re-admits a predeclared plan leaf through the same canonical direct-argv
+/// contract used by typed focused validation. No command or coverage inference
+/// is performed here.
+pub(crate) fn validate_structured_validation_leaf(
+    leaf: &ValidationRouteLeaf,
+    repo_root: &Path,
+) -> Result<String, String> {
+    let Some((program, args)) = leaf.argv.split_first() else {
+        return Err("the validation route argv cannot be empty".to_string());
+    };
+    let invocation = CommandInvocation::Argv {
+        program: program.clone(),
+        args: args.to_vec(),
+    };
+    let canonical = invocation.display_command();
+    focused_validation_command_summary(
+        &leaf.argv,
+        &canonical,
+        true,
+        repo_root,
+        repo_root,
+        &ExecExpiration::Timeout(std::time::Duration::from_millis(leaf.timeout_ms)),
+        false,
+        false,
+        false,
+    )?;
+    if program == "cargo"
+        && args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--workspace" | "--all" | "--all-targets" | "--all-features"
+            )
+        })
+    {
+        return Err("auto-validation cargo routes must remain focused".to_string());
+    }
+    if program == "just"
+        && matches!(
+            args.first().map(String::as_str),
+            Some("test-fast" | "test-compile" | "test-lane-main")
+        )
+    {
+        return Err("auto-validation just routes must name a focused lane or package".to_string());
+    }
+    Ok(canonical)
+}
+
+fn collect_focused_validation_argv_violations(
+    program: &str,
+    args: &[String],
+    repo_root: &Path,
+) -> Vec<FocusedValidationViolation> {
+    let mut violations = Vec::new();
+    if args.iter().any(|arg| forbidden_control_argument(arg)) {
+        violations.push(focused_validation_violation(
+            "shell_control_argument_forbidden",
+            "shell chaining, wrappers, and redirection are not allowed",
+            json!({"shell_control_arguments": false}),
+        ));
+    }
+    let program_result = match program {
+        "cargo" => validate_cargo_validation(args).map_err(|message| {
+            focused_validation_violation(
+                "cargo_validation_shape_required",
+                message,
+                json!({"program": "cargo", "subcommands": ["check", "test"]}),
+            )
+        }),
+        "just" => validate_just_validation(args).map_err(|message| {
+            focused_validation_violation(
+                "just_validation_shape_required",
+                message,
+                json!({"program": "just", "recipe_class": "admitted_nonmutating_validation"}),
+            )
+        }),
+        "python" | "python3" => validate_python_validation(args, repo_root).map_err(|message| {
+            focused_validation_violation(
+                "python_validation_shape_required",
+                message,
+                json!({"program": ["python", "python3"], "module_mode": true}),
+            )
+        }),
+        _ => Err(focused_validation_violation(
+            "validation_program_required",
+            "only direct cargo, just, or python validation is allowed",
+            json!({"program": ["cargo", "just", "python", "python3"]}),
+        )),
+    };
+    if let Err(violation) = program_result {
+        violations.push(violation);
+    }
+    violations
+}
+
+#[cfg(test)]
 fn requires_repository_wide_mutation_lease(
     typed_binding: bool,
     independent_review: bool,
@@ -932,27 +1391,16 @@ fn requires_repository_wide_mutation_lease(
     intercepted_apply_patch: bool,
     admitted_nonmutating_validation: bool,
 ) -> bool {
-    !typed_binding
-        && !independent_review
-        && !inspection_command
-        && !intercepted_apply_patch
-        && !admitted_nonmutating_validation
-}
-
-fn validate_focused_validation_argv(
-    program: &str,
-    args: &[String],
-    repo_root: &Path,
-) -> Result<(), String> {
-    if args.iter().any(|arg| forbidden_control_argument(arg)) {
-        return Err("shell chaining, wrappers, and redirection are not allowed".to_string());
-    }
-    match program {
-        "cargo" => validate_cargo_validation(args),
-        "just" => validate_just_validation(args),
-        "python" | "python3" => validate_python_validation(args, repo_root),
-        _ => Err("only direct cargo, just, or python validation is allowed".to_string()),
-    }
+    matches!(
+        WorkspaceMutationScope::for_shell(
+            typed_binding,
+            independent_review,
+            inspection_command,
+            intercepted_apply_patch,
+            admitted_nonmutating_validation,
+        ),
+        WorkspaceMutationScope::Repository
+    )
 }
 
 fn validate_cargo_validation(args: &[String]) -> Result<(), String> {
@@ -1733,6 +2181,7 @@ async fn run_exec_like_with_exit_code_inner(
             output,
             exit_code: Some(0),
             validation_reuse_success: None,
+            canonical_output: None,
         });
     }
 
@@ -1847,6 +2296,7 @@ async fn run_exec_like_with_exit_code_inner(
     };
     let mut orchestrator = ToolOrchestrator::new();
     let mut runtime = ShellRuntime::for_shell_command(shell_runtime_backend);
+    let validation_started_at = tokio::time::Instant::now();
     let tool_ctx = ToolCtx {
         session: session.clone(),
         turn: turn.clone(),
@@ -1872,6 +2322,7 @@ async fn run_exec_like_with_exit_code_inner(
                 output,
                 exit_code: None,
                 validation_reuse_success: Some(true),
+                canonical_output: None,
             });
         }
         Err(error) => Err(error),
@@ -1952,6 +2403,18 @@ async fn run_exec_like_with_exit_code_inner(
         } else {
             None
         };
+    if let (Some(launch), Some(artifact), Some(exit_code)) = (
+        req.validation_launch.as_ref(),
+        raw_output_artifact.as_ref(),
+        exit_code,
+    ) {
+        session
+            .services
+            .command_execution
+            .publish_inline_validation(launch, artifact.clone(), validation_started_at, exit_code)
+            .await;
+    }
+    let canonical_output = canonical_exec_output_bytes(&out);
     let finish_result = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
         .await;
@@ -1986,9 +2449,12 @@ async fn run_exec_like_with_exit_code_inner(
             ],
             success: Some(true),
             post_tool_use_response,
+            sampling_request_signal: None,
+            deterministic_continuation_receipts: Vec::new(),
         },
         exit_code,
         validation_reuse_success: None,
+        canonical_output,
     })
 }
 
@@ -2003,6 +2469,17 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
         Err(ToolError::Denied(_)) => None,
         Err(ToolError::Rejected(_)) => Some(-1),
         Err(ToolError::ValidationSkipped(_)) => None,
+    }
+}
+
+fn canonical_exec_output_bytes(out: &Result<ExecToolCallOutput, ToolError>) -> Option<Vec<u8>> {
+    match out {
+        Ok(output) => Some(output.aggregated_output.text.as_bytes().to_vec()),
+        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
+        | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
+            Some(output.aggregated_output.text.as_bytes().to_vec())
+        }
+        Err(_) => None,
     }
 }
 

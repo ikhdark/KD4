@@ -4,14 +4,14 @@ sandbox_mode = "danger-full-access"
 allow_login_shell = false
 
 [features]
-task_completion_reviewer = true
+task_completion_reviewer = false
+
+[features.token_budget]
+enabled = false
 
 [agents]
 max_depth = 1
 
-[agents.default]
-description = "Default agent."
-config_file = "./agents/default.toml"
 
 [features.multi_agent_v2]
 enabled = true

@@ -11,6 +11,7 @@ use crate::session::step_context::StepContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
@@ -64,6 +65,7 @@ pub struct ToolRouter {
     model_visible_specs: Vec<ToolSpec>,
     planning_warnings: Vec<String>,
     proven_read_only_external_tools: HashSet<ToolName>,
+    exposure_identity: ToolExposureIdentity,
 }
 
 pub(crate) struct ToolRouterParams<'a> {
@@ -72,6 +74,7 @@ pub(crate) struct ToolRouterParams<'a> {
     pub(crate) tool_suggest_candidates: Option<ToolSuggestCandidates>,
     pub(crate) extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     pub(crate) dynamic_tools: &'a [DynamicToolSpec],
+    pub(crate) exposure_identity: ToolExposureIdentity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +90,14 @@ pub(crate) struct ToolSuggestCandidates {
 }
 
 impl ToolRouter {
+    pub(crate) fn external_mutation_intent(&self, tool_name: &ToolName) -> ExternalMutationIntent {
+        if self.proven_read_only_external_tools.contains(tool_name) {
+            ExternalMutationIntent::ProvenReadOnly
+        } else {
+            ExternalMutationIntent::MayMutate
+        }
+    }
+
     pub(crate) fn from_context(
         step_context: &StepContext,
         params: ToolRouterParams<'_>,
@@ -106,21 +117,59 @@ impl ToolRouter {
         Self::from_parts_with_warnings(registry, model_visible_specs, Vec::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn from_parts_with_warnings(
         registry: ToolRegistry,
         model_visible_specs: Vec<ToolSpec>,
         planning_warnings: Vec<String>,
+    ) -> Self {
+        Self::from_parts_with_warnings_and_identity(
+            registry,
+            model_visible_specs,
+            planning_warnings,
+            ToolExposureIdentity::default(),
+        )
+    }
+
+    pub(crate) fn from_parts_with_warnings_and_identity(
+        registry: ToolRegistry,
+        model_visible_specs: Vec<ToolSpec>,
+        planning_warnings: Vec<String>,
+        exposure_identity: ToolExposureIdentity,
     ) -> Self {
         Self {
             registry,
             model_visible_specs,
             planning_warnings,
             proven_read_only_external_tools: HashSet::new(),
+            exposure_identity,
         }
+    }
+
+    pub(crate) fn exposure_identity(&self) -> &ToolExposureIdentity {
+        &self.exposure_identity
     }
 
     pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
         self.model_visible_specs.clone()
+    }
+
+    pub(crate) fn deferred_tool_capability_revisions(&self) -> HashMap<ToolName, String> {
+        let exposure_identity = serde_json::to_value(&self.exposure_identity).unwrap_or_default();
+        self.registry
+            .manifest_entries()
+            .into_iter()
+            .filter(|(_, exposure, _)| *exposure == crate::tools::registry::ToolExposure::Deferred)
+            .map(|(name, _, spec)| {
+                let encoded = serde_json::to_vec(&serde_json::json!({
+                    "tool_exposure_identity": exposure_identity,
+                    "provenance": name.to_string(),
+                    "spec": spec,
+                }))
+                .unwrap_or_default();
+                (name, format!("{:x}", Sha256::digest(encoded)))
+            })
+            .collect()
     }
 
     pub(crate) fn tool_manifest(
@@ -151,7 +200,11 @@ impl ToolRouter {
             "model_visible": self.model_visible_specs,
             "registered": registered,
         }));
-        let encoded = serde_json::to_vec(&manifest).unwrap_or_default();
+        let fingerprint_input = serde_json::json!({
+            "manifest": &manifest,
+            "tool_exposure_identity": &self.exposure_identity,
+        });
+        let encoded = serde_json::to_vec(&fingerprint_input).unwrap_or_default();
         ToolManifestItem {
             hash: format!("{:x}", Sha256::digest(encoded)),
             manifest,

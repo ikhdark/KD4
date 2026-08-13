@@ -64,6 +64,10 @@ pub(crate) struct RecordedTokenDelta {
 }
 
 impl GoalAccountingState {
+    pub(crate) fn has_active_goal(&self) -> bool {
+        self.inner().wall_clock.active_goal_id.is_some()
+    }
+
     pub(crate) fn start_turn(
         &self,
         turn_id: impl Into<String>,

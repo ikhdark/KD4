@@ -77,6 +77,9 @@ pub struct ReasoningPhaseEfforts {
     pub diagnose: Option<ReasoningEffort>,
     pub verify: Option<ReasoningEffort>,
     pub finalize: Option<ReasoningEffort>,
+    /// Lowest-effort override for an unavoidable model request whose
+    /// continuation has already been proven deterministic by its owner.
+    pub deterministic_continuation: Option<ReasoningEffort>,
 }
 
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
@@ -324,6 +327,10 @@ pub struct ConfigToml {
 
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
+
+    /// Whether completed textual tool outputs may be represented by bounded,
+    /// exactly retrievable receipts in manually managed prompt history.
+    pub completed_tool_history_projection: Option<bool>,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
     /// Default: `300000` (5 minutes).
@@ -1039,6 +1046,7 @@ implement = "high"
 diagnose = "high"
 verify = "low"
 finalize = "low"
+deterministic_continuation = "low"
 "#,
         )
         .expect("full table should deserialize");

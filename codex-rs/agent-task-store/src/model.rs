@@ -2,6 +2,8 @@ use chrono::DateTime;
 use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::path::Path;
@@ -33,6 +35,7 @@ pub const DEFAULT_WORKSPACE_LEASE_SECONDS: i64 = 120;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
+    Architect,
     Explorer,
     Worker,
     Reviewer,
@@ -53,7 +56,7 @@ pub enum CapabilityProfile {
 impl AgentRole {
     pub fn capability_profile(self) -> CapabilityProfile {
         match self {
-            Self::Explorer => CapabilityProfile::ReadSearch,
+            Self::Architect | Self::Explorer => CapabilityProfile::ReadSearch,
             Self::Worker => CapabilityProfile::ScopedSourceWrite,
             Self::Reviewer => CapabilityProfile::ReadSearchDiff,
             Self::Verifier => CapabilityProfile::ReadSearchShell,
@@ -80,6 +83,45 @@ pub enum RelationKind {
 pub struct AssignmentRelation {
     pub kind: RelationKind,
     pub target_assignment_ids: Vec<AssignmentId>,
+}
+
+pub const ARCHITECTURE_CONTRACT_V1_SCHEMA_VERSION: u32 = 1;
+
+/// The worker contract authored by a distinct read-only Architect. The sealed
+/// receipt is the single source of truth; assignment fields are projections
+/// checked against its canonical normalized representation at admission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArchitectureContractV1 {
+    pub schema_version: u32,
+    pub objective: String,
+    pub acceptance_criteria: Vec<AcceptanceCriterion>,
+    #[serde(default)]
+    pub read_scope: Vec<RepoScope>,
+    #[serde(default)]
+    pub write_scope: Vec<RepoScope>,
+    pub stop_condition: String,
+    #[serde(default)]
+    pub risk_hints: Vec<String>,
+    #[serde(default)]
+    pub required_evidence: Vec<String>,
+    #[serde(default)]
+    pub prohibited_changes: Vec<String>,
+    #[serde(default)]
+    pub contract_claims: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SealedArchitectureContractV1 {
+    pub contract: ArchitectureContractV1,
+    pub contract_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArchitectureContractRef {
+    pub architect_assignment_id: AssignmentId,
+    pub architect_attempt_id: AttemptId,
+    pub contract_version: u32,
+    pub contract_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -116,6 +158,67 @@ pub struct AssignmentDraft {
     #[serde(default)]
     pub workspace_strategy: WorkspaceStrategy,
     pub relation: Option<AssignmentRelation>,
+    #[serde(default)]
+    pub architecture_contract_ref: Option<ArchitectureContractRef>,
+}
+
+/// Stable, bounded identity for an Explorer's declared primary question and surface.
+/// Supporting-read history is deliberately excluded.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimaryInvestigationIdentity(String);
+
+impl PrimaryInvestigationIdentity {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdmissionOverlapSummary {
+    pub benign_read_overlap_count: u32,
+    pub duplicated_primary_investigation_count: u32,
+    pub conflicting_write_read_count: u32,
+    pub conflicting_write_write_count: u32,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionRejectionReason {
+    DuplicateExplorerInvestigation,
+    CorrectnessSensitiveReadConflict,
+    ActiveValidationConflict,
+    IsolatedIntegratorUnavailable,
+}
+
+impl std::fmt::Display for AdmissionRejectionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::DuplicateExplorerInvestigation => "duplicate_explorer_investigation",
+            Self::CorrectnessSensitiveReadConflict => "correctness_sensitive_read_conflict",
+            Self::ActiveValidationConflict => "active_validation_conflict",
+            Self::IsolatedIntegratorUnavailable => "isolated_integrator_unavailable",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegrationPlan {
+    SingleWriter,
+    RootOwned,
+    TypedIntegratorRequired,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedAssignment {
+    pub assignment: Assignment,
+    pub attempt: Attempt,
+    pub overlaps: AdmissionOverlapSummary,
+    pub integration_plan: IntegrationPlan,
 }
 
 impl AssignmentDraft {
@@ -152,6 +255,26 @@ impl AssignmentDraft {
                 return Err(StoreError::InvalidAssignment(format!(
                     "duplicate dependency {dependency}"
                 )));
+            }
+        }
+        if let Some(contract_ref) = self.architecture_contract_ref.as_ref() {
+            if self.role != AgentRole::Worker {
+                return Err(StoreError::InvalidAssignment(
+                    "only workers may reference a sealed architecture contract".to_string(),
+                ));
+            }
+            if !dependency_ids.contains(&contract_ref.architect_assignment_id) {
+                return Err(StoreError::InvalidAssignment(
+                    "architecture contract assignment must be an explicit dependency".to_string(),
+                ));
+            }
+            if contract_ref.contract_version != ARCHITECTURE_CONTRACT_V1_SCHEMA_VERSION
+                || contract_ref.contract_sha256.trim().is_empty()
+            {
+                return Err(StoreError::InvalidAssignment(
+                    "architecture contract reference has an unsupported version or empty hash"
+                        .to_string(),
+                ));
             }
         }
         let mut required_evidence = HashSet::new();
@@ -202,6 +325,7 @@ impl AssignmentDraft {
             workspace_id: String::new(),
             start_epoch: 0,
             relation: self.relation,
+            architecture_contract_ref: self.architecture_contract_ref,
             task_capsule: None,
             created_at: Utc::now(),
         })
@@ -237,10 +361,90 @@ pub struct Assignment {
     #[serde(default)]
     pub start_epoch: u64,
     pub relation: Option<AssignmentRelation>,
+    #[serde(default)]
+    pub architecture_contract_ref: Option<ArchitectureContractRef>,
     /// Immutable canonical `TaskCapsuleV1` JSON attached before the child is launched.
     #[serde(default)]
     pub task_capsule: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+impl Assignment {
+    pub fn primary_investigation_identity(&self) -> Option<PrimaryInvestigationIdentity> {
+        if self.role != AgentRole::Explorer {
+            return None;
+        }
+        let mut scopes = self.read_scope.clone();
+        scopes.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.recursive.cmp(&right.recursive))
+        });
+        let mut claims = self.contract_claims.clone();
+        claims.sort();
+        let mut criteria = self.acceptance_criteria.clone();
+        criteria.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.text.cmp(&right.text))
+        });
+        let canonical =
+            serde_json::to_vec(&(scopes, claims, self.objective.trim(), criteria)).ok()?;
+        Some(PrimaryInvestigationIdentity(format!(
+            "{:x}",
+            Sha256::digest(&canonical)
+        )))
+    }
+
+    pub(crate) fn validate_selective_role_contract(&self) -> StoreResult<()> {
+        let invalid = |detail: &str| Err(StoreError::InvalidAssignment(detail.to_string()));
+        match self.role {
+            AgentRole::Architect => {
+                if self.read_scope.is_empty() {
+                    return invalid("architects require a non-empty architecture scope");
+                }
+                if !self.required_evidence.is_empty() {
+                    return invalid("architects cannot require focused validation proofs");
+                }
+            }
+            AgentRole::Explorer => {
+                if self.read_scope.is_empty() {
+                    return invalid("explorers require a non-empty primary investigation scope");
+                }
+                if !self.required_evidence.is_empty() {
+                    return invalid("explorers cannot require focused validation proofs");
+                }
+            }
+            AgentRole::Worker => {
+                if self.write_scope.is_empty() {
+                    return invalid("workers require a non-empty owned write scope");
+                }
+                if self.required_evidence.is_empty() {
+                    return invalid("workers require at least one proof obligation");
+                }
+            }
+            AgentRole::Reviewer => {
+                if !self.required_evidence.is_empty() {
+                    return invalid(
+                        "reviewers report diff/findings/gate evidence and cannot own focused proof obligations",
+                    );
+                }
+            }
+            AgentRole::Verifier => {
+                if self.required_evidence.is_empty() {
+                    return invalid("verifiers require at least one focused proof obligation");
+                }
+            }
+            AgentRole::Integrator => {
+                if self.required_evidence.is_empty() {
+                    return invalid(
+                        "integrators require at least one integration proof obligation",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -391,6 +595,15 @@ pub struct WorkspaceManifestEntry {
     pub existed: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceCasMismatchDetail {
+    pub path: String,
+    pub expected: Option<WorkspaceManifestEntry>,
+    pub current: Option<WorkspaceManifestEntry>,
+    pub current_epoch: Option<u64>,
+    pub last_writer: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceRevision {
     pub repository_id: String,
@@ -448,6 +661,180 @@ pub struct WorkspaceMutationResult {
     pub end_epoch: u64,
     pub changed_paths: Vec<String>,
     pub drift_paths: Vec<String>,
+}
+
+/// Internal optimization receipt for a strongly constructed workspace manifest.
+/// This is deliberately not serialized into command or protocol schemas.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceManifestReceipt {
+    pub(crate) repository_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) epoch: u64,
+    pub(crate) paths: Vec<String>,
+    pub(crate) manifest_id: String,
+    pub(crate) entries: Vec<WorkspaceManifestEntry>,
+}
+
+impl WorkspaceManifestReceipt {
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    pub fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+
+    pub fn entries(&self) -> &[WorkspaceManifestEntry] {
+        &self.entries
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkspaceManifestWork {
+    pub overlay_traversals: u64,
+    pub files_examined: u64,
+    pub files_hashed: u64,
+    pub bytes_hashed: u64,
+    pub git_subprocesses: u64,
+    pub manifests_constructed: u64,
+    pub full_constructions: u64,
+    pub incremental_constructions: u64,
+    pub reuse_hits: u64,
+    pub reuse_rejections: u64,
+    pub unique_payloads: u64,
+    pub payload_reuses: u64,
+    pub manifest_bytes_persisted: u64,
+    pub reference_bytes_persisted: u64,
+    pub sqlite_statements: u64,
+    pub transaction_micros: u64,
+    pub duration_micros: u64,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedWorkspaceManifest {
+    pub(crate) receipt: WorkspaceManifestReceipt,
+    pub(crate) canonical: crate::manifest_storage::CanonicalManifest,
+    pub(crate) dependency_identity: Option<String>,
+    pub(crate) work: WorkspaceManifestWork,
+}
+
+impl PreparedWorkspaceManifest {
+    pub(crate) fn new(
+        receipt: WorkspaceManifestReceipt,
+        work: WorkspaceManifestWork,
+    ) -> StoreResult<Self> {
+        let canonical = crate::manifest_storage::canonical_manifest(&receipt.entries)?;
+        if canonical.manifest_hash != receipt.manifest_id {
+            return Err(StoreError::CorruptData(
+                "prepared workspace receipt hash does not match its canonical payload".to_string(),
+            ));
+        }
+        Ok(Self {
+            receipt,
+            canonical,
+            dependency_identity: None,
+            work,
+        })
+    }
+
+    pub fn receipt(&self) -> &WorkspaceManifestReceipt {
+        &self.receipt
+    }
+
+    pub fn work(&self) -> WorkspaceManifestWork {
+        self.work
+    }
+
+    pub fn canonical_byte_count(&self) -> usize {
+        self.canonical.bytes.len()
+    }
+
+    pub fn dependency_identity(&self) -> Option<&str> {
+        self.dependency_identity.as_deref()
+    }
+
+    pub fn with_dependency_identity(mut self, dependency_identity: String) -> Self {
+        self.dependency_identity = Some(dependency_identity);
+        self
+    }
+
+    pub fn reused_after_validation(
+        mut self,
+        overlay_traversals: u64,
+        files_examined: u64,
+        git_subprocesses: u64,
+        duration_micros: u64,
+    ) -> Self {
+        self.work = WorkspaceManifestWork {
+            overlay_traversals,
+            files_examined,
+            git_subprocesses,
+            reuse_hits: 1,
+            duration_micros,
+            ..WorkspaceManifestWork::default()
+        };
+        self
+    }
+
+    pub fn with_revalidation_work(
+        mut self,
+        overlay_traversals: u64,
+        files_examined: u64,
+        git_subprocesses: u64,
+        reuse_rejections: u64,
+        duration_micros: u64,
+    ) -> Self {
+        self.work.overlay_traversals = self
+            .work
+            .overlay_traversals
+            .saturating_add(overlay_traversals);
+        self.work.files_examined = self.work.files_examined.saturating_add(files_examined);
+        self.work.git_subprocesses = self.work.git_subprocesses.saturating_add(git_subprocesses);
+        self.work.reuse_rejections = self.work.reuse_rejections.saturating_add(reuse_rejections);
+        self.work.duration_micros = self.work.duration_micros.saturating_add(duration_micros);
+        self
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceMutationFinishOutcome {
+    pub(crate) result: WorkspaceMutationResult,
+    pub(crate) final_manifest: Option<PreparedWorkspaceManifest>,
+    pub(crate) work: WorkspaceManifestWork,
+}
+
+impl WorkspaceMutationFinishOutcome {
+    pub fn result(&self) -> &WorkspaceMutationResult {
+        &self.result
+    }
+
+    pub fn final_manifest(&self) -> Option<&PreparedWorkspaceManifest> {
+        self.final_manifest.as_ref()
+    }
+
+    pub fn work(&self) -> WorkspaceManifestWork {
+        self.work
+    }
+
+    pub fn into_result(self) -> WorkspaceMutationResult {
+        self.result
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -547,6 +934,26 @@ pub enum ObservationKind {
     Abandoned,
 }
 
+impl ObservationKind {
+    #[doc(hidden)]
+    pub fn is_meaningful_progress(self) -> bool {
+        matches!(
+            self,
+            Self::Reading
+                | Self::Reviewing
+                | Self::Validating
+                | Self::Blocked
+                | Self::Mutation
+                | Self::GateChanged
+                | Self::ReceiptSealed
+                | Self::Completed
+                | Self::NeedsMain
+                | Self::Violated
+                | Self::Abandoned
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeObservation {
     pub event_id: MutationEventId,
@@ -604,6 +1011,18 @@ pub struct ValidationCall {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ValidationEvidence {
+    /// Immutable completion-candidate identity. Missing values mark legacy
+    /// evidence that may be displayed but must never satisfy proof reuse.
+    #[serde(default)]
+    pub candidate_id: String,
+    #[serde(default)]
+    pub implementation_identity: String,
+    #[serde(default)]
+    pub source_evidence_epoch: Option<u64>,
+    #[serde(default)]
+    pub normalized_invocation: String,
+    #[serde(default)]
+    pub coverage_identity: String,
     pub start_epoch: u64,
     pub end_epoch: Option<u64>,
     #[serde(default)]
@@ -617,12 +1036,60 @@ pub struct ValidationEvidence {
     pub cwd: Option<String>,
     pub environment_hash: Option<String>,
     pub toolchain: Option<String>,
+    #[serde(default)]
+    pub features_configuration_identity: String,
+    #[serde(default)]
+    pub covered_input_manifest_hash: String,
+    #[serde(default)]
+    pub dependency_manifest_hash: String,
+    #[serde(default)]
+    pub successful_result: Option<bool>,
+    #[serde(default)]
+    pub retained_output_digest: String,
     pub retained_output_ref: Option<String>,
     #[serde(default)]
     pub output_summary: Option<String>,
+    /// Backward-compatible structured terminal projection. The task store
+    /// remains protocol-agnostic and preserves the canonical JSON value.
+    #[serde(default)]
+    pub validation_result: Option<serde_json::Value>,
     pub lease_expires_at: Option<DateTime<Utc>>,
     pub shared_from_call_id: Option<String>,
     pub stale_reason: Option<String>,
+}
+
+impl ValidationEvidence {
+    pub fn has_complete_request_identity(&self) -> bool {
+        !self.candidate_id.is_empty()
+            && !self.implementation_identity.is_empty()
+            && self.source_evidence_epoch.is_some()
+            && !self.normalized_invocation.is_empty()
+            && !self.coverage_identity.is_empty()
+            && !self.manifest_hash.is_empty()
+            && self.cwd.as_deref().is_some_and(|cwd| !cwd.is_empty())
+            && self
+                .environment_hash
+                .as_deref()
+                .is_some_and(|hash| !hash.is_empty())
+            && self
+                .toolchain
+                .as_deref()
+                .is_some_and(|toolchain| !toolchain.is_empty())
+            && !self.covered_input_manifest_hash.is_empty()
+            && !self.dependency_manifest_hash.is_empty()
+            && !self.features_configuration_identity.is_empty()
+    }
+
+    pub fn is_reusable_success(&self) -> bool {
+        self.has_complete_request_identity()
+            && self.successful_result == Some(true)
+            && !self.retained_output_digest.is_empty()
+            && self
+                .retained_output_ref
+                .as_deref()
+                .is_some_and(|output_ref| !output_ref.is_empty())
+            && self.stale_reason.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -688,6 +1155,15 @@ pub struct ReceiptDraft {
     pub blockers: Vec<String>,
     pub risks: Vec<String>,
     pub next_action: Option<String>,
+    #[serde(default)]
+    pub architecture_contract: Option<ArchitectureContractV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MissingEvidenceObligation {
+    /// Stable within the immutable assignment and persisted requirement ordinal.
+    pub id: String,
+    pub requirement: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -703,10 +1179,32 @@ pub struct AgentReceipt {
     pub risks: Vec<String>,
     pub next_action: Option<String>,
     #[serde(default)]
+    pub architecture_contract: Option<SealedArchitectureContractV1>,
+    #[serde(default)]
     pub evidence_epoch: u64,
     #[serde(default)]
     pub evidence_manifest_hash: String,
     pub sealed_at: DateTime<Utc>,
+}
+
+/// Bounded result of evaluating the generic productivity deadline against owned operations.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProductivitySummary {
+    pub active_owned_operation_count: u32,
+    pub cancelled_expired_operation_count: u32,
+}
+
+/// Atomic outcome of one nonproductive-assignment recovery evaluation.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NonproductiveRecovery {
+    NotEligible,
+    Suspended(ProductivitySummary),
+    Recovered {
+        receipt: Box<AgentReceipt>,
+        productivity: ProductivitySummary,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1009,6 +1507,13 @@ fn validate_role_relation(
             .all(|target| dependencies.contains(target))
     };
     match role {
+        AgentRole::Architect => {
+            if !write_scope.is_empty() || relation.is_some() {
+                return Err(StoreError::InvalidAssignment(
+                    "architects must be read-only and cannot declare a relation".to_string(),
+                ));
+            }
+        }
         AgentRole::Explorer => {
             if !write_scope.is_empty() || relation.is_some() {
                 return Err(StoreError::InvalidAssignment(

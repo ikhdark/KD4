@@ -78,6 +78,45 @@ path = "scripts/test_kd4_perf_snapshot.py"
 contains = "test_phase0_profile_covers_required_baseline_categories"
 
 [[features]]
+id = "long-task-token-amplification-control"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Canonical task checkpoints, continuity deduplication, dispatch occupancy enforcement, and root-task amplification telemetry."
+upstream_equivalent = "none"
+config_keys = [
+  "features.token_budget",
+  "model_auto_compact_token_limit",
+  "model_auto_compact_token_limit_scope",
+]
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/compact_token_budget.rs"
+contains = "schema: \"task_checkpoint_v1\""
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/session/turn.rs"
+contains = "let kd4_dispatch_telemetry = enforce_kd4_dispatch_budget("
+
+[[features.evidence]]
+kind = "config"
+path = "codex-rs/core/src/config/mod.rs"
+contains = "pub token_budget: Option<TokenBudgetConfig>"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/compact_token_budget.rs"
+contains = "fn repeated_checkpoint_projection_keeps_one_active_checkpoint_and_artifact_id()"
+
+[[features.evidence]]
+kind = "test"
+path = "scripts/test_kd4_perf_snapshot.py"
+contains = "test_amplification_coverage_retries_and_algebraic_attribution"
+
+[[features]]
 id = "extension-boundary-core"
 version = 1
 status = "enabled"
@@ -250,7 +289,7 @@ contains = ".mark_running_process_completed(process_id, exit_code)"
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/tools/command_execution.rs"
-contains = "blocks_third_identical_attempt_after_two_failures"
+contains = "deterministic_failure_suppresses_only_duplicate_diagnosis_and_never_command_retry"
 
 [[features]]
 id = "command-output-artifacts"
@@ -534,11 +573,11 @@ retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
 
 [[features]]
 id = "task-evidence-completion-gate"
-version = 5
+version = 9
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Persisted schema-v5 task evidence with explicit plan acknowledgement, versioned user-source and requirement manifests, candidate-bound proof identity, atomic completion-review lineage, and migration from v1-v4."
+summary = "Persisted schema-v9 task evidence, including the schema-v7 bounded owner-packet and source-refresh projection, explicit plan acknowledgement, versioned user-source and requirement manifests, candidate-bound proof identity, atomic completion-review lineage, and migration from older schemas."
 upstream_equivalent = "none"
 config_keys = []
 
@@ -555,7 +594,7 @@ contains = "pub(crate) task_evidence: TaskEvidenceLedger"
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/plan.rs"
-contains = ".record_plan_update(&requested_args)"
+contains = ".record_planning_update(requested_input.clone())"
 
 [[features.evidence]]
 kind = "registration"
@@ -565,12 +604,32 @@ contains = ".record_edit_intent_with_provenance("
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/events.rs"
-contains = ".record_command_bound_with_provenance("
+contains = ".record_command_bound_with_validation_result("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/source.rs"
+contains = ".record_owner_packet_from_locator("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/file-search/src/task_locator.rs"
+contains = "pub owner_packet_seed: Option<LocateTaskOwnerPacketSeed>"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/runtimes/apply_patch.rs"
+contains = ".record_owner_patch_finalization("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/agent-task-store/src/workspace.rs"
+contains = "upsert_actor_supporting_read_entries_tx("
 
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tasks/mod.rs"
-contains = ".task_evidence.completion_gate().await"
+contains = "self.services.task_evidence.completion_gate(),"
 
 [[features.evidence]]
 kind = "registration"
@@ -596,6 +655,16 @@ contains = "explicit_passed_and_completed_are_authoritative_success_states"
 kind = "test"
 path = "codex-rs/core/src/task_evidence_tests.rs"
 contains = "frozen_v4_loader_refuses_v5_without_modifying_the_file"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/task_evidence_tests.rs"
+contains = "owner_packet_refreshes_actual_post_state_and_keeps_followup_edits_current"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/agent-task-store/src/tests.rs"
+contains = "mutation_finalization_refreshes_the_same_actors_supporting_identity"
 
 [[features]]
 id = "task-completion-reviewer"
@@ -626,11 +695,6 @@ contains = "#[path = \"completion_review_v2.rs\"]"
 kind = "config"
 path = "codex-rs/features/src/lib.rs"
 contains = "key: \"task_completion_reviewer\""
-
-[[features.evidence]]
-kind = "config"
-path = ".codex/config.toml"
-contains = "task_completion_reviewer = true"
 
 [[features.evidence]]
 kind = "test"

@@ -42,7 +42,7 @@ impl FixedPointPlanningState {
     pub(crate) fn begin_iteration(
         &mut self,
         snapshot: &PlanningSnapshotIdentity,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.iterations = self.iterations.saturating_add(1);
         if self.iterations > MAX_FIXED_POINT_ITERATIONS {
             return Err(format!(
@@ -54,13 +54,14 @@ impl FixedPointPlanningState {
             .entry(snapshot.state_digest.clone())
             .or_default();
         *visits = visits.saturating_add(1);
+        let repeated_digest = *visits > 1;
         if *visits > MAX_FIXED_POINT_ITERATIONS {
             return Err(format!(
                 "pending-turn planning repeatedly invalidated the same model-visible state digest `{}`",
                 snapshot.state_digest
             ));
         }
-        Ok(())
+        Ok(repeated_digest)
     }
 
     pub(crate) fn completed(&self, effect_id: &str) -> Option<&CompletedEffect> {

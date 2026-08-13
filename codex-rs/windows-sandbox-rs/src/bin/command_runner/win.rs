@@ -54,6 +54,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::mpsc;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
 use windows_sys::Win32::Foundation::DuplicateHandle;
@@ -529,8 +530,8 @@ fn spawn_input_loop_with_terminator<F>(
 where
     F: Fn() + Send + 'static,
 {
+    let mut stdin_tx = stdin_handle.map(|handle| spawn_stdin_writer(handle, log_dir.clone()));
     std::thread::spawn(move || {
-        let mut stdin_handle = stdin_handle;
         loop {
             let msg = match read_frame(&mut reader) {
                 Ok(Some(v)) => v,
@@ -555,101 +556,117 @@ where
             };
             match msg.message {
                 Message::Stdin { payload } => {
-                    let Ok(bytes) = decode_bytes(&payload.data_b64) else {
-                        continue;
-                    };
-                    if let Some(handle) = stdin_handle {
-                        let mut offset = 0usize;
-                        // `WriteFile` can report success after consuming only part of the buffer
-                        // when the target is a pipe. Treat this like a normal partial write and
-                        // keep advancing until every decoded stdin byte has been forwarded.
-                        //
-                        // If the child closes stdin or the pipe enters an error state, we log
-                        // that fact, close our local HANDLE, and stop trying to forward later
-                        // `Stdin` frames. That prevents silent truncation while also avoiding an
-                        // endless stream of failing writes after the child is already gone.
-                        while offset < bytes.len() {
-                            let chunk = &bytes[offset..];
-                            let chunk_len = chunk.len().min(u32::MAX as usize);
-                            let mut written = 0u32;
-                            let ok = unsafe {
-                                windows_sys::Win32::Storage::FileSystem::WriteFile(
-                                    handle,
-                                    chunk.as_ptr(),
-                                    chunk_len as u32,
-                                    &mut written,
-                                    ptr::null_mut(),
-                                )
-                            };
-                            if ok == 0 {
-                                log_note(
-                                    &format!(
-                                        "runner stdin write failed after {offset} bytes: {}",
-                                        unsafe { GetLastError() }
-                                    ),
-                                    log_dir.as_deref(),
-                                );
-                                unsafe {
-                                    CloseHandle(handle);
-                                }
-                                stdin_handle = None;
-                                break;
-                            }
-                            if written == 0 {
-                                log_note(
-                                    "runner stdin write made no progress; closing child stdin",
-                                    log_dir.as_deref(),
-                                );
-                                unsafe {
-                                    CloseHandle(handle);
-                                }
-                                stdin_handle = None;
-                                break;
-                            }
-                            offset += written as usize;
+                    let bytes = match decode_bytes(&payload.data_b64) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            terminate_process_tree();
+                            log_note(
+                                &format!(
+                                    "runner received invalid stdin payload; terminating process tree: {err}"
+                                ),
+                                log_dir.as_deref(),
+                            );
+                            break;
                         }
+                    };
+                    if let Some(tx) = stdin_tx.as_ref()
+                        && tx.send(Some(bytes)).is_err()
+                    {
+                        stdin_tx = None;
                     }
                 }
                 Message::CloseStdin { .. } => {
-                    if let Some(handle) = stdin_handle.take() {
-                        unsafe {
-                            CloseHandle(handle);
-                        }
+                    if let Some(tx) = stdin_tx.take() {
+                        let _ = tx.send(None);
                     }
                 }
                 Message::Resize {
                     payload: ResizePayload { rows, cols },
                 } => {
+                    let (Ok(rows), Ok(cols)) = (i16::try_from(rows), i16::try_from(cols)) else {
+                        log_note(
+                            &format!("runner rejected invalid terminal size {cols}x{rows}"),
+                            log_dir.as_deref(),
+                        );
+                        continue;
+                    };
                     if let Ok(guard) = hpc_handle.lock()
                         && let Some(hpc) = guard.as_ref()
                     {
-                        unsafe {
-                            let _ = ResizePseudoConsole(
-                                *hpc,
-                                COORD {
-                                    X: cols as i16,
-                                    Y: rows as i16,
-                                },
+                        let result =
+                            unsafe { ResizePseudoConsole(*hpc, COORD { X: cols, Y: rows }) };
+                        if result != 0 {
+                            log_note(
+                                &format!(
+                                    "runner failed to resize pseudoconsole to {cols}x{rows}: HRESULT 0x{result:08x}"
+                                ),
+                                log_dir.as_deref(),
                             );
                         }
                     }
                 }
                 Message::Terminate { .. } => {
                     terminate_process_tree();
+                    break;
                 }
-                Message::SpawnRequest { .. } => {}
-                Message::SpawnReady { .. } => {}
-                Message::Output { .. } => {}
-                Message::Exit { .. } => {}
-                Message::Error { .. } => {}
-            }
-        }
-        if let Some(handle) = stdin_handle {
-            unsafe {
-                CloseHandle(handle);
+                other => {
+                    terminate_process_tree();
+                    log_note(
+                        &format!(
+                            "runner received unexpected control message; terminating process tree: {other:?}"
+                        ),
+                        log_dir.as_deref(),
+                    );
+                    break;
+                }
             }
         }
     })
+}
+
+fn spawn_stdin_writer(handle: HANDLE, log_dir: Option<PathBuf>) -> mpsc::Sender<Option<Vec<u8>>> {
+    let (stdin_tx, stdin_rx) = mpsc::channel::<Option<Vec<u8>>>();
+    std::thread::spawn(move || {
+        'writer: while let Ok(Some(bytes)) = stdin_rx.recv() {
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                let chunk = &bytes[offset..];
+                let chunk_len = chunk.len().min(u32::MAX as usize);
+                let mut written = 0u32;
+                let ok = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::WriteFile(
+                        handle,
+                        chunk.as_ptr(),
+                        chunk_len as u32,
+                        &mut written,
+                        ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    log_note(
+                        &format!(
+                            "runner stdin write failed after {offset} bytes: {}",
+                            unsafe { GetLastError() }
+                        ),
+                        log_dir.as_deref(),
+                    );
+                    break 'writer;
+                }
+                if written == 0 {
+                    log_note(
+                        "runner stdin write made no progress; closing child stdin",
+                        log_dir.as_deref(),
+                    );
+                    break 'writer;
+                }
+                offset += written as usize;
+            }
+        }
+        unsafe {
+            CloseHandle(handle);
+        }
+    });
+    stdin_tx
 }
 
 /// Entry point for the Windows command runner process.
@@ -852,20 +869,28 @@ pub fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::FramedMessage;
+    use super::IPC_PROTOCOL_VERSION;
+    use super::Message;
     use super::OwnedWinHandle;
     use super::ProcessWaitOutcome;
     use super::WAIT_FAILED;
     use super::encode_bytes;
     use super::spawn_input_loop;
+    use super::spawn_input_loop_with_terminator;
     use super::wait_for_process;
+    use super::write_frame;
     use codex_utils_pty::JobObject;
+    use codex_windows_sandbox::StdinPayload;
     use std::fs::File;
+    use std::io::Seek;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::io::FromRawHandle;
     use std::process::Stdio;
     use std::ptr;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::mpsc;
     use std::time::Duration;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
@@ -901,6 +926,49 @@ mod tests {
                 windows_error: Some(ERROR_INVALID_HANDLE),
             }
         );
+    }
+
+    #[test]
+    fn blocked_stdin_does_not_delay_control_eof() -> anyhow::Result<()> {
+        let mut control_reader = tempfile::tempfile()?;
+        write_frame(
+            &mut control_reader,
+            &FramedMessage {
+                version: IPC_PROTOCOL_VERSION,
+                message: Message::Stdin {
+                    payload: StdinPayload {
+                        data_b64: encode_bytes(&vec![b'x'; 1024 * 1024]),
+                    },
+                },
+            },
+        )?;
+        control_reader.rewind()?;
+
+        let mut stdin_read: HANDLE = 0;
+        let mut stdin_write: HANDLE = 0;
+        let pipe_created = unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, ptr::null(), 0) };
+        assert_ne!(pipe_created, 0, "CreatePipe failed: {}", unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        });
+        let stdin_read = OwnedWinHandle::new(stdin_read);
+
+        let (terminated_tx, terminated_rx) = mpsc::channel();
+        let input_thread = spawn_input_loop_with_terminator(
+            control_reader,
+            Some(stdin_write),
+            Arc::new(Mutex::new(None)),
+            None,
+            move || {
+                let _ = terminated_tx.send(());
+            },
+        );
+
+        terminated_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("control EOF must remain responsive while child stdin is blocked");
+        input_thread.join().expect("join runner input loop");
+        drop(stdin_read);
+        Ok(())
     }
 
     #[test]

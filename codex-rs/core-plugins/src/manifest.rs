@@ -4,7 +4,9 @@ use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::find_plugin_manifest_path;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 const MAX_DEFAULT_PROMPT_COUNT: usize = 3;
@@ -16,6 +18,9 @@ pub type PluginManifestInterface = codex_plugin::manifest::PluginManifestInterfa
 pub type PluginManifestMcpServers =
     codex_plugin::manifest::PluginManifestMcpServers<AbsolutePathBuf>;
 pub type PluginManifestPaths = codex_plugin::manifest::PluginManifestPaths<AbsolutePathBuf>;
+pub type PluginSkillToolExposure = codex_plugin::manifest::PluginSkillToolExposure;
+pub type PluginToolExposure = codex_plugin::manifest::PluginToolExposure;
+pub type PluginToolExposureConfig = codex_plugin::manifest::PluginToolExposureConfig;
 
 pub(crate) type UriPluginManifest = codex_plugin::manifest::PluginManifest<PathUri>;
 
@@ -42,6 +47,34 @@ struct RawPluginManifest {
     hooks: Option<RawPluginManifestHooks>,
     #[serde(default)]
     interface: Option<RawPluginManifestInterface>,
+    #[serde(default, deserialize_with = "deserialize_raw_tool_exposure")]
+    tool_exposure: RawToolExposure,
+}
+
+#[derive(Debug, Default)]
+enum RawToolExposure {
+    #[default]
+    Missing,
+    Present(JsonValue),
+}
+
+fn deserialize_raw_tool_exposure<'de, D>(deserializer: D) -> Result<RawToolExposure, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    JsonValue::deserialize(deserializer).map(RawToolExposure::Present)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawPluginToolExposure {
+    skills: BTreeMap<String, RawPluginSkillToolExposure>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawPluginSkillToolExposure {
+    mcp_tools: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -167,6 +200,7 @@ pub(crate) fn parse_plugin_manifest_uri(
         apps,
         hooks,
         interface,
+        tool_exposure,
     } = serde_json::from_str::<RawPluginManifest>(contents)?;
     let name = plugin_root
         .basename()
@@ -264,7 +298,84 @@ pub(crate) fn parse_plugin_manifest_uri(
             hooks: resolve_manifest_hooks(plugin_root, hooks),
         },
         interface,
+        tool_exposure: parse_tool_exposure(tool_exposure),
     })
+}
+
+fn parse_tool_exposure(raw: RawToolExposure) -> Option<PluginToolExposure> {
+    let RawToolExposure::Present(raw) = raw else {
+        return None;
+    };
+    Some(match serde_json::from_value::<RawPluginToolExposure>(raw) {
+        Ok(raw) => match normalize_tool_exposure(raw) {
+            Ok(config) => PluginToolExposure::Valid(config),
+            Err(message) => PluginToolExposure::Invalid(message),
+        },
+        Err(error) => PluginToolExposure::Invalid(error.to_string()),
+    })
+}
+
+fn normalize_tool_exposure(raw: RawPluginToolExposure) -> Result<PluginToolExposureConfig, String> {
+    if raw.skills.is_empty() {
+        return Err("toolExposure.skills must declare at least one skill".to_string());
+    }
+    let mut skills = BTreeMap::new();
+    for (skill_name, skill) in raw.skills {
+        let skill_name = skill_name.trim();
+        if skill_name.is_empty() {
+            return Err("toolExposure.skills contains an empty skill name".to_string());
+        }
+        if skill.mcp_tools.is_empty() {
+            return Err(format!(
+                "toolExposure.skills.{skill_name}.mcpTools must declare at least one server"
+            ));
+        }
+        let mut mcp_tools = BTreeMap::new();
+        for (server_name, tool_names) in skill.mcp_tools {
+            let server_name = server_name.trim();
+            if server_name.is_empty() {
+                return Err(format!(
+                    "toolExposure.skills.{skill_name}.mcpTools contains an empty server name"
+                ));
+            }
+            let mut tool_names = tool_names
+                .into_iter()
+                .map(|tool_name| tool_name.trim().to_string())
+                .collect::<Vec<_>>();
+            if tool_names.iter().any(String::is_empty) {
+                return Err(format!(
+                    "toolExposure.skills.{skill_name}.mcpTools.{server_name} contains an empty tool name"
+                ));
+            }
+            tool_names.sort_unstable();
+            tool_names.dedup();
+            if tool_names.is_empty() {
+                return Err(format!(
+                    "toolExposure.skills.{skill_name}.mcpTools.{server_name} must declare at least one tool"
+                ));
+            }
+            if mcp_tools
+                .insert(server_name.to_string(), tool_names)
+                .is_some()
+            {
+                return Err(format!(
+                    "toolExposure.skills.{skill_name}.mcpTools contains duplicate server `{server_name}`"
+                ));
+            }
+        }
+        if skills
+            .insert(
+                skill_name.to_string(),
+                PluginSkillToolExposure { mcp_tools },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "toolExposure.skills contains duplicate skill `{skill_name}`"
+            ));
+        }
+    }
+    Ok(PluginToolExposureConfig { skills })
 }
 
 fn resolve_manifest_hooks(
@@ -706,6 +817,66 @@ mod tests {
     }
 
     #[test]
+    fn plugin_manifest_parses_skill_scoped_tool_exposure() {
+        let tmp = tempdir().expect("tempdir");
+        let plugin_root = tmp.path().join("repo-atlas");
+        fs::create_dir_all(plugin_root.join(".codex-plugin")).expect("create manifest dir");
+        fs::write(
+            plugin_root.join(".codex-plugin/plugin.json"),
+            r#"{
+  "name": "repo-atlas",
+  "toolExposure": {
+    "skills": {
+      "repo-atlas": {
+        "mcpTools": { "repo-atlas": ["task"] }
+      }
+    }
+  }
+}"#,
+        )
+        .expect("write manifest");
+
+        let manifest = load_manifest(&plugin_root);
+        let Some(super::PluginToolExposure::Valid(config)) = manifest.tool_exposure else {
+            panic!("expected valid tool exposure");
+        };
+        assert_eq!(
+            config.skills["repo-atlas"].mcp_tools["repo-atlas"],
+            vec!["task".to_string()]
+        );
+    }
+
+    #[test]
+    fn plugin_manifest_retains_invalid_explicit_tool_exposure_as_diagnostic_state() {
+        let tmp = tempdir().expect("tempdir");
+        let plugin_root = tmp.path().join("invalid-exposure");
+        fs::create_dir_all(plugin_root.join(".codex-plugin")).expect("create manifest dir");
+        fs::write(
+            plugin_root.join(".codex-plugin/plugin.json"),
+            r#"{
+  "name": "invalid-exposure",
+  "toolExposure": { "skills": [] }
+}"#,
+        )
+        .expect("write manifest");
+
+        let manifest = load_manifest(&plugin_root);
+        assert!(matches!(
+            manifest.tool_exposure,
+            Some(super::PluginToolExposure::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn plugin_manifest_without_tool_exposure_preserves_legacy_state() {
+        let tmp = tempdir().expect("tempdir");
+        let plugin_root = tmp.path().join("legacy-exposure");
+        write_manifest(&plugin_root, None, r#"{ "displayName": "Legacy" }"#);
+
+        assert_eq!(load_manifest(&plugin_root).tool_exposure, None);
+    }
+
+    #[test]
     fn plugin_manifest_uses_alternate_discoverable_path() {
         let tmp = tempdir().expect("tempdir");
         let plugin_root = tmp.path().join("demo-plugin");
@@ -872,6 +1043,7 @@ mod tests {
                     ),
                     ..PluginManifestInterface::default()
                 }),
+                tool_exposure: None,
             }
         );
     }

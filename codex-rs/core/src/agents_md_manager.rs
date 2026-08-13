@@ -126,9 +126,7 @@ impl AgentsMdManager {
         let loaded = load.loaded;
         let semantically_unchanged = cache.key.as_ref() == Some(&key)
             && match (cache.loaded.as_ref(), loaded.as_ref()) {
-                (Some(current), Some(candidate)) => {
-                    current.semantic_digest() == candidate.semantic_digest()
-                }
+                (Some(current), Some(candidate)) => current.as_ref() == candidate,
                 (None, None) => true,
                 _ => false,
             };

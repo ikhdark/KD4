@@ -1,6 +1,9 @@
+use crate::AdmissionRejectionReason;
 use crate::AssignmentId;
 use crate::AttemptId;
 use crate::DependencyBlocker;
+use crate::MissingEvidenceObligation;
+use crate::WorkspaceCasMismatchDetail;
 use crate::WriteClaimConflict;
 
 #[derive(Debug, thiserror::Error)]
@@ -11,6 +14,8 @@ pub enum StoreError {
     InvalidScope(String),
     #[error("invalid assignment: {0}")]
     InvalidAssignment(String),
+    #[error("typed assignment admission rejected: {reason}")]
+    AdmissionRejected { reason: AdmissionRejectionReason },
     #[error("assignment {0} does not exist")]
     AssignmentNotFound(AssignmentId),
     #[error("attempt {0} does not exist")]
@@ -31,8 +36,10 @@ pub enum StoreError {
     WriteClaimConflict { conflicts: Vec<WriteClaimConflict> },
     #[error("workspace mutation overlaps an active claim: {details:?}")]
     WorkspaceClaimConflict { details: Vec<String> },
-    #[error("workspace file changed after the supporting read: {paths:?}")]
-    WorkspaceCasMismatch { paths: Vec<String> },
+    #[error("workspace file changed after the supporting read: {details:?}")]
+    WorkspaceCasMismatch {
+        details: Vec<WorkspaceCasMismatchDetail>,
+    },
     #[error("workspace mutation lease {0} is unavailable, expired, or already released")]
     WorkspaceLeaseUnavailable(String),
     #[error("workspace finalization is already active for root session {root_session_id}")]
@@ -73,8 +80,10 @@ pub enum StoreError {
     ValidationCallImmutable(String),
     #[error("receipt references validation calls with incompatible status: {call_ids:?}")]
     ValidationCallStatusInvalid { call_ids: Vec<String> },
-    #[error("completed receipt is missing required evidence: {requirements:?}")]
-    RequiredEvidenceMissing { requirements: Vec<String> },
+    #[error("completed receipt is missing required evidence: {obligations:?}")]
+    RequiredEvidenceMissing {
+        obligations: Vec<MissingEvidenceObligation>,
+    },
     #[error(
         "declared changes do not match finalized mutation evidence; declared={declared:?}, finalized={finalized:?}"
     )]

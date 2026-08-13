@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest import mock
 import tempfile
 import unittest
 
@@ -87,6 +88,47 @@ symbol = "{owner_id}_entry"
 
             with self.assertRaisesRegex(ValueError, "collision"):
                 source_owners.load_and_validate(manifest_path, root)
+
+    def test_custom_manifest_defaults_declared_paths_to_its_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 1
+[[owners]]
+id = "alpha"
+roots = ["src"]
+""",
+                encoding="utf-8",
+            )
+
+            manifest, _ = source_owners.load_and_validate(manifest_path)
+
+            self.assertEqual(manifest["owners"][0]["id"], "alpha")
+
+    def test_malformed_nested_shape_uses_manifest_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "source_owners.toml"
+            manifest_path.write_text(
+                'schema_version = 1\nowners = ["not-a-table"]\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "routing_manifest_invalid"):
+                source_owners.load_and_validate(manifest_path)
+
+    def test_atomic_writer_preserves_target_when_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "SOURCEMAP.md"
+            target.write_text("old\n", encoding="utf-8")
+
+            with mock.patch.object(source_owners.os, "replace", side_effect=OSError):
+                with self.assertRaises(OSError):
+                    source_owners.write_text_atomic(target, "new\n")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

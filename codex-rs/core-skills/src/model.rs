@@ -10,6 +10,11 @@ use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use sha2::Digest;
+use sha2::Sha256;
+
+const SKILL_CATALOG_ID_DOMAIN: &[u8] = b"codex.skill-catalog-id.v1";
+pub const SKILL_CATALOG_LOCATOR_PREFIX: &str = "skill:";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillMetadata {
@@ -137,11 +142,25 @@ impl SkillLoadOutcome {
 #[derive(Debug, Clone)]
 pub struct HostSkillsSnapshot {
     outcome: Arc<SkillLoadOutcome>,
+    skills_by_catalog_id: Arc<HashMap<String, SkillMetadata>>,
 }
 
 impl HostSkillsSnapshot {
     pub fn new(outcome: Arc<SkillLoadOutcome>) -> Self {
-        Self { outcome }
+        let mut skills_by_catalog_id = HashMap::with_capacity(outcome.skills.len());
+        for skill in &outcome.skills {
+            let catalog_id = skill_catalog_id(skill);
+            assert!(
+                skills_by_catalog_id
+                    .insert(catalog_id.clone(), skill.clone())
+                    .is_none(),
+                "duplicate deterministic skill catalog ID: {catalog_id}"
+            );
+        }
+        Self {
+            outcome,
+            skills_by_catalog_id: Arc::new(skills_by_catalog_id),
+        }
     }
 
     pub fn outcome(&self) -> &SkillLoadOutcome {
@@ -155,6 +174,145 @@ impl HostSkillsSnapshot {
             .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
         let path = PathUri::from_abs_path(&skill.path_to_skills_md);
         fs.read_file_text(&path, /*sandbox*/ None).await
+    }
+
+    pub fn resolve_catalog_locator(&self, locator: &str) -> Option<&SkillMetadata> {
+        let catalog_id = locator.strip_prefix(SKILL_CATALOG_LOCATOR_PREFIX)?;
+        self.skills_by_catalog_id.get(catalog_id)
+    }
+
+    pub async fn read_skill_text_by_catalog_locator(&self, locator: &str) -> io::Result<String> {
+        let skill = self.resolve_catalog_locator(locator).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown skill catalog locator `{locator}`"),
+            )
+        })?;
+        self.read_skill_text(skill).await
+    }
+}
+
+pub fn skill_catalog_id(skill: &SkillMetadata) -> String {
+    let source_kind = "host";
+    let scope = match skill.scope {
+        SkillScope::Repo => "repo",
+        SkillScope::User => "user",
+        SkillScope::System => "system",
+        SkillScope::Admin => "admin",
+    };
+    let plugin_id = skill.plugin_id.as_deref().unwrap_or_default();
+    let canonical_host_locator = PathUri::from_abs_path(&skill.path_to_skills_md).to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(SKILL_CATALOG_ID_DOMAIN);
+    for part in [
+        source_kind,
+        scope,
+        plugin_id,
+        canonical_host_locator.as_str(),
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod catalog_id_tests {
+    use super::*;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
+
+    fn skill(name: &str, path: &str, scope: SkillScope, plugin_id: Option<&str>) -> SkillMetadata {
+        SkillMetadata {
+            name: name.to_string(),
+            description: "description".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: test_path_buf(path).abs(),
+            scope,
+            plugin_id: plugin_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn catalog_ids_are_deterministic_and_identity_sensitive() {
+        let original = skill(
+            "alpha",
+            "/host/skills/alpha/SKILL.md",
+            SkillScope::User,
+            Some("plugin-a"),
+        );
+        let mut reordered_metadata = original.clone();
+        reordered_metadata.name = "renamed without changing source identity".to_string();
+        reordered_metadata.description = "different description".to_string();
+        let id = skill_catalog_id(&original);
+
+        assert_eq!(id, skill_catalog_id(&reordered_metadata));
+        assert_eq!(id.len(), 24);
+        assert!(
+            id.bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+
+        let mut changed_scope = original.clone();
+        changed_scope.scope = SkillScope::Repo;
+        let mut changed_plugin = original.clone();
+        changed_plugin.plugin_id = Some("plugin-b".to_string());
+        let mut changed_locator = original;
+        changed_locator.path_to_skills_md = test_path_buf("/host/skills/beta/SKILL.md").abs();
+        assert_ne!(id, skill_catalog_id(&changed_scope));
+        assert_ne!(id, skill_catalog_id(&changed_plugin));
+        assert_ne!(id, skill_catalog_id(&changed_locator));
+    }
+
+    #[test]
+    fn snapshot_resolves_catalog_locator_independent_of_input_order() {
+        let alpha = skill(
+            "alpha",
+            "/host/skills/alpha/SKILL.md",
+            SkillScope::Repo,
+            None,
+        );
+        let beta = skill(
+            "beta",
+            "/host/skills/beta/SKILL.md",
+            SkillScope::System,
+            Some("plugin-b"),
+        );
+        let alpha_locator = format!("{SKILL_CATALOG_LOCATOR_PREFIX}{}", skill_catalog_id(&alpha));
+        for skills in [vec![alpha.clone(), beta.clone()], vec![beta, alpha.clone()]] {
+            let snapshot = HostSkillsSnapshot::new(Arc::new(SkillLoadOutcome {
+                skills,
+                ..Default::default()
+            }));
+            assert_eq!(
+                snapshot.resolve_catalog_locator(&alpha_locator),
+                Some(&alpha)
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate deterministic skill catalog ID")]
+    fn snapshot_rejects_duplicate_catalog_ids() {
+        let first = skill(
+            "alpha",
+            "/host/skills/alpha/SKILL.md",
+            SkillScope::Repo,
+            None,
+        );
+        let mut duplicate = first.clone();
+        duplicate.name = "duplicate".to_string();
+        HostSkillsSnapshot::new(Arc::new(SkillLoadOutcome {
+            skills: vec![first, duplicate],
+            ..Default::default()
+        }));
     }
 }
 

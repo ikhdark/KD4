@@ -64,6 +64,17 @@ async fn coordination_pool(fixture: &Fixture) -> sqlx::SqlitePool {
         .expect("coordination database opens")
 }
 
+async fn validation_evidence_revision(pool: &sqlx::SqlitePool, attempt_id: AttemptId) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT revision FROM validation_evidence_revisions WHERE attempt_id = ?",
+    )
+    .bind(attempt_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .expect("revision reads")
+    .unwrap_or(0)
+}
+
 #[tokio::test]
 async fn workspace_actor_registration_waits_for_transient_writer_contention() {
     let fixture = Fixture::new().await;
@@ -165,6 +176,683 @@ async fn workspace_mutation_admission_waits_for_transient_writer_contention() {
         .finish_workspace_mutation(fixture.repo.path(), lease)
         .await
         .expect("contended mutation lease releases");
+}
+
+#[tokio::test]
+async fn repository_wide_manifests_are_referenced_reused_and_restart_decodable() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.repo.path().join("overlay.txt"), "before\n").expect("overlay fixture");
+    let request = WorkspaceMutationRequest {
+        root_session_id: "manifest-reference-root".to_string(),
+        actor_id: "root:manifest-reference-root".to_string(),
+        kind: WorkspaceActorKind::Root,
+        attempt_id: None,
+        paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+        contracts: Vec::new(),
+        expected_manifest: Vec::new(),
+    };
+    let lease = fixture
+        .store
+        .begin_workspace_mutation(fixture.repo.path(), request.clone())
+        .await
+        .expect("repository-wide lease starts");
+    let pool = coordination_pool(&fixture).await;
+    let stored = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT expected_manifest_json, expected_manifest_storage_kind,
+                expected_manifest_reference_hash
+         FROM workspace_mutation_leases WHERE lease_id = ?",
+    )
+    .bind(&lease.lease_id)
+    .fetch_one(&pool)
+    .await
+    .expect("stored manifest reference reads");
+    assert_eq!(stored.1, "content_addressed_v1");
+    let reference_hash = stored.2.as_deref().expect("reference hash");
+    let reference: serde_json::Value =
+        serde_json::from_str(&stored.0).expect("tagged manifest reference");
+    assert_eq!(reference["storage"], "content_addressed");
+    assert_eq!(reference["tag_version"], 1);
+    assert_eq!(reference["payload_format_version"], 1);
+    assert_eq!(reference["manifest_id"], reference_hash);
+    assert!(
+        serde_json::from_str::<Vec<WorkspaceManifestEntry>>(&stored.0).is_err(),
+        "a legacy array reader must fail instead of treating a reference as empty"
+    );
+    let referenced_entries = crate::manifest_storage::decode_manifest(
+        &pool,
+        &lease.workspace_id,
+        &stored.0,
+        &stored.1,
+        stored.2.as_deref(),
+    )
+    .await
+    .expect("referenced manifest reads before disabling new reference writes");
+    let mut disabled_write = pool.begin().await.expect("write-policy transaction starts");
+    let inline = crate::manifest_storage::encode_manifest(
+        &mut disabled_write,
+        &lease.workspace_id,
+        &referenced_entries,
+        false,
+    )
+    .await
+    .expect("disabled reference writes fall back to inline storage");
+    assert_eq!(inline.storage_kind, crate::manifest_storage::INLINE_V1);
+    assert!(inline.reference_hash.is_none());
+    disabled_write
+        .rollback()
+        .await
+        .expect("write-policy transaction rolls back");
+    assert_eq!(
+        crate::manifest_storage::decode_manifest(
+            &pool,
+            &lease.workspace_id,
+            &stored.0,
+            &stored.1,
+            stored.2.as_deref(),
+        )
+        .await
+        .expect("existing reference remains readable while new reference writes are disabled"),
+        referenced_entries
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace_manifest_payloads")
+            .fetch_one(&pool)
+            .await
+            .expect("payload count"),
+        1
+    );
+    pool.close().await;
+
+    fixture.store.close().await;
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .expect("store restarts with referenced lease");
+    restarted
+        .finish_workspace_mutation(fixture.repo.path(), lease)
+        .await
+        .expect("referenced manifest decodes after restart");
+    let second = restarted
+        .begin_workspace_mutation(fixture.repo.path(), request)
+        .await
+        .expect("second repository-wide lease starts");
+    let second_workspace_id = second.workspace_id.clone();
+    let pool = coordination_pool(&fixture).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace_manifest_payloads")
+            .fetch_one(&pool)
+            .await
+            .expect("deduplicated payload count"),
+        1,
+        "an unchanged canonical manifest reuses its payload"
+    );
+    pool.close().await;
+    restarted
+        .finish_workspace_mutation(fixture.repo.path(), second)
+        .await
+        .expect("second lease releases");
+    let pool = coordination_pool(&fixture).await;
+    let head = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT head_manifest_json, head_manifest_storage_kind,
+                head_manifest_reference_hash
+         FROM workspace_repositories WHERE workspace_id = ?",
+    )
+    .bind(&second_workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("workspace head reads");
+    assert_eq!(head.1, "content_addressed_v1");
+    let head_hash = head.2.as_deref().expect("head reference hash");
+    let head_reference: serde_json::Value =
+        serde_json::from_str(&head.0).expect("tagged head manifest reference");
+    assert_eq!(head_reference["storage"], "content_addressed");
+    assert_eq!(head_reference["tag_version"], 1);
+    assert_eq!(head_reference["payload_format_version"], 1);
+    assert_eq!(head_reference["manifest_id"], head_hash);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace_manifest_payloads")
+            .fetch_one(&pool)
+            .await
+            .expect("retained payload count"),
+        1,
+        "lease release and final-head publication retain the unique payload"
+    );
+    let expected_head = head.clone();
+    pool.close().await;
+
+    let exact = restarted
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "exact-after-repository-root".to_string(),
+                actor_id: "root:exact-after-repository-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["overlay.txt".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("exact-path lease starts after repository head publication");
+    restarted
+        .finish_workspace_mutation(fixture.repo.path(), exact)
+        .await
+        .expect("exact-path lease releases");
+    let pool = coordination_pool(&fixture).await;
+    let head_after_exact = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT head_manifest_json, head_manifest_storage_kind,
+                head_manifest_reference_hash
+         FROM workspace_repositories WHERE workspace_id = ?",
+    )
+    .bind(&second_workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("workspace head reads after exact-path finalization");
+    assert_eq!(
+        head_after_exact, expected_head,
+        "an exact-path final manifest must not replace the repository-wide head"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn referenced_empty_legacy_inline_and_unknown_storage_remain_distinct() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.repo.path().join("legacy.txt"), "legacy\n")
+        .expect("nonempty legacy fixture");
+    let legacy_lease = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "legacy-nonempty-root".to_string(),
+                actor_id: "root:legacy-nonempty-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["legacy.txt".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("nonempty inline lease starts");
+    let pool = coordination_pool(&fixture).await;
+    let (legacy_json, legacy_kind) = sqlx::query_as::<_, (String, String)>(
+        "SELECT expected_manifest_json, expected_manifest_storage_kind
+         FROM workspace_mutation_leases WHERE lease_id = ?",
+    )
+    .bind(&legacy_lease.lease_id)
+    .fetch_one(&pool)
+    .await
+    .expect("nonempty inline manifest reads");
+    assert_eq!(legacy_kind, "inline_v1");
+    assert_eq!(
+        serde_json::from_str::<Vec<WorkspaceManifestEntry>>(&legacy_json)
+            .expect("legacy array decodes")
+            .len(),
+        1
+    );
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), legacy_lease)
+        .await
+        .expect("nonempty legacy array decodes through authoritative codec");
+
+    std::fs::create_dir(fixture.repo.path().join("empty-directory")).expect("empty fixture");
+    let empty_lease = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "legacy-empty-root".to_string(),
+                actor_id: "root:legacy-empty-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["empty-directory".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("empty inline lease starts");
+    let referenced = sqlx::query_scalar::<_, String>(
+        "SELECT expected_manifest_json
+         FROM workspace_mutation_leases WHERE lease_id = ?",
+    )
+    .bind(&empty_lease.lease_id)
+    .fetch_one(&pool)
+    .await
+    .expect("referenced empty manifest reads");
+    assert_eq!(referenced, "[]");
+    let workspace_id = empty_lease.workspace_id.clone();
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), empty_lease)
+        .await
+        .expect("genuinely empty legacy array decodes");
+
+    let error = crate::manifest_storage::decode_manifest(
+        &pool,
+        &workspace_id,
+        r#"{"storage":"content_addressed_v1"}"#,
+        "unknown_v1",
+        Some("bad"),
+    )
+    .await
+    .expect_err("unknown storage kind must fail closed");
+    assert!(matches!(error, StoreError::CorruptData(_)));
+
+    for malformed in [
+        r#"{}"#,
+        r#"{"storage":"future","tag_version":1,"payload_format_version":1,"manifest_id":"bad"}"#,
+        r#"{"storage":"content_addressed","tag_version":2,"payload_format_version":1,"manifest_id":"bad"}"#,
+        r#"{"storage":"content_addressed","tag_version":1,"payload_format_version":2,"manifest_id":"bad"}"#,
+        r#"{"storage":"content_addressed","tag_version":1,"payload_format_version":1,"manifest_id":"other"}"#,
+        r#"{"storage":"content_addressed","tag_version":1,"payload_format_version":1,"manifest_id":"bad","future":true}"#,
+    ] {
+        let error = crate::manifest_storage::decode_manifest(
+            &pool,
+            &workspace_id,
+            malformed,
+            crate::manifest_storage::CONTENT_ADDRESSED_V1,
+            Some("bad"),
+        )
+        .await
+        .expect_err("malformed or future references must fail closed");
+        assert!(matches!(error, StoreError::CorruptData(_)));
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn exact_two_file_manifest_examines_only_two_paths() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.repo.path().join("one.txt"), "one").expect("first fixture");
+    std::fs::write(fixture.repo.path().join("two.txt"), "two").expect("second fixture");
+    std::fs::write(fixture.repo.path().join("ignored.txt"), "ignored").expect("ignored fixture");
+    let prepared = fixture
+        .store
+        .prepare_workspace_mutation(
+            fixture.repo.path(),
+            vec!["one.txt".to_string(), "two.txt".to_string()],
+        )
+        .await
+        .expect("exact manifest prepares")
+        .expect("local store supports preparation");
+    assert_eq!(prepared.receipt().paths(), ["one.txt", "two.txt"]);
+    assert_eq!(prepared.receipt().entries().len(), 2);
+    assert_eq!(prepared.work().files_examined, 2);
+    assert_eq!(prepared.work().files_hashed, 2);
+    assert_eq!(prepared.work().overlay_traversals, 0);
+    assert_eq!(prepared.work().git_subprocesses, 0);
+}
+
+#[tokio::test]
+async fn repository_manifest_workflow_benchmark_1111_files() {
+    async fn run_workflow(optimized: bool) -> serde_json::Value {
+        const COMMANDS: u64 = 12;
+        const OVERLAY_FILES: u64 = 1_111;
+
+        let fixture = Fixture::new().await;
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(fixture.repo.path())
+                .output()
+                .expect("git benchmark command runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Codex Benchmark"]);
+        git(&["config", "user.email", "codex-benchmark@example.com"]);
+        std::fs::write(fixture.repo.path().join("tracked.txt"), "tracked\n")
+            .expect("tracked fixture");
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "benchmark baseline"]);
+        for index in 0..OVERLAY_FILES {
+            std::fs::write(
+                fixture.repo.path().join(format!("overlay-{index:04}.txt")),
+                format!("overlay payload {index:04}\n"),
+            )
+            .expect("overlay fixture");
+        }
+
+        let mut cached = if optimized {
+            fixture
+                .store
+                .prepare_workspace_mutation(
+                    fixture.repo.path(),
+                    vec![REPOSITORY_WIDE_PATH.to_string()],
+                )
+                .await
+                .expect("warm manifest prepares")
+        } else {
+            None
+        };
+        let warm_work = cached
+            .as_ref()
+            .map(super::model::PreparedWorkspaceManifest::work);
+        let mut inline_bytes_per_manifest = cached
+            .as_ref()
+            .map(|manifest| {
+                serde_json::to_vec(manifest.receipt().entries())
+                    .expect("manifest serializes")
+                    .len() as u64
+            })
+            .unwrap_or(0);
+
+        let mut admission = WorkspaceManifestWork::default();
+        let mut final_verification = WorkspaceManifestWork::default();
+        let mut admission_wall_micros = 0_u64;
+        let mut final_wall_micros = 0_u64;
+        for command in 0..COMMANDS {
+            let admission_started = std::time::Instant::now();
+            let prepared = if optimized {
+                let prepared = cached.clone().expect("cached receipt");
+                assert_eq!(
+                    fixture
+                        .store
+                        .workspace_mutation_epoch(fixture.repo.path())
+                        .await
+                        .expect("epoch reads"),
+                    Some(prepared.receipt().epoch())
+                );
+                git(&["config", "--includes", "--show-origin", "--null", "--list"]);
+                git(&["rev-parse", "HEAD"]);
+                let before = crate::workspace::repository_overlay_paths(fixture.repo.path())
+                    .await
+                    .expect("authoritative overlay enumerates");
+                for path in &before {
+                    let file = std::fs::File::open(fixture.repo.path().join(path))
+                        .expect("overlay identity opens");
+                    file.metadata().expect("overlay identity reads");
+                }
+                let after = crate::workspace::repository_overlay_paths(fixture.repo.path())
+                    .await
+                    .expect("authoritative overlay re-enumerates");
+                git(&["config", "--includes", "--show-origin", "--null", "--list"]);
+                git(&["rev-parse", "HEAD"]);
+                assert_eq!(before, after);
+                assert_eq!(before.len() as u64, OVERLAY_FILES);
+                prepared.reused_after_validation(2, OVERLAY_FILES, 8, 0)
+            } else {
+                fixture
+                    .store
+                    .prepare_workspace_mutation(
+                        fixture.repo.path(),
+                        vec![REPOSITORY_WIDE_PATH.to_string()],
+                    )
+                    .await
+                    .expect("legacy admission manifest prepares")
+                    .expect("local store supports preparation")
+            };
+            let work = prepared.work();
+            admission.overlay_traversals = admission
+                .overlay_traversals
+                .saturating_add(work.overlay_traversals);
+            admission.files_examined = admission.files_examined.saturating_add(work.files_examined);
+            admission.files_hashed = admission.files_hashed.saturating_add(work.files_hashed);
+            admission.bytes_hashed = admission.bytes_hashed.saturating_add(work.bytes_hashed);
+            admission.git_subprocesses = admission
+                .git_subprocesses
+                .saturating_add(work.git_subprocesses);
+            admission.manifests_constructed = admission
+                .manifests_constructed
+                .saturating_add(work.manifests_constructed);
+            admission.reuse_hits = admission.reuse_hits.saturating_add(work.reuse_hits);
+            if inline_bytes_per_manifest == 0 {
+                inline_bytes_per_manifest = serde_json::to_vec(prepared.receipt().entries())
+                    .expect("legacy manifest serializes")
+                    .len() as u64;
+            }
+            let lease = fixture
+                .store
+                .begin_workspace_mutation_prepared(
+                    fixture.repo.path(),
+                    WorkspaceMutationRequest {
+                        root_session_id: format!("benchmark-root-{command}"),
+                        actor_id: format!("root:benchmark-{command}"),
+                        kind: WorkspaceActorKind::Root,
+                        attempt_id: None,
+                        paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                        contracts: Vec::new(),
+                        expected_manifest: Vec::new(),
+                    },
+                    prepared,
+                )
+                .await
+                .expect("benchmark lease starts");
+            admission_wall_micros = admission_wall_micros.saturating_add(
+                admission_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            );
+
+            let final_started = std::time::Instant::now();
+            let outcome = fixture
+                .store
+                .finish_workspace_mutation_with_receipt(fixture.repo.path(), lease)
+                .await
+                .expect("benchmark lease finalizes");
+            let work = outcome.work();
+            final_verification.overlay_traversals = final_verification
+                .overlay_traversals
+                .saturating_add(work.overlay_traversals);
+            final_verification.files_examined = final_verification
+                .files_examined
+                .saturating_add(work.files_examined);
+            final_verification.files_hashed = final_verification
+                .files_hashed
+                .saturating_add(work.files_hashed);
+            final_verification.bytes_hashed = final_verification
+                .bytes_hashed
+                .saturating_add(work.bytes_hashed);
+            final_verification.git_subprocesses = final_verification
+                .git_subprocesses
+                .saturating_add(work.git_subprocesses);
+            final_verification.manifests_constructed = final_verification
+                .manifests_constructed
+                .saturating_add(work.manifests_constructed);
+            final_verification.unique_payloads = final_verification
+                .unique_payloads
+                .saturating_add(work.unique_payloads);
+            final_verification.payload_reuses = final_verification
+                .payload_reuses
+                .saturating_add(work.payload_reuses);
+            final_verification.manifest_bytes_persisted = final_verification
+                .manifest_bytes_persisted
+                .saturating_add(work.manifest_bytes_persisted);
+            final_verification.reference_bytes_persisted = final_verification
+                .reference_bytes_persisted
+                .saturating_add(work.reference_bytes_persisted);
+            final_wall_micros = final_wall_micros.saturating_add(
+                final_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            );
+            if optimized {
+                cached = outcome.final_manifest().cloned();
+            }
+        }
+
+        let pool = coordination_pool(&fixture).await;
+        let (payload_count, payload_bytes) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*), COALESCE(SUM(payload_byte_count), 0)
+             FROM workspace_manifest_payloads",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("payload metrics read");
+        let reference_bytes = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(SUM(LENGTH(expected_manifest_json)), 0)
+             FROM workspace_mutation_leases",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("reference metrics read");
+        pool.close().await;
+
+        serde_json::json!({
+            "commands": COMMANDS,
+            "overlay_files": OVERLAY_FILES,
+            "warm": warm_work.map(|work| serde_json::json!({
+                "traversals": work.overlay_traversals,
+                "files": work.files_hashed,
+                "bytes": work.bytes_hashed,
+                "git": work.git_subprocesses,
+                "constructions": work.manifests_constructed,
+            })),
+            "admission": {
+                "traversals": admission.overlay_traversals,
+                "files_examined": admission.files_examined,
+                "files": admission.files_hashed,
+                "bytes": admission.bytes_hashed,
+                "git": admission.git_subprocesses,
+                "constructions": admission.manifests_constructed,
+                "hits": admission.reuse_hits,
+                "wall_micros": admission_wall_micros,
+            },
+            "final": {
+                "traversals": final_verification.overlay_traversals,
+                "files": final_verification.files_hashed,
+                "bytes": final_verification.bytes_hashed,
+                "git": final_verification.git_subprocesses,
+                "constructions": final_verification.manifests_constructed,
+                "unique_payloads": final_verification.unique_payloads,
+                "payload_reuses": final_verification.payload_reuses,
+                "manifest_bytes": final_verification.manifest_bytes_persisted,
+                "reference_bytes": final_verification.reference_bytes_persisted,
+                "wall_micros": final_wall_micros,
+            },
+            "stored": {
+                "unique_payloads": payload_count,
+                "manifest_bytes": payload_bytes,
+                "lease_reference_bytes": reference_bytes,
+                "counterfactual_inline_admission_bytes": inline_bytes_per_manifest.saturating_mul(COMMANDS),
+            }
+        })
+    }
+
+    let legacy = run_workflow(false).await;
+    let optimized = run_workflow(true).await;
+    println!(
+        "KD4_MANIFEST_BENCHMARK={}",
+        serde_json::json!({"legacy": legacy, "optimized": optimized})
+    );
+    assert_eq!(optimized["admission"]["traversals"], 24);
+    assert_eq!(optimized["admission"]["files_examined"], 13_332);
+    assert_eq!(optimized["admission"]["files"], 0);
+    assert_eq!(optimized["admission"]["bytes"], 0);
+    assert_eq!(optimized["admission"]["constructions"], 0);
+    assert_eq!(optimized["admission"]["hits"], 12);
+    assert_eq!(
+        legacy["final"]["traversals"],
+        optimized["final"]["traversals"]
+    );
+    assert_eq!(legacy["final"]["files"], optimized["final"]["files"]);
+}
+
+#[tokio::test]
+async fn missing_corrupt_and_conflicting_manifest_payloads_fail_closed() {
+    async fn referenced_lease(fixture: &Fixture, suffix: &str) -> WorkspaceMutationLease {
+        std::fs::write(fixture.repo.path().join("overlay.txt"), suffix).expect("overlay fixture");
+        fixture
+            .store
+            .begin_workspace_mutation(
+                fixture.repo.path(),
+                WorkspaceMutationRequest {
+                    root_session_id: format!("payload-{suffix}"),
+                    actor_id: format!("root:payload-{suffix}"),
+                    kind: WorkspaceActorKind::Root,
+                    attempt_id: None,
+                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                    contracts: Vec::new(),
+                    expected_manifest: Vec::new(),
+                },
+            )
+            .await
+            .expect("referenced lease starts")
+    }
+
+    let missing = Fixture::new().await;
+    let missing_lease = referenced_lease(&missing, "missing").await;
+    let pool = coordination_pool(&missing).await;
+    sqlx::query("DELETE FROM workspace_manifest_payloads WHERE workspace_id = ?")
+        .bind(&missing_lease.workspace_id)
+        .execute(&pool)
+        .await
+        .expect("missing payload injected");
+    let error = missing
+        .store
+        .finish_workspace_mutation(missing.repo.path(), missing_lease)
+        .await
+        .expect_err("missing payload must fail closed");
+    assert!(matches!(error, StoreError::CorruptData(_)));
+    pool.close().await;
+
+    let corrupt = Fixture::new().await;
+    let corrupt_lease = referenced_lease(&corrupt, "corrupt").await;
+    let pool = coordination_pool(&corrupt).await;
+    sqlx::query(
+        "UPDATE workspace_manifest_payloads
+         SET canonical_manifest_bytes = X'5B5D'
+         WHERE workspace_id = ?",
+    )
+    .bind(&corrupt_lease.workspace_id)
+    .execute(&pool)
+    .await
+    .expect("payload corruption injected");
+    let error = corrupt
+        .store
+        .finish_workspace_mutation(corrupt.repo.path(), corrupt_lease)
+        .await
+        .expect_err("corrupt payload must fail closed");
+    assert!(matches!(error, StoreError::CorruptData(_)));
+    pool.close().await;
+
+    let conflict = Fixture::new().await;
+    std::fs::write(conflict.repo.path().join("overlay.txt"), "conflict").expect("conflict fixture");
+    let prepared = conflict
+        .store
+        .prepare_workspace_mutation(conflict.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
+        .await
+        .expect("manifest prepares")
+        .expect("local store supports preparation");
+    let pool = coordination_pool(&conflict).await;
+    sqlx::query(
+        "INSERT INTO workspace_manifest_payloads (
+            workspace_id, manifest_id, payload_format_version,
+            canonical_manifest_bytes, entry_count, payload_byte_count, created_at
+         ) VALUES (?, ?, 1, X'5B5D', 0, 2, ?)",
+    )
+    .bind(prepared.receipt().workspace_id())
+    .bind(prepared.receipt().manifest_id())
+    .bind(serde_json::to_string(&Utc::now()).expect("time serializes"))
+    .execute(&pool)
+    .await
+    .expect("conflicting identity injected");
+    let mut transaction = pool.begin().await.expect("transaction begins");
+    let error = crate::manifest_storage::encode_canonical_manifest_reference(
+        &mut transaction,
+        prepared.receipt().workspace_id(),
+        &prepared.canonical,
+    )
+    .await
+    .expect_err("conflicting bytes for one hash fail closed");
+    assert!(matches!(error, StoreError::CorruptData(_)));
+    transaction
+        .rollback()
+        .await
+        .expect("transaction rolls back");
+    pool.close().await;
 }
 
 async fn expire_workspace_actor_leases(fixture: &Fixture, attempt_ids: &[AttemptId]) {
@@ -306,6 +994,7 @@ fn worker_draft(root_session_id: &str, scope: &str) -> AssignmentDraft {
         contract_claims: Vec::new(),
         workspace_strategy: WorkspaceStrategy::Auto,
         relation: None,
+        architecture_contract_ref: None,
     }
 }
 
@@ -323,7 +1012,212 @@ fn completed_receipt(validation_call_ids: Vec<String>) -> ReceiptDraft {
         blockers: Vec::new(),
         risks: Vec::new(),
         next_action: None,
+        architecture_contract: None,
     }
+}
+
+fn architecture_contract_for_worker(scope: &str) -> ArchitectureContractV1 {
+    ArchitectureContractV1 {
+        schema_version: ARCHITECTURE_CONTRACT_V1_SCHEMA_VERSION,
+        objective: "implement the bounded change".to_string(),
+        acceptance_criteria: vec![criterion()],
+        read_scope: Vec::new(),
+        write_scope: vec![RepoScope {
+            path: scope.to_string(),
+            recursive: true,
+        }],
+        stop_condition: "stop after focused validation".to_string(),
+        risk_hints: Vec::new(),
+        required_evidence: Vec::new(),
+        prohibited_changes: Vec::new(),
+        contract_claims: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_projection() {
+    let fixture = Fixture::new().await;
+    let architect_draft = AssignmentDraft {
+        root_session_id: "architecture-root".to_string(),
+        role: AgentRole::Architect,
+        capability_profile: CapabilityProfile::ReadSearch,
+        objective: "define the worker contract".to_string(),
+        acceptance_criteria: vec![AcceptanceCriterion {
+            id: "architecture".to_string(),
+            text: "seal one canonical worker contract".to_string(),
+        }],
+        read_scope: vec![RepoScope {
+            path: "src".to_string(),
+            recursive: true,
+        }],
+        write_scope: Vec::new(),
+        stop_condition: "stop after sealing the contract".to_string(),
+        dependencies: Vec::new(),
+        risk_hints: Vec::new(),
+        required_evidence: Vec::new(),
+        prohibited_changes: Vec::new(),
+        contract_claims: Vec::new(),
+        workspace_strategy: WorkspaceStrategy::Shared,
+        relation: None,
+        architecture_contract_ref: None,
+    };
+    let (architect, architect_attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), architect_draft)
+        .await
+        .expect("architect assignment");
+    let receipt = fixture
+        .store
+        .submit_agent_receipt(
+            architect_attempt.attempt_id,
+            ReceiptDraft {
+                status: AgentStatusClaim::Completed,
+                summary: "architecture sealed".to_string(),
+                criterion_results: vec![CriterionResult {
+                    criterion_id: "architecture".to_string(),
+                    status: CriterionStatus::Passed,
+                    evidence: Some("canonical contract attached".to_string()),
+                }],
+                declared_changes: Vec::new(),
+                validation_call_ids: Vec::new(),
+                blockers: Vec::new(),
+                risks: Vec::new(),
+                next_action: None,
+                architecture_contract: Some(architecture_contract_for_worker("src")),
+            },
+        )
+        .await
+        .expect("architect receipt");
+    let sealed = receipt
+        .architecture_contract
+        .expect("sealed architecture contract");
+    assert_eq!(sealed.contract.schema_version, 1);
+    assert_eq!(sealed.contract_sha256.len(), 64);
+
+    let mut worker = worker_draft("architecture-root", "src");
+    worker.dependencies = vec![architect.assignment_id];
+    worker.architecture_contract_ref = Some(ArchitectureContractRef {
+        architect_assignment_id: architect.assignment_id,
+        architect_attempt_id: architect_attempt.attempt_id,
+        contract_version: sealed.contract.schema_version,
+        contract_sha256: sealed.contract_sha256,
+    });
+    fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker)
+        .await
+        .expect("exact worker projection is admitted");
+}
+
+#[tokio::test]
+async fn architect_dependent_workers_fail_closed_on_missing_or_wrong_contract_references() {
+    let fixture = Fixture::new().await;
+    let (architect, architect_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            AssignmentDraft {
+                root_session_id: "architecture-root".to_string(),
+                role: AgentRole::Architect,
+                capability_profile: CapabilityProfile::ReadSearch,
+                objective: "define the worker contract".to_string(),
+                acceptance_criteria: vec![AcceptanceCriterion {
+                    id: "architecture".to_string(),
+                    text: "seal one canonical worker contract".to_string(),
+                }],
+                read_scope: vec![RepoScope {
+                    path: "src".to_string(),
+                    recursive: true,
+                }],
+                write_scope: Vec::new(),
+                stop_condition: "stop after sealing the contract".to_string(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence: Vec::new(),
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: WorkspaceStrategy::Shared,
+                relation: None,
+                architecture_contract_ref: None,
+            },
+        )
+        .await
+        .expect("architect assignment");
+    let sealed = fixture
+        .store
+        .submit_agent_receipt(
+            architect_attempt.attempt_id,
+            ReceiptDraft {
+                status: AgentStatusClaim::Completed,
+                summary: "architecture sealed".to_string(),
+                criterion_results: vec![CriterionResult {
+                    criterion_id: "architecture".to_string(),
+                    status: CriterionStatus::Passed,
+                    evidence: Some("canonical contract attached".to_string()),
+                }],
+                declared_changes: Vec::new(),
+                validation_call_ids: Vec::new(),
+                blockers: Vec::new(),
+                risks: Vec::new(),
+                next_action: None,
+                architecture_contract: Some(architecture_contract_for_worker("src")),
+            },
+        )
+        .await
+        .expect("architect receipt")
+        .architecture_contract
+        .expect("sealed contract");
+
+    let mut missing = worker_draft("architecture-root", "src");
+    missing.dependencies = vec![architect.assignment_id];
+    let error = fixture
+        .store
+        .create_assignment(fixture.repo.path(), missing)
+        .await
+        .expect_err("architect-dependent worker requires a reference");
+    assert!(
+        error
+            .to_string()
+            .contains("missing its architecture contract reference")
+    );
+
+    let mut wrong_hash = worker_draft("architecture-root", "src");
+    wrong_hash.dependencies = vec![architect.assignment_id];
+    wrong_hash.architecture_contract_ref = Some(ArchitectureContractRef {
+        architect_assignment_id: architect.assignment_id,
+        architect_attempt_id: architect_attempt.attempt_id,
+        contract_version: sealed.contract.schema_version,
+        contract_sha256: "0".repeat(64),
+    });
+    let error = fixture
+        .store
+        .create_assignment(fixture.repo.path(), wrong_hash)
+        .await
+        .expect_err("wrong contract hash fails closed");
+    assert!(error.to_string().contains("version or hash does not match"));
+}
+
+#[tokio::test]
+async fn explorer_cannot_seal_architecture_contract() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("architecture-root", "src");
+    draft.role = AgentRole::Explorer;
+    draft.capability_profile = CapabilityProfile::ReadSearch;
+    draft.write_scope.clear();
+    let (_assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("explorer assignment");
+    let mut receipt = completed_receipt(Vec::new());
+    receipt.architecture_contract = Some(architecture_contract_for_worker("src"));
+
+    let error = fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, receipt)
+        .await
+        .expect_err("explorer cannot seal architecture");
+    assert!(error.to_string().contains("only an Architect"));
 }
 
 fn resolved_test_executable() -> Option<String> {
@@ -339,6 +1233,46 @@ fn validation_worker_draft(root_session_id: &str, scope: &str, command: &str) ->
     let mut draft = worker_draft(root_session_id, scope);
     draft.required_evidence = vec![command.to_string()];
     draft
+}
+
+fn selective_worker_draft(
+    root_session_id: &str,
+    write_scope: &str,
+    read_scope: &[&str],
+) -> AssignmentDraft {
+    let mut draft = validation_worker_draft(root_session_id, write_scope, "focused proof");
+    draft.read_scope = read_scope
+        .iter()
+        .map(|path| RepoScope {
+            path: (*path).to_string(),
+            recursive: true,
+        })
+        .collect();
+    draft
+}
+
+fn explorer_draft(root_session_id: &str, scope: &str, objective: &str) -> AssignmentDraft {
+    AssignmentDraft {
+        root_session_id: root_session_id.to_string(),
+        role: AgentRole::Explorer,
+        capability_profile: CapabilityProfile::ReadSearch,
+        objective: objective.to_string(),
+        acceptance_criteria: vec![criterion()],
+        read_scope: vec![RepoScope {
+            path: scope.to_string(),
+            recursive: true,
+        }],
+        write_scope: Vec::new(),
+        stop_condition: "stop after recording the bounded finding".to_string(),
+        dependencies: Vec::new(),
+        risk_hints: Vec::new(),
+        required_evidence: Vec::new(),
+        prohibited_changes: Vec::new(),
+        contract_claims: Vec::new(),
+        workspace_strategy: WorkspaceStrategy::Auto,
+        relation: None,
+        architecture_contract_ref: None,
+    }
 }
 
 async fn start_focused_validation(
@@ -508,6 +1442,7 @@ fn relation_draft(root_session_id: &str, role: AgentRole, target: AssignmentId) 
             kind,
             target_assignment_ids: vec![target],
         }),
+        architecture_contract_ref: None,
     }
 }
 
@@ -572,6 +1507,232 @@ fn reviewer_and_verifier_invariants_are_enforced() {
 }
 
 #[tokio::test]
+async fn selective_admission_allows_shared_reads_and_rejects_conflicting_ownership() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "selective-overlap-root";
+    let first = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            selective_worker_draft(
+                root_session_id,
+                "src/first.rs",
+                &["AGENTS.md", "src/types.rs"],
+            ),
+            true,
+        )
+        .await
+        .expect("first disjoint writer is admitted");
+    assert_eq!(first.integration_plan, IntegrationPlan::SingleWriter);
+
+    let second = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            selective_worker_draft(
+                root_session_id,
+                "src/second.rs",
+                &["AGENTS.md", "src/types.rs"],
+            ),
+            true,
+        )
+        .await
+        .expect("shared supporting reads do not exclude a disjoint writer");
+    assert_eq!(second.integration_plan, IntegrationPlan::RootOwned);
+    assert_eq!(second.overlaps.benign_read_overlap_count, 1);
+
+    let write_conflict = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            selective_worker_draft(root_session_id, "src", &["AGENTS.md"]),
+            true,
+        )
+        .await
+        .expect_err("overlapping active writers are rejected");
+    assert!(matches!(
+        write_conflict,
+        StoreError::WriteClaimConflict { .. }
+    ));
+
+    let sensitive = Fixture::new().await;
+    sensitive
+        .store
+        .create_admitted_assignment(
+            sensitive.repo.path(),
+            explorer_draft(
+                root_session_id,
+                "src/critical.rs",
+                "determine the critical invariant",
+            ),
+            true,
+        )
+        .await
+        .expect("primary investigation is admitted");
+    let read_conflict = sensitive
+        .store
+        .create_admitted_assignment(
+            sensitive.repo.path(),
+            selective_worker_draft(root_session_id, "src/critical.rs", &[]),
+            true,
+        )
+        .await
+        .expect_err("writes cannot invalidate an active primary investigation");
+    assert!(matches!(
+        read_conflict,
+        StoreError::AdmissionRejected {
+            reason: AdmissionRejectionReason::CorrectnessSensitiveReadConflict
+        }
+    ));
+}
+
+#[tokio::test]
+async fn explorer_identity_rejects_only_the_same_primary_question() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "explorer-identity-root";
+    let first = explorer_draft(
+        root_session_id,
+        "src/shared.rs",
+        "trace the parser ownership",
+    );
+    fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), first.clone(), true)
+        .await
+        .expect("first investigation is admitted");
+    let duplicate = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), first, true)
+        .await
+        .expect_err("the same canonical investigation is rejected");
+    assert!(matches!(
+        duplicate,
+        StoreError::AdmissionRejected {
+            reason: AdmissionRejectionReason::DuplicateExplorerInvestigation
+        }
+    ));
+
+    let distinct = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            explorer_draft(
+                root_session_id,
+                "src/shared.rs",
+                "trace the serializer ownership",
+            ),
+            true,
+        )
+        .await
+        .expect("a distinct question may inspect the same surface");
+    assert_eq!(distinct.overlaps.benign_read_overlap_count, 1);
+}
+
+#[tokio::test]
+async fn selective_multi_writer_admission_records_the_required_integration_plan() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "integration-plan-root";
+    fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            selective_worker_draft(root_session_id, "src/first.rs", &[]),
+            true,
+        )
+        .await
+        .expect("first writer is admitted");
+
+    let mut isolated = selective_worker_draft(root_session_id, "src/second.rs", &[]);
+    isolated.workspace_strategy = WorkspaceStrategy::Isolated;
+    let unavailable = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), isolated.clone(), false)
+        .await
+        .expect_err("isolated handoff requires a configured typed integrator");
+    assert!(matches!(
+        unavailable,
+        StoreError::AdmissionRejected {
+            reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable
+        }
+    ));
+    let admitted = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), isolated, true)
+        .await
+        .expect("configured typed integrator makes the isolated handoff feasible");
+    assert_eq!(
+        admitted.integration_plan,
+        IntegrationPlan::TypedIntegratorRequired
+    );
+}
+
+#[tokio::test]
+async fn selective_admission_rejects_writes_over_active_verification_proof_ownership() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "active-verification-admission-root";
+    let worker_command = "cargo test -p owner worker-proof";
+    let (worker, worker_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft(root_session_id, "src/verified.rs", worker_command),
+        )
+        .await
+        .expect("worker assignment");
+    finish_focused_validation(
+        &fixture.store,
+        start_focused_validation(
+            &fixture.store,
+            worker_attempt.attempt_id,
+            "worker-proof-call",
+            worker_command,
+        )
+        .await,
+    )
+    .await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            worker_attempt.attempt_id,
+            completed_receipt(vec!["worker-proof-call".to_string()]),
+        )
+        .await
+        .expect("worker receipt");
+
+    let verifier_command = "cargo test -p owner verifier-proof";
+    let mut verifier = relation_draft(root_session_id, AgentRole::Verifier, worker.assignment_id);
+    verifier.required_evidence = vec![verifier_command.to_string()];
+    let verifier = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), verifier, true)
+        .await
+        .expect("verifier assignment");
+    start_focused_validation(
+        &fixture.store,
+        verifier.attempt.attempt_id,
+        "verifier-proof-call",
+        verifier_command,
+    )
+    .await;
+
+    let error = fixture
+        .store
+        .create_admitted_assignment(
+            fixture.repo.path(),
+            selective_worker_draft(root_session_id, "src/verified.rs", &[]),
+            true,
+        )
+        .await
+        .expect_err("writes cannot invalidate an active verification proof");
+    assert!(matches!(
+        error,
+        StoreError::AdmissionRejected {
+            reason: AdmissionRejectionReason::ActiveValidationConflict
+        }
+    ));
+}
+
+#[tokio::test]
 async fn dependency_validation_returns_every_blocker() {
     let fixture = Fixture::new().await;
     let (incomplete, _) = fixture
@@ -596,6 +1757,53 @@ async fn dependency_validation_returns_every_blocker() {
             .collect::<Vec<_>>(),
         vec![DependencyState::Incomplete, DependencyState::Unknown]
     );
+}
+
+#[tokio::test]
+async fn oversized_receipts_seal_and_remain_fully_retrievable() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("oversized-receipt-root", "src/lib.rs"),
+        )
+        .await
+        .expect("oversized receipt assignment");
+    let summary = "durable oversized receipt evidence ".repeat(2_000);
+    let blockers = vec!["durable blocker evidence ".repeat(1_000)];
+    let receipt = fixture
+        .store
+        .submit_agent_receipt(
+            attempt.attempt_id,
+            ReceiptDraft {
+                status: AgentStatusClaim::NeedsMain,
+                summary: summary.clone(),
+                criterion_results: vec![CriterionResult {
+                    criterion_id: criterion().id,
+                    status: CriterionStatus::NotRun,
+                    evidence: None,
+                }],
+                declared_changes: Vec::new(),
+                validation_call_ids: Vec::new(),
+                blockers: blockers.clone(),
+                risks: vec!["durable risk evidence ".repeat(1_000)],
+                next_action: Some("root must resolve the durable blocker".to_string()),
+                architecture_contract: None,
+            },
+        )
+        .await
+        .expect("large prose does not reject receipt sealing");
+    assert_eq!(receipt.summary, summary);
+
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("sealed oversized receipt remains readable");
+    let stored = task.receipt.expect("sealed receipt");
+    assert_eq!(stored.summary, summary);
+    assert_eq!(stored.blockers, blockers);
 }
 
 #[tokio::test]
@@ -678,6 +1886,299 @@ async fn receipts_are_sealed_and_validation_calls_are_attempt_owned() {
         task.receipt.expect("sealed receipt").status,
         AgentStatusClaim::Completed
     );
+}
+
+#[tokio::test]
+async fn unchanged_missing_evidence_replays_with_stable_assignment_bound_obligations() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("missing-replay-root", "src");
+    draft.required_evidence = vec![
+        "cargo test -p first".to_string(),
+        "cargo test -p second".to_string(),
+    ];
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("worker assignment");
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "missing-replay-root",
+    )
+    .await;
+    let receipt = completed_receipt(Vec::new());
+    let error = fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, receipt.clone())
+        .await
+        .expect_err("missing evidence is rejected");
+    let StoreError::RequiredEvidenceMissing { obligations } = error else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!(obligations.len(), 2);
+    assert!(
+        obligations[0]
+            .id
+            .contains(&assignment.assignment_id.to_string())
+    );
+    assert!(obligations[0].id.contains(":0001:"));
+    assert!(obligations[1].id.contains(":0002:"));
+
+    let replayed = fixture
+        .store
+        .replay_required_evidence_missing(attempt.attempt_id, &receipt)
+        .await
+        .expect("cache lookup succeeds")
+        .expect("unchanged rejection replays");
+    assert_eq!(replayed, obligations);
+
+    let mut changed_receipt = receipt.clone();
+    changed_receipt.summary.push_str(" with a changed draft");
+    assert_eq!(
+        fixture
+            .store
+            .replay_required_evidence_missing(attempt.attempt_id, &changed_receipt)
+            .await
+            .expect("changed draft lookup succeeds"),
+        None,
+        "the complete receipt draft participates in the fingerprint"
+    );
+}
+
+#[tokio::test]
+async fn validation_revision_invalidates_partial_missing_evidence_replay() {
+    let fixture = Fixture::new().await;
+    let first_command = "cargo test -p first";
+    let second_command = "cargo test -p second";
+    let mut draft = worker_draft("partial-replay-root", "src");
+    draft.required_evidence = vec![first_command.to_string(), second_command.to_string()];
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("worker assignment");
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "partial-replay-root",
+    )
+    .await;
+    let first = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "partial-first",
+        first_command,
+    )
+    .await;
+    finish_focused_validation(&fixture.store, first).await;
+    let receipt = completed_receipt(vec!["partial-first".to_string()]);
+    let error = fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, receipt.clone())
+        .await
+        .expect_err("second obligation is missing");
+    let StoreError::RequiredEvidenceMissing { obligations } = error else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(obligations[0].requirement, second_command);
+    assert_eq!(
+        fixture
+            .store
+            .replay_required_evidence_missing(attempt.attempt_id, &receipt)
+            .await
+            .expect("partial cache lookup succeeds"),
+        Some(obligations),
+        "partial replay refreshes referenced validation before the exact hit"
+    );
+
+    let _second = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "partial-second",
+        second_command,
+    )
+    .await;
+    assert_eq!(
+        fixture
+            .store
+            .replay_required_evidence_missing(attempt.attempt_id, &receipt)
+            .await
+            .expect("revision-invalidated lookup succeeds"),
+        None,
+        "every validation-call transition advances the checked revision"
+    );
+}
+
+#[tokio::test]
+async fn partial_missing_evidence_replay_refreshes_host_staleness() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "before\n").expect("source fixture");
+    let first_command = "cargo test -p first";
+    let second_command = "cargo test -p second";
+    let mut draft = worker_draft("partial-stale-root", "src/lib.rs");
+    draft.required_evidence = vec![first_command.to_string(), second_command.to_string()];
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("worker assignment");
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "partial-stale-root",
+    )
+    .await;
+    let first = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "partial-stale-first",
+        first_command,
+    )
+    .await;
+    finish_focused_validation(&fixture.store, first).await;
+    let receipt = completed_receipt(vec!["partial-stale-first".to_string()]);
+    let error = fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, receipt.clone())
+        .await
+        .expect_err("second obligation is missing");
+    assert!(matches!(error, StoreError::RequiredEvidenceMissing { .. }));
+
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "changed\n").expect("host mutation");
+    assert_eq!(
+        fixture
+            .store
+            .replay_required_evidence_missing(attempt.attempt_id, &receipt)
+            .await
+            .expect("staleness-aware lookup succeeds"),
+        None
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_validation_call("partial-stale-first".to_string())
+            .await
+            .expect("validation reads")
+            .expect("validation exists")
+            .status,
+        ValidationCallStatus::Superseded
+    );
+}
+
+#[tokio::test]
+async fn missing_evidence_cache_clears_on_rebinding_and_sealing() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("cache-lifecycle-root", "src");
+    draft.required_evidence = vec!["cargo test -p missing".to_string()];
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("worker assignment");
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "cache-lifecycle-root",
+    )
+    .await;
+    let receipt = completed_receipt(Vec::new());
+    let error = fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, receipt.clone())
+        .await
+        .expect_err("missing evidence is rejected");
+    assert!(matches!(error, StoreError::RequiredEvidenceMissing { .. }));
+    assert!(
+        fixture
+            .store
+            .has_cached_missing_evidence_rejection(attempt.attempt_id)
+    );
+
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "cache-lifecycle-root",
+    )
+    .await;
+    assert!(
+        !fixture
+            .store
+            .has_cached_missing_evidence_rejection(attempt.attempt_id)
+    );
+
+    let error = fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, receipt)
+        .await
+        .expect_err("missing evidence is rejected again");
+    assert!(matches!(error, StoreError::RequiredEvidenceMissing { .. }));
+    fixture
+        .store
+        .abandon_agent_task(
+            TaskActor::Root,
+            assignment.assignment_id,
+            "root replaces the active attempt".to_string(),
+        )
+        .await
+        .expect("attempt seals as abandoned");
+    assert!(
+        !fixture
+            .store
+            .has_cached_missing_evidence_rejection(attempt.attempt_id)
+    );
+}
+
+#[tokio::test]
+async fn validation_evidence_revision_is_monotonic() {
+    let fixture = Fixture::new().await;
+    let command = "cargo test -p revision";
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("revision-root", "src", command),
+        )
+        .await
+        .expect("worker assignment");
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "revision-root",
+    )
+    .await;
+    let pool = coordination_pool(&fixture).await;
+    assert_eq!(
+        validation_evidence_revision(&pool, attempt.attempt_id).await,
+        0
+    );
+    let call =
+        start_focused_validation(&fixture.store, attempt.attempt_id, "revision-call", command)
+            .await;
+    let after_creation = validation_evidence_revision(&pool, attempt.attempt_id).await;
+    assert!(after_creation > 0);
+    finish_focused_validation(&fixture.store, call).await;
+    assert!(validation_evidence_revision(&pool, attempt.attempt_id).await > after_creation);
+    pool.close().await;
+}
+
+#[test]
+fn unsupported_required_evidence_source_disables_replay_cache() {
+    assert!(super::local::required_evidence_sources_are_revisioned(&[
+        "focused_validation_call_summary:v1"
+    ]));
+    assert!(!super::local::required_evidence_sources_are_revisioned(&[
+        "focused_validation_call_summary:v1",
+        "external_evidence:v1",
+    ]));
 }
 
 #[tokio::test]
@@ -2484,6 +3985,74 @@ async fn relevant_drift_supersedes_validation_but_unrelated_drift_preserves_it()
 }
 
 #[tokio::test]
+async fn in_flight_validation_supersedes_only_relevant_drift() {
+    let command = "cargo test -p owner narrow";
+
+    let disjoint = Fixture::new().await;
+    std::fs::create_dir_all(disjoint.repo.path().join("src")).expect("src directory");
+    std::fs::write(disjoint.repo.path().join("src/a.rs"), "before\n").expect("a fixture");
+    std::fs::write(disjoint.repo.path().join("src/b.rs"), "before\n").expect("b fixture");
+    disjoint
+        .store
+        .capture_workspace_revision(disjoint.repo.path(), vec!["src/b.rs".to_string()])
+        .await
+        .expect("disjoint baseline");
+    let (_, disjoint_attempt) = disjoint
+        .store
+        .create_assignment(
+            disjoint.repo.path(),
+            validation_worker_draft("in-flight-disjoint-root", "src/a.rs", command),
+        )
+        .await
+        .expect("disjoint assignment");
+    let disjoint_call = start_focused_validation(
+        &disjoint.store,
+        disjoint_attempt.attempt_id,
+        "in-flight-disjoint-validation",
+        command,
+    )
+    .await;
+    std::fs::write(disjoint.repo.path().join("src/b.rs"), "changed\n").expect("disjoint mutation");
+    disjoint
+        .store
+        .capture_workspace_revision(disjoint.repo.path(), vec!["src/b.rs".to_string()])
+        .await
+        .expect("disjoint mutation is observed");
+    assert_eq!(
+        finish_focused_validation(&disjoint.store, disjoint_call)
+            .await
+            .status,
+        ValidationCallStatus::Succeeded
+    );
+
+    let relevant = Fixture::new().await;
+    std::fs::create_dir_all(relevant.repo.path().join("src")).expect("src directory");
+    std::fs::write(relevant.repo.path().join("src/a.rs"), "before\n").expect("a fixture");
+    let (_, relevant_attempt) = relevant
+        .store
+        .create_assignment(
+            relevant.repo.path(),
+            validation_worker_draft("in-flight-relevant-root", "src/a.rs", command),
+        )
+        .await
+        .expect("relevant assignment");
+    let relevant_call = start_focused_validation(
+        &relevant.store,
+        relevant_attempt.attempt_id,
+        "in-flight-relevant-validation",
+        command,
+    )
+    .await;
+    std::fs::write(relevant.repo.path().join("src/a.rs"), "changed\n").expect("relevant mutation");
+    assert_eq!(
+        finish_focused_validation(&relevant.store, relevant_call)
+            .await
+            .status,
+        ValidationCallStatus::Superseded
+    );
+}
+
+#[tokio::test]
 async fn directory_changes_and_new_build_configuration_supersede_validation() {
     let directory = Fixture::new().await;
     std::fs::create_dir_all(directory.repo.path().join("src")).expect("src directory");
@@ -3042,11 +4611,173 @@ async fn partial_supporting_reads_cannot_bypass_multi_file_cas() {
     assert!(
         matches!(
             error,
-            StoreError::WorkspaceCasMismatch { paths }
-                if paths == vec!["src/b.rs".to_string()]
+            StoreError::WorkspaceCasMismatch { details }
+                if details.iter().map(|detail| detail.path.as_str()).collect::<Vec<_>>()
+                    == vec!["src/b.rs"]
         ),
         "the unread path is reported as the CAS mismatch"
     );
+}
+
+#[tokio::test]
+async fn mutation_finalization_refreshes_the_same_actors_supporting_identity() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "before\n").expect("source fixture");
+    let actor_id = "root:self-refresh-root".to_string();
+    fixture
+        .store
+        .record_supporting_read(
+            fixture.repo.path(),
+            actor_id.clone(),
+            vec!["src/lib.rs".to_string()],
+        )
+        .await
+        .expect("supporting read");
+    let expected_manifest = fixture
+        .store
+        .supporting_read_manifest(
+            fixture.repo.path(),
+            actor_id.clone(),
+            vec!["src/lib.rs".to_string()],
+        )
+        .await
+        .expect("supporting manifest");
+    let lease = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "self-refresh-root".to_string(),
+                actor_id: actor_id.clone(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["src/lib.rs".to_string()],
+                contracts: Vec::new(),
+                expected_manifest,
+            },
+        )
+        .await
+        .expect("first mutation begins");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "after\n").expect("owned edit");
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), lease)
+        .await
+        .expect("first mutation finalizes");
+
+    let refreshed_manifest = fixture
+        .store
+        .supporting_read_manifest(
+            fixture.repo.path(),
+            actor_id.clone(),
+            vec!["src/lib.rs".to_string()],
+        )
+        .await
+        .expect("refreshed supporting manifest");
+    let second = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "self-refresh-root".to_string(),
+                actor_id,
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["src/lib.rs".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: refreshed_manifest,
+            },
+        )
+        .await
+        .expect("same-actor follow-up mutation uses refreshed identity");
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), second)
+        .await
+        .expect("second mutation finalizes");
+}
+
+#[tokio::test]
+async fn external_drift_after_owned_refresh_reports_structured_identities() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "before\n").expect("source fixture");
+    let actor_id = "root:external-after-refresh-root".to_string();
+    fixture
+        .store
+        .record_supporting_read(
+            fixture.repo.path(),
+            actor_id.clone(),
+            vec!["src/lib.rs".to_string()],
+        )
+        .await
+        .expect("supporting read");
+    let expected_manifest = fixture
+        .store
+        .supporting_read_manifest(
+            fixture.repo.path(),
+            actor_id.clone(),
+            vec!["src/lib.rs".to_string()],
+        )
+        .await
+        .expect("supporting manifest");
+    let lease = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "external-after-refresh-root".to_string(),
+                actor_id: actor_id.clone(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["src/lib.rs".to_string()],
+                contracts: Vec::new(),
+                expected_manifest,
+            },
+        )
+        .await
+        .expect("owned mutation begins");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "owned\n").expect("owned edit");
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), lease)
+        .await
+        .expect("owned mutation finalizes");
+    let refreshed_manifest = fixture
+        .store
+        .supporting_read_manifest(
+            fixture.repo.path(),
+            actor_id.clone(),
+            vec!["src/lib.rs".to_string()],
+        )
+        .await
+        .expect("refreshed manifest");
+
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "external\n").expect("external drift");
+    let error = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "external-after-refresh-root".to_string(),
+                actor_id,
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["src/lib.rs".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: refreshed_manifest,
+            },
+        )
+        .await
+        .expect_err("external drift remains rejected");
+    let StoreError::WorkspaceCasMismatch { details } = error else {
+        panic!("expected a structured CAS mismatch")
+    };
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].path, "src/lib.rs");
+    assert_ne!(details[0].expected, details[0].current);
+    assert!(details[0].current_epoch.is_some());
 }
 
 #[tokio::test]
@@ -3583,6 +5314,7 @@ async fn completed_validation_reuse_is_successful_exact_and_manifest_bound() {
             cwd: Some("codex-rs".to_string()),
             environment_hash: Some("rust-env".to_string()),
             toolchain: Some("stable".to_string()),
+            retained_output_ref: Some("tool-call:retained-validation-output".to_string()),
             ..ValidationEvidence::default()
         }
     }
@@ -3752,6 +5484,50 @@ async fn completed_validation_reuse_is_successful_exact_and_manifest_bound() {
     assert_eq!(changed_generated.evidence.shared_from_call_id, None);
 }
 
+#[test]
+fn validation_reuse_rejects_every_incomplete_or_legacy_identity() {
+    let complete = ValidationEvidence {
+        candidate_id: "candidate-a".to_string(),
+        implementation_identity: "implementation-a".to_string(),
+        source_evidence_epoch: Some(7),
+        normalized_invocation: "cargo test -p owner focused".to_string(),
+        coverage_identity: "coverage-a".to_string(),
+        manifest_hash: "manifest-a".to_string(),
+        cwd: Some("codex-rs".to_string()),
+        environment_hash: Some("environment-a".to_string()),
+        toolchain: Some("stable-a".to_string()),
+        features_configuration_identity: "features-a".to_string(),
+        covered_input_manifest_hash: "inputs-a".to_string(),
+        dependency_manifest_hash: "dependencies-a".to_string(),
+        successful_result: Some(true),
+        retained_output_digest: "output-a".to_string(),
+        retained_output_ref: Some("artifact://output-a".to_string()),
+        ..ValidationEvidence::default()
+    };
+    assert!(complete.has_complete_request_identity());
+    assert!(complete.is_reusable_success());
+
+    let mut incomplete = complete.clone();
+    incomplete.cwd = None;
+    assert!(!incomplete.has_complete_request_identity());
+    let mut incomplete = complete.clone();
+    incomplete.environment_hash = None;
+    assert!(!incomplete.has_complete_request_identity());
+    let mut incomplete = complete.clone();
+    incomplete.toolchain = None;
+    assert!(!incomplete.has_complete_request_identity());
+    let mut incomplete = complete.clone();
+    incomplete.source_evidence_epoch = None;
+    assert!(!incomplete.has_complete_request_identity());
+    let mut incomplete = complete.clone();
+    incomplete.retained_output_ref = None;
+    assert!(incomplete.has_complete_request_identity());
+    assert!(!incomplete.is_reusable_success());
+    let mut incomplete = complete;
+    incomplete.successful_result = None;
+    assert!(!incomplete.is_reusable_success());
+}
+
 #[tokio::test]
 async fn failed_and_cancelled_validation_evidence_is_not_reused() {
     let fixture = Fixture::new().await;
@@ -3815,6 +5591,189 @@ async fn failed_and_cancelled_validation_evidence_is_not_reused() {
         assert_eq!(retry.evidence.shared_from_call_id, None);
         finish_focused_validation(&fixture.store, retry).await;
     }
+}
+
+#[tokio::test]
+async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
+    let fixture = Fixture::new().await;
+    let command = "cargo test -p owner bounded-operation";
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("bounded-operation-root", "src/lib.rs", command),
+        )
+        .await
+        .expect("bounded-operation assignment");
+    let running = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "bounded-operation-call",
+        command,
+    )
+    .await;
+    let deadline = running
+        .evidence
+        .lease_expires_at
+        .expect("bounded operation has a hard deadline");
+    let before_deadline = deadline - Duration::seconds(1);
+    let suspended = crate::local::with_test_comparison_now(before_deadline, async {
+        fixture
+            .store
+            .reserve_stalled_nudge(
+                assignment.assignment_id,
+                before_deadline - Duration::seconds(120),
+            )
+            .await
+    })
+    .await
+    .expect("pre-deadline productivity check");
+    assert!(
+        !suspended,
+        "a live bounded operation suspends idle recovery"
+    );
+    let recovery = crate::local::with_test_comparison_now(before_deadline, async {
+        fixture
+            .store
+            .recover_nonproductive_assignment(
+                assignment.assignment_id,
+                before_deadline - Duration::seconds(120),
+            )
+            .await
+    })
+    .await
+    .expect("pre-deadline recovery evaluation");
+    assert_eq!(
+        recovery,
+        NonproductiveRecovery::Suspended(ProductivitySummary {
+            active_owned_operation_count: 1,
+            cancelled_expired_operation_count: 0,
+        })
+    );
+
+    let after_deadline = deadline + Duration::seconds(121);
+    let recovery = crate::local::with_test_comparison_now(after_deadline, async {
+        fixture
+            .store
+            .recover_nonproductive_assignment(
+                assignment.assignment_id,
+                after_deadline - Duration::seconds(120),
+            )
+            .await
+    })
+    .await
+    .expect("post-deadline productivity recovery");
+    let NonproductiveRecovery::Recovered {
+        receipt,
+        productivity,
+    } = recovery
+    else {
+        panic!("expired operation should no longer suppress recovery: {recovery:?}");
+    };
+    assert_eq!(receipt.status, AgentStatusClaim::Abandoned);
+    assert_eq!(productivity.cancelled_expired_operation_count, 1);
+    assert_eq!(
+        fixture
+            .store
+            .get_validation_call(running.call_id)
+            .await
+            .expect("cancelled operation reads")
+            .expect("cancelled operation remains durable")
+            .status,
+        ValidationCallStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn only_new_supporting_evidence_updates_productivity_and_heartbeats_do_not() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "evidence\n").expect("evidence fixture");
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("evidence-productivity-root", "src/lib.rs"),
+        )
+        .await
+        .expect("evidence assignment");
+    let binding = bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "evidence-productivity-root",
+    )
+    .await;
+    let actor_id = format!("attempt:{}", attempt.attempt_id);
+    let pool = coordination_pool(&fixture).await;
+    let old_progress = fixed_time("2000-01-01T00:00:00Z");
+    sqlx::query("UPDATE workspace_actors SET last_progress_at = ? WHERE attempt_id = ?")
+        .bind(serde_json::to_string(&old_progress).expect("old progress serializes"))
+        .bind(attempt.attempt_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("old progress injects");
+    pool.close().await;
+
+    fixture
+        .store
+        .record_supporting_read(
+            fixture.repo.path(),
+            actor_id.clone(),
+            vec!["src/lib.rs".to_string()],
+        )
+        .await
+        .expect("new evidence persists");
+    let pool = coordination_pool(&fixture).await;
+    let progressed: String =
+        sqlx::query_scalar("SELECT last_progress_at FROM workspace_actors WHERE attempt_id = ?")
+            .bind(attempt.attempt_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("progress timestamp reads");
+    assert!(
+        serde_json::from_str::<chrono::DateTime<Utc>>(&progressed)
+            .expect("progress timestamp decodes")
+            > old_progress
+    );
+
+    sqlx::query("UPDATE workspace_actors SET last_progress_at = ? WHERE attempt_id = ?")
+        .bind(serde_json::to_string(&old_progress).expect("old progress serializes"))
+        .bind(attempt.attempt_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("old progress resets");
+    pool.close().await;
+    fixture
+        .store
+        .record_supporting_read(
+            fixture.repo.path(),
+            actor_id,
+            vec!["src/lib.rs".to_string()],
+        )
+        .await
+        .expect("identical evidence is reusable");
+    assert!(
+        fixture
+            .store
+            .heartbeat_typed_workspace_actor(binding)
+            .await
+            .expect("heartbeat persists")
+    );
+    let pool = coordination_pool(&fixture).await;
+    let unchanged: String =
+        sqlx::query_scalar("SELECT last_progress_at FROM workspace_actors WHERE attempt_id = ?")
+            .bind(attempt.attempt_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("unchanged progress reads");
+    assert_eq!(
+        serde_json::from_str::<chrono::DateTime<Utc>>(&unchanged)
+            .expect("unchanged progress decodes"),
+        old_progress,
+        "identical evidence and ordinary heartbeats must not renew productivity"
+    );
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -4116,24 +6075,28 @@ async fn workspace_finalization_dispatch_seal_blocks_mutations_and_releases() {
             .is_err(),
         "dispatching fences remain exclusive"
     );
-    assert!(matches!(
-        fixture
-            .store
-            .begin_workspace_mutation(
-                fixture.repo.path(),
-                WorkspaceMutationRequest {
-                    root_session_id: "competing-dispatch-root".to_string(),
-                    actor_id: "root:competing-dispatch-root".to_string(),
-                    kind: WorkspaceActorKind::Root,
-                    attempt_id: None,
-                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-                    contracts: Vec::new(),
-                    expected_manifest: Vec::new(),
-                },
-            )
-            .await,
-        Err(StoreError::WorkspaceFinalizationActive { .. })
-    ));
+    let blocked_mutation = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "competing-dispatch-root".to_string(),
+                actor_id: "root:competing-dispatch-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            blocked_mutation,
+            Err(StoreError::WorkspaceFinalizationActive { .. })
+        ),
+        "dispatching fence returned the wrong mutation-admission outcome: {blocked_mutation:?}"
+    );
     assert!(
         fixture
             .store
@@ -4999,6 +6962,7 @@ async fn isolated_overlap_integrates_only_through_versioned_handoff() {
             kind: RelationKind::Integration,
             target_assignment_ids: vec![isolated.assignment_id],
         }),
+        architecture_contract_ref: None,
     };
     let (integrator, integrator_attempt) = fixture
         .store

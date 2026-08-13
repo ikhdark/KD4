@@ -23,6 +23,7 @@ use crate::shell::ShellType;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::command_shape::CommandInvocation;
@@ -127,6 +128,7 @@ fn successful_validation_skip_remains_successful_for_reuse() {
         output: FunctionToolOutput::from_text("validation skipped".to_string(), Some(true)),
         exit_code: None,
         validation_reuse_success: Some(true),
+        canonical_output: None,
     };
     assert!(skipped.validation_reuse_succeeded());
 
@@ -134,8 +136,40 @@ fn successful_validation_skip_remains_successful_for_reuse() {
         output: FunctionToolOutput::from_text("no exit".to_string(), Some(true)),
         exit_code: None,
         validation_reuse_success: None,
+        canonical_output: None,
     };
     assert!(!unknown_exit.validation_reuse_succeeded());
+}
+
+#[test]
+fn legacy_shell_keeps_exact_canonical_bytes_and_one_typed_projection() {
+    let raw = vec![b'o', b'k', b'\n', 0xff];
+    let output = super::LegacyShellToolOutput {
+        inner: FunctionToolOutput::from_text("bounded shell output".to_string(), Some(false)),
+        canonical_output: Some(raw.clone()),
+        exit_code: Some(7),
+        call_id: "shell-call".to_string(),
+    };
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+
+    assert_eq!(
+        output
+            .canonical_result(&payload)
+            .expect("canonical shell bytes")
+            .bytes,
+        raw
+    );
+    let projection = output
+        .projection_metadata()
+        .expect("typed shell projection");
+    assert_eq!(projection.spillable_text.len(), 1);
+    assert_eq!(projection.essential_inline["exit_code"], 7);
+    assert_eq!(projection.essential_inline["call_id"], "shell-call");
+    assert!(projection.fragments.iter().any(|fragment| {
+        fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ProcessFinalStatus
+    }));
 }
 
 #[tokio::test]
@@ -1151,6 +1185,114 @@ async fn shell_command_handler_preserves_structured_argv_shape() {
 }
 
 #[test]
+fn focused_validation_aggregates_independent_capability_denials() {
+    let command = validation_argv("bash", &["&&"]);
+    let denial = super::focused_validation_command_summary(
+        &command,
+        "not canonical",
+        /*direct_argv*/ false,
+        std::path::Path::new("repo/subdir"),
+        std::path::Path::new("repo"),
+        &ExecExpiration::DefaultTimeout,
+        /*sandbox_override*/ true,
+        /*additional_permissions*/ true,
+        /*prefix_rule*/ true,
+    )
+    .expect_err("invalid envelope and argv should be denied together");
+    let encoded = denial
+        .strip_prefix("FocusedValidationCapabilityDenied: ")
+        .expect("structured denial prefix");
+    let denial: serde_json::Value = serde_json::from_str(encoded).expect("structured denial JSON");
+    let codes = denial["violations"]
+        .as_array()
+        .expect("violation array")
+        .iter()
+        .map(|violation| violation["code"].as_str().expect("violation code"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        codes,
+        vec![
+            "direct_argv_required",
+            "repository_root_cwd_required",
+            "explicit_timeout_required",
+            "default_permissions_required",
+            "shell_control_argument_forbidden",
+            "validation_program_required",
+            "canonical_summary_required",
+        ]
+    );
+    assert!(denial.get("canonical_permitted_command").is_none());
+}
+
+#[test]
+fn focused_validation_only_suggests_a_canonical_command_for_permitted_argv() {
+    let command = validation_argv("cargo", &["test", "-p", "codex-core"]);
+    let summary = validation_summary(&command);
+    let denial = super::focused_validation_command_summary(
+        &command,
+        &summary,
+        /*direct_argv*/ true,
+        std::path::Path::new("repo/subdir"),
+        std::path::Path::new("repo"),
+        &ExecExpiration::Timeout(Duration::from_secs(60)),
+        /*sandbox_override*/ false,
+        /*additional_permissions*/ false,
+        /*prefix_rule*/ false,
+    )
+    .expect_err("wrong cwd should still deny an otherwise valid command");
+    let encoded = denial
+        .strip_prefix("FocusedValidationCapabilityDenied: ")
+        .expect("structured denial prefix");
+    let denial: serde_json::Value = serde_json::from_str(encoded).expect("structured denial JSON");
+    assert_eq!(denial["canonical_permitted_command"], summary);
+}
+
+#[test]
+fn focused_validation_invalid_program_does_not_cascade_shape_violations() {
+    let command = validation_argv("bash", &["test", "--workspace"]);
+    let summary = validation_summary(&command);
+    let denial = super::focused_validation_command_summary(
+        &command,
+        &summary,
+        /*direct_argv*/ true,
+        std::path::Path::new("repo"),
+        std::path::Path::new("repo"),
+        &ExecExpiration::Timeout(Duration::from_secs(60)),
+        /*sandbox_override*/ false,
+        /*additional_permissions*/ false,
+        /*prefix_rule*/ false,
+    )
+    .expect_err("unsupported executable should be denied");
+    let encoded = denial
+        .strip_prefix("FocusedValidationCapabilityDenied: ")
+        .expect("structured denial prefix");
+    let denial: serde_json::Value = serde_json::from_str(encoded).expect("structured denial JSON");
+    let codes = denial["violations"]
+        .as_array()
+        .expect("violation array")
+        .iter()
+        .map(|violation| violation["code"].as_str().expect("violation code"))
+        .collect::<Vec<_>>();
+    assert_eq!(codes, vec!["validation_program_required"]);
+    assert!(denial.get("canonical_permitted_command").is_none());
+}
+
+#[test]
+fn read_only_and_intercepted_structured_edits_do_not_add_repository_wide_leases() {
+    assert!(!super::requires_repository_wide_mutation_lease(
+        false, false, true, false, false,
+    ));
+    // Interception already owns the exact create/update/delete targets, including
+    // multi-target patches. The repository-wide shell path must stay bypassed.
+    assert!(!super::requires_repository_wide_mutation_lease(
+        false, false, false, true, false,
+    ));
+    assert!(super::requires_repository_wide_mutation_lease(
+        false, false, false, false, false,
+    ));
+}
+
+#[test]
 fn shell_command_handler_rejects_login_when_disallowed() {
     let err =
         ShellCommandHandler::resolve_use_login_shell(Some(true), /*allow_login_shell*/ false)
@@ -1387,6 +1529,8 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
         body: vec![],
         success: Some(true),
         post_tool_use_response: Some(json!("shell output")),
+        deterministic_continuation_receipts: Vec::new(),
+        sampling_request_signal: None,
     };
     let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
     let (session, turn) = make_session_and_context().await;

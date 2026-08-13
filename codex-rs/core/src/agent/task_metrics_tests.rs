@@ -121,6 +121,7 @@ fn completed_task_with_validation(
             start_epoch: 0,
             relation: None,
             task_capsule: None,
+            architecture_contract_ref: None,
             created_at: now,
         },
         current_attempt: Attempt {
@@ -151,6 +152,7 @@ fn completed_task_with_validation(
             blockers: Vec::new(),
             risks: Vec::new(),
             next_action: None,
+            architecture_contract: None,
             evidence_epoch: 0,
             evidence_manifest_hash: String::new(),
             sealed_at: now,

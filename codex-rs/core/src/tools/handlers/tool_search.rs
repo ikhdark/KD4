@@ -481,67 +481,51 @@ fn compact_recovery_tool(tool: &ResponsesApiTool, qualified_name: &str) -> Respo
         ),
         strict: false,
         defer_loading: Some(true),
-        parameters: compact_recovery_schema(&tool.parameters, 0),
+        parameters: compact_recovery_schema(&tool.parameters),
         output_schema: None,
     }
 }
 
-fn compact_recovery_schema(
-    schema: &codex_tools::JsonSchema,
-    depth: usize,
-) -> codex_tools::JsonSchema {
-    const MAX_RECOVERY_SCHEMA_DEPTH: usize = 4;
+fn compact_recovery_schema(schema: &codex_tools::JsonSchema) -> codex_tools::JsonSchema {
+    let mut compact = schema.clone();
+    strip_schema_descriptions(&mut compact);
+    compact
+}
 
-    let enum_values = schema.enum_values.as_ref().and_then(|values| {
-        (values.len() <= 16
-            && serde_json::to_vec(values).is_ok_and(|serialized| serialized.len() <= 1_024))
-        .then(|| values.clone())
-    });
-    if depth >= MAX_RECOVERY_SCHEMA_DEPTH {
-        return codex_tools::JsonSchema {
-            schema_type: schema.schema_type.clone(),
-            enum_values,
-            ..Default::default()
-        };
+fn strip_schema_descriptions(schema: &mut codex_tools::JsonSchema) {
+    schema.description = None;
+    if let Some(items) = schema.items.as_mut() {
+        strip_schema_descriptions(items);
     }
-
-    codex_tools::JsonSchema {
-        schema_type: schema.schema_type.clone(),
-        encrypted: schema.encrypted,
-        enum_values,
-        items: schema
-            .items
-            .as_ref()
-            .map(|item| Box::new(compact_recovery_schema(item, depth + 1))),
-        properties: schema.properties.as_ref().map(|properties| {
-            properties
-                .iter()
-                .map(|(name, property)| {
-                    (name.clone(), compact_recovery_schema(property, depth + 1))
-                })
-                .collect()
-        }),
-        required: schema.required.clone(),
-        additional_properties: schema.properties.as_ref().map(|_| true.into()),
-        any_of: schema.any_of.as_ref().map(|variants| {
-            variants
-                .iter()
-                .map(|variant| compact_recovery_schema(variant, depth + 1))
-                .collect()
-        }),
-        one_of: schema.one_of.as_ref().map(|variants| {
-            variants
-                .iter()
-                .map(|variant| compact_recovery_schema(variant, depth + 1))
-                .collect()
-        }),
-        all_of: schema.all_of.as_ref().map(|variants| {
-            variants
-                .iter()
-                .map(|variant| compact_recovery_schema(variant, depth + 1))
-                .collect()
-        }),
-        ..Default::default()
+    if let Some(properties) = schema.properties.as_mut() {
+        for property in properties.values_mut() {
+            strip_schema_descriptions(property);
+        }
+    }
+    if let Some(codex_tools::AdditionalProperties::Schema(additional)) =
+        schema.additional_properties.as_mut()
+    {
+        strip_schema_descriptions(additional);
+    }
+    for variants in [
+        schema.any_of.as_mut(),
+        schema.one_of.as_mut(),
+        schema.all_of.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for variant in variants {
+            strip_schema_descriptions(variant);
+        }
+    }
+    for definitions in [schema.defs.as_mut(), schema.definitions.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        for definition in definitions.values_mut() {
+            strip_schema_descriptions(definition);
+        }
     }
 }
 
@@ -986,11 +970,20 @@ mod tests {
         source_tool.parameters = codex_tools::JsonSchema::object(
             std::collections::BTreeMap::from([(
                 "title".to_string(),
-                codex_tools::JsonSchema::string(Some("Event title".to_string())),
+                codex_tools::JsonSchema {
+                    enum_values: Some(vec![serde_json::json!(2), serde_json::json!(4)]),
+                    minimum: Some(1.into()),
+                    maximum: Some(8.into()),
+                    exclusive_minimum: Some(0.into()),
+                    exclusive_maximum: Some(9.into()),
+                    multiple_of: Some(2.into()),
+                    ..codex_tools::JsonSchema::integer(Some("Event title".to_string()))
+                },
             )]),
             Some(vec!["title".to_string()]),
             Some(false.into()),
         );
+        let expected_parameters = compact_recovery_schema(&source_tool.parameters);
         let handler = ToolSearchHandler::new(vec![search_info]);
 
         let tools = handler
@@ -1005,6 +998,7 @@ mod tests {
         };
         assert_eq!(tool.name, "create_event");
         assert!(tool.description.contains("verbose schema details"));
+        assert_eq!(tool.parameters, expected_parameters);
         assert!(
             tool.parameters
                 .properties
@@ -1012,7 +1006,22 @@ mod tests {
                 .is_some_and(|properties| properties.contains_key("title"))
         );
         assert_eq!(tool.parameters.required, Some(vec!["title".to_string()]));
-        assert_eq!(tool.parameters.additional_properties, Some(true.into()));
+        assert_eq!(tool.parameters.additional_properties, Some(false.into()));
+        let title = tool
+            .parameters
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("title"))
+            .expect("title schema");
+        assert_eq!(title.minimum, Some(1.into()));
+        assert_eq!(title.maximum, Some(8.into()));
+        assert_eq!(
+            title.enum_values,
+            Some(vec![serde_json::json!(2), serde_json::json!(4)])
+        );
+        assert_eq!(title.exclusive_minimum, Some(0.into()));
+        assert_eq!(title.exclusive_maximum, Some(9.into()));
+        assert_eq!(title.multiple_of, Some(2.into()));
         assert_eq!(tools.omitted_result_count, 0);
         assert!(
             serde_json::to_vec(&tools.tools)

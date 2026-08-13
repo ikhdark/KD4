@@ -6,9 +6,13 @@ use codex_protocol::mcp::CallToolResult;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::plan_tool::ValidationRoute;
+use codex_protocol::plan_tool::ValidationRouteOrdering;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::user_input::UserInput;
+use codex_protocol::validation::ValidationResult;
+use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
@@ -33,19 +37,29 @@ use tokio::sync::Semaphore;
 use tracing::debug;
 use tracing::warn;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 6;
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 9;
+const FROZEN_TASK_EVIDENCE_V8_SCHEMA_VERSION: u32 = 8;
+const FROZEN_TASK_EVIDENCE_V7_SCHEMA_VERSION: u32 = 7;
+const FROZEN_TASK_EVIDENCE_V6_SCHEMA_VERSION: u32 = 6;
 const FROZEN_TASK_EVIDENCE_V5_SCHEMA_VERSION: u32 = 5;
 const FROZEN_TASK_EVIDENCE_V4_SCHEMA_VERSION: u32 = 4;
-pub(crate) const SOURCE_CLASSIFICATION_CONTRACT_VERSION: &str = "source-local-v1";
+pub(crate) const SOURCE_CLASSIFICATION_CONTRACT_VERSION: &str = "source-local-v2";
 pub(crate) const RELATIONSHIP_RESOLVER_CONTRACT_VERSION: &str = "relationship-v1";
 const TASK_EVIDENCE_COMPLETION_MODEL_VERSION: u32 = 3;
 const FILE_HASH_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_COMMAND_RECEIPTS: usize = 256;
 const MAX_EDIT_RECEIPTS: usize = 256;
 const MAX_EXTERNAL_EVIDENCE_RECEIPTS: usize = 256;
-#[cfg(test)]
 const MAX_COMPLETION_REVIEW_RECEIPTS: usize = 256;
 const MAX_ATTRIBUTED_WORKSPACE_EVENTS: usize = 256;
+const MAX_TERMINALIZATION_RECEIPTS: usize = 64;
+const MAX_OWNER_PACKETS: usize = 8;
+const MAX_OWNER_PACKET_REFERENCES: usize = 16;
+const MAX_OWNER_PACKET_SPANS: usize = 32;
+const MAX_TASK_CONTRACT_SOURCES: usize = 16;
+const MAX_PLANNING_AUDIT_ENTRIES: usize = 512;
+const MAX_OUTSIDE_PLAN_ACTIONS: usize = 256;
+const MAX_COMPLETION_CHECKPOINT_HUNK_BYTES: usize = 16 * 1024;
 const EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
 const EXTERNAL_EVIDENCE_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
 const EXTERNAL_EVIDENCE_ARTIFACT_HEADER: &str =
@@ -76,6 +90,434 @@ pub(crate) enum TaskEvidenceMode {
     Disabled,
     EvidenceOnly,
     Kd4Completion,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlanningTier {
+    #[default]
+    Focused,
+    Medium,
+    Complex,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ValidationDisposition {
+    Executable,
+    UnresolvedDiscoverable,
+    UnavailableBlocked,
+    #[default]
+    NotRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PlanningFactInput {
+    pub(crate) id: String,
+    pub(crate) value: String,
+    #[serde(default)]
+    pub(crate) source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReasonedPlanningRemoval {
+    pub(crate) id: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MutationObligationInput {
+    pub(crate) id: String,
+    pub(crate) description: String,
+    #[serde(default)]
+    pub(crate) paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExternalValidationRouteInput {
+    pub(crate) server_name: String,
+    pub(crate) tool_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PlanStepEvidenceInput {
+    pub(crate) step_id: String,
+    #[serde(default)]
+    pub(crate) source_owner: Option<String>,
+    #[serde(default)]
+    pub(crate) implementation_surfaces: Vec<String>,
+    #[serde(default)]
+    pub(crate) mutation_obligations: Vec<MutationObligationInput>,
+    #[serde(default)]
+    pub(crate) validation_disposition: Option<ValidationDisposition>,
+    #[serde(default)]
+    pub(crate) external_validation_route: Option<ExternalValidationRouteInput>,
+}
+
+/// Core-only planning input. The public PlanUpdate event continues to contain
+/// only the materialized `UpdatePlanArgs` projection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PlanningUpdateInput {
+    #[serde(default)]
+    pub(crate) explanation: Option<String>,
+    #[serde(default)]
+    pub(crate) tier: Option<PlanningTier>,
+    #[serde(default)]
+    pub(crate) facts: Vec<PlanningFactInput>,
+    #[serde(default)]
+    pub(crate) removed_facts: Vec<ReasonedPlanningRemoval>,
+    #[serde(default)]
+    pub(crate) removed_steps: Vec<ReasonedPlanningRemoval>,
+    #[serde(default)]
+    pub(crate) source_owner: Option<String>,
+    #[serde(default)]
+    pub(crate) implementation_surfaces: Vec<String>,
+    #[serde(default)]
+    pub(crate) acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub(crate) mutation_obligations: Vec<MutationObligationInput>,
+    #[serde(default)]
+    pub(crate) validation_disposition: Option<ValidationDisposition>,
+    #[serde(default)]
+    pub(crate) validation_route: Option<ValidationRoute>,
+    #[serde(default)]
+    pub(crate) external_validation_route: Option<ExternalValidationRouteInput>,
+    #[serde(default)]
+    pub(crate) step_evidence: Vec<PlanStepEvidenceInput>,
+    #[serde(default)]
+    pub(crate) plan: Vec<PlanItemArg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanUpdateEffect {
+    Initial,
+    StructuralRevision,
+    StatusOnly,
+    NoOp,
+}
+
+impl PlanUpdateEffect {
+    pub(crate) fn requests_generation(self) -> bool {
+        matches!(self, Self::Initial | Self::StructuralRevision)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanUpdateOutcome {
+    pub(crate) public_update: UpdatePlanArgs,
+    pub(crate) effect: PlanUpdateEffect,
+}
+
+/// Read-only, deterministic projection of the durable task ledger used by
+/// token-budget compaction.  This deliberately contains no timestamps and is
+/// not written back to task evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CanonicalTaskCheckpointSnapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) root_task_id: String,
+    pub(crate) source_thread_id: String,
+    pub(crate) evidence_revision: u64,
+    pub(crate) provenance: BTreeMap<String, String>,
+    pub(crate) requirements: Vec<CheckpointRequirement>,
+    pub(crate) prohibitions: Vec<CheckpointRequirement>,
+    pub(crate) unresolved_conflicts: Vec<CheckpointReference>,
+    pub(crate) decisions: Vec<CheckpointPlanState>,
+    pub(crate) owners: Vec<String>,
+    pub(crate) relevant_files: Vec<String>,
+    pub(crate) relevant_contracts: Vec<String>,
+    pub(crate) implementation_state: CheckpointImplementationState,
+    pub(crate) proof_ids: Vec<String>,
+    pub(crate) blockers: Vec<CheckpointReference>,
+    pub(crate) risks: Vec<CheckpointReference>,
+    pub(crate) immediate_action: Option<String>,
+    pub(crate) durable_artifact_references: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CheckpointRequirement {
+    pub(crate) id: String,
+    pub(crate) source_id: String,
+    pub(crate) source_content_hash: String,
+    pub(crate) exact_material: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct CheckpointReference {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CheckpointPlanState {
+    pub(crate) id: String,
+    pub(crate) status: String,
+    pub(crate) depends_on: Vec<String>,
+    pub(crate) acceptance_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CheckpointImplementationState {
+    pub(crate) evidence_epoch: u64,
+    pub(crate) host_mutation_revision: u64,
+    pub(crate) active_step_id: Option<String>,
+    pub(crate) implementation_identities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FinalProofStateV1 {
+    #[serde(default)]
+    pub(crate) basis: Option<CompletionCandidateBasisV1>,
+    #[serde(default)]
+    pub(crate) validation_plan: Option<ValidationPlanV1>,
+    #[serde(default)]
+    pub(crate) candidate: Option<CompletionCandidateV1>,
+    #[serde(default)]
+    pub(crate) diff_snapshot: Option<CandidateDiffSnapshotV1>,
+    #[serde(default)]
+    pub(crate) proof_observations: Vec<FinalProofObservationV1>,
+    #[serde(default)]
+    pub(crate) failure_fingerprint: Option<CompletionFailureFingerprintV1>,
+    #[serde(default)]
+    pub(crate) terminal_decision: Option<TaskCompletionGate>,
+    #[serde(default)]
+    pub(crate) reasons: Vec<CompletionReasonV1>,
+    #[serde(default)]
+    pub(crate) checkpoint: Option<CompletionCheckpointV1>,
+    #[serde(default)]
+    pub(crate) reviewer_infrastructure_memo: Option<ReviewerInfrastructureMemoV1>,
+    #[serde(default)]
+    pub(crate) finalization_memo: Option<CompletionFinalizationMemoV1>,
+    #[serde(default)]
+    pub(crate) repair_count_by_lineage: BTreeMap<String, u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompletionCandidateBasisV1 {
+    pub(crate) basis_id: String,
+    pub(crate) implementation_identity: String,
+    pub(crate) source_identity: String,
+    pub(crate) requirement_identity: String,
+    #[serde(default)]
+    pub(crate) task_evidence_epoch: u64,
+    #[serde(default)]
+    pub(crate) host_mutation_revision: u64,
+    pub(crate) workspace_epoch: u64,
+    pub(crate) workspace_manifest_identity: String,
+    pub(crate) environment_identity: String,
+    pub(crate) toolchain_identity: String,
+    pub(crate) features_identity: String,
+    pub(crate) configuration_identity: String,
+    #[serde(default)]
+    pub(crate) child_gate_state: Vec<String>,
+    pub(crate) reviewer_configuration_identity: String,
+    pub(crate) canonical_diff_identity: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ValidationPlanV1 {
+    pub(crate) plan_id: String,
+    pub(crate) basis_id: String,
+    #[serde(default)]
+    pub(crate) steps: Vec<ValidationPlanStepV1>,
+    pub(crate) ambiguous_or_unmappable: bool,
+    pub(crate) resolution_generation_used: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ValidationPlanStepV1 {
+    pub(crate) step_id: String,
+    pub(crate) obligation_id: String,
+    #[serde(default)]
+    pub(crate) argv: Vec<String>,
+    #[serde(default)]
+    pub(crate) covered_paths: Vec<String>,
+    #[serde(default)]
+    pub(crate) covered_contracts: Vec<String>,
+    pub(crate) timeout_ms: u64,
+    pub(crate) semantic_timeout: bool,
+    pub(crate) batch_group: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompletionCandidateV1 {
+    pub(crate) candidate_id: String,
+    pub(crate) basis_id: String,
+    pub(crate) validation_plan_id: String,
+    pub(crate) lineage_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CandidateDiffSnapshotV1 {
+    pub(crate) candidate_id: String,
+    pub(crate) diff_identity: String,
+    #[serde(default)]
+    pub(crate) head_identity: Option<String>,
+    #[serde(default)]
+    pub(crate) index_identity: Option<String>,
+    #[serde(default)]
+    pub(crate) worktree_identity: Option<String>,
+    #[serde(default)]
+    pub(crate) changed_paths: Vec<String>,
+    #[serde(default)]
+    pub(crate) bounded_hunks: String,
+    pub(crate) raw_artifact_digest: String,
+    #[serde(default)]
+    pub(crate) raw_artifact_ref: Option<String>,
+    pub(crate) workspace_epoch: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FinalProofObservationV1 {
+    pub(crate) candidate_id: String,
+    pub(crate) plan_step_id: String,
+    pub(crate) obligation_id: String,
+    pub(crate) successful: bool,
+    pub(crate) complete_identity: bool,
+    pub(crate) invocation_identity: String,
+    pub(crate) coverage_identity: String,
+    pub(crate) retained_output_digest: String,
+    #[serde(default)]
+    pub(crate) retained_output_ref: Option<String>,
+    pub(crate) evidence_revision: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompletionFailureFingerprintV1 {
+    pub(crate) fingerprint: String,
+    pub(crate) candidate_id: String,
+    pub(crate) correctness_evidence_revision: u64,
+    #[serde(default)]
+    pub(crate) missing_or_failed_obligation_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) child_gate_state: Vec<String>,
+    #[serde(default)]
+    pub(crate) reviewer_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompletionReasonV1 {
+    pub(crate) reason_code: String,
+    #[serde(default)]
+    pub(crate) obligation_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) path_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) contract_ids: Vec<String>,
+    pub(crate) first_epoch: u64,
+    pub(crate) last_epoch: u64,
+    pub(crate) occurrence_count: u64,
+    pub(crate) latest_occurrence: String,
+    #[serde(default)]
+    pub(crate) evidence_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompletionCheckpointV1 {
+    pub(crate) checkpoint_id: String,
+    pub(crate) candidate_id: String,
+    pub(crate) basis_id: String,
+    pub(crate) validation_plan_id: String,
+    pub(crate) diff_identity: String,
+    #[serde(default)]
+    pub(crate) requirements: Vec<CheckpointRequirementV1>,
+    #[serde(default)]
+    pub(crate) affected_surfaces: Vec<String>,
+    #[serde(default)]
+    pub(crate) changed_paths: Vec<String>,
+    #[serde(default)]
+    pub(crate) bounded_hunks: String,
+    #[serde(default)]
+    pub(crate) proof_receipts: Vec<CheckpointProofReceiptV1>,
+    #[serde(default)]
+    pub(crate) unresolved_blockers: Vec<String>,
+    #[serde(default)]
+    pub(crate) unresolved_risks: Vec<String>,
+    #[serde(default)]
+    pub(crate) child_gate_state: Vec<String>,
+    #[serde(default)]
+    pub(crate) evidence_artifact_references: Vec<String>,
+    pub(crate) estimated_tokens: u64,
+}
+
+impl CompletionCheckpointV1 {
+    pub(crate) fn canonical_payload(&self) -> Option<String> {
+        serde_json::to_string(self).ok()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckpointRequirementV1 {
+    pub(crate) requirement_id: String,
+    pub(crate) source_id: String,
+    pub(crate) exact_text: String,
+    pub(crate) status: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckpointProofReceiptV1 {
+    pub(crate) obligation_id: String,
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) evidence_ref: Option<String>,
+    pub(crate) evidence_digest: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReviewerInfrastructureMemoV1 {
+    pub(crate) identity: String,
+    pub(crate) candidate_id: String,
+    pub(crate) dossier_id: String,
+    pub(crate) reviewer_configuration_identity: String,
+    pub(crate) infrastructure_condition_identity: String,
+    pub(crate) outcome: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompletionFinalizationMemoV1 {
+    pub(crate) identity: String,
+    pub(crate) candidate_id: String,
+    pub(crate) checkpoint_id: String,
+    pub(crate) final_message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FinalProofSealInputV1 {
+    pub(crate) implementation_identity: String,
+    pub(crate) source_identity: String,
+    pub(crate) requirement_identity: String,
+    pub(crate) workspace_epoch: u64,
+    pub(crate) workspace_manifest_identity: String,
+    pub(crate) environment_identity: String,
+    pub(crate) toolchain_identity: String,
+    pub(crate) features_identity: String,
+    pub(crate) configuration_identity: String,
+    pub(crate) child_gate_state: Vec<String>,
+    pub(crate) reviewer_configuration_identity: String,
+    pub(crate) diff_snapshot: CandidateDiffSnapshotV1,
+    pub(crate) checkpoint_token_budget: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FinalProofIdentitySnapshotV1 {
+    pub(crate) implementation_identity: String,
+    pub(crate) source_identity: String,
+    pub(crate) requirement_identity: String,
+    pub(crate) task_evidence_epoch: u64,
+    pub(crate) host_mutation_revision: u64,
+    pub(crate) changed_paths: Vec<String>,
+    pub(crate) workspace_path_snapshot_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FinalProofSealResultV1 {
+    Sealed {
+        candidate: CompletionCandidateV1,
+        validation_plan: ValidationPlanV1,
+        checkpoint: Box<CompletionCheckpointV1>,
+        gate: TaskCompletionGate,
+    },
+    Memoized(TaskCompletionGate),
+    PreflightFailed(TaskCompletionGate),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,8 +674,14 @@ struct TaskEvidenceDocument {
     start: TaskStartState,
     evidence_epoch: u64,
     last_mutation_at: Option<String>,
+    #[serde(default)]
+    planning: PlanningEvidenceState,
     plan: Vec<EvidencePlanStep>,
     active_step_id: Option<String>,
+    /// An explicit model-authored implementation boundary. This is separate
+    /// from edit-driven status promotion and is invalidated by relevant edits.
+    #[serde(default)]
+    batch_acknowledgement: Option<ImplementationBatchAcknowledgement>,
     edit_intents: Vec<EditIntent>,
     edit_receipts: Vec<EditReceipt>,
     command_receipts: Vec<CommandReceipt>,
@@ -259,7 +707,397 @@ struct TaskEvidenceDocument {
     completion_review_v2: Option<CompletionReviewLedgerV2>,
     #[serde(default, deserialize_with = "deserialize_source_classification_cache")]
     source_classification_cache: Vec<SourceClassificationCacheEntry>,
+    #[serde(default)]
+    terminalization_receipts: Vec<TerminalizationReceipt>,
+    #[serde(default = "initial_contract_epoch")]
+    contract_epoch: u64,
+    #[serde(default)]
+    task_contract_sources: Vec<TaskContractSource>,
+    #[serde(default)]
+    owner_packets: Vec<OwnerPacketProjection>,
+    #[serde(default)]
+    owner_packet_metrics: OwnerPacketMetrics,
+    #[serde(default)]
+    final_proof: FinalProofStateV1,
     completion: Option<TaskCompletionGate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TaskContractSource {
+    message_id: String,
+    content_sha256: String,
+    classification: String,
+    contract_epoch: u64,
+    recorded_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OwnerPacketStatus {
+    #[default]
+    Collecting,
+    Ready,
+    Mutated,
+    AwaitingFormat,
+    AwaitingProof,
+    Closed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OwnerRelationshipDisposition {
+    MustChange,
+    MustRemainCompatible,
+    TestOrProofOnly,
+    Irrelevant,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OwnerObligationStatus {
+    #[default]
+    NotRequired,
+    Pending,
+    Passed,
+    Failed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OwnerSourceSpanState {
+    Current,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketRegion {
+    path: String,
+    symbol: Option<String>,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketSourceIdentity {
+    path: String,
+    file_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketSourceSpan {
+    section_id: String,
+    path: String,
+    start_line: usize,
+    end_line: usize,
+    file_sha256: String,
+    span_sha256: String,
+    state: OwnerSourceSpanState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketRelationship {
+    path: String,
+    role: String,
+    start_line: usize,
+    end_line: usize,
+    disposition: OwnerRelationshipDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerAcceptanceMapping {
+    criterion_id: String,
+    region_path: String,
+    proof_route_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketCommandRoute {
+    id: String,
+    cwd: String,
+    argv: Vec<String>,
+    role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketGeneratedOwnership {
+    generated_path: String,
+    authoritative_source_path: String,
+    evidence_kind: String,
+    requires_synchronized_representations: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketCounters {
+    edits: u64,
+    same_region_revisits: u64,
+    caller_repairs: u64,
+    acceptance_repairs: u64,
+    lifecycle_repairs: u64,
+    formatting_only_repairs: u64,
+    other_repairs: u64,
+    identity_refreshes: u64,
+    interval_invalidations: u64,
+    span_refreshes: u64,
+    self_owned_cas_failures: u64,
+    external_cas_failures: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketMetrics {
+    packets_created: u64,
+    files_observed: u64,
+    regions_observed: u64,
+    callers_observed: u64,
+    acceptance_mappings_observed: u64,
+    edits: u64,
+    same_region_revisits: u64,
+    caller_repairs: u64,
+    acceptance_repairs: u64,
+    lifecycle_repairs: u64,
+    formatting_only_repairs: u64,
+    other_repairs: u64,
+    identity_refreshes: u64,
+    interval_invalidations: u64,
+    span_refreshes: u64,
+    self_owned_cas_failures: u64,
+    external_cas_failures: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CoreOwnerPacketSeed {
+    seed_id: String,
+    request_identity: String,
+    source_snapshot_identity: String,
+    owner_id: String,
+    owner_roots: Vec<String>,
+    target_regions: Vec<CoreOwnerPacketTargetRegion>,
+    supporting_identities: Vec<codex_file_search::task_locator::SupportingRead>,
+    observed_spans: Vec<CoreOwnerPacketObservedSpan>,
+    relationships: Vec<codex_file_search::task_locator::LocateTaskSourceRelationship>,
+    contracts: Vec<codex_file_search::task_locator::LocateTaskLocatedPath>,
+    tests: Vec<codex_file_search::task_locator::LocateTaskLocatedPath>,
+    validation_routes: Vec<codex_file_search::task_locator::LocateTaskValidationRoute>,
+    lifecycle_obligations: Vec<String>,
+    generated_source_ownership: Option<CoreOwnerPacketGeneratedOwnership>,
+    multi_owner_atomic_evidence: bool,
+    unresolved_source_obligations: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CoreOwnerPacketTargetRegion {
+    path: String,
+    symbol: Option<String>,
+    span: Option<codex_file_search::task_locator::ExactSpan>,
+}
+
+#[derive(Debug, Clone)]
+struct CoreOwnerPacketObservedSpan {
+    section_id: String,
+    path: String,
+    span: Option<codex_file_search::task_locator::ExactSpan>,
+    file_content_hash: Option<String>,
+    span_content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CoreOwnerPacketGeneratedOwnership {
+    generated_path: String,
+    authoritative_source_path: String,
+    evidence_kind: String,
+    requires_synchronized_representations: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerPacketProjection {
+    packet_id: String,
+    seed_id: String,
+    contract_epoch: u64,
+    request_identity: String,
+    source_snapshot_identity: String,
+    owner_id: String,
+    owner_roots: Vec<String>,
+    target_regions: Vec<OwnerPacketRegion>,
+    #[serde(default)]
+    last_mutation_regions: Vec<OwnerPacketChangeRegion>,
+    source_identities: Vec<OwnerPacketSourceIdentity>,
+    source_spans: Vec<OwnerPacketSourceSpan>,
+    relationships: Vec<OwnerPacketRelationship>,
+    contract_paths: Vec<String>,
+    test_paths: Vec<String>,
+    acceptance_mappings: Vec<OwnerAcceptanceMapping>,
+    lifecycle_obligations: Vec<String>,
+    validation_route: Option<OwnerPacketCommandRoute>,
+    formatter_route: Option<OwnerPacketCommandRoute>,
+    proof_status: OwnerObligationStatus,
+    format_status: OwnerObligationStatus,
+    generated_source_ownership: Option<OwnerPacketGeneratedOwnership>,
+    multi_owner_atomic_evidence: bool,
+    status: OwnerPacketStatus,
+    missing_obligations: Vec<String>,
+    edit_call_ids: Vec<String>,
+    edit_receipt_ids: Vec<String>,
+    command_receipt_ids: Vec<String>,
+    counters: OwnerPacketCounters,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct OwnerPacketPreview {
+    pub(crate) packet_id: String,
+    pub(crate) contract_epoch: u64,
+    pub(crate) owner_id: String,
+    pub(crate) status: String,
+    pub(crate) target_regions: Vec<OwnerPacketPreviewRegion>,
+    pub(crate) caller_dispositions: Vec<OwnerPacketPreviewCaller>,
+    pub(crate) acceptance_ids: Vec<String>,
+    pub(crate) lifecycle_obligations: Vec<String>,
+    pub(crate) validation_route_id: Option<String>,
+    pub(crate) formatter_route_id: Option<String>,
+    pub(crate) generated_source_ownership_enforced: bool,
+    pub(crate) missing_obligations: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OwnerPacketSeedOutcome {
+    pub(crate) preview: OwnerPacketPreview,
+    pub(crate) created: bool,
+    pub(crate) files: usize,
+    pub(crate) regions: usize,
+    pub(crate) callers: usize,
+    pub(crate) acceptance_mappings: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OwnerPacketTransitionMetrics {
+    pub(crate) edits: u64,
+    pub(crate) same_region_revisits: u64,
+    pub(crate) caller_repairs: u64,
+    pub(crate) acceptance_repairs: u64,
+    pub(crate) lifecycle_repairs: u64,
+    pub(crate) formatting_only_repairs: u64,
+    pub(crate) other_repairs: u64,
+    pub(crate) identity_refreshes: u64,
+    pub(crate) interval_invalidations: u64,
+    pub(crate) span_refreshes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct OwnerPacketPreviewRegion {
+    pub(crate) path: String,
+    pub(crate) start_line: Option<usize>,
+    pub(crate) end_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct OwnerPacketPreviewCaller {
+    pub(crate) path: String,
+    pub(crate) disposition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OwnerPacketChangeRegion {
+    pub(crate) path: String,
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OwnerPacketBinding {
+    pub(crate) packet_id: String,
+    pub(crate) owner_id: String,
+    pub(crate) regions: Vec<OwnerPacketChangeRegion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct OwnerPacketNotReady {
+    pub(crate) kind: &'static str,
+    pub(crate) unresolved_obligations: Vec<String>,
+    pub(crate) expected_evidence_workflow: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OwnerPacketPostMutationPath {
+    pub(crate) path: String,
+    pub(crate) existed: bool,
+    pub(crate) file_sha256: Option<String>,
+    pub(crate) content: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalDeliveryState {
+    #[default]
+    NotAttempted,
+    Claimed,
+    Delivered,
+    DeliveryFailed,
+}
+
+impl TerminalDeliveryState {
+    pub(crate) fn is_authoritative_claim(self) -> bool {
+        !matches!(self, Self::NotAttempted)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalRecoveryState {
+    #[default]
+    None,
+    Pending,
+    Recovered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TerminalizationReceipt {
+    terminal_identity: String,
+    durable_outcome: String,
+    delivery_state: TerminalDeliveryState,
+    active_turn_detached: bool,
+    terminal_interaction_released: bool,
+    #[serde(default)]
+    deadline_exhausted_phase: Option<String>,
+    mutation_quiescent: bool,
+    durable_success_established: bool,
+    #[serde(default)]
+    retained_ownership: Vec<String>,
+    #[serde(default)]
+    recovery_state: TerminalRecoveryState,
+    #[serde(default)]
+    phase_timings_ns: BTreeMap<String, u64>,
+    recorded_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalDecisionClaim {
+    pub(crate) terminal_identity: String,
+    pub(crate) durable_outcome: String,
+    pub(crate) deadline_exhausted_phase: Option<String>,
+    pub(crate) mutation_quiescent: bool,
+    pub(crate) durable_success_established: bool,
+    pub(crate) retained_ownership: Vec<String>,
+    pub(crate) phase_timings_ns: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalInteractionUpdate {
+    pub(crate) terminal_identity: String,
+    pub(crate) delivery_state: TerminalDeliveryState,
+    pub(crate) active_turn_detached: bool,
+    pub(crate) terminal_interaction_released: bool,
+    pub(crate) recovery_state: TerminalRecoveryState,
+    pub(crate) phase_timings_ns: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalClaimResult {
+    Claimed,
+    AlreadyClaimed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,7 +1123,13 @@ struct CompletionReviewLedgerV2 {
     #[serde(default)]
     attributed_workspace_events: Vec<TaskAttributedWorkspaceEvent>,
     #[serde(default)]
+    workspace_proof_scope_identity: String,
+    #[serde(default)]
+    workspace_event_history_complete: bool,
+    #[serde(default)]
     source_capture_failed: bool,
+    #[serde(default)]
+    obligation: CompletionReviewObligationState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +1138,32 @@ struct TaskAttributedWorkspaceEvent {
     epoch: u64,
     actor_id: String,
     paths: Vec<String>,
+    #[serde(default)]
+    contracts: Vec<String>,
+    #[serde(default)]
+    actor_kind: Option<codex_agent_task_store::WorkspaceActorKind>,
+    #[serde(default)]
+    attribution_confidence: Option<codex_agent_task_store::AttributionConfidence>,
+    #[serde(default)]
+    relevance: WorkspaceEventRelevance,
+    #[serde(default)]
+    classified_scope_identity: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceEventRelevance {
+    Relevant,
+    Unrelated,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceProofScope {
+    identity: String,
+    paths: BTreeSet<String>,
+    contracts: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +1232,8 @@ pub(crate) enum LocalSemanticCueKind {
     ReplacementIntent,
     WithdrawalIntent,
     RelationshipOnlyContext,
+    MandatoryCompletionReview,
+    SupplementalCompletionReview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -690,6 +1562,12 @@ pub(crate) enum CompletionReviewAttemptKind {
     TerminalClosure,
 }
 
+impl CompletionReviewAttemptKind {
+    #[cfg(test)]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Initial: Self = Self::InitialReview;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CompletionReviewFindingReceipt {
     pub(crate) finding_id: String,
@@ -892,6 +1770,10 @@ struct CompletionReviewReceiptV2 {
     dossier_snapshot_id: String,
     user_source_ledger_hash: String,
     requirement_manifest_hash: String,
+    #[serde(default)]
+    attempt_identity: String,
+    #[serde(default)]
+    reviewer_contract_hash: String,
     findings: Vec<CompletionReviewFindingReceipt>,
     dispositions: Vec<CompletionReviewDispositionReceipt>,
     #[serde(default)]
@@ -913,10 +1795,52 @@ struct CompletionReviewReceiptV2 {
     candidate_implementation_identity: Option<String>,
     #[serde(default)]
     rereview_audit_hash: Option<String>,
+    #[serde(default)]
+    requirement: CompletionReviewRequirement,
+    #[serde(default)]
+    disposition: CompletionReviewDisposition,
+    #[serde(default)]
+    attempted_outcome: Option<CompletionReviewAttemptedOutcome>,
     infrastructure_outcome: String,
     review_clean: bool,
     terminal_outcome: Option<String>,
     recorded_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionReviewRequirement {
+    Disabled,
+    #[default]
+    Supplemental,
+    Mandatory,
+}
+
+impl CompletionReviewRequirement {
+    fn from_obligation_mode(mode: &str) -> Self {
+        match mode {
+            "disabled" => Self::Disabled,
+            "mandatory" => Self::Mandatory,
+            _ => Self::Supplemental,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionReviewDisposition {
+    NotApplicable,
+    PreflightSkipped,
+    #[default]
+    Attempted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionReviewAttemptedOutcome {
+    Clean,
+    ActionableFindings,
+    InfrastructureFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -944,6 +1868,79 @@ pub(crate) struct CompletionReviewAttemptInput {
     pub(crate) infrastructure_outcome: String,
     pub(crate) review_clean: bool,
     pub(crate) terminal_outcome: Option<String>,
+    pub(crate) attempt_identity: String,
+    pub(crate) reviewer_contract_hash: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct CompletionReviewObligationState {
+    mode: String,
+    requirement_ids: Vec<String>,
+    obligation_hash: String,
+    required_attempt_identity: Option<String>,
+    satisfied_attempt_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CompletionReviewObligationInput {
+    pub(crate) mode: String,
+    pub(crate) requirement_ids: Vec<String>,
+    pub(crate) obligation_hash: String,
+    pub(crate) required_attempt_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PriorCompletionReviewAttempt {
+    Clean,
+    Actionable,
+    DeterministicInfrastructure,
+}
+
+fn completion_review_attempt_dimensions(
+    attempt_kind: CompletionReviewAttemptKind,
+    infrastructure_outcome: &str,
+    review_clean: bool,
+    has_actionable_result: bool,
+) -> (
+    CompletionReviewDisposition,
+    Option<CompletionReviewAttemptedOutcome>,
+) {
+    if matches!(
+        attempt_kind,
+        CompletionReviewAttemptKind::CorrectionEvidence
+            | CompletionReviewAttemptKind::TerminalClosure
+    ) {
+        return (CompletionReviewDisposition::NotApplicable, None);
+    }
+    if matches!(
+        infrastructure_outcome,
+        "capacity"
+            | "spawn_model"
+            | "oversized_request"
+            | "persistence"
+            | "input_unavailable_or_truncated"
+            | "user_source_drift"
+            | "repeated_or_invalid_manifest_gap"
+            | "invalid_or_incomplete_dossier"
+            | "unsupported_reviewer_configuration"
+            | "self_review_prohibited"
+            | "candidate_changed"
+    ) {
+        return (CompletionReviewDisposition::PreflightSkipped, None);
+    }
+    let attempted_outcome = if infrastructure_outcome != "ok" {
+        CompletionReviewAttemptedOutcome::InfrastructureFailure
+    } else if has_actionable_result {
+        CompletionReviewAttemptedOutcome::ActionableFindings
+    } else if review_clean {
+        CompletionReviewAttemptedOutcome::Clean
+    } else {
+        CompletionReviewAttemptedOutcome::InfrastructureFailure
+    };
+    (
+        CompletionReviewDisposition::Attempted,
+        Some(attempted_outcome),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1005,7 +2002,7 @@ pub(crate) struct CompletionReviewDossier {
 
 /// Validated structured facts that the completion-review host may use to select
 /// applicable review lenses. Free-form review material is intentionally absent.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct ReviewLensSelectionFacts {
     pub(crate) risk_hints: Vec<String>,
     pub(crate) task_mutation_paths: Vec<String>,
@@ -1036,6 +2033,8 @@ struct TaskStartState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct EvidencePlanStep {
     id: String,
+    #[serde(default = "initial_plan_step_revision")]
+    revision: u64,
     step: String,
     status: StepStatus,
     depends_on: Vec<String>,
@@ -1044,13 +2043,150 @@ struct EvidencePlanStep {
     generated_artifacts: Vec<String>,
     risks: Vec<String>,
     requires_desktop_activation: bool,
+    #[serde(default)]
+    validation_route: Option<ValidationRoute>,
+    #[serde(default)]
+    external_validation_route: Option<ExternalValidationRouteInput>,
+    #[serde(default)]
+    validation_disposition: ValidationDisposition,
+    #[serde(default)]
+    source_owner: Option<String>,
+    #[serde(default)]
+    implementation_surfaces: Vec<String>,
+    #[serde(default)]
+    mutation_obligations: Vec<MutationObligationState>,
+    #[serde(default)]
+    validation_receipt_id: Option<String>,
     edit_paths: BTreeSet<String>,
+}
+
+const fn initial_plan_step_revision() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PlanningEvidenceState {
+    tier: PlanningTier,
+    #[serde(default)]
+    material_revision: u64,
+    #[serde(default)]
+    facts: BTreeMap<String, PlanningFactInput>,
+    #[serde(default)]
+    work_unit: Option<FocusedWorkUnit>,
+    #[serde(default)]
+    audit_history: Vec<PlanningAuditEntry>,
+    #[serde(default)]
+    outside_plan_actions: Vec<OutsidePlanAction>,
+    #[serde(default)]
+    counters: PlanningEvidenceCounters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FocusedWorkUnit {
+    id: String,
+    source_owner: Option<String>,
+    implementation_surfaces: Vec<String>,
+    acceptance_criteria: Vec<String>,
+    mutation_obligations: Vec<MutationObligationState>,
+    validation_disposition: ValidationDisposition,
+    validation_route: Option<ValidationRoute>,
+    external_validation_route: Option<ExternalValidationRouteInput>,
+    validation_receipt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MutationObligationState {
+    id: String,
+    description: String,
+    paths: Vec<String>,
+    #[serde(default)]
+    satisfied_paths: BTreeSet<String>,
+    #[serde(default)]
+    satisfied: bool,
+}
+
+impl From<MutationObligationInput> for MutationObligationState {
+    fn from(input: MutationObligationInput) -> Self {
+        Self {
+            id: input.id,
+            description: input.description,
+            paths: input
+                .paths
+                .into_iter()
+                .map(|path| normalize_slashes(&path))
+                .collect(),
+            satisfied_paths: BTreeSet::new(),
+            satisfied: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PlanningAuditEntry {
+    kind: String,
+    id: String,
+    reason: String,
+    revision: u64,
+    recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OutsidePlanAction {
+    kind: String,
+    action_id: String,
+    recorded_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PlanningEvidenceCounters {
+    initial_updates: u64,
+    structural_revisions: u64,
+    status_only_updates: u64,
+    no_op_updates: u64,
+    step_revisions: u64,
+    step_removals: u64,
+    fact_removals: u64,
+    outside_plan_actions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActionAttributionKind {
+    FocusedWorkUnit,
+    PlannedStep,
+    OutsidePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ImplementationBatchAcknowledgement {
+    step_id: String,
+    implementation_revision: u64,
+    acknowledged_at: String,
+    /// Exact covered-file snapshot at the boundary. Empty coverage is
+    /// repository-wide and relies on the authoritative repository revision and
+    /// active-mutation checks at launch.
+    covered_manifest: Vec<FileHashSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoValidationCandidate {
+    pub(crate) step_id: String,
+    pub(crate) route: ValidationRoute,
+    pub(crate) implementation_revision: u64,
+    pub(crate) implementation_identity: String,
+    pub(crate) repository_wide: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EditIntent {
     call_id: String,
     step_id: Option<String>,
+    #[serde(default)]
+    step_revision: Option<u64>,
+    #[serde(default)]
+    work_unit_id: Option<String>,
+    #[serde(default)]
+    attribution: Option<ActionAttributionKind>,
     started_at: String,
     completed_at: Option<String>,
     outcome: Option<String>,
@@ -1066,6 +2202,12 @@ struct EditReceipt {
     id: String,
     call_id: String,
     step_id: Option<String>,
+    #[serde(default)]
+    step_revision: Option<u64>,
+    #[serde(default)]
+    work_unit_id: Option<String>,
+    #[serde(default)]
+    attribution: Option<ActionAttributionKind>,
     recorded_at: String,
     epoch: u64,
     outcome: String,
@@ -1104,6 +2246,12 @@ struct CommandReceipt {
     recorded_at: String,
     epoch: u64,
     step_id: Option<String>,
+    #[serde(default)]
+    step_revision: Option<u64>,
+    #[serde(default)]
+    work_unit_id: Option<String>,
+    #[serde(default)]
+    attribution: Option<ActionAttributionKind>,
     command: Vec<String>,
     cwd: String,
     exit_code: i32,
@@ -1120,6 +2268,8 @@ struct CommandReceipt {
     requirement_manifest_hash: Option<String>,
     #[serde(default)]
     implementation_identity_hash: Option<String>,
+    #[serde(default)]
+    validation_result: Option<ValidationResult>,
     #[serde(default)]
     source_thread_id: Option<String>,
     #[serde(default)]
@@ -1149,6 +2299,12 @@ struct ExternalEvidenceReceipt {
     recorded_at: String,
     task_epoch: u64,
     step_id: Option<String>,
+    #[serde(default)]
+    step_revision: Option<u64>,
+    #[serde(default)]
+    work_unit_id: Option<String>,
+    #[serde(default)]
+    attribution: Option<ActionAttributionKind>,
     workspace_root_fingerprint: String,
     host_mutation_revision: Option<u64>,
     #[serde(default)]
@@ -1173,6 +2329,32 @@ struct CompletionReviewAuditReceipt {
     failure_category: Option<String>,
     finding_summary: Vec<String>,
     repair_injected: bool,
+    #[serde(default)]
+    measurements: CompletionReviewAuditMeasurements,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompletionReviewAuditMeasurements {
+    pub(crate) obligation_mode: String,
+    pub(crate) obligation_hash: String,
+    pub(crate) admission_result: String,
+    pub(crate) preflight_result: String,
+    pub(crate) attempt_identity: String,
+    pub(crate) reviewer_contract_hash: String,
+    pub(crate) failure_class: String,
+    pub(crate) retry_disposition: String,
+    pub(crate) elapsed_millis: u64,
+    pub(crate) logical_generations: u64,
+    pub(crate) physical_requests: u64,
+    pub(crate) tool_calls: u64,
+    pub(crate) findings: u64,
+    pub(crate) actionable_findings: u64,
+    pub(crate) repair_count: u64,
+    pub(crate) rereview_count: u64,
+    pub(crate) resulting_changes: bool,
+    pub(crate) mandatory_proof_state: String,
+    pub(crate) review_infrastructure_caused_partial: bool,
+    pub(crate) validation_failures_prevented: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1250,11 +2432,279 @@ fn new_completion_review_ledger(root_task_id: &str) -> CompletionReviewLedgerV2 
         workspace_event_baseline_epoch: 0,
         typed_assignment_baseline: BTreeSet::new(),
         attributed_workspace_events: Vec::new(),
+        workspace_proof_scope_identity: String::new(),
+        workspace_event_history_complete: false,
         source_capture_failed: false,
+        obligation: CompletionReviewObligationState::default(),
     }
 }
 
 impl TaskEvidenceLedger {
+    /// Produce canonical checkpoint state strictly from accepted structured
+    /// records.  In particular, this never classifies or summarizes user prose,
+    /// tool output, or reasoning, and it never mutates the evidence ledger.
+    pub(crate) async fn canonical_checkpoint_snapshot(
+        &self,
+    ) -> Option<CanonicalTaskCheckpointSnapshot> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
+        let document = self.document.lock().await;
+        let document = document.as_ref()?;
+        let completion = document.completion_review_v2.as_ref();
+
+        let root_task_id = completion
+            .map(|ledger| ledger.root_task_id.clone())
+            .unwrap_or_else(|| document.thread_id.clone());
+        let mut requirements = completion
+            .and_then(active_manifest)
+            .map(|manifest| {
+                manifest
+                    .requirements
+                    .iter()
+                    .filter(|requirement| requirement.status == RequirementStatus::Active)
+                    .map(|requirement| CheckpointRequirement {
+                        id: requirement.requirement_id.clone(),
+                        source_id: requirement.source_id.clone(),
+                        source_content_hash: requirement.source_content_hash.clone(),
+                        exact_material: requirement.exact_material.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        requirements.sort_by(|left, right| left.id.cmp(&right.id));
+
+        // There is no typed prohibition owner in TaskEvidence today.  Do not
+        // infer one by interpreting accepted requirement text.
+        let prohibitions = Vec::new();
+
+        let mut unresolved_conflicts = completion
+            .map(|ledger| {
+                active_source_mappings(ledger)
+                    .into_iter()
+                    .filter_map(|(source_id, mapping)| match mapping {
+                        SourceMapping::PendingClassification => Some(CheckpointReference {
+                            id: source_id,
+                            kind: "pending_source_classification".to_string(),
+                        }),
+                        SourceMapping::UnavailableOrTruncated => Some(CheckpointReference {
+                            id: source_id,
+                            kind: "source_unavailable_or_truncated".to_string(),
+                        }),
+                        SourceMapping::RequirementBearing { .. }
+                        | SourceMapping::NonRequirement { .. }
+                        | SourceMapping::SupersededContext { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        unresolved_conflicts.sort();
+
+        let mut decisions = document
+            .plan
+            .iter()
+            .map(|step| CheckpointPlanState {
+                id: step.id.clone(),
+                status: checkpoint_step_status(&step.status).to_string(),
+                depends_on: step.depends_on.clone(),
+                acceptance_criteria: step.acceptance_criteria.clone(),
+            })
+            .collect::<Vec<_>>();
+        decisions.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut owners = BTreeSet::new();
+        for (thread_id, agent_path) in document
+            .edit_receipts
+            .iter()
+            .map(|receipt| (&receipt.source_thread_id, &receipt.source_agent_path))
+            .chain(
+                document
+                    .command_receipts
+                    .iter()
+                    .map(|receipt| (&receipt.source_thread_id, &receipt.source_agent_path)),
+            )
+            .chain(
+                document
+                    .external_evidence
+                    .iter()
+                    .map(|receipt| (&receipt.source_thread_id, &receipt.source_agent_path)),
+            )
+        {
+            if let Some(thread_id) = thread_id.as_deref() {
+                owners.insert(format!("thread:{thread_id}"));
+            }
+            if let Some(agent_path) = agent_path.as_deref() {
+                owners.insert(format!("agent:{agent_path}"));
+            }
+        }
+
+        let mut relevant_files = BTreeSet::new();
+        relevant_files.extend(document.latest_file_hashes.keys().cloned());
+        relevant_files.extend(document.latest_generated_artifact_hashes.keys().cloned());
+        for step in &document.plan {
+            relevant_files.extend(step.edit_paths.iter().cloned());
+            relevant_files.extend(step.runtime_paths.iter().cloned());
+            relevant_files.extend(step.generated_artifacts.iter().cloned());
+        }
+
+        let mut relevant_contracts = document
+            .plan
+            .iter()
+            .flat_map(|step| step.acceptance_criteria.iter().cloned())
+            .collect::<Vec<_>>();
+        relevant_contracts.sort();
+        relevant_contracts.dedup();
+
+        let mut implementation_identities = document
+            .command_receipts
+            .iter()
+            .filter(|receipt| receipt.epoch == document.evidence_epoch)
+            .filter_map(|receipt| receipt.implementation_identity_hash.clone())
+            .collect::<Vec<_>>();
+        implementation_identities.sort();
+        implementation_identities.dedup();
+
+        let mut proof_ids = document
+            .command_receipts
+            .iter()
+            .filter(|receipt| receipt.epoch == document.evidence_epoch)
+            .map(|receipt| receipt.id.clone())
+            .chain(
+                document
+                    .external_evidence
+                    .iter()
+                    .filter(|receipt| receipt.task_epoch == document.evidence_epoch)
+                    .map(|receipt| receipt.id.clone()),
+            )
+            .collect::<Vec<_>>();
+        proof_ids.sort();
+        proof_ids.dedup();
+
+        let mut blockers = document
+            .risks
+            .iter()
+            .filter(|risk| risk.blocking && !risk.resolved)
+            .map(|risk| CheckpointReference {
+                id: risk.id.clone(),
+                kind: risk.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        blockers.sort();
+        let mut risks = document
+            .risks
+            .iter()
+            .filter(|risk| !risk.resolved)
+            .map(|risk| CheckpointReference {
+                id: risk.id.clone(),
+                kind: risk.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        risks.sort();
+
+        let immediate_action = document.active_step_id.clone().or_else(|| {
+            document
+                .plan
+                .iter()
+                .find(|step| matches!(step.status, StepStatus::InProgress | StepStatus::Pending))
+                .map(|step| step.id.clone())
+        });
+
+        let mut durable_artifact_references = document
+            .external_evidence
+            .iter()
+            .filter_map(|receipt| receipt.payload_artifact_id.clone())
+            .chain(
+                document
+                    .generated_artifact_requirements
+                    .iter()
+                    .map(|requirement| requirement.id.clone()),
+            )
+            .collect::<Vec<_>>();
+        durable_artifact_references.sort();
+        durable_artifact_references.dedup();
+
+        let provenance = BTreeMap::from([
+            (
+                "requirements".to_string(),
+                "accepted_structured_task_contract".to_string(),
+            ),
+            (
+                "prohibitions".to_string(),
+                "accepted_structured_task_contract".to_string(),
+            ),
+            (
+                "unresolved_conflicts".to_string(),
+                "accepted_structured_task_contract".to_string(),
+            ),
+            (
+                "decisions".to_string(),
+                "active_structured_plan_task_state".to_string(),
+            ),
+            (
+                "owners".to_string(),
+                "collaboration_and_task_evidence_records".to_string(),
+            ),
+            (
+                "relevant_files".to_string(),
+                "collaboration_and_task_evidence_records".to_string(),
+            ),
+            (
+                "relevant_contracts".to_string(),
+                "active_structured_plan_task_state".to_string(),
+            ),
+            (
+                "implementation_state".to_string(),
+                "current_implementation_identity_and_receipts".to_string(),
+            ),
+            (
+                "proof_ids".to_string(),
+                "current_implementation_identity_and_receipts".to_string(),
+            ),
+            (
+                "blockers".to_string(),
+                "explicit_structured_records".to_string(),
+            ),
+            (
+                "risks".to_string(),
+                "explicit_structured_records".to_string(),
+            ),
+            (
+                "immediate_action".to_string(),
+                "active_structured_plan_task_state".to_string(),
+            ),
+            (
+                "durable_artifact_references".to_string(),
+                "existing_durable_ids_only".to_string(),
+            ),
+        ]);
+
+        Some(CanonicalTaskCheckpointSnapshot {
+            schema_version: 1,
+            root_task_id,
+            source_thread_id: document.thread_id.clone(),
+            evidence_revision: document.revision,
+            provenance,
+            requirements,
+            prohibitions,
+            unresolved_conflicts,
+            decisions,
+            owners: owners.into_iter().collect(),
+            relevant_files: relevant_files.into_iter().collect(),
+            relevant_contracts,
+            implementation_state: CheckpointImplementationState {
+                evidence_epoch: document.evidence_epoch,
+                host_mutation_revision: document.host_mutation_revision,
+                active_step_id: document.active_step_id.clone(),
+                implementation_identities,
+            },
+            proof_ids,
+            blockers,
+            risks,
+            immediate_action,
+            durable_artifact_references,
+        })
+    }
+
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
         let (mode, repo_root) = if let Some(repo_root) = find_kd4_repo_root(cwd) {
             (TaskEvidenceMode::Kd4Completion, repo_root)
@@ -1313,6 +2763,19 @@ impl TaskEvidenceLedger {
         };
         let document = if let Some((mut document, legacy_completion_model)) = existing {
             migrate_document_with_completion_model(&mut document, legacy_completion_model);
+            for receipt in &mut document.terminalization_receipts {
+                if receipt.delivery_state.is_authoritative_claim()
+                    && !receipt.terminal_interaction_released
+                {
+                    // Restoration never retries live delivery. The durable decision is
+                    // authoritative, while interactive and retained mutation ownership remain
+                    // independent.
+                    receipt.active_turn_detached = true;
+                    receipt.terminal_interaction_released = true;
+                    receipt.recovery_state = TerminalRecoveryState::Recovered;
+                    receipt.updated_at = now.clone();
+                }
+            }
             document.start.repository_root.clone_from(&repository_root);
             document.updated_at = now;
             document.revision = document.revision.saturating_add(1);
@@ -1344,8 +2807,10 @@ impl TaskEvidenceLedger {
                 },
                 evidence_epoch: 0,
                 last_mutation_at: None,
+                planning: PlanningEvidenceState::default(),
                 plan: Vec::new(),
                 active_step_id: None,
+                batch_acknowledgement: None,
                 edit_intents: Vec::new(),
                 edit_receipts: Vec::new(),
                 command_receipts: Vec::new(),
@@ -1362,6 +2827,12 @@ impl TaskEvidenceLedger {
                 host_mutation_revision: 0,
                 completion_review_v2: Some(new_completion_review_ledger(&thread_id_text)),
                 source_classification_cache: Vec::new(),
+                terminalization_receipts: Vec::new(),
+                contract_epoch: initial_contract_epoch(),
+                task_contract_sources: Vec::new(),
+                owner_packets: Vec::new(),
+                owner_packet_metrics: OwnerPacketMetrics::default(),
+                final_proof: FinalProofStateV1::default(),
                 completion: None,
             }
         };
@@ -1488,6 +2959,153 @@ impl TaskEvidenceLedger {
         self.mode == TaskEvidenceMode::Kd4Completion
     }
 
+    /// Atomically commits the terminal decision and reserves the one live-delivery attempt.
+    /// A recovered or duplicated caller that observes an existing claim must never send again.
+    pub(crate) async fn commit_terminal_decision_and_claim(
+        &self,
+        claim: TerminalDecisionClaim,
+    ) -> TerminalClaimResult {
+        if !self.allows_kd4_completion() {
+            return TerminalClaimResult::Claimed;
+        }
+        for _ in 0..8 {
+            let Some(expected_revision) = self.document_revision().await else {
+                return TerminalClaimResult::Failed;
+            };
+            let terminal_identity = claim.terminal_identity.clone();
+            let candidate_claim = claim.clone();
+            let transition = self
+                .atomic_review_update(expected_revision, None, None, |document| {
+                    if document.terminalization_receipts.iter().any(|receipt| {
+                        receipt.terminal_identity == terminal_identity
+                            && receipt.delivery_state.is_authoritative_claim()
+                    }) {
+                        return false;
+                    }
+                    let now = timestamp();
+                    document
+                        .terminalization_receipts
+                        .push(TerminalizationReceipt {
+                            terminal_identity: candidate_claim.terminal_identity,
+                            durable_outcome: candidate_claim.durable_outcome,
+                            delivery_state: TerminalDeliveryState::Claimed,
+                            active_turn_detached: false,
+                            terminal_interaction_released: false,
+                            deadline_exhausted_phase: candidate_claim.deadline_exhausted_phase,
+                            mutation_quiescent: candidate_claim.mutation_quiescent,
+                            durable_success_established: candidate_claim
+                                .durable_success_established,
+                            retained_ownership: candidate_claim.retained_ownership,
+                            recovery_state: TerminalRecoveryState::Pending,
+                            phase_timings_ns: candidate_claim.phase_timings_ns,
+                            recorded_at: now.clone(),
+                            updated_at: now,
+                        });
+                    trim_to_last(
+                        &mut document.terminalization_receipts,
+                        MAX_TERMINALIZATION_RECEIPTS,
+                    );
+                    document.updated_at = timestamp();
+                    true
+                })
+                .await;
+            match transition {
+                AtomicReviewTransition::Persisted(true) => {
+                    return TerminalClaimResult::Claimed;
+                }
+                AtomicReviewTransition::Persisted(false) => {
+                    return TerminalClaimResult::AlreadyClaimed;
+                }
+                AtomicReviewTransition::Superseded => continue,
+                AtomicReviewTransition::Failed => return TerminalClaimResult::Failed,
+            }
+        }
+        TerminalClaimResult::Failed
+    }
+
+    /// Durably records delivery and interaction release. Failure intentionally leaves the
+    /// durable receipt at `claimed`, which recovery treats as authoritative and never resends.
+    pub(crate) async fn update_terminal_interaction(
+        &self,
+        update: TerminalInteractionUpdate,
+    ) -> bool {
+        if !self.allows_kd4_completion() {
+            return true;
+        }
+        for _ in 0..8 {
+            let Some(expected_revision) = self.document_revision().await else {
+                return false;
+            };
+            let terminal_identity = update.terminal_identity.clone();
+            let candidate_update = update.clone();
+            let transition = self
+                .atomic_review_update(expected_revision, None, None, |document| {
+                    let Some(receipt) = document
+                        .terminalization_receipts
+                        .iter_mut()
+                        .find(|receipt| receipt.terminal_identity == terminal_identity)
+                    else {
+                        return false;
+                    };
+                    if !receipt.delivery_state.is_authoritative_claim() {
+                        return false;
+                    }
+                    if candidate_update.delivery_state != TerminalDeliveryState::Claimed {
+                        receipt.delivery_state = candidate_update.delivery_state;
+                    }
+                    receipt.active_turn_detached |= candidate_update.active_turn_detached;
+                    receipt.terminal_interaction_released |=
+                        candidate_update.terminal_interaction_released;
+                    receipt.recovery_state = candidate_update.recovery_state;
+                    for (phase, duration) in candidate_update.phase_timings_ns {
+                        receipt.phase_timings_ns.insert(phase, duration);
+                    }
+                    receipt.updated_at = timestamp();
+                    document.updated_at = timestamp();
+                    true
+                })
+                .await;
+            match transition {
+                AtomicReviewTransition::Persisted(updated) => return updated,
+                AtomicReviewTransition::Superseded => continue,
+                AtomicReviewTransition::Failed => return false,
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn terminalization_receipts_for_test(
+        &self,
+    ) -> Vec<(
+        String,
+        TerminalDeliveryState,
+        bool,
+        bool,
+        TerminalRecoveryState,
+    )> {
+        self.document
+            .lock()
+            .await
+            .as_ref()
+            .map(|document| {
+                document
+                    .terminalization_receipts
+                    .iter()
+                    .map(|receipt| {
+                        (
+                            receipt.terminal_identity.clone(),
+                            receipt.delivery_state,
+                            receipt.active_turn_detached,
+                            receipt.terminal_interaction_released,
+                            receipt.recovery_state,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn mark_user_source_capture_failed(&self) {
         self.source_capture_failed.store(true, Ordering::Release);
         if !self.allows_kd4_completion() {
@@ -1565,7 +3183,9 @@ impl TaskEvidenceLedger {
                     let Some(ledger) = document.completion_review_v2.as_ref() else {
                         return false;
                     };
-                    if ledger.workspace_event_baseline_epoch == ledger.completion_epoch {
+                    if ledger.workspace_event_baseline_epoch == ledger.completion_epoch
+                        && ledger.workspace_event_history_complete
+                    {
                         return true;
                     }
                     let completion_epoch = ledger.completion_epoch;
@@ -1575,6 +3195,9 @@ impl TaskEvidenceLedger {
                     ledger.last_workspace_event_epoch = workspace_epoch;
                     ledger.workspace_event_baseline_epoch = completion_epoch;
                     ledger.typed_assignment_baseline = typed_assignment_baseline;
+                    ledger.attributed_workspace_events.clear();
+                    ledger.workspace_event_history_complete = true;
+                    ledger.workspace_proof_scope_identity.clear();
                     resolve_risk(document, "completion-review-workspace-baseline");
                     document.updated_at = timestamp();
                     true
@@ -1673,6 +3296,7 @@ impl TaskEvidenceLedger {
                         document.latest_generated_artifact_hashes.clear();
                         document.plan.clear();
                         document.active_step_id = None;
+                        document.planning = PlanningEvidenceState::default();
                         document.risks.clear();
                         document.completion = None;
                     }
@@ -1805,23 +3429,652 @@ impl TaskEvidenceLedger {
         false
     }
 
-    pub(crate) async fn record_plan_update(&self, update: &UpdatePlanArgs) -> UpdatePlanArgs {
-        if !self.allows_kd4_completion() {
-            return update.clone();
+    pub(crate) async fn record_task_contract_source(
+        &self,
+        message_id: &str,
+        content: &[UserInput],
+    ) {
+        if self.mode != TaskEvidenceMode::Kd4Completion || message_id.trim().is_empty() {
+            return;
         }
+        let text = content
+            .iter()
+            .filter_map(|input| match input {
+                UserInput::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let classification = classify_task_contract_source(&text);
+        let Some((_, snapshot)) = self
+            .update_document(|document| {
+                if document
+                    .task_contract_sources
+                    .iter()
+                    .any(|source| source.message_id == message_id)
+                {
+                    return;
+                }
+                if classification == "material_followup" && document.host_mutation_revision > 0 {
+                    document.contract_epoch = document.contract_epoch.saturating_add(1).max(1);
+                    document.owner_packets.clear();
+                }
+                document.task_contract_sources.push(TaskContractSource {
+                    message_id: message_id.to_string(),
+                    content_sha256,
+                    classification: classification.to_string(),
+                    contract_epoch: document.contract_epoch,
+                    recorded_at: timestamp(),
+                });
+                trim_to_last(
+                    &mut document.task_contract_sources,
+                    MAX_TASK_CONTRACT_SOURCES,
+                );
+                document.updated_at = timestamp();
+                document.completion = None;
+            })
+            .await
+        else {
+            return;
+        };
+        self.persist_document(&snapshot).await;
+    }
+
+    pub(crate) async fn record_owner_packet_from_locator(
+        &self,
+        facts: &codex_file_search::task_locator::LocateTaskDecisionFacts,
+        locator_seed: Option<&codex_file_search::task_locator::LocateTaskOwnerPacketSeed>,
+        supporting_reads: &[codex_file_search::task_locator::SupportingRead],
+        request_identity: &str,
+        task: &str,
+    ) -> Option<OwnerPacketSeedOutcome> {
+        if self.mode != TaskEvidenceMode::Kd4Completion {
+            return None;
+        }
+        let (contract_epoch, plan) = {
+            let guard = self.document.lock().await;
+            let document = guard.as_ref()?;
+            (document.contract_epoch, document.plan.clone())
+        };
+        let seed = core_owner_packet_seed(
+            facts,
+            locator_seed,
+            supporting_reads,
+            request_identity,
+            task,
+        )?;
+        let packet = owner_packet_from_seed(&seed, contract_epoch, &plan);
+        let (outcome, snapshot) = self
+            .update_document(|document| {
+                if document.contract_epoch != contract_epoch {
+                    return None;
+                }
+                document
+                    .owner_packets
+                    .retain(|existing| existing.contract_epoch == contract_epoch);
+                let previous = document
+                    .owner_packets
+                    .iter()
+                    .filter(|existing| existing.owner_id == packet.owner_id)
+                    .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
+                    .cloned();
+                document.owner_packets.retain(|existing| {
+                    existing.owner_id != packet.owner_id
+                        || existing.contract_epoch != contract_epoch
+                });
+                let created = previous.is_none();
+                let stored = if let Some(previous) = previous {
+                    merge_owner_packet_seed(previous, packet.clone())
+                } else {
+                    document.owner_packet_metrics.packets_created = document
+                        .owner_packet_metrics
+                        .packets_created
+                        .saturating_add(1);
+                    document.owner_packet_metrics.files_observed = document
+                        .owner_packet_metrics
+                        .files_observed
+                        .saturating_add(owner_packet_file_count(&packet) as u64);
+                    document.owner_packet_metrics.regions_observed = document
+                        .owner_packet_metrics
+                        .regions_observed
+                        .saturating_add(packet.target_regions.len() as u64);
+                    document.owner_packet_metrics.callers_observed = document
+                        .owner_packet_metrics
+                        .callers_observed
+                        .saturating_add(packet.relationships.len() as u64);
+                    document.owner_packet_metrics.acceptance_mappings_observed = document
+                        .owner_packet_metrics
+                        .acceptance_mappings_observed
+                        .saturating_add(packet.acceptance_mappings.len() as u64);
+                    packet.clone()
+                };
+                let outcome = OwnerPacketSeedOutcome {
+                    preview: owner_packet_preview(&stored),
+                    created,
+                    files: owner_packet_file_count(&stored),
+                    regions: stored.target_regions.len(),
+                    callers: stored.relationships.len(),
+                    acceptance_mappings: stored.acceptance_mappings.len(),
+                };
+                document.owner_packets.push(stored);
+                trim_to_last(&mut document.owner_packets, MAX_OWNER_PACKETS);
+                document.updated_at = timestamp();
+                document.completion = None;
+                Some(outcome)
+            })
+            .await?;
+        self.persist_document(&snapshot).await;
+        outcome
+    }
+
+    pub(crate) async fn record_owner_source_span(
+        &self,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+        file_sha256: &str,
+        span_sha256: &str,
+    ) {
+        if self.mode != TaskEvidenceMode::Kd4Completion || start_line == 0 || end_line < start_line
+        {
+            return;
+        }
+        let normalized = normalize_packet_path(path);
+        let Some((_, snapshot)) = self
+            .update_document(|document| {
+                let mut changed = false;
+                for packet in document
+                    .owner_packets
+                    .iter_mut()
+                    .filter(|packet| packet.contract_epoch == document.contract_epoch)
+                {
+                    if !packet_covers_path(packet, &normalized) {
+                        continue;
+                    }
+                    packet
+                        .source_identities
+                        .retain(|identity| !packet_path_eq(&identity.path, &normalized));
+                    packet.source_identities.push(OwnerPacketSourceIdentity {
+                        path: normalized.clone(),
+                        file_sha256: file_sha256.to_string(),
+                    });
+                    trim_to_last(
+                        &mut packet.source_identities,
+                        MAX_OWNER_PACKET_REFERENCES * 2,
+                    );
+                    let section_id = owner_span_id(
+                        &packet.packet_id,
+                        &normalized,
+                        start_line,
+                        end_line,
+                        span_sha256,
+                    );
+                    packet
+                        .source_spans
+                        .retain(|span| span.section_id != section_id);
+                    packet.source_spans.push(OwnerPacketSourceSpan {
+                        section_id,
+                        path: normalized.clone(),
+                        start_line,
+                        end_line,
+                        file_sha256: file_sha256.to_string(),
+                        span_sha256: span_sha256.to_string(),
+                        state: OwnerSourceSpanState::Current,
+                    });
+                    trim_to_last(&mut packet.source_spans, MAX_OWNER_PACKET_SPANS);
+                    packet.updated_at = timestamp();
+                    changed = true;
+                }
+                if changed {
+                    document.updated_at = timestamp();
+                }
+            })
+            .await
+        else {
+            return;
+        };
+        self.persist_document(&snapshot).await;
+    }
+
+    pub(crate) async fn prepare_owner_patch(
+        &self,
+        regions: &[OwnerPacketChangeRegion],
+    ) -> Result<Vec<OwnerPacketBinding>, OwnerPacketNotReady> {
+        if self.mode != TaskEvidenceMode::Kd4Completion {
+            return Ok(Vec::new());
+        }
+        let result = {
+            let guard = self.document.lock().await;
+            let Some(document) = guard.as_ref() else {
+                return Err(owner_packet_not_ready(vec![
+                    "task_evidence_document_unavailable".to_string(),
+                ]));
+            };
+            verify_owner_patch(document, regions)
+        }?;
+        let binding_ids = result
+            .iter()
+            .map(|binding| binding.packet_id.clone())
+            .collect::<BTreeSet<_>>();
+        let changed_paths = regions
+            .iter()
+            .map(|region| normalize_packet_path(&region.path))
+            .collect::<BTreeSet<_>>();
+        if let Some((_, snapshot)) = self
+            .update_document(|document| {
+                for packet in document.owner_packets.iter_mut().filter(|packet| {
+                    binding_ids.contains(&packet.packet_id)
+                        && packet.contract_epoch == document.contract_epoch
+                }) {
+                    for relationship in &mut packet.relationships {
+                        if changed_paths
+                            .iter()
+                            .any(|path| packet_path_eq(path, &relationship.path))
+                            && relationship.disposition
+                                == OwnerRelationshipDisposition::MustRemainCompatible
+                        {
+                            relationship.disposition = OwnerRelationshipDisposition::MustChange;
+                        }
+                    }
+                    packet.updated_at = timestamp();
+                }
+                document.updated_at = timestamp();
+            })
+            .await
+        {
+            self.persist_document(&snapshot).await;
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn record_owner_patch_finalization(
+        &self,
+        call_id: &str,
+        bindings: &[OwnerPacketBinding],
+        post_paths: &[OwnerPacketPostMutationPath],
+    ) -> OwnerPacketTransitionMetrics {
+        if self.mode != TaskEvidenceMode::Kd4Completion || bindings.is_empty() {
+            return OwnerPacketTransitionMetrics::default();
+        }
+        let binding_by_packet = bindings
+            .iter()
+            .map(|binding| (binding.packet_id.clone(), binding.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let post_paths = post_paths
+            .iter()
+            .cloned()
+            .map(|mut post| {
+                post.path = normalize_packet_path(&post.path);
+                (post.path.clone(), post)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let Some((aggregate, snapshot)) = self
+            .update_document(|document| {
+                let mut aggregate = OwnerPacketCounters::default();
+                for packet in document.owner_packets.iter_mut().filter(|packet| {
+                    binding_by_packet.contains_key(&packet.packet_id)
+                        && packet.contract_epoch == document.contract_epoch
+                }) {
+                    let binding = &binding_by_packet[&packet.packet_id];
+                    let post_state_complete = binding.regions.iter().all(|region| {
+                        post_paths
+                            .get(&normalize_packet_path(&region.path))
+                            .is_some_and(|post| !post.existed || post.file_sha256.is_some())
+                    });
+                    if !post_state_complete {
+                        for span in packet.source_spans.iter_mut().filter(|span| {
+                            binding
+                                .regions
+                                .iter()
+                                .any(|region| packet_path_eq(&region.path, &span.path))
+                        }) {
+                            if span.state != OwnerSourceSpanState::Invalidated {
+                                span.state = OwnerSourceSpanState::Invalidated;
+                                packet.counters.interval_invalidations =
+                                    packet.counters.interval_invalidations.saturating_add(1);
+                                aggregate.interval_invalidations =
+                                    aggregate.interval_invalidations.saturating_add(1);
+                            }
+                        }
+                        packet.status = OwnerPacketStatus::Blocked;
+                        packet.missing_obligations =
+                            vec!["post_mutation_source_identity_unavailable".to_string()];
+                        packet.updated_at = timestamp();
+                        continue;
+                    }
+                    let changed = binding.regions.iter().any(|region| {
+                        post_paths
+                            .get(&normalize_packet_path(&region.path))
+                            .is_some_and(|post| {
+                                let previous = packet
+                                    .source_identities
+                                    .iter()
+                                    .find(|identity| packet_path_eq(&identity.path, &post.path));
+                                previous.map(|identity| identity.file_sha256.as_str())
+                                    != post.file_sha256.as_deref()
+                                    || previous.is_some() != post.existed
+                            })
+                    });
+                    if !changed {
+                        continue;
+                    }
+                    let revisited = packet.counters.edits > 0
+                        && binding.regions.iter().any(|region| {
+                            packet
+                                .last_mutation_regions
+                                .iter()
+                                .any(|previous| same_region_with_margin(region, previous, 5))
+                        });
+                    packet.counters.edits = packet.counters.edits.saturating_add(1);
+                    aggregate.edits = aggregate.edits.saturating_add(1);
+                    if revisited {
+                        packet.counters.same_region_revisits =
+                            packet.counters.same_region_revisits.saturating_add(1);
+                        aggregate.same_region_revisits =
+                            aggregate.same_region_revisits.saturating_add(1);
+                    }
+                    if packet.counters.edits > 1 {
+                        let repair_kind = if packet.format_status == OwnerObligationStatus::Failed
+                            && packet.proof_status != OwnerObligationStatus::Failed
+                        {
+                            "formatting"
+                        } else if packet.proof_status == OwnerObligationStatus::Failed
+                            && !packet.lifecycle_obligations.is_empty()
+                        {
+                            "lifecycle"
+                        } else if packet.proof_status == OwnerObligationStatus::Failed
+                            && !packet.acceptance_mappings.is_empty()
+                        {
+                            "acceptance"
+                        } else if binding.regions.iter().any(|region| {
+                            packet.relationships.iter().any(|relationship| {
+                                relationship.disposition == OwnerRelationshipDisposition::MustChange
+                                    && packet_path_eq(&relationship.path, &region.path)
+                            })
+                        }) {
+                            "caller"
+                        } else {
+                            "other"
+                        };
+                        if repair_kind == "caller" {
+                            packet.counters.caller_repairs =
+                                packet.counters.caller_repairs.saturating_add(1);
+                            aggregate.caller_repairs = aggregate.caller_repairs.saturating_add(1);
+                        } else if repair_kind == "acceptance" {
+                            packet.counters.acceptance_repairs =
+                                packet.counters.acceptance_repairs.saturating_add(1);
+                            aggregate.acceptance_repairs =
+                                aggregate.acceptance_repairs.saturating_add(1);
+                        } else if repair_kind == "lifecycle" {
+                            packet.counters.lifecycle_repairs =
+                                packet.counters.lifecycle_repairs.saturating_add(1);
+                            aggregate.lifecycle_repairs =
+                                aggregate.lifecycle_repairs.saturating_add(1);
+                        } else if repair_kind == "formatting" {
+                            packet.counters.formatting_only_repairs =
+                                packet.counters.formatting_only_repairs.saturating_add(1);
+                            aggregate.formatting_only_repairs =
+                                aggregate.formatting_only_repairs.saturating_add(1);
+                        } else {
+                            packet.counters.other_repairs =
+                                packet.counters.other_repairs.saturating_add(1);
+                            aggregate.other_repairs = aggregate.other_repairs.saturating_add(1);
+                        }
+                    }
+                    packet.last_mutation_regions = binding.regions.clone();
+                    trim_to_last(&mut packet.edit_call_ids, MAX_OWNER_PACKET_REFERENCES - 1);
+                    if !packet.edit_call_ids.iter().any(|id| id == call_id) {
+                        packet.edit_call_ids.push(call_id.to_string());
+                    }
+
+                    for post in post_paths.values().filter(|post| {
+                        binding
+                            .regions
+                            .iter()
+                            .any(|region| packet_path_eq(&region.path, &post.path))
+                    }) {
+                        packet
+                            .source_identities
+                            .retain(|identity| !packet_path_eq(&identity.path, &post.path));
+                        if let Some(file_sha256) = post.file_sha256.as_ref() {
+                            packet.source_identities.push(OwnerPacketSourceIdentity {
+                                path: post.path.clone(),
+                                file_sha256: file_sha256.clone(),
+                            });
+                            trim_to_last(
+                                &mut packet.source_identities,
+                                MAX_OWNER_PACKET_REFERENCES * 2,
+                            );
+                            packet.counters.identity_refreshes =
+                                packet.counters.identity_refreshes.saturating_add(1);
+                            aggregate.identity_refreshes =
+                                aggregate.identity_refreshes.saturating_add(1);
+                        }
+                        refresh_packet_spans_from_post_state(packet, binding, post, &mut aggregate);
+                    }
+                    let content_missing = binding.regions.iter().any(|region| {
+                        post_paths
+                            .get(&normalize_packet_path(&region.path))
+                            .is_none_or(|post| post.existed && post.content.is_none())
+                    });
+                    packet.status = OwnerPacketStatus::Mutated;
+                    if content_missing {
+                        packet.status = OwnerPacketStatus::Blocked;
+                        packet.missing_obligations =
+                            vec!["post_mutation_source_content_unavailable".to_string()];
+                    } else {
+                        packet.format_status = if packet.formatter_route.is_some() {
+                            OwnerObligationStatus::Pending
+                        } else {
+                            OwnerObligationStatus::NotRequired
+                        };
+                        packet.proof_status = if packet.validation_route.is_some() {
+                            OwnerObligationStatus::Pending
+                        } else {
+                            OwnerObligationStatus::NotRequired
+                        };
+                        packet.missing_obligations.clear();
+                    }
+                    if packet.status == OwnerPacketStatus::Blocked {
+                        // Preserve the source-content blocker established above.
+                    } else if packet.format_status == OwnerObligationStatus::Pending {
+                        packet.status = OwnerPacketStatus::AwaitingFormat;
+                    } else if packet.proof_status == OwnerObligationStatus::Pending {
+                        packet.status = OwnerPacketStatus::AwaitingProof;
+                    } else {
+                        packet.status = OwnerPacketStatus::Closed;
+                    }
+                    packet.updated_at = timestamp();
+                }
+                add_owner_packet_counters(&mut document.owner_packet_metrics, &aggregate);
+                document.updated_at = timestamp();
+                document.completion = None;
+                aggregate
+            })
+            .await
+        else {
+            return OwnerPacketTransitionMetrics::default();
+        };
+        self.persist_document(&snapshot).await;
+        owner_transition_metrics(&aggregate)
+    }
+
+    pub(crate) async fn record_owner_cas_failure(&self, paths: &[String], self_owned: bool) {
+        if self.mode != TaskEvidenceMode::Kd4Completion {
+            return;
+        }
+        let normalized = paths
+            .iter()
+            .map(|path| normalize_packet_path(path))
+            .collect::<Vec<_>>();
+        let Some((_, snapshot)) = self
+            .update_document(|document| {
+                for packet in document.owner_packets.iter_mut().filter(|packet| {
+                    packet.contract_epoch == document.contract_epoch
+                        && normalized
+                            .iter()
+                            .any(|path| packet_covers_path(packet, path))
+                }) {
+                    if self_owned {
+                        packet.counters.self_owned_cas_failures =
+                            packet.counters.self_owned_cas_failures.saturating_add(1);
+                    } else {
+                        packet.counters.external_cas_failures =
+                            packet.counters.external_cas_failures.saturating_add(1);
+                    }
+                    packet.updated_at = timestamp();
+                }
+                if self_owned {
+                    document.owner_packet_metrics.self_owned_cas_failures = document
+                        .owner_packet_metrics
+                        .self_owned_cas_failures
+                        .saturating_add(1);
+                } else {
+                    document.owner_packet_metrics.external_cas_failures = document
+                        .owner_packet_metrics
+                        .external_cas_failures
+                        .saturating_add(1);
+                }
+                document.updated_at = timestamp();
+            })
+            .await
+        else {
+            return;
+        };
+        self.persist_document(&snapshot).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn record_plan_update(&self, update: &UpdatePlanArgs) -> UpdatePlanArgs {
+        self.record_planning_update(PlanningUpdateInput {
+            explanation: update.explanation.clone(),
+            plan: update.plan.clone(),
+            ..PlanningUpdateInput::default()
+        })
+        .await
+        .public_update
+    }
+
+    pub(crate) async fn record_planning_update(
+        &self,
+        update: PlanningUpdateInput,
+    ) -> PlanUpdateOutcome {
+        let requested_public = UpdatePlanArgs {
+            explanation: update.explanation.clone(),
+            plan: update.plan.clone(),
+        };
+        if !self.allows_kd4_completion() {
+            return PlanUpdateOutcome {
+                public_update: requested_public,
+                effect: PlanUpdateEffect::NoOp,
+            };
+        }
+        // Only a model-authored transition of the currently active, explicitly
+        // named work unit to Implemented establishes a batch boundary. The
+        // edit path's automatic status promotion never passes through here.
+        let acknowledgement_candidate = {
+            let guard = self.document.lock().await;
+            guard.as_ref().and_then(|document| {
+                let active_step_id = document.active_step_id.as_ref()?;
+                let item = update.plan.iter().find(|item| {
+                    item.id.as_deref() == Some(active_step_id.as_str())
+                        && item.status == StepStatus::Implemented
+                })?;
+                let route = item.validation_route.clone().or_else(|| {
+                    document
+                        .plan
+                        .iter()
+                        .find(|step| step.id == *active_step_id)
+                        .and_then(|step| step.validation_route.clone())
+                })?;
+                Some((
+                    active_step_id.clone(),
+                    document.host_mutation_revision,
+                    route,
+                ))
+            })
+        };
+        let acknowledgement =
+            if let Some((step_id, implementation_revision, route)) = acknowledgement_candidate {
+                let covered_paths = validation_route_covered_paths(&route);
+                let mut covered_manifest = Vec::with_capacity(covered_paths.len());
+                if let Some(repo_root) = self.repo_root.as_ref() {
+                    for path in covered_paths {
+                        covered_manifest.push(snapshot_file(repo_root, &path).await);
+                    }
+                }
+                Some(ImplementationBatchAcknowledgement {
+                    step_id,
+                    implementation_revision,
+                    acknowledged_at: timestamp(),
+                    covered_manifest,
+                })
+            } else {
+                None
+            };
         let Some((response, snapshot)) = self
             .update_document(|document| {
-                let previous = document
-                    .plan
-                    .iter()
-                    .cloned()
-                    .map(|step| (step.id.clone(), step))
-                    .collect::<BTreeMap<_, _>>();
+                let was_unplanned = document.plan.is_empty()
+                    && document.planning.work_unit.is_none()
+                    && document.planning.facts.is_empty();
                 let mut used_ids = BTreeSet::new();
-                let mut normalized = Vec::with_capacity(update.plan.len());
-                let mut material_plan_change = previous.len() != update.plan.len();
+                let mut material_plan_change = false;
+                let mut status_change = false;
                 let mut duplicate_explicit_ids = BTreeSet::new();
                 let mut seen_explicit_ids = BTreeSet::new();
+                let step_evidence = update
+                    .step_evidence
+                    .iter()
+                    .map(|evidence| (evidence.step_id.as_str(), evidence))
+                    .collect::<BTreeMap<_, _>>();
+
+                if let Some(tier) = update.tier
+                    && document.planning.tier != tier
+                {
+                    document.planning.tier = tier;
+                    material_plan_change = true;
+                }
+                for fact in &update.facts {
+                    if document.planning.facts.get(&fact.id) != Some(fact) {
+                        document
+                            .planning
+                            .facts
+                            .insert(fact.id.clone(), fact.clone());
+                        material_plan_change = true;
+                    }
+                }
+                for removal in &update.removed_facts {
+                    if document.planning.facts.remove(&removal.id).is_some() {
+                        document.planning.audit_history.push(PlanningAuditEntry {
+                            kind: "fact_removed".to_string(),
+                            id: removal.id.clone(),
+                            reason: removal.reason.clone(),
+                            revision: document.planning.material_revision.saturating_add(1),
+                            recorded_at: timestamp(),
+                        });
+                        document.planning.counters.fact_removals =
+                            document.planning.counters.fact_removals.saturating_add(1);
+                        material_plan_change = true;
+                    }
+                }
+                for removal in &update.removed_steps {
+                    if let Some(index) = document.plan.iter().position(|step| step.id == removal.id)
+                    {
+                        let retired = document.plan.remove(index);
+                        document.planning.audit_history.push(PlanningAuditEntry {
+                            kind: "step_removed".to_string(),
+                            id: retired.id,
+                            reason: removal.reason.clone(),
+                            revision: retired.revision,
+                            recorded_at: timestamp(),
+                        });
+                        document.planning.counters.step_removals =
+                            document.planning.counters.step_removals.saturating_add(1);
+                        material_plan_change = true;
+                    }
+                }
+
                 for (index, item) in update.plan.iter().enumerate() {
                     if let Some(id) = item.id.as_ref()
                         && !seen_explicit_ids.insert(id.clone())
@@ -1829,32 +4082,151 @@ impl TaskEvidenceLedger {
                         duplicate_explicit_ids.insert(id.clone());
                     }
                     let id = effective_step_id(item, index, &mut used_ids);
-                    let old = previous.get(&id);
-                    let material_step_change =
-                        old.is_none_or(|step| !step_materially_matches_item(step, item));
-                    material_plan_change |= material_step_change;
-                    let status = normalize_requested_status(&item.status);
-                    normalized.push(EvidencePlanStep {
-                        id,
+                    let old = document.plan.iter().find(|step| step.id == id).cloned();
+                    let evidence = step_evidence.get(id.as_str()).copied();
+                    let requested_obligations = evidence.map(|evidence| {
+                        evidence
+                            .mutation_obligations
+                            .clone()
+                            .into_iter()
+                            .map(MutationObligationState::from)
+                            .collect::<Vec<_>>()
+                    });
+                    let mut candidate = EvidencePlanStep {
+                        id: id.clone(),
+                        revision: old.as_ref().map_or(1, |step| step.revision),
                         step: item.step.clone(),
-                        status,
+                        status: normalize_requested_status(&item.status),
                         depends_on: item.depends_on.clone(),
                         acceptance_criteria: item.acceptance_criteria.clone(),
                         runtime_paths: item.runtime_paths.clone(),
                         generated_artifacts: item.generated_artifacts.clone(),
                         risks: item.risks.clone(),
                         requires_desktop_activation: item.requires_desktop_activation,
+                        validation_route: if evidence.is_some_and(|evidence| {
+                            evidence.validation_disposition
+                                == Some(ValidationDisposition::NotRequired)
+                        }) {
+                            None
+                        } else {
+                            item.validation_route.clone().or_else(|| {
+                                old.as_ref().and_then(|step| step.validation_route.clone())
+                            })
+                        },
+                        external_validation_route: evidence
+                            .and_then(|evidence| evidence.external_validation_route.clone())
+                            .or_else(|| {
+                                old.as_ref()
+                                    .and_then(|step| step.external_validation_route.clone())
+                            }),
+                        validation_disposition: evidence
+                            .and_then(|evidence| evidence.validation_disposition)
+                            .unwrap_or_else(|| {
+                                old.as_ref().map_or_else(
+                                    || {
+                                        if item.validation_route.is_some() {
+                                            ValidationDisposition::Executable
+                                        } else {
+                                            ValidationDisposition::NotRequired
+                                        }
+                                    },
+                                    |step| step.validation_disposition,
+                                )
+                            }),
+                        source_owner: evidence
+                            .and_then(|evidence| evidence.source_owner.clone())
+                            .or_else(|| old.as_ref().and_then(|step| step.source_owner.clone())),
+                        implementation_surfaces: evidence
+                            .map(|evidence| evidence.implementation_surfaces.clone())
+                            .or_else(|| {
+                                old.as_ref()
+                                    .map(|step| step.implementation_surfaces.clone())
+                            })
+                            .unwrap_or_default(),
+                        mutation_obligations: requested_obligations
+                            .or_else(|| old.as_ref().map(|step| step.mutation_obligations.clone()))
+                            .unwrap_or_default(),
+                        validation_receipt_id: old
+                            .as_ref()
+                            .and_then(|step| step.validation_receipt_id.clone()),
                         edit_paths: old
-                            .filter(|_| !material_step_change)
+                            .as_ref()
                             .map_or_else(BTreeSet::new, |step| step.edit_paths.clone()),
+                    };
+                    let material_step_change = old.as_ref().is_none_or(|step| {
+                        !step_materially_matches_item(step, item)
+                            || !step_internal_structure_matches(step, &candidate)
                     });
+                    if material_step_change {
+                        if let Some(old) = old.as_ref() {
+                            candidate.revision = old.revision.saturating_add(1);
+                            document.planning.counters.step_revisions =
+                                document.planning.counters.step_revisions.saturating_add(1);
+                        }
+                        candidate.edit_paths.clear();
+                        candidate.validation_receipt_id = None;
+                        for obligation in &mut candidate.mutation_obligations {
+                            obligation.satisfied = false;
+                            obligation.satisfied_paths.clear();
+                        }
+                        material_plan_change = true;
+                    } else if old
+                        .as_ref()
+                        .is_some_and(|step| step.status != candidate.status)
+                    {
+                        status_change = true;
+                    }
+                    candidate.status = admissible_requested_status(&candidate);
+                    if let Some(position) = document.plan.iter().position(|step| step.id == id) {
+                        document.plan[position] = candidate;
+                    } else {
+                        document.plan.push(candidate);
+                    }
                 }
-                material_plan_change |= previous
-                    .keys()
-                    .any(|id| !normalized.iter().any(|step| &step.id == id));
-                document.plan = normalized;
+
+                if document.planning.tier == PlanningTier::Focused && document.plan.is_empty() {
+                    let work_unit = ensure_focused_work_unit(document);
+                    let before = work_unit.clone();
+                    if update.source_owner.is_some() {
+                        work_unit.source_owner.clone_from(&update.source_owner);
+                    }
+                    if !update.implementation_surfaces.is_empty() {
+                        work_unit.implementation_surfaces = update
+                            .implementation_surfaces
+                            .iter()
+                            .map(|path| normalize_slashes(path))
+                            .collect();
+                    }
+                    if !update.acceptance_criteria.is_empty() {
+                        work_unit.acceptance_criteria = update.acceptance_criteria.clone();
+                    }
+                    if !update.mutation_obligations.is_empty() {
+                        work_unit.mutation_obligations = update
+                            .mutation_obligations
+                            .clone()
+                            .into_iter()
+                            .map(MutationObligationState::from)
+                            .collect();
+                    }
+                    if let Some(disposition) = update.validation_disposition {
+                        work_unit.validation_disposition = disposition;
+                    }
+                    if update.validation_route.is_some() {
+                        work_unit
+                            .validation_route
+                            .clone_from(&update.validation_route);
+                    }
+                    if update.external_validation_route.is_some() {
+                        work_unit
+                            .external_validation_route
+                            .clone_from(&update.external_validation_route);
+                    }
+                    material_plan_change |= before != *work_unit;
+                }
                 if material_plan_change {
                     invalidate_for_plan_change(document);
+                    document.planning.material_revision =
+                        document.planning.material_revision.saturating_add(1);
                 }
                 sync_plan_structure_state(document, &duplicate_explicit_ids);
                 rebuild_declared_requirements_and_risks(document);
@@ -1862,19 +4234,128 @@ impl TaskEvidenceLedger {
                 if plan_is_terminally_acknowledged(document) {
                     resolve_recoverable_runtime_risks(document);
                 }
+                if let Some(acknowledgement) = acknowledgement.clone()
+                    && acknowledgement.implementation_revision == document.host_mutation_revision
+                    && document.plan.iter().any(|step| {
+                        step.id == acknowledgement.step_id
+                            && step.status == StepStatus::Implemented
+                            && step.validation_route.is_some()
+                    })
+                {
+                    document.batch_acknowledgement = Some(acknowledgement);
+                }
                 document.updated_at = timestamp();
                 document.completion = None;
-                UpdatePlanArgs {
-                    explanation: update.explanation.clone(),
-                    plan: document.plan.iter().map(plan_item_from_evidence).collect(),
+                let effect = if material_plan_change {
+                    if was_unplanned {
+                        document.planning.counters.initial_updates =
+                            document.planning.counters.initial_updates.saturating_add(1);
+                        PlanUpdateEffect::Initial
+                    } else {
+                        document.planning.counters.structural_revisions = document
+                            .planning
+                            .counters
+                            .structural_revisions
+                            .saturating_add(1);
+                        PlanUpdateEffect::StructuralRevision
+                    }
+                } else if status_change {
+                    document.planning.counters.status_only_updates = document
+                        .planning
+                        .counters
+                        .status_only_updates
+                        .saturating_add(1);
+                    PlanUpdateEffect::StatusOnly
+                } else {
+                    document.planning.counters.no_op_updates =
+                        document.planning.counters.no_op_updates.saturating_add(1);
+                    PlanUpdateEffect::NoOp
+                };
+                trim_to_last(
+                    &mut document.planning.audit_history,
+                    MAX_PLANNING_AUDIT_ENTRIES,
+                );
+                PlanUpdateOutcome {
+                    public_update: UpdatePlanArgs {
+                        explanation: update.explanation.clone(),
+                        plan: document.plan.iter().map(plan_item_from_evidence).collect(),
+                    },
+                    effect,
                 }
             })
             .await
         else {
-            return update.clone();
+            return PlanUpdateOutcome {
+                public_update: requested_public,
+                effect: PlanUpdateEffect::NoOp,
+            };
         };
         self.persist_document(&snapshot).await;
         response
+    }
+
+    /// Returns a route only when the explicit batch acknowledgement is still
+    /// authoritative. This intentionally does not infer completion from time or
+    /// from an automatically promoted Implemented status.
+    pub(crate) async fn auto_validation_candidate(&self) -> Option<AutoValidationCandidate> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
+        let (candidate, covered_manifest) = {
+            let guard = self.document.lock().await;
+            let document = guard.as_ref()?;
+            let acknowledgement = document.batch_acknowledgement.as_ref()?;
+            if acknowledgement.implementation_revision != document.host_mutation_revision {
+                return None;
+            }
+            let step = document
+                .plan
+                .iter()
+                .find(|step| step.id == acknowledgement.step_id)?;
+            if step.status != StepStatus::Implemented
+                || !implementation_dependencies_satisfied(document, step)
+            {
+                return None;
+            }
+            let route = step.validation_route.clone()?;
+            let covered_paths = validation_route_covered_paths(&route);
+            let repository_wide = covered_paths.is_empty();
+            let has_relevant_pending_intent = document.edit_intents.iter().any(|intent| {
+                intent.completed_at.is_none()
+                    && (repository_wide
+                        || intent.files.iter().any(|file| {
+                            covered_paths
+                                .iter()
+                                .any(|covered| validation_paths_overlap(covered, &file.path))
+                        }))
+            });
+            if has_relevant_pending_intent {
+                return None;
+            }
+            (
+                AutoValidationCandidate {
+                    step_id: step.id.clone(),
+                    route,
+                    implementation_revision: acknowledgement.implementation_revision,
+                    implementation_identity: validation_implementation_identity(
+                        acknowledgement.implementation_revision,
+                        repository_wide,
+                        &acknowledgement.covered_manifest,
+                    ),
+                    repository_wide,
+                },
+                acknowledgement.covered_manifest.clone(),
+            )
+        };
+        if !candidate.repository_wide {
+            let repo_root = self.repo_root.as_ref()?;
+            for expected in &covered_manifest {
+                if snapshot_file(repo_root, &expected.path).await != *expected {
+                    return None;
+                }
+            }
+        }
+        Some(candidate)
     }
 
     #[cfg(test)]
@@ -1910,12 +4391,17 @@ impl TaskEvidenceLedger {
 
         let Some((_, snapshot)) = self
             .update_document(|document| {
+                let (step_id, step_revision, work_unit_id, attribution) =
+                    current_action_attribution(document, "edit", &evidence_call_id);
                 document
                     .edit_intents
                     .retain(|intent| intent.call_id != evidence_call_id);
                 document.edit_intents.push(EditIntent {
                     call_id: evidence_call_id,
-                    step_id: document.active_step_id.clone(),
+                    step_id,
+                    step_revision,
+                    work_unit_id,
+                    attribution: Some(attribution),
                     started_at: timestamp(),
                     completed_at: None,
                     outcome: None,
@@ -2005,7 +4491,11 @@ impl TaskEvidenceLedger {
                     stored.outcome = Some(outcome.to_string());
                 }
                 if !transitions.is_empty() {
-                    invalidate_for_mutation(document);
+                    let changed_paths = transitions
+                        .iter()
+                        .map(|transition| transition.path.clone())
+                        .collect::<BTreeSet<_>>();
+                    invalidate_for_mutation(document, Some(&changed_paths));
                     let epoch = document.evidence_epoch;
                     let mut affected_steps = BTreeMap::<String, BTreeSet<String>>::new();
                     for transition in &transitions {
@@ -2029,14 +4519,39 @@ impl TaskEvidenceLedger {
                     for step in &mut document.plan {
                         if let Some(paths) = affected_steps.get(&step.id) {
                             step.edit_paths.extend(paths.iter().cloned());
+                            if edit_succeeded {
+                                record_obligation_progress(&mut step.mutation_obligations, paths);
+                            }
                             if edit_succeeded
+                                && implementation_obligations_satisfied(
+                                    &step.mutation_obligations,
+                                )
                                 && !matches!(step.status, StepStatus::Blocked | StepStatus::Skipped)
                             {
                                 step.status = StepStatus::Implemented;
                             }
                         }
                     }
-                    if affected_steps.is_empty() {
+                    if let Some(work_unit_id) = intent.work_unit_id.as_deref()
+                        && let Some(work_unit) = document.planning.work_unit.as_mut()
+                        && work_unit.id == work_unit_id
+                        && edit_succeeded
+                    {
+                        if work_unit.mutation_obligations.is_empty() {
+                            work_unit.mutation_obligations.push(MutationObligationState {
+                                id: "focused-mutation".to_string(),
+                                description: "focused atomic mutation".to_string(),
+                                paths: changed_paths.iter().cloned().collect(),
+                                satisfied_paths: BTreeSet::new(),
+                                satisfied: false,
+                            });
+                        }
+                        record_obligation_progress(
+                            &mut work_unit.mutation_obligations,
+                            &changed_paths,
+                        );
+                    }
+                    if affected_steps.is_empty() && intent.work_unit_id.is_none() {
                         upsert_risk(
                             document,
                             EvidenceRisk {
@@ -2061,10 +4576,24 @@ impl TaskEvidenceLedger {
                     }
                     let receipt_id =
                         next_receipt_id("edit", &mut document.next_edit_receipt_sequence);
+                    for packet in document.owner_packets.iter_mut().filter(|packet| {
+                        packet.contract_epoch == document.contract_epoch
+                            && packet.edit_call_ids.iter().any(|id| id == &evidence_call_id)
+                    }) {
+                        trim_to_last(
+                            &mut packet.edit_receipt_ids,
+                            MAX_OWNER_PACKET_REFERENCES - 1,
+                        );
+                        packet.edit_receipt_ids.push(receipt_id.clone());
+                        packet.updated_at = timestamp();
+                    }
                     document.edit_receipts.push(EditReceipt {
                         id: receipt_id,
                         call_id: evidence_call_id,
                         step_id: intent.step_id,
+                        step_revision: intent.step_revision,
+                        work_unit_id: intent.work_unit_id,
+                        attribution: intent.attribution,
                         recorded_at: timestamp(),
                         epoch,
                         outcome: outcome.to_string(),
@@ -2131,6 +4660,7 @@ impl TaskEvidenceLedger {
         .await;
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_command_bound_with_provenance(
         &self,
@@ -2143,6 +4673,35 @@ impl TaskEvidenceLedger {
         provenance: Option<&ChildEvidenceProvenance>,
         implementation_identity_hash: Option<&str>,
     ) {
+        self.record_command_bound_with_validation_result(
+            command,
+            cwd,
+            exit_code,
+            timed_out,
+            duration_ms,
+            possible_mutation,
+            provenance,
+            implementation_identity_hash,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_command_bound_with_validation_result(
+        &self,
+        command: &[String],
+        cwd: &PathUri,
+        exit_code: i32,
+        timed_out: bool,
+        duration_ms: u64,
+        possible_mutation: bool,
+        provenance: Option<&ChildEvidenceProvenance>,
+        implementation_identity_hash: Option<&str>,
+        validation_result: Option<ValidationResult>,
+        bound_plan_step: Option<(&str, u64)>,
+    ) {
         if self.mode == TaskEvidenceMode::EvidenceOnly {
             if possible_mutation {
                 self.record_host_mutation().await;
@@ -2152,22 +4711,35 @@ impl TaskEvidenceLedger {
         if self.mode != TaskEvidenceMode::Kd4Completion {
             return;
         }
+        let formatter_post_paths = if possible_mutation {
+            self.collect_formatter_post_paths(command, cwd).await
+        } else {
+            Vec::new()
+        };
         let command_succeeded = exit_code == 0 && !timed_out;
         let Some((_, snapshot)) = self
             .update_document(|document| {
+                let action_id = command.join("\u{1f}");
+                let (step_id, step_revision, work_unit_id, attribution) = bound_plan_step
+                    .filter(|(step_id, step_revision)| {
+                        document.plan.iter().any(|step| {
+                            step.id == *step_id && step.revision == *step_revision
+                        })
+                    })
+                    .map(|(step_id, step_revision)| {
+                        (
+                            Some(step_id.to_string()),
+                            Some(step_revision),
+                            None,
+                            ActionAttributionKind::PlannedStep,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        current_action_attribution(document, "command", &action_id)
+                    });
                 if possible_mutation {
-                    invalidate_for_mutation(document);
+                    invalidate_for_mutation(document, None);
                     let epoch = document.evidence_epoch;
-                    if let Some(active_step_id) = document.active_step_id.clone()
-                        && let Some(step) = document
-                            .plan
-                            .iter_mut()
-                            .find(|step| step.id == active_step_id)
-                        && command_succeeded
-                        && !matches!(step.status, StepStatus::Blocked | StepStatus::Skipped)
-                    {
-                        step.status = StepStatus::Implemented;
-                    }
                     upsert_risk(
                         document,
                         EvidenceRisk {
@@ -2187,11 +4759,14 @@ impl TaskEvidenceLedger {
                     &mut document.next_command_receipt_sequence,
                 );
                 let contract_binding = completion_contract_hashes(document, false);
-                document.command_receipts.push(CommandReceipt {
+                let receipt = CommandReceipt {
                     id: receipt_id,
                     recorded_at: timestamp(),
                     epoch: document.evidence_epoch,
-                    step_id: document.active_step_id.clone(),
+                    step_id,
+                    step_revision,
+                    work_unit_id,
+                    attribution: Some(attribution),
                     command: command.to_vec(),
                     cwd: cwd.to_string(),
                     exit_code,
@@ -2208,9 +4783,15 @@ impl TaskEvidenceLedger {
                     requirement_manifest_hash: contract_binding
                         .map(|(_, _, manifest_hash)| manifest_hash),
                     implementation_identity_hash: implementation_identity_hash.map(str::to_string),
+                    validation_result,
                     source_thread_id: provenance.map(|value| value.source_thread_id.clone()),
                     source_agent_path: provenance.map(|value| value.source_agent_path.clone()),
-                });
+                };
+                if command_succeeded && !possible_mutation {
+                    accept_matching_command_proof(document, &receipt);
+                }
+                record_owner_packet_command_outcome(document, &receipt, &formatter_post_paths);
+                document.command_receipts.push(receipt);
                 trim_to_last(&mut document.command_receipts, MAX_COMMAND_RECEIPTS);
                 document.updated_at = timestamp();
                 document.completion = None;
@@ -2220,6 +4801,60 @@ impl TaskEvidenceLedger {
             return;
         };
         self.persist_document(&snapshot).await;
+    }
+
+    async fn collect_formatter_post_paths(
+        &self,
+        command: &[String],
+        cwd: &PathUri,
+    ) -> Vec<OwnerPacketPostMutationPath> {
+        let Some(repo_root) = self.repo_root.as_ref() else {
+            return Vec::new();
+        };
+        let cwd = cwd.to_string();
+        let paths = {
+            let guard = self.document.lock().await;
+            let Some(document) = guard.as_ref() else {
+                return Vec::new();
+            };
+            document
+                .owner_packets
+                .iter()
+                .filter(|packet| packet.contract_epoch == document.contract_epoch)
+                .filter(|packet| {
+                    packet.formatter_route.as_ref().is_some_and(|route| {
+                        owner_command_route_matches_input(
+                            &document.start.repository_root,
+                            route,
+                            command,
+                            &cwd,
+                        )
+                    })
+                })
+                .flat_map(|packet| {
+                    packet
+                        .source_identities
+                        .iter()
+                        .map(|identity| identity.path.clone())
+                        .chain(packet.source_spans.iter().map(|span| span.path.clone()))
+                        .chain(
+                            packet
+                                .target_regions
+                                .iter()
+                                .map(|region| region.path.clone()),
+                        )
+                })
+                .map(|path| normalize_packet_path(&path))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(MAX_OWNER_PACKET_REFERENCES * 2)
+                .collect::<Vec<_>>()
+        };
+        let mut post_paths = Vec::with_capacity(paths.len());
+        for path in paths {
+            post_paths.push(read_owner_post_mutation_path(repo_root, path).await);
+        }
+        post_paths
     }
 
     pub(crate) async fn finalization_advisory(&self) -> Option<String> {
@@ -2495,8 +5130,9 @@ impl TaskEvidenceLedger {
                             == Some(user_source_ledger_hash.as_str())
                         && receipt.requirement_manifest_hash.as_deref()
                             == Some(requirement_manifest_hash.as_str())
-                        && receipt.implementation_identity_hash.as_deref()
+                        && (receipt.implementation_identity_hash.as_deref()
                             == Some(implementation_identity_hash.as_str())
+                            || command_receipt_has_current_proof_identity(document, receipt))
                 })
                 .map(|receipt| {
                     serde_json::json!({
@@ -2832,6 +5468,11 @@ impl TaskEvidenceLedger {
                     || input.infrastructure_outcome != "ok"
                     || input.terminal_outcome.is_some()))
             || input.infrastructure_outcome.trim().is_empty()
+            || (matches!(
+                input.attempt_kind,
+                CompletionReviewAttemptKind::InitialReview | CompletionReviewAttemptKind::Rereview
+            ) && (input.attempt_identity.trim().is_empty()
+                || input.reviewer_contract_hash.trim().is_empty()))
             || !matches!(
                 input.terminal_outcome.as_deref(),
                 None | Some("partial") | Some("blocked")
@@ -3065,6 +5706,8 @@ impl TaskEvidenceLedger {
         let infrastructure_outcome = input.infrastructure_outcome.clone();
         let terminal_outcome = input.terminal_outcome.clone();
         let review_clean = input.review_clean;
+        let attempt_identity = input.attempt_identity.clone();
+        let reviewer_contract_hash = input.reviewer_contract_hash.clone();
         let evidence_path = self
             .evidence_path
             .as_ref()
@@ -3111,6 +5754,14 @@ impl TaskEvidenceLedger {
             )
         });
         self.atomic_review_update(dossier.document_revision, None, None, move |document| {
+            let current_validation_receipt_ids = reconstruct_manifest.then(|| {
+                document
+                    .command_receipts
+                    .iter()
+                    .filter(|receipt| command_receipt_has_current_proof_identity(document, receipt))
+                    .map(|receipt| receipt.id.clone())
+                    .collect::<BTreeSet<_>>()
+            });
             if let Some((replacement_cache_keys, replacement_cache_entries, _, _)) =
                 gap_persistence.as_mut()
             {
@@ -3143,6 +5794,21 @@ impl TaskEvidenceLedger {
                     proof_route: finding.proof_route,
                 })
                 .collect::<Vec<_>>();
+            let requirement =
+                CompletionReviewRequirement::from_obligation_mode(&ledger.obligation.mode);
+            let has_actionable_result = !findings.is_empty()
+                || dispositions.iter().any(|disposition| {
+                    matches!(
+                        disposition.disposition.as_str(),
+                        "still_present" | "insufficient_proof" | "regressed"
+                    )
+                });
+            let (disposition, attempted_outcome) = completion_review_attempt_dimensions(
+                attempt_kind,
+                &infrastructure_outcome,
+                review_clean,
+                has_actionable_result,
+            );
             ledger.receipts.push(CompletionReviewReceiptV2 {
                 review_id: review_id.clone(),
                 attempt_kind,
@@ -3154,6 +5820,8 @@ impl TaskEvidenceLedger {
                 dossier_snapshot_id: dossier.dossier_snapshot_id.clone(),
                 user_source_ledger_hash: dossier.user_source_ledger_hash.clone(),
                 requirement_manifest_hash: dossier.requirement_manifest_hash.clone(),
+                attempt_identity: attempt_identity.clone(),
+                reviewer_contract_hash: reviewer_contract_hash.clone(),
                 findings: findings.clone(),
                 dispositions,
                 manifest_gaps: manifest_gaps.clone(),
@@ -3166,6 +5834,9 @@ impl TaskEvidenceLedger {
                 fallback_reasons: persisted_fallback_reasons,
                 candidate_implementation_identity: persisted_candidate_identity,
                 rereview_audit_hash: persisted_rereview_audit_hash,
+                requirement,
+                disposition,
+                attempted_outcome,
                 infrastructure_outcome,
                 review_clean,
                 terminal_outcome: None,
@@ -3188,6 +5859,8 @@ impl TaskEvidenceLedger {
                     dossier_snapshot_id: dossier.dossier_snapshot_id.clone(),
                     user_source_ledger_hash: dossier.user_source_ledger_hash.clone(),
                     requirement_manifest_hash: dossier.requirement_manifest_hash.clone(),
+                    attempt_identity: attempt_identity.clone(),
+                    reviewer_contract_hash: reviewer_contract_hash.clone(),
                     findings: Vec::new(),
                     dispositions: Vec::new(),
                     manifest_gaps: Vec::new(),
@@ -3200,6 +5873,9 @@ impl TaskEvidenceLedger {
                     fallback_reasons: Vec::new(),
                     candidate_implementation_identity: None,
                     rereview_audit_hash: None,
+                    requirement,
+                    disposition: CompletionReviewDisposition::NotApplicable,
+                    attempted_outcome: None,
                     infrastructure_outcome: "ok".to_string(),
                     review_clean: false,
                     terminal_outcome: Some(outcome.to_string()),
@@ -3256,8 +5932,9 @@ impl TaskEvidenceLedger {
                     .map(|cycle| cycle.cycle_id.clone());
                 ledger.review_risk.opened_at = Some(timestamp());
                 ledger.review_risk.resolved_at = None;
-                document.evidence_epoch = document.evidence_epoch.saturating_add(1);
-                document.desktop_activation_receipt = None;
+                // Reconstructing a review manifest is observational bookkeeping.  It does
+                // not mutate the candidate or invalidate otherwise-current ordinary proof;
+                // the fresh review cycle is what validates the corrected review surface.
             } else if let Some(cycle) = ledger.active_review_cycle.as_mut() {
                 if terminal_outcome.as_deref() == Some("partial") {
                     cycle.phase = CompletionReviewCyclePhase::TerminalPartial;
@@ -3288,8 +5965,7 @@ impl TaskEvidenceLedger {
                             cycle.phase = if review_clean {
                                 CompletionReviewCyclePhase::ProvisionalClean
                             } else {
-                                cycle.correction_consumed = false;
-                                CompletionReviewCyclePhase::CorrectionPending
+                                CompletionReviewCyclePhase::TerminalPartial
                             };
                         }
                         CompletionReviewAttemptKind::TerminalClosure => unreachable!(),
@@ -3298,7 +5974,21 @@ impl TaskEvidenceLedger {
                 if review_clean && !needs_correction && terminal_outcome.is_none() {
                     cycle.accepted_review_id = Some(review_id.clone());
                     cycle.accepted_dossier_snapshot_id = Some(dossier.dossier_snapshot_id.clone());
+                    if ledger.obligation.mode == "mandatory"
+                        && ledger.obligation.required_attempt_identity.as_deref()
+                            == Some(attempt_identity.as_str())
+                    {
+                        ledger.obligation.satisfied_attempt_identity =
+                            Some(attempt_identity.clone());
+                    }
                 }
+                // Every persisted review attempt remains an unresolved review risk until the
+                // terminal closure is committed atomically.  Classification can create the
+                // cycle before `begin_completion_review_cycle` is called, so do not rely on
+                // that transition alone to establish this invariant.
+                ledger.review_risk.unresolved = true;
+                ledger.review_risk.cycle_id = Some(cycle.cycle_id.clone());
+                ledger.review_risk.resolved_at = None;
             }
             if let Some(terminal_closure_id) = terminal_closure_id {
                 ledger.last_terminal_closure = Some(terminal_closure_id);
@@ -3322,6 +6012,18 @@ impl TaskEvidenceLedger {
             } else {
                 document.completion = None;
             }
+            if let Some(current_validation_receipt_ids) = current_validation_receipt_ids
+                && let Some((manifest_revision, source_hash, manifest_hash)) =
+                    completion_contract_hashes(document, false)
+            {
+                for receipt in &mut document.command_receipts {
+                    if current_validation_receipt_ids.contains(&receipt.id) {
+                        receipt.manifest_revision = Some(manifest_revision);
+                        receipt.user_source_ledger_hash = Some(source_hash.clone());
+                        receipt.requirement_manifest_hash = Some(manifest_hash.clone());
+                    }
+                }
+            }
             document.updated_at = timestamp();
             RecordedReviewAttempt {
                 review_id,
@@ -3337,9 +6039,6 @@ impl TaskEvidenceLedger {
     ) -> AtomicReviewTransition<TaskCompletionGate> {
         if self.user_source_capture_failed()
             || !dossier.mappings_classified
-            || !dossier.typed_quiescent
-            || !dossier.default_children_quiescent
-            || dossier.evidence_gate.status != TaskCompletionStatus::Passed
             || dossier.sources.iter().any(|source| {
                 source.availability != UserSourceAvailability::Available
                     || matches!(
@@ -3356,7 +6055,11 @@ impl TaskEvidenceLedger {
         let Some(accepted_review_id) = dossier.accepted_review_id.clone() else {
             return AtomicReviewTransition::Failed;
         };
-        {
+        let (
+            accepted_attempt_identity,
+            accepted_reviewer_contract_hash,
+            accepted_dossier_snapshot_id,
+        ) = {
             let guard = self.document.lock().await;
             let Some(document) = guard.as_ref() else {
                 return AtomicReviewTransition::Failed;
@@ -3374,50 +6077,35 @@ impl TaskEvidenceLedger {
             else {
                 return AtomicReviewTransition::Failed;
             };
-            let activation_required = document
-                .plan
-                .iter()
-                .any(|step| step.requires_desktop_activation);
-            let activation_current = !activation_required
-                || document
-                    .desktop_activation_receipt
-                    .as_ref()
-                    .is_some_and(|receipt| {
-                        desktop_activation_receipt_is_complete(receipt)
-                            && receipt.epoch == document.evidence_epoch
-                            && receipt.implementation_identity_hash.as_deref()
-                                == Some(dossier.implementation_identity_hash.as_str())
-                    });
             if document.revision != dossier.document_revision
                 || !ledger.review_risk.unresolved
                 || cycle.phase != CompletionReviewCyclePhase::ProvisionalClean
                 || cycle.accepted_review_id.as_deref() != Some(accepted_review_id.as_str())
                 || cycle.accepted_dossier_snapshot_id.as_deref()
-                    != Some(dossier.dossier_snapshot_id.as_str())
+                    != Some(accepted.dossier_snapshot_id.as_str())
                 || !accepted.review_clean
                 || accepted.terminal_outcome.is_some()
                 || accepted.implementation_identity_hash != dossier.implementation_identity_hash
-                || accepted.dossier_snapshot_id != dossier.dossier_snapshot_id
-                || !activation_current
+                || accepted.user_source_ledger_hash != dossier.user_source_ledger_hash
+                || accepted.requirement_manifest_hash != dossier.requirement_manifest_hash
             {
                 return AtomicReviewTransition::Superseded;
             }
-        }
+            (
+                accepted.attempt_identity.clone(),
+                accepted.reviewer_contract_hash.clone(),
+                accepted.dossier_snapshot_id.clone(),
+            )
+        };
 
         let accepted_parent = accepted_review_id.clone();
-        let completion = TaskCompletionGate {
-            status: TaskCompletionStatus::Passed,
-            reasons: Vec::new(),
-            evidence_path: self
-                .evidence_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-        };
+        let completion = dossier.evidence_gate.clone();
+        let terminal_outcome = completion_status_name(completion.status).to_string();
         let transition = self
             .atomic_review_update(
                 dossier.document_revision,
                 Some(&dossier.implementation_identity_hash),
-                Some(&dossier.dossier_snapshot_id),
+                Some(&accepted_dossier_snapshot_id),
                 |document| {
                     let Some(ledger) = document.completion_review_v2.as_mut() else {
                         unreachable!("V2 dossier requires a V2 ledger");
@@ -3437,9 +6125,11 @@ impl TaskEvidenceLedger {
                         candidate_mutation_revision: dossier.host_mutation_revision,
                         candidate_hash: dossier.implementation_identity_hash.clone(),
                         implementation_identity_hash: dossier.implementation_identity_hash.clone(),
-                        dossier_snapshot_id: dossier.dossier_snapshot_id.clone(),
+                        dossier_snapshot_id: accepted_dossier_snapshot_id.clone(),
                         user_source_ledger_hash: dossier.user_source_ledger_hash.clone(),
                         requirement_manifest_hash: dossier.requirement_manifest_hash.clone(),
+                        attempt_identity: accepted_attempt_identity.clone(),
+                        reviewer_contract_hash: accepted_reviewer_contract_hash.clone(),
                         findings: Vec::new(),
                         dispositions: Vec::new(),
                         manifest_gaps: Vec::new(),
@@ -3452,9 +6142,14 @@ impl TaskEvidenceLedger {
                         fallback_reasons: Vec::new(),
                         candidate_implementation_identity: None,
                         rereview_audit_hash: None,
+                        requirement: CompletionReviewRequirement::from_obligation_mode(
+                            &ledger.obligation.mode,
+                        ),
+                        disposition: CompletionReviewDisposition::NotApplicable,
+                        attempted_outcome: None,
                         infrastructure_outcome: "ok".to_string(),
                         review_clean: true,
-                        terminal_outcome: Some("passed".to_string()),
+                        terminal_outcome: Some(terminal_outcome.clone()),
                         recorded_at: timestamp(),
                     });
                     if let Some(cycle) = ledger.active_review_cycle.as_mut() {
@@ -3509,6 +6204,13 @@ impl TaskEvidenceLedger {
         else {
             return false;
         };
+        let Some(accepted) = ledger
+            .receipts
+            .iter()
+            .find(|receipt| receipt.review_id == accepted_review_id)
+        else {
+            return false;
+        };
         document.revision == dossier.document_revision
             && document
                 .completion
@@ -3517,12 +6219,16 @@ impl TaskEvidenceLedger {
             && cycle.phase == CompletionReviewCyclePhase::Closed
             && !ledger.review_risk.unresolved
             && cycle.accepted_dossier_snapshot_id.as_deref()
-                == Some(dossier.dossier_snapshot_id.as_str())
+                == Some(accepted.dossier_snapshot_id.as_str())
+            && accepted.review_clean
+            && accepted.implementation_identity_hash == dossier.implementation_identity_hash
+            && accepted.user_source_ledger_hash == dossier.user_source_ledger_hash
+            && accepted.requirement_manifest_hash == dossier.requirement_manifest_hash
             && terminal.attempt_kind == CompletionReviewAttemptKind::TerminalClosure
             && terminal.terminal_outcome.as_deref() == Some("passed")
             && terminal.parent_review_id.as_deref() == Some(accepted_review_id)
+            && receipt_identity_matches(terminal, accepted)
             && terminal.implementation_identity_hash == dossier.implementation_identity_hash
-            && terminal.dossier_snapshot_id == dossier.dossier_snapshot_id
             && terminal.user_source_ledger_hash == dossier.user_source_ledger_hash
             && terminal.requirement_manifest_hash == dossier.requirement_manifest_hash
     }
@@ -3671,6 +6377,8 @@ impl TaskEvidenceLedger {
                 dossier_snapshot_id: superseded.dossier_snapshot_id.clone(),
                 user_source_ledger_hash: superseded.user_source_ledger_hash.clone(),
                 requirement_manifest_hash: superseded.requirement_manifest_hash,
+                attempt_identity: superseded.attempt_identity.clone(),
+                reviewer_contract_hash: superseded.reviewer_contract_hash.clone(),
                 findings: Vec::new(),
                 dispositions: Vec::new(),
                 manifest_gaps: Vec::new(),
@@ -3683,6 +6391,9 @@ impl TaskEvidenceLedger {
                 fallback_reasons: Vec::new(),
                 candidate_implementation_identity: None,
                 rereview_audit_hash: None,
+                requirement: superseded.requirement,
+                disposition: CompletionReviewDisposition::NotApplicable,
+                attempted_outcome: None,
                 infrastructure_outcome: format!("terminal_emission_failure:{reason}"),
                 review_clean: false,
                 terminal_outcome: Some("partial".to_string()),
@@ -3753,53 +6464,63 @@ impl TaskEvidenceLedger {
         let classified_manifest_revision = dossier.manifest_revision.saturating_add(1);
         let manifest_hash = requirement_manifest_hash(classified_manifest_revision, &requirements);
         self.atomic_review_update(dossier.document_revision, None, None, move |document| {
+            let current_validation_receipt_ids = document
+                .command_receipts
+                .iter()
+                .filter(|receipt| command_receipt_has_current_proof_identity(document, receipt))
+                .map(|receipt| receipt.id.clone())
+                .collect::<BTreeSet<_>>();
             document
                 .source_classification_cache
                 .retain(|entry| !replacement_cache_keys.contains(&entry.key()));
             document
                 .source_classification_cache
                 .extend(replacement_cache_entries);
-            let Some(ledger) = document.completion_review_v2.as_mut() else {
-                return;
-            };
-            ledger
-                .mapping_revisions
-                .extend(
-                    mappings
-                        .into_iter()
-                        .map(|(source_id, mapping)| SourceMappingRevision {
-                            completion_epoch: ledger.completion_epoch,
-                            manifest_revision: classified_manifest_revision,
-                            source_id,
-                            source_classification_contract_version: Some(
-                                SOURCE_CLASSIFICATION_CONTRACT_VERSION.to_string(),
-                            ),
-                            relationship_resolver_contract_version: Some(
-                                RELATIONSHIP_RESOLVER_CONTRACT_VERSION.to_string(),
-                            ),
-                            mapping,
-                        }),
-                );
-            ledger.manifest_snapshots.push(RequirementManifestSnapshot {
-                completion_epoch: ledger.completion_epoch,
-                manifest_revision: classified_manifest_revision,
-                manifest_hash,
-                requirements,
-            });
-            ledger.manifest_revision = classified_manifest_revision;
-            if let Some(cycle) = ledger.active_review_cycle.as_mut() {
-                cycle.cycle_id = format!(
-                    "cycle-{}-{classified_manifest_revision}",
-                    ledger.completion_epoch
-                );
-                cycle.manifest_revision = classified_manifest_revision;
-                cycle.phase = CompletionReviewCyclePhase::InitialReviewPending;
-                cycle.accepted_review_id = None;
-                cycle.accepted_dossier_snapshot_id = None;
+            {
+                let Some(ledger) = document.completion_review_v2.as_mut() else {
+                    return;
+                };
+                ledger.mapping_revisions.extend(mappings.into_iter().map(
+                    |(source_id, mapping)| SourceMappingRevision {
+                        completion_epoch: ledger.completion_epoch,
+                        manifest_revision: classified_manifest_revision,
+                        source_id,
+                        source_classification_contract_version: Some(
+                            SOURCE_CLASSIFICATION_CONTRACT_VERSION.to_string(),
+                        ),
+                        relationship_resolver_contract_version: Some(
+                            RELATIONSHIP_RESOLVER_CONTRACT_VERSION.to_string(),
+                        ),
+                        mapping,
+                    },
+                ));
+                ledger.manifest_snapshots.push(RequirementManifestSnapshot {
+                    completion_epoch: ledger.completion_epoch,
+                    manifest_revision: classified_manifest_revision,
+                    manifest_hash,
+                    requirements,
+                });
+                ledger.manifest_revision = classified_manifest_revision;
+                if let Some(cycle) = ledger.active_review_cycle.as_mut()
+                    && cycle.phase == CompletionReviewCyclePhase::ClassificationPending
+                {
+                    cycle.manifest_revision = classified_manifest_revision;
+                    cycle.phase = CompletionReviewCyclePhase::InitialReviewPending;
+                }
             }
-            document.evidence_epoch = document.evidence_epoch.saturating_add(1);
-            document.desktop_activation_receipt = None;
-            document.completion = None;
+            if let Some((manifest_revision, source_hash, manifest_hash)) =
+                completion_contract_hashes(document, false)
+            {
+                for receipt in &mut document.command_receipts {
+                    if current_validation_receipt_ids.contains(&receipt.id) {
+                        receipt.manifest_revision = Some(manifest_revision);
+                        receipt.user_source_ledger_hash = Some(source_hash.clone());
+                        receipt.requirement_manifest_hash = Some(manifest_hash.clone());
+                    }
+                }
+            }
+            // Source classification is observational review materialization. It
+            // must not invalidate ordinary validation or completion proof.
             document.updated_at = timestamp();
         })
         .await
@@ -3881,6 +6602,26 @@ impl TaskEvidenceLedger {
         finding_summary: Vec<String>,
         repair_injected: bool,
     ) -> bool {
+        self.record_completion_review_audit_with_measurements(
+            turn_id,
+            outcome,
+            failure_category,
+            finding_summary,
+            repair_injected,
+            CompletionReviewAuditMeasurements::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn record_completion_review_audit_with_measurements(
+        &self,
+        turn_id: &str,
+        outcome: &str,
+        failure_category: Option<&str>,
+        finding_summary: Vec<String>,
+        repair_injected: bool,
+        measurements: CompletionReviewAuditMeasurements,
+    ) -> bool {
         if !self.allows_kd4_completion() {
             return false;
         }
@@ -3896,6 +6637,7 @@ impl TaskEvidenceLedger {
                         failure_category: failure_category.map(str::to_string),
                         finding_summary,
                         repair_injected,
+                        measurements,
                     });
                 trim_to_last(
                     &mut document.completion_review_receipts,
@@ -3912,6 +6654,616 @@ impl TaskEvidenceLedger {
             return false;
         }
         true
+    }
+
+    pub(crate) async fn synchronize_completion_review_obligation(
+        &self,
+        input: CompletionReviewObligationInput,
+    ) -> AtomicReviewTransition<()> {
+        if !matches!(
+            input.mode.as_str(),
+            "mandatory" | "supplemental" | "disabled"
+        ) || (input.mode == "mandatory"
+            && (input.requirement_ids.is_empty() || input.obligation_hash.is_empty()))
+        {
+            return AtomicReviewTransition::Failed;
+        }
+        let Some(expected_revision) = self.document_revision().await else {
+            return AtomicReviewTransition::Failed;
+        };
+        self.atomic_review_update(expected_revision, None, None, move |document| {
+            let Some(ledger) = document.completion_review_v2.as_mut() else {
+                return;
+            };
+            let changed = ledger.obligation.mode != input.mode
+                || ledger.obligation.requirement_ids != input.requirement_ids
+                || ledger.obligation.obligation_hash != input.obligation_hash;
+            if changed {
+                ledger.obligation = CompletionReviewObligationState {
+                    mode: input.mode.clone(),
+                    requirement_ids: input.requirement_ids.clone(),
+                    obligation_hash: input.obligation_hash.clone(),
+                    required_attempt_identity: input.required_attempt_identity.clone(),
+                    satisfied_attempt_identity: None,
+                };
+                if input.mode == "mandatory" {
+                    document.completion = None;
+                }
+            } else if let Some(identity) = input.required_attempt_identity
+                && ledger.obligation.required_attempt_identity.as_deref() != Some(identity.as_str())
+            {
+                ledger.obligation.required_attempt_identity = Some(identity);
+                ledger.obligation.satisfied_attempt_identity = None;
+                if ledger.obligation.mode == "mandatory" {
+                    document.completion = None;
+                }
+            }
+            document.updated_at = timestamp();
+        })
+        .await
+    }
+
+    pub(crate) async fn prior_completion_review_attempt(
+        &self,
+        attempt_identity: &str,
+    ) -> Option<PriorCompletionReviewAttempt> {
+        let guard = self.document.lock().await;
+        let document = guard.as_ref()?;
+        if let Some(receipt) = document
+            .completion_review_v2
+            .as_ref()?
+            .receipts
+            .iter()
+            .rev()
+            .find(|receipt| {
+                receipt.attempt_identity == attempt_identity
+                    && receipt.attempt_kind != CompletionReviewAttemptKind::TerminalClosure
+            })
+        {
+            if receipt.review_clean && receipt.infrastructure_outcome == "ok" {
+                return Some(PriorCompletionReviewAttempt::Clean);
+            }
+            if !receipt.findings.is_empty() && receipt.infrastructure_outcome == "ok" {
+                return Some(PriorCompletionReviewAttempt::Actionable);
+            }
+        }
+        document
+            .completion_review_receipts
+            .iter()
+            .rev()
+            .find(|receipt| {
+                receipt.measurements.attempt_identity == attempt_identity
+                    && receipt.measurements.failure_class == "deterministic"
+            })
+            .map(|_| PriorCompletionReviewAttempt::DeterministicInfrastructure)
+    }
+
+    pub(crate) async fn reviewer_infrastructure_memo_matches(
+        &self,
+        candidate_id: &str,
+        dossier_id: &str,
+        reviewer_configuration_identity: &str,
+        infrastructure_condition_identity: &str,
+    ) -> bool {
+        let identity = reviewer_infrastructure_memo_identity(
+            candidate_id,
+            dossier_id,
+            reviewer_configuration_identity,
+            infrastructure_condition_identity,
+        );
+        self.document
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|document| document.final_proof.reviewer_infrastructure_memo.as_ref())
+            .is_some_and(|memo| memo.identity == identity)
+    }
+
+    pub(crate) async fn record_reviewer_infrastructure_memo(
+        &self,
+        candidate_id: String,
+        dossier_id: String,
+        reviewer_configuration_identity: String,
+        infrastructure_condition_identity: String,
+        outcome: String,
+    ) -> bool {
+        let identity = reviewer_infrastructure_memo_identity(
+            &candidate_id,
+            &dossier_id,
+            &reviewer_configuration_identity,
+            &infrastructure_condition_identity,
+        );
+        let Some(((), snapshot)) = self
+            .update_document(move |document| {
+                document.final_proof.reviewer_infrastructure_memo =
+                    Some(ReviewerInfrastructureMemoV1 {
+                        identity,
+                        candidate_id,
+                        dossier_id,
+                        reviewer_configuration_identity,
+                        infrastructure_condition_identity,
+                        outcome,
+                    });
+                document.updated_at = timestamp();
+            })
+            .await
+        else {
+            return false;
+        };
+        self.persist_document(&snapshot).await == PersistOutcome::Persisted
+    }
+
+    pub(crate) async fn reuse_completion_review_clean_proof(
+        &self,
+        attempt_identity: &str,
+    ) -> AtomicReviewTransition<()> {
+        let Some(expected_revision) = self.document_revision().await else {
+            return AtomicReviewTransition::Failed;
+        };
+        let attempt_identity = attempt_identity.to_string();
+        self.atomic_review_update(expected_revision, None, None, move |document| {
+            let Some(ledger) = document.completion_review_v2.as_mut() else {
+                return;
+            };
+            let reusable = ledger.receipts.iter().any(|receipt| {
+                receipt.attempt_identity == attempt_identity
+                    && receipt.review_clean
+                    && receipt.infrastructure_outcome == "ok"
+            });
+            if reusable
+                && ledger.obligation.mode == "mandatory"
+                && ledger.obligation.required_attempt_identity.as_deref()
+                    == Some(attempt_identity.as_str())
+            {
+                ledger.obligation.satisfied_attempt_identity = Some(attempt_identity);
+            }
+            document.updated_at = timestamp();
+        })
+        .await
+    }
+
+    pub(crate) async fn abandon_completion_review_cycle(
+        &self,
+        dossier: &CompletionReviewDossier,
+    ) -> AtomicReviewTransition<()> {
+        self.atomic_review_update(dossier.document_revision, None, None, |document| {
+            let Some(ledger) = document.completion_review_v2.as_mut() else {
+                return;
+            };
+            if let Some(cycle) = ledger.active_review_cycle.as_mut() {
+                cycle.phase = CompletionReviewCyclePhase::Closed;
+                cycle.accepted_review_id = None;
+                cycle.accepted_dossier_snapshot_id = None;
+            }
+            ledger.review_risk.unresolved = false;
+            ledger.review_risk.resolved_at = Some(timestamp());
+            document.updated_at = timestamp();
+        })
+        .await
+    }
+
+    pub(crate) async fn completion_review_has_lineage(&self) -> bool {
+        self.document
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|document| document.completion_review_v2.as_ref())
+            .and_then(|ledger| ledger.active_review_cycle.as_ref())
+            .is_some_and(|cycle| cycle.phase != CompletionReviewCyclePhase::Closed)
+    }
+
+    /// Returns the correctness identities owned by task evidence for the final
+    /// proof boundary. The caller adds host-owned workspace, environment, diff,
+    /// and reviewer identities only after terminal quiescence is established.
+    pub(crate) async fn final_proof_identity_snapshot(
+        &self,
+    ) -> Option<FinalProofIdentitySnapshotV1> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
+        let guard = self.document.lock().await;
+        let document = guard.as_ref()?;
+        let completion_review = document.completion_review_v2.as_ref();
+        let source_identity = completion_review
+            .map(|ledger| {
+                user_source_ledger_snapshot_hash(
+                    ledger,
+                    ledger.completion_epoch,
+                    ledger.manifest_revision,
+                    ledger.source_capture_failed,
+                )
+            })
+            .unwrap_or_else(|| canonical_hash("KD4_EMPTY_USER_SOURCE_LEDGER_V1", &Value::Null));
+        let requirement_identity = completion_review
+            .and_then(active_manifest)
+            .map(|manifest| manifest.manifest_hash.clone())
+            .unwrap_or_else(|| canonical_hash("KD4_EMPTY_REQUIREMENT_MANIFEST_V1", &Value::Null));
+        let implementation_identity = document
+            .command_receipts
+            .iter()
+            .rev()
+            .find(|receipt| {
+                receipt.epoch == document.evidence_epoch
+                    && receipt.host_mutation_revision == Some(document.host_mutation_revision)
+                    && receipt.user_source_ledger_hash.as_deref() == Some(source_identity.as_str())
+                    && receipt.requirement_manifest_hash.as_deref()
+                        == Some(requirement_identity.as_str())
+            })
+            .and_then(|receipt| receipt.implementation_identity_hash.clone())
+            .unwrap_or_else(|| {
+                canonical_hash(
+                    "KD4_FINAL_PROOF_IMPLEMENTATION_IDENTITY_V1",
+                    &serde_json::json!({
+                        "evidence_epoch": document.evidence_epoch,
+                        "host_mutation_revision": document.host_mutation_revision,
+                        "plan": document.plan,
+                        "work_unit": document.planning.work_unit,
+                        "latest_file_hashes": document.latest_file_hashes,
+                    }),
+                )
+            });
+        let mut changed_paths = document
+            .latest_file_hashes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        changed_paths.sort();
+        changed_paths.dedup();
+        let workspace_path_snapshot_identity = canonical_hash(
+            "KD4_FINAL_PROOF_WORKSPACE_PATH_SNAPSHOTS_V1",
+            &serde_json::to_value(&document.latest_file_hashes).unwrap_or(Value::Null),
+        );
+        Some(FinalProofIdentitySnapshotV1 {
+            implementation_identity,
+            source_identity,
+            requirement_identity,
+            task_evidence_epoch: document.evidence_epoch,
+            host_mutation_revision: document.host_mutation_revision,
+            changed_paths,
+            workspace_path_snapshot_identity,
+        })
+    }
+
+    pub(crate) async fn pre_review_final_proof_reasons(
+        &self,
+        implementation_identity: &str,
+        source_identity: &str,
+        requirement_identity: &str,
+    ) -> Vec<String> {
+        let guard = self.document.lock().await;
+        let Some(document) = guard.as_ref() else {
+            return vec!["task evidence is unavailable for final-proof preflight".to_string()];
+        };
+        let mut reasons = derive_completion_gate(document, self.evidence_path.as_deref()).reasons;
+        let routes = document.plan.iter().filter(|step| {
+            step.validation_disposition != ValidationDisposition::NotRequired
+                || step.validation_route.is_some()
+        });
+        for step in routes {
+            let Some(route) = step.validation_route.as_ref() else {
+                reasons.push(format!(
+                    "validation obligation `{}` has no structured route",
+                    step.id
+                ));
+                continue;
+            };
+            for leaf in &route.leaves {
+                let has_current_proof = document.command_receipts.iter().rev().any(|receipt| {
+                    receipt.command == leaf.argv
+                        && receipt.user_source_ledger_hash.as_deref() == Some(source_identity)
+                        && receipt.requirement_manifest_hash.as_deref()
+                            == Some(requirement_identity)
+                        && (receipt.implementation_identity_hash.as_deref()
+                            == Some(implementation_identity)
+                            || command_receipt_has_current_proof_identity(document, receipt))
+                });
+                if !has_current_proof {
+                    reasons.push(format!(
+                        "validation proof for obligation `{}` is missing, failed, or stale",
+                        step.id
+                    ));
+                }
+            }
+        }
+        if document.plan.is_empty()
+            && let Some(work_unit) = document.planning.work_unit.as_ref()
+            && (work_unit.validation_disposition != ValidationDisposition::NotRequired
+                || work_unit.validation_route.is_some())
+        {
+            if let Some(route) = work_unit.validation_route.as_ref() {
+                for leaf in &route.leaves {
+                    let has_current_proof = document.command_receipts.iter().rev().any(|receipt| {
+                        receipt.command == leaf.argv
+                            && receipt.user_source_ledger_hash.as_deref() == Some(source_identity)
+                            && receipt.requirement_manifest_hash.as_deref()
+                                == Some(requirement_identity)
+                            && (receipt.implementation_identity_hash.as_deref()
+                                == Some(implementation_identity)
+                                || command_receipt_has_current_proof_identity(document, receipt))
+                    });
+                    if !has_current_proof {
+                        reasons.push(format!(
+                            "validation proof for obligation `{}` is missing, failed, or stale",
+                            work_unit.id
+                        ));
+                    }
+                }
+            } else {
+                reasons.push(format!(
+                    "validation obligation `{}` has no structured route",
+                    work_unit.id
+                ));
+            }
+        }
+        reasons.sort();
+        reasons.dedup();
+        reasons
+    }
+
+    /// Seals the correctness-affecting completion basis and its deterministic
+    /// validation plan. Callers must establish mutation/hook/child quiescence and
+    /// the existing workspace-finalization fence before invoking this boundary.
+    pub(crate) async fn seal_final_proof_candidate(
+        &self,
+        input: FinalProofSealInputV1,
+    ) -> Option<FinalProofSealResultV1> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
+        let evidence_path = self
+            .evidence_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let ((result, changed), snapshot) = self
+            .update_document(move |document| {
+                let basis = completion_candidate_basis(document, &input);
+                let validation_plan = validation_plan_for_basis(document, &basis);
+                let candidate = completion_candidate_for(&basis, &validation_plan);
+                let mut diff_snapshot = input.diff_snapshot.clone();
+                diff_snapshot
+                    .candidate_id
+                    .clone_from(&candidate.candidate_id);
+                diff_snapshot.bounded_hunks = truncate_checkpoint_hunks(
+                    &diff_snapshot.bounded_hunks,
+                    MAX_COMPLETION_CHECKPOINT_HUNK_BYTES,
+                );
+
+                let proof_observations = current_final_proof_observations(
+                    document,
+                    &basis,
+                    &candidate,
+                    &validation_plan,
+                );
+                let mut gate = derive_completion_gate(document, self.evidence_path.as_deref());
+                let missing_or_failed = missing_or_failed_obligations(
+                    &candidate,
+                    &validation_plan,
+                    &proof_observations,
+                );
+                let mut structured_reasons = document.final_proof.reasons.clone();
+                for obligation_id in &missing_or_failed {
+                    let occurrence = format!(
+                        "final proof obligation {obligation_id} is missing, failed, or stale"
+                    );
+                    gate.reasons.push(occurrence.clone());
+                    merge_completion_reason(
+                        &mut structured_reasons,
+                        "missing_failed_or_stale_proof",
+                        std::slice::from_ref(obligation_id),
+                        &[],
+                        &[],
+                        document.evidence_epoch,
+                        &occurrence,
+                        None,
+                    );
+                }
+                if validation_plan.ambiguous_or_unmappable {
+                    let occurrence =
+                        "the sealed validation plan is ambiguous or unmappable".to_string();
+                    gate.reasons.push(occurrence.clone());
+                    merge_completion_reason(
+                        &mut structured_reasons,
+                        "invalid_validation_plan",
+                        &[],
+                        &[],
+                        &[],
+                        document.evidence_epoch,
+                        &occurrence,
+                        None,
+                    );
+                }
+                if !basis.child_gate_state.is_empty() {
+                    for state in &basis.child_gate_state {
+                        let occurrence = format!("child or typed gate is not clear: {state}");
+                        gate.reasons.push(occurrence.clone());
+                        merge_completion_reason(
+                            &mut structured_reasons,
+                            "child_or_typed_gate_blocked",
+                            &[],
+                            &[],
+                            &[],
+                            document.evidence_epoch,
+                            &occurrence,
+                            None,
+                        );
+                    }
+                }
+                gate.reasons.sort();
+                gate.reasons.dedup();
+                if !gate.reasons.is_empty() && gate.status == TaskCompletionStatus::Passed {
+                    gate.status = TaskCompletionStatus::Partial;
+                }
+
+                let failure_fingerprint = completion_failure_fingerprint(
+                    document.evidence_epoch,
+                    &candidate,
+                    &missing_or_failed,
+                    &basis.child_gate_state,
+                    None,
+                );
+                if document.final_proof.candidate.as_ref() == Some(&candidate)
+                    && document.final_proof.failure_fingerprint.as_ref()
+                        == Some(&failure_fingerprint)
+                    && let Some(decision) = document.final_proof.terminal_decision.clone()
+                {
+                    return (FinalProofSealResultV1::Memoized(decision), false);
+                }
+
+                let checkpoint = match completion_checkpoint_for(
+                    document,
+                    &basis,
+                    &candidate,
+                    &validation_plan,
+                    &diff_snapshot,
+                    &proof_observations,
+                    input.checkpoint_token_budget,
+                ) {
+                    Ok(checkpoint) => checkpoint,
+                    Err(reason) => {
+                        gate.status = TaskCompletionStatus::Partial;
+                        gate.reasons.push(reason.clone());
+                        gate.reasons.sort();
+                        gate.reasons.dedup();
+                        merge_completion_reason(
+                            &mut structured_reasons,
+                            "checkpoint_preflight_failed",
+                            &[],
+                            &[],
+                            &[],
+                            document.evidence_epoch,
+                            &reason,
+                            None,
+                        );
+                        document.final_proof = FinalProofStateV1 {
+                            basis: Some(basis),
+                            validation_plan: Some(validation_plan),
+                            candidate: Some(candidate),
+                            diff_snapshot: Some(diff_snapshot),
+                            proof_observations,
+                            failure_fingerprint: Some(failure_fingerprint),
+                            terminal_decision: Some(gate.clone()),
+                            reasons: structured_reasons,
+                            reviewer_infrastructure_memo: document
+                                .final_proof
+                                .reviewer_infrastructure_memo
+                                .clone(),
+                            repair_count_by_lineage: document
+                                .final_proof
+                                .repair_count_by_lineage
+                                .clone(),
+                            ..FinalProofStateV1::default()
+                        };
+                        document.completion = Some(gate.clone());
+                        document.updated_at = timestamp();
+                        return (FinalProofSealResultV1::PreflightFailed(gate), true);
+                    }
+                };
+
+                document.final_proof = FinalProofStateV1 {
+                    basis: Some(basis),
+                    validation_plan: Some(validation_plan.clone()),
+                    candidate: Some(candidate.clone()),
+                    diff_snapshot: Some(diff_snapshot),
+                    proof_observations,
+                    failure_fingerprint: Some(failure_fingerprint),
+                    terminal_decision: Some(gate.clone()),
+                    reasons: structured_reasons,
+                    checkpoint: Some(checkpoint.clone()),
+                    reviewer_infrastructure_memo: document
+                        .final_proof
+                        .reviewer_infrastructure_memo
+                        .clone(),
+                    finalization_memo: document.final_proof.finalization_memo.clone().filter(
+                        |memo| {
+                            memo.candidate_id == candidate.candidate_id
+                                && memo.checkpoint_id == checkpoint.checkpoint_id
+                        },
+                    ),
+                    repair_count_by_lineage: document.final_proof.repair_count_by_lineage.clone(),
+                };
+                document.updated_at = timestamp();
+                (
+                    FinalProofSealResultV1::Sealed {
+                        candidate,
+                        validation_plan,
+                        checkpoint: Box::new(checkpoint),
+                        gate,
+                    },
+                    true,
+                )
+            })
+            .await?;
+        if changed {
+            match self.persist_document(&snapshot).await {
+                PersistOutcome::Persisted => {}
+                PersistOutcome::Superseded | PersistOutcome::Failed => {
+                    return Some(FinalProofSealResultV1::PreflightFailed(
+                        TaskCompletionGate {
+                            status: TaskCompletionStatus::Partial,
+                            reasons: vec![
+                                "the sealed final-proof state could not be durably persisted"
+                                    .to_string(),
+                            ],
+                            evidence_path,
+                        },
+                    ));
+                }
+            }
+        }
+        Some(result)
+    }
+
+    pub(crate) async fn completion_checkpoint_payload(&self) -> Option<(String, String)> {
+        let guard = self.document.lock().await;
+        let checkpoint = guard.as_ref()?.final_proof.checkpoint.as_ref()?;
+        Some((
+            checkpoint.checkpoint_id.clone(),
+            checkpoint.canonical_payload()?,
+        ))
+    }
+
+    pub(crate) async fn memoized_finalization_result(&self) -> Option<String> {
+        let guard = self.document.lock().await;
+        let document = guard.as_ref()?;
+        let candidate = document.final_proof.candidate.as_ref()?;
+        let checkpoint = document.final_proof.checkpoint.as_ref()?;
+        let memo = document.final_proof.finalization_memo.as_ref()?;
+        (memo.candidate_id == candidate.candidate_id
+            && memo.checkpoint_id == checkpoint.checkpoint_id)
+            .then(|| memo.final_message.clone())
+    }
+
+    pub(crate) async fn record_finalization_result(&self, final_message: String) -> bool {
+        let Some((recorded, snapshot)) = self
+            .update_document(|document| {
+                let (Some(candidate), Some(checkpoint)) = (
+                    document.final_proof.candidate.as_ref(),
+                    document.final_proof.checkpoint.as_ref(),
+                ) else {
+                    return false;
+                };
+                let identity = canonical_hash(
+                    "KD4_COMPLETION_FINALIZATION_MEMO_V1",
+                    &serde_json::json!({
+                        "candidate_id": candidate.candidate_id,
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "final_message": final_message,
+                    }),
+                );
+                document.final_proof.finalization_memo = Some(CompletionFinalizationMemoV1 {
+                    identity,
+                    candidate_id: candidate.candidate_id.clone(),
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    final_message,
+                });
+                document.updated_at = timestamp();
+                true
+            })
+            .await
+        else {
+            return false;
+        };
+        recorded && self.persist_document(&snapshot).await == PersistOutcome::Persisted
     }
 
     pub(crate) async fn completion_gate(&self) -> Option<TaskCompletionGate> {
@@ -4050,14 +7402,20 @@ impl TaskEvidenceLedger {
         false
     }
 
+    fn lock_freshness_state(&self) -> std::sync::MutexGuard<'_, FreshnessState> {
+        self.freshness_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Returns false only when ledger state changed during the filesystem scan.
     async fn refresh_external_file_freshness_once(&self, purpose: FreshnessPurpose) -> bool {
         if !self.allows_kd4_completion() {
             return true;
         }
-        if self.repo_root.is_none() {
+        let Some(repo_root) = self.repo_root.as_deref() else {
             return true;
-        }
+        };
         let manifest = {
             let guard = self.document.lock().await;
             guard.as_ref().map(freshness_manifest).unwrap_or_default()
@@ -4065,11 +7423,9 @@ impl TaskEvidenceLedger {
         if manifest.tracked.is_empty() && manifest.artifact_paths.is_empty() {
             return true;
         }
-        let _freshness_permit = self
-            .freshness_gate
-            .acquire()
-            .await
-            .expect("freshness semaphore remains open");
+        let Ok(_freshness_permit) = self.freshness_gate.acquire().await else {
+            return false;
+        };
         let manifest_after_wait = {
             let guard = self.document.lock().await;
             guard.as_ref().map(freshness_manifest).unwrap_or_default()
@@ -4087,20 +7443,12 @@ impl TaskEvidenceLedger {
             if manifest_after_token_check != manifest {
                 return false;
             }
-            self.freshness_state
-                .lock()
-                .expect("freshness state mutex")
-                .diagnostics
-                .strong_hashes_reused += reused_hashes;
+            self.lock_freshness_state().diagnostics.strong_hashes_reused += reused_hashes;
             return true;
         }
-        self.freshness_state
-            .lock()
-            .expect("freshness state mutex")
-            .diagnostics
-            .scan_invocations += 1;
+        self.lock_freshness_state().diagnostics.scan_invocations += 1;
         let scan = self
-            .scan_freshness_manifest(&manifest, purpose == FreshnessPurpose::Ordinary)
+            .scan_freshness_manifest(repo_root, &manifest, purpose == FreshnessPurpose::Ordinary)
             .await;
         let manifest_after_scan = {
             let guard = self.document.lock().await;
@@ -4162,7 +7510,12 @@ impl TaskEvidenceLedger {
                     && artifact_state_is_current;
                 let changed_files = !changed.is_empty();
                 if changed_files || prior_artifact_state_exists {
-                    invalidate_for_mutation(document);
+                    let changed_paths = changed
+                        .iter()
+                        .map(|current| current.path.clone())
+                        .collect::<BTreeSet<_>>();
+                    let affected_paths = (!prior_artifact_state_exists).then_some(&changed_paths);
+                    invalidate_for_mutation(document, affected_paths);
                 }
                 let epoch = document.evidence_epoch;
                 for current in changed {
@@ -4173,13 +7526,6 @@ impl TaskEvidenceLedger {
                         resolve_risk(document, &unreadable_file_risk_id(&path));
                     }
                     document.latest_file_hashes.insert(path.clone(), current);
-                    for step in &mut document.plan {
-                        if step.edit_paths.contains(&path)
-                            && !matches!(step.status, StepStatus::Blocked | StepStatus::Skipped)
-                        {
-                            step.status = StepStatus::Implemented;
-                        }
-                    }
                 }
                 document.latest_generated_artifact_hashes = current_artifacts;
                 if changed_files || prior_artifact_state_exists {
@@ -4208,10 +7554,7 @@ impl TaskEvidenceLedger {
             return false;
         }
         if purpose == FreshnessPurpose::Ordinary {
-            self.freshness_state
-                .lock()
-                .expect("freshness state mutex")
-                .completion_proof = None;
+            self.lock_freshness_state().completion_proof = None;
         } else {
             self.store_completion_proof(freshness_manifest(&snapshot), scan);
         }
@@ -4221,10 +7564,10 @@ impl TaskEvidenceLedger {
 
     async fn scan_freshness_manifest(
         &self,
+        repo_root: &Path,
         manifest: &FreshnessManifest,
         allow_cache_reuse: bool,
     ) -> FreshnessScanResult {
-        let repo_root = self.repo_root.as_deref().expect("freshness has repo root");
         let mut requests = BTreeMap::<PathBuf, BTreeSet<String>>::new();
         let mut snapshots = BTreeMap::new();
         for path in manifest.tracked.keys() {
@@ -4245,13 +7588,7 @@ impl TaskEvidenceLedger {
         }
 
         #[cfg(test)]
-        let before_scan = {
-            self.freshness_state
-                .lock()
-                .expect("freshness state mutex")
-                .before_next_scan
-                .take()
-        };
+        let before_scan = { self.lock_freshness_state().before_next_scan.take() };
         #[cfg(test)]
         if let Some((started, release)) = before_scan {
             started.wait().await;
@@ -4298,7 +7635,7 @@ impl TaskEvidenceLedger {
     }
 
     fn commit_freshness_cache(&self, scan: &FreshnessScanResult) {
-        let mut state = self.freshness_state.lock().expect("freshness state mutex");
+        let mut state = self.lock_freshness_state();
         for path in &scan.cache_removals {
             state.cache.remove(path);
         }
@@ -4345,7 +7682,7 @@ impl TaskEvidenceLedger {
         };
         #[cfg(test)]
         let (force_untrusted_tokens, force_ambiguous_tokens) = {
-            let state = self.freshness_state.lock().expect("freshness state mutex");
+            let state = self.lock_freshness_state();
             (state.force_untrusted_tokens, state.force_ambiguous_tokens)
         };
         #[cfg(not(test))]
@@ -4355,22 +7692,12 @@ impl TaskEvidenceLedger {
         } else {
             trusted_file_token(&file).await
         };
-        if allow_cache_reuse
-            && let Some(token) = token_before.as_ref()
-            && let Some(cached) = self
-                .freshness_state
-                .lock()
-                .expect("freshness state mutex")
-                .cache
-                .get(absolute)
-                .cloned()
+        let cached =
+            allow_cache_reuse.then(|| self.lock_freshness_state().cache.get(absolute).cloned());
+        if let (Some(token), Some(Some(cached))) = (token_before.as_ref(), cached)
             && cached.token == *token
         {
-            self.freshness_state
-                .lock()
-                .expect("freshness state mutex")
-                .diagnostics
-                .strong_hashes_reused += 1;
+            self.lock_freshness_state().diagnostics.strong_hashes_reused += 1;
             return FreshnessPathObservation {
                 snapshot: FileHashSnapshot {
                     path: display_path,
@@ -4406,7 +7733,7 @@ impl TaskEvidenceLedger {
             }
         }
         {
-            let mut state = self.freshness_state.lock().expect("freshness state mutex");
+            let mut state = self.lock_freshness_state();
             state.diagnostics.files_strongly_hashed += 1;
             state.diagnostics.bytes_strongly_hashed += bytes_hashed;
         }
@@ -4438,15 +7765,8 @@ impl TaskEvidenceLedger {
     }
 
     async fn completion_proof_reuse_count(&self, manifest: &FreshnessManifest) -> Option<u64> {
-        let proof = self
-            .freshness_state
-            .lock()
-            .expect("freshness state mutex")
-            .completion_proof
-            .clone();
-        let Some(proof) = proof else {
-            return None;
-        };
+        let proof = self.lock_freshness_state().completion_proof.clone();
+        let proof = proof?;
         if !proof.all_reusable || proof.manifest != *manifest {
             return None;
         }
@@ -4462,19 +7782,14 @@ impl TaskEvidenceLedger {
     }
 
     fn completion_proof_manifest(&self) -> Option<FreshnessManifest> {
-        self.freshness_state
-            .lock()
-            .expect("freshness state mutex")
+        self.lock_freshness_state()
             .completion_proof
             .as_ref()
             .map(|proof| proof.manifest.clone())
     }
 
     fn store_completion_proof(&self, manifest: FreshnessManifest, scan: FreshnessScanResult) {
-        self.freshness_state
-            .lock()
-            .expect("freshness state mutex")
-            .completion_proof = Some(CompletionProof {
+        self.lock_freshness_state().completion_proof = Some(CompletionProof {
             manifest,
             tokens: scan.tokens,
             all_reusable: scan.all_reusable,
@@ -4483,10 +7798,7 @@ impl TaskEvidenceLedger {
 
     #[cfg(test)]
     pub(crate) fn freshness_diagnostics(&self) -> FreshnessDiagnostics {
-        self.freshness_state
-            .lock()
-            .expect("freshness state mutex")
-            .diagnostics
+        self.lock_freshness_state().diagnostics
     }
 
     #[cfg(test)]
@@ -4495,34 +7807,26 @@ impl TaskEvidenceLedger {
     ) -> (Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>) {
         let started = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
-        self.freshness_state
-            .lock()
-            .expect("freshness state mutex")
-            .before_next_scan = Some((Arc::clone(&started), Arc::clone(&release)));
+        self.lock_freshness_state().before_next_scan =
+            Some((Arc::clone(&started), Arc::clone(&release)));
         (started, release)
     }
 
     #[cfg(test)]
     pub(crate) fn set_force_untrusted_freshness_tokens(&self, force: bool) {
-        self.freshness_state
-            .lock()
-            .expect("freshness state mutex")
-            .force_untrusted_tokens = force;
+        self.lock_freshness_state().force_untrusted_tokens = force;
     }
 
     #[cfg(test)]
     pub(crate) fn set_force_ambiguous_freshness_tokens(&self, force: bool) {
-        self.freshness_state
-            .lock()
-            .expect("freshness state mutex")
-            .force_ambiguous_tokens = force;
+        self.lock_freshness_state().force_ambiguous_tokens = force;
     }
 
     pub(crate) async fn reconcile_default_child_workspace_events(
         &self,
         events: &[codex_agent_task_store::WorkspaceEvent],
         root_session_id: &str,
-        same_root_typed_actor_ids: &BTreeSet<String>,
+        _same_root_typed_actor_ids: &BTreeSet<String>,
     ) -> bool {
         if self.mode != TaskEvidenceMode::Kd4Completion {
             return true;
@@ -4530,20 +7834,34 @@ impl TaskEvidenceLedger {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return false;
         };
-        let cursor = {
+        let (cursor, stored_scope_identity) = {
             let guard = self.document.lock().await;
-            guard
+            let ledger = guard
                 .as_ref()
-                .and_then(|document| document.completion_review_v2.as_ref())
-                .map(|ledger| ledger.last_workspace_event_epoch)
-                .unwrap_or_default()
+                .and_then(|document| document.completion_review_v2.as_ref());
+            (
+                ledger
+                    .map(|ledger| ledger.last_workspace_event_epoch)
+                    .unwrap_or_default(),
+                ledger
+                    .map(|ledger| ledger.workspace_proof_scope_identity.clone())
+                    .unwrap_or_default(),
+            )
         };
         let scanned = events
             .iter()
             .filter(|event| event.epoch > cursor)
             .cloned()
             .collect::<Vec<_>>();
-        if scanned.is_empty() {
+        let current_scope_identity = {
+            let guard = self.document.lock().await;
+            guard
+                .as_ref()
+                .map(workspace_proof_scope)
+                .map(|scope| scope.identity)
+                .unwrap_or_default()
+        };
+        if scanned.is_empty() && stored_scope_identity == current_scope_identity {
             return true;
         }
         let max_epoch = scanned
@@ -4568,30 +7886,10 @@ impl TaskEvidenceLedger {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let unattributed_epochs = scanned
-            .iter()
-            .filter(|event| match event.actor_kind {
-                codex_agent_task_store::WorkspaceActorKind::External => true,
-                codex_agent_task_store::WorkspaceActorKind::Root => {
-                    event.actor_id.as_deref() != Some(root_actor_id.as_str())
-                }
-                codex_agent_task_store::WorkspaceActorKind::Legacy => event
-                    .actor_id
-                    .as_deref()
-                    .is_none_or(|actor_id| !actor_id.starts_with(&legacy_actor_prefix)),
-                codex_agent_task_store::WorkspaceActorKind::Typed => event
-                    .actor_id
-                    .as_ref()
-                    .is_none_or(|actor_id| !same_root_typed_actor_ids.contains(actor_id)),
-            })
-            .map(|event| event.epoch)
-            .collect::<Vec<_>>();
         let mut snapshots = BTreeMap::new();
-        let mut repository_wide = false;
-        for event in &accepted {
+        for event in &scanned {
             for path in &event.paths {
                 if path == codex_agent_task_store::REPOSITORY_WIDE_PATH {
-                    repository_wide = true;
                     continue;
                 }
                 snapshots
@@ -4602,83 +7900,148 @@ impl TaskEvidenceLedger {
 
         let Some((_, snapshot)) = self
             .update_document(|document| {
+                let Some(existing_ledger) = document.completion_review_v2.as_ref() else {
+                    return;
+                };
+                if existing_ledger.last_workspace_event_epoch != cursor {
+                    return;
+                }
+                let scope = workspace_proof_scope(document);
+                let latest_file_hashes = document.latest_file_hashes.clone();
                 let Some(ledger) = document.completion_review_v2.as_mut() else {
                     return;
                 };
-                if ledger.last_workspace_event_epoch != cursor {
-                    return;
-                }
                 ledger.last_workspace_event_epoch = max_epoch;
-                if !accepted.is_empty() {
-                    let has_unrepresented_mutation = repository_wide
-                        || snapshots.iter().any(|(path, state)| {
-                            document.latest_file_hashes.get(path) != Some(state)
+                let scope_changed = ledger.workspace_proof_scope_identity != scope.identity;
+                if scanned
+                    .first()
+                    .is_some_and(|event| event.epoch > cursor.saturating_add(1))
+                {
+                    ledger.workspace_event_history_complete = false;
+                }
+                for event in &scanned {
+                    let actor_id = event.actor_id.clone().unwrap_or_default();
+                    if ledger.attributed_workspace_events.iter().any(|stored| {
+                        stored.workspace_id == event.workspace_id
+                            && stored.epoch == event.epoch
+                            && stored.actor_id == actor_id
+                    }) {
+                        continue;
+                    }
+                    let mut paths = event.paths.clone();
+                    paths.sort();
+                    paths.dedup();
+                    let mut contracts = event.contracts.clone();
+                    contracts.sort();
+                    contracts.dedup();
+                    ledger
+                        .attributed_workspace_events
+                        .push(TaskAttributedWorkspaceEvent {
+                            workspace_id: event.workspace_id.clone(),
+                            epoch: event.epoch,
+                            actor_id,
+                            paths,
+                            contracts,
+                            actor_kind: Some(event.actor_kind),
+                            attribution_confidence: Some(event.attribution_confidence),
+                            relevance: WorkspaceEventRelevance::Unknown,
+                            classified_scope_identity: String::new(),
                         });
-                    if has_unrepresented_mutation {
-                        let only_after_agent_mutations_are_unrepresented = accepted
-                            .iter()
-                            .filter(|event| {
-                                event.paths.iter().any(|path| {
-                                    path == codex_agent_task_store::REPOSITORY_WIDE_PATH
-                                        || snapshots.get(path).is_some_and(|state| {
-                                            document.latest_file_hashes.get(path) != Some(state)
-                                        })
-                                })
-                            })
-                            .all(|event| {
-                                event.contracts.iter().any(|contract| {
-                                    contract == "kd4-completion-review-afteragent"
-                                })
-                            });
-                        if only_after_agent_mutations_are_unrepresented {
-                            invalidate_for_after_agent_mutation(document);
-                        } else {
-                            invalidate_for_mutation(document);
-                        }
-                    }
-                    let Some(ledger) = document.completion_review_v2.as_mut() else {
-                        return;
-                    };
-                    for event in &accepted {
-                        let Some(actor_id) = event.actor_id.clone() else {
-                            continue;
-                        };
-                        if ledger.attributed_workspace_events.iter().any(|stored| {
-                            stored.workspace_id == event.workspace_id
-                                && stored.epoch == event.epoch
-                                && stored.actor_id == actor_id
-                        }) {
-                            continue;
-                        }
-                        let mut paths = event.paths.clone();
-                        paths.sort();
-                        paths.dedup();
-                        ledger
-                            .attributed_workspace_events
-                            .push(TaskAttributedWorkspaceEvent {
-                                workspace_id: event.workspace_id.clone(),
-                                epoch: event.epoch,
-                                actor_id,
-                                paths,
-                            });
-                    }
+                }
+                if ledger.attributed_workspace_events.len() > MAX_ATTRIBUTED_WORKSPACE_EVENTS {
+                    ledger.workspace_event_history_complete = false;
                     trim_to_last(
                         &mut ledger.attributed_workspace_events,
                         MAX_ATTRIBUTED_WORKSPACE_EVENTS,
                     );
-                    for (path, state) in &snapshots {
-                        document.latest_file_hashes.insert(path.clone(), state.clone());
+                }
+
+                let mut relevant_paths = BTreeSet::new();
+                let mut invalidating_fact = false;
+                let mut unknown_fact = workspace_scope_history_is_unknown(
+                    scope_changed,
+                    ledger.workspace_event_history_complete,
+                );
+                let mut only_after_agent = true;
+                let mut invalidating_epochs = Vec::new();
+                for event in &mut ledger.attributed_workspace_events {
+                    let requires_classification = scope_changed
+                        || event.classified_scope_identity != scope.identity;
+                    if !requires_classification {
+                        continue;
+                    }
+                    event.relevance = classify_workspace_event(event, &scope);
+                    event.classified_scope_identity.clone_from(&scope.identity);
+                    match event.relevance {
+                        WorkspaceEventRelevance::Relevant => {
+                            let already_accounted_direct_mutation = matches!(
+                                event.attribution_confidence,
+                                Some(codex_agent_task_store::AttributionConfidence::Definitive)
+                            ) && !event.paths.iter().any(|path| {
+                                path == codex_agent_task_store::REPOSITORY_WIDE_PATH
+                            }) && event.paths.iter().all(|path| {
+                                latest_file_hashes.get(path) == snapshots.get(path)
+                            });
+                            if !already_accounted_direct_mutation {
+                                invalidating_fact = true;
+                                invalidating_epochs.push(event.epoch);
+                                only_after_agent &= event.contracts.iter().any(|contract| {
+                                    contract == "kd4-completion-review-afteragent"
+                                });
+                            }
+                            relevant_paths.extend(
+                                event
+                                    .paths
+                                    .iter()
+                                    .filter(|path| {
+                                        path.as_str()
+                                            != codex_agent_task_store::REPOSITORY_WIDE_PATH
+                                    })
+                                    .cloned(),
+                            );
+                        }
+                        WorkspaceEventRelevance::Unknown => {
+                            invalidating_fact = true;
+                            unknown_fact = true;
+                            only_after_agent = false;
+                            invalidating_epochs.push(event.epoch);
+                        }
+                        WorkspaceEventRelevance::Unrelated => {}
                     }
                 }
-                if repository_wide || !unattributed_epochs.is_empty() {
+                ledger.workspace_proof_scope_identity = scope.identity;
+
+                if invalidating_fact || unknown_fact {
+                    if only_after_agent && !unknown_fact {
+                        invalidate_for_after_agent_mutation(document);
+                    } else if unknown_fact {
+                        invalidate_for_mutation(document, None);
+                    } else {
+                        invalidate_for_mutation(document, Some(&relevant_paths));
+                    }
+                }
+                for event in &accepted {
+                    if event.paths.iter().any(|path| {
+                        relevant_paths
+                            .iter()
+                            .any(|controlled| validation_paths_overlap(controlled, path))
+                    }) {
+                        for path in &event.paths {
+                            if let Some(state) = snapshots.get(path) {
+                                document.latest_file_hashes.insert(path.clone(), state.clone());
+                            }
+                        }
+                    }
+                }
+                if unknown_fact {
                     let epoch = document.evidence_epoch;
                     upsert_risk(
                         document,
                         EvidenceRisk {
                             id: format!("unattributed-workspace-mutation-{epoch}"),
                             description: format!(
-                                "concurrent or repository-wide mutation could not be attributed exactly (workspace epochs: {})",
-                                unattributed_epochs
+                                "workspace mutation history was relevant or insufficiently attributed for the current proof scope (workspace epochs: {})",
+                                invalidating_epochs
                                     .iter()
                                     .map(u64::to_string)
                                     .collect::<Vec<_>>()
@@ -4692,7 +8055,6 @@ impl TaskEvidenceLedger {
                     );
                 }
                 document.updated_at = timestamp();
-                document.completion = None;
             })
             .await
         else {
@@ -4707,7 +8069,7 @@ impl TaskEvidenceLedger {
         }
         let Some((_, snapshot)) = self
             .update_document(|document| {
-                invalidate_for_mutation(document);
+                invalidate_for_mutation(document, None);
                 document.updated_at = timestamp();
             })
             .await
@@ -4806,16 +8168,27 @@ impl TaskEvidenceLedger {
             }
         };
         let result_sha256 = format!("{:x}", Sha256::digest(&canonical_bytes));
-        let (task_epoch, step_id, workspace_root_fingerprint, host_mutation_revision) = {
-            let guard = self.document.lock().await;
-            let Some(document) = guard.as_ref() else {
+        let (
+            task_epoch,
+            step_id,
+            step_revision,
+            work_unit_id,
+            attribution,
+            workspace_root_fingerprint,
+            host_mutation_revision,
+        ) = {
+            let mut guard = self.document.lock().await;
+            let Some(document) = guard.as_mut() else {
                 return ExternalEvidenceCapture::Ignored;
             };
+            let (step_id, step_revision, work_unit_id, attribution) =
+                current_action_attribution(document, "external_evidence", call_id);
             (
                 document.evidence_epoch,
-                (self.mode == TaskEvidenceMode::Kd4Completion)
-                    .then(|| document.active_step_id.clone())
-                    .flatten(),
+                step_id,
+                step_revision,
+                work_unit_id,
+                attribution,
                 workspace_root_fingerprint(&document.start),
                 Some(document.host_mutation_revision),
             )
@@ -4921,7 +8294,7 @@ impl TaskEvidenceLedger {
                     &mut document.next_external_evidence_receipt_sequence,
                 );
                 receipt_id.clone_from(&id);
-                document.external_evidence.push(ExternalEvidenceReceipt {
+                let receipt = ExternalEvidenceReceipt {
                     id,
                     producer: metadata.producer,
                     producer_schema_version: metadata.producer_schema_version,
@@ -4937,6 +8310,9 @@ impl TaskEvidenceLedger {
                     recorded_at: timestamp(),
                     task_epoch,
                     step_id,
+                    step_revision,
+                    work_unit_id,
+                    attribution: Some(attribution),
                     workspace_root_fingerprint,
                     host_mutation_revision,
                     implementation_identity_hash,
@@ -4949,7 +8325,9 @@ impl TaskEvidenceLedger {
                     result_sha256,
                     payload,
                     payload_artifact_id,
-                });
+                };
+                accept_matching_external_proof(document, &receipt);
+                document.external_evidence.push(receipt);
                 let trim_count = document
                     .external_evidence
                     .len()
@@ -5194,6 +8572,1918 @@ impl TaskEvidenceLedger {
     }
 }
 
+fn completion_candidate_basis(
+    document: &TaskEvidenceDocument,
+    input: &FinalProofSealInputV1,
+) -> CompletionCandidateBasisV1 {
+    let mut child_gate_state = input.child_gate_state.clone();
+    child_gate_state.sort();
+    child_gate_state.dedup();
+    let basis_id = canonical_hash(
+        "KD4_COMPLETION_CANDIDATE_BASIS_V1",
+        &serde_json::json!({
+            "implementation_identity": input.implementation_identity,
+            "source_identity": input.source_identity,
+            "requirement_identity": input.requirement_identity,
+            "task_evidence_epoch": document.evidence_epoch,
+            "host_mutation_revision": document.host_mutation_revision,
+            "workspace_epoch": input.workspace_epoch,
+            "workspace_manifest_identity": input.workspace_manifest_identity,
+            "environment_identity": input.environment_identity,
+            "toolchain_identity": input.toolchain_identity,
+            "features_identity": input.features_identity,
+            "configuration_identity": input.configuration_identity,
+            "child_gate_state": child_gate_state,
+            "reviewer_configuration_identity": input.reviewer_configuration_identity,
+            "canonical_diff_identity": input.diff_snapshot.diff_identity,
+        }),
+    );
+    CompletionCandidateBasisV1 {
+        basis_id,
+        implementation_identity: input.implementation_identity.clone(),
+        source_identity: input.source_identity.clone(),
+        requirement_identity: input.requirement_identity.clone(),
+        task_evidence_epoch: document.evidence_epoch,
+        host_mutation_revision: document.host_mutation_revision,
+        workspace_epoch: input.workspace_epoch,
+        workspace_manifest_identity: input.workspace_manifest_identity.clone(),
+        environment_identity: input.environment_identity.clone(),
+        toolchain_identity: input.toolchain_identity.clone(),
+        features_identity: input.features_identity.clone(),
+        configuration_identity: input.configuration_identity.clone(),
+        child_gate_state,
+        reviewer_configuration_identity: input.reviewer_configuration_identity.clone(),
+        canonical_diff_identity: input.diff_snapshot.diff_identity.clone(),
+    }
+}
+
+fn reviewer_infrastructure_memo_identity(
+    candidate_id: &str,
+    dossier_id: &str,
+    reviewer_configuration_identity: &str,
+    infrastructure_condition_identity: &str,
+) -> String {
+    canonical_hash(
+        "KD4_REVIEWER_INFRASTRUCTURE_MEMO_V1",
+        &serde_json::json!({
+            "candidate_id": candidate_id,
+            "dossier_id": dossier_id,
+            "reviewer_configuration_identity": reviewer_configuration_identity,
+            "infrastructure_condition_identity": infrastructure_condition_identity,
+        }),
+    )
+}
+
+fn validation_plan_for_basis(
+    document: &TaskEvidenceDocument,
+    basis: &CompletionCandidateBasisV1,
+) -> ValidationPlanV1 {
+    let mut steps = Vec::new();
+    let mut ambiguous_or_unmappable = false;
+    for evidence_step in &document.plan {
+        let needs_validation = evidence_step.validation_disposition
+            != ValidationDisposition::NotRequired
+            || evidence_step.validation_route.is_some();
+        let Some(route) = evidence_step.validation_route.as_ref() else {
+            ambiguous_or_unmappable |= needs_validation;
+            continue;
+        };
+        for (leaf_index, leaf) in route.leaves.iter().enumerate() {
+            let mut covered_paths = leaf.covered_paths.clone();
+            covered_paths.sort();
+            covered_paths.dedup();
+            let mut covered_contracts = leaf.covered_contracts.clone();
+            covered_contracts.sort();
+            covered_contracts.dedup();
+            steps.push(ValidationPlanStepV1 {
+                step_id: format!("{}/validation/{}", evidence_step.id, leaf_index + 1),
+                obligation_id: evidence_step.id.clone(),
+                argv: leaf.argv.clone(),
+                covered_paths,
+                covered_contracts,
+                timeout_ms: leaf.timeout_ms,
+                semantic_timeout: leaf.semantic_timeout,
+                batch_group: match route.ordering {
+                    ValidationRouteOrdering::RunAll => 0,
+                    ValidationRouteOrdering::StopOnFailure => {
+                        u32::try_from(leaf_index + 1).unwrap_or(u32::MAX)
+                    }
+                },
+            });
+        }
+    }
+    if document.plan.is_empty()
+        && let Some(work_unit) = document.planning.work_unit.as_ref()
+    {
+        let needs_validation = work_unit.validation_disposition
+            != ValidationDisposition::NotRequired
+            || work_unit.validation_route.is_some();
+        if let Some(route) = work_unit.validation_route.as_ref() {
+            for (leaf_index, leaf) in route.leaves.iter().enumerate() {
+                let mut covered_paths = leaf.covered_paths.clone();
+                covered_paths.sort();
+                covered_paths.dedup();
+                let mut covered_contracts = leaf.covered_contracts.clone();
+                covered_contracts.sort();
+                covered_contracts.dedup();
+                steps.push(ValidationPlanStepV1 {
+                    step_id: format!("{}/validation/{}", work_unit.id, leaf_index + 1),
+                    obligation_id: work_unit.id.clone(),
+                    argv: leaf.argv.clone(),
+                    covered_paths,
+                    covered_contracts,
+                    timeout_ms: leaf.timeout_ms,
+                    semantic_timeout: leaf.semantic_timeout,
+                    batch_group: match route.ordering {
+                        ValidationRouteOrdering::RunAll => 0,
+                        ValidationRouteOrdering::StopOnFailure => {
+                            u32::try_from(leaf_index + 1).unwrap_or(u32::MAX)
+                        }
+                    },
+                });
+            }
+        } else {
+            ambiguous_or_unmappable |= needs_validation;
+        }
+    }
+    let plan_id = canonical_hash(
+        "KD4_VALIDATION_PLAN_V1",
+        &serde_json::json!({
+            "basis_id": basis.basis_id,
+            "steps": steps,
+            "ambiguous_or_unmappable": ambiguous_or_unmappable,
+            "resolution_generation_used": false,
+        }),
+    );
+    ValidationPlanV1 {
+        plan_id,
+        basis_id: basis.basis_id.clone(),
+        steps,
+        ambiguous_or_unmappable,
+        resolution_generation_used: false,
+    }
+}
+
+fn completion_candidate_for(
+    basis: &CompletionCandidateBasisV1,
+    plan: &ValidationPlanV1,
+) -> CompletionCandidateV1 {
+    let lineage_id = canonical_hash(
+        "KD4_COMPLETION_CANDIDATE_LINEAGE_V1",
+        &serde_json::json!({
+            "source_identity": basis.source_identity,
+            "requirement_identity": basis.requirement_identity,
+            "environment_identity": basis.environment_identity,
+            "toolchain_identity": basis.toolchain_identity,
+            "features_identity": basis.features_identity,
+            "configuration_identity": basis.configuration_identity,
+        }),
+    );
+    let candidate_id = canonical_hash(
+        "KD4_COMPLETION_CANDIDATE_V1",
+        &serde_json::json!({
+            "basis_id": basis.basis_id,
+            "validation_plan_id": plan.plan_id,
+        }),
+    );
+    CompletionCandidateV1 {
+        candidate_id,
+        basis_id: basis.basis_id.clone(),
+        validation_plan_id: plan.plan_id.clone(),
+        lineage_id,
+    }
+}
+
+fn current_final_proof_observations(
+    document: &TaskEvidenceDocument,
+    basis: &CompletionCandidateBasisV1,
+    candidate: &CompletionCandidateV1,
+    plan: &ValidationPlanV1,
+) -> Vec<FinalProofObservationV1> {
+    let mut by_step = document
+        .final_proof
+        .proof_observations
+        .iter()
+        .filter(|observation| {
+            observation.candidate_id == candidate.candidate_id && observation.complete_identity
+        })
+        .map(|observation| (observation.plan_step_id.clone(), observation.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for step in &plan.steps {
+        let Some(receipt) = document.command_receipts.iter().rev().find(|receipt| {
+            receipt.command == step.argv
+                && receipt.exit_code == 0
+                && !receipt.timed_out
+                && !receipt.possible_mutation
+                && receipt.epoch == basis.task_evidence_epoch
+                && receipt.host_mutation_revision == Some(basis.host_mutation_revision)
+                && receipt.user_source_ledger_hash.as_deref()
+                    == Some(basis.source_identity.as_str())
+                && receipt.requirement_manifest_hash.as_deref()
+                    == Some(basis.requirement_identity.as_str())
+                && (receipt.implementation_identity_hash.as_deref()
+                    == Some(basis.implementation_identity.as_str())
+                    || command_receipt_has_current_proof_identity(document, receipt))
+        }) else {
+            continue;
+        };
+        let invocation_identity = canonical_hash(
+            "KD4_VALIDATION_INVOCATION_V1",
+            &serde_json::json!({"argv": receipt.command, "cwd": receipt.cwd}),
+        );
+        let coverage_identity = canonical_hash(
+            "KD4_VALIDATION_COVERAGE_V1",
+            &serde_json::json!({
+                "paths": step.covered_paths,
+                "contracts": step.covered_contracts,
+            }),
+        );
+        let retained_output_digest = canonical_hash(
+            "KD4_VALIDATION_RECEIPT_V1",
+            &serde_json::to_value(receipt).unwrap_or(Value::Null),
+        );
+        by_step.insert(
+            step.step_id.clone(),
+            FinalProofObservationV1 {
+                candidate_id: candidate.candidate_id.clone(),
+                plan_step_id: step.step_id.clone(),
+                obligation_id: step.obligation_id.clone(),
+                successful: true,
+                complete_identity: true,
+                invocation_identity,
+                coverage_identity,
+                retained_output_digest,
+                retained_output_ref: Some(receipt.id.clone()),
+                evidence_revision: document.evidence_epoch,
+            },
+        );
+    }
+    by_step.into_values().collect()
+}
+
+fn missing_or_failed_obligations(
+    candidate: &CompletionCandidateV1,
+    plan: &ValidationPlanV1,
+    observations: &[FinalProofObservationV1],
+) -> Vec<String> {
+    let successful_steps = observations
+        .iter()
+        .filter(|observation| {
+            observation.candidate_id == candidate.candidate_id
+                && observation.complete_identity
+                && observation.successful
+        })
+        .map(|observation| observation.plan_step_id.as_str())
+        .collect::<BTreeSet<_>>();
+    plan.steps
+        .iter()
+        .filter(|step| !successful_steps.contains(step.step_id.as_str()))
+        .map(|step| step.obligation_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn completion_failure_fingerprint(
+    correctness_evidence_revision: u64,
+    candidate: &CompletionCandidateV1,
+    missing_or_failed_obligation_ids: &[String],
+    child_gate_state: &[String],
+    reviewer_state: Option<String>,
+) -> CompletionFailureFingerprintV1 {
+    let fingerprint = canonical_hash(
+        "KD4_COMPLETION_FAILURE_FINGERPRINT_V1",
+        &serde_json::json!({
+            "candidate_id": candidate.candidate_id,
+            "correctness_evidence_revision": correctness_evidence_revision,
+            "missing_or_failed_obligation_ids": missing_or_failed_obligation_ids,
+            "child_gate_state": child_gate_state,
+            "reviewer_state": reviewer_state,
+        }),
+    );
+    CompletionFailureFingerprintV1 {
+        fingerprint,
+        candidate_id: candidate.candidate_id.clone(),
+        correctness_evidence_revision,
+        missing_or_failed_obligation_ids: missing_or_failed_obligation_ids.to_vec(),
+        child_gate_state: child_gate_state.to_vec(),
+        reviewer_state,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_completion_reason(
+    reasons: &mut Vec<CompletionReasonV1>,
+    reason_code: &str,
+    obligation_ids: &[String],
+    path_ids: &[String],
+    contract_ids: &[String],
+    epoch: u64,
+    latest_occurrence: &str,
+    evidence_ref: Option<String>,
+) {
+    let mut obligation_ids = obligation_ids.to_vec();
+    obligation_ids.sort();
+    obligation_ids.dedup();
+    let mut path_ids = path_ids.to_vec();
+    path_ids.sort();
+    path_ids.dedup();
+    let mut contract_ids = contract_ids.to_vec();
+    contract_ids.sort();
+    contract_ids.dedup();
+    if let Some(existing) = reasons.iter_mut().find(|reason| {
+        reason.reason_code == reason_code
+            && reason.obligation_ids == obligation_ids
+            && reason.path_ids == path_ids
+            && reason.contract_ids == contract_ids
+    }) {
+        existing.last_epoch = epoch;
+        existing.occurrence_count = existing.occurrence_count.saturating_add(1);
+        existing.latest_occurrence = latest_occurrence.to_string();
+        existing.evidence_ref = evidence_ref;
+        return;
+    }
+    reasons.push(CompletionReasonV1 {
+        reason_code: reason_code.to_string(),
+        obligation_ids,
+        path_ids,
+        contract_ids,
+        first_epoch: epoch,
+        last_epoch: epoch,
+        occurrence_count: 1,
+        latest_occurrence: latest_occurrence.to_string(),
+        evidence_ref,
+    });
+    reasons.sort_by(|left, right| {
+        left.reason_code
+            .cmp(&right.reason_code)
+            .then_with(|| left.obligation_ids.cmp(&right.obligation_ids))
+            .then_with(|| left.path_ids.cmp(&right.path_ids))
+            .then_with(|| left.contract_ids.cmp(&right.contract_ids))
+    });
+}
+
+fn completion_checkpoint_for(
+    document: &TaskEvidenceDocument,
+    basis: &CompletionCandidateBasisV1,
+    candidate: &CompletionCandidateV1,
+    plan: &ValidationPlanV1,
+    diff: &CandidateDiffSnapshotV1,
+    observations: &[FinalProofObservationV1],
+    token_budget: usize,
+) -> Result<CompletionCheckpointV1, String> {
+    let requirements = document
+        .completion_review_v2
+        .as_ref()
+        .and_then(active_manifest)
+        .map(|manifest| {
+            manifest
+                .requirements
+                .iter()
+                .filter(|requirement| requirement.status == RequirementStatus::Active)
+                .map(|requirement| CheckpointRequirementV1 {
+                    requirement_id: requirement.requirement_id.clone(),
+                    source_id: requirement.source_id.clone(),
+                    exact_text: requirement.exact_material.clone(),
+                    status: "active".to_string(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut affected_surfaces = document
+        .plan
+        .iter()
+        .flat_map(|step| {
+            step.runtime_paths
+                .iter()
+                .chain(step.implementation_surfaces.iter())
+                .chain(step.edit_paths.iter())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(work_unit) = document.planning.work_unit.as_ref() {
+        affected_surfaces.extend(work_unit.implementation_surfaces.iter().cloned());
+    }
+    affected_surfaces.sort();
+    affected_surfaces.dedup();
+    let observations_by_step = observations
+        .iter()
+        .map(|observation| (observation.plan_step_id.as_str(), observation))
+        .collect::<BTreeMap<_, _>>();
+    let proof_receipts = plan
+        .steps
+        .iter()
+        .map(|step| {
+            let observation = observations_by_step.get(step.step_id.as_str()).copied();
+            CheckpointProofReceiptV1 {
+                obligation_id: step.obligation_id.clone(),
+                status: if observation.is_some_and(|observation| {
+                    observation.successful && observation.complete_identity
+                }) {
+                    "passed".to_string()
+                } else {
+                    "missing_or_stale".to_string()
+                },
+                evidence_ref: observation
+                    .and_then(|observation| observation.retained_output_ref.clone()),
+                evidence_digest: observation
+                    .map(|observation| observation.retained_output_digest.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let evidence_gate = derive_completion_gate(document, None);
+    let unresolved_blockers = evidence_gate.reasons;
+    let unresolved_risks = document
+        .risks
+        .iter()
+        .filter(|risk| !risk.resolved)
+        .map(|risk| format!("{}: {}", risk.id, risk.description))
+        .collect::<Vec<_>>();
+    let mut evidence_artifact_references = observations
+        .iter()
+        .filter_map(|observation| observation.retained_output_ref.clone())
+        .chain(
+            document
+                .external_evidence
+                .iter()
+                .filter_map(|receipt| receipt.payload_artifact_id.clone()),
+        )
+        .chain(diff.raw_artifact_ref.iter().cloned())
+        .collect::<Vec<_>>();
+    evidence_artifact_references.sort();
+    evidence_artifact_references.dedup();
+    let mut checkpoint = CompletionCheckpointV1 {
+        checkpoint_id: String::new(),
+        candidate_id: candidate.candidate_id.clone(),
+        basis_id: basis.basis_id.clone(),
+        validation_plan_id: plan.plan_id.clone(),
+        diff_identity: diff.diff_identity.clone(),
+        requirements,
+        affected_surfaces,
+        changed_paths: diff.changed_paths.clone(),
+        bounded_hunks: truncate_checkpoint_hunks(
+            &diff.bounded_hunks,
+            MAX_COMPLETION_CHECKPOINT_HUNK_BYTES,
+        ),
+        proof_receipts,
+        unresolved_blockers,
+        unresolved_risks,
+        child_gate_state: basis.child_gate_state.clone(),
+        evidence_artifact_references,
+        estimated_tokens: 0,
+    };
+    let mut mandatory = checkpoint.clone();
+    mandatory.bounded_hunks.clear();
+    let mandatory_payload = serde_json::to_string(&mandatory)
+        .map_err(|_| "completion checkpoint could not be serialized".to_string())?;
+    let mandatory_tokens = approx_token_count(&mandatory_payload);
+    if token_budget == 0 || mandatory_tokens > token_budget {
+        return Err(format!(
+            "completion checkpoint mandatory material requires approximately {mandatory_tokens} tokens but only {token_budget} are available"
+        ));
+    }
+    loop {
+        let payload = serde_json::to_string(&checkpoint)
+            .map_err(|_| "completion checkpoint could not be serialized".to_string())?;
+        if approx_token_count(&payload) <= token_budget || checkpoint.bounded_hunks.is_empty() {
+            break;
+        }
+        let target = checkpoint.bounded_hunks.len() / 2;
+        checkpoint.bounded_hunks = truncate_checkpoint_hunks(&checkpoint.bounded_hunks, target);
+    }
+    checkpoint.checkpoint_id = canonical_hash(
+        "KD4_COMPLETION_CHECKPOINT_V1",
+        &serde_json::to_value(&checkpoint).unwrap_or(Value::Null),
+    );
+    checkpoint.estimated_tokens = checkpoint
+        .canonical_payload()
+        .map(|payload| u64::try_from(approx_token_count(&payload)).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX);
+    Ok(checkpoint)
+}
+
+fn truncate_checkpoint_hunks(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
+}
+
+fn core_owner_packet_seed(
+    facts: &codex_file_search::task_locator::LocateTaskDecisionFacts,
+    locator_seed: Option<&codex_file_search::task_locator::LocateTaskOwnerPacketSeed>,
+    supporting_reads: &[codex_file_search::task_locator::SupportingRead],
+    request_identity: &str,
+    task: &str,
+) -> Option<CoreOwnerPacketSeed> {
+    let owner = locator_seed
+        .map(|seed| &seed.authoritative_owner)
+        .or(facts.authoritative_owner.as_ref())?;
+    let primary_path = locator_seed
+        .and_then(|seed| seed.primary_path.as_ref())
+        .or(facts.primary_path.as_ref());
+    let primary_symbol = locator_seed
+        .and_then(|seed| seed.primary_symbol.as_ref())
+        .or(facts.primary_symbol.as_ref());
+    let primary_span = locator_seed
+        .and_then(|seed| seed.primary_span.as_ref())
+        .or(facts.primary_span.as_ref());
+    let target_regions = primary_path
+        .as_ref()
+        .map(|path| {
+            vec![CoreOwnerPacketTargetRegion {
+                path: (*path).clone(),
+                symbol: primary_symbol.cloned(),
+                span: primary_span.cloned(),
+            }]
+        })
+        .unwrap_or_default();
+    let supporting_identities = locator_seed.map_or_else(
+        || supporting_reads.iter().take(32).cloned().collect(),
+        |seed| seed.supporting_reads.iter().take(32).cloned().collect(),
+    );
+    let observed_spans = locator_seed.map_or_else(
+        || {
+            facts
+                .captured_source_sections
+                .iter()
+                .take(MAX_OWNER_PACKET_SPANS)
+                .map(|section| CoreOwnerPacketObservedSpan {
+                    section_id: section.section_id.clone(),
+                    path: section.path.clone(),
+                    span: section.span.clone(),
+                    file_content_hash: section.file_content_hash.clone(),
+                    span_content_hash: section.content_hash.clone(),
+                })
+                .collect()
+        },
+        |seed| {
+            seed.observed_spans
+                .iter()
+                .take(MAX_OWNER_PACKET_SPANS)
+                .map(|span| CoreOwnerPacketObservedSpan {
+                    section_id: span.section_id.clone(),
+                    path: span.path.clone(),
+                    span: span.span.clone(),
+                    file_content_hash: span.file_content_hash.clone(),
+                    span_content_hash: span.span_content_hash.clone(),
+                })
+                .collect()
+        },
+    );
+    let lifecycle_obligations = if locator_evidence_is_stateful(task, facts) {
+        ["success", "failure", "cancellation", "retry_or_recovery"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let generated_source_ownership = core_generated_source_ownership(task, owner, facts);
+    let multi_owner_atomic_evidence = task_explicitly_requires_atomic_owner(task, &owner.id);
+    let seed_id = sha256_join_task_evidence(&[
+        "owner_packet_seed_v2",
+        request_identity,
+        &facts.source_snapshot_identity,
+        &owner.id,
+    ]);
+    Some(CoreOwnerPacketSeed {
+        seed_id,
+        request_identity: request_identity.to_string(),
+        source_snapshot_identity: facts.source_snapshot_identity.clone(),
+        owner_id: owner.id.clone(),
+        owner_roots: owner.roots.iter().take(8).cloned().collect(),
+        target_regions,
+        supporting_identities,
+        observed_spans,
+        relationships: locator_seed.map_or_else(
+            || {
+                facts
+                    .source_relationships
+                    .iter()
+                    .take(MAX_OWNER_PACKET_REFERENCES)
+                    .cloned()
+                    .collect()
+            },
+            |seed| {
+                seed.source_relationships
+                    .iter()
+                    .take(MAX_OWNER_PACKET_REFERENCES)
+                    .cloned()
+                    .collect()
+            },
+        ),
+        contracts: locator_seed.map_or_else(
+            || {
+                facts
+                    .located_contracts
+                    .iter()
+                    .take(MAX_OWNER_PACKET_REFERENCES)
+                    .cloned()
+                    .collect()
+            },
+            |seed| {
+                seed.located_contracts
+                    .iter()
+                    .take(MAX_OWNER_PACKET_REFERENCES)
+                    .cloned()
+                    .collect()
+            },
+        ),
+        tests: locator_seed.map_or_else(
+            || {
+                facts
+                    .located_tests
+                    .iter()
+                    .take(MAX_OWNER_PACKET_REFERENCES)
+                    .cloned()
+                    .collect()
+            },
+            |seed| {
+                seed.located_tests
+                    .iter()
+                    .take(MAX_OWNER_PACKET_REFERENCES)
+                    .cloned()
+                    .collect()
+            },
+        ),
+        validation_routes: locator_seed.map_or_else(
+            || {
+                facts
+                    .candidate_validation_routes
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect()
+            },
+            |seed| {
+                seed.candidate_validation_routes
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect()
+            },
+        ),
+        lifecycle_obligations,
+        generated_source_ownership,
+        multi_owner_atomic_evidence,
+        unresolved_source_obligations: locator_seed.map_or_else(
+            || {
+                facts
+                    .source_gaps
+                    .iter()
+                    .chain(&facts.unresolved_source_ambiguity)
+                    .take(16)
+                    .cloned()
+                    .collect()
+            },
+            |seed| {
+                seed.unresolved_source_obligations
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect()
+            },
+        ),
+    })
+}
+
+fn locator_evidence_is_stateful(
+    task: &str,
+    facts: &codex_file_search::task_locator::LocateTaskDecisionFacts,
+) -> bool {
+    let task = task.to_ascii_lowercase();
+    if [
+        "stateful",
+        "lifecycle",
+        "cancellation",
+        "cancelled",
+        "retry",
+        "recovery",
+    ]
+    .iter()
+    .any(|term| task.contains(term))
+    {
+        return true;
+    }
+    facts.captured_source_sections.iter().any(|section| {
+        section.kind
+            == codex_file_search::task_locator::LocateTaskSourceSectionKind::PrimaryImplementation
+            && section.text.as_deref().is_some_and(|text| {
+                let text = text.to_ascii_lowercase();
+                (text.contains("enum ") && text.contains("state"))
+                    || (text.contains("cancel") && text.contains("retry"))
+            })
+    })
+}
+
+fn task_explicitly_requires_atomic_owner(task: &str, owner_id: &str) -> bool {
+    let task = task.to_ascii_lowercase();
+    (task.contains("atomic") || task.contains("together") || task.contains("same patch"))
+        && (task.contains("owner") || task.contains("authoritative"))
+        && task.contains(&owner_id.to_ascii_lowercase())
+}
+
+fn core_generated_source_ownership(
+    task: &str,
+    owner: &codex_file_search::task_locator::ManifestOwnerProjection,
+    facts: &codex_file_search::task_locator::LocateTaskDecisionFacts,
+) -> Option<CoreOwnerPacketGeneratedOwnership> {
+    let primary_path = facts.primary_path.as_ref()?;
+    let primary_is_generated = owner
+        .generated_mirrors
+        .iter()
+        .any(|path| packet_path_eq(path, primary_path));
+    let task = task.to_ascii_lowercase();
+    let requires_synchronization = (task.contains("synchron") || task.contains("keep in sync"))
+        && !owner.generated_mirrors.is_empty();
+    if !primary_is_generated && !requires_synchronization {
+        return None;
+    }
+    let authoritative_source_path = owner.primary_entries.first()?.path.clone();
+    let generated_path = if primary_is_generated {
+        primary_path.clone()
+    } else {
+        owner.generated_mirrors.first()?.clone()
+    };
+    Some(CoreOwnerPacketGeneratedOwnership {
+        generated_path,
+        authoritative_source_path,
+        evidence_kind: if primary_is_generated {
+            "structured_generated_file_backpointer"
+        } else {
+            "active_contract_requires_synchronization"
+        }
+        .to_string(),
+        requires_synchronized_representations: requires_synchronization,
+    })
+}
+
+fn owner_packet_from_seed(
+    seed: &CoreOwnerPacketSeed,
+    contract_epoch: u64,
+    plan: &[EvidencePlanStep],
+) -> OwnerPacketProjection {
+    let target_regions = seed
+        .target_regions
+        .iter()
+        .map(|region| OwnerPacketRegion {
+            path: normalize_packet_path(&region.path),
+            symbol: region.symbol.clone(),
+            start_line: region.span.as_ref().map(|span| span.start_line),
+            end_line: region.span.as_ref().map(|span| span.end_line),
+        })
+        .collect::<Vec<_>>();
+    let source_identities = seed
+        .supporting_identities
+        .iter()
+        .take(MAX_OWNER_PACKET_REFERENCES * 2)
+        .map(|identity| OwnerPacketSourceIdentity {
+            path: normalize_packet_path(&identity.path),
+            file_sha256: identity.content_hash.clone(),
+        })
+        .collect::<Vec<_>>();
+    let source_spans = seed
+        .observed_spans
+        .iter()
+        .filter_map(|span| {
+            let range = span.span.as_ref()?;
+            Some(OwnerPacketSourceSpan {
+                section_id: span.section_id.clone(),
+                path: normalize_packet_path(&span.path),
+                start_line: range.start_line,
+                end_line: range.end_line,
+                file_sha256: span.file_content_hash.clone()?,
+                span_sha256: span.span_content_hash.clone()?,
+                state: OwnerSourceSpanState::Current,
+            })
+        })
+        .take(MAX_OWNER_PACKET_SPANS)
+        .collect::<Vec<_>>();
+    let mut criterion_inputs = Vec::new();
+    for step in plan
+        .iter()
+        .filter(|step| step.status != StepStatus::Skipped)
+    {
+        for (index, criterion) in step.acceptance_criteria.iter().enumerate() {
+            criterion_inputs.push((
+                acceptance_criterion_id(&step.id, index, criterion),
+                criterion,
+            ));
+        }
+    }
+    let mut relationships = seed
+        .relationships
+        .iter()
+        .map(|relationship| {
+            let path = normalize_packet_path(&relationship.path);
+            let disposition = if criterion_inputs
+                .iter()
+                .any(|(_, criterion)| criterion_mentions_path(criterion, &path))
+            {
+                OwnerRelationshipDisposition::MustChange
+            } else {
+                OwnerRelationshipDisposition::MustRemainCompatible
+            };
+            OwnerPacketRelationship {
+                path,
+                role: relationship.role.clone(),
+                start_line: relationship.span.start_line,
+                end_line: relationship.span.end_line,
+                disposition,
+            }
+        })
+        .collect::<Vec<_>>();
+    relationships.extend(seed.tests.iter().map(|test| OwnerPacketRelationship {
+        path: normalize_packet_path(&test.path),
+        role: "test".to_string(),
+        start_line: 0,
+        end_line: 0,
+        disposition: OwnerRelationshipDisposition::TestOrProofOnly,
+    }));
+    relationships.extend(
+        seed.contracts
+            .iter()
+            .map(|contract| OwnerPacketRelationship {
+                path: normalize_packet_path(&contract.path),
+                role: contract.role.clone(),
+                start_line: 0,
+                end_line: 0,
+                disposition: OwnerRelationshipDisposition::MustRemainCompatible,
+            }),
+    );
+    relationships.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.role.cmp(&right.role))
+    });
+    relationships.dedup_by(|left, right| left.path == right.path && left.role == right.role);
+    relationships.truncate(MAX_OWNER_PACKET_REFERENCES);
+
+    let formatter_route = seed
+        .validation_routes
+        .iter()
+        .find(|route| route.role.to_ascii_lowercase().contains("format"))
+        .map(owner_command_route);
+    let formatter_required = formatter_route.is_some();
+    let validation_route = seed
+        .validation_routes
+        .iter()
+        .find(|route| !route.role.to_ascii_lowercase().contains("format"))
+        .map(owner_command_route);
+    let validation_required = validation_route.is_some();
+    let acceptance_mappings = criterion_inputs
+        .iter()
+        .filter_map(|(criterion_id, criterion)| {
+            let region_path = target_regions
+                .iter()
+                .map(|region| region.path.as_str())
+                .chain(
+                    relationships
+                        .iter()
+                        .map(|relationship| relationship.path.as_str()),
+                )
+                .find(|path| criterion_mentions_path(criterion, path))
+                .or_else(|| target_regions.first().map(|region| region.path.as_str()))?
+                .to_string();
+            Some(OwnerAcceptanceMapping {
+                criterion_id: criterion_id.clone(),
+                region_path,
+                proof_route_id: validation_route.as_ref().map(|route| route.id.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let generated_source_ownership =
+        seed.generated_source_ownership
+            .as_ref()
+            .map(|ownership| OwnerPacketGeneratedOwnership {
+                generated_path: normalize_packet_path(&ownership.generated_path),
+                authoritative_source_path: normalize_packet_path(
+                    &ownership.authoritative_source_path,
+                ),
+                evidence_kind: ownership.evidence_kind.clone(),
+                requires_synchronized_representations: ownership
+                    .requires_synchronized_representations,
+            });
+    let mut missing_obligations = Vec::new();
+    if target_regions.is_empty() {
+        missing_obligations.push("authoritative_target_region".to_string());
+    }
+    for target in &target_regions {
+        if !source_identities
+            .iter()
+            .any(|identity| packet_path_eq(&identity.path, &target.path))
+        {
+            missing_obligations.push(format!("supporting_source_identity:{}", target.path));
+        }
+    }
+    for gap in &seed.unresolved_source_obligations {
+        let gap_lower = gap.to_ascii_lowercase();
+        if gap_lower.contains("ambiguity")
+            || gap_lower.contains("conflict")
+            || gap_lower.contains("contradiction")
+            || gap_lower.contains("routing_manifest_invalid")
+            || gap_lower.contains("primary_unresolved")
+            || gap_lower.contains("overflow")
+            || gap_lower.contains("truncated")
+        {
+            missing_obligations.push(format!("source_closure:{gap}"));
+        }
+    }
+    if !criterion_inputs.is_empty() && validation_route.is_none() {
+        missing_obligations.push("acceptance_proof_route".to_string());
+    }
+    if !seed.lifecycle_obligations.is_empty() && validation_route.is_none() {
+        missing_obligations.push("lifecycle_proof_route".to_string());
+    }
+    if let Some(ownership) = generated_source_ownership.as_ref() {
+        for required in [
+            ownership.authoritative_source_path.as_str(),
+            ownership.generated_path.as_str(),
+        ] {
+            if ownership.requires_synchronized_representations
+                && !source_identities
+                    .iter()
+                    .any(|identity| packet_path_eq(&identity.path, required))
+            {
+                missing_obligations.push(format!("generated_sync_identity:{required}"));
+            }
+        }
+    }
+    missing_obligations.sort();
+    missing_obligations.dedup();
+    let status = if missing_obligations.is_empty() {
+        OwnerPacketStatus::Ready
+    } else {
+        OwnerPacketStatus::Collecting
+    };
+    let packet_id = sha256_join_task_evidence(&[
+        "owner_packet_v1",
+        &contract_epoch.to_string(),
+        &seed.owner_id,
+    ]);
+    let now = timestamp();
+    OwnerPacketProjection {
+        packet_id,
+        seed_id: seed.seed_id.clone(),
+        contract_epoch,
+        request_identity: seed.request_identity.clone(),
+        source_snapshot_identity: seed.source_snapshot_identity.clone(),
+        owner_id: seed.owner_id.clone(),
+        owner_roots: seed
+            .owner_roots
+            .iter()
+            .map(|path| normalize_packet_path(path))
+            .take(8)
+            .collect(),
+        target_regions,
+        last_mutation_regions: Vec::new(),
+        source_identities,
+        source_spans,
+        relationships,
+        contract_paths: seed
+            .contracts
+            .iter()
+            .map(|contract| normalize_packet_path(&contract.path))
+            .take(MAX_OWNER_PACKET_REFERENCES)
+            .collect(),
+        test_paths: seed
+            .tests
+            .iter()
+            .map(|test| normalize_packet_path(&test.path))
+            .take(MAX_OWNER_PACKET_REFERENCES)
+            .collect(),
+        acceptance_mappings,
+        lifecycle_obligations: seed.lifecycle_obligations.clone(),
+        validation_route,
+        formatter_route,
+        proof_status: if validation_required {
+            OwnerObligationStatus::Pending
+        } else if criterion_inputs.is_empty() && seed.lifecycle_obligations.is_empty() {
+            OwnerObligationStatus::NotRequired
+        } else {
+            OwnerObligationStatus::Unavailable
+        },
+        format_status: if formatter_required {
+            OwnerObligationStatus::Pending
+        } else {
+            OwnerObligationStatus::NotRequired
+        },
+        generated_source_ownership,
+        multi_owner_atomic_evidence: seed.multi_owner_atomic_evidence,
+        status,
+        missing_obligations,
+        edit_call_ids: Vec::new(),
+        edit_receipt_ids: Vec::new(),
+        command_receipt_ids: Vec::new(),
+        counters: OwnerPacketCounters::default(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn merge_owner_packet_seed(
+    previous: OwnerPacketProjection,
+    mut refreshed: OwnerPacketProjection,
+) -> OwnerPacketProjection {
+    let same_seed = previous.seed_id == refreshed.seed_id
+        && previous.source_snapshot_identity == refreshed.source_snapshot_identity;
+    refreshed.created_at = previous.created_at.clone();
+    refreshed.last_mutation_regions = previous.last_mutation_regions.clone();
+    refreshed.counters = previous.counters.clone();
+    refreshed.edit_call_ids = previous.edit_call_ids.clone();
+    refreshed.edit_receipt_ids = previous.edit_receipt_ids.clone();
+    refreshed.command_receipt_ids = previous.command_receipt_ids.clone();
+
+    if same_seed && previous.counters.edits > 0 {
+        // Replaying the exact locator seed must never replace identities and
+        // excerpts that were refreshed from authoritative post-mutation state.
+        refreshed.source_identities = previous.source_identities.clone();
+        refreshed.source_spans = previous.source_spans.clone();
+    }
+    if previous
+        .formatter_route
+        .as_ref()
+        .zip(refreshed.formatter_route.as_ref())
+        .is_some_and(|(left, right)| left.id == right.id && left.argv == right.argv)
+    {
+        refreshed.format_status = previous.format_status;
+    }
+    if previous
+        .validation_route
+        .as_ref()
+        .zip(refreshed.validation_route.as_ref())
+        .is_some_and(|(left, right)| left.id == right.id && left.argv == right.argv)
+    {
+        refreshed.proof_status = previous.proof_status;
+    }
+    if refreshed.missing_obligations.is_empty() && previous.counters.edits > 0 {
+        refreshed.status =
+            owner_packet_status_for_obligations(refreshed.format_status, refreshed.proof_status);
+    }
+    refreshed
+}
+
+fn owner_packet_file_count(packet: &OwnerPacketProjection) -> usize {
+    packet
+        .target_regions
+        .iter()
+        .map(|region| normalize_packet_path(&region.path))
+        .chain(
+            packet
+                .source_identities
+                .iter()
+                .map(|identity| normalize_packet_path(&identity.path)),
+        )
+        .chain(
+            packet
+                .relationships
+                .iter()
+                .map(|relationship| normalize_packet_path(&relationship.path)),
+        )
+        .chain(
+            packet
+                .contract_paths
+                .iter()
+                .map(|path| normalize_packet_path(path)),
+        )
+        .chain(
+            packet
+                .test_paths
+                .iter()
+                .map(|path| normalize_packet_path(path)),
+        )
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn owner_packet_status_for_obligations(
+    format_status: OwnerObligationStatus,
+    proof_status: OwnerObligationStatus,
+) -> OwnerPacketStatus {
+    if format_status == OwnerObligationStatus::Unavailable
+        || proof_status == OwnerObligationStatus::Unavailable
+    {
+        OwnerPacketStatus::Blocked
+    } else if matches!(
+        format_status,
+        OwnerObligationStatus::Pending | OwnerObligationStatus::Failed
+    ) {
+        OwnerPacketStatus::AwaitingFormat
+    } else if matches!(
+        proof_status,
+        OwnerObligationStatus::Pending | OwnerObligationStatus::Failed
+    ) {
+        OwnerPacketStatus::AwaitingProof
+    } else {
+        OwnerPacketStatus::Closed
+    }
+}
+
+fn classify_task_contract_source(text: &str) -> &'static str {
+    let text = text.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return "ambiguous_refinement";
+    }
+    let routing_refinement = [
+        "owner is",
+        "source owner",
+        "caller",
+        "validation route",
+        "source location",
+        "corrected source",
+        "path is",
+        "file is",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let explicit_material_followup = [
+        "changed objective",
+        "change the objective",
+        "new objective",
+        "new requirement",
+        "additional requirement",
+        "new acceptance",
+        "changed acceptance",
+        "new required behavior",
+        "new prohibited behavior",
+        "new scope",
+        "expand scope",
+        "in addition",
+        "independent follow-up",
+        "separately implement",
+        "must now",
+        "do not allow",
+        "must reject",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let generic_material_followup = [
+        "also add",
+        "also implement",
+        "now add",
+        "now implement",
+        "instead implement",
+        "instead, implement",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    if explicit_material_followup || (generic_material_followup && !routing_refinement) {
+        "material_followup"
+    } else if routing_refinement {
+        "knowledge_refinement"
+    } else {
+        "ambiguous_refinement"
+    }
+}
+
+fn owner_command_route(
+    route: &codex_file_search::task_locator::LocateTaskValidationRoute,
+) -> OwnerPacketCommandRoute {
+    OwnerPacketCommandRoute {
+        id: route.id.clone(),
+        cwd: normalize_packet_path(&route.cwd),
+        argv: route.argv.iter().take(16).cloned().collect(),
+        role: route.role.clone(),
+    }
+}
+
+fn acceptance_criterion_id(step_id: &str, index: usize, criterion: &str) -> String {
+    if let Some(rest) = criterion.strip_prefix('[')
+        && let Some((id, _)) = rest.split_once(']')
+        && !id.trim().is_empty()
+    {
+        return id.trim().to_string();
+    }
+    if let Some((id, _)) = criterion.split_once(':')
+        && !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return id.to_string();
+    }
+    format!("{step_id}:acceptance:{index}")
+}
+
+fn criterion_mentions_path(criterion: &str, path: &str) -> bool {
+    let criterion = criterion.to_ascii_lowercase().replace('\\', "/");
+    let path = path.to_ascii_lowercase();
+    criterion.contains(&path)
+        || Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| criterion.contains(name))
+}
+
+fn owner_packet_preview(packet: &OwnerPacketProjection) -> OwnerPacketPreview {
+    OwnerPacketPreview {
+        packet_id: packet.packet_id.clone(),
+        contract_epoch: packet.contract_epoch,
+        owner_id: packet.owner_id.clone(),
+        status: owner_packet_status_name(packet.status).to_string(),
+        target_regions: packet
+            .target_regions
+            .iter()
+            .map(|region| OwnerPacketPreviewRegion {
+                path: region.path.clone(),
+                start_line: region.start_line,
+                end_line: region.end_line,
+            })
+            .collect(),
+        caller_dispositions: packet
+            .relationships
+            .iter()
+            .map(|relationship| OwnerPacketPreviewCaller {
+                path: relationship.path.clone(),
+                disposition: owner_relationship_disposition_name(relationship.disposition)
+                    .to_string(),
+            })
+            .collect(),
+        acceptance_ids: packet
+            .acceptance_mappings
+            .iter()
+            .map(|mapping| mapping.criterion_id.clone())
+            .collect(),
+        lifecycle_obligations: packet.lifecycle_obligations.clone(),
+        validation_route_id: packet
+            .validation_route
+            .as_ref()
+            .map(|route| route.id.clone()),
+        formatter_route_id: packet
+            .formatter_route
+            .as_ref()
+            .map(|route| route.id.clone()),
+        generated_source_ownership_enforced: packet.generated_source_ownership.is_some(),
+        missing_obligations: packet.missing_obligations.clone(),
+    }
+}
+
+fn verify_owner_patch(
+    document: &TaskEvidenceDocument,
+    regions: &[OwnerPacketChangeRegion],
+) -> Result<Vec<OwnerPacketBinding>, OwnerPacketNotReady> {
+    if regions.is_empty() {
+        return Err(owner_packet_not_ready(vec![
+            "proposed_file_changes".to_string(),
+        ]));
+    }
+    let packets = document
+        .owner_packets
+        .iter()
+        .filter(|packet| packet.contract_epoch == document.contract_epoch)
+        .collect::<Vec<_>>();
+    if packets.is_empty() {
+        return Err(owner_packet_not_ready(vec![
+            "ready_owner_packet".to_string(),
+        ]));
+    }
+    let mut by_packet = BTreeMap::<String, OwnerPacketBinding>::new();
+    let mut missing = Vec::new();
+    for region in regions {
+        let path = normalize_packet_path(&region.path);
+        let matches = packets
+            .iter()
+            .filter(|packet| packet_covers_path(packet, &path))
+            .copied()
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            missing.push(format!(
+                "authoritative_owner:{}:{}",
+                path,
+                if matches.is_empty() {
+                    "missing"
+                } else {
+                    "ambiguous"
+                }
+            ));
+            continue;
+        }
+        let packet = matches[0];
+        if !matches!(
+            packet.status,
+            OwnerPacketStatus::Ready
+                | OwnerPacketStatus::Mutated
+                | OwnerPacketStatus::AwaitingFormat
+                | OwnerPacketStatus::AwaitingProof
+                | OwnerPacketStatus::Closed
+        ) {
+            missing.extend(packet.missing_obligations.iter().cloned());
+            missing.push(format!("packet_ready:{}", packet.packet_id));
+        }
+        if !packet
+            .source_identities
+            .iter()
+            .any(|identity| packet_path_eq(&identity.path, &path))
+        {
+            missing.push(format!("current_supporting_source_identity:{path}"));
+        }
+        by_packet
+            .entry(packet.packet_id.clone())
+            .or_insert_with(|| OwnerPacketBinding {
+                packet_id: packet.packet_id.clone(),
+                owner_id: packet.owner_id.clone(),
+                regions: Vec::new(),
+            })
+            .regions
+            .push(OwnerPacketChangeRegion {
+                path,
+                start_line: region.start_line.max(1),
+                end_line: region.end_line.max(region.start_line.max(1)),
+            });
+    }
+    let changed_paths = regions
+        .iter()
+        .map(|region| normalize_packet_path(&region.path))
+        .collect::<BTreeSet<_>>();
+    for binding in by_packet.values() {
+        let Some(packet) = packets
+            .iter()
+            .find(|packet| packet.packet_id == binding.packet_id)
+            .copied()
+        else {
+            continue;
+        };
+        for relationship in packet.relationships.iter().filter(|relationship| {
+            relationship.disposition == OwnerRelationshipDisposition::MustChange
+        }) {
+            if !changed_paths
+                .iter()
+                .any(|path| packet_path_eq(path, &relationship.path))
+            {
+                missing.push(format!("must_change_caller:{}", relationship.path));
+            }
+        }
+        if let Some(ownership) = packet.generated_source_ownership.as_ref() {
+            let changes_generated = changed_paths
+                .iter()
+                .any(|path| packet_path_eq(path, &ownership.generated_path));
+            let changes_source = changed_paths
+                .iter()
+                .any(|path| packet_path_eq(path, &ownership.authoritative_source_path));
+            if changes_generated && !changes_source {
+                missing.push(format!(
+                    "authoritative_generated_source:{}",
+                    ownership.authoritative_source_path
+                ));
+            }
+            if ownership.requires_synchronized_representations
+                && (changes_generated || changes_source)
+                && !(changes_generated && changes_source)
+            {
+                missing.push(format!(
+                    "synchronized_generated_representation:{}+{}",
+                    ownership.authoritative_source_path, ownership.generated_path
+                ));
+            }
+        }
+    }
+    let owners = by_packet
+        .values()
+        .map(|binding| binding.owner_id.clone())
+        .collect::<BTreeSet<_>>();
+    if owners.len() > 1 {
+        let structurally_atomic = by_packet.values().all(|binding| {
+            packets
+                .iter()
+                .find(|packet| packet.packet_id == binding.packet_id)
+                .is_some_and(|packet| packet.multi_owner_atomic_evidence)
+        }) || plan_establishes_atomic_owners(&document.plan, &owners);
+        if !structurally_atomic {
+            missing.push("multi_owner_atomic_contract".to_string());
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        return Err(owner_packet_not_ready(missing));
+    }
+    Ok(by_packet.into_values().collect())
+}
+
+fn plan_establishes_atomic_owners(plan: &[EvidencePlanStep], owners: &BTreeSet<String>) -> bool {
+    plan.iter().any(|step| {
+        let evidence = std::iter::once(step.step.as_str())
+            .chain(step.acceptance_criteria.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        (evidence.contains("atomic") || evidence.contains("together"))
+            && owners
+                .iter()
+                .all(|owner| evidence.contains(&owner.to_ascii_lowercase()))
+    })
+}
+
+fn owner_packet_not_ready(unresolved_obligations: Vec<String>) -> OwnerPacketNotReady {
+    OwnerPacketNotReady {
+        kind: "packet_not_ready",
+        unresolved_obligations,
+        expected_evidence_workflow: vec!["locate_task", "read_file_span", "update_plan"],
+    }
+}
+
+fn packet_covers_path(packet: &OwnerPacketProjection, path: &str) -> bool {
+    packet
+        .target_regions
+        .iter()
+        .any(|region| packet_path_eq(&region.path, path))
+        || packet
+            .relationships
+            .iter()
+            .any(|relationship| packet_path_eq(&relationship.path, path))
+        || packet
+            .contract_paths
+            .iter()
+            .chain(&packet.test_paths)
+            .any(|candidate| packet_path_eq(candidate, path))
+        || packet
+            .owner_roots
+            .iter()
+            .any(|root| packet_path_within(path, root))
+}
+
+fn packet_path_within(path: &str, root: &str) -> bool {
+    let path = comparable_packet_path(path);
+    let root = comparable_packet_path(root)
+        .trim_end_matches('/')
+        .to_string();
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn packet_path_eq(left: &str, right: &str) -> bool {
+    comparable_packet_path(left) == comparable_packet_path(right)
+}
+
+fn comparable_packet_path(path: &str) -> String {
+    let path = normalize_packet_path(path);
+    if cfg!(windows) {
+        path.to_ascii_lowercase()
+    } else {
+        path
+    }
+}
+
+fn normalize_packet_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn same_region_with_margin(
+    left: &OwnerPacketChangeRegion,
+    right: &OwnerPacketChangeRegion,
+    margin: usize,
+) -> bool {
+    packet_path_eq(&left.path, &right.path)
+        && left.start_line.saturating_sub(margin) <= right.end_line.saturating_add(margin)
+        && right.start_line.saturating_sub(margin) <= left.end_line.saturating_add(margin)
+}
+
+fn refresh_packet_spans_from_post_state(
+    packet: &mut OwnerPacketProjection,
+    binding: &OwnerPacketBinding,
+    post: &OwnerPacketPostMutationPath,
+    aggregate: &mut OwnerPacketCounters,
+) {
+    let file_sha256 = post.file_sha256.as_deref();
+    for span in packet
+        .source_spans
+        .iter_mut()
+        .filter(|span| packet_path_eq(&span.path, &post.path))
+    {
+        let still_current = post
+            .content
+            .as_deref()
+            .and_then(|content| hash_line_span(content, span.start_line, span.end_line))
+            == Some(span.span_sha256.clone());
+        if still_current {
+            if let Some(file_sha256) = file_sha256 {
+                span.file_sha256 = file_sha256.to_string();
+                span.state = OwnerSourceSpanState::Current;
+            }
+        } else if span.state != OwnerSourceSpanState::Invalidated {
+            span.state = OwnerSourceSpanState::Invalidated;
+            packet.counters.interval_invalidations =
+                packet.counters.interval_invalidations.saturating_add(1);
+            aggregate.interval_invalidations = aggregate.interval_invalidations.saturating_add(1);
+        }
+    }
+    let Some(content) = post.content.as_deref() else {
+        return;
+    };
+    let Some(file_sha256) = file_sha256 else {
+        return;
+    };
+    for region in binding
+        .regions
+        .iter()
+        .filter(|region| packet_path_eq(&region.path, &post.path))
+    {
+        let Some(span_sha256) = hash_line_span(content, region.start_line, region.end_line) else {
+            continue;
+        };
+        let section_id = owner_span_id(
+            &packet.packet_id,
+            &post.path,
+            region.start_line,
+            region.end_line,
+            &span_sha256,
+        );
+        packet
+            .source_spans
+            .retain(|span| span.section_id != section_id);
+        packet.source_spans.push(OwnerPacketSourceSpan {
+            section_id,
+            path: post.path.clone(),
+            start_line: region.start_line,
+            end_line: region.end_line,
+            file_sha256: file_sha256.to_string(),
+            span_sha256,
+            state: OwnerSourceSpanState::Current,
+        });
+        packet.counters.span_refreshes = packet.counters.span_refreshes.saturating_add(1);
+        aggregate.span_refreshes = aggregate.span_refreshes.saturating_add(1);
+    }
+    trim_to_last(&mut packet.source_spans, MAX_OWNER_PACKET_SPANS);
+}
+
+fn hash_line_span(content: &[u8], start_line: usize, end_line: usize) -> Option<String> {
+    let text = std::str::from_utf8(content).ok()?;
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    if start_line == 0 || start_line > lines.len().max(1) || end_line < start_line {
+        return None;
+    }
+    let end = end_line.min(lines.len());
+    let selected = lines.get(start_line - 1..end)?.concat();
+    Some(format!("{:x}", Sha256::digest(selected.as_bytes())))
+}
+
+fn owner_span_id(
+    packet_id: &str,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    span_sha256: &str,
+) -> String {
+    sha256_join_task_evidence(&[
+        "owner_span_v1",
+        packet_id,
+        path,
+        &start_line.to_string(),
+        &end_line.to_string(),
+        span_sha256,
+    ])
+}
+
+fn sha256_join_task_evidence(parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn add_owner_packet_counters(metrics: &mut OwnerPacketMetrics, counters: &OwnerPacketCounters) {
+    metrics.edits = metrics.edits.saturating_add(counters.edits);
+    metrics.same_region_revisits = metrics
+        .same_region_revisits
+        .saturating_add(counters.same_region_revisits);
+    metrics.caller_repairs = metrics
+        .caller_repairs
+        .saturating_add(counters.caller_repairs);
+    metrics.acceptance_repairs = metrics
+        .acceptance_repairs
+        .saturating_add(counters.acceptance_repairs);
+    metrics.lifecycle_repairs = metrics
+        .lifecycle_repairs
+        .saturating_add(counters.lifecycle_repairs);
+    metrics.formatting_only_repairs = metrics
+        .formatting_only_repairs
+        .saturating_add(counters.formatting_only_repairs);
+    metrics.other_repairs = metrics.other_repairs.saturating_add(counters.other_repairs);
+    metrics.identity_refreshes = metrics
+        .identity_refreshes
+        .saturating_add(counters.identity_refreshes);
+    metrics.interval_invalidations = metrics
+        .interval_invalidations
+        .saturating_add(counters.interval_invalidations);
+    metrics.span_refreshes = metrics
+        .span_refreshes
+        .saturating_add(counters.span_refreshes);
+}
+
+fn owner_transition_metrics(counters: &OwnerPacketCounters) -> OwnerPacketTransitionMetrics {
+    OwnerPacketTransitionMetrics {
+        edits: counters.edits,
+        same_region_revisits: counters.same_region_revisits,
+        caller_repairs: counters.caller_repairs,
+        acceptance_repairs: counters.acceptance_repairs,
+        lifecycle_repairs: counters.lifecycle_repairs,
+        formatting_only_repairs: counters.formatting_only_repairs,
+        other_repairs: counters.other_repairs,
+        identity_refreshes: counters.identity_refreshes,
+        interval_invalidations: counters.interval_invalidations,
+        span_refreshes: counters.span_refreshes,
+    }
+}
+
+fn record_owner_packet_command_outcome(
+    document: &mut TaskEvidenceDocument,
+    receipt: &CommandReceipt,
+    formatter_post_paths: &[OwnerPacketPostMutationPath],
+) {
+    let infrastructure_unavailable = receipt.timed_out || matches!(receipt.exit_code, 127 | 9009);
+    let repository_root = document.start.repository_root.clone();
+    let mut aggregate = OwnerPacketCounters::default();
+    for packet in document
+        .owner_packets
+        .iter_mut()
+        .filter(|packet| packet.contract_epoch == document.contract_epoch)
+    {
+        let formatter = packet
+            .formatter_route
+            .as_ref()
+            .is_some_and(|route| owner_command_route_matches(&repository_root, route, receipt));
+        let validation = packet
+            .validation_route
+            .as_ref()
+            .is_some_and(|route| owner_command_route_matches(&repository_root, route, receipt));
+        if !formatter && !validation {
+            continue;
+        }
+        trim_to_last(
+            &mut packet.command_receipt_ids,
+            MAX_OWNER_PACKET_REFERENCES - 1,
+        );
+        packet.command_receipt_ids.push(receipt.id.clone());
+        if formatter {
+            packet.format_status = if receipt.exit_code == 0 && !receipt.timed_out {
+                OwnerObligationStatus::Passed
+            } else if infrastructure_unavailable {
+                OwnerObligationStatus::Unavailable
+            } else {
+                OwnerObligationStatus::Failed
+            };
+            refresh_packet_after_formatter(packet, formatter_post_paths, &mut aggregate);
+        }
+        if validation {
+            packet.proof_status = if receipt.exit_code == 0 && !receipt.timed_out {
+                OwnerObligationStatus::Passed
+            } else if infrastructure_unavailable {
+                OwnerObligationStatus::Unavailable
+            } else {
+                OwnerObligationStatus::Failed
+            };
+        }
+        packet.missing_obligations.retain(|obligation| {
+            !obligation.starts_with("formatter_infrastructure_unavailable:")
+                && !obligation.starts_with("validation_infrastructure_unavailable:")
+        });
+        if packet.format_status == OwnerObligationStatus::Unavailable {
+            let route = packet
+                .formatter_route
+                .as_ref()
+                .map_or("unknown", |route| route.id.as_str());
+            packet
+                .missing_obligations
+                .push(format!("formatter_infrastructure_unavailable:{route}"));
+        }
+        if packet.proof_status == OwnerObligationStatus::Unavailable {
+            let route = packet
+                .validation_route
+                .as_ref()
+                .map_or("unknown", |route| route.id.as_str());
+            packet
+                .missing_obligations
+                .push(format!("validation_infrastructure_unavailable:{route}"));
+        }
+        packet.status = if packet
+            .missing_obligations
+            .iter()
+            .any(|obligation| obligation == "post_formatter_source_content_unavailable")
+        {
+            OwnerPacketStatus::Blocked
+        } else {
+            owner_packet_status_for_obligations(packet.format_status, packet.proof_status)
+        };
+        packet.updated_at = timestamp();
+    }
+    add_owner_packet_counters(&mut document.owner_packet_metrics, &aggregate);
+}
+
+fn owner_command_route_matches(
+    repository_root: &str,
+    route: &OwnerPacketCommandRoute,
+    receipt: &CommandReceipt,
+) -> bool {
+    owner_command_route_matches_input(repository_root, route, &receipt.command, &receipt.cwd)
+}
+
+fn owner_command_route_matches_input(
+    repository_root: &str,
+    route: &OwnerPacketCommandRoute,
+    command: &[String],
+    cwd: &str,
+) -> bool {
+    if route.argv != command {
+        return false;
+    }
+    let route_cwd = Path::new(&route.cwd);
+    let resolved = if route_cwd.is_absolute() {
+        route_cwd.to_path_buf()
+    } else {
+        Path::new(repository_root).join(route_cwd)
+    };
+    let resolved = resolved.components().collect::<PathBuf>();
+    recorded_path_uri_matches(cwd, &resolved)
+}
+
+fn refresh_packet_after_formatter(
+    packet: &mut OwnerPacketProjection,
+    post_paths: &[OwnerPacketPostMutationPath],
+    aggregate: &mut OwnerPacketCounters,
+) {
+    let mut content_missing = false;
+    for post in post_paths {
+        if !packet_covers_path(packet, &post.path) {
+            continue;
+        }
+        packet
+            .source_identities
+            .retain(|identity| !packet_path_eq(&identity.path, &post.path));
+        if let Some(file_sha256) = post.file_sha256.as_ref() {
+            packet.source_identities.push(OwnerPacketSourceIdentity {
+                path: post.path.clone(),
+                file_sha256: file_sha256.clone(),
+            });
+            trim_to_last(
+                &mut packet.source_identities,
+                MAX_OWNER_PACKET_REFERENCES * 2,
+            );
+            packet.counters.identity_refreshes =
+                packet.counters.identity_refreshes.saturating_add(1);
+            aggregate.identity_refreshes = aggregate.identity_refreshes.saturating_add(1);
+        }
+        let regions = packet
+            .source_spans
+            .iter()
+            .filter(|span| packet_path_eq(&span.path, &post.path))
+            .map(|span| OwnerPacketChangeRegion {
+                path: span.path.clone(),
+                start_line: span.start_line,
+                end_line: span.end_line,
+            })
+            .chain(
+                packet
+                    .target_regions
+                    .iter()
+                    .filter(|region| packet_path_eq(&region.path, &post.path))
+                    .filter_map(|region| {
+                        Some(OwnerPacketChangeRegion {
+                            path: region.path.clone(),
+                            start_line: region.start_line?,
+                            end_line: region.end_line?,
+                        })
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let binding = OwnerPacketBinding {
+            packet_id: packet.packet_id.clone(),
+            owner_id: packet.owner_id.clone(),
+            regions,
+        };
+        refresh_packet_spans_from_post_state(packet, &binding, post, aggregate);
+        content_missing |= post.existed && post.content.is_none();
+    }
+    if content_missing {
+        packet.status = OwnerPacketStatus::Blocked;
+        packet
+            .missing_obligations
+            .push("post_formatter_source_content_unavailable".to_string());
+    }
+}
+
+async fn read_owner_post_mutation_path(
+    repo_root: &Path,
+    path: String,
+) -> OwnerPacketPostMutationPath {
+    const MAX_OWNER_POST_CONTENT_BYTES: u64 = 4 * 1024 * 1024;
+    let relative = Path::new(&path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return OwnerPacketPostMutationPath {
+            path,
+            existed: true,
+            file_sha256: None,
+            content: None,
+        };
+    }
+    let candidate = repo_root.join(relative);
+    let metadata = match tokio::fs::metadata(&candidate).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return OwnerPacketPostMutationPath {
+                path,
+                existed: false,
+                file_sha256: None,
+                content: None,
+            };
+        }
+        Err(_) => {
+            return OwnerPacketPostMutationPath {
+                path,
+                existed: true,
+                file_sha256: None,
+                content: None,
+            };
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_OWNER_POST_CONTENT_BYTES {
+        return OwnerPacketPostMutationPath {
+            path,
+            existed: true,
+            file_sha256: None,
+            content: None,
+        };
+    }
+    let confined = match (
+        tokio::fs::canonicalize(repo_root).await,
+        tokio::fs::canonicalize(&candidate).await,
+    ) {
+        (Ok(root), Ok(candidate)) => candidate.starts_with(root),
+        _ => false,
+    };
+    if !confined {
+        return OwnerPacketPostMutationPath {
+            path,
+            existed: true,
+            file_sha256: None,
+            content: None,
+        };
+    }
+    let content = tokio::fs::read(candidate).await.ok();
+    let file_sha256 = content
+        .as_deref()
+        .map(|content| format!("{:x}", Sha256::digest(content)));
+    OwnerPacketPostMutationPath {
+        path,
+        existed: true,
+        file_sha256,
+        content,
+    }
+}
+
+const fn owner_packet_status_name(status: OwnerPacketStatus) -> &'static str {
+    match status {
+        OwnerPacketStatus::Collecting => "collecting",
+        OwnerPacketStatus::Ready => "ready",
+        OwnerPacketStatus::Mutated => "mutated",
+        OwnerPacketStatus::AwaitingFormat => "awaiting_format",
+        OwnerPacketStatus::AwaitingProof => "awaiting_proof",
+        OwnerPacketStatus::Closed => "closed",
+        OwnerPacketStatus::Blocked => "blocked",
+    }
+}
+
+const fn owner_relationship_disposition_name(
+    disposition: OwnerRelationshipDisposition,
+) -> &'static str {
+    match disposition {
+        OwnerRelationshipDisposition::MustChange => "must_change",
+        OwnerRelationshipDisposition::MustRemainCompatible => "must_remain_compatible",
+        OwnerRelationshipDisposition::TestOrProofOnly => "test_or_proof_only",
+        OwnerRelationshipDisposition::Irrelevant => "irrelevant",
+    }
+}
+
+fn checkpoint_step_status(status: &StepStatus) -> &'static str {
+    match status {
+        StepStatus::Pending => "pending",
+        StepStatus::InProgress => "in_progress",
+        StepStatus::Implemented => "implemented",
+        StepStatus::Passed | StepStatus::Completed => "passed",
+        StepStatus::Blocked => "blocked",
+        StepStatus::Skipped => "skipped",
+    }
+}
+
 fn review_identity_is_current(
     document: &TaskEvidenceDocument,
     expected_implementation_identity: Option<&str>,
@@ -5339,16 +10629,71 @@ pub(crate) fn source_local_classifications_with_manifest_gaps(
         .iter()
         .map(source_classification_cache_key)
         .collect::<BTreeSet<_>>();
-    let mut corrected = expected_keys
-        .iter()
-        .map(|key| {
-            dossier
-                .source_classification_cache
-                .get(key)
-                .cloned()
-                .map(|classification| (key.clone(), classification))
-        })
-        .collect::<Option<BTreeMap<_, _>>>()?;
+    let mut corrected = BTreeMap::new();
+    for source in &dossier.sources {
+        let key = source_classification_cache_key(source);
+        let classification =
+            if let Some(classification) = dossier.source_classification_cache.get(&key) {
+                classification.clone()
+            } else {
+                let mut requirement_spans = dossier
+                    .requirements
+                    .iter()
+                    .filter(|requirement| requirement.source_id == source.source_id)
+                    .map(|requirement| requirement.source_span.clone())
+                    .collect::<Vec<_>>();
+                requirement_spans.sort();
+                requirement_spans.dedup();
+                match dossier.source_mappings.get(&source.source_id)? {
+                    SourceMapping::RequirementBearing { .. } if !requirement_spans.is_empty() => {
+                        SourceLocalClassification {
+                            local_kind: SourceLocalClassificationKind::RequirementBearing,
+                            local_semantic_cues: requirement_spans
+                                .iter()
+                                .cloned()
+                                .map(|source_span| LocalSemanticCue {
+                                    kind: LocalSemanticCueKind::Assertion,
+                                    source_span: Some(source_span),
+                                })
+                                .collect(),
+                            requirement_spans,
+                            reason:
+                                "Reconstructed from the validated current requirement manifest."
+                                    .to_string(),
+                        }
+                    }
+                    SourceMapping::NonRequirement { reason } => SourceLocalClassification {
+                        local_kind: SourceLocalClassificationKind::NonRequirement,
+                        requirement_spans: Vec::new(),
+                        local_semantic_cues: Vec::new(),
+                        reason: reason.clone(),
+                    },
+                    SourceMapping::SupersededContext { reason } => SourceLocalClassification {
+                        local_kind: SourceLocalClassificationKind::RelationshipOnlyContext,
+                        requirement_spans: Vec::new(),
+                        local_semantic_cues: vec![LocalSemanticCue {
+                            kind: LocalSemanticCueKind::RelationshipOnlyContext,
+                            source_span: None,
+                        }],
+                        reason: reason.clone(),
+                    },
+                    SourceMapping::UnavailableOrTruncated => SourceLocalClassification {
+                        local_kind: SourceLocalClassificationKind::UnavailableOrTruncated,
+                        requirement_spans: Vec::new(),
+                        local_semantic_cues: Vec::new(),
+                        reason: "The immutable source was unavailable or truncated.".to_string(),
+                    },
+                    SourceMapping::PendingClassification
+                    | SourceMapping::RequirementBearing { .. } => return None,
+                }
+            };
+        if corrected
+            .insert(key, classification.clone())
+            .is_some_and(|existing| existing != classification)
+        {
+            return None;
+        }
+    }
     let mut seen = BTreeSet::new();
     const CORRECTION_REASON: &str =
         "Validated immutable manifest gap establishes an omitted requirement span.";
@@ -5978,7 +11323,18 @@ fn plan_structure_hash(plan: &[EvidencePlanStep]) -> String {
         .map(|step| {
             serde_json::json!({
                 "id": step.id,
+                "revision": step.revision,
                 "step": step.step,
+                "sourceOwner": step.source_owner,
+                "implementationSurfaces": step.implementation_surfaces,
+                "mutationObligations": step.mutation_obligations.iter().map(|obligation| serde_json::json!({
+                    "id": obligation.id,
+                    "description": obligation.description,
+                    "paths": obligation.paths,
+                })).collect::<Vec<_>>(),
+                "validationDisposition": step.validation_disposition,
+                "validationRoute": step.validation_route,
+                "externalValidationRoute": step.external_validation_route,
                 "dependsOn": step.depends_on,
                 "acceptanceCriteria": step.acceptance_criteria,
                 "runtimePaths": step.runtime_paths,
@@ -6914,14 +12270,14 @@ async fn load_existing_document_with_supported_version(
         };
     }
     let schema_version = schema_version as u32;
-    if schema_version == TASK_EVIDENCE_SCHEMA_VERSION
+    if schema_version >= FROZEN_TASK_EVIDENCE_V6_SCHEMA_VERSION
         && !value
             .get("source_classification_cache")
             .is_some_and(Value::is_array)
     {
         return ExistingDocument::Rejected {
             kind: "corrupt",
-            reason: "V6 requires an array source_classification_cache".to_string(),
+            reason: "V6+ requires an array source_classification_cache".to_string(),
         };
     }
     let legacy_completion_model = schema_version < TASK_EVIDENCE_COMPLETION_MODEL_VERSION
@@ -6950,7 +12306,11 @@ async fn load_existing_document_with_supported_version(
     }
     if matches!(
         schema_version,
-        FROZEN_TASK_EVIDENCE_V5_SCHEMA_VERSION | TASK_EVIDENCE_SCHEMA_VERSION
+        FROZEN_TASK_EVIDENCE_V5_SCHEMA_VERSION
+            | FROZEN_TASK_EVIDENCE_V6_SCHEMA_VERSION
+            | FROZEN_TASK_EVIDENCE_V7_SCHEMA_VERSION
+            | FROZEN_TASK_EVIDENCE_V8_SCHEMA_VERSION
+            | TASK_EVIDENCE_SCHEMA_VERSION
     ) && let Err(reason) = validate_v5_completion_review(&document)
     {
         return ExistingDocument::Rejected {
@@ -6958,12 +12318,12 @@ async fn load_existing_document_with_supported_version(
             reason: format!("invalid V5 completion-review lineage: {reason}"),
         };
     }
-    if schema_version == TASK_EVIDENCE_SCHEMA_VERSION
+    if schema_version >= FROZEN_TASK_EVIDENCE_V6_SCHEMA_VERSION
         && let Err(reason) = validate_v6_source_classification_state(&document)
     {
         return ExistingDocument::Rejected {
             kind: "corrupt",
-            reason: format!("invalid V6 source-classification state: {reason}"),
+            reason: format!("invalid V6+ source-classification state: {reason}"),
         };
     }
     ExistingDocument::Loaded {
@@ -7760,6 +13120,37 @@ fn validate_v5_review_receipts(
         {
             return Err("review receipt identity or infrastructure outcome is invalid".to_string());
         }
+        if (receipt.disposition == CompletionReviewDisposition::Attempted)
+            != receipt.attempted_outcome.is_some()
+        {
+            return Err(
+                "attempted-review outcome is inconsistent with its disposition".to_string(),
+            );
+        }
+        match receipt.attempted_outcome {
+            Some(CompletionReviewAttemptedOutcome::Clean)
+                if !receipt.review_clean || !receipt.findings.is_empty() =>
+            {
+                return Err("clean review outcome has findings or is not marked clean".to_string());
+            }
+            Some(CompletionReviewAttemptedOutcome::ActionableFindings)
+                if receipt.findings.is_empty() || receipt.infrastructure_outcome != "ok" =>
+            {
+                return Err(
+                    "actionable review outcome lacks findings or has infrastructure failure"
+                        .to_string(),
+                );
+            }
+            Some(CompletionReviewAttemptedOutcome::InfrastructureFailure)
+                if receipt.infrastructure_outcome == "ok" =>
+            {
+                return Err(
+                    "infrastructure review outcome is recorded with successful infrastructure"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
         let parent =
             match receipt.parent_review_id.as_ref() {
                 Some(parent_id) => Some(*seen.get(parent_id).ok_or_else(|| {
@@ -8130,6 +13521,13 @@ fn repository_roots_match(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn recorded_path_uri_matches(recorded: &str, expected: &Path) -> bool {
+    PathUri::parse(recorded)
+        .ok()
+        .and_then(|uri| uri.to_abs_path().ok())
+        .is_some_and(|path| repository_roots_match(path.as_path(), expected))
+}
+
 #[cfg(not(windows))]
 fn repository_root_paths_equal(left: &Path, right: &Path) -> bool {
     left == right
@@ -8306,6 +13704,23 @@ fn migrate_document_with_completion_model(
             std::mem::take(&mut document.source_classification_cache),
         );
     }
+    if source_schema_version <= FROZEN_TASK_EVIDENCE_V6_SCHEMA_VERSION
+        && let Some(ledger) = document.completion_review_v2.as_mut()
+    {
+        let requirement =
+            CompletionReviewRequirement::from_obligation_mode(&ledger.obligation.mode);
+        for receipt in &mut ledger.receipts {
+            let (disposition, attempted_outcome) = completion_review_attempt_dimensions(
+                receipt.attempt_kind,
+                &receipt.infrastructure_outcome,
+                receipt.review_clean,
+                !receipt.findings.is_empty(),
+            );
+            receipt.requirement = requirement;
+            receipt.disposition = disposition;
+            receipt.attempted_outcome = attempted_outcome;
+        }
+    }
     document.schema_version = TASK_EVIDENCE_SCHEMA_VERSION;
 }
 
@@ -8367,6 +13782,8 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
         dossier_snapshot_id: dossier_snapshot_id.clone(),
         user_source_ledger_hash: source_ledger_hash.clone(),
         requirement_manifest_hash: manifest_hash.clone(),
+        attempt_identity: "migrated_v4".to_string(),
+        reviewer_contract_hash: "migrated_v4".to_string(),
         findings: Vec::new(),
         dispositions: Vec::new(),
         manifest_gaps: Vec::new(),
@@ -8379,6 +13796,14 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
         fallback_reasons: Vec::new(),
         candidate_implementation_identity: None,
         rereview_audit_hash: None,
+        requirement: CompletionReviewRequirement::Supplemental,
+        disposition: if attempt_kind == CompletionReviewAttemptKind::TerminalClosure {
+            CompletionReviewDisposition::NotApplicable
+        } else {
+            CompletionReviewDisposition::Attempted
+        },
+        attempted_outcome: (attempt_kind == CompletionReviewAttemptKind::InitialReview)
+            .then_some(CompletionReviewAttemptedOutcome::Clean),
         infrastructure_outcome: "migrated_v4_terminal".to_string(),
         review_clean: true,
         terminal_outcome,
@@ -8419,6 +13844,10 @@ fn seed_migrated_v4_terminal_lineage(document: &mut TaskEvidenceDocument) {
 }
 
 const fn initial_receipt_sequence() -> u64 {
+    1
+}
+
+const fn initial_contract_epoch() -> u64 {
     1
 }
 
@@ -8522,6 +13951,276 @@ fn normalize_requested_status(requested: &StepStatus) -> StepStatus {
     }
 }
 
+fn step_internal_structure_matches(left: &EvidencePlanStep, right: &EvidencePlanStep) -> bool {
+    left.source_owner == right.source_owner
+        && left.implementation_surfaces == right.implementation_surfaces
+        && left
+            .mutation_obligations
+            .iter()
+            .map(|obligation| (&obligation.id, &obligation.description, &obligation.paths))
+            .eq(right
+                .mutation_obligations
+                .iter()
+                .map(|obligation| (&obligation.id, &obligation.description, &obligation.paths)))
+        && left.validation_disposition == right.validation_disposition
+        && left.external_validation_route == right.external_validation_route
+}
+
+fn implementation_obligations_satisfied(obligations: &[MutationObligationState]) -> bool {
+    !obligations.is_empty() && obligations.iter().all(|obligation| obligation.satisfied)
+}
+
+fn record_obligation_progress(
+    obligations: &mut [MutationObligationState],
+    changed_paths: &BTreeSet<String>,
+) {
+    for obligation in obligations {
+        if obligation.paths.is_empty() {
+            obligation.satisfied = !changed_paths.is_empty();
+            obligation
+                .satisfied_paths
+                .extend(changed_paths.iter().cloned());
+            continue;
+        }
+        for changed in changed_paths {
+            if obligation
+                .paths
+                .iter()
+                .any(|expected| validation_paths_overlap(expected, changed))
+            {
+                obligation.satisfied_paths.insert(changed.clone());
+            }
+        }
+        obligation.satisfied = obligation.paths.iter().all(|expected| {
+            obligation
+                .satisfied_paths
+                .iter()
+                .any(|changed| validation_paths_overlap(expected, changed))
+        });
+    }
+}
+
+fn admissible_requested_status(step: &EvidencePlanStep) -> StepStatus {
+    match step.status {
+        StepStatus::Passed => match step.validation_disposition {
+            ValidationDisposition::NotRequired => StepStatus::Passed,
+            ValidationDisposition::UnavailableBlocked => StepStatus::Blocked,
+            ValidationDisposition::Executable | ValidationDisposition::UnresolvedDiscoverable => {
+                if step.validation_receipt_id.is_some() {
+                    StepStatus::Passed
+                } else if implementation_obligations_satisfied(&step.mutation_obligations) {
+                    StepStatus::Implemented
+                } else {
+                    StepStatus::InProgress
+                }
+            }
+        },
+        StepStatus::Implemented
+            if !step.mutation_obligations.is_empty()
+                && !implementation_obligations_satisfied(&step.mutation_obligations) =>
+        {
+            StepStatus::InProgress
+        }
+        ref status => status.clone(),
+    }
+}
+
+fn ensure_focused_work_unit(document: &mut TaskEvidenceDocument) -> &mut FocusedWorkUnit {
+    let mut hasher = Sha256::new();
+    hasher.update(b"KD4_FOCUSED_WORK_UNIT_V1\0");
+    hasher.update(document.thread_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    document.planning.work_unit.get_or_insert(FocusedWorkUnit {
+        id: format!("work-{}", &digest[..24]),
+        source_owner: None,
+        implementation_surfaces: Vec::new(),
+        acceptance_criteria: Vec::new(),
+        mutation_obligations: Vec::new(),
+        validation_disposition: ValidationDisposition::NotRequired,
+        validation_route: None,
+        external_validation_route: None,
+        validation_receipt_id: None,
+    })
+}
+
+fn current_action_attribution(
+    document: &mut TaskEvidenceDocument,
+    kind: &str,
+    action_id: &str,
+) -> (
+    Option<String>,
+    Option<u64>,
+    Option<String>,
+    ActionAttributionKind,
+) {
+    if let Some(step_id) = document.active_step_id.as_ref()
+        && let Some(step) = document.plan.iter().find(|step| &step.id == step_id)
+    {
+        return (
+            Some(step.id.clone()),
+            Some(step.revision),
+            None,
+            ActionAttributionKind::PlannedStep,
+        );
+    }
+    if document.plan.is_empty() {
+        let work_unit_id = ensure_focused_work_unit(document).id.clone();
+        return (
+            None,
+            None,
+            Some(work_unit_id),
+            ActionAttributionKind::FocusedWorkUnit,
+        );
+    }
+    document
+        .planning
+        .outside_plan_actions
+        .push(OutsidePlanAction {
+            kind: kind.to_string(),
+            action_id: action_id.to_string(),
+            recorded_at: timestamp(),
+        });
+    trim_to_last(
+        &mut document.planning.outside_plan_actions,
+        MAX_OUTSIDE_PLAN_ACTIONS,
+    );
+    document.planning.counters.outside_plan_actions = document
+        .planning
+        .counters
+        .outside_plan_actions
+        .saturating_add(1);
+    (None, None, None, ActionAttributionKind::OutsidePlan)
+}
+
+fn command_receipt_has_current_proof_identity(
+    document: &TaskEvidenceDocument,
+    receipt: &CommandReceipt,
+) -> bool {
+    let Some((manifest_revision, source_hash, manifest_hash)) =
+        completion_contract_hashes(document, false)
+    else {
+        return false;
+    };
+    let Some(validation) = receipt.validation_result.as_ref() else {
+        return false;
+    };
+    let Some(implementation_identity) = receipt.implementation_identity_hash.as_deref() else {
+        return false;
+    };
+    receipt.exit_code == 0
+        && !receipt.timed_out
+        && !receipt.possible_mutation
+        && receipt.epoch == document.evidence_epoch
+        && receipt.host_mutation_revision == Some(document.host_mutation_revision)
+        && receipt.manifest_revision == Some(manifest_revision)
+        && receipt.user_source_ledger_hash.as_deref() == Some(source_hash.as_str())
+        && receipt.requirement_manifest_hash.as_deref() == Some(manifest_hash.as_str())
+        && validation.status.is_success()
+        && validation.proof_key.validation_contract_version
+            == codex_protocol::validation::VALIDATION_CONTRACT_VERSION
+        && validation.proof_key.implementation_identity == implementation_identity
+        && repository_roots_match(
+            Path::new(&validation.proof_key.repository),
+            Path::new(&document.start.repository_root),
+        )
+        && recorded_path_uri_matches(&receipt.cwd, Path::new(&validation.proof_key.cwd))
+        && recorded_path_uri_matches(&receipt.cwd, Path::new(&document.start.repository_root))
+}
+
+fn accept_matching_command_proof(document: &mut TaskEvidenceDocument, receipt: &CommandReceipt) {
+    if !command_receipt_has_current_proof_identity(document, receipt) {
+        return;
+    }
+    if let (Some(step_id), Some(step_revision)) =
+        (receipt.step_id.as_deref(), receipt.step_revision)
+        && let Some(step) = document
+            .plan
+            .iter_mut()
+            .find(|step| step.id == step_id && step.revision == step_revision)
+        && step.validation_disposition == ValidationDisposition::Executable
+        && step.validation_route.as_ref().is_some_and(|route| {
+            route.leaves.iter().any(|leaf| leaf.argv == receipt.command)
+                && receipt
+                    .validation_result
+                    .as_ref()
+                    .is_some_and(|validation| validation.route == *route)
+        })
+        && (step.mutation_obligations.is_empty()
+            || implementation_obligations_satisfied(&step.mutation_obligations))
+    {
+        step.validation_receipt_id = Some(receipt.id.clone());
+        step.status = StepStatus::Passed;
+        return;
+    }
+    if let Some(work_unit_id) = receipt.work_unit_id.as_deref()
+        && let Some(work_unit) = document.planning.work_unit.as_mut()
+        && work_unit.id == work_unit_id
+        && work_unit.validation_disposition == ValidationDisposition::Executable
+        && work_unit.validation_route.as_ref().is_some_and(|route| {
+            route.leaves.iter().any(|leaf| leaf.argv == receipt.command)
+                && receipt
+                    .validation_result
+                    .as_ref()
+                    .is_some_and(|validation| validation.route == *route)
+        })
+        && (work_unit.mutation_obligations.is_empty()
+            || implementation_obligations_satisfied(&work_unit.mutation_obligations))
+    {
+        work_unit.validation_receipt_id = Some(receipt.id.clone());
+    }
+}
+
+fn accept_matching_external_proof(
+    document: &mut TaskEvidenceDocument,
+    receipt: &ExternalEvidenceReceipt,
+) {
+    let fresh = receipt.tool_success
+        && receipt.payload_completeness == EvidenceCompleteness::Complete
+        && !receipt.truncated
+        && !receipt.approximate
+        && receipt.task_epoch == document.evidence_epoch
+        && receipt.host_mutation_revision == Some(document.host_mutation_revision)
+        && receipt.implementation_identity_hash.is_some()
+        && receipt.workspace_root_fingerprint == workspace_root_fingerprint(&document.start);
+    if !fresh {
+        return;
+    }
+    let route_matches = |route: &ExternalValidationRouteInput| {
+        route.server_name == receipt.server_name && route.tool_name == receipt.tool_name
+    };
+    if let (Some(step_id), Some(step_revision)) =
+        (receipt.step_id.as_deref(), receipt.step_revision)
+        && let Some(step) = document
+            .plan
+            .iter_mut()
+            .find(|step| step.id == step_id && step.revision == step_revision)
+        && step.validation_disposition == ValidationDisposition::Executable
+        && step
+            .external_validation_route
+            .as_ref()
+            .is_some_and(route_matches)
+        && (step.mutation_obligations.is_empty()
+            || implementation_obligations_satisfied(&step.mutation_obligations))
+    {
+        step.validation_receipt_id = Some(receipt.id.clone());
+        step.status = StepStatus::Passed;
+        return;
+    }
+    if let Some(work_unit_id) = receipt.work_unit_id.as_deref()
+        && let Some(work_unit) = document.planning.work_unit.as_mut()
+        && work_unit.id == work_unit_id
+        && work_unit.validation_disposition == ValidationDisposition::Executable
+        && work_unit
+            .external_validation_route
+            .as_ref()
+            .is_some_and(route_matches)
+        && (work_unit.mutation_obligations.is_empty()
+            || implementation_obligations_satisfied(&work_unit.mutation_obligations))
+    {
+        work_unit.validation_receipt_id = Some(receipt.id.clone());
+    }
+}
+
 fn step_materially_matches_item(step: &EvidencePlanStep, item: &PlanItemArg) -> bool {
     step.step == item.step
         && step.depends_on == item.depends_on
@@ -8530,6 +14229,7 @@ fn step_materially_matches_item(step: &EvidencePlanStep, item: &PlanItemArg) -> 
         && step.generated_artifacts == item.generated_artifacts
         && step.risks == item.risks
         && step.requires_desktop_activation == item.requires_desktop_activation
+        && (item.validation_route.is_none() || step.validation_route == item.validation_route)
 }
 
 fn plan_item_from_evidence(step: &EvidencePlanStep) -> PlanItemArg {
@@ -8543,7 +14243,210 @@ fn plan_item_from_evidence(step: &EvidencePlanStep) -> PlanItemArg {
         generated_artifacts: step.generated_artifacts.clone(),
         risks: step.risks.clone(),
         requires_desktop_activation: step.requires_desktop_activation,
+        validation_route: step.validation_route.clone(),
     }
+}
+
+fn validation_route_covered_paths(route: &ValidationRoute) -> BTreeSet<String> {
+    route
+        .leaves
+        .iter()
+        .flat_map(|leaf| leaf.covered_paths.iter())
+        .map(|path| path.replace('\\', "/").trim_start_matches("./").to_string())
+        .collect()
+}
+
+fn validation_implementation_identity(
+    implementation_revision: u64,
+    repository_wide: bool,
+    covered_manifest: &[FileHashSnapshot],
+) -> String {
+    if repository_wide {
+        return format!("repository-revision:{implementation_revision}");
+    }
+    let canonical = serde_json::to_vec(&(
+        "KD4_VALIDATION_IMPLEMENTATION_IDENTITY_V1",
+        covered_manifest,
+    ))
+    .unwrap_or_default();
+    format!("covered-manifest:{:x}", Sha256::digest(canonical))
+}
+
+fn validation_paths_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
+    left == right
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn workspace_proof_scope(document: &TaskEvidenceDocument) -> WorkspaceProofScope {
+    let mut paths = document
+        .latest_file_hashes
+        .keys()
+        .chain(document.latest_generated_artifact_hashes.keys())
+        .map(|path| normalize_slashes(path))
+        .collect::<BTreeSet<_>>();
+    let mut contracts = BTreeSet::new();
+    for step in &document.plan {
+        paths.extend(step.edit_paths.iter().map(|path| normalize_slashes(path)));
+        paths.extend(
+            step.runtime_paths
+                .iter()
+                .map(|path| normalize_slashes(path)),
+        );
+        paths.extend(
+            step.generated_artifacts
+                .iter()
+                .map(|path| normalize_slashes(path)),
+        );
+        paths.extend(
+            step.implementation_surfaces
+                .iter()
+                .map(|path| normalize_slashes(path)),
+        );
+        for obligation in &step.mutation_obligations {
+            paths.extend(obligation.paths.iter().map(|path| normalize_slashes(path)));
+        }
+        if let Some(route) = step.validation_route.as_ref() {
+            paths.extend(validation_route_covered_paths(route));
+            contracts.extend(
+                route
+                    .leaves
+                    .iter()
+                    .flat_map(|leaf| leaf.covered_contracts.iter().cloned()),
+            );
+        }
+    }
+    if let Some(work_unit) = document.planning.work_unit.as_ref() {
+        paths.extend(
+            work_unit
+                .implementation_surfaces
+                .iter()
+                .map(|path| normalize_slashes(path)),
+        );
+        for obligation in &work_unit.mutation_obligations {
+            paths.extend(obligation.paths.iter().map(|path| normalize_slashes(path)));
+        }
+        if let Some(route) = work_unit.validation_route.as_ref() {
+            paths.extend(validation_route_covered_paths(route));
+            contracts.extend(
+                route
+                    .leaves
+                    .iter()
+                    .flat_map(|leaf| leaf.covered_contracts.iter().cloned()),
+            );
+        }
+    }
+    for packet in document
+        .owner_packets
+        .iter()
+        .filter(|packet| packet.contract_epoch == document.contract_epoch)
+    {
+        paths.extend(
+            packet
+                .owner_roots
+                .iter()
+                .map(|path| normalize_slashes(path)),
+        );
+        paths.extend(
+            packet
+                .target_regions
+                .iter()
+                .map(|region| normalize_slashes(&region.path)),
+        );
+        paths.extend(
+            packet
+                .contract_paths
+                .iter()
+                .map(|path| normalize_slashes(path)),
+        );
+        paths.extend(packet.test_paths.iter().map(|path| normalize_slashes(path)));
+        contracts.extend(packet.lifecycle_obligations.iter().cloned());
+        contracts.extend(
+            packet
+                .acceptance_mappings
+                .iter()
+                .map(|mapping| mapping.criterion_id.clone()),
+        );
+    }
+    paths.retain(|path| !path.is_empty());
+    contracts.retain(|contract| !contract.trim().is_empty());
+    let baseline_epoch = document
+        .completion_review_v2
+        .as_ref()
+        .map(|ledger| ledger.workspace_event_baseline_epoch)
+        .unwrap_or_default();
+    let identity = canonical_hash(
+        "workspace-proof-scope-v1",
+        &serde_json::json!({
+            "paths": &paths,
+            "contracts": &contracts,
+            "proof_baseline_epoch": baseline_epoch,
+        }),
+    );
+    WorkspaceProofScope {
+        identity,
+        paths,
+        contracts,
+    }
+}
+
+fn classify_workspace_event(
+    event: &TaskAttributedWorkspaceEvent,
+    scope: &WorkspaceProofScope,
+) -> WorkspaceEventRelevance {
+    let repository_wide = event
+        .paths
+        .iter()
+        .any(|path| path == codex_agent_task_store::REPOSITORY_WIDE_PATH);
+    let path_overlap = !repository_wide
+        && event.paths.iter().any(|event_path| {
+            scope.paths.iter().any(|controlled_path| {
+                validation_paths_overlap(controlled_path, &normalize_slashes(event_path))
+            })
+        });
+    let contract_overlap = event
+        .contracts
+        .iter()
+        .any(|contract| scope.contracts.contains(contract));
+    if path_overlap || contract_overlap {
+        return WorkspaceEventRelevance::Relevant;
+    }
+    if repository_wide
+        || (event.paths.is_empty() && event.contracts.is_empty())
+        || event.attribution_confidence
+            != Some(codex_agent_task_store::AttributionConfidence::Definitive)
+    {
+        return WorkspaceEventRelevance::Unknown;
+    }
+    WorkspaceEventRelevance::Unrelated
+}
+
+const fn workspace_scope_history_is_unknown(scope_changed: bool, history_complete: bool) -> bool {
+    scope_changed && !history_complete
+}
+
+fn implementation_dependencies_satisfied(
+    document: &TaskEvidenceDocument,
+    step: &EvidencePlanStep,
+) -> bool {
+    step.depends_on.iter().all(|dependency| {
+        document
+            .plan
+            .iter()
+            .find(|candidate| &candidate.id == dependency)
+            .is_some_and(|candidate| {
+                matches!(
+                    candidate.status,
+                    StepStatus::Implemented | StepStatus::Passed | StepStatus::Skipped
+                )
+            })
+    })
 }
 
 fn sync_plan_structure_state(
@@ -8722,8 +14625,7 @@ fn completion_review_locally_obtainable_proof_routes(gate: &TaskCompletionGate) 
         .reasons
         .iter()
         .filter_map(|reason| {
-            if reason == "no durable plan steps were recorded"
-                || reason.starts_with("plan steps are not acknowledged as passed:")
+            if reason.starts_with("plan steps are not acknowledged as passed:")
                 || (reason.starts_with("plan step `") && reason.contains("unfinished step"))
             {
                 Some(format!(
@@ -8756,8 +14658,24 @@ fn derive_completion_gate(
 ) -> TaskCompletionGate {
     let mut blocked = Vec::new();
     let mut partial = Vec::new();
-    if document.plan.is_empty() {
-        partial.push("no durable plan steps were recorded".to_string());
+    for packet in document
+        .owner_packets
+        .iter()
+        .filter(|packet| packet.contract_epoch == document.contract_epoch)
+    {
+        match packet.status {
+            OwnerPacketStatus::Closed => {}
+            OwnerPacketStatus::Blocked => blocked.push(format!(
+                "owner packet `{}` is blocked: {}",
+                packet.packet_id,
+                packet.missing_obligations.join(", ")
+            )),
+            status => partial.push(format!(
+                "owner packet `{}` remains {}",
+                packet.packet_id,
+                owner_packet_status_name(status)
+            )),
+        }
     }
     let blocked_steps = document
         .plan
@@ -8889,9 +14807,41 @@ fn overlay_completion_review_gate(
     };
     let cycle_phase = ledger.active_review_cycle.as_ref().map(|cycle| cycle.phase);
     let blocked = cycle_phase == Some(CompletionReviewCyclePhase::TerminalBlocked);
+    let mandatory = CompletionReviewRequirement::from_obligation_mode(&ledger.obligation.mode)
+        == CompletionReviewRequirement::Mandatory;
+    let current_clean_attempt = ledger.receipts.iter().rev().any(|receipt| {
+        receipt.candidate_mutation_revision == document.host_mutation_revision
+            && receipt.disposition == CompletionReviewDisposition::Attempted
+            && receipt.attempted_outcome == Some(CompletionReviewAttemptedOutcome::Clean)
+    });
+    let mandatory_proof_missing = mandatory
+        && ledger
+            .obligation
+            .required_attempt_identity
+            .as_deref()
+            .map_or(!current_clean_attempt, |required| {
+                ledger.obligation.satisfied_attempt_identity.as_deref() != Some(required)
+            });
+    let actionable_findings_pending = matches!(
+        cycle_phase,
+        Some(
+            CompletionReviewCyclePhase::CorrectionPending
+                | CompletionReviewCyclePhase::RereviewPending
+                | CompletionReviewCyclePhase::TerminalPartial
+        )
+    ) && ledger.receipts.iter().rev().any(|receipt| {
+        receipt.candidate_mutation_revision == document.host_mutation_revision
+            && receipt.disposition == CompletionReviewDisposition::Attempted
+            && receipt.attempted_outcome
+                == Some(CompletionReviewAttemptedOutcome::ActionableFindings)
+    });
     let unresolved = source_capture_failed
         || ledger.review_risk.unresolved
-        || cycle_phase.is_some_and(|phase| phase != CompletionReviewCyclePhase::Closed);
+        || cycle_phase.is_some_and(|phase| phase != CompletionReviewCyclePhase::Closed)
+        || mandatory_proof_missing;
+    if !mandatory && !source_capture_failed && !actionable_findings_pending {
+        return;
+    }
     if !unresolved && !blocked {
         return;
     }
@@ -8905,17 +14855,52 @@ fn overlay_completion_review_gate(
             .push("completion review is blocked by an external impediment".to_string());
         gate.status = TaskCompletionStatus::Blocked;
     } else if gate.status != TaskCompletionStatus::Blocked {
-        gate.reasons.push(
-            "completion review risk remains unresolved for the current candidate".to_string(),
-        );
+        if mandatory_proof_missing {
+            gate.reasons.push(
+                "mandatory completion-review proof is missing for the current candidate"
+                    .to_string(),
+            );
+        } else {
+            gate.reasons.push(
+                "completion review risk remains unresolved for the current candidate".to_string(),
+            );
+        }
         gate.status = TaskCompletionStatus::Partial;
     }
     gate.reasons.sort();
     gate.reasons.dedup();
 }
 
-fn invalidate_for_mutation(document: &mut TaskEvidenceDocument) {
+fn invalidate_for_mutation(
+    document: &mut TaskEvidenceDocument,
+    affected_paths: Option<&BTreeSet<String>>,
+) {
+    let repair_count_by_lineage = std::mem::take(&mut document.final_proof.repair_count_by_lineage);
+    document.final_proof = FinalProofStateV1 {
+        repair_count_by_lineage,
+        ..FinalProofStateV1::default()
+    };
+    let acknowledgement_invalidated =
+        document
+            .batch_acknowledgement
+            .as_ref()
+            .is_some_and(|acknowledgement| {
+                document
+                    .plan
+                    .iter()
+                    .find(|step| step.id == acknowledgement.step_id)
+                    .is_none_or(|step| mutation_can_affect_step(step, affected_paths))
+            });
+    if acknowledgement_invalidated {
+        document.batch_acknowledgement = None;
+    }
     document.host_mutation_revision = document.host_mutation_revision.saturating_add(1);
+    if let Some(acknowledgement) = document.batch_acknowledgement.as_mut() {
+        // A mutation proven disjoint from the route does not stale the explicit
+        // implementation boundary. Rebind only its orchestration revision; the
+        // semantic proof identity remains the covered manifest hash.
+        acknowledgement.implementation_revision = document.host_mutation_revision;
+    }
     document.evidence_epoch = document.evidence_epoch.saturating_add(1);
     document.last_mutation_at = Some(timestamp());
     document.desktop_activation_receipt = None;
@@ -8974,31 +14959,109 @@ fn invalidate_for_mutation(document: &mut TaskEvidenceDocument) {
         }
     }
     for step in &mut document.plan {
-        if step.status == StepStatus::Passed {
+        if step.status == StepStatus::Passed && mutation_can_affect_step(step, affected_paths) {
             step.status = StepStatus::Implemented;
+            step.validation_receipt_id = None;
         }
+    }
+    if let Some(work_unit) = document.planning.work_unit.as_mut()
+        && mutation_can_affect_work_unit(work_unit, affected_paths)
+    {
+        work_unit.validation_receipt_id = None;
     }
 }
 
+fn mutation_can_affect_step(
+    step: &EvidencePlanStep,
+    affected_paths: Option<&BTreeSet<String>>,
+) -> bool {
+    let Some(affected_paths) = affected_paths else {
+        return true;
+    };
+    let mut covered = step
+        .implementation_surfaces
+        .iter()
+        .map(|path| normalize_slashes(path))
+        .chain(
+            step.mutation_obligations
+                .iter()
+                .flat_map(|obligation| obligation.paths.iter().map(|path| normalize_slashes(path))),
+        )
+        .chain(step.edit_paths.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if let Some(route) = step.validation_route.as_ref() {
+        covered.extend(validation_route_covered_paths(route));
+    }
+    covered.is_empty()
+        || affected_paths.iter().any(|changed| {
+            covered
+                .iter()
+                .any(|expected| validation_paths_overlap(expected, changed))
+        })
+}
+
+fn mutation_can_affect_work_unit(
+    work_unit: &FocusedWorkUnit,
+    affected_paths: Option<&BTreeSet<String>>,
+) -> bool {
+    let Some(affected_paths) = affected_paths else {
+        return true;
+    };
+    let mut covered = work_unit
+        .implementation_surfaces
+        .iter()
+        .map(|path| normalize_slashes(path))
+        .chain(
+            work_unit
+                .mutation_obligations
+                .iter()
+                .flat_map(|obligation| obligation.paths.iter().map(|path| normalize_slashes(path))),
+        )
+        .collect::<BTreeSet<_>>();
+    if let Some(route) = work_unit.validation_route.as_ref() {
+        covered.extend(validation_route_covered_paths(route));
+    }
+    covered.is_empty()
+        || affected_paths.iter().any(|changed| {
+            covered
+                .iter()
+                .any(|expected| validation_paths_overlap(expected, changed))
+        })
+}
+
 fn invalidate_for_after_agent_mutation(document: &mut TaskEvidenceDocument) {
-    let passed_step_ids = document
+    let passed_steps = document
         .plan
         .iter()
         .filter(|step| step.status == StepStatus::Passed)
-        .map(|step| step.id.clone())
-        .collect::<BTreeSet<_>>();
-    invalidate_for_mutation(document);
+        .map(|step| (step.id.clone(), step.validation_receipt_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let focused_receipt = document
+        .planning
+        .work_unit
+        .as_ref()
+        .and_then(|work_unit| work_unit.validation_receipt_id.clone());
+    invalidate_for_mutation(document, None);
     for step in &mut document.plan {
-        if passed_step_ids.contains(&step.id) && step.status == StepStatus::Implemented {
+        if let Some(receipt_id) = passed_steps.get(&step.id)
+            && step.status == StepStatus::Implemented
+        {
             step.status = StepStatus::Passed;
+            step.validation_receipt_id.clone_from(receipt_id);
         }
+    }
+    if let Some(work_unit) = document.planning.work_unit.as_mut() {
+        work_unit.validation_receipt_id = focused_receipt;
     }
 }
 
 fn invalidate_for_plan_change(document: &mut TaskEvidenceDocument) {
-    document.evidence_epoch = document.evidence_epoch.saturating_add(1);
-    document.desktop_activation_receipt = None;
-    document.latest_generated_artifact_hashes.clear();
+    document.batch_acknowledgement = None;
+    let repair_count_by_lineage = std::mem::take(&mut document.final_proof.repair_count_by_lineage);
+    document.final_proof = FinalProofStateV1 {
+        repair_count_by_lineage,
+        ..FinalProofStateV1::default()
+    };
     document.completion = None;
 }
 
@@ -9474,6 +15537,7 @@ mod tests {
                 generated_artifacts: Vec::new(),
                 risks: Vec::new(),
                 requires_desktop_activation: false,
+                validation_route: None,
             }],
         }
     }
@@ -9756,6 +15820,7 @@ mod tests {
     fn plan_status_is_non_structural_but_plan_contract_changes_are_structural() {
         let original = EvidencePlanStep {
             id: "implement".to_string(),
+            revision: 1,
             step: "Implement the runtime path".to_string(),
             status: StepStatus::Implemented,
             depends_on: vec!["design".to_string()],
@@ -9764,6 +15829,13 @@ mod tests {
             generated_artifacts: vec!["generated/schema.json".to_string()],
             risks: vec!["protocol".to_string()],
             requires_desktop_activation: false,
+            validation_route: None,
+            external_validation_route: None,
+            validation_disposition: ValidationDisposition::NotRequired,
+            source_owner: None,
+            implementation_surfaces: Vec::new(),
+            mutation_obligations: Vec::new(),
+            validation_receipt_id: None,
             edit_paths: BTreeSet::from(["src/lib.rs".to_string()]),
         };
         let mut status_only = original.clone();

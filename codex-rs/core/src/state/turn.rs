@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -97,11 +98,34 @@ pub(crate) struct RunningTask {
 pub(crate) struct TurnTerminalCoordinator {
     turn_id: String,
     claimed: AtomicBool,
-    completed: AtomicBool,
-    terminal_event_dispatched: AtomicBool,
+    durable_terminal_committed: AtomicBool,
+    interaction_released: AtomicBool,
+    cleanup_completed: AtomicBool,
+    delivery_state: AtomicU8,
     completion_notify: Notify,
+    cleanup_completion_notify: Notify,
     #[cfg(test)]
     panic_before_worker_cancellation: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum TerminalDeliveryState {
+    NotAttempted = 0,
+    Claimed = 1,
+    Delivered = 2,
+    DeliveryFailed = 3,
+}
+
+impl TerminalDeliveryState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Claimed,
+            2 => Self::Delivered,
+            3 => Self::DeliveryFailed,
+            _ => Self::NotAttempted,
+        }
+    }
 }
 
 impl TurnTerminalCoordinator {
@@ -109,9 +133,12 @@ impl TurnTerminalCoordinator {
         Arc::new(Self {
             turn_id,
             claimed: AtomicBool::new(false),
-            completed: AtomicBool::new(false),
-            terminal_event_dispatched: AtomicBool::new(false),
+            durable_terminal_committed: AtomicBool::new(false),
+            interaction_released: AtomicBool::new(false),
+            cleanup_completed: AtomicBool::new(false),
+            delivery_state: AtomicU8::new(TerminalDeliveryState::NotAttempted as u8),
             completion_notify: Notify::new(),
+            cleanup_completion_notify: Notify::new(),
             #[cfg(test)]
             panic_before_worker_cancellation: AtomicBool::new(false),
         })
@@ -127,18 +154,37 @@ impl TurnTerminalCoordinator {
             .ok()?;
         Some(TurnTerminalPermit {
             coordinator: Arc::clone(self),
-            completed: false,
+            cleanup_completed: false,
         })
     }
 
-    pub(crate) fn terminal_event_dispatched(&self) -> bool {
-        self.terminal_event_dispatched.load(Ordering::Acquire)
+    pub(crate) fn delivery_state(&self) -> TerminalDeliveryState {
+        TerminalDeliveryState::from_u8(self.delivery_state.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn interaction_released(&self) -> bool {
+        self.interaction_released.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn durable_terminal_committed(&self) -> bool {
+        self.durable_terminal_committed.load(Ordering::Acquire)
     }
 
     pub(crate) async fn wait_completed(&self) {
         loop {
             let notified = self.completion_notify.notified();
-            if self.completed.load(Ordering::Acquire) {
+            if self.interaction_released() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_cleanup_completed(&self) {
+        loop {
+            let notified = self.cleanup_completion_notify.notified();
+            if self.cleanup_completed.load(Ordering::Acquire) {
                 return;
             }
             notified.await;
@@ -164,26 +210,71 @@ impl TurnTerminalCoordinator {
 
 pub(crate) struct TurnTerminalPermit {
     coordinator: Arc<TurnTerminalCoordinator>,
-    completed: bool,
+    cleanup_completed: bool,
 }
 
 impl TurnTerminalPermit {
-    pub(crate) fn mark_terminal_event_dispatched(&self) {
+    pub(crate) fn mark_durable_commit(&self, committed: bool) {
         self.coordinator
-            .terminal_event_dispatched
-            .store(true, Ordering::Release);
+            .durable_terminal_committed
+            .store(committed, Ordering::Release);
     }
 
-    pub(crate) fn complete(mut self) {
-        self.coordinator.completed.store(true, Ordering::Release);
+    pub(crate) fn mark_delivery_claimed(&self) -> bool {
+        self.coordinator
+            .delivery_state
+            .compare_exchange(
+                TerminalDeliveryState::NotAttempted as u8,
+                TerminalDeliveryState::Claimed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn mark_delivery_attempted(&self, delivered: bool) {
+        debug_assert_eq!(
+            self.coordinator.delivery_state(),
+            TerminalDeliveryState::Claimed
+        );
+        let state = if delivered {
+            TerminalDeliveryState::Delivered
+        } else {
+            TerminalDeliveryState::DeliveryFailed
+        };
+        self.coordinator
+            .delivery_state
+            .store(state as u8, Ordering::Release);
+    }
+
+    pub(crate) fn mark_interaction_released(&self) {
+        self.coordinator
+            .interaction_released
+            .store(true, Ordering::Release);
         self.coordinator.completion_notify.notify_waiters();
-        self.completed = true;
+    }
+
+    pub(crate) fn complete_cleanup(mut self) {
+        // If both terminal dispatch paths failed before reaching the interactive milestone,
+        // preserve the old full-finalizer fallback so abort/replacement callers cannot wait
+        // forever after cleanup has definitively ended.
+        self.coordinator
+            .interaction_released
+            .store(true, Ordering::Release);
+        self.coordinator.completion_notify.notify_waiters();
+        self.coordinator
+            .cleanup_completed
+            .store(true, Ordering::Release);
+        self.coordinator.cleanup_completion_notify.notify_waiters();
+        self.cleanup_completed = true;
     }
 }
 
 impl Drop for TurnTerminalPermit {
     fn drop(&mut self) {
-        if !self.completed && !self.coordinator.terminal_event_dispatched() {
+        if !self.cleanup_completed
+            && self.coordinator.delivery_state() == TerminalDeliveryState::NotAttempted
+        {
             self.coordinator.claimed.store(false, Ordering::Release);
         }
     }

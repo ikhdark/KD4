@@ -5,6 +5,8 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
+use crate::tools::exposure::AgentSurfaceStage;
+use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
@@ -166,6 +168,7 @@ struct CoreToolPlanContext<'a> {
     tool_search_handler_cache: &'a ToolSearchHandlerCache,
     default_agent_type_description: &'a str,
     wait_agent_timeouts: WaitAgentTimeoutOptions,
+    exposure_identity: &'a ToolExposureIdentity,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -174,9 +177,15 @@ pub(crate) fn build_tool_router(
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> ToolRouter {
+    let exposure_identity = params.exposure_identity.clone();
     let (model_visible_specs, registry, warnings) =
         build_tool_specs_and_registry(step_context, params, tool_search_handler_cache);
-    ToolRouter::from_parts_with_warnings(registry, model_visible_specs, warnings)
+    ToolRouter::from_parts_with_warnings_and_identity(
+        registry,
+        model_visible_specs,
+        warnings,
+        exposure_identity,
+    )
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -192,6 +201,7 @@ fn build_tool_specs_and_registry(
         tool_suggest_candidates,
         extension_tool_executors,
         dynamic_tools,
+        exposure_identity,
     } = params;
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
@@ -205,6 +215,7 @@ fn build_tool_specs_and_registry(
         tool_search_handler_cache,
         default_agent_type_description: &default_agent_type_description,
         wait_agent_timeouts: wait_agent_timeout_options(turn_context),
+        exposure_identity: &exposure_identity,
     };
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
@@ -483,6 +494,7 @@ fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) 
 fn build_code_mode_executors(
     turn_context: &TurnContext,
     executors: &[Arc<dyn CoreToolRuntime>],
+    wait_available: bool,
 ) -> Vec<Arc<dyn CoreToolRuntime>> {
     let tool_mode = effective_tool_mode(turn_context);
     if !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
@@ -529,19 +541,20 @@ fn build_code_mode_executors(
     let deferred_tools =
         collect_code_mode_exec_prompt_tool_definitions(deferred_exec_prompt_tool_specs.iter());
 
-    vec![
-        Arc::new(CodeModeExecuteHandler::new(
-            create_code_mode_tool(
-                &enabled_tools,
-                &deferred_tools,
-                &namespace_descriptions,
-                tool_mode == ToolMode::CodeModeOnly,
-            ),
-            code_mode_nested_tool_specs,
-            deferred_code_mode_nested_tool_specs,
-        )),
-        Arc::new(CodeModeWaitHandler),
-    ]
+    let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
+        create_code_mode_tool(
+            &enabled_tools,
+            &deferred_tools,
+            &namespace_descriptions,
+            tool_mode == ToolMode::CodeModeOnly,
+        ),
+        code_mode_nested_tool_specs,
+        deferred_code_mode_nested_tool_specs,
+    ))];
+    if wait_available {
+        result.push(Arc::new(CodeModeWaitHandler));
+    }
+    result
 }
 
 #[instrument(level = "trace", skip_all, fields(tool_spec_count = specs.len()))]
@@ -749,7 +762,7 @@ fn unified_exec_should_include_shell_parameter(
 
 #[instrument(level = "trace", skip_all)]
 fn add_mcp_resource_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
-    if context.mcp_tools.is_some() {
+    if context.mcp_tools.is_some() && context.exposure_identity.mcp_resources_available {
         planned_tools.add(ListMcpResourcesHandler);
         planned_tools.add(ListMcpResourceTemplatesHandler);
         planned_tools.add(ReadMcpResourceHandler);
@@ -788,7 +801,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         planned_tools.add(WaitForEnvironmentHandler);
     }
 
-    if turn_context.config.experimental_request_user_input_enabled {
+    if turn_context.config.experimental_request_user_input_enabled
+        && context.exposure_identity.request_user_input_eligible
+    {
         planned_tools.add_with_exposure(
             RequestUserInputHandler {
                 available_modes: request_user_input_available_modes(features),
@@ -872,7 +887,14 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 #[instrument(level = "trace", skip_all)]
 fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
     let turn_context = context.step_context.turn.as_ref();
-    if collab_tools_enabled(turn_context) {
+    if agent_jobs_tools_enabled(turn_context) {
+        planned_tools.add(SpawnAgentsOnCsvHandler);
+        if agent_jobs_worker_tools_enabled(turn_context) {
+            planned_tools.add(ReportAgentJobResultHandler);
+        }
+    }
+    let agent_surface_stage = context.exposure_identity.agent_surface_stage;
+    if agent_surface_stage != AgentSurfaceStage::Prohibited && collab_tools_enabled(turn_context) {
         if multi_agent_v2_enabled(turn_context) {
             let exposure = if turn_context.config.multi_agent_v2.non_code_mode_only {
                 ToolExposure::DirectModelOnly
@@ -899,6 +921,9 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 ),
                 exposure,
             ));
+            if agent_surface_stage == AgentSurfaceStage::SpawnOnly {
+                return;
+            }
             planned_tools.add_arc(override_tool_exposure(
                 multi_agent_v2_handler(SendMessageHandlerV2, tool_namespace),
                 exposure,
@@ -922,6 +947,9 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 multi_agent_v2_handler(ListAgentsHandlerV2, tool_namespace),
                 exposure,
             ));
+            if agent_surface_stage != AgentSurfaceStage::TypedAdministration {
+                return;
+            }
             planned_tools.add_arc(override_tool_exposure(
                 multi_agent_v2_handler(GetAgentTaskHandler, tool_namespace),
                 exposure,
@@ -966,18 +994,14 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 }),
                 exposure,
             );
+            if agent_surface_stage == AgentSurfaceStage::SpawnOnly {
+                return;
+            }
             planned_tools.add_with_exposure(SendInputHandler, exposure);
             planned_tools.add_with_exposure(ResumeAgentHandler, exposure);
             planned_tools
                 .add_with_exposure(WaitAgentHandler::new(context.wait_agent_timeouts), exposure);
             planned_tools.add_with_exposure(CloseAgentHandler, exposure);
-        }
-    }
-
-    if agent_jobs_tools_enabled(turn_context) {
-        planned_tools.add(SpawnAgentsOnCsvHandler);
-        if agent_jobs_worker_tools_enabled(turn_context) {
-            planned_tools.add(ReportAgentJobResultHandler);
         }
     }
 }
@@ -1102,7 +1126,11 @@ fn prepend_code_mode_executors(
     planned_tools: &mut PlannedTools,
 ) {
     let turn_context = context.step_context.turn.as_ref();
-    let code_mode_executors = build_code_mode_executors(turn_context, planned_tools.runtimes());
+    let code_mode_executors = build_code_mode_executors(
+        turn_context,
+        planned_tools.runtimes(),
+        context.exposure_identity.wait_available,
+    );
     planned_tools.runtimes.splice(0..0, code_mode_executors);
 }
 

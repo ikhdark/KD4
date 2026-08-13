@@ -242,6 +242,21 @@ async fn shutdown_clients_with_deadline<T, G, GFut, F, FFut>(
 }
 
 impl McpConnectionManager {
+    /// Returns the coarse negotiated resources capability for fully started servers.
+    pub async fn has_ready_server_with_resources(&self) -> bool {
+        for client in self.clients.values() {
+            if !client.startup_complete.load(Ordering::Acquire) {
+                continue;
+            }
+            if let Ok(managed_client) = client.client().await
+                && managed_client.server_supports_resources_capability
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         mcp_servers: &HashMap<String, EffectiveMcpServer>,

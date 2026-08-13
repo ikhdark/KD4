@@ -17,7 +17,7 @@ fn preset_names_use_mode_display_names() {
 }
 
 #[test]
-fn default_mode_instructions_replace_mode_names_placeholder() {
+fn default_mode_instructions_keep_only_the_compact_execution_contract() {
     let default_instructions = default_preset()
         .developer_instructions
         .expect("default preset should include instructions")
@@ -26,25 +26,17 @@ fn default_mode_instructions_replace_mode_names_placeholder() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-
     assert!(!default_instructions.contains("{{KNOWN_MODE_NAMES}}"));
-
-    let known_mode_names = format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES);
-    let expected_snippet = format!("Known mode names are: {known_mode_names}.");
-    assert!(default_instructions.contains(&expected_snippet));
-
-    assert!(
-        default_instructions.contains(
-            "Use `request_user_input` only when it is available and a structured choice is"
-        )
-    );
-    assert!(default_instructions.contains("ask one concise plain-text question"));
-    assert!(normalized_instructions.contains("ask one targeted question only when all"));
-    assert!(default_instructions.contains("cannot reasonably be discovered"));
-    assert!(default_instructions.contains("`double check` and `audit` are read-only"));
-    assert!(default_instructions.contains("Offer two to four mutually exclusive options"));
-    assert!(default_instructions.contains("implementation acceptance"));
-    assert!(default_instructions.len() < 3_000);
+    assert!(!default_instructions.contains("Known mode names"));
+    assert!(!default_instructions.contains("request_user_input"));
+    assert!(!default_instructions.contains("For example"));
+    assert!(default_instructions.contains("requests are read-only"));
+    assert!(default_instructions.contains("scoped implementation"));
+    assert!(default_instructions.contains("Resolve discoverable facts"));
+    assert!(normalized_instructions.contains("one concise question"));
+    assert!(default_instructions.contains("external-action"));
+    assert!(default_instructions.contains("nearest sufficient proof"));
+    assert!(default_instructions.len() < 1_000);
 }
 
 #[test]

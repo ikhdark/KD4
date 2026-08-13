@@ -3,6 +3,7 @@ pub(crate) mod command_execution;
 pub(crate) mod command_output_artifact;
 pub(crate) mod context;
 pub(crate) mod events;
+pub(crate) mod exposure;
 pub(crate) mod handlers;
 pub(crate) mod hook_names;
 pub(crate) mod hosted_spec;

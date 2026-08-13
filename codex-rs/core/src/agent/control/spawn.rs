@@ -12,6 +12,107 @@ struct SpawnAgentThreadInheritance {
     exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
 }
 
+/// Logical capacity reserved before a durable typed assignment is prepared.
+///
+/// Each field is an RAII token backed by bounded in-memory state. No registry,
+/// capacity, workspace, or database lock is retained while this value crosses
+/// asynchronous worktree or task-store preparation. Dropping an unconsumed value
+/// releases every reservation exactly once.
+pub(crate) struct PreparedTypedSpawn {
+    multi_agent_version: MultiAgentVersion,
+    execution_guard: Option<AgentExecutionGuard>,
+    reservation: crate::agent::registry::SpawnReservation,
+    session_source: SessionSource,
+    agent_metadata: AgentMetadata,
+    residency_slot: Option<super::residency::V2ResidencySlot>,
+}
+
+impl std::fmt::Debug for PreparedTypedSpawn {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PreparedTypedSpawn { .. }")
+    }
+}
+
+/// Revalidated logical capacity consumed immediately before durable assignment creation.
+pub(crate) struct ConsumedTypedSpawn {
+    multi_agent_version: MultiAgentVersion,
+    execution_guard: Option<AgentExecutionGuard>,
+    reservation: crate::agent::registry::SpawnReservation,
+    session_source: SessionSource,
+    agent_metadata: AgentMetadata,
+    residency_slot: Option<super::residency::V2ResidencySlot>,
+}
+
+impl PreparedTypedSpawn {
+    async fn consume(
+        self,
+        state: &Arc<ThreadManagerState>,
+        config: &Config,
+        requested_source: Option<&SessionSource>,
+        parent_thread_id: Option<ThreadId>,
+    ) -> CodexResult<ConsumedTypedSpawn> {
+        let requested_source = requested_source.ok_or_else(|| {
+            CodexErr::InvalidRequest(
+                "prepared typed spawn requires a thread-spawn session source".to_string(),
+            )
+        })?;
+        if !typed_spawn_sources_match(&self.session_source, requested_source) {
+            return Err(CodexErr::InvalidRequest(
+                "prepared typed spawn no longer matches the requested source".to_string(),
+            ));
+        }
+        let current_version = state
+            .effective_multi_agent_version_for_spawn(
+                &InitialHistory::New,
+                Some(requested_source),
+                parent_thread_id,
+                /*forked_from_thread_id*/ None,
+                config,
+            )
+            .await;
+        if current_version != self.multi_agent_version || current_version != MultiAgentVersion::V2 {
+            return Err(CodexErr::InvalidRequest(
+                "prepared typed spawn configuration changed before consumption".to_string(),
+            ));
+        }
+        Ok(ConsumedTypedSpawn {
+            multi_agent_version: self.multi_agent_version,
+            execution_guard: self.execution_guard,
+            reservation: self.reservation,
+            session_source: self.session_source,
+            agent_metadata: self.agent_metadata,
+            residency_slot: self.residency_slot,
+        })
+    }
+}
+
+fn typed_spawn_sources_match(prepared: &SessionSource, requested: &SessionSource) -> bool {
+    match (prepared, requested) {
+        (
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: prepared_parent,
+                depth: prepared_depth,
+                agent_path: prepared_path,
+                agent_role: prepared_role,
+                ..
+            }),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: requested_parent,
+                depth: requested_depth,
+                agent_path: requested_path,
+                agent_role: requested_role,
+                ..
+            }),
+        ) => {
+            prepared_parent == requested_parent
+                && prepared_depth == requested_depth
+                && prepared_path == requested_path
+                && prepared_role == requested_role
+        }
+        _ => false,
+    }
+}
+
 /// Initial input delivered after a spawned agent acquires execution capacity.
 ///
 /// V2 communication spawns keep the communication and its context paired so centralized
@@ -259,6 +360,124 @@ fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &
 }
 
 impl AgentControl {
+    /// Reserves all bounded logical capacity needed by a typed spawn before any durable
+    /// assignment or isolated worktree is created.
+    pub(crate) async fn prepare_typed_spawn(
+        &self,
+        config: &Config,
+        session_source: SessionSource,
+        parent_thread_id: Option<ThreadId>,
+    ) -> CodexResult<PreparedTypedSpawn> {
+        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: source_parent_thread_id,
+            depth,
+            agent_path,
+            agent_role,
+            ..
+        }) = session_source
+        else {
+            return Err(CodexErr::InvalidRequest(
+                "typed assignments require a thread-spawn session source".to_string(),
+            ));
+        };
+        let role_name = agent_role.as_deref().ok_or_else(|| {
+            CodexErr::InvalidRequest("typed assignments require an explicit role".to_string())
+        })?;
+        if !matches!(
+            role_name,
+            "architect" | "explorer" | "worker" | "reviewer" | "verifier" | "integrator"
+        ) || resolve_role_config(config, role_name).is_none()
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "typed role {role_name:?} is not configured"
+            )));
+        }
+        if parent_thread_id != Some(source_parent_thread_id) {
+            return Err(CodexErr::InvalidRequest(
+                "typed spawn parent changed during admission".to_string(),
+            ));
+        }
+        let requested_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: source_parent_thread_id,
+            depth,
+            agent_path,
+            agent_nickname: None,
+            agent_role,
+        });
+        let state = self.upgrade()?;
+        let multi_agent_version = state
+            .effective_multi_agent_version_for_spawn(
+                &InitialHistory::New,
+                Some(&requested_source),
+                parent_thread_id,
+                /*forked_from_thread_id*/ None,
+                config,
+            )
+            .await;
+        if multi_agent_version != MultiAgentVersion::V2
+            || !is_v2_resident_session_source(&requested_source)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "durable typed assignments require MultiAgentV2 residency".to_string(),
+            ));
+        }
+        let execution_guard =
+            self.reserve_execution_capacity(multi_agent_version, &requested_source)?;
+        // V2 residency owns the configured resident limit. The registry token still reserves
+        // identity/path state, but must not apply that same bound a second time.
+        let mut reservation = self.state.reserve_spawn_slot(/*max_threads*/ None)?;
+        let (prepared_source, agent_metadata) = match requested_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth,
+                agent_path,
+                agent_role,
+                ..
+            }) => self.prepare_thread_spawn(
+                &mut reservation,
+                config,
+                parent_thread_id,
+                depth,
+                agent_path,
+                agent_role,
+                /*preferred_agent_nickname*/ None,
+            )?,
+            _ => unreachable!("requested source was validated above"),
+        };
+        let residency_slot = Some(
+            self.reserve_v2_residency_slot(&state, config, /*protected_thread_id*/ None)
+                .await?,
+        );
+        Ok(PreparedTypedSpawn {
+            multi_agent_version,
+            execution_guard,
+            reservation,
+            session_source: prepared_source,
+            agent_metadata,
+            residency_slot,
+        })
+    }
+
+    /// Atomically consumes and revalidates a prepared typed reservation immediately before the
+    /// caller creates its durable assignment. The consumed value continues to own every logical
+    /// capacity token until thread retention succeeds or the operation unwinds.
+    pub(crate) async fn consume_prepared_typed_spawn(
+        &self,
+        prepared: PreparedTypedSpawn,
+        config: &Config,
+        session_source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+    ) -> CodexResult<ConsumedTypedSpawn> {
+        prepared
+            .consume(
+                &self.upgrade()?,
+                config,
+                Some(session_source),
+                parent_thread_id,
+            )
+            .await
+    }
+
     /// Spawn a new agent thread and submit the initial prompt.
     #[cfg(test)]
     pub(crate) async fn spawn_agent(
@@ -272,6 +491,7 @@ impl AgentControl {
             SpawnInitialInput::UserInput(initial_input),
             session_source,
             SpawnAgentOptions::default(),
+            None,
         ))
         .await?;
         Ok(spawned_agent.thread_id)
@@ -290,6 +510,7 @@ impl AgentControl {
             SpawnInitialInput::UserInput(initial_input),
             session_source,
             options,
+            None,
         ))
         .await
     }
@@ -307,23 +528,44 @@ impl AgentControl {
             SpawnInitialInput::InterAgentCommunication(communication, context),
             session_source,
             options,
+            None,
         ))
         .await
     }
 
-    /// Spawn a typed child whose sole bootstrap is the canonical TaskCapsule payload.
-    pub(crate) async fn spawn_agent_with_task_capsule(
+    pub(crate) async fn spawn_agent_with_prepared_typed_communication(
+        &self,
+        config: Config,
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+        session_source: SessionSource,
+        options: SpawnAgentOptions,
+        prepared: ConsumedTypedSpawn,
+    ) -> CodexResult<LiveAgent> {
+        Box::pin(self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::InterAgentCommunication(communication, context),
+            Some(session_source),
+            options,
+            Some(prepared),
+        ))
+        .await
+    }
+
+    pub(crate) async fn spawn_agent_with_prepared_typed_task_capsule(
         &self,
         config: Config,
         canonical_payload: String,
-        session_source: Option<SessionSource>,
+        session_source: SessionSource,
         options: SpawnAgentOptions,
+        prepared: ConsumedTypedSpawn,
     ) -> CodexResult<LiveAgent> {
         Box::pin(self.spawn_agent_internal(
             config,
             SpawnInitialInput::TaskCapsule(canonical_payload),
-            session_source,
+            Some(session_source),
             options,
+            Some(prepared),
         ))
         .await
     }
@@ -605,63 +847,92 @@ impl AgentControl {
         initial_input: SpawnInitialInput,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
+        consumed_typed_spawn: Option<ConsumedTypedSpawn>,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
-        let multi_agent_version = state
-            .effective_multi_agent_version_for_spawn(
-                &InitialHistory::New,
-                session_source.as_ref(),
-                options.parent_thread_id,
-                /*forked_from_thread_id*/ None,
-                &config,
+        let (
+            multi_agent_version,
+            execution_guard,
+            reservation,
+            session_source,
+            mut agent_metadata,
+            residency_slot,
+        ) = if let Some(consumed) = consumed_typed_spawn {
+            (
+                consumed.multi_agent_version,
+                consumed.execution_guard,
+                consumed.reservation,
+                Some(consumed.session_source),
+                consumed.agent_metadata,
+                consumed.residency_slot,
             )
-            .await;
-        let execution_guard = if let Some(session_source) = session_source.as_ref() {
-            self.reserve_execution_capacity(multi_agent_version, session_source)?
         } else {
-            None
-        };
-        let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
-        let spawn_uses_v2_residency = multi_agent_version == MultiAgentVersion::V2
-            && session_source
-                .as_ref()
-                .is_some_and(is_v2_resident_session_source);
-        let reservation_max_threads = if spawn_uses_v2_residency {
-            None
-        } else {
-            agent_max_threads
-        };
-        let mut reservation = self.state.reserve_spawn_slot(reservation_max_threads)?;
-        let (session_source, mut agent_metadata) = match session_source {
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth,
-                agent_path,
-                agent_role,
-                ..
-            })) => {
-                let (session_source, agent_metadata) = self.prepare_thread_spawn(
-                    &mut reservation,
+            let multi_agent_version = state
+                .effective_multi_agent_version_for_spawn(
+                    &InitialHistory::New,
+                    session_source.as_ref(),
+                    options.parent_thread_id,
+                    /*forked_from_thread_id*/ None,
                     &config,
+                )
+                .await;
+            let execution_guard = if let Some(session_source) = session_source.as_ref() {
+                self.reserve_execution_capacity(multi_agent_version, session_source)?
+            } else {
+                None
+            };
+            let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
+            let spawn_uses_v2_residency = multi_agent_version == MultiAgentVersion::V2
+                && session_source
+                    .as_ref()
+                    .is_some_and(is_v2_resident_session_source);
+            let reservation_max_threads = if spawn_uses_v2_residency {
+                None
+            } else {
+                agent_max_threads
+            };
+            let mut reservation = self.state.reserve_spawn_slot(reservation_max_threads)?;
+            let (session_source, agent_metadata) = match session_source {
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id,
                     depth,
                     agent_path,
                     agent_role,
-                    /*preferred_agent_nickname*/ None,
-                )?;
-                (Some(session_source), agent_metadata)
-            }
-            other => (other, AgentMetadata::default()),
+                    ..
+                })) => {
+                    let (session_source, agent_metadata) = self.prepare_thread_spawn(
+                        &mut reservation,
+                        &config,
+                        parent_thread_id,
+                        depth,
+                        agent_path,
+                        agent_role,
+                        /*preferred_agent_nickname*/ None,
+                    )?;
+                    (Some(session_source), agent_metadata)
+                }
+                other => (other, AgentMetadata::default()),
+            };
+            let residency_slot = if spawn_uses_v2_residency {
+                Some(
+                    self.reserve_v2_residency_slot(
+                        &state, &config, /*protected_thread_id*/ None,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            (
+                multi_agent_version,
+                execution_guard,
+                reservation,
+                session_source,
+                agent_metadata,
+                residency_slot,
+            )
         };
         let notification_source = session_source.clone();
-        let residency_slot = if spawn_uses_v2_residency {
-            Some(
-                self.reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
-                    .await?,
-            )
-        } else {
-            None
-        };
         let inheritance = SpawnAgentThreadInheritance {
             environments: self
                 .inherited_environments_for_source(&state, session_source.as_ref())

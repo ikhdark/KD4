@@ -9,31 +9,22 @@ use crate::PUBLIC_TOOL_NAME;
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
 To find one, filter `ALL_TOOLS` by `name` and `description`."#;
-const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
-- Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
-- All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`. Tool names are exposed as normalized JavaScript identifiers, for example `await tools.mcp__ologs__get_profile(...)`.
-- Nested tool methods take either a string or an object as their input argument.
-- Nested tools return either an object or a string, based on the description.
-- Runs raw JavaScript -- no Node, no file system, no network access, no console.
-- Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
-- You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
-- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
-- `max_output_tokens` sets the token budget for direct `exec` results. Model projections are capped at 1000 tokens for success, 2000 for failure/timeout, and 4000 for high-signal diagnostics; a lower requested value is honored.
-- Prefer public `exec` to batch two or more related, independent inspections; use a direct tool call for a single read.
-- When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
+const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate tool calls in a fresh async V8 isolate.
+- Input is JavaScript source, not JSON, quotes, or a Markdown fence. Node, filesystem, network, and console APIs are unavailable.
+- Nested tools are normalized methods on `tools` (for example `await tools.exec_command(...)`); methods accept the documented string or object and return the documented object or string.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`. `yield_time_ms` defaults to 10000; `max_output_tokens` limits direct output.
+- When evaluation ends, unawaited work is discarded.
 
-- Global helpers:
-- `exit()`: Immediately ends the current script successfully (like an early return from the top level).
-- `text(value: string | number | boolean | undefined | null)`: Appends a text item. Non-string values are stringified with `JSON.stringify(...)` when possible.
-- `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | ImageContent, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. MCP image blocks may request detail with `_meta: { "codex/imageDetail": "original" }`. When provided, the second `detail` argument overrides any detail embedded in the first argument.
-- `generatedImage(result: { image_url: string; output_hint?: string })`: Appends an image-generation result and its optional output hint. HTTP(S) URLs are not supported.
-- `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls in the same session.
-- `load(key: string)`: returns the stored value for a string key, or `undefined` if it is missing.
-- `notify(value: string | number | boolean | undefined | null)`: immediately injects an extra `custom_tool_call_output` for the current `exec` call. Values are stringified like `text(...)`.
-- `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
-- `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
-- `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
-- `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
+Global helpers:
+- `exit()` ends successfully.
+- `text(value: string | number | boolean | undefined | null)` appends text, JSON-stringifying non-strings when possible.
+- `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | { type: "image"; data: string; mimeType: string; _meta?: Record<string, unknown> }, detail?: "auto" | "low" | "high" | "original" | null)` appends a base64 `data:` image or one MCP image block; explicit detail overrides metadata.
+- `audio(audioUrlOrItem: string | { audio_url: string } | { type: "audio"; data: string; mimeType: string })` appends a base64 `data:` audio URL or one MCP audio block.
+- `generatedImage(result: { image_url: string; output_hint?: string })` appends generated-image output; HTTP(S) URLs are unsupported.
+- `store(key: string, value: any)` and `load(key: string)` persist serializable values within the exec session.
+- `notify(value: string | number | boolean | undefined | null)` emits an immediate extra tool output.
+- `setTimeout(callback: () => void, delayMs?: number)` schedules work; pending timers do not keep exec alive, so await them. `clearTimeout(timeoutId?: number)` cancels one.
+- `ALL_TOOLS` lists `{ name, description }`; `yield_control()` emits accumulated output while execution continues."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
 - `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
@@ -266,7 +257,6 @@ pub fn build_exec_tool_description(
 
     let has_mcp_tools = enabled_tools
         .iter()
-        .chain(deferred_tools)
         .any(|tool| mcp_structured_content_schema(tool.output_schema.as_ref()).is_some());
     if has_mcp_tools {
         sections.push(format!(
@@ -710,6 +700,7 @@ fn render_json_schema_literal(value: &JsonValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::CodeModeToolKind;
+    use super::EXEC_DESCRIPTION_TEMPLATE;
     use super::ParsedExecSource;
     use super::ToolDefinition;
     use super::ToolNamespaceDescription;
@@ -883,6 +874,28 @@ bar"
             build_exec_tool_description(&[], &[], &BTreeMap::new(), /*code_mode_only*/ false);
         assert!(description.contains("`setTimeout(callback: () => void, delayMs?: number)`"));
         assert!(description.contains("`clearTimeout(timeoutId?: number)`"));
+    }
+
+    #[test]
+    fn common_exec_description_keeps_inline_image_and_audio_without_rich_mcp_types() {
+        let description =
+            build_exec_tool_description(&[], &[], &BTreeMap::new(), /*code_mode_only*/ false);
+
+        assert!(description.contains("raw JavaScript"));
+        assert!(description.contains("await tools.exec_command"));
+        assert!(description.contains("yield_time_ms"));
+        assert!(description.contains("max_output_tokens"));
+        assert!(description.contains("type: \"image\""));
+        assert!(description.contains("type: \"audio\""));
+        assert!(description.contains("unawaited work is discarded"));
+        assert!(!description.contains("Shared MCP Types:"));
+        assert!(!description.contains("type ImageContent ="));
+        assert!(!description.contains("Model projections are capped"));
+        const HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES: usize = 3_337;
+        assert!(
+            EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 65,
+            "common exec description must retain at least a 35% reduction"
+        );
     }
 
     #[test]
@@ -1083,7 +1096,7 @@ bar"
     }
 
     #[test]
-    fn code_mode_only_description_renders_shared_mcp_types_for_deferred_tools() {
+    fn code_mode_only_description_defers_shared_mcp_types_with_deferred_tools() {
         let deferred_tool = ToolDefinition {
             name: "mcp__sample__alpha".to_string(),
             tool_name: ToolName::namespaced("mcp__sample__", "alpha"),
@@ -1109,7 +1122,7 @@ bar"
         );
 
         assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(description.contains("Shared MCP Types:"));
+        assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("### `mcp__sample__alpha`"));
     }
 

@@ -119,3 +119,89 @@ fn source_tool_count_and_line_parameters_are_integers() {
         );
     }
 }
+
+#[test]
+fn source_tool_numeric_bounds_are_emitted_from_runtime_constants() {
+    let cases = [
+        (
+            create_search_source_tool(SourceToolOptions {
+                include_environment_id: false,
+            }),
+            vec![
+                ("max_results", 1_u64, SOURCE_SEARCH_MAX_MATCHES as u64),
+                (
+                    "context_lines",
+                    0_u64,
+                    SOURCE_SEARCH_MAX_CONTEXT_LINES as u64,
+                ),
+            ],
+        ),
+        (
+            create_locate_task_tool(SourceToolOptions {
+                include_environment_id: false,
+            }),
+            vec![
+                ("max_files", 1_u64, LOCATE_TASK_MAX_FILES as u64),
+                (
+                    "max_source_bytes",
+                    1_u64,
+                    LOCATE_TASK_MAX_SOURCE_BYTES as u64,
+                ),
+            ],
+        ),
+        (
+            create_read_file_span_tool(SourceToolOptions {
+                include_environment_id: false,
+            }),
+            vec![("line_count", 1_u64, SOURCE_READ_MAX_LINES as u64)],
+        ),
+    ];
+
+    for (tool, bounds) in cases {
+        let tool = serde_json::to_value(tool).expect("serialize source tool");
+        for (parameter, minimum, maximum) in bounds {
+            let schema = tool
+                .pointer(&format!("/parameters/properties/{parameter}"))
+                .expect("parameter schema");
+            assert_eq!(schema.get("minimum"), Some(&minimum.into()));
+            assert_eq!(schema.get("maximum"), Some(&maximum.into()));
+        }
+    }
+
+    let read_tool = serde_json::to_value(create_read_file_span_tool(SourceToolOptions {
+        include_environment_id: false,
+    }))
+    .expect("serialize read tool");
+    let start_line = read_tool
+        .pointer("/parameters/properties/start_line")
+        .expect("start_line schema");
+    assert_eq!(start_line.get("minimum"), Some(&1_u64.into()));
+    assert!(start_line.get("maximum").is_none());
+}
+
+#[test]
+fn source_question_enum_and_closed_object_constraints_are_emitted() {
+    let tool = serde_json::to_value(create_search_source_tool(SourceToolOptions {
+        include_environment_id: false,
+    }))
+    .expect("serialize search tool");
+    let question = tool
+        .pointer("/parameters/properties/source_question")
+        .expect("source question schema");
+    assert_eq!(
+        question.get("required"),
+        Some(&serde_json::json!(["kind", "detail"]))
+    );
+    assert_eq!(question.get("additionalProperties"), Some(&false.into()));
+    assert_eq!(
+        question.pointer("/properties/kind/enum"),
+        Some(&serde_json::json!([
+            "unknown_caller",
+            "unknown_contract",
+            "ambiguous_ownership",
+            "incomplete_prior_result",
+            "source_changed",
+            "validation_dependency"
+        ]))
+    );
+}

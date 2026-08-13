@@ -367,6 +367,17 @@ mod built_in {
                     }
                 ),
                 (
+                    "architect".to_string(),
+                    AgentRoleConfig {
+                        description: Some(
+                            "Define and seal one authoritative ArchitectureContractV1 for dependent workers. Remain read-only; architecture authority does not permit source mutation."
+                                .to_string(),
+                        ),
+                        config_file: Some("architect.toml".to_string().parse().unwrap_or_default()),
+                        nickname_candidates: None,
+                    },
+                ),
+                (
                     "explorer".to_string(),
                     AgentRoleConfig {
                         description: Some(r#"Use `explorer` for specific codebase questions.
@@ -455,7 +466,7 @@ Rules:
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
         const AWAITER: &str = include_str!("builtins/awaiter.toml");
         match path.to_str()? {
-            "explorer.toml" | "reviewer.toml" | "verifier.toml" => {
+            "architect.toml" | "explorer.toml" | "reviewer.toml" | "verifier.toml" => {
                 Some(read_only_config_file_contents())
             }
             "awaiter.toml" => Some(AWAITER),

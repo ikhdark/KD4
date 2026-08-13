@@ -25,6 +25,14 @@ PREDICTOR_FIELDS = (
     *COMPONENT_FIELDS,
 )
 RECONCILIATION_TOLERANCE_BYTES = 256.0
+AMPLIFICATION_CATEGORY_FIELDS = (
+    "checkpoint_tokens",
+    "completed_tool_receipt_tokens",
+    "raw_tool_output_tokens",
+    "completed_call_tokens",
+    "schema_tokens",
+    "continuity_tokens",
+)
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -47,7 +55,7 @@ def _number(value: Any, *, nonnegative: bool = True) -> float | None:
     return result
 
 
-def _event_fields(value: Any) -> dict[str, Any] | None:
+def _event_fields(value: Any) -> tuple[str, dict[str, Any]] | None:
     if not isinstance(value, dict):
         return None
     fields = dict(value)
@@ -56,29 +64,204 @@ def _event_fields(value: Any) -> dict[str, Any] | None:
         if isinstance(nested, dict):
             fields.update(nested)
     event_name = fields.get("event.name", fields.get("event_name"))
-    return fields if event_name == "codex.model_attempt" else None
+    if event_name == "codex.model_attempt":
+        return "attempt", fields
+    if event_name == "codex.model_context_component":
+        return "component", fields
+    return None
 
 
 def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, int]]:
     records: list[dict[str, Any]] = []
     exclusions: dict[str, int] = {}
+    seen_attempts: dict[tuple[str, str, int], dict[str, Any]] = {}
+    components: list[dict[str, Any]] = []
+    seen_components: set[tuple[Any, ...]] = set()
     for path in paths:
         with path.open(encoding="utf-8") as source:
             for line in source:
                 if not line.strip():
                     continue
                 try:
-                    fields = _event_fields(json.loads(line))
+                    recognized = _event_fields(json.loads(line))
                 except json.JSONDecodeError:
-                    fields = None
+                    recognized = None
                     reason = "malformed_json"
                 else:
                     reason = "not_model_attempt"
-                if fields is None:
+                if recognized is None:
                     exclusions[reason] = exclusions.get(reason, 0) + 1
                 else:
+                    event_kind, fields = recognized
+                    if event_kind == "component":
+                        identity = (
+                            fields.get("sampling_request_id"),
+                            fields.get("attempt_id"),
+                            fields.get("retry_index"),
+                            fields.get("component_kind"),
+                            fields.get("semantic_id"),
+                            fields.get("content_hash"),
+                        )
+                        if identity in seen_components:
+                            exclusions["duplicate_context_component_collapsed"] = (
+                                exclusions.get("duplicate_context_component_collapsed", 0) + 1
+                            )
+                        else:
+                            seen_components.add(identity)
+                            components.append(fields)
+                        continue
+                    identity_values = (
+                        fields.get("sampling_request_id"),
+                        fields.get("attempt_id"),
+                        fields.get("retry_index"),
+                    )
+                    if (
+                        isinstance(identity_values[0], str)
+                        and identity_values[0]
+                        and isinstance(identity_values[1], str)
+                        and identity_values[1]
+                        and isinstance(identity_values[2], int)
+                        and not isinstance(identity_values[2], bool)
+                    ):
+                        identity = identity_values
+                        previous = seen_attempts.get(identity)
+                        if previous == fields:
+                            reason = "duplicate_physical_attempt_collapsed"
+                            exclusions[reason] = exclusions.get(reason, 0) + 1
+                            continue
+                        if previous is not None:
+                            reason = "conflicting_physical_attempt_duplicate"
+                            exclusions[reason] = exclusions.get(reason, 0) + 1
+                        else:
+                            seen_attempts[identity] = fields
                     records.append(fields)
+    attempts_by_identity = {
+        (record.get("sampling_request_id"), record.get("attempt_id"), record.get("retry_index")): record
+        for record in records
+    }
+    for component in components:
+        identity = (
+            component.get("sampling_request_id"),
+            component.get("attempt_id"),
+            component.get("retry_index"),
+        )
+        attempt = attempts_by_identity.get(identity)
+        if attempt is None:
+            exclusions["orphan_context_component"] = exclusions.get("orphan_context_component", 0) + 1
+            continue
+        attempt.setdefault("_stable_context_components", []).append(component)
     return records, exclusions
+
+
+def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
+    active_totals: list[float] = []
+    local_constructed_bytes = 0.0
+    local_reused_bytes = 0.0
+    component_cache_hits = 0.0
+    fail_open_attempts = 0
+    successful_rebases = 0
+    wire_bytes = 0.0
+    cached_tokens = 0.0
+    input_tokens = 0.0
+    requests_over_80k = 0
+    for record in records:
+        active_total = 0.0
+        attempt_constructed_bytes = 0.0
+        attempt_reused_bytes = 0.0
+        attempt_cache_hits = 0.0
+        components = record.get("_stable_context_components")
+        if not isinstance(components, list):
+            components = []
+        for component in components:
+            if not isinstance(component, dict) or component.get("active") is not True:
+                continue
+            tokens = _number(component.get("approx_tokens")) or 0.0
+            size = _number(component.get("serialized_bytes")) or 0.0
+            active_total += tokens
+            if component.get("local_reused") is True:
+                attempt_reused_bytes += size
+                attempt_cache_hits += 1
+            else:
+                attempt_constructed_bytes += size
+            key = (
+                component.get("component_kind"),
+                component.get("contract_version"),
+                component.get("semantic_id"),
+                component.get("content_hash"),
+            )
+            summary = grouped.setdefault(
+                key,
+                {
+                    "kind": key[0],
+                    "contractVersion": key[1],
+                    "semanticId": key[2],
+                    "contentHash": key[3],
+                    "requestAppearances": 0,
+                    "serializedBytes": size,
+                    "approxTokens": tokens,
+                    "cumulativeLogicalExposureTokens": 0.0,
+                    "locallyReusedAppearances": 0,
+                },
+            )
+            summary["requestAppearances"] += 1
+            summary["cumulativeLogicalExposureTokens"] += tokens
+            if component.get("local_reused") is True:
+                summary["locallyReusedAppearances"] += 1
+        reported_active_total = _number(record.get("logical_context_tokens"))
+        if reported_active_total is not None:
+            active_total = reported_active_total
+        active_totals.append(active_total)
+        reported_constructed = _number(record.get("local_constructed_bytes"))
+        local_constructed_bytes += (
+            attempt_constructed_bytes
+            if reported_constructed is None
+            else reported_constructed
+        )
+        reported_reused = _number(record.get("local_reused_bytes"))
+        local_reused_bytes += (
+            attempt_reused_bytes if reported_reused is None else reported_reused
+        )
+        reported_hits = _number(record.get("component_cache_hits"))
+        component_cache_hits += (
+            attempt_cache_hits if reported_hits is None else reported_hits
+        )
+        if active_total > 80_000:
+            requests_over_80k += 1
+        if record.get("provider_baseline") == "fail_open_stale_retained":
+            fail_open_attempts += 1
+        if (
+            record.get("provider_baseline") == "fresh_full_replay"
+            and record.get("fresh_response_id_established") is True
+        ):
+            successful_rebases += 1
+        wire_bytes += _number(record.get("wire_request_bytes")) or 0.0
+        cached_tokens += _number(record.get("cached_input_token_count")) or 0.0
+        input_tokens += _number(record.get("input_token_count")) or 0.0
+    top = sorted(
+        grouped.values(),
+        key=lambda component: (
+            -component["cumulativeLogicalExposureTokens"],
+            str(component["kind"]),
+            str(component["semanticId"]),
+        ),
+    )
+    return {
+        "componentVersions": top,
+        "averageActiveContextTokens": round(sum(active_totals) / len(active_totals), 3)
+        if active_totals
+        else None,
+        "peakActiveContextTokens": max(active_totals) if active_totals else None,
+        "requestsOver80K": requests_over_80k,
+        "cumulativeLogicalContextTokens": sum(active_totals),
+        "localConstructedBytes": local_constructed_bytes,
+        "localReusedBytes": local_reused_bytes,
+        "componentCacheHits": component_cache_hits,
+        "wireRequestBytes": wire_bytes,
+        "providerCachedShare": round(cached_tokens / input_tokens, 6) if input_tokens else None,
+        "failOpenAttempts": fail_open_attempts,
+        "successfulRebases": successful_rebases,
+    }
 
 
 def _ranks(values: Sequence[float]) -> list[float]:
@@ -116,6 +299,144 @@ def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
         "p50": round(percentile(values, 0.50), 3) if values else None,
         "p95": round(percentile(values, 0.95), 3) if values else None,
     }
+
+
+def algebraic_attribution(
+    before_count: float,
+    before_mean: float,
+    after_count: float,
+    after_mean: float,
+) -> dict[str, float | str]:
+    """Exact algebraic decomposition; individual terms are not causal claims."""
+    request_count = (before_count - after_count) * after_mean
+    working_set = after_count * (before_mean - after_mean)
+    interaction = (before_count - after_count) * (before_mean - after_mean)
+    observed = before_count * before_mean - after_count * after_mean
+    return {
+        "interpretation": "algebraic attribution, not independent causal proof",
+        "requestCountTerm": request_count,
+        "workingSetTerm": working_set,
+        "interactionTerm": interaction,
+        "observedInputDifference": observed,
+        "termSum": request_count + working_set + interaction,
+    }
+
+
+def _amplification_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    roots: dict[str, list[dict[str, Any]]] = {}
+    ungrouped = 0
+    for record in records:
+        root_task_id = record.get("root_task_id")
+        if isinstance(root_task_id, str) and root_task_id:
+            roots.setdefault(root_task_id, []).append(record)
+        else:
+            ungrouped += 1
+
+    summaries: list[dict[str, Any]] = []
+    for root_task_id, attempts in sorted(roots.items()):
+        windows: dict[str, list[dict[str, Any]]] = {}
+        coverage_reason: str | None = None
+        cumulative_input = 0.0
+        cached_input = 0.0
+        continuation_input = 0.0
+        for attempt in attempts:
+            window_id = attempt.get("measurement_window_id")
+            if not isinstance(window_id, str) or not window_id:
+                coverage_reason = coverage_reason or "missing_measurement_window_id"
+                continue
+            windows.setdefault(window_id, []).append(attempt)
+            provider_input = _number(attempt.get("input_token_count"))
+            cached = _number(attempt.get("cached_input_token_count"))
+            if provider_input is None or cached is None:
+                coverage_reason = coverage_reason or "missing_attempt_provider_usage"
+                continue
+            cumulative_input += provider_input
+            cached_input += cached
+            if attempt.get("request_kind") == "continuation":
+                continuation_input += provider_input
+
+        unique_new = 0.0
+        logical_inputs: list[float] = []
+        category_totals = {field: 0.0 for field in AMPLIFICATION_CATEGORY_FIELDS}
+        local_peaks: list[float] = []
+        effective_peaks: list[float] = []
+        compactions: list[float] = []
+        for window_attempts in windows.values():
+            representative = window_attempts[0]
+            if any(
+                attempt.get("amplification_measurement_complete") is not True
+                for attempt in window_attempts
+            ):
+                reasons = [
+                    attempt.get("amplification_null_reason")
+                    for attempt in window_attempts
+                    if isinstance(attempt.get("amplification_null_reason"), str)
+                ]
+                coverage_reason = coverage_reason or (reasons[0] if reasons else "incomplete_unique_material")
+            window_unique = sum(
+                value
+                for attempt in window_attempts
+                if (value := _number(attempt.get("unique_new_tokens"))) is not None
+            )
+            if any(_number(attempt.get("unique_new_tokens")) is None for attempt in window_attempts):
+                coverage_reason = coverage_reason or "missing_unique_new_tokens"
+            unique_new += window_unique
+            window_inputs = [
+                value
+                for attempt in window_attempts
+                if (value := _number(attempt.get("input_token_count"))) is not None
+            ]
+            if len(window_inputs) == len(window_attempts):
+                logical_inputs.append(sum(window_inputs))
+            for field in AMPLIFICATION_CATEGORY_FIELDS:
+                value = _number(representative.get(field))
+                if value is None:
+                    coverage_reason = coverage_reason or f"missing_{field}"
+                else:
+                    category_totals[field] += value
+            local = _number(representative.get("local_projected_occupancy"))
+            effective = _number(representative.get("effective_provider_occupancy"))
+            if local is not None:
+                local_peaks.append(local)
+            if effective is not None:
+                effective_peaks.append(effective)
+            compaction = _number(representative.get("compactions"))
+            if compaction is not None:
+                compactions.append(compaction)
+
+        if not windows:
+            coverage_reason = coverage_reason or "no_complete_measurement_windows"
+        replay = (
+            cumulative_input / unique_new
+            if coverage_reason is None and unique_new > 0
+            else None
+        )
+        if coverage_reason is None and unique_new == 0:
+            coverage_reason = "zero_unique_new_tokens"
+        summaries.append(
+            {
+                "rootTaskId": root_task_id,
+                "physicalAttemptCount": len(attempts),
+                "requestCount": len(windows),
+                "cumulativeInputTokens": cumulative_input,
+                "cachedInputTokens": cached_input,
+                "inputTokensPerRequest": {
+                    "average": round(sum(logical_inputs) / len(logical_inputs), 3)
+                    if logical_inputs
+                    else None,
+                    **_distribution(logical_inputs),
+                },
+                "peakLocalProjectedOccupancy": max(local_peaks) if local_peaks else None,
+                "peakEffectiveProviderOccupancy": max(effective_peaks) if effective_peaks else None,
+                "categoryTotals": category_totals,
+                "compactions": max(compactions) if compactions else None,
+                "replayAmplification": round(replay, 6) if replay is not None else None,
+                "replayAmplificationNullReason": coverage_reason,
+                "continuationReplayExposureInputTokens": continuation_input,
+                "continuationReplayExposureInterpretation": "observational, not causal waste",
+            }
+        )
+    return {"ungroupedAttemptCount": ungrouped, "roots": summaries}
 
 
 def _quantile_bins(rows: Sequence[dict[str, Any]], predictor: str, count: int = 4) -> list[dict[str, Any]]:
@@ -267,6 +588,8 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
             "suppliedResidualMismatchCount": supplied_residual_mismatches,
             "residualBytes": _distribution(residuals),
         },
+        "stableContext": _stable_context_summary(records),
+        "amplification": _amplification_summary(records),
         "rows": rows,
     }
 
@@ -308,7 +631,37 @@ def render(analysis: dict[str, Any]) -> str:
         f"tolerance_bytes={reconciliation['toleranceBytes']} "
         f"residual={json.dumps(reconciliation['residualBytes'], sort_keys=True)}"
     )
+    for root in analysis["amplification"]["roots"]:
+        lines.append(
+            "amplification root "
+            f"{root['rootTaskId']}: requests={root['requestCount']} "
+            f"input={root['cumulativeInputTokens']} cached={root['cachedInputTokens']} "
+            f"replay={root['replayAmplification']} "
+            f"null_reason={root['replayAmplificationNullReason']}"
+        )
     lines.append(
         "Provider queueing, cache lookup, prefill execution, and generation startup are not separately observable."
     )
+    stable = analysis["stableContext"]
+    lines.append(
+        "stable context: "
+        f"average_active_tokens={stable['averageActiveContextTokens']} "
+        f"peak_active_tokens={stable['peakActiveContextTokens']} "
+        f"requests_over_80k={stable['requestsOver80K']} "
+        f"local_constructed_bytes={stable['localConstructedBytes']} "
+        f"local_reused_bytes={stable['localReusedBytes']} "
+        f"component_cache_hits={stable['componentCacheHits']} "
+        f"wire_bytes={stable['wireRequestBytes']} "
+        f"provider_cached_share={stable['providerCachedShare']} "
+        f"successful_rebases={stable['successfulRebases']} "
+        f"fail_open_attempts={stable['failOpenAttempts']}"
+    )
+    for component in stable["componentVersions"][:15]:
+        lines.append(
+            "  component "
+            f"{component['kind']} {component['semanticId']}: "
+            f"requests={component['requestAppearances']} "
+            f"tokens={component['approxTokens']} "
+            f"cumulative={component['cumulativeLogicalExposureTokens']}"
+        )
     return "\n".join(lines)

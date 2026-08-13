@@ -655,6 +655,81 @@ async fn concurrent_v2_send_input_admission_is_atomic_and_releases_after_shutdow
 }
 
 #[tokio::test]
+async fn prepared_typed_spawn_reserves_capacity_revalidates_and_releases_on_drop() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    harness.control.agent_execution_limiter.initialize(1);
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let source = |task_name: &str| {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: 1,
+            agent_path: Some(AgentPath::root().join(task_name).expect("typed task path")),
+            agent_nickname: None,
+            agent_role: Some("worker".to_string()),
+        })
+    };
+
+    let first_source = source("prepared-a");
+    let prepared = harness
+        .control
+        .prepare_typed_spawn(
+            &harness.config,
+            first_source.clone(),
+            Some(parent_thread_id),
+        )
+        .await
+        .expect("first typed reservation");
+    assert_matches!(
+        harness
+            .control
+            .prepare_typed_spawn(
+                &harness.config,
+                source("prepared-b"),
+                Some(parent_thread_id),
+            )
+            .await,
+        Err(CodexErr::AgentLimitReached { max_threads: 1 })
+    );
+
+    let consumed = harness
+        .control
+        .consume_prepared_typed_spawn(
+            prepared,
+            &harness.config,
+            &first_source,
+            Some(parent_thread_id),
+        )
+        .await
+        .expect("prepared reservation revalidates before durable assignment creation");
+    assert_matches!(
+        harness
+            .control
+            .prepare_typed_spawn(
+                &harness.config,
+                source("prepared-c"),
+                Some(parent_thread_id),
+            )
+            .await,
+        Err(CodexErr::AgentLimitReached { max_threads: 1 })
+    );
+
+    drop(consumed);
+    let retry = harness
+        .control
+        .prepare_typed_spawn(
+            &harness.config,
+            source("prepared-c"),
+            Some(parent_thread_id),
+        )
+        .await
+        .expect("all logical capacity is reusable after cancellation cleanup");
+    drop(retry);
+}
+
+#[tokio::test]
 async fn send_inter_agent_communication_without_turn_queues_message_without_triggering_turn() {
     let harness = AgentControlHarness::new().await;
     let (thread_id, thread) = harness.start_thread().await;
@@ -2907,6 +2982,7 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
                 contract_claims: Vec::new(),
                 workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
                 relation: None,
+                architecture_contract_ref: None,
             },
         )
         .await

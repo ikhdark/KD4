@@ -2,6 +2,8 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
+use crate::AdmissionOverlapSummary;
+use crate::AdmittedAssignment;
 use crate::AgentGate;
 use crate::AgentReceipt;
 use crate::AgentTask;
@@ -16,11 +18,14 @@ use crate::AttemptId;
 use crate::AttributionConfidence;
 use crate::GateKind;
 use crate::GateStatus;
+use crate::IntegrationPlan;
+use crate::MissingEvidenceObligation;
 use crate::MutationEventId;
 use crate::MutationEvidence;
 use crate::MutationSnapshotChunk;
 use crate::MutationSnapshotVersion;
 use crate::ObservationKind;
+use crate::PreparedWorkspaceManifest;
 use crate::QuiescenceStatus;
 use crate::ReceiptDraft;
 use crate::RuntimeObservation;
@@ -32,6 +37,7 @@ use crate::WakeEventId;
 use crate::WakeRead;
 use crate::WorkspaceActorRegistration;
 use crate::WorkspaceManifestEntry;
+use crate::WorkspaceMutationFinishOutcome;
 use crate::WorkspaceMutationLease;
 use crate::WorkspaceMutationRequest;
 use crate::WorkspaceMutationResult;
@@ -48,6 +54,26 @@ pub trait AgentTaskStore: Send + Sync {
         repo_root: &'a Path,
         draft: AssignmentDraft,
     ) -> TaskStoreFuture<'a, (Assignment, Attempt)>;
+
+    /// Selective typed-lane admission. The boolean records whether the configured typed
+    /// Integrator capability is available for an isolated multi-writer handoff.
+    fn create_admitted_assignment<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        draft: AssignmentDraft,
+        isolated_integrator_available: bool,
+    ) -> TaskStoreFuture<'a, AdmittedAssignment> {
+        Box::pin(async move {
+            let _ = isolated_integrator_available;
+            let (assignment, attempt) = self.create_assignment(repo_root, draft).await?;
+            Ok(AdmittedAssignment {
+                assignment,
+                attempt,
+                overlaps: AdmissionOverlapSummary::default(),
+                integration_plan: IntegrationPlan::SingleWriter,
+            })
+        })
+    }
 
     /// Atomically attaches the one immutable, canonical TaskCapsule bootstrap snapshot.
     fn attach_task_capsule(
@@ -118,6 +144,20 @@ pub trait AgentTaskStore: Send + Sync {
         call_id: String,
         lease_expires_at: DateTime<Utc>,
     ) -> TaskStoreFuture<'_, bool>;
+
+    /// Replays only an unchanged, previously evaluated `RequiredEvidenceMissing`
+    /// result. Implementations must fail open when every authoritative input
+    /// cannot be refreshed and represented in the cache identity.
+    fn replay_required_evidence_missing<'a>(
+        &'a self,
+        attempt_id: AttemptId,
+        receipt: &'a ReceiptDraft,
+    ) -> TaskStoreFuture<'a, Option<Vec<MissingEvidenceObligation>>> {
+        Box::pin(async move {
+            let _ = (attempt_id, receipt);
+            Ok(None)
+        })
+    }
 
     fn submit_agent_receipt(
         &self,
@@ -193,6 +233,19 @@ pub trait AgentTaskStore: Send + Sync {
         no_progress_before: DateTime<Utc>,
     ) -> TaskStoreFuture<'_, bool>;
 
+    /// Atomically abandons a still-active assignment that has made no meaningful progress by
+    /// the supplied boundary and has no live bounded validation operation.
+    fn recover_nonproductive_assignment(
+        &self,
+        assignment_id: AssignmentId,
+        no_progress_before: DateTime<Utc>,
+    ) -> TaskStoreFuture<'_, crate::NonproductiveRecovery> {
+        Box::pin(async move {
+            let _ = (assignment_id, no_progress_before);
+            Ok(crate::NonproductiveRecovery::NotEligible)
+        })
+    }
+
     fn release_stalled_nudge(&self, assignment_id: AssignmentId) -> TaskStoreFuture<'_, bool>;
 
     fn capture_workspace_revision<'a>(
@@ -240,6 +293,72 @@ pub trait AgentTaskStore: Send + Sync {
         request: WorkspaceMutationRequest,
     ) -> TaskStoreFuture<'a, WorkspaceMutationLease>;
 
+    /// Returns a strongly constructed internal manifest when this store can
+    /// provide prepared admission. Legacy implementations retain their fresh
+    /// manifest behavior by returning `None`.
+    #[doc(hidden)]
+    fn prepare_workspace_mutation<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, Option<PreparedWorkspaceManifest>> {
+        Box::pin(async move {
+            let _ = (repo_root, paths);
+            Ok(None)
+        })
+    }
+
+    #[doc(hidden)]
+    fn workspace_manifest_overlay_paths<'a>(
+        &'a self,
+        repo_root: &'a Path,
+    ) -> TaskStoreFuture<'a, Option<Vec<String>>> {
+        Box::pin(async move {
+            let _ = repo_root;
+            Ok(None)
+        })
+    }
+
+    #[doc(hidden)]
+    fn refresh_workspace_mutation<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        prepared: PreparedWorkspaceManifest,
+        overlay_paths: Vec<String>,
+        changed_paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, Option<PreparedWorkspaceManifest>> {
+        Box::pin(async move {
+            let _ = (repo_root, prepared, overlay_paths, changed_paths);
+            Ok(None)
+        })
+    }
+
+    /// Begins against an internal strong-manifest receipt. The default ignores
+    /// it and preserves legacy fresh-manifest admission.
+    #[doc(hidden)]
+    fn begin_workspace_mutation_prepared<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        request: WorkspaceMutationRequest,
+        prepared: PreparedWorkspaceManifest,
+    ) -> TaskStoreFuture<'a, WorkspaceMutationLease> {
+        let _ = prepared;
+        self.begin_workspace_mutation(repo_root, request)
+    }
+
+    /// Reads only the committed repository-mutation epoch. `None` means the
+    /// store cannot establish this narrow identity and reuse must be skipped.
+    #[doc(hidden)]
+    fn workspace_mutation_epoch<'a>(
+        &'a self,
+        repo_root: &'a Path,
+    ) -> TaskStoreFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            let _ = repo_root;
+            Ok(None)
+        })
+    }
+
     fn heartbeat_workspace_mutation<'a>(
         &'a self,
         repo_root: &'a Path,
@@ -252,6 +371,23 @@ pub trait AgentTaskStore: Send + Sync {
         repo_root: &'a Path,
         lease: WorkspaceMutationLease,
     ) -> TaskStoreFuture<'a, WorkspaceMutationResult>;
+
+    /// Finishes with the authoritative post-commit manifest when supported.
+    #[doc(hidden)]
+    fn finish_workspace_mutation_with_receipt<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        lease: WorkspaceMutationLease,
+    ) -> TaskStoreFuture<'a, WorkspaceMutationFinishOutcome> {
+        Box::pin(async move {
+            let result = self.finish_workspace_mutation(repo_root, lease).await?;
+            Ok(WorkspaceMutationFinishOutcome {
+                result,
+                final_manifest: None,
+                work: crate::WorkspaceManifestWork::default(),
+            })
+        })
+    }
 
     fn begin_workspace_finalization<'a>(
         &'a self,

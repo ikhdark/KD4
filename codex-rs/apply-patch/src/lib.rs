@@ -4,7 +4,9 @@ mod seek_sequence;
 mod standalone_executable;
 mod streaming_parser;
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
@@ -21,6 +23,9 @@ pub use parser::ParseError;
 use parser::ParseError::*;
 pub use parser::UpdateFileChunk;
 pub use parser::parse_patch;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use similar::TextDiff;
 pub use streaming_parser::StreamingPatchParser;
 use thiserror::Error;
@@ -52,6 +57,10 @@ pub enum ApplyPatchError {
     /// Error that occurs while computing replacements when applying patch chunks
     #[error("{0}")]
     ComputeReplacements(String),
+    /// A patch chunk did not match, with bounded context from the exact source
+    /// snapshot observed by the confined patch runtime when safely available.
+    #[error(transparent)]
+    PatchContextMismatch(#[from] PatchContextMismatch),
     /// A patch path could not be resolved as a path URI.
     #[error(transparent)]
     PathUri(#[from] PathUriParseError),
@@ -68,6 +77,37 @@ pub enum ApplyPatchError {
         selected_environment_id: String,
     },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchContextMismatchKind {
+    ContextNotFound,
+    ExpectedLinesNotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PatchContextMismatch {
+    pub kind: PatchContextMismatchKind,
+    pub hunk_ordinal: usize,
+    pub chunk_ordinal: usize,
+    pub canonical_path: String,
+    pub current_content_sha256: String,
+    pub current_line_start: usize,
+    pub current_line_end: usize,
+    pub current_excerpt: String,
+    pub message: String,
+}
+
+impl fmt::Display for PatchContextMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match serde_json::to_string(self) {
+            Ok(encoded) => write!(formatter, "PatchContextMismatch: {encoded}"),
+            Err(error) => write!(formatter, "{} ({error})", self.message),
+        }
+    }
+}
+
+impl std::error::Error for PatchContextMismatch {}
 
 impl From<std::io::Error> for ApplyPatchError {
     fn from(err: std::io::Error) -> Self {
@@ -343,13 +383,15 @@ pub async fn apply_hunks(
             writeln!(stderr, "{msg}").map_err(|error| {
                 ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
             })?;
-            let error = if let Some(io) = error.downcast_ref::<std::io::Error>() {
-                ApplyPatchError::from(io)
-            } else {
-                ApplyPatchError::IoError(IoError {
-                    context: msg,
-                    source: std::io::Error::other(error),
-                })
+            let error = match error.downcast::<ApplyPatchError>() {
+                Ok(error) => error,
+                Err(error) => match error.downcast::<std::io::Error>() {
+                    Ok(io) => ApplyPatchError::from(io),
+                    Err(error) => ApplyPatchError::IoError(IoError {
+                        context: msg,
+                        source: std::io::Error::other(error),
+                    }),
+                },
             };
             Err(ApplyPatchFailure::new(error, delta))
         }
@@ -398,7 +440,7 @@ async fn apply_hunks_to_files(
     }
 
     // TODO(anp): Carry PathUri through committed patch deltas and the turn diff tracker.
-    for hunk in hunks {
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
         let affected_path = hunk.path().to_path_buf();
         let path_uri = hunk.resolve_path(cwd)?;
         match hunk {
@@ -479,7 +521,14 @@ async fn apply_hunks_to_files(
                 let AppliedPatch {
                     original_contents,
                     new_contents,
-                } = derive_new_contents_from_chunks(&path_uri, chunks, fs, sandbox).await?;
+                } = derive_new_contents_from_chunks(
+                    &path_uri,
+                    chunks,
+                    Some(hunk_index + 1),
+                    fs,
+                    sandbox,
+                )
+                .await?;
                 if let Some(dest) = move_path {
                     let dest_uri = cwd.join(&dest.to_string_lossy())?;
                     let overwritten_move_content =
@@ -685,6 +734,7 @@ struct AppliedPatch {
 async fn derive_new_contents_from_chunks(
     path: &PathUri,
     chunks: &[UpdateFileChunk],
+    hunk_ordinal: Option<usize>,
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> std::result::Result<AppliedPatch, ApplyPatchError> {
@@ -715,7 +765,14 @@ async fn derive_new_contents_from_chunks(
     }
 
     let path_text = path.inferred_native_path_string();
-    let replacements = compute_replacements(&original_lines, &path_text, chunks)?;
+    let replacements = compute_replacements(
+        &original_lines,
+        &original_contents,
+        path,
+        &path_text,
+        hunk_ordinal,
+        chunks,
+    )?;
     let new_lines = apply_replacements(original_lines, &replacements);
     let mut new_lines = new_lines;
     if !new_lines.last().is_some_and(String::is_empty) {
@@ -733,13 +790,16 @@ async fn derive_new_contents_from_chunks(
 /// `(start_index, old_len, new_lines)`.
 fn compute_replacements(
     original_lines: &[String],
+    original_contents: &str,
+    path_uri: &PathUri,
     path: &str,
+    hunk_ordinal: Option<usize>,
     chunks: &[UpdateFileChunk],
 ) -> std::result::Result<Vec<(usize, usize, Vec<String>)>, ApplyPatchError> {
     let mut replacements: Vec<(usize, usize, Vec<String>)> = Vec::new();
     let mut line_index: usize = 0;
 
-    for chunk in chunks {
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
         // If a chunk has a `change_context`, we use seek_sequence to find it, then
         // adjust our `line_index` to continue from there.
         if let Some(ctx_line) = &chunk.change_context {
@@ -751,9 +811,19 @@ fn compute_replacements(
             ) {
                 line_index = idx + 1;
             } else {
-                return Err(ApplyPatchError::ComputeReplacements(format!(
-                    "Failed to find context '{ctx_line}' in {path}"
-                )));
+                let message = format!("Failed to find context '{ctx_line}' in {path}");
+                return Err(patch_context_mismatch(
+                    PatchMismatchSource {
+                        original_lines,
+                        original_contents,
+                        path: path_uri,
+                        hunk_ordinal,
+                    },
+                    chunk_index + 1,
+                    chunk,
+                    PatchContextMismatchKind::ContextNotFound,
+                    message,
+                ));
             }
         }
 
@@ -804,17 +874,191 @@ fn compute_replacements(
             replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
             line_index = start_idx + pattern.len();
         } else {
-            return Err(ApplyPatchError::ComputeReplacements(format!(
+            let message = format!(
                 "Failed to find expected lines in {}:\n{}",
                 path,
                 chunk.old_lines.join("\n"),
-            )));
+            );
+            return Err(patch_context_mismatch(
+                PatchMismatchSource {
+                    original_lines,
+                    original_contents,
+                    path: path_uri,
+                    hunk_ordinal,
+                },
+                chunk_index + 1,
+                chunk,
+                PatchContextMismatchKind::ExpectedLinesNotFound,
+                message,
+            ));
         }
     }
 
     replacements.sort_by_key(|(index, _, _)| *index);
 
     Ok(replacements)
+}
+
+const PATCH_MISMATCH_CONTEXT_LINES: usize = 3;
+const PATCH_MISMATCH_MAX_LINES: usize = 20;
+const PATCH_MISMATCH_MAX_BYTES: usize = 4 * 1024;
+
+struct PatchMismatchSource<'a> {
+    original_lines: &'a [String],
+    original_contents: &'a str,
+    path: &'a PathUri,
+    hunk_ordinal: Option<usize>,
+}
+
+fn patch_context_mismatch(
+    source: PatchMismatchSource<'_>,
+    chunk_ordinal: usize,
+    chunk: &UpdateFileChunk,
+    kind: PatchContextMismatchKind,
+    message: String,
+) -> ApplyPatchError {
+    let Some(hunk_ordinal) = source.hunk_ordinal else {
+        return ApplyPatchError::ComputeReplacements(message);
+    };
+    let Some((current_line_start, current_line_end, current_excerpt)) =
+        bounded_patch_mismatch_excerpt(source.original_lines, chunk)
+    else {
+        return ApplyPatchError::ComputeReplacements(message);
+    };
+    let current_content_sha256 =
+        format!("{:x}", Sha256::digest(source.original_contents.as_bytes()));
+    let recovery_message = match kind {
+        PatchContextMismatchKind::ContextNotFound => {
+            "patch context was not found in the current source snapshot"
+        }
+        PatchContextMismatchKind::ExpectedLinesNotFound => {
+            "patch expected lines were not found in the current source snapshot"
+        }
+    };
+    ApplyPatchError::PatchContextMismatch(PatchContextMismatch {
+        kind,
+        hunk_ordinal,
+        chunk_ordinal,
+        canonical_path: source.path.to_string(),
+        current_content_sha256,
+        current_line_start,
+        current_line_end,
+        current_excerpt,
+        message: recovery_message.to_string(),
+    })
+}
+
+fn bounded_patch_mismatch_excerpt(
+    original_lines: &[String],
+    chunk: &UpdateFileChunk,
+) -> Option<(usize, usize, String)> {
+    if original_lines.is_empty() {
+        return None;
+    }
+    let mut expected = Vec::new();
+    if let Some(context) = chunk
+        .change_context
+        .as_ref()
+        .filter(|line| !line.is_empty())
+    {
+        expected.push(context.as_str());
+    }
+    expected.extend(
+        chunk
+            .old_lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| !line.is_empty()),
+    );
+    if expected.is_empty() {
+        return None;
+    }
+
+    let mut candidate_scores = BTreeMap::<usize, usize>::new();
+    for (expected_offset, expected_line) in expected.iter().enumerate() {
+        for (current_index, current_line) in original_lines.iter().enumerate() {
+            if current_line == expected_line && current_index >= expected_offset {
+                let start = current_index - expected_offset;
+                let score = expected
+                    .iter()
+                    .enumerate()
+                    .filter(|(offset, line)| {
+                        original_lines
+                            .get(start + offset)
+                            .is_some_and(|current| current == **line)
+                    })
+                    .count();
+                candidate_scores
+                    .entry(start)
+                    .and_modify(|current| *current = (*current).max(score))
+                    .or_insert(score);
+            }
+        }
+    }
+    let best_score = candidate_scores.values().copied().max()?;
+    let mut best = candidate_scores
+        .into_iter()
+        .filter_map(|(start, score)| (score == best_score).then_some(start));
+    let candidate_start = best.next()?;
+    if best.next().is_some() {
+        return None;
+    }
+
+    let expected_end = candidate_start
+        .saturating_add(expected.len())
+        .min(original_lines.len());
+    let mut excerpt_start = candidate_start.saturating_sub(PATCH_MISMATCH_CONTEXT_LINES);
+    let mut excerpt_end = expected_end
+        .saturating_add(PATCH_MISMATCH_CONTEXT_LINES)
+        .min(original_lines.len());
+    if excerpt_end.saturating_sub(excerpt_start) > PATCH_MISMATCH_MAX_LINES {
+        excerpt_end = excerpt_start + PATCH_MISMATCH_MAX_LINES;
+    }
+    if excerpt_start == excerpt_end {
+        excerpt_start = candidate_start.min(original_lines.len() - 1);
+        excerpt_end = excerpt_start + 1;
+    }
+
+    let mut rendered = String::new();
+    let mut rendered_end = excerpt_start;
+    for (index, line) in original_lines[excerpt_start..excerpt_end]
+        .iter()
+        .enumerate()
+    {
+        let line_number = excerpt_start + index + 1;
+        let prefix = format!("{line_number:>6} | ");
+        let separator_bytes = usize::from(!rendered.is_empty());
+        let remaining = PATCH_MISMATCH_MAX_BYTES.saturating_sub(
+            rendered
+                .len()
+                .saturating_add(prefix.len())
+                .saturating_add(separator_bytes),
+        );
+        if remaining == 0 {
+            break;
+        }
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&prefix);
+        rendered.push_str(truncate_utf8(line, remaining));
+        rendered_end = excerpt_start + index + 1;
+        if line.len() > remaining {
+            break;
+        }
+    }
+    (!rendered.is_empty()).then(|| (excerpt_start + 1, rendered_end, rendered))
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 /// Apply the `(start_index, old_len, new_lines)` replacements to `original_lines`,
@@ -872,7 +1116,7 @@ pub async fn unified_diff_from_chunks_with_context(
     let AppliedPatch {
         original_contents,
         new_contents,
-    } = derive_new_contents_from_chunks(path, chunks, fs, sandbox).await?;
+    } = derive_new_contents_from_chunks(path, chunks, None, fs, sandbox).await?;
     let text_diff = TextDiff::from_lines(&original_contents, &new_contents);
     let unified_diff = text_diff.unified_diff().context_radius(context).to_string();
     Ok(ApplyPatchFileUpdate {
@@ -913,6 +1157,115 @@ mod tests {
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
+    }
+
+    #[tokio::test]
+    async fn patch_context_mismatch_reports_post_prefix_commit_identity_and_recovers() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let path = dir.path().join("sample.txt");
+        fs::write(&path, "alpha\nanchor\nstale-current\nomega\n").unwrap();
+        let patch = wrap_patch(
+            "*** Update File: sample.txt\n@@\n-alpha\n+ALPHA\n*** Update File: sample.txt\n@@\n anchor\n-stale-old\n+fixed\n omega",
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let failure = apply_patch(
+            &patch,
+            &cwd,
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .expect_err("second hunk should mismatch");
+        let (error, delta) = failure.into_parts();
+        let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+            panic!("expected structured mismatch");
+        };
+        let post_prefix_contents = "ALPHA\nanchor\nstale-current\nomega\n";
+        assert_eq!(fs::read_to_string(&path).unwrap(), post_prefix_contents);
+        assert_eq!(delta.changes().len(), 1);
+        assert_eq!(mismatch.hunk_ordinal, 2);
+        assert_eq!(mismatch.chunk_ordinal, 1);
+        assert_eq!(
+            mismatch.canonical_path,
+            PathUri::from_host_native_path(&path).unwrap().to_string()
+        );
+        assert_eq!(
+            mismatch.current_content_sha256,
+            format!("{:x}", Sha256::digest(post_prefix_contents.as_bytes()))
+        );
+        assert!(mismatch.current_excerpt.contains("ALPHA"));
+        assert!(mismatch.current_excerpt.contains("stale-current"));
+        assert_eq!(
+            (mismatch.current_line_start, mismatch.current_line_end),
+            (1, 4)
+        );
+        assert!(mismatch.current_excerpt.len() <= PATCH_MISMATCH_MAX_BYTES);
+        assert!(mismatch.current_line_end - mismatch.current_line_start < PATCH_MISMATCH_MAX_LINES);
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("PatchContextMismatch:"), "{stderr}");
+
+        let corrected =
+            wrap_patch("*** Update File: sample.txt\n@@\n anchor\n-stale-current\n+fixed\n omega");
+        apply_patch(
+            &corrected,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .expect("fresh returned context should support a corrected patch");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "ALPHA\nanchor\nfixed\nomega\n"
+        );
+    }
+
+    #[test]
+    fn ambiguous_patch_context_preserves_legacy_failure() {
+        let lines = vec![
+            "anchor".to_string(),
+            "current".to_string(),
+            "anchor".to_string(),
+            "current".to_string(),
+        ];
+        let chunk = UpdateFileChunk {
+            change_context: None,
+            old_lines: vec!["anchor".to_string(), "stale".to_string()],
+            new_lines: vec!["anchor".to_string(), "new".to_string()],
+            is_end_of_file: false,
+        };
+
+        assert_eq!(bounded_patch_mismatch_excerpt(&lines, &chunk), None);
+    }
+
+    #[test]
+    fn patch_context_mismatch_excerpt_is_utf8_and_byte_bounded() {
+        let long_line = "é".repeat(PATCH_MISMATCH_MAX_BYTES);
+        let lines = vec![
+            "unique-anchor".to_string(),
+            long_line,
+            "current-tail".to_string(),
+        ];
+        let chunk = UpdateFileChunk {
+            change_context: None,
+            old_lines: vec!["unique-anchor".to_string(), "stale-tail".to_string()],
+            new_lines: vec!["unique-anchor".to_string(), "fixed-tail".to_string()],
+            is_end_of_file: false,
+        };
+
+        let (start, end, excerpt) =
+            bounded_patch_mismatch_excerpt(&lines, &chunk).expect("unique mismatch location");
+        assert_eq!(start, 1);
+        assert!(end <= PATCH_MISMATCH_MAX_LINES);
+        assert!(excerpt.len() <= PATCH_MISMATCH_MAX_BYTES);
+        assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
     }
 
     #[tokio::test]

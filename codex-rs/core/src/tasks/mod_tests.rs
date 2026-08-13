@@ -1,4 +1,6 @@
 use super::TASK_COMPACT_METRIC;
+use super::TerminalDeadline;
+use super::TerminalWaitError;
 use super::WORKSPACE_FINALIZATION_DISPATCH_SEAL_FAILED_REASON;
 use super::WorkspaceFinalizationGuard;
 use super::emit_compact_metric;
@@ -8,6 +10,8 @@ use super::merge_completion_review_partial;
 use super::seal_passed_completion_for_terminal_dispatch;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
+use crate::state::TerminalDeliveryState;
+use crate::state::TurnTerminalCoordinator;
 use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::LocalAgentTaskStore;
 use codex_otel::MetricsClient;
@@ -30,6 +34,9 @@ use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tempfile::TempDir;
 
 async fn workspace_finalization_guard() -> (
@@ -148,9 +155,10 @@ fn completion_review_partial_status_never_overrides_concrete_blockers() {
 async fn workspace_finalization_guard_seals_and_releases_dispatching_fence() {
     let (_codex_home, repo, store, mut guard) = workspace_finalization_guard().await;
     let original_expiry = guard.fence.as_ref().expect("active fence").expires_at;
+    let deadline = super::TerminalDeadline::start();
 
     guard
-        .seal_for_terminal_dispatch()
+        .seal_for_terminal_dispatch(&deadline)
         .await
         .expect("fence seals for terminal dispatch");
 
@@ -188,9 +196,11 @@ async fn terminal_dispatch_seal_failure_downgrades_passed_but_no_store_does_not(
         reasons: Vec::new(),
         evidence_path: None,
     });
+    let deadline = super::TerminalDeadline::start();
 
     let reason =
-        seal_passed_completion_for_terminal_dispatch(&mut completion, Some(&mut guard)).await;
+        seal_passed_completion_for_terminal_dispatch(&mut completion, Some(&mut guard), &deadline)
+            .await;
 
     assert_eq!(
         reason,
@@ -219,7 +229,8 @@ async fn terminal_dispatch_seal_failure_downgrades_passed_but_no_store_does_not(
         evidence_path: None,
     });
     assert_eq!(
-        seal_passed_completion_for_terminal_dispatch(&mut no_store_completion, None).await,
+        seal_passed_completion_for_terminal_dispatch(&mut no_store_completion, None, &deadline,)
+            .await,
         None
     );
     assert_eq!(
@@ -259,6 +270,79 @@ async fn taskless_placeholder_cleanup_is_pointer_identity_guarded() {
             Arc::ptr_eq(&active_turn.turn_state, &replacement_state)
         })
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_deadline_is_shared_and_starts_no_work_after_exhaustion() {
+    let started = tokio::time::Instant::now();
+    let deadline = TerminalDeadline::start();
+
+    assert_eq!(
+        deadline
+            .run(
+                "first_wait",
+                Duration::from_secs(3),
+                std::future::pending::<()>(),
+            )
+            .await,
+        Err(TerminalWaitError::OperationTimedOut)
+    );
+    assert_eq!(
+        deadline
+            .run(
+                "second_wait",
+                Duration::from_secs(3),
+                std::future::pending::<()>(),
+            )
+            .await,
+        Err(TerminalWaitError::DeadlineExhausted)
+    );
+    assert_eq!(
+        tokio::time::Instant::now().saturating_duration_since(started),
+        Duration::from_secs(5)
+    );
+    assert_eq!(deadline.exhausted_phase().as_deref(), Some("second_wait"));
+
+    let polled_after_expiry = Arc::new(AtomicBool::new(false));
+    let future_polled = Arc::clone(&polled_after_expiry);
+    assert_eq!(
+        deadline
+            .run("late_work", Duration::from_secs(1), async move {
+                future_polled.store(true, Ordering::Release);
+            })
+            .await,
+        Err(TerminalWaitError::DeadlineExhausted)
+    );
+    assert!(!polled_after_expiry.load(Ordering::Acquire));
+
+    let timings = deadline.phase_timings_ns();
+    assert_eq!(timings["first_wait"], 3_000_000_000);
+    assert_eq!(timings["second_wait"], 2_000_000_000);
+}
+
+#[tokio::test]
+async fn terminal_delivery_claim_is_one_shot_and_cleanup_is_a_separate_milestone() {
+    let coordinator = TurnTerminalCoordinator::new("turn-1".to_string());
+    let permit = coordinator.try_claim().expect("first terminal claimant");
+    assert!(permit.mark_delivery_claimed());
+    assert!(!permit.mark_delivery_claimed());
+    permit.mark_delivery_attempted(false);
+    assert_eq!(
+        coordinator.delivery_state(),
+        TerminalDeliveryState::DeliveryFailed
+    );
+
+    permit.mark_interaction_released();
+    coordinator.wait_completed().await;
+    let cleanup_waiter = {
+        let coordinator = Arc::clone(&coordinator);
+        tokio::spawn(async move { coordinator.wait_cleanup_completed().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!cleanup_waiter.is_finished());
+
+    permit.complete_cleanup();
+    cleanup_waiter.await.expect("cleanup waiter joins");
 }
 
 #[test]

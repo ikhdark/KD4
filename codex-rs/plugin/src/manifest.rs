@@ -1,4 +1,5 @@
 use codex_config::HooksFile;
+use std::collections::BTreeMap;
 
 /// Parsed plugin metadata parameterized by its resource locator representation.
 ///
@@ -12,6 +13,27 @@ pub struct PluginManifest<Resource> {
     pub keywords: Vec<String>,
     pub paths: PluginManifestPaths<Resource>,
     pub interface: Option<PluginManifestInterface<Resource>>,
+    /// Optional skill-scoped declarations for MCP operations promoted while a skill is selected.
+    ///
+    /// Missing metadata preserves the legacy whole-server promotion behavior. Invalid explicit
+    /// metadata is retained as a diagnostic so it cannot accidentally broaden exposure.
+    pub tool_exposure: Option<PluginToolExposure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginToolExposure {
+    Valid(PluginToolExposureConfig),
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginToolExposureConfig {
+    pub skills: BTreeMap<String, PluginSkillToolExposure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginSkillToolExposure {
+    pub mcp_tools: BTreeMap<String, Vec<String>>,
 }
 
 /// Component resources declared by a plugin manifest.
@@ -102,6 +124,7 @@ impl<Resource> PluginManifest<Resource> {
             keywords,
             paths,
             interface,
+            tool_exposure,
         } = self;
         let PluginManifestPaths {
             skills,
@@ -186,6 +209,7 @@ impl<Resource> PluginManifest<Resource> {
                 hooks,
             },
             interface,
+            tool_exposure,
         })
     }
 }

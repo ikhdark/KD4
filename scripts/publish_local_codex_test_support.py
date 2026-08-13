@@ -316,17 +316,29 @@ class PublishLocalCodexTestBase(unittest.TestCase):
     def assert_no_publish_temps(self, install_dir: Path) -> None:
         self.assertEqual(list(install_dir.glob(".codex-local-publish.*.tmp")), [])
 
-    def install_matching_code_mode_host(
+    def install_matching_publish_helpers(
         self,
         install_dir: Path,
         *,
         timestamp: float | None = None,
-    ) -> Path:
-        target = install_dir / "codex-code-mode-host.exe"
-        target.write_bytes(self.source_code_mode_host_bytes)
-        if timestamp is not None:
-            os.utime(target, (timestamp, timestamp))
-        return target
+    ) -> tuple[Path, Path, Path]:
+        resources = install_dir / "codex-resources"
+        resources.mkdir(exist_ok=True)
+        targets = (
+            install_dir / "codex-code-mode-host.exe",
+            resources / "codex-windows-sandbox-setup.exe",
+            resources / "codex-command-runner.exe",
+        )
+        contents = (
+            self.source_code_mode_host_bytes,
+            self.source_windows_sandbox_setup_bytes,
+            self.source_command_runner_bytes,
+        )
+        for target, content in zip(targets, contents, strict=True):
+            target.write_bytes(content)
+            if timestamp is not None:
+                os.utime(target, (timestamp, timestamp))
+        return targets
 
     def write_fake_codex(
         self,

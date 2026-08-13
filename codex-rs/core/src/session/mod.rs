@@ -998,6 +998,12 @@ fn push_prompt_fragment(
     contextual_user_sections: &mut Vec<String>,
     separate_developer_sections: &mut Vec<String>,
 ) {
+    let categorized = crate::context::CategorizedPromptFragment::from_extension(fragment);
+    debug_assert_eq!(
+        categorized.category(),
+        crate::context::PromptContextCategory::OtherInjected
+    );
+    let fragment = categorized.into_fragment();
     let Some(text) = budget.take(fragment.text()) else {
         return;
     };
@@ -1825,11 +1831,88 @@ impl Session {
             msg,
         };
         self.send_event_raw(event).await;
-        self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
+        self.finish_terminal_event_dispatch(turn_context, &legacy_source)
             .await;
-        self.maybe_mirror_event_text_to_realtime(&legacy_source)
+    }
+
+    pub(crate) async fn soft_floor_receipt_matches(&self, identity: &str) -> bool {
+        self.state.lock().await.soft_floor_receipt_matches(identity)
+    }
+
+    pub(crate) async fn record_soft_floor_receipt(&self, identity: String) {
+        self.state.lock().await.record_soft_floor_receipt(identity);
+    }
+
+    /// Attempts terminal-event persistence within a fixed finalization budget.
+    ///
+    /// A timeout is intentionally distinguishable from dispatch: callers can downgrade a
+    /// completion gate and still deliver the terminal event live.
+    pub(crate) async fn persist_terminal_event_for_dispatch(
+        &self,
+        msg: &EventMsg,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let rollout_items = [RolloutItem::EventMsg(msg.clone())];
+        match tokio::time::timeout(timeout, async {
+            if let Some(live_thread) = self.live_thread() {
+                live_thread
+                    .append_items(&rollout_items)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err("timed out persisting the terminal event".to_string()),
+        }
+    }
+
+    /// Delivers the already-persisted (or explicitly degraded) terminal event without putting
+    /// any task-store or rollout I/O in front of the client-visible milestone.
+    pub(crate) fn dispatch_terminal_event_live(
+        &self,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+    ) -> bool {
+        self.services
+            .rollout_thread_trace
+            .record_codex_turn_event(&turn_context.sub_id, &msg);
+        self.services
+            .rollout_thread_trace
+            .record_tool_call_event(turn_context.sub_id.clone(), &msg);
+        self.services
+            .rollout_thread_trace
+            .record_protocol_event(&msg);
+        let event = Event {
+            id: turn_context.sub_id.clone(),
+            msg,
+        };
+        if let Some(status) = agent_status_from_event(&event.msg) {
+            self.agent_status.send_replace(status);
+        }
+        match self.tx_event.try_send(event) {
+            Ok(()) => true,
+            Err(err) => {
+                debug!("dropping terminal live event because channel is unavailable: {err}");
+                false
+            }
+        }
+    }
+
+    /// Completes parent notification, realtime mirroring, and legacy event emission after the
+    /// interactive terminal milestone has detached the turn.
+    pub(crate) async fn finish_terminal_event_dispatch(
+        &self,
+        turn_context: &TurnContext,
+        legacy_source: &EventMsg,
+    ) {
+        self.maybe_notify_parent_of_terminal_turn(turn_context, legacy_source)
             .await;
-        self.maybe_clear_realtime_handoff_for_event(&legacy_source)
+        self.maybe_mirror_event_text_to_realtime(legacy_source)
+            .await;
+        self.maybe_clear_realtime_handoff_for_event(legacy_source)
             .await;
 
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
@@ -3484,9 +3567,6 @@ impl Session {
             }
         }
         if turn_context.config.include_skill_instructions {
-            if turn_context.model_info.include_skills_usage_instructions {
-                developer_sections.push(SkillsUsageInstructions.render());
-            }
             let available_skills = build_available_skills(
                 turn_context.turn_skills.snapshot.outcome(),
                 default_skill_metadata_budget(turn_context.model_info.context_window),
@@ -3499,6 +3579,9 @@ impl Session {
                 },
             );
             if let Some(available_skills) = available_skills {
+                if turn_context.model_info.include_skills_usage_instructions {
+                    developer_sections.push(SkillsUsageInstructions.render());
+                }
                 let warning_message = available_skills.warning_message.clone();
                 let skills_instructions =
                     AvailableSkillsInstructions::from_available_skills(&available_skills);
@@ -3697,6 +3780,54 @@ impl Session {
         state.clone_history()
     }
 
+    pub(crate) async fn register_tool_history_candidate(
+        &self,
+        codex_home: &std::path::Path,
+        candidate: crate::tool_history::ToolHistoryCandidate,
+    ) {
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            state.register_tool_history_candidate(candidate);
+            state.tool_history_state()
+        };
+        if let Err(err) = crate::tool_history::persist_tool_history_state(
+            codex_home,
+            &self.thread_id.to_string(),
+            &snapshot,
+        )
+        .await
+        {
+            tracing::warn!("failed to persist completed-tool history metadata: {err}");
+        }
+    }
+
+    pub(crate) async fn mark_tool_history_consumed(
+        &self,
+        turn_context: &TurnContext,
+        input: &[ResponseItem],
+        generation: crate::tool_history::ModelGenerationId,
+    ) {
+        if !turn_context.config.completed_tool_history_projection {
+            return;
+        }
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            if !state.mark_tool_history_consumed(input, generation) {
+                return;
+            }
+            state.tool_history_state()
+        };
+        if let Err(err) = crate::tool_history::persist_tool_history_state(
+            turn_context.config.codex_home.as_path(),
+            &self.thread_id.to_string(),
+            &snapshot,
+        )
+        .await
+        {
+            tracing::warn!("failed to persist completed-tool consumption state: {err}");
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn last_passed_root_completion_turn_id(&self) -> Option<String> {
         self.state
@@ -3717,6 +3848,10 @@ impl Session {
         let thread_id = self.thread_id;
         let window_number = state.auto_compact_window_number();
         format!("{thread_id}:{window_number}")
+    }
+
+    pub(crate) async fn auto_compact_window_number(&self) -> u64 {
+        self.state.lock().await.auto_compact_window_number()
     }
 
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
@@ -4133,86 +4268,40 @@ impl Session {
         // ledger can bind exact pre-compaction inputs to the same stable item identity.
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_id = client_id;
+        let completion_evidence_eligible = self.services.task_evidence.allows_kd4_completion()
+            && !matches!(
+                turn_context.session_source,
+                SessionSource::SubAgent(SubAgentSource::Review)
+            );
+        if completion_evidence_eligible {
+            self.services
+                .task_evidence
+                .record_task_contract_source(&user_message_item.id, input)
+                .await;
+        }
         if turn_context
             .config
             .features
             .enabled(Feature::TaskCompletionReviewer)
-            && self.services.task_evidence.allows_kd4_completion()
-            && !turn_context.session_source.is_non_root_agent()
-        {
-            if !self
+            && completion_evidence_eligible
+            && !self
                 .services
                 .task_evidence
                 .record_user_sources(&user_message_item.id, input)
                 .await
-            {
-                self.services
-                    .task_evidence
-                    .mark_user_source_capture_failed()
-                    .await;
-                tracing::warn!(
-                    turn_id = %turn_context.sub_id,
-                    "KD4 user-source ledger capture was not durably persisted"
-                );
-            } else if let (Some(store), Some(repo_root)) = (
-                self.services.agent_control.task_coordinator().store(),
-                self.services
-                    .task_evidence
-                    .repository_root()
-                    .map(Path::to_path_buf),
-            ) {
-                let root_session_id = self
-                    .services
-                    .agent_control
-                    .task_coordinator()
-                    .root_session_id();
-                let typed_assignment_baseline = match root_session_id {
-                    Some(root_session_id) => store
-                        .list_agent_task_bindings(root_session_id, Some(256))
-                        .await
-                        .map(|bindings| {
-                            bindings
-                                .into_iter()
-                                .map(|binding| binding.assignment_id.to_string())
-                                .collect::<std::collections::BTreeSet<_>>()
-                        }),
-                    None => Ok(std::collections::BTreeSet::new()),
-                };
-                match (
-                    store
-                        .capture_workspace_revision(&repo_root, Vec::new())
-                        .await,
-                    typed_assignment_baseline,
-                ) {
-                    (Ok(revision), Ok(typed_assignment_baseline))
-                        if self
-                            .services
-                            .task_evidence
-                            .seed_workspace_event_baseline(
-                                revision.epoch,
-                                typed_assignment_baseline.clone(),
-                            )
-                            .await => {}
-                    (Ok(_), Ok(_)) => {
-                        self.services
-                            .task_evidence
-                            .mark_workspace_event_baseline_failed(
-                                "the workspace-event baseline could not be persisted",
-                            )
-                            .await;
-                    }
-                    (revision, bindings) => {
-                        self.services
-                            .task_evidence
-                            .mark_workspace_event_baseline_failed(&format!(
-                                "the workspace-event baseline could not be captured: revision={:?}; bindings={:?}",
-                                revision.err(),
-                                bindings.err(),
-                            ))
-                            .await;
-                    }
-                }
-            }
+        {
+            self.services
+                .task_evidence
+                .mark_user_source_capture_failed()
+                .await;
+            tracing::warn!(
+                turn_id = %turn_context.sub_id,
+                "KD4 user-source ledger capture was not durably persisted"
+            );
+        }
+        if completion_evidence_eligible {
+            self.capture_completion_workspace_baseline(turn_context)
+                .await;
         }
 
         // Persist the user message to history, but emit the turn item from `UserInput` so
@@ -4225,6 +4314,92 @@ impl Session {
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;
         self.ensure_rollout_materialized().await;
+    }
+
+    async fn capture_completion_workspace_baseline(&self, turn_context: &TurnContext) {
+        let coordinator = self.services.agent_control.task_coordinator();
+        let coordination = if coordinator.store().is_none() {
+            coordinator
+                .initialize_for_workspace_coordination(
+                    self.services.state_db.clone(),
+                    turn_context.config.sqlite_home.clone(),
+                    turn_context.config.model_provider_id.clone(),
+                    self.services.agent_control.session_id().to_string(),
+                )
+                .await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = coordination {
+            self.services
+                .task_evidence
+                .mark_workspace_event_baseline_failed(&format!(
+                    "workspace coordination could not initialize before baseline capture: {error}",
+                ))
+                .await;
+            return;
+        }
+        let (Some(store), Some(repo_root)) = (
+            coordinator.store(),
+            self.services
+                .task_evidence
+                .repository_root()
+                .map(Path::to_path_buf),
+        ) else {
+            self.services
+                .task_evidence
+                .mark_workspace_event_baseline_failed(
+                    "workspace coordination was unavailable after initialization",
+                )
+                .await;
+            return;
+        };
+        let typed_assignment_baseline = match coordinator.root_session_id() {
+            Some(root_session_id) => store
+                .list_agent_task_bindings(root_session_id, Some(256))
+                .await
+                .map(|bindings| {
+                    bindings
+                        .into_iter()
+                        .map(|binding| binding.assignment_id.to_string())
+                        .collect::<std::collections::BTreeSet<_>>()
+                }),
+            None => Ok(std::collections::BTreeSet::new()),
+        };
+        match (
+            store
+                .capture_workspace_revision(&repo_root, Vec::new())
+                .await,
+            typed_assignment_baseline,
+        ) {
+            (Ok(revision), Ok(typed_assignment_baseline))
+                if self
+                    .services
+                    .task_evidence
+                    .seed_workspace_event_baseline(
+                        revision.epoch,
+                        typed_assignment_baseline.clone(),
+                    )
+                    .await => {}
+            (Ok(_), Ok(_)) => {
+                self.services
+                    .task_evidence
+                    .mark_workspace_event_baseline_failed(
+                        "the workspace-event baseline could not be persisted",
+                    )
+                    .await;
+            }
+            (revision, bindings) => {
+                self.services
+                    .task_evidence
+                    .mark_workspace_event_baseline_failed(&format!(
+                        "the workspace-event baseline could not be captured: revision={:?}; bindings={:?}",
+                        revision.err(),
+                        bindings.err(),
+                    ))
+                    .await;
+            }
+        }
     }
 
     pub(crate) async fn notify_stream_error(
@@ -4299,6 +4474,9 @@ impl Session {
         }
         active_turn_context
             .update_validation_authorization(&input)
+            .await;
+        active_turn_context
+            .update_source_owner_candidates(&input)
             .await;
         let input_for_telemetry = input.clone();
 

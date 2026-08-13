@@ -682,24 +682,44 @@ async fn emit_exec_end(
                 .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
         );
     }
-    let (ledger, provenance) = ctx
+    let bound_auto_validation = ctx
         .session
         .services
-        .agent_control
-        .completion_evidence_target(
-            &ctx.turn.session_source,
-            ctx.session.thread_id,
-            &ctx.session.services.task_evidence,
-        )
+        .command_execution
+        .auto_validation_leaf(ctx.call_id)
+        .await;
+    let (ledger, provenance) = if bound_auto_validation.is_some() {
+        // The bound route belongs to this session's acknowledged plan.  An untyped
+        // non-root session otherwise forwards generic command evidence to the root,
+        // which would strand its own Implemented step without the focused receipt.
+        (ctx.session.services.task_evidence.clone(), None)
+    } else {
+        ctx.session
+            .services
+            .agent_control
+            .completion_evidence_target(
+                &ctx.turn.session_source,
+                ctx.session.thread_id,
+                &ctx.session.services.task_evidence,
+            )
+            .await
+    };
+    let validation_result = ctx
+        .session
+        .services
+        .command_execution
+        .validation_result_for_call(ctx.call_id)
         .await;
     let implementation_identity_hash = if possible_mutation {
         None
+    } else if let Some(validation_result) = validation_result.as_ref() {
+        Some(validation_result.proof_key.implementation_identity.clone())
     } else {
         crate::tasks::completion_review::implementation_identity_for_evidence(ctx.session, &ledger)
             .await
     };
     ledger
-        .record_command_bound_with_provenance(
+        .record_command_bound_with_validation_result(
             exec_input.command,
             exec_input.cwd,
             exec_result.exit_code,
@@ -708,6 +728,10 @@ async fn emit_exec_end(
             possible_mutation,
             provenance.as_ref(),
             implementation_identity_hash.as_deref(),
+            validation_result,
+            bound_auto_validation
+                .as_ref()
+                .map(|binding| (binding.step_id.as_str(), binding.implementation_revision)),
         )
         .await;
     ctx.session

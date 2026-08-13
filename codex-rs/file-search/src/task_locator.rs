@@ -36,6 +36,8 @@ pub const LOCATE_TASK_MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 pub const LOCATE_TASK_MAX_RENDERED_BYTES: usize = 8 * 1024;
 const MAX_NEIGHBORHOOD_BYTES: usize = 5 * 1024;
 const MAX_NEIGHBORHOOD_LINES: usize = 120;
+const MAX_MATERIALIZED_CLOSURE_BYTES: usize = 64 * 1024;
+const SOURCE_CLOSURE_CONTRACT_VERSION: &str = "source_closure_v2";
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const PARSER_VERSIONS: &str =
     "tree-sitter-rust/0.24.2;tree-sitter-javascript/0.25.0;tree-sitter-typescript/0.23.2";
@@ -65,15 +67,181 @@ pub struct LocateTaskRequest<'a> {
 
 #[derive(Debug, Clone)]
 pub struct LocateTaskOutput {
+    /// Canonical identity of the exact locator request, including freshness
+    /// policy and bounds. This stays on the authoritative locator output.
+    pub request_identity: String,
     pub rendered: String,
     pub supporting_reads: Vec<SupportingRead>,
     pub snapshot_id: String,
+    pub decision_facts: LocateTaskDecisionFacts,
+    pub owner_packet_seed: Option<LocateTaskOwnerPacketSeed>,
     pub files_inspected: usize,
     pub files_reparsed: usize,
     pub rendered_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Bounded, text-free source evidence for a host-materialized owner packet.
+/// Core enriches this with task, plan, acceptance, and lifecycle state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskOwnerPacketSeed {
+    pub authoritative_owner: ManifestOwnerProjection,
+    pub primary_path: Option<String>,
+    pub primary_symbol: Option<String>,
+    pub primary_span: Option<ExactSpan>,
+    pub supporting_reads: Vec<SupportingRead>,
+    pub observed_spans: Vec<LocateTaskOwnerPacketObservedSpan>,
+    pub source_relationships: Vec<LocateTaskSourceRelationship>,
+    pub located_contracts: Vec<LocateTaskLocatedPath>,
+    pub located_tests: Vec<LocateTaskLocatedPath>,
+    pub candidate_validation_routes: Vec<LocateTaskValidationRoute>,
+    pub unresolved_source_obligations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskOwnerPacketObservedSpan {
+    pub section_id: String,
+    pub path: String,
+    pub span: Option<ExactSpan>,
+    pub file_content_hash: Option<String>,
+    pub span_content_hash: Option<String>,
+}
+
+/// Source-routing facts emitted for core-side evidence convergence.
+///
+/// This deliberately contains no instruction-validation, plan, agent, mutation,
+/// validation-disposition, or completion-review state. Those remain core-owned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskDecisionFacts {
+    pub repository_identity: String,
+    pub source_snapshot_identity: String,
+    pub owner_manifest_revision: String,
+    pub closure_contract_revision: String,
+    pub completeness: String,
+    pub selected_owner: Option<String>,
+    pub authoritative_owner: Option<ManifestOwnerProjection>,
+    pub owner_candidates: Vec<LocateTaskOwnerCandidate>,
+    pub primary_path: Option<String>,
+    pub primary_symbol: Option<String>,
+    pub primary_span: Option<ExactSpan>,
+    pub source_relationships: Vec<LocateTaskSourceRelationship>,
+    pub located_contracts: Vec<LocateTaskLocatedPath>,
+    pub located_tests: Vec<LocateTaskLocatedPath>,
+    pub captured_instruction_sources: Vec<LocateTaskSourceIdentity>,
+    pub captured_source_sections: Vec<LocateTaskSourceSection>,
+    pub candidate_validation_routes: Vec<LocateTaskValidationRoute>,
+    pub source_gaps: Vec<String>,
+    pub unresolved_source_ambiguity: Vec<String>,
+    pub truncated: bool,
+}
+
+impl LocateTaskDecisionFacts {
+    pub fn permits_exact_reuse(&self) -> bool {
+        !self.truncated
+            && self.unresolved_source_ambiguity.is_empty()
+            && self.selected_owner.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskOwnerCandidate {
+    pub owner_id: String,
+    pub reason: String,
+    pub score_millis: u32,
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskSourceIdentity {
+    pub path: String,
+    pub content_hash: String,
+    pub source_snapshot_identity: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateTaskSourceSectionKind {
+    PrimaryImplementation,
+    Caller,
+    Test,
+    Contract,
+    Generated,
+    OtherSourceContext,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateTaskSourceSectionState {
+    Materialized,
+    NotMaterialized,
+}
+
+/// A bounded source slice tied to the same snapshot as its routing decision.
+///
+/// `content_hash` hashes the exact materialized bytes, while `file_content_hash`
+/// identifies the captured file revision from which the slice was selected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskSourceSection {
+    pub section_id: String,
+    pub kind: LocateTaskSourceSectionKind,
+    pub state: LocateTaskSourceSectionState,
+    pub path: String,
+    pub span: Option<ExactSpan>,
+    pub content_hash: Option<String>,
+    pub file_content_hash: Option<String>,
+    pub source_snapshot_identity: String,
+    pub text: Option<String>,
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskSourceRelationship {
+    pub path: String,
+    pub role: String,
+    pub resolution: String,
+    pub span: ExactSpan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskLocatedPath {
+    pub path: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocateTaskValidationRoute {
+    pub id: String,
+    pub cwd: String,
+    pub argv: Vec<String>,
+    pub role: String,
+}
+
+/// Bounded implementation-ownership facts copied from a validated manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestOwnerProjection {
+    pub id: String,
+    pub roots: Vec<String>,
+    pub primary_entries: Vec<LocateTaskLocatedPath>,
+    pub instructions: Vec<String>,
+    pub consumers: Vec<String>,
+    pub contracts: Vec<String>,
+    pub generated_mirrors: Vec<String>,
+    pub tests: Vec<String>,
+    pub validation: Vec<LocateTaskValidationRoute>,
+}
+
+/// Lightweight exact-path routing result. Candidate paths never become owners
+/// without this validated manifest mapping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerCandidateResolution {
+    pub manifest_hash: String,
+    pub authoritative_owner: Option<ManifestOwnerProjection>,
+    pub alternative_owners: Vec<ManifestOwnerProjection>,
+    pub matched_candidates: Vec<String>,
+    pub unmatched_candidates: Vec<String>,
+    pub unresolved: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupportingRead {
     pub path: String,
     pub content_hash: String,
@@ -396,6 +564,110 @@ pub fn validate_routing_manifest(
     validate_routing_manifest_with_cache(repository_root, manifest_path, None).0
 }
 
+/// Resolve already-known exact paths without building or querying the locator
+/// index. Manifest validation remains authoritative; any invalid, unmatched, or
+/// contradictory candidate deliberately falls back to the ordinary locator.
+pub fn resolve_owner_candidates(
+    repository_root: &Path,
+    manifest_path: &Path,
+    candidates: &[String],
+) -> OwnerCandidateResolution {
+    let validation = validate_routing_manifest(repository_root, manifest_path);
+    let mut resolution = OwnerCandidateResolution {
+        manifest_hash: validation.manifest_hash,
+        authoritative_owner: None,
+        alternative_owners: Vec::new(),
+        matched_candidates: Vec::new(),
+        unmatched_candidates: Vec::new(),
+        unresolved: validation.errors,
+    };
+    let Some(manifest) = validation.manifest.as_ref() else {
+        resolution
+            .unresolved
+            .push("owner_manifest_unavailable".to_string());
+        resolution.unresolved.sort();
+        resolution.unresolved.dedup();
+        return resolution;
+    };
+
+    let mut matched_owners = BTreeMap::<String, &OwnerDeclaration>::new();
+    for candidate in candidates.iter().take(64) {
+        let owners = owners_for_path(manifest, candidate);
+        if owners.len() == 1 {
+            resolution.matched_candidates.push(candidate.clone());
+            matched_owners.insert(owners[0].id.clone(), owners[0]);
+        } else {
+            resolution.unmatched_candidates.push(candidate.clone());
+            if owners.len() > 1 {
+                resolution
+                    .unresolved
+                    .push(format!("candidate_owner_ambiguity:{candidate}"));
+                for owner in owners {
+                    matched_owners.insert(owner.id.clone(), owner);
+                }
+            }
+        }
+    }
+    if !resolution.unmatched_candidates.is_empty() {
+        resolution
+            .unresolved
+            .push("unmatched_owner_candidate".to_string());
+    }
+    if matched_owners.len() > 1 {
+        resolution
+            .unresolved
+            .push("candidate_owner_conflict".to_string());
+    }
+
+    let owners = matched_owners.into_values().collect::<Vec<_>>();
+    if resolution.unresolved.is_empty() && owners.len() == 1 {
+        resolution.authoritative_owner = Some(manifest_owner_projection(owners[0]));
+    } else {
+        resolution.alternative_owners = owners
+            .into_iter()
+            .take(8)
+            .map(manifest_owner_projection)
+            .collect();
+    }
+    resolution.matched_candidates.sort();
+    resolution.matched_candidates.dedup();
+    resolution.unmatched_candidates.sort();
+    resolution.unmatched_candidates.dedup();
+    resolution.unresolved.sort();
+    resolution.unresolved.dedup();
+    resolution
+}
+
+fn manifest_owner_projection(owner: &OwnerDeclaration) -> ManifestOwnerProjection {
+    ManifestOwnerProjection {
+        id: owner.id.clone(),
+        roots: owner.roots.clone(),
+        primary_entries: owner
+            .primary_entries
+            .iter()
+            .map(|entry| LocateTaskLocatedPath {
+                path: entry.path.clone(),
+                role: "primary_implementation".to_string(),
+            })
+            .collect(),
+        instructions: owner.instructions.clone(),
+        consumers: owner.consumers.clone(),
+        contracts: owner.contracts.clone(),
+        generated_mirrors: owner.generated_mirrors.clone(),
+        tests: owner.tests.clone(),
+        validation: owner
+            .validation
+            .iter()
+            .map(|entry| LocateTaskValidationRoute {
+                id: entry.id.clone(),
+                cwd: entry.cwd.clone(),
+                argv: entry.argv.clone(),
+                role: entry.role.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn validate_routing_manifest_with_cache(
     repository_root: &Path,
     manifest_path: &Path,
@@ -638,10 +910,10 @@ fn locate_task_inner(
         }
     };
     let _guard = lock_cache_guard(&guard, cancelled)?;
-    match locate_once(request, &root, &cache_key, cancelled) {
+    match locate_once(request, &root, &cache_key, cancelled, false) {
         Ok(output) => Ok(output),
         Err(error) if error.to_string().contains("source_changed_during_query") => {
-            locate_once(request, &root, &cache_key, cancelled)
+            locate_once(request, &root, &cache_key, cancelled, true)
         }
         Err(error) => Err(error),
     }
@@ -675,6 +947,7 @@ fn locate_once(
     root: &Path,
     cache_path: &Path,
     cancelled: Option<&AtomicBool>,
+    return_incomplete_on_change: bool,
 ) -> Result<LocateTaskOutput> {
     check_cancelled(cancelled)?;
     let repository_identity = repository_identity(root);
@@ -820,6 +1093,7 @@ fn locate_once(
     ]);
     let files_inspected = fingerprints.len();
     let files_reparsed = reparsed;
+    let authoritative_owner = route.owner.map(manifest_owner_projection);
     let mut result = build_result(
         request,
         root,
@@ -840,28 +1114,447 @@ fn locate_once(
         },
     );
     check_cancelled(cancelled)?;
-    let rendered = render_bounded(&mut result)?;
     #[cfg(test)]
     run_before_final_verify_hook(root);
-    verify_captured(root, &fingerprints)?;
-    if let Some(path) = expected_missing_manifest {
-        verify_absent(root, &path)?;
+    let captured_changed = verify_captured(root, &fingerprints).is_err()
+        || expected_missing_manifest
+            .as_deref()
+            .is_some_and(|path| verify_absent(root, path).is_err());
+    if captured_changed && !return_incomplete_on_change {
+        anyhow::bail!("source_changed_during_query")
     }
+    if captured_changed {
+        result.snapshot.completeness = "partial".to_string();
+        result.source_neighborhoods.clear();
+        for instruction in &mut result.instructions {
+            instruction.excerpt = None;
+        }
+        result.unresolved.push("source_changed".to_string());
+        result.unresolved.sort();
+        result.unresolved.dedup();
+    }
+    let mut decision_facts = decision_facts(&result, authoritative_owner, &captured, &fingerprints);
+    if captured_changed {
+        for section in &mut decision_facts.captured_source_sections {
+            if section.state == LocateTaskSourceSectionState::Materialized {
+                decision_facts
+                    .source_gaps
+                    .push(format!("source_changed:{}", section.path));
+            }
+            section.state = LocateTaskSourceSectionState::NotMaterialized;
+            section.content_hash = None;
+            section.text = None;
+        }
+        decision_facts.source_gaps.sort();
+        decision_facts.source_gaps.dedup();
+        decision_facts.truncated = true;
+    }
+    let request_root = root.to_string_lossy();
+    let request_max_files = request.max_files.to_string();
+    let request_max_source_bytes = request.max_source_bytes.to_string();
+    let request_identity = sha256_join(&[
+        &request_root,
+        request.environment_id.unwrap_or_default(),
+        request.task,
+        request.path_anchor.unwrap_or_default(),
+        request.symbol_anchor.unwrap_or_default(),
+        &request_max_files,
+        &request_max_source_bytes,
+        if request.force_fresh {
+            "fresh"
+        } else {
+            "cached"
+        },
+    ]);
+    let rendered = render_bounded(&mut result)?;
     check_cancelled(cancelled)?;
-    persist_cache(cache_path, &cache);
+    if !captured_changed {
+        persist_cache(cache_path, &cache);
+    }
     let rendered_bytes = rendered.len();
-    let supporting_reads = fingerprints
+    let supporting_reads: Vec<SupportingRead> = fingerprints
         .into_iter()
         .map(|(path, content_hash)| SupportingRead { path, content_hash })
         .collect();
+    let owner_packet_seed = locate_task_owner_packet_seed(&decision_facts, &supporting_reads);
     Ok(LocateTaskOutput {
+        request_identity,
         rendered,
         supporting_reads,
         snapshot_id,
+        decision_facts,
+        owner_packet_seed,
         files_inspected,
         files_reparsed,
         rendered_bytes,
     })
+}
+
+fn locate_task_owner_packet_seed(
+    facts: &LocateTaskDecisionFacts,
+    supporting_reads: &[SupportingRead],
+) -> Option<LocateTaskOwnerPacketSeed> {
+    let authoritative_owner = facts.authoritative_owner.clone()?;
+    let mut unresolved_source_obligations = facts
+        .source_gaps
+        .iter()
+        .chain(&facts.unresolved_source_ambiguity)
+        .take(16)
+        .cloned()
+        .collect::<Vec<_>>();
+    for (category, count, limit) in [
+        ("source_relationships", facts.source_relationships.len(), 16),
+        ("located_contracts", facts.located_contracts.len(), 16),
+        ("located_tests", facts.located_tests.len(), 16),
+    ] {
+        if count > limit {
+            unresolved_source_obligations
+                .push(format!("owner_packet_{category}_overflow:{count}>{limit}"));
+        }
+    }
+    unresolved_source_obligations.sort();
+    unresolved_source_obligations.dedup();
+    Some(LocateTaskOwnerPacketSeed {
+        authoritative_owner,
+        primary_path: facts.primary_path.clone(),
+        primary_symbol: facts.primary_symbol.clone(),
+        primary_span: facts.primary_span.clone(),
+        supporting_reads: supporting_reads.iter().take(32).cloned().collect(),
+        observed_spans: facts
+            .captured_source_sections
+            .iter()
+            .take(32)
+            .map(|section| LocateTaskOwnerPacketObservedSpan {
+                section_id: section.section_id.clone(),
+                path: section.path.clone(),
+                span: section.span.clone(),
+                file_content_hash: section.file_content_hash.clone(),
+                span_content_hash: section.content_hash.clone(),
+            })
+            .collect(),
+        source_relationships: facts
+            .source_relationships
+            .iter()
+            .take(16)
+            .cloned()
+            .collect(),
+        located_contracts: facts.located_contracts.iter().take(16).cloned().collect(),
+        located_tests: facts.located_tests.iter().take(16).cloned().collect(),
+        candidate_validation_routes: facts
+            .candidate_validation_routes
+            .iter()
+            .take(8)
+            .cloned()
+            .collect(),
+        unresolved_source_obligations,
+    })
+}
+
+fn decision_facts(
+    result: &LocateTaskResult,
+    authoritative_owner: Option<ManifestOwnerProjection>,
+    captured: &BTreeMap<String, Vec<u8>>,
+    fingerprints: &BTreeMap<String, String>,
+) -> LocateTaskDecisionFacts {
+    let unresolved_source_ambiguity = result
+        .unresolved
+        .iter()
+        .filter(|item| {
+            let item = item.to_ascii_lowercase();
+            item.contains("ambiguity")
+                || item.contains("conflict")
+                || item.contains("contradiction")
+                || item.contains("routing_manifest_invalid")
+        })
+        .cloned()
+        .collect();
+    LocateTaskDecisionFacts {
+        repository_identity: result.repository.identity.clone(),
+        source_snapshot_identity: result.snapshot.snapshot_id.clone(),
+        owner_manifest_revision: result.snapshot.manifest_hash.clone(),
+        closure_contract_revision: SOURCE_CLOSURE_CONTRACT_VERSION.to_string(),
+        completeness: result.snapshot.completeness.clone(),
+        selected_owner: result.routing.owner_id.clone(),
+        authoritative_owner,
+        owner_candidates: result
+            .alternatives
+            .iter()
+            .map(|candidate| LocateTaskOwnerCandidate {
+                owner_id: candidate.owner_id.clone(),
+                reason: candidate.reason.clone(),
+                score_millis: (candidate.score.clamp(0.0, 1.0) * 1_000.0).round() as u32,
+                provenance: candidate.provenance.clone(),
+            })
+            .collect(),
+        primary_path: result.primary.path.clone(),
+        primary_symbol: result.primary.symbol.clone(),
+        primary_span: result.primary.span.clone(),
+        source_relationships: result
+            .relationships
+            .iter()
+            .map(|relationship| LocateTaskSourceRelationship {
+                path: relationship.path.clone(),
+                role: relationship.role.clone(),
+                resolution: relationship.resolution.clone(),
+                span: relationship.span.clone(),
+            })
+            .collect(),
+        located_contracts: result
+            .contracts
+            .iter()
+            .map(|contract| LocateTaskLocatedPath {
+                path: contract.path.clone(),
+                role: contract.role.clone(),
+            })
+            .collect(),
+        located_tests: result
+            .tests
+            .iter()
+            .map(|test| LocateTaskLocatedPath {
+                path: test.path.clone(),
+                role: "test".to_string(),
+            })
+            .collect(),
+        captured_instruction_sources: result
+            .instructions
+            .iter()
+            .map(|instruction| LocateTaskSourceIdentity {
+                path: instruction.path.clone(),
+                content_hash: instruction.fingerprint.clone(),
+                source_snapshot_identity: result.snapshot.snapshot_id.clone(),
+            })
+            .collect(),
+        captured_source_sections: captured_source_sections(result, captured, fingerprints),
+        candidate_validation_routes: result
+            .validation
+            .iter()
+            .map(|validation| LocateTaskValidationRoute {
+                id: validation.id.clone(),
+                cwd: validation.cwd.clone(),
+                argv: validation.argv.clone(),
+                role: validation.role.clone(),
+            })
+            .collect(),
+        source_gaps: result.unresolved.clone(),
+        unresolved_source_ambiguity,
+        truncated: !result.truncation.is_empty(),
+    }
+}
+
+#[derive(Debug)]
+struct RequestedSourceSection {
+    kind: LocateTaskSourceSectionKind,
+    path: String,
+    span: Option<ExactSpan>,
+    provenance: String,
+}
+
+fn captured_source_sections(
+    result: &LocateTaskResult,
+    captured: &BTreeMap<String, Vec<u8>>,
+    fingerprints: &BTreeMap<String, String>,
+) -> Vec<LocateTaskSourceSection> {
+    let mut requested = Vec::new();
+    if let Some(path) = &result.primary.path {
+        requested.push(RequestedSourceSection {
+            kind: LocateTaskSourceSectionKind::PrimaryImplementation,
+            path: path.clone(),
+            span: result.primary.span.clone(),
+            provenance: result.primary.provenance.clone(),
+        });
+    }
+    requested.extend(
+        result
+            .relationships
+            .iter()
+            .map(|relationship| RequestedSourceSection {
+                kind: LocateTaskSourceSectionKind::Caller,
+                path: relationship.path.clone(),
+                span: Some(relationship.span.clone()),
+                provenance: relationship.provenance.clone(),
+            }),
+    );
+    // This is the ordered closure-read batch exposed to core: owner first,
+    // followed by independent callers, focused tests, and contracts. Core can retain
+    // this order while dispatching independent reads through its parallel gate.
+    requested.extend(result.tests.iter().map(|test| RequestedSourceSection {
+        kind: LocateTaskSourceSectionKind::Test,
+        path: test.path.clone(),
+        span: test.span.clone(),
+        provenance: test.provenance.clone(),
+    }));
+    requested.extend(
+        result
+            .contracts
+            .iter()
+            .map(|contract| RequestedSourceSection {
+                kind: if contract.role == "generated_mirror" {
+                    LocateTaskSourceSectionKind::Generated
+                } else {
+                    LocateTaskSourceSectionKind::Contract
+                },
+                path: contract.path.clone(),
+                span: None,
+                provenance: contract.provenance.clone(),
+            }),
+    );
+
+    let mut seen = BTreeSet::new();
+    requested.retain(|section| {
+        seen.insert((
+            section.kind,
+            section.path.clone(),
+            section.span.as_ref().map(|span| {
+                (
+                    span.start_line,
+                    span.end_line,
+                    span.start_byte,
+                    span.end_byte,
+                )
+            }),
+        ))
+    });
+
+    let mut remaining_bytes = MAX_MATERIALIZED_CLOSURE_BYTES;
+    requested
+        .into_iter()
+        .map(|requested| {
+            materialize_source_section(
+                requested,
+                captured,
+                fingerprints,
+                &result.snapshot.snapshot_id,
+                &mut remaining_bytes,
+            )
+        })
+        .collect()
+}
+
+fn materialize_source_section(
+    requested: RequestedSourceSection,
+    captured: &BTreeMap<String, Vec<u8>>,
+    fingerprints: &BTreeMap<String, String>,
+    snapshot_id: &str,
+    remaining_bytes: &mut usize,
+) -> LocateTaskSourceSection {
+    let file_content_hash = fingerprints.get(&requested.path).cloned();
+    let selected = captured
+        .get(&requested.path)
+        .and_then(|bytes| bounded_contiguous_source_slice(bytes, requested.span.as_ref()));
+    let (state, span, content_hash, text) = match selected {
+        Some((span, text)) if text.len() <= *remaining_bytes => {
+            *remaining_bytes = (*remaining_bytes).saturating_sub(text.len());
+            (
+                LocateTaskSourceSectionState::Materialized,
+                Some(span),
+                Some(sha256_bytes(text.as_bytes())),
+                Some(text),
+            )
+        }
+        _ => (
+            LocateTaskSourceSectionState::NotMaterialized,
+            requested.span.clone(),
+            None,
+            None,
+        ),
+    };
+    let section_id = source_section_id(
+        requested.kind,
+        &requested.path,
+        span.as_ref(),
+        content_hash.as_deref().or(file_content_hash.as_deref()),
+        snapshot_id,
+    );
+    LocateTaskSourceSection {
+        section_id,
+        kind: requested.kind,
+        state,
+        path: requested.path,
+        span,
+        content_hash,
+        file_content_hash,
+        source_snapshot_identity: snapshot_id.to_string(),
+        text,
+        provenance: requested.provenance,
+    }
+}
+
+fn bounded_contiguous_source_slice(
+    bytes: &[u8],
+    requested_span: Option<&ExactSpan>,
+) -> Option<(ExactSpan, String)> {
+    std::str::from_utf8(bytes).ok()?;
+    let mut line_starts = vec![0usize];
+    line_starts.extend(
+        bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1)),
+    );
+    let total_lines = line_starts.len().max(1);
+    let requested_start = requested_span.map_or(1, |span| span.start_line.max(1));
+    let requested_end = requested_span.map_or(requested_start, |span| span.end_line.max(1));
+    let start_line = requested_start.saturating_sub(20).max(1).min(total_lines);
+    let mut end_line = requested_end
+        .saturating_add(20)
+        .max(start_line)
+        .min(total_lines)
+        .min(start_line.saturating_add(MAX_NEIGHBORHOOD_LINES - 1));
+    let start_byte = line_starts[start_line - 1];
+    let mut end_byte = line_starts.get(end_line).copied().unwrap_or(bytes.len());
+    while end_line > start_line && end_byte.saturating_sub(start_byte) > MAX_NEIGHBORHOOD_BYTES {
+        end_line -= 1;
+        end_byte = line_starts.get(end_line).copied().unwrap_or(bytes.len());
+    }
+    if end_byte.saturating_sub(start_byte) > MAX_NEIGHBORHOOD_BYTES {
+        end_byte = floor_char_boundary_bytes(bytes, start_byte + MAX_NEIGHBORHOOD_BYTES);
+    }
+    let text = std::str::from_utf8(&bytes[start_byte..end_byte])
+        .ok()?
+        .to_string();
+    Some((
+        ExactSpan {
+            start_line,
+            end_line,
+            start_byte,
+            end_byte,
+        },
+        text,
+    ))
+}
+
+fn floor_char_boundary_bytes(bytes: &[u8], mut index: usize) -> usize {
+    index = index.min(bytes.len());
+    while index > 0 && index < bytes.len() && (bytes[index] & 0b1100_0000) == 0b1000_0000 {
+        index -= 1;
+    }
+    index
+}
+
+fn source_section_id(
+    kind: LocateTaskSourceSectionKind,
+    path: &str,
+    span: Option<&ExactSpan>,
+    content_hash: Option<&str>,
+    snapshot_id: &str,
+) -> String {
+    let span = span
+        .map(|span| {
+            format!(
+                "{}:{}:{}:{}",
+                span.start_line, span.end_line, span.start_byte, span.end_byte
+            )
+        })
+        .unwrap_or_else(|| "unmaterialized".to_string());
+    let kind = serde_json::to_string(&kind).unwrap_or_else(|_| "unknown".to_string());
+    sha256_join(&[
+        SOURCE_CLOSURE_CONTRACT_VERSION,
+        &kind,
+        &normalize_relative(path),
+        &span,
+        content_hash.unwrap_or("not_materialized"),
+        snapshot_id,
+    ])
 }
 
 fn route_task<'a>(
@@ -2395,6 +3088,11 @@ fn sort_source_file(source: &mut SourceFile) {
 }
 
 fn owner_for_path<'a>(manifest: &'a RoutingManifest, path: &str) -> Option<&'a OwnerDeclaration> {
+    let owners = owners_for_path(manifest, path);
+    (owners.len() == 1).then(|| owners[0])
+}
+
+fn owners_for_path<'a>(manifest: &'a RoutingManifest, path: &str) -> Vec<&'a OwnerDeclaration> {
     let normalized = normalize_relative(path);
     let mut owners = manifest
         .owners
@@ -2432,10 +3130,12 @@ fn owner_for_path<'a>(manifest: &'a RoutingManifest, path: &str) -> Option<&'a O
                 .map(|specificity| (owner, specificity))
         })
         .collect::<Vec<_>>();
-    let best = owners.iter().map(|(_, specificity)| *specificity).max()?;
+    let Some(best) = owners.iter().map(|(_, specificity)| *specificity).max() else {
+        return Vec::new();
+    };
     owners.retain(|(_, specificity)| *specificity == best);
     owners.sort_by(|(left, _), (right, _)| left.id.cmp(&right.id));
-    (owners.len() == 1).then(|| owners[0].0)
+    owners.into_iter().map(|(owner, _)| owner).collect()
 }
 
 fn owners_for_symbol<'a>(manifest: &'a RoutingManifest, symbol: &str) -> Vec<&'a OwnerDeclaration> {

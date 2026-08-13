@@ -53,6 +53,9 @@ class SyncAudit:
     head: str
     upstream_ref: str
     upstream: str
+    upstream_remote: str
+    upstream_remote_tip: str
+    upstream_ref_stale: bool
     merge_base: str
     ahead: int
     behind: int
@@ -177,6 +180,30 @@ def audit_repository(
         ["rev-parse", "--verify", f"{upstream_ref}^{{commit}}"],
         timeout_seconds=timeout_seconds,
     )
+    upstream_remote, separator, upstream_branch = upstream_ref.partition("/")
+    if not separator or not upstream_remote or not upstream_branch:
+        raise RuntimeError(
+            f"upstream ref must have <remote>/<branch> form: {upstream_ref!r}"
+        )
+    remote_output = _git_text(
+        repo_root,
+        [
+            "ls-remote",
+            "--exit-code",
+            upstream_remote,
+            f"refs/heads/{upstream_branch}",
+        ],
+        timeout_seconds=timeout_seconds,
+    )
+    remote_fields = remote_output.split()
+    if len(remote_fields) != 2 or not re.fullmatch(
+        r"[0-9a-f]{40,64}", remote_fields[0]
+    ):
+        raise RuntimeError(
+            f"unexpected ls-remote output for {upstream_ref}: {remote_output!r}"
+        )
+    upstream_remote_tip = remote_fields[0]
+    upstream_ref_stale = upstream != upstream_remote_tip
     branch = (
         _git_text(
             repo_root,
@@ -226,8 +253,14 @@ def audit_repository(
         reasons.append(f"branch is {behind} commit(s) behind {upstream_ref}")
     if ahead:
         reasons.append(f"branch has {ahead} fork commit(s) not in {upstream_ref}")
+    if upstream_ref_stale:
+        reasons.append(f"local {upstream_ref} is stale relative to {upstream_remote}")
 
-    safe_for_in_place_sync = not worktree.dirty and merge_forecast.status == "clean"
+    safe_for_in_place_sync = (
+        not worktree.dirty
+        and merge_forecast.status == "clean"
+        and not upstream_ref_stale
+    )
     recommended_strategy = (
         "reviewed-in-place-merge"
         if safe_for_in_place_sync
@@ -241,6 +274,9 @@ def audit_repository(
         head=head,
         upstream_ref=upstream_ref,
         upstream=upstream,
+        upstream_remote=upstream_remote,
+        upstream_remote_tip=upstream_remote_tip,
+        upstream_ref_stale=upstream_ref_stale,
         merge_base=merge_base,
         ahead=ahead,
         behind=behind,
@@ -319,6 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"ahead={audit.ahead} behind={audit.behind} "
             f"dirty={audit.worktree.changed_paths} "
             f"forecast={audit.merge_forecast.status}"
+            f" upstream_stale={audit.upstream_ref_stale}"
         )
         print(f"Strategy: {audit.recommended_strategy}")
         for reason in audit.reasons:

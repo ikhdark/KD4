@@ -1,3 +1,5 @@
+use crate::context::PromptProvenanceSidecar;
+use crate::stable_context::StableContextManifest;
 pub use codex_api::ResponseEvent;
 use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
@@ -20,6 +22,17 @@ pub struct Prompt {
     /// Conversation context input items.
     pub input: Arc<[ResponseItem]>,
 
+    /// Complete normalized input retained for fail-open dispatch if a
+    /// transport cannot establish a fresh non-inheriting provider baseline.
+    pub(crate) stable_context_fallback_input: Arc<[ResponseItem]>,
+
+    /// Internal-only context identity and accounting sidecar. This field is
+    /// never serialized into a provider request.
+    pub(crate) stable_context_manifest: StableContextManifest,
+
+    /// Measurement-only response-item provenance. It is never serialized.
+    pub(crate) prompt_provenance: PromptProvenanceSidecar,
+
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
     pub(crate) tools: Vec<ToolSpec>,
@@ -40,6 +53,9 @@ impl Default for Prompt {
     fn default() -> Self {
         Self {
             input: Arc::from([]),
+            stable_context_fallback_input: Arc::from([]),
+            stable_context_manifest: StableContextManifest::default(),
+            prompt_provenance: PromptProvenanceSidecar::default(),
             tools: Vec::new(),
             parallel_tool_calls: false,
             base_instructions: BaseInstructions::default(),
@@ -59,6 +75,17 @@ impl Prompt {
         } else {
             Arc::from(self.input.to_vec())
         };
+        if use_responses_lite && has_image_details(&input) {
+            strip_image_details(Arc::make_mut(&mut input));
+        }
+        input
+    }
+
+    pub(crate) fn get_formatted_fallback_input_for_request(
+        &self,
+        use_responses_lite: bool,
+    ) -> Arc<[ResponseItem]> {
+        let mut input = Arc::clone(&self.stable_context_fallback_input);
         if use_responses_lite && has_image_details(&input) {
             strip_image_details(Arc::make_mut(&mut input));
         }

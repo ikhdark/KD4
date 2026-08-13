@@ -1,6 +1,6 @@
 use crate::function_tool::FunctionCallError;
-use crate::tools::command_output_artifact::read_tool_output_artifact;
-use crate::tools::context::FunctionToolOutput;
+use crate::tools::command_output_artifact::ToolOutputSelector;
+use crate::tools::command_output_artifact::read_tool_output_selectors;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -8,23 +8,38 @@ use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME;
 use crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use crate::turn_timing::SourceDiscoveryTimingEvent;
+use codex_tools::JsonToolOutput;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
 
 const DEFAULT_MAX_BYTES: usize = 16_384;
 const DEFAULT_LINE_COUNT: usize = 200;
+const MAX_LEGACY_RANGES: usize = 16;
+const MAX_AGGREGATE_LINES: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadToolOutputArgs {
     artifact_id: String,
     #[serde(default)]
+    selectors: Option<Vec<ToolOutputSelector>>,
+    #[serde(default)]
     start_line: Option<usize>,
     #[serde(default)]
     end_line: Option<usize>,
     #[serde(default)]
+    ranges: Vec<ReadToolOutputRangeArgs>,
+    #[serde(default)]
     max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadToolOutputRangeArgs {
+    start_line: usize,
+    end_line: usize,
 }
 
 pub struct ReadToolOutputHandler;
@@ -62,23 +77,119 @@ async fn handle_read_tool_output(
             "failed to parse read_tool_output arguments: {err}"
         ))
     })?;
-    let max_bytes = resolved_max_bytes(args.max_bytes)?;
-    let (start_line, end_line) = resolved_line_range(&args)?;
-    let output = read_tool_output_artifact(
+    // Keep validating the legacy knob for compatibility, but never use it to
+    // clip a selected value. The selector engine owns its exact response fit.
+    let _legacy_max_bytes = resolved_max_bytes(args.max_bytes)?;
+    let selectors = resolved_selectors(&args)?;
+    let output = read_tool_output_selectors(
         invocation.turn.config.codex_home.as_path(),
         &invocation.session.thread_id.to_string(),
         &args.artifact_id,
-        start_line,
-        end_line,
-        max_bytes,
+        selectors,
     )
     .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+    invocation
+        .turn
+        .turn_timing_state
+        .record_tool_output_artifact_reread();
+    invocation
+        .turn
+        .turn_timing_state
+        .record_tool_output_recovery();
+    invocation
+        .turn
+        .turn_timing_state
+        .record_source_discovery(SourceDiscoveryTimingEvent::Recovery);
 
-    Ok(boxed_tool_output(FunctionToolOutput::from_text(
-        output,
-        Some(true),
-    )))
+    let output = serde_json::to_value(output).map_err(|err| {
+        FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
+    })?;
+    Ok(boxed_tool_output(JsonToolOutput::new(output)))
+}
+
+fn resolved_selectors(
+    args: &ReadToolOutputArgs,
+) -> Result<Vec<ToolOutputSelector>, FunctionCallError> {
+    if let Some(selectors) = &args.selectors {
+        if selectors.is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "selectors must contain at least one selector".to_string(),
+            ));
+        }
+        if selectors.len() > 64 {
+            return Err(FunctionCallError::RespondToModel(
+                "selectors may contain at most 64 entries".to_string(),
+            ));
+        }
+        if args.start_line.is_some() || args.end_line.is_some() || !args.ranges.is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "selectors cannot be combined with legacy line arguments".to_string(),
+            ));
+        }
+        return Ok(selectors.clone());
+    }
+    if !args.ranges.is_empty() {
+        if args.start_line.is_some() || args.end_line.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "ranges is mutually exclusive with start_line/end_line".to_string(),
+            ));
+        }
+        if args.ranges.len() > MAX_LEGACY_RANGES {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "ranges may contain at most {MAX_LEGACY_RANGES} entries"
+            )));
+        }
+        let mut ranges = args
+            .ranges
+            .iter()
+            .map(|range| {
+                if range.start_line == 0 || range.end_line < range.start_line {
+                    Err(FunctionCallError::RespondToModel(
+                        "each range requires 1-based start_line <= end_line".to_string(),
+                    ))
+                } else {
+                    Ok(ToolOutputSelector::Lines {
+                        start: range.start_line,
+                        end: range.end_line,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ranges.sort_unstable_by_key(|selector| match selector {
+            ToolOutputSelector::Lines { start, end } => (*start, *end),
+            _ => unreachable!("legacy ranges always normalize to line selectors"),
+        });
+        let mut normalized: Vec<ToolOutputSelector> = Vec::with_capacity(ranges.len());
+        for selector in ranges {
+            let ToolOutputSelector::Lines { start, end } = selector else {
+                unreachable!("legacy ranges always normalize to line selectors");
+            };
+            match normalized.last_mut() {
+                Some(ToolOutputSelector::Lines {
+                    start: _,
+                    end: previous_end,
+                }) if start <= previous_end.saturating_add(1) => {
+                    *previous_end = (*previous_end).max(end);
+                }
+                _ => normalized.push(ToolOutputSelector::Lines { start, end }),
+            }
+        }
+        let aggregate_lines = normalized.iter().try_fold(0_usize, |total, selector| {
+            let ToolOutputSelector::Lines { start, end } = selector else {
+                unreachable!("legacy ranges always normalize to line selectors");
+            };
+            total.checked_add(end - start + 1)
+        });
+        if aggregate_lines.is_none_or(|lines| lines > MAX_AGGREGATE_LINES) {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "ranges may request at most {MAX_AGGREGATE_LINES} aggregate lines"
+            )));
+        }
+        return Ok(normalized);
+    }
+    let (start, end) = resolved_line_range(args)?;
+    Ok(vec![ToolOutputSelector::Lines { start, end }])
 }
 
 fn resolved_line_range(args: &ReadToolOutputArgs) -> Result<(usize, usize), FunctionCallError> {
@@ -114,26 +225,118 @@ mod tests {
     fn default_range_is_exactly_two_hundred_lines() {
         let args = ReadToolOutputArgs {
             artifact_id: uuid::Uuid::now_v7().to_string(),
+            selectors: None,
             start_line: Some(17),
             end_line: None,
+            ranges: Vec::new(),
             max_bytes: None,
         };
         assert_eq!(resolved_line_range(&args).unwrap(), (17, 216));
     }
 
     #[test]
-    fn max_bytes_is_hard_limited_to_sixteen_kibibytes() {
+    fn max_bytes_is_legacy_validated_but_not_a_clipping_contract() {
         assert_eq!(resolved_max_bytes(None).unwrap(), 16_384);
         assert_eq!(resolved_max_bytes(Some(1)).unwrap(), 1);
         assert_eq!(resolved_max_bytes(Some(16_384)).unwrap(), 16_384);
         for invalid in [0, 16_385, usize::MAX] {
-            let error = resolved_max_bytes(Some(invalid)).unwrap_err();
-            assert_eq!(
-                error,
-                FunctionCallError::RespondToModel(
-                    "max_bytes must be between 1 and 16384".to_string()
-                )
-            );
+            assert!(resolved_max_bytes(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn three_exact_ranges_become_one_bounded_owner_batch() {
+        let args = ReadToolOutputArgs {
+            artifact_id: uuid::Uuid::now_v7().to_string(),
+            selectors: None,
+            start_line: None,
+            end_line: None,
+            ranges: vec![
+                ReadToolOutputRangeArgs {
+                    start_line: 2,
+                    end_line: 4,
+                },
+                ReadToolOutputRangeArgs {
+                    start_line: 11,
+                    end_line: 13,
+                },
+                ReadToolOutputRangeArgs {
+                    start_line: 21,
+                    end_line: 25,
+                },
+            ],
+            max_bytes: None,
+        };
+
+        assert_eq!(
+            resolved_selectors(&args).unwrap(),
+            vec![
+                ToolOutputSelector::Lines { start: 2, end: 4 },
+                ToolOutputSelector::Lines { start: 11, end: 13 },
+                ToolOutputSelector::Lines { start: 21, end: 25 },
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_ranges_are_sorted_merged_and_capped_at_sixteen() {
+        let mut args = ReadToolOutputArgs {
+            artifact_id: uuid::Uuid::now_v7().to_string(),
+            selectors: None,
+            start_line: None,
+            end_line: None,
+            ranges: vec![
+                ReadToolOutputRangeArgs {
+                    start_line: 10,
+                    end_line: 12,
+                },
+                ReadToolOutputRangeArgs {
+                    start_line: 2,
+                    end_line: 4,
+                },
+                ReadToolOutputRangeArgs {
+                    start_line: 4,
+                    end_line: 6,
+                },
+                ReadToolOutputRangeArgs {
+                    start_line: 7,
+                    end_line: 9,
+                },
+            ],
+            max_bytes: None,
+        };
+
+        assert_eq!(
+            resolved_selectors(&args).unwrap(),
+            vec![ToolOutputSelector::Lines { start: 2, end: 12 }]
+        );
+
+        args.ranges = (1..=MAX_LEGACY_RANGES)
+            .map(|line| ReadToolOutputRangeArgs {
+                start_line: line * 2,
+                end_line: line * 2,
+            })
+            .collect();
+        assert_eq!(resolved_selectors(&args).unwrap().len(), MAX_LEGACY_RANGES);
+
+        args.ranges = (1..=MAX_LEGACY_RANGES + 1)
+            .map(|line| ReadToolOutputRangeArgs {
+                start_line: line * 2,
+                end_line: line * 2,
+            })
+            .collect();
+        assert!(resolved_selectors(&args).is_err());
+
+        args.ranges = vec![
+            ReadToolOutputRangeArgs {
+                start_line: 1,
+                end_line: 1_000,
+            },
+            ReadToolOutputRangeArgs {
+                start_line: 2_000,
+                end_line: 3_000,
+            },
+        ];
+        assert!(resolved_selectors(&args).is_err());
     }
 }

@@ -24,7 +24,10 @@ use ignore::Match;
 use ignore::WalkBuilder;
 use ignore::gitignore::Gitignore;
 use ignore::gitignore::GitignoreBuilder;
+use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use unicode_casefold::UnicodeCaseFold;
 
 use crate::source_routes::source_map_route_for_path;
@@ -45,6 +48,8 @@ pub const SOURCE_SEARCH_MAX_WALK_ENTRIES: usize = 50_000;
 pub const SOURCE_READ_DEFAULT_LINES: usize = 120;
 pub const SOURCE_READ_MAX_LINES: usize = 400;
 pub const SOURCE_READ_MAX_BYTES: usize = 512 * 1024;
+const SOURCE_SEARCH_HYDRATION_MAX_BYTES: usize = 5 * 1024;
+const SOURCE_SEARCH_HYDRATION_LINES: usize = 120;
 
 #[derive(Clone, Copy)]
 struct SourceWalkLimits {
@@ -407,6 +412,8 @@ pub struct SourceSearchOptions {
     pub include_generated: bool,
     pub include_vendor: bool,
     pub include_locks: bool,
+    pub hydrate_selected_span: bool,
+    pub hydration_candidates: Vec<SourceSearchHydrationCandidate>,
 }
 
 impl SourceSearchOptions {
@@ -421,8 +428,24 @@ impl SourceSearchOptions {
             include_generated: false,
             include_vendor: false,
             include_locks: false,
+            hydrate_selected_span: true,
+            hydration_candidates: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSearchHydrationCandidate {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: SourceSearchHydrationCandidateKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceSearchHydrationCandidateKind {
+    AuthoritativeDefinition,
+    StructuredContext,
 }
 
 #[derive(Debug, Clone)]
@@ -433,7 +456,7 @@ pub struct ReadFileSpanOptions {
     pub line_count: usize,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SourceSearchOutput {
     pub query: String,
     pub roots: Vec<String>,
@@ -443,6 +466,9 @@ pub struct SourceSearchOutput {
     pub coverage_note: Option<String>,
     pub coverage: SourceSearchCoverage,
     pub matches: Vec<SourceSearchMatch>,
+    pub hydration_status: SourceSearchHydrationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hydrated_span: Option<SourceSearchHydratedSpan>,
     #[serde(skip)]
     pub diagnostics: SourceSearchDiagnostics,
 }
@@ -457,12 +483,32 @@ impl PartialEq for SourceSearchOutput {
             && self.coverage_note == other.coverage_note
             && self.coverage == other.coverage
             && self.matches == other.matches
+            && self.hydration_status == other.hydration_status
+            && self.hydrated_span == other.hydrated_span
     }
 }
 
 impl Eq for SourceSearchOutput {}
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSearchHydrationStatus {
+    Disabled,
+    HydratedAuthoritativeDefinition,
+    HydratedStructuredContext,
+    HydratedDeterministicWindow,
+    SkippedCoverageIncomplete,
+    SkippedNoUniqueMatch,
+    SkippedObservationUnavailable,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SourceSearchHydratedSpan {
+    pub content_hash: String,
+    pub observation: ReadFileSpanOutput,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct SourceSearchCoverage {
     pub walked_entries: usize,
     pub ignored_entries: usize,
@@ -480,6 +526,16 @@ pub struct SourceSearchCoverage {
     pub max_bytes: usize,
     pub max_file_bytes: usize,
     pub max_result_bytes: usize,
+    #[serde(default)]
+    pub index_complete: bool,
+    #[serde(default)]
+    pub context_complete: bool,
+    #[serde(default)]
+    pub indexed_matches: usize,
+    #[serde(default)]
+    pub omitted_contexts: usize,
+    #[serde(default)]
+    pub result_cap_reached: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -491,7 +547,7 @@ pub struct SourceSearchDiagnostics {
     pub projection_micros: u64,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceTruncatedReason {
     MaxMatches,
@@ -505,24 +561,34 @@ pub enum SourceTruncatedReason {
     FilesystemErrors,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct SourceSearchMatch {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub file_id: String,
     pub path: String,
+    #[serde(default)]
+    pub source_revision: String,
     pub source_map_route: Option<String>,
     pub line_number: usize,
+    #[serde(default)]
+    pub matched_content: String,
     pub start_line: usize,
     pub end_line: usize,
+    #[serde(default)]
+    pub context_complete: bool,
     pub lines: Vec<SourceLine>,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct SourceLine {
     pub line_number: usize,
     pub text: String,
     pub text_truncated: bool,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ReadFileSpanOutput {
     pub path: String,
     pub source_map_route: Option<String>,
@@ -534,6 +600,26 @@ pub struct ReadFileSpanOutput {
     pub bytes_returned: usize,
     pub truncated: bool,
     pub lines: Vec<SourceLine>,
+    #[serde(default)]
+    pub full_file_sha256: String,
+    #[serde(default)]
+    pub requested_content_sha256: String,
+    #[serde(default)]
+    pub requested_bytes: usize,
+    #[serde(default)]
+    pub exact_content: String,
+    #[serde(default)]
+    pub chunks: Vec<SourceReadChunk>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SourceReadChunk {
+    pub id: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub exact_bytes: usize,
 }
 
 pub fn run_source_search_cli(cli: SourceSearchCli) -> anyhow::Result<()> {
@@ -684,6 +770,23 @@ pub fn read_file_span_from_bytes(
     let mut lines = Vec::new();
     let mut bytes_returned = 0usize;
     let mut byte_truncated = false;
+    let line_ranges = exact_line_ranges(&text);
+    let requested_byte_start = line_ranges
+        .get(start_index)
+        .map_or(text.len(), |(start, _)| *start);
+    let requested_byte_end = end_index
+        .checked_sub(1)
+        .and_then(|index| line_ranges.get(index))
+        .map_or(requested_byte_start, |(_, end)| *end);
+    let exact_content = text[requested_byte_start..requested_byte_end].to_string();
+    let full_file_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let requested_content_sha256 = format!("{:x}", Sha256::digest(exact_content.as_bytes()));
+    let chunks = source_read_chunks(
+        &line_ranges[start_index..end_index],
+        start_index,
+        requested_byte_start,
+        &requested_content_sha256,
+    );
 
     for (offset, text) in source_lines[start_index..end_index].iter().enumerate() {
         let remaining = SOURCE_READ_MAX_BYTES.saturating_sub(bytes_returned);
@@ -715,7 +818,65 @@ pub fn read_file_span_from_bytes(
         bytes_returned,
         truncated: byte_truncated,
         lines,
+        full_file_sha256,
+        requested_content_sha256,
+        requested_bytes: exact_content.len(),
+        exact_content,
+        chunks,
     })
+}
+
+fn exact_line_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut cursor = 0_usize;
+    text.split_inclusive('\n')
+        .map(|line| {
+            let start = cursor;
+            cursor = cursor.saturating_add(line.len());
+            (start, cursor)
+        })
+        .collect()
+}
+
+fn source_read_chunks(
+    line_ranges: &[(usize, usize)],
+    zero_based_start_line: usize,
+    requested_byte_start: usize,
+    content_hash: &str,
+) -> Vec<SourceReadChunk> {
+    const MAX_CHUNK_LINES: usize = 40;
+    const MAX_CHUNK_BYTES: usize = 8 * 1024;
+    let mut chunks = Vec::new();
+    let mut cursor = 0_usize;
+    while cursor < line_ranges.len() {
+        let chunk_start = cursor;
+        let absolute_start = line_ranges[cursor].0;
+        let mut chunk_end = cursor + 1;
+        while chunk_end < line_ranges.len() && chunk_end - chunk_start < MAX_CHUNK_LINES {
+            let candidate_bytes = line_ranges[chunk_end].1.saturating_sub(absolute_start);
+            if candidate_bytes > MAX_CHUNK_BYTES {
+                break;
+            }
+            chunk_end += 1;
+        }
+        let absolute_end = line_ranges[chunk_end - 1].1;
+        let start_line = zero_based_start_line + chunk_start + 1;
+        let end_line = zero_based_start_line + chunk_end;
+        let byte_start = absolute_start.saturating_sub(requested_byte_start);
+        let byte_end = absolute_end.saturating_sub(requested_byte_start);
+        chunks.push(SourceReadChunk {
+            id: format!(
+                "src:{}:L{start_line}-L{end_line}",
+                &content_hash[..content_hash.len().min(16)]
+            ),
+            start_line,
+            end_line,
+            byte_start,
+            byte_end,
+            exact_bytes: byte_end.saturating_sub(byte_start),
+        });
+        cursor = chunk_end;
+    }
+    chunks
 }
 
 pub fn validate_read_file_span_bounds(start_line: usize, line_count: usize) -> anyhow::Result<()> {
@@ -737,6 +898,9 @@ pub struct SourceSearchAccumulator {
     include_vendor: bool,
     include_locks: bool,
     unscoped: bool,
+    hydrate_selected_span: bool,
+    hydration_candidates: Vec<SourceSearchHydrationCandidate>,
+    unique_observation: Option<UniqueSearchObservation>,
     started_at: Instant,
     traversal_duration: Duration,
     file_scan_match_duration: Duration,
@@ -773,6 +937,9 @@ impl SourceSearchAccumulator {
             include_vendor: options.include_vendor,
             include_locks: options.include_locks,
             unscoped: options.roots.is_empty(),
+            hydrate_selected_span: options.hydrate_selected_span,
+            hydration_candidates: options.hydration_candidates.clone(),
+            unique_observation: None,
             started_at: Instant::now(),
             traversal_duration: Duration::ZERO,
             file_scan_match_duration: Duration::ZERO,
@@ -829,6 +996,7 @@ impl SourceSearchAccumulator {
             return;
         }
         self.state.bytes_scanned = self.state.bytes_scanned.saturating_add(bytes.len());
+        let content_hash = format!("{:x}", Sha256::digest(&bytes));
         let Ok(text) = String::from_utf8(bytes) else {
             self.state.files_skipped_non_utf8 = self.state.files_skipped_non_utf8.saturating_add(1);
             return;
@@ -837,11 +1005,24 @@ impl SourceSearchAccumulator {
         collect_matches(
             relative_path,
             &text,
-            self.case_sensitive,
-            self.context_lines,
-            &self.query_cmp,
+            MatchParameters {
+                case_sensitive: self.case_sensitive,
+                context_lines: self.context_lines,
+                query: &self.query,
+                query_cmp: &self.query_cmp,
+                source_revision: &content_hash,
+            },
             &mut self.state,
         );
+        if self.state.total_matches == 1 && self.state.total_matches > matches_before {
+            self.unique_observation = Some(UniqueSearchObservation {
+                path: relative_path.to_path_buf(),
+                bytes: text.into_bytes(),
+                content_hash,
+            });
+        } else if self.state.total_matches != 1 {
+            self.unique_observation = None;
+        }
         if self.first_match_duration.is_none() && self.state.total_matches > matches_before {
             self.first_match_duration = Some(self.started_at.elapsed());
         }
@@ -921,6 +1102,11 @@ impl SourceSearchAccumulator {
             max_bytes: SOURCE_SEARCH_MAX_BYTES,
             max_file_bytes: SOURCE_SEARCH_MAX_FILE_BYTES,
             max_result_bytes: SOURCE_SEARCH_MAX_RESULT_BYTES,
+            index_complete: coverage_limit.is_none() && result_limit.is_none(),
+            context_complete: true,
+            indexed_matches: self.state.matches.len(),
+            omitted_contexts: 0,
+            result_cap_reached: result_limit == Some(SourceTruncatedReason::MaxMatches),
         };
         let mut output = SourceSearchOutput {
             query: self.query,
@@ -931,28 +1117,58 @@ impl SourceSearchAccumulator {
             coverage_note: None,
             coverage,
             matches: self.state.matches,
+            hydration_status: SourceSearchHydrationStatus::SkippedNoUniqueMatch,
+            hydrated_span: None,
             diagnostics: SourceSearchDiagnostics::default(),
         };
         update_search_output_status(&mut output, coverage_limit, result_limit, self.unscoped);
-        let matches = std::mem::take(&mut output.matches);
-        let match_projection_bytes = matches
-            .iter()
-            .map(pretty_projected_match_bytes)
-            .collect::<Vec<_>>();
-        let mut projection = largest_serialized_prefix(&mut output, &match_projection_bytes);
-        if projection.0 < matches.len() {
-            result_limit = Some(SourceTruncatedReason::MaxResultBytes);
+        apply_unique_search_hydration(
+            &mut output,
+            self.hydrate_selected_span,
+            self.unique_observation.take(),
+            &self.hydration_candidates,
+        );
+        let result_cap_reached = result_limit == Some(SourceTruncatedReason::MaxMatches);
+        let mut identity_cap_reached = false;
+        loop {
+            if update_serialized_result_bytes(&mut output) <= SOURCE_SEARCH_MAX_RESULT_BYTES {
+                break;
+            }
+            if let Some(source_match) = output
+                .matches
+                .iter_mut()
+                .rev()
+                .find(|source_match| !source_match.lines.is_empty())
+            {
+                source_match.lines.clear();
+                source_match.context_complete = false;
+                output.coverage.context_complete = false;
+                output.coverage.omitted_contexts =
+                    output.coverage.omitted_contexts.saturating_add(1);
+            } else if let Some(source_match) = output
+                .matches
+                .iter_mut()
+                .rev()
+                .find(|source_match| !source_match.matched_content.is_empty())
+            {
+                source_match.matched_content.clear();
+            } else if output.hydrated_span.take().is_some() {
+                output.hydration_status =
+                    SourceSearchHydrationStatus::SkippedObservationUnavailable;
+            } else if output.matches.pop().is_some() {
+                identity_cap_reached = true;
+            } else {
+                break;
+            }
+            result_limit.get_or_insert(SourceTruncatedReason::MaxResultBytes);
             update_search_output_status(&mut output, coverage_limit, result_limit, self.unscoped);
-            projection = largest_serialized_prefix(&mut output, &match_projection_bytes);
         }
-        output.matches = matches.into_iter().take(projection.0).collect();
-        output.coverage.matches_returned = projection.0;
-        output.coverage.result_bytes = projection.1;
-        let final_serialized_bytes = serde_json::to_vec_pretty(&output)
-            .map(|bytes| bytes.len().saturating_add(1))
-            .unwrap_or(usize::MAX);
-        debug_assert_eq!(final_serialized_bytes, projection.1);
-        output.coverage.result_bytes = final_serialized_bytes;
+        output.coverage.result_cap_reached = result_cap_reached || identity_cap_reached;
+        output.coverage.index_complete =
+            output.coverage_complete && !result_cap_reached && !identity_cap_reached;
+        output.coverage.matches_returned = output.matches.len();
+        output.coverage.indexed_matches = output.matches.len();
+        update_serialized_result_bytes(&mut output);
         let projection_duration = projection_started.elapsed();
         output.diagnostics = SourceSearchDiagnostics {
             total_micros: duration_micros(self.started_at.elapsed()),
@@ -963,6 +1179,124 @@ impl SourceSearchAccumulator {
         };
         output
     }
+}
+
+fn update_serialized_result_bytes(output: &mut SourceSearchOutput) -> usize {
+    for _ in 0..4 {
+        let serialized_bytes = serde_json::to_vec_pretty(output)
+            .map(|bytes| bytes.len().saturating_add(1))
+            .unwrap_or(usize::MAX);
+        if output.coverage.result_bytes == serialized_bytes {
+            break;
+        }
+        output.coverage.result_bytes = serialized_bytes;
+    }
+    output.coverage.result_bytes
+}
+
+struct UniqueSearchObservation {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    content_hash: String,
+}
+
+fn apply_unique_search_hydration(
+    output: &mut SourceSearchOutput,
+    enabled: bool,
+    observation: Option<UniqueSearchObservation>,
+    candidates: &[SourceSearchHydrationCandidate],
+) {
+    if !enabled {
+        output.hydration_status = SourceSearchHydrationStatus::Disabled;
+        return;
+    }
+    if !output.coverage_complete {
+        output.hydration_status = SourceSearchHydrationStatus::SkippedCoverageIncomplete;
+        return;
+    }
+    if output.coverage.total_matches != 1 || output.matches.len() != 1 {
+        output.hydration_status = SourceSearchHydrationStatus::SkippedNoUniqueMatch;
+        return;
+    }
+    let Some(observation) = observation else {
+        output.hydration_status = SourceSearchHydrationStatus::SkippedObservationUnavailable;
+        return;
+    };
+    let matched = &output.matches[0];
+    let selected_candidate = [
+        SourceSearchHydrationCandidateKind::AuthoritativeDefinition,
+        SourceSearchHydrationCandidateKind::StructuredContext,
+    ]
+    .into_iter()
+    .find_map(|kind| {
+        let matches = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == kind
+                    && candidate.path.replace('\\', "/") == matched.path
+                    && candidate.start_line <= matched.line_number
+                    && candidate.end_line >= matched.line_number
+                    && candidate.start_line > 0
+                    && candidate.end_line >= candidate.start_line
+            })
+            .collect::<Vec<_>>();
+        (matches.len() == 1).then(|| (kind, matches[0]))
+    });
+    let start_line = selected_candidate.map_or_else(
+        || matched.line_number.saturating_sub(20).max(1),
+        |(_, candidate)| candidate.start_line,
+    );
+    let line_count = selected_candidate.map_or(SOURCE_SEARCH_HYDRATION_LINES, |(_, candidate)| {
+        candidate
+            .end_line
+            .saturating_sub(candidate.start_line)
+            .saturating_add(1)
+            .min(SOURCE_SEARCH_HYDRATION_LINES)
+    });
+    let Ok(mut span) = read_file_span_from_bytes(
+        observation.path.to_string_lossy().replace('\\', "/"),
+        observation.bytes,
+        start_line,
+        line_count,
+    ) else {
+        output.hydration_status = SourceSearchHydrationStatus::SkippedObservationUnavailable;
+        return;
+    };
+    let mut remaining = SOURCE_SEARCH_HYDRATION_MAX_BYTES;
+    let mut bounded_lines = Vec::new();
+    let original_line_count = span.lines.len();
+    for mut line in std::mem::take(&mut span.lines) {
+        if remaining == 0 {
+            break;
+        }
+        let (text, text_truncated) = bounded_text(&line.text, remaining);
+        remaining = remaining.saturating_sub(text.len());
+        line.text = text;
+        line.text_truncated |= text_truncated;
+        bounded_lines.push(line);
+        if text_truncated {
+            break;
+        }
+    }
+    let omitted = bounded_lines.len() < original_line_count;
+    span.lines = bounded_lines;
+    span.start_line = span.lines.first().map(|line| line.line_number);
+    span.end_line = span.lines.last().map(|line| line.line_number);
+    span.bytes_returned = SOURCE_SEARCH_HYDRATION_MAX_BYTES.saturating_sub(remaining);
+    span.truncated |= omitted;
+    output.hydration_status = match selected_candidate.map(|(kind, _)| kind) {
+        Some(SourceSearchHydrationCandidateKind::AuthoritativeDefinition) => {
+            SourceSearchHydrationStatus::HydratedAuthoritativeDefinition
+        }
+        Some(SourceSearchHydrationCandidateKind::StructuredContext) => {
+            SourceSearchHydrationStatus::HydratedStructuredContext
+        }
+        None => SourceSearchHydrationStatus::HydratedDeterministicWindow,
+    };
+    output.hydrated_span = Some(SourceSearchHydratedSpan {
+        content_hash: observation.content_hash,
+        observation: span,
+    });
 }
 
 struct SearchState {
@@ -1036,11 +1370,19 @@ fn update_search_output_status(
         output.coverage.files_skipped_non_utf8,
     );
     output.truncated = output.truncated_reason.is_some();
-    output.coverage_complete = output.truncated_reason.is_none();
+    output.coverage_complete = coverage_limit.is_none()
+        && output.coverage.files_changed_during_read == 0
+        && output.coverage.filesystem_errors == 0
+        && output.coverage.files_skipped_too_large == 0
+        && output.coverage.files_skipped_non_utf8 == 0;
     output.coverage.matches_returned = output.matches.len();
-    let cap_reason = coverage_limit
-        .filter(|reason| reason.is_search_cap())
-        .or_else(|| result_limit.filter(|reason| reason.is_search_cap()));
+    output.coverage.index_complete =
+        output.coverage_complete && result_limit != Some(SourceTruncatedReason::MaxMatches);
+    output.coverage.result_cap_reached = result_limit == Some(SourceTruncatedReason::MaxMatches);
+    if result_limit == Some(SourceTruncatedReason::MaxResultBytes) {
+        output.coverage.context_complete = false;
+    }
+    let cap_reason = coverage_limit.filter(|reason| reason.is_search_cap());
     output.coverage_note = unscoped.then_some(cap_reason).flatten().map(|cap_reason| {
         let result_summary = if output.coverage.total_matches == 0 {
             "No matches were found in the scanned portion of the repository."
@@ -1081,68 +1423,8 @@ impl SourceTruncatedReason {
     }
 }
 
-fn largest_serialized_prefix(
-    output: &mut SourceSearchOutput,
-    match_projection_bytes: &[usize],
-) -> (usize, usize) {
-    output.coverage.matches_returned = 0;
-    output.coverage.result_bytes = 0;
-    let empty_output_bytes = serde_json::to_vec_pretty(output)
-        .map(|bytes| bytes.len().saturating_add(1))
-        .unwrap_or(usize::MAX);
-    let fixed_bytes = empty_output_bytes.saturating_sub(2);
-    let mut prefix_payload_bytes = 0usize;
-    let mut fitting = (0usize, serialized_prefix_bytes(fixed_bytes, 0, 0));
-
-    for (index, match_bytes) in match_projection_bytes.iter().copied().enumerate() {
-        prefix_payload_bytes = prefix_payload_bytes.saturating_add(match_bytes);
-        let count = index.saturating_add(1);
-        let match_array_growth = prefix_payload_bytes
-            .saturating_add(count.saturating_mul(2))
-            .saturating_add(2);
-        let serialized_bytes = serialized_prefix_bytes(fixed_bytes, count, match_array_growth);
-        if serialized_bytes > SOURCE_SEARCH_MAX_RESULT_BYTES {
-            break;
-        }
-        fitting = (count, serialized_bytes);
-    }
-
-    fitting
-}
-
 fn duration_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn pretty_projected_match_bytes(source_match: &SourceSearchMatch) -> usize {
-    let serialized = serde_json::to_vec_pretty(source_match).unwrap_or_default();
-    let line_count = serialized
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count()
-        .saturating_add(1);
-    serialized
-        .len()
-        .saturating_add(line_count.saturating_mul(4))
-}
-
-fn serialized_prefix_bytes(
-    fixed_bytes: usize,
-    matches_returned: usize,
-    match_array_growth: usize,
-) -> usize {
-    let without_result_bytes = fixed_bytes
-        .saturating_add(matches_returned.to_string().len())
-        .saturating_add(match_array_growth);
-    let mut result_bytes_digits = 1usize;
-    loop {
-        let serialized_bytes = without_result_bytes.saturating_add(result_bytes_digits);
-        let next_digits = serialized_bytes.to_string().len();
-        if next_digits == result_bytes_digits {
-            return serialized_bytes;
-        }
-        result_bytes_digits = next_digits;
-    }
 }
 
 fn scan_root(
@@ -1590,21 +1872,27 @@ fn is_changed_file_race_error(kind: ErrorKind) -> bool {
     )
 }
 
+struct MatchParameters<'a> {
+    case_sensitive: bool,
+    context_lines: usize,
+    query: &'a str,
+    query_cmp: &'a str,
+    source_revision: &'a str,
+}
+
 fn collect_matches(
     relative_path: &Path,
     text: &str,
-    case_sensitive: bool,
-    context_lines: usize,
-    query_cmp: &str,
+    parameters: MatchParameters<'_>,
     state: &mut SearchState,
 ) {
     let lines = text.lines().collect::<Vec<_>>();
     let relative_path = relative_path.to_string_lossy().replace('\\', "/");
     for (index, line) in lines.iter().enumerate() {
-        let is_match = if case_sensitive {
-            line.contains(query_cmp)
+        let is_match = if parameters.case_sensitive {
+            line.contains(parameters.query_cmp)
         } else {
-            unicode_case_fold(line).contains(query_cmp)
+            unicode_case_fold(line).contains(parameters.query_cmp)
         };
         if !is_match {
             continue;
@@ -1616,9 +1904,9 @@ fn collect_matches(
                 .get_or_insert(SourceTruncatedReason::MaxMatches);
             continue;
         }
-        let start = index.saturating_sub(context_lines);
+        let start = index.saturating_sub(parameters.context_lines);
         let end = index
-            .saturating_add(context_lines)
+            .saturating_add(parameters.context_lines)
             .saturating_add(1)
             .min(lines.len());
         let source_lines = lines[start..end]
@@ -1634,11 +1922,39 @@ fn collect_matches(
             })
             .collect::<Vec<_>>();
         let source_match = SourceSearchMatch {
+            id: format!(
+                "match:{}",
+                &format!(
+                    "{:x}",
+                    Sha256::digest(
+                        format!(
+                            "{}\0{relative_path}\0{}\0{}\0{}",
+                            parameters.query,
+                            parameters.source_revision,
+                            index + 1,
+                            line,
+                        )
+                        .as_bytes(),
+                    )
+                )[..16]
+            ),
+            file_id: format!(
+                "file:{}",
+                &format!(
+                    "{:x}",
+                    Sha256::digest(
+                        format!("{relative_path}\0{}", parameters.source_revision).as_bytes()
+                    )
+                )[..16]
+            ),
             path: relative_path.clone(),
+            source_revision: parameters.source_revision.to_string(),
             source_map_route: source_map_route_for_path(Path::new(&relative_path)),
             line_number: index + 1,
+            matched_content: (*line).to_string(),
             start_line: start + 1,
             end_line: end,
+            context_complete: true,
             lines: source_lines,
         };
         state.matches.push(source_match);

@@ -3,6 +3,11 @@ use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tasks::SessionTaskResult;
+use crate::tools::exposure::AgentSurfaceStage;
+use crate::tools::exposure::GoalSurfaceState;
+use crate::tools::exposure::ToolExposureIdentity;
+use crate::tools::registry::ToolRegistry;
+use crate::tools::router::ToolRouter;
 use anyhow::Result;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
@@ -51,6 +56,42 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+#[test]
+fn kd4_stateless_dispatch_uses_local_occupancy_authoritatively() {
+    assert_eq!(
+        effective_provider_occupancy_for_dispatch(60_000, None, None, None),
+        Some((60_000, "full_request_local_authoritative"))
+    );
+}
+
+#[test]
+fn kd4_continuation_dispatch_never_hides_provider_baseline_occupancy() {
+    assert_eq!(
+        effective_provider_occupancy_for_dispatch(60_000, Some(7), Some(81_000), Some(55_000)),
+        Some((86_000, "server_baseline_plus_known_request_delta"))
+    );
+    assert_eq!(
+        effective_provider_occupancy_for_dispatch(90_000, Some(7), Some(70_000), Some(80_000)),
+        Some((90_000, "server_baseline_plus_known_request_delta"))
+    );
+}
+
+#[test]
+fn kd4_continuation_dispatch_requires_rebase_when_baseline_is_missing() {
+    assert_eq!(
+        effective_provider_occupancy_for_dispatch(60_000, Some(7), None, Some(55_000)),
+        None
+    );
+    assert_eq!(
+        effective_provider_occupancy_for_dispatch(60_000, Some(7), Some(75_000), None),
+        None
+    );
+    assert_eq!(
+        effective_provider_occupancy_for_dispatch(60_000, None, None, None),
+        Some((60_000, "full_request_local_authoritative"))
+    );
+}
+
 fn run_turn_multi_thread_test_with_stack<F, Fut, T>(test_name: &'static str, test: F) -> T
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -84,6 +125,32 @@ struct EnvironmentEchoContributor;
 
 struct CountingTurnInputContributor {
     poll_count: Arc<AtomicUsize>,
+}
+
+struct ExposureOnlyTool {
+    name: &'static str,
+    exposure: codex_extension_api::ToolExposure,
+}
+
+impl codex_extension_api::ToolExecutor<codex_extension_api::ToolCall> for ExposureOnlyTool {
+    fn tool_name(&self) -> codex_extension_api::ToolName {
+        codex_extension_api::ToolName::plain(self.name)
+    }
+
+    fn spec(&self) -> codex_extension_api::ToolSpec {
+        panic!("exposure identity tests do not build tool schemas")
+    }
+
+    fn exposure(&self) -> codex_extension_api::ToolExposure {
+        self.exposure
+    }
+
+    fn handle(
+        &self,
+        _call: codex_extension_api::ToolCall,
+    ) -> codex_extension_api::ToolExecutorFuture<'_> {
+        Box::pin(async { panic!("exposure identity tests do not dispatch tools") })
+    }
 }
 
 #[derive(Clone)]
@@ -227,6 +294,90 @@ fn ordinary_continuation_precedence_is_stable() {
         Some(ContinuationCause::PendingInput)
     );
     assert_eq!(ordinary_continuation_cause(false, false, false), None);
+}
+
+#[test]
+fn finalized_router_reuse_requires_identical_coarse_exposure_identity() {
+    let disabled = ToolExposureIdentity {
+        goal_surface_state: GoalSurfaceState::Disabled,
+        ..ToolExposureIdentity::default()
+    };
+    let router = ToolRouter::from_parts_with_warnings_and_identity(
+        ToolRegistry::empty_for_test(),
+        Vec::new(),
+        Vec::new(),
+        disabled.clone(),
+    );
+
+    assert!(finalized_router_matches_exposure(&router, &disabled));
+
+    let inactive = ToolExposureIdentity {
+        goal_surface_state: GoalSurfaceState::Inactive,
+        ..disabled.clone()
+    };
+    assert!(!finalized_router_matches_exposure(&router, &inactive));
+
+    let active = ToolExposureIdentity {
+        goal_surface_state: GoalSurfaceState::Active,
+        ..disabled
+    };
+    assert!(!finalized_router_matches_exposure(&router, &active));
+}
+
+#[test]
+fn goal_surface_state_has_disabled_inactive_and_active_transitions() {
+    let tool = |name, exposure| {
+        Arc::new(ExposureOnlyTool { name, exposure })
+            as Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>
+    };
+
+    assert_eq!(goal_surface_state(&[]), GoalSurfaceState::Disabled);
+    assert_eq!(
+        goal_surface_state(&[tool(
+            "create_goal",
+            codex_extension_api::ToolExposure::Deferred,
+        )]),
+        GoalSurfaceState::Inactive
+    );
+    assert_eq!(
+        goal_surface_state(&[
+            tool("create_goal", codex_extension_api::ToolExposure::Deferred,),
+            tool("get_goal", codex_extension_api::ToolExposure::Direct),
+            tool("update_goal", codex_extension_api::ToolExposure::Direct),
+        ]),
+        GoalSurfaceState::Active
+    );
+}
+
+#[test]
+fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
+    assert_eq!(
+        agent_surface_stage_from_snapshot(false, false, false),
+        AgentSurfaceStage::Prohibited
+    );
+    assert_eq!(
+        agent_surface_stage_from_snapshot(true, false, false),
+        AgentSurfaceStage::SpawnOnly
+    );
+    assert_eq!(
+        agent_surface_stage_from_snapshot(true, true, false),
+        AgentSurfaceStage::Lifecycle
+    );
+    assert_eq!(
+        agent_surface_stage_from_snapshot(true, false, true),
+        AgentSurfaceStage::TypedAdministration
+    );
+    assert_eq!(
+        agent_surface_stage_from_snapshot(true, true, true),
+        AgentSurfaceStage::TypedAdministration
+    );
+
+    // Running/waiting status, gates, targets, and capacity are deliberately absent from this
+    // snapshot, so those fine-grained transitions cannot change the schema identity.
+    assert_eq!(
+        agent_surface_stage_from_snapshot(true, true, false),
+        agent_surface_stage_from_snapshot(true, true, false)
+    );
 }
 
 fn response_input_texts(items: &[ResponseItem]) -> Vec<&str> {

@@ -124,6 +124,18 @@ class CargoLaneTest(unittest.TestCase):
             os.utime(path, (timestamp, timestamp))
         return path
 
+    def make_junction(self, junction: Path, target: Path) -> None:
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
+        )
+        if created.returncode != 0:
+            self.skipTest(f"could not create test junction: {created.stderr}")
+
     def test_rejects_command_mistaken_for_positional_lane(self) -> None:
         result = self.run_fake_cargo("cargo", "check")
 
@@ -373,6 +385,65 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertTrue(trash.exists())
 
+    def test_lane_runner_rejects_junction_root_before_mutation(self) -> None:
+        external_root = self.temp_root / "external-lanes-root"
+        self.mark_lanes_root(external_root)
+        sentinel = external_root / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        junction_root = self.temp_root / "junction-lanes-root"
+        self.make_junction(junction_root, external_root)
+
+        result = self.run_script(
+            "-Lane",
+            f"unit-junction-{os.getpid()}",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo ok",
+            lanes_root=junction_root,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not be a reparse point or junction", result.stderr)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_cleanup_rejects_junction_root(self) -> None:
+        external_root = self.temp_root / "external-cleanup-root"
+        self.mark_lanes_root(external_root)
+        trash = external_root / "old.trash-20260728123456789"
+        trash.mkdir()
+        junction_root = self.temp_root / "junction-cleanup-root"
+        self.make_junction(junction_root, external_root)
+
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CLEANUP_SCRIPT),
+                "-LanesRoot",
+                str(junction_root),
+                "-MaxPasses",
+                "1",
+                "-RetryDelaySeconds",
+                "0",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertTrue(trash.exists())
+
     def test_cleanup_preserves_trash_named_junction_and_external_target(self) -> None:
         self.mark_lanes_root()
         external = self.temp_root / "external-sentinel"
@@ -555,7 +626,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(package)}", result.stdout)
 
-    def test_existing_cargo_target_dir_is_not_duplicated(self) -> None:
+    def test_mismatched_cargo_target_dir_is_rejected(self) -> None:
         package = f"unit-explicit-target-{os.getpid()}"
         explicit_target = self.temp_root / "explicit-target"
 
@@ -570,13 +641,29 @@ class CargoLaneTest(unittest.TestCase):
             package,
         )
 
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match reserved lane target", result.stderr)
+
+    def test_matching_cargo_target_dir_is_not_duplicated(self) -> None:
+        lane = f"unit-matching-target-{os.getpid()}"
+        explicit_target = self.lanes_root / lane
+
+        result = self.run_fake_cargo(
+            "-Lane",
+            lane,
+            "cargo",
+            "check",
+            "--target-dir",
+            str(explicit_target),
+        )
+
         self.assertEqual(
             result.returncode,
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
+        self.assertEqual(result.stdout.count("--target-dir"), 1)
         self.assertIn(f"--target-dir {explicit_target}", result.stdout)
-        self.assertNotIn(str(self.lanes_root), result.stdout)
 
     def test_lowercase_c_is_not_treated_as_value_taking_uppercase_option(self) -> None:
         lane = f"unit-lower-c-{os.getpid()}"
@@ -596,7 +683,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"check --target-dir {self.lane_path(lane)}", result.stdout)
 
-    def test_existing_equals_cargo_target_dir_is_not_duplicated(self) -> None:
+    def test_mismatched_equals_cargo_target_dir_is_rejected(self) -> None:
         package = f"unit-explicit-equals-target-{os.getpid()}"
         explicit_target = "explicit-equals-target"
 
@@ -610,15 +697,10 @@ class CargoLaneTest(unittest.TestCase):
             package,
         )
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertIn(f"--target-dir={explicit_target}", result.stdout)
-        self.assertNotIn(str(self.lanes_root), result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match reserved lane target", result.stderr)
 
-    def test_existing_nextest_target_dir_is_not_duplicated(self) -> None:
+    def test_mismatched_nextest_target_dir_is_rejected(self) -> None:
         package = f"unit-nextest-explicit-target-{os.getpid()}"
         explicit_target = self.temp_root / "nextest-target"
 
@@ -634,13 +716,8 @@ class CargoLaneTest(unittest.TestCase):
             package,
         )
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertIn(f"--target-dir {explicit_target}", result.stdout)
-        self.assertNotIn(str(self.lanes_root), result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match reserved lane target", result.stderr)
 
     def test_auto_lane_reuses_warm_idle_suffix_when_base_lane_is_active(self) -> None:
         package = f"unit-core-active-{os.getpid()}"
@@ -712,7 +789,7 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn(f"--target-dir {self.lane_path(f'{package}-2')}", result.stdout)
 
-    def test_auto_lane_treats_read_only_lock_as_busy(self) -> None:
+    def test_auto_lane_surfaces_read_only_lock_error(self) -> None:
         package = f"unit-core-readonly-{os.getpid()}"
         lane = self.make_lane(package)
         lock_path = lane / ".cargo-lock"
@@ -730,12 +807,8 @@ class CargoLaneTest(unittest.TestCase):
         finally:
             lock_path.chmod(stat.S_IWRITE)
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertIn(f"--target-dir {self.lane_path(f'{package}-2')}", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(self.lane_path(f"{package}-2"), result.stdout)
 
     def test_auto_lane_skips_busy_lane_reservation_lock(self) -> None:
         package = f"unit-core-reserved-{os.getpid()}"
@@ -839,6 +912,42 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"--exec=check -p {package} --target-dir", result.stdout)
         self.assertIn(self.lane_path(package), result.stdout)
 
+    def test_cargo_watch_exec_rejects_mismatched_target_dir(self) -> None:
+        lane = f"unit-watch-mismatch-{os.getpid()}"
+        mismatched_target = self.temp_root / "watch-escape"
+
+        result = self.run_fake_cargo(
+            "-Lane",
+            lane,
+            "cargo",
+            "watch",
+            "-x",
+            f'check --target-dir "{mismatched_target}"',
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match reserved lane target", result.stderr)
+
+    def test_cargo_watch_exec_accepts_matching_target_dir(self) -> None:
+        lane = f"unit-watch-match-{os.getpid()}"
+        matching_target = self.lanes_root / lane
+
+        result = self.run_fake_cargo(
+            "-Lane",
+            lane,
+            "cargo",
+            "watch",
+            "-x",
+            f'check --target-dir "{matching_target}"',
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(result.stdout.count("--target-dir"), 1)
+
     def test_cargo_watch_exec_inserts_target_before_test_arguments(self) -> None:
         result = self.run_fake_cargo(
             "-Lane",
@@ -857,7 +966,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("test --target-dir", result.stdout)
         self.assertIn(" -- --nocapture", result.stdout)
 
-    def test_cargo_watch_shell_command_is_not_rewritten(self) -> None:
+    def test_cargo_watch_shell_command_is_rejected(self) -> None:
         result = self.run_fake_cargo(
             "-Lane",
             "auto",
@@ -867,16 +976,11 @@ class CargoLaneTest(unittest.TestCase):
             "cargo check",
         )
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertNotIn("--target-dir", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--shell/-s is not allowed", result.stderr)
 
-    def test_timestamped_explicit_lane_is_normalized_for_cache_reuse(self) -> None:
+    def test_timestamped_explicit_lane_is_preserved_literally(self) -> None:
         lane = f"unit-stable-{os.getpid()}-20260608183755"
-        stable_lane = lane.removesuffix("-20260608183755")
 
         result = self.run_fake_cargo(
             "-Lane",
@@ -890,8 +994,7 @@ class CargoLaneTest(unittest.TestCase):
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertIn(f"--target-dir {self.lane_path(stable_lane)}", result.stdout)
-        self.assertNotIn("20260608183755", result.stdout)
+        self.assertIn(f"--target-dir {self.lane_path(lane)}", result.stdout)
 
     def test_isolated_cargo_home_preserves_user_config_and_adds_sccache(self) -> None:
         lane = f"unit-cargo-home-{os.getpid()}"

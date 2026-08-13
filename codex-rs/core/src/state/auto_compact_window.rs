@@ -30,7 +30,7 @@ enum AutoCompactWindowPrefill {
     Estimated(i64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AutoCompactWindow {
     window_number: u64,
     ids: AutoCompactWindowIds,
@@ -42,6 +42,9 @@ pub(super) struct AutoCompactWindow {
     /// resume/recompute baselines when available.
     prefill_input_tokens: Option<AutoCompactWindowPrefill>,
     token_budget_reminder_delivered: bool,
+    /// Runtime-only proof that the current post-compaction composition has an
+    /// unavoidable 72K-80K floor. It is never persisted as task evidence.
+    soft_floor_receipt_identity: Option<String>,
 }
 
 impl AutoCompactWindow {
@@ -52,6 +55,7 @@ impl AutoCompactWindow {
             new_context_window_requested: false,
             prefill_input_tokens: None,
             token_budget_reminder_delivered: false,
+            soft_floor_receipt_identity: None,
         }
     }
 
@@ -79,11 +83,20 @@ impl AutoCompactWindow {
         self.new_context_window_requested = false;
         self.prefill_input_tokens = None;
         self.token_budget_reminder_delivered = false;
+        self.soft_floor_receipt_identity = None;
         (self.window_number, self.ids)
     }
 
     pub(super) fn claim_token_budget_reminder(&mut self) -> bool {
         !std::mem::replace(&mut self.token_budget_reminder_delivered, true)
+    }
+
+    pub(super) fn soft_floor_receipt_matches(&self, identity: &str) -> bool {
+        self.soft_floor_receipt_identity.as_deref() == Some(identity)
+    }
+
+    pub(super) fn record_soft_floor_receipt(&mut self, identity: String) {
+        self.soft_floor_receipt_identity = Some(identity);
     }
 
     pub(super) fn request_new_context_window(&mut self) {
@@ -232,5 +245,18 @@ mod tests {
                 prefill_input_tokens: None,
             }
         );
+    }
+
+    #[test]
+    fn soft_floor_receipt_is_reused_only_for_the_same_identity_and_window() {
+        let mut window = AutoCompactWindow::new_with_ids(AutoCompactWindowIds::new_initial());
+
+        assert!(!window.soft_floor_receipt_matches("identity-a"));
+        window.record_soft_floor_receipt("identity-a".to_string());
+        assert!(window.soft_floor_receipt_matches("identity-a"));
+        assert!(!window.soft_floor_receipt_matches("identity-b"));
+
+        window.advance();
+        assert!(!window.soft_floor_receipt_matches("identity-a"));
     }
 }

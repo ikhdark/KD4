@@ -17,7 +17,7 @@ fn render_plugins_section_keeps_plugin_usage_guidance_without_listing_plugins() 
     }])
     .expect("plugin section should render");
 
-    let expected = "<plugins_instructions>\n## Plugins\nA plugin is a local bundle of skills, MCP servers, and apps.\n### How to use plugins\n- Skill naming: If a plugin contributes skills, those skill entries are prefixed with `plugin_name:` in the Skills list.\n- MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as `mcp__server__tool`; use tool provenance to tell which plugin they come from.\n- Use: If the user names a plugin, prefer its relevant capabilities for that turn. Otherwise, use plugin-contributed capabilities when their exposed descriptions clearly match the task. Invoke the contributed skill, MCP tool, or app; plugins are not invoked directly.\n- Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for the task, say so briefly and continue with the best fallback.\n</plugins_instructions>";
+    let expected = "<plugins_instructions>\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; invoke the contributed capability, not the bundle. Prefer a named plugin's relevant capabilities. If none are callable, say so briefly and use the best fallback.\n</plugins_instructions>";
 
     assert_eq!(rendered, expected);
 }

@@ -41,6 +41,8 @@ class Kd4SyncAuditTest(unittest.TestCase):
         self.git("commit", "-m", "upstream")
         upstream = self.git("rev-parse", "HEAD").stdout.strip()
         self.git("update-ref", "refs/remotes/upstream/main", upstream)
+        self.git("update-ref", "refs/heads/main", upstream)
+        self.git("remote", "add", "upstream", str(self.repo))
 
         self.git("checkout", "-b", "fork", self.base)
         (self.repo / "fork.txt").write_text("fork\n", encoding="utf-8")
@@ -48,6 +50,17 @@ class Kd4SyncAuditTest(unittest.TestCase):
             (self.repo / "shared.txt").write_text("fork\n", encoding="utf-8")
         self.git("add", ".")
         self.git("commit", "-m", "fork")
+
+    def test_stale_local_upstream_ref_is_not_safe(self) -> None:
+        self.create_divergence(conflict=False)
+        stale = self.git("rev-parse", "refs/remotes/upstream/main").stdout.strip()
+        self.git("update-ref", "refs/remotes/upstream/main", self.base)
+
+        audit = kd4_sync_audit.audit_repository(self.repo)
+
+        self.assertEqual(audit.upstream_remote_tip, stale)
+        self.assertTrue(audit.upstream_ref_stale)
+        self.assertFalse(audit.safe_for_in_place_sync)
 
     def test_clean_trial_merge_is_safe_for_pristine_worktree(self) -> None:
         self.create_divergence(conflict=False)

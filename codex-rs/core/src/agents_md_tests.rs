@@ -364,6 +364,94 @@ fn project_provenance(path: AbsolutePathBuf, cwd: AbsolutePathBuf) -> Instructio
     }
 }
 
+fn stable_context_loaded(entries: &[(&str, &str)]) -> LoadedAgentsMd {
+    let cwd = PathUri::parse("file:///stable-context-repository").expect("cwd URI");
+    LoadedAgentsMd {
+        user_instructions: None,
+        entries: entries
+            .iter()
+            .map(|(name, contents)| InstructionEntry {
+                contents: (*contents).to_string(),
+                provenance: InstructionProvenance::Project {
+                    source_path: cwd.join(name).expect("source URI"),
+                    environment_id: "local".to_string(),
+                    cwd: cwd.clone(),
+                },
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn repository_stable_context_identity_covers_sources_order_scope_and_content() {
+    let cwd = PathUri::parse("file:///stable-context-repository").expect("cwd URI");
+    let moved_cwd = PathUri::parse("file:///stable-context-repository/nested").expect("cwd URI");
+    let original = stable_context_loaded(&[("AGENTS.md", "root"), ("nested/AGENTS.md", "nested")]);
+    let edited =
+        stable_context_loaded(&[("AGENTS.md", "root edited"), ("nested/AGENTS.md", "nested")]);
+    let added = stable_context_loaded(&[
+        ("AGENTS.md", "root"),
+        ("extra/AGENTS.md", "extra"),
+        ("nested/AGENTS.md", "nested"),
+    ]);
+    let removed = stable_context_loaded(&[("nested/AGENTS.md", "nested")]);
+    let reordered = stable_context_loaded(&[("nested/AGENTS.md", "nested"), ("AGENTS.md", "root")]);
+    let moved_source =
+        stable_context_loaded(&[("moved/AGENTS.md", "root"), ("nested/AGENTS.md", "nested")]);
+
+    let identity = original.stable_context_identity(&cwd);
+    for changed in [&edited, &added, &removed, &reordered, &moved_source] {
+        assert_ne!(identity, changed.stable_context_identity(&cwd));
+    }
+    assert_ne!(identity, original.stable_context_identity(&moved_cwd));
+}
+
+#[test]
+fn unchanged_repository_stable_context_bundle_reuses_cached_rendering() {
+    let cwd = PathUri::parse("file:///stable-context-cache-test").expect("cwd URI");
+    let loaded = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![InstructionEntry {
+            contents: "cache-test-unique-instructions".to_string(),
+            provenance: InstructionProvenance::Project {
+                source_path: cwd.join("AGENTS.md").expect("source URI"),
+                environment_id: "cache-test".to_string(),
+                cwd: cwd.clone(),
+            },
+        }],
+    };
+
+    let first = loaded.stable_context_bundle(&cwd);
+    let second = loaded.stable_context_bundle(&cwd);
+
+    assert!(!first.reused);
+    assert!(!first.semantic_replacement);
+    assert!(second.reused);
+    assert!(!second.semantic_replacement);
+    assert_eq!(first.identity, second.identity);
+    assert!(Arc::ptr_eq(&first.rendered, &second.rendered));
+}
+
+#[test]
+fn byte_identical_repository_from_a_different_source_is_a_semantic_replacement() {
+    let cwd = PathUri::parse("file:///stable-context-semantic-replacement").expect("cwd URI");
+    let original = stable_context_loaded(&[(
+        "semantic-original/AGENTS.md",
+        "semantic-replacement-identical-bytes",
+    )]);
+    let moved = stable_context_loaded(&[(
+        "semantic-moved/AGENTS.md",
+        "semantic-replacement-identical-bytes",
+    )]);
+
+    let first = original.stable_context_bundle(&cwd);
+    let second = moved.stable_context_bundle(&cwd);
+
+    assert_ne!(first.identity, second.identity);
+    assert_eq!(first.rendered, second.rendered);
+    assert!(second.semantic_replacement);
+}
+
 #[test]
 fn foreign_agents_md_uses_environment_native_paths() {
     let (cwd, rendered_cwd) = if cfg!(windows) {

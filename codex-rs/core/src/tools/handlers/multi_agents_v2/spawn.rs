@@ -5,6 +5,7 @@ use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::AgentRoleLocks;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::agent::role::resolve_role_config;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::context::ContextualUserFragment;
@@ -13,9 +14,11 @@ use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use codex_agent_task_store::AcceptanceCriterion;
+use codex_agent_task_store::AdmissionRejectionReason;
 use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentTaskBindingDraft;
 use codex_agent_task_store::AgentTaskStore;
+use codex_agent_task_store::ArchitectureContractRef;
 use codex_agent_task_store::Assignment;
 use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
@@ -31,6 +34,7 @@ use codex_agent_task_store::WorkspaceStrategy;
 use codex_agent_task_store::normalize_repo_path;
 use codex_context_fragments::ModelContextBudget;
 use codex_git_utils::get_git_repo_root;
+use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -188,6 +192,50 @@ async fn handle_spawn_agent(
             "spawned agent is missing a canonical task name".to_string(),
         )
     })?;
+    // Typed spawns reserve execution, registry identity, and V2 residency before any
+    // worktree or durable assignment preparation. The token holds only logical RAII
+    // reservations; all synchronization guards used to create it have already been released.
+    let typed_role_metric = typed_role.map(agent_role_metric_label);
+    if let Some(role) = typed_role_metric {
+        turn.session_telemetry.counter(
+            "codex.multi_agent.typed_spawn_lifecycle",
+            1,
+            &[("outcome", "attempted"), ("role", role)],
+        );
+    }
+    let mut typed_reservation_metric = None;
+    let mut prepared_typed_spawn = if let Some(role) = typed_role_metric {
+        match session
+            .services
+            .agent_control
+            .prepare_typed_spawn(&config, spawn_source.clone(), Some(session.thread_id))
+            .await
+        {
+            Ok(prepared) => {
+                turn.session_telemetry.counter(
+                    "codex.multi_agent.typed_spawn_lifecycle",
+                    1,
+                    &[("outcome", "reserved"), ("role", role)],
+                );
+                typed_reservation_metric = Some(TypedSpawnReservationMetric::new(
+                    turn.session_telemetry.clone(),
+                    role,
+                ));
+                Some(prepared)
+            }
+            Err(error) => {
+                turn.session_telemetry.counter(
+                    "codex.multi_agent.typed_spawn_lifecycle",
+                    1,
+                    &[("outcome", "reservation_rejected"), ("role", role)],
+                );
+                return Err(collab_spawn_error(error));
+            }
+        }
+    } else {
+        None
+    };
+    let mut consumed_typed_spawn = None;
     let typed_task = if let Some(assignment_args) = args.assignment.take() {
         let role = typed_role.ok_or_else(|| {
             FunctionCallError::RespondToModel(
@@ -263,9 +311,39 @@ async fn handle_spawn_agent(
         };
         let relevant_handles = assignment_args.relevant_handles.clone();
         let draft = assignment_args.into_draft(root_session_id, role);
-        let (assignment, attempt) = match coordinator.create_assignment(&repo_root, draft).await {
+        let isolated_integrator_available = resolve_role_config(&config, "integrator").is_some();
+        let prepared = prepared_typed_spawn.take().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent: typed spawn reservation became unavailable".to_string(),
+            )
+        })?;
+        consumed_typed_spawn = match session
+            .services
+            .agent_control
+            .consume_prepared_typed_spawn(prepared, &config, &spawn_source, Some(session.thread_id))
+            .await
+        {
+            Ok(consumed) => Some(consumed),
+            Err(error) => {
+                if let Some(workspace) = isolated_workspace.take()
+                    && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                {
+                    tracing::warn!(
+                        path = %workspace.path.display(),
+                        %cleanup_error,
+                        "failed to clean isolated worktree after typed reservation revalidation failure"
+                    );
+                }
+                return Err(collab_spawn_error(error));
+            }
+        };
+        let admitted = match coordinator
+            .create_admitted_assignment(&repo_root, draft, isolated_integrator_available)
+            .await
+        {
             Ok(task) => task,
             Err(error) => {
+                emit_admission_rejection_metric(&turn.session_telemetry, &error);
                 if let Some(workspace) = isolated_workspace.take()
                     && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
                 {
@@ -278,6 +356,9 @@ async fn handle_spawn_agent(
                 return Err(typed_task_store_error(error));
             }
         };
+        emit_admission_overlap_metrics(&turn.session_telemetry, admitted.overlaps);
+        let assignment = admitted.assignment;
+        let attempt = admitted.attempt;
         let task_capsule = if matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)) {
             match construct_and_attach_task_capsule(
                 store.as_ref(),
@@ -349,15 +430,21 @@ async fn handle_spawn_agent(
         .as_ref()
         .and_then(|(_, _, capsule)| capsule.as_ref())
     {
+        let prepared = consumed_typed_spawn.take().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent: typed spawn reservation became unavailable".to_string(),
+            )
+        })?;
         Box::pin(
             session
                 .services
                 .agent_control
-                .spawn_agent_with_task_capsule(
+                .spawn_agent_with_prepared_typed_task_capsule(
                     config,
                     canonical_payload.clone(),
-                    Some(spawn_source),
+                    spawn_source,
                     options,
+                    prepared,
                 ),
         )
         .await
@@ -384,19 +471,41 @@ async fn handle_spawn_agent(
         };
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
-        Box::pin(
-            session
-                .services
-                .agent_control
-                .spawn_agent_with_communication(
-                    config,
-                    communication,
-                    context,
-                    Some(spawn_source),
-                    options,
-                ),
-        )
-        .await
+        if typed_task.is_some() {
+            let prepared = consumed_typed_spawn.take().ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "spawn_agent: typed spawn reservation became unavailable".to_string(),
+                )
+            })?;
+            Box::pin(
+                session
+                    .services
+                    .agent_control
+                    .spawn_agent_with_prepared_typed_communication(
+                        config,
+                        communication,
+                        context,
+                        spawn_source,
+                        options,
+                        prepared,
+                    ),
+            )
+            .await
+        } else {
+            Box::pin(
+                session
+                    .services
+                    .agent_control
+                    .spawn_agent_with_communication(
+                        config,
+                        communication,
+                        context,
+                        Some(spawn_source),
+                        options,
+                    ),
+            )
+            .await
+        }
     };
     let spawned_agent = match spawned_agent {
         Ok(spawned_agent) => spawned_agent,
@@ -451,6 +560,9 @@ async fn handle_spawn_agent(
             return Err(collab_spawn_error(error));
         }
     };
+    if let Some(metric) = typed_reservation_metric.as_mut() {
+        metric.mark_retained();
+    }
     let new_thread_id = spawned_agent.thread_id;
     let agent_snapshot = session
         .services
@@ -495,6 +607,136 @@ async fn handle_spawn_agent(
             nickname,
             assignment_id,
         })
+    }
+}
+
+struct TypedSpawnReservationMetric {
+    session_telemetry: SessionTelemetry,
+    role: &'static str,
+    retained: bool,
+}
+
+impl TypedSpawnReservationMetric {
+    fn new(session_telemetry: SessionTelemetry, role: &'static str) -> Self {
+        Self {
+            session_telemetry,
+            role,
+            retained: false,
+        }
+    }
+
+    fn mark_retained(&mut self) {
+        self.retained = true;
+        self.session_telemetry.counter(
+            "codex.multi_agent.typed_spawn_lifecycle",
+            1,
+            &[("outcome", "retained"), ("role", self.role)],
+        );
+    }
+}
+
+impl Drop for TypedSpawnReservationMetric {
+    fn drop(&mut self) {
+        if !self.retained {
+            self.session_telemetry.counter(
+                "codex.multi_agent.typed_spawn_lifecycle",
+                1,
+                &[("outcome", "reservation_released"), ("role", self.role)],
+            );
+        }
+    }
+}
+
+const fn agent_role_metric_label(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Architect => "architect",
+        AgentRole::Explorer => "explorer",
+        AgentRole::Worker => "worker",
+        AgentRole::Reviewer => "reviewer",
+        AgentRole::Verifier => "verifier",
+        AgentRole::Integrator => "integrator",
+    }
+}
+
+fn emit_admission_overlap_metrics(
+    session_telemetry: &SessionTelemetry,
+    overlaps: codex_agent_task_store::AdmissionOverlapSummary,
+) {
+    for (kind, count) in [
+        ("benign_read_read", overlaps.benign_read_overlap_count),
+        (
+            "duplicated_primary_investigation",
+            overlaps.duplicated_primary_investigation_count,
+        ),
+        (
+            "conflicting_write_read",
+            overlaps.conflicting_write_read_count,
+        ),
+        (
+            "conflicting_write_write",
+            overlaps.conflicting_write_write_count,
+        ),
+    ] {
+        if count > 0 {
+            session_telemetry.counter(
+                "codex.multi_agent.admission_overlap",
+                i64::from(count),
+                &[("kind", kind), ("outcome", "admitted")],
+            );
+        }
+    }
+}
+
+fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: &StoreError) {
+    const MAX_RECORDED_OVERLAP_COUNT: i64 = 1_024;
+    let (reason, overlap_kind, overlap_count) = match error {
+        StoreError::AdmissionRejected { reason } => match reason {
+            AdmissionRejectionReason::DuplicateExplorerInvestigation => (
+                "duplicate_explorer_investigation",
+                Some("duplicated_primary_investigation"),
+                1,
+            ),
+            AdmissionRejectionReason::CorrectnessSensitiveReadConflict => (
+                "correctness_sensitive_read_conflict",
+                Some("conflicting_write_read"),
+                1,
+            ),
+            AdmissionRejectionReason::ActiveValidationConflict => (
+                "active_validation_conflict",
+                Some("conflicting_write_read"),
+                1,
+            ),
+            AdmissionRejectionReason::IsolatedIntegratorUnavailable => {
+                ("isolated_integrator_unavailable", None, 0)
+            }
+        },
+        StoreError::WriteClaimConflict { conflicts } => (
+            "conflicting_write_write",
+            Some("conflicting_write_write"),
+            i64::try_from(conflicts.len())
+                .unwrap_or(MAX_RECORDED_OVERLAP_COUNT)
+                .clamp(1, MAX_RECORDED_OVERLAP_COUNT),
+        ),
+        StoreError::WorkspaceClaimConflict { details } => (
+            "conflicting_write_read",
+            Some("conflicting_write_read"),
+            i64::try_from(details.len())
+                .unwrap_or(MAX_RECORDED_OVERLAP_COUNT)
+                .clamp(1, MAX_RECORDED_OVERLAP_COUNT),
+        ),
+        _ => ("other", None, 0),
+    };
+    session_telemetry.counter(
+        "codex.multi_agent.admission",
+        1,
+        &[("outcome", "rejected"), ("reason", reason)],
+    );
+    if let Some(kind) = overlap_kind {
+        session_telemetry.counter(
+            "codex.multi_agent.admission_overlap",
+            overlap_count,
+            &[("kind", kind), ("outcome", "rejected")],
+        );
     }
 }
 
@@ -888,6 +1130,8 @@ struct TypedAssignmentArgs {
     #[serde(default)]
     workspace_strategy: WorkspaceStrategy,
     relation: Option<AssignmentRelation>,
+    #[serde(default)]
+    architecture_contract_ref: Option<ArchitectureContractRef>,
 }
 
 impl TypedAssignmentArgs {
@@ -908,6 +1152,7 @@ impl TypedAssignmentArgs {
             contract_claims: self.contract_claims,
             workspace_strategy: self.workspace_strategy,
             relation: self.relation,
+            architecture_contract_ref: self.architecture_contract_ref,
         }
     }
 }
@@ -1067,6 +1312,7 @@ async fn construct_and_attach_task_capsule(
 fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallError> {
     match agent_type.map(str::trim).filter(|role| !role.is_empty()) {
         Some(role) => match role {
+            "architect" => Ok(AgentRole::Architect),
             "explorer" => Ok(AgentRole::Explorer),
             "worker" => Ok(AgentRole::Worker),
             "reviewer" => Ok(AgentRole::Reviewer),
@@ -1163,6 +1409,7 @@ mod tests {
             relevant_handles: Vec::new(),
             workspace_strategy: WorkspaceStrategy::Auto,
             relation: None,
+            architecture_contract_ref: None,
         }
     }
 
@@ -1311,6 +1558,7 @@ mod tests {
     #[test]
     fn custom_role_aliases_are_rejected_for_typed_tasks() {
         for agent_type in [
+            "kd4_architect",
             "kd4_explorer",
             "kd4_worker",
             "kd4_reviewer",
@@ -1319,6 +1567,18 @@ mod tests {
         ] {
             assert!(parse_typed_role(Some(agent_type)).is_err());
         }
+    }
+
+    #[test]
+    fn typed_architect_is_a_distinct_read_only_role() {
+        let role = parse_typed_role(Some("architect")).expect("architect role");
+
+        assert_eq!(role, AgentRole::Architect);
+        assert_eq!(
+            role.capability_profile(),
+            AgentRole::Explorer.capability_profile()
+        );
+        assert_ne!(role, AgentRole::Explorer);
     }
 
     #[test]

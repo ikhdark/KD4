@@ -45,6 +45,14 @@ impl CodeModeDispatchBroker {
         remove_dispatch_gate(&self.dispatch_gates, cell_id);
     }
 
+    pub(super) fn has_waitable_cells(&self) -> bool {
+        !self
+            .dispatch_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     pub(super) fn start_turn_worker(
         &self,
         exec: ExecContext,

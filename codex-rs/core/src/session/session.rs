@@ -49,6 +49,9 @@ pub(crate) struct Session {
     pub(crate) startup_timing: Arc<StartupTimingState>,
     /// Owns terminal coordinators so request cancellation cannot strand a claimed turn.
     pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
+    /// Admission stays closed while the prior turn is between terminal claim and the
+    /// interaction-released milestone, even if its raw active-turn slot is being detached.
+    pub(crate) terminal_interaction_pending: std::sync::atomic::AtomicBool,
     /// Prevents terminal cleanup from waking queued work after shutdown begins.
     pub(crate) shutting_down: std::sync::atomic::AtomicBool,
     pub(crate) input_queue: InputQueue,
@@ -483,6 +486,10 @@ impl Session {
 
     pub(crate) fn try_acquire_completion_review_slot(&self) -> Option<SemaphorePermit<'_>> {
         self.completion_review_slot.try_acquire().ok()
+    }
+
+    pub(crate) fn completion_review_capacity_available(&self) -> bool {
+        self.completion_review_slot.available_permits() > 0
     }
 
     pub(crate) async fn originator(&self) -> String {
@@ -975,10 +982,18 @@ impl Session {
             session_configuration.thread_name = thread_name.clone();
             validate_config_lock_if_configured(&session_configuration).await?;
             export_config_lock_if_configured(&session_configuration, thread_id).await?;
-            let state = SessionState::new_with_auto_compact_window_ids(
+            let mut state = SessionState::new_with_auto_compact_window_ids(
                 session_configuration.clone(),
                 initial_auto_compact_window_ids,
             );
+            if config.completed_tool_history_projection {
+                let tool_history = crate::tool_history::load_tool_history_state(
+                    config.codex_home.as_path(),
+                    &thread_id.to_string(),
+                )
+                .await;
+                state.set_tool_history_state(tool_history);
+            }
             let managed_network_requirements_configured = config
                 .config_layer_stack
                 .requirements_toml()
@@ -1212,6 +1227,7 @@ impl Session {
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
+                terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),

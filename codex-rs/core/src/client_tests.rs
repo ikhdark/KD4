@@ -10,6 +10,11 @@ use super::ModelRequestMeasurements;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
 use super::UnauthorizedRecoveryExecution;
+use super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION;
+use super::WebsocketCachePublicationPermit;
+use super::WebsocketHistoryBaseline;
+use super::WebsocketSession;
+use super::WebsocketTransportCache;
 use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
@@ -21,13 +26,17 @@ use super::new_sampling_request_id;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
+use crate::context::PromptProvenanceSidecar;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::stable_context::StableContextManifest;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
+use codex_api::ResponseCreateWsRequest;
 use codex_api::ResponseEvent;
 use codex_api::ResponsesApiRequest;
+use codex_api::ResponsesWsRequest;
 use codex_api::TransportError;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -164,6 +173,104 @@ fn websocket_stream_retries_when_another_session_already_activated_http_fallback
     assert!(!concurrent_session.try_switch_fallback_transport(&telemetry, &model_info));
 }
 
+#[test]
+fn lane2_websocket_cache_denies_speculative_publication() {
+    let client = websocket_test_model_client();
+    let normal_session = client.new_session();
+    let speculative_session = client.new_speculative_session();
+
+    assert!(normal_session.websocket_cache_publication.is_some());
+    assert!(speculative_session.websocket_cache_publication.is_none());
+}
+
+#[test]
+fn lane2_websocket_cache_admits_only_one_current_publisher() {
+    let cache = Arc::new(Mutex::new(WebsocketTransportCache::default()));
+    let permit = WebsocketCachePublicationPermit { epoch: 0 };
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut publishers = Vec::new();
+
+    for _ in 0..2 {
+        let cache = Arc::clone(&cache);
+        let barrier = Arc::clone(&barrier);
+        publishers.push(std::thread::spawn(move || {
+            barrier.wait();
+            cache
+                .lock()
+                .expect("websocket transport cache lock")
+                .publish_if_current(permit, WebsocketSession::default())
+        }));
+    }
+    barrier.wait();
+
+    let published = publishers
+        .into_iter()
+        .map(|publisher| publisher.join().expect("publisher thread"))
+        .filter(|published| *published)
+        .count();
+    assert_eq!(published, 1);
+    assert!(
+        cache
+            .lock()
+            .expect("websocket transport cache lock")
+            .session
+            .is_some()
+    );
+}
+
+#[test]
+fn lane2_websocket_cache_rejects_revoked_publisher() {
+    let mut cache = WebsocketTransportCache {
+        epoch: 1,
+        session: None,
+    };
+
+    assert!(!cache.publish_if_current(
+        WebsocketCachePublicationPermit { epoch: 0 },
+        WebsocketSession::default(),
+    ));
+    assert!(cache.session.is_none());
+}
+
+#[test]
+fn lane2_websocket_cache_drops_turn_scoped_state() {
+    let request = history_test_request(vec![history_test_item("warmup", Some("turn-1"))]);
+    let request_prefix = CanonicalPrefixHash::from_items(&request.input).expect("prefix hash");
+    let request_properties_fingerprint =
+        super::responses_request_properties_fingerprint(&request).expect("request fingerprint");
+    let (_last_response_tx, last_response_rx) = tokio::sync::oneshot::channel();
+    let session = WebsocketSession {
+        setup_fingerprint: Some(super::WebsocketSetupFingerprint([7; 32])),
+        last_request: Some(request),
+        last_request_history: Some(WebsocketHistoryBaseline {
+            request_prefix,
+            request_properties_fingerprint,
+            stable_context_fingerprint: [3; 32],
+            provider_response_id_established: true,
+            generation: 9,
+            normalization_policy_version: WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION,
+        }),
+        next_history_generation: 10,
+        last_response_rx: Some(last_response_rx),
+        last_response_from_untraced_warmup: true,
+        ..WebsocketSession::default()
+    };
+    session.set_connection_reused(/*connection_reused*/ true);
+
+    let cached = session.into_transport_only();
+
+    assert_eq!(
+        cached.setup_fingerprint,
+        Some(super::WebsocketSetupFingerprint([7; 32]))
+    );
+    assert!(cached.last_request.is_none());
+    assert!(cached.last_request_history.is_none());
+    assert_eq!(cached.next_history_generation, 0);
+    assert!(cached.last_response_rx.is_none());
+    assert!(!cached.last_response_from_untraced_warmup);
+    assert!(!cached.connection_reused());
+}
+
 fn history_test_item(text: &str, turn_id: Option<&str>) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -200,6 +307,10 @@ fn history_test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
     }
 }
 
+fn history_test_provenance(request: &ResponsesApiRequest) -> PromptProvenanceSidecar {
+    PromptProvenanceSidecar::from_assembled_items(&request.input, &StableContextManifest::default())
+}
+
 #[test]
 fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
     let sensitive_payload = "UNIQUE_PROMPT_SENTINEL_42";
@@ -223,11 +334,15 @@ fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
         assert!(uuid::Uuid::parse_str(id).is_ok());
     }
 
-    let measurements =
-        ModelRequestMeasurements::for_responses_request(&history_test_request(vec![
-            history_test_item(sensitive_payload, None),
-        ]))
-        .expect("measure request");
+    let request = history_test_request(vec![history_test_item(sensitive_payload, None)]);
+    let measurements = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &history_test_provenance(&request),
+        None,
+        None,
+        None,
+    )
+    .expect("measure request");
     let mut first = ModelAttemptGuard::new(
         test_session_telemetry(),
         &sampling_request_id,
@@ -265,10 +380,22 @@ fn model_request_measurements_count_serialized_tools_independently() {
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
     })]);
 
-    let baseline = ModelRequestMeasurements::for_responses_request(&without_tools)
-        .expect("measure request without tools");
-    let measured = ModelRequestMeasurements::for_responses_request(&with_tools)
-        .expect("measure request with tools");
+    let baseline = ModelRequestMeasurements::for_responses_request(
+        &without_tools,
+        &history_test_provenance(&without_tools),
+        None,
+        None,
+        None,
+    )
+    .expect("measure request without tools");
+    let measured = ModelRequestMeasurements::for_responses_request(
+        &with_tools,
+        &history_test_provenance(&with_tools),
+        None,
+        None,
+        None,
+    )
+    .expect("measure request with tools");
     let serialized_tools = serde_json::to_string(with_tools.tools.as_ref().unwrap()).unwrap();
 
     assert_eq!(baseline.tool_token_count, 0);
@@ -283,8 +410,14 @@ fn model_request_measurements_count_serialized_tools_independently() {
 #[test]
 fn model_request_measurements_reconcile_and_match_serialized_wire_payload() {
     let request = history_test_request(vec![history_test_item(r#"input with escaping: \""#, None)]);
-    let measured =
-        ModelRequestMeasurements::for_responses_request(&request).expect("measure request");
+    let measured = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &history_test_provenance(&request),
+        None,
+        None,
+        None,
+    )
+    .expect("measure request");
     let final_payload = serde_json::to_vec(&request).expect("serialize final request");
     let classified = measured.base_instructions_bytes
         + measured.tool_schemas_bytes
@@ -307,8 +440,67 @@ fn model_request_measurements_reconcile_and_match_serialized_wire_payload() {
             <= MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES
     );
     assert_eq!(measured.conversation_history_bytes, 0);
-    assert_eq!(measured.current_input_bytes, 0);
+    assert!(measured.current_input_bytes > 0);
     assert_eq!(measured.other_injected_context_bytes > 0, true);
+}
+
+#[test]
+fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
+    let first_request = history_test_request(vec![history_test_item("first task", Some("turn-1"))]);
+    let mut first = ModelRequestMeasurements::for_responses_request(
+        &first_request,
+        &history_test_provenance(&first_request),
+        None,
+        None,
+        None,
+    )
+    .expect("measure first request");
+    let mut baseline = None;
+    first.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"));
+    assert!(!first.fixed_prefix_reuse_eligible);
+
+    let second_request =
+        history_test_request(vec![history_test_item("different task", Some("turn-2"))]);
+    let mut second = ModelRequestMeasurements::for_responses_request(
+        &second_request,
+        &history_test_provenance(&second_request),
+        None,
+        None,
+        None,
+    )
+    .expect("measure second request");
+    second.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"));
+    assert!(second.fixed_prefix_reuse_eligible);
+    let category = |name| {
+        second
+            .prompt_context_categories
+            .iter()
+            .find(|measurement| measurement.category == name)
+            .expect("category measurement")
+    };
+    assert!(category("base_system").unchanged_from_previous_request);
+    assert!(!category("task_input").unchanged_from_previous_request);
+
+    let mut changed_tools = second_request;
+    changed_tools.tools = Some(vec![json!({"type": "function", "name": "changed"})]);
+    let mut third = ModelRequestMeasurements::for_responses_request(
+        &changed_tools,
+        &history_test_provenance(&changed_tools),
+        None,
+        None,
+        None,
+    )
+    .expect("measure changed fixed prefix");
+    third.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"));
+    assert!(!third.fixed_prefix_reuse_eligible);
+    assert!(
+        !third
+            .prompt_context_categories
+            .iter()
+            .find(|measurement| measurement.category == "tool_schemas")
+            .expect("tool schema category")
+            .unchanged_from_previous_request
+    );
 }
 
 #[test]
@@ -351,7 +543,7 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
     let original = history_test_request(vec![history_test_item("user", Some("turn-a"))]);
-    session.remember_request_history(&original);
+    session.remember_request_history(&original, [1; 32]);
     session.websocket_session.last_request = Some(original.clone());
     let response = LastResponse {
         response_id: "response-1".to_string(),
@@ -390,7 +582,7 @@ fn websocket_incremental_history_invalidates_without_dropping_transport_contract
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
     let request = history_test_request(vec![history_test_item("user", None)]);
-    session.remember_request_history(&request);
+    session.remember_request_history(&request, [1; 32]);
     session.websocket_session.last_request = Some(request);
     let generation_before = session.websocket_session.next_history_generation;
 
@@ -399,6 +591,138 @@ fn websocket_incremental_history_invalidates_without_dropping_transport_contract
     assert!(session.websocket_session.last_request.is_none());
     assert!(session.websocket_session.last_request_history.is_none());
     assert!(session.websocket_session.next_history_generation > generation_before);
+}
+
+#[test]
+fn websocket_exact_stable_prefix_inherits_existing_response_id() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let original = history_test_request(vec![history_test_item("user", None)]);
+    session.remember_request_history(&original, [7; 32]);
+    session.websocket_session.last_request = Some(original.clone());
+    let response = LastResponse {
+        response_id: "response-old".to_string(),
+        items_added: vec![history_test_item("assistant", None)],
+    };
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(response.clone())
+        .expect("response receiver open");
+    session.websocket_session.last_response_rx = Some(receiver);
+    let delta = history_test_item("next", None);
+    let mut current = original;
+    current.input = current
+        .input
+        .iter()
+        .cloned()
+        .chain(response.items_added)
+        .chain([delta.clone()])
+        .collect::<Vec<_>>()
+        .into();
+
+    let (prepared, _) = session.prepare_websocket_request(
+        ResponseCreateWsRequest::from(&current),
+        &current,
+        [7; 32],
+    );
+    let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
+    assert_eq!(
+        prepared.previous_response_id.as_deref(),
+        Some("response-old")
+    );
+    assert_eq!(prepared.input.as_ref(), &[delta]);
+}
+
+#[test]
+fn websocket_stable_replacement_rebases_without_stale_inheritance() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let old = history_test_request(vec![history_test_item("old stable", None)]);
+    session.remember_request_history(&old, [1; 32]);
+    session.websocket_session.last_request = Some(old);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(LastResponse {
+            response_id: "response-stale".to_string(),
+            items_added: Vec::new(),
+        })
+        .expect("response receiver open");
+    session.websocket_session.last_response_rx = Some(receiver);
+    let current = history_test_request(vec![history_test_item("new stable", None)]);
+
+    let (prepared, _) = session.prepare_websocket_request(
+        ResponseCreateWsRequest::from(&current),
+        &current,
+        [2; 32],
+    );
+    let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
+    assert!(prepared.previous_response_id.is_none());
+    assert_eq!(prepared.input, current.input);
+    assert!(session.websocket_session.last_request.is_none());
+    assert!(session.websocket_session.last_response_rx.is_none());
+
+    // A failed fresh replay has not installed any new response baseline, so a
+    // retry remains a complete, non-inheriting replay.
+    let (retry, _) = session.prepare_websocket_request(
+        ResponseCreateWsRequest::from(&current),
+        &current,
+        [2; 32],
+    );
+    let ResponsesWsRequest::ResponseCreate(retry) = retry;
+    assert!(retry.previous_response_id.is_none());
+    assert_eq!(retry.input, current.input);
+}
+
+#[tokio::test]
+async fn stable_context_fallback_request_replays_complete_input() {
+    let client = test_model_client(SessionSource::Cli);
+    let projected = history_test_item("projected delta", None);
+    let stable = history_test_item("stable prefix", None);
+    let prompt = Prompt {
+        input: vec![projected.clone()].into(),
+        stable_context_fallback_input: vec![stable.clone(), projected.clone()].into(),
+        ..Prompt::default()
+    };
+    let model_info = test_model_info();
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /* turn_id */ None,
+        format!("{}:0", client.state.thread_id),
+        /* parent_thread_id */ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let setup = client
+        .current_client_setup()
+        .await
+        .expect("client setup should resolve");
+
+    let normal = client
+        .build_responses_request_with_input(
+            &setup.api_provider,
+            &prompt,
+            &model_info,
+            /* effort */ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /* service_tier */ None,
+            &responses_metadata,
+            /* use_stable_context_fallback */ false,
+        )
+        .expect("normal request should build");
+    let fallback = client
+        .build_responses_request_with_input(
+            &setup.api_provider,
+            &prompt,
+            &model_info,
+            /* effort */ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /* service_tier */ None,
+            &responses_metadata,
+            /* use_stable_context_fallback */ true,
+        )
+        .expect("fallback request should build");
+
+    assert_eq!(normal.input.as_ref(), std::slice::from_ref(&projected));
+    assert_eq!(fallback.input.as_ref(), &[stable, projected]);
 }
 
 #[test]

@@ -22,7 +22,7 @@ impl ContextualUserFragment for AppsInstructions {
 
     fn body(&self) -> String {
         format!(
-            "\n## Apps (Connectors)\nApps expose MCP tools through the `{CODEX_APPS_MCP_SERVER_NAME}` MCP. Use an installed app when the user names it with `[$app-name](app://{{connector_id}})` or when it is clearly relevant to the request.\nAn app's tools may already be available or may be discoverable through `tool_search`; use that tool only when it is listed for the current turn.\nDo not use `list_mcp_resources` or `list_mcp_resource_templates` to discover apps.\n"
+            "\n## Apps (Connectors)\nUse a relevant installed app when named as `[$app-name](app://{{connector_id}})` or clearly matched by the task. Its `{CODEX_APPS_MCP_SERVER_NAME}` tools are either present or discoverable through `tool_search` when that tool is available. Do not discover apps through MCP resource-listing tools.\n"
         )
     }
 }

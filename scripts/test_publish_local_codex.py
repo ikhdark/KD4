@@ -107,7 +107,18 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         self.assertIn(
             'Write-ProofLine "codexPostPublishVerify" "sha256 ok"', publish_script
         )
-        self.assertIn("running-target process detection failed", publish_script)
+        self.assertIn("running-target process detection was indeterminate", publish_script)
+        self.assertIn(
+            "$script:RunningTargetProcessProbeWarnings.Count -gt 0", publish_script
+        )
+        self.assertIn("StartTimeUtcTicks", publish_script)
+        self.assertIn("Stop-Process -InputObject $process", publish_script)
+        self.assertIn(
+            "Get-CachedLocalPublishFileSha256 -Path $path -ForceRefresh",
+            publish_script,
+        )
+        self.assertIn('"ls-files", "-z"', publish_script)
+        self.assertIn('"status", "--porcelain=v1", "-z"', publish_script)
 
     def test_user_path_edits_preserve_expandable_registry_values(self) -> None:
         publish_script = publish_source_text()

@@ -147,6 +147,7 @@ pub fn decode_bytes(data: &str) -> Result<Vec<u8>> {
 
 /// Write a length-prefixed JSON frame.
 pub fn write_frame<W: Write>(mut writer: W, msg: &FramedMessage) -> Result<()> {
+    validate_protocol_version(msg.version)?;
     let payload = serde_json::to_vec(msg)?;
     if payload.len() > MAX_FRAME_LEN {
         anyhow::bail!("frame too large: {}", payload.len());
@@ -161,10 +162,20 @@ pub fn write_frame<W: Write>(mut writer: W, msg: &FramedMessage) -> Result<()> {
 /// Read a length-prefixed JSON frame; returns `Ok(None)` on EOF.
 pub fn read_frame<R: Read>(mut reader: R) -> Result<Option<FramedMessage>> {
     let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.into()),
+    let mut header_len = 0;
+    while header_len < len_buf.len() {
+        match reader.read(&mut len_buf[header_len..]) {
+            Ok(0) if header_len == 0 => return Ok(None),
+            Ok(0) => {
+                anyhow::bail!(
+                    "truncated frame header: expected {} bytes, got {header_len}",
+                    len_buf.len()
+                );
+            }
+            Ok(read) => header_len += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        }
     }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > MAX_FRAME_LEN {
@@ -173,7 +184,17 @@ pub fn read_frame<R: Read>(mut reader: R) -> Result<Option<FramedMessage>> {
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
     let msg: FramedMessage = serde_json::from_slice(&payload)?;
+    validate_protocol_version(msg.version)?;
     Ok(Some(msg))
+}
+
+fn validate_protocol_version(version: u8) -> Result<()> {
+    if version != IPC_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "unsupported runner IPC protocol version {version}; expected {IPC_PROTOCOL_VERSION}"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -204,6 +225,49 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn partial_frame_header_is_rejected() {
+        assert!(
+            read_frame(&[][..])
+                .expect("clean EOF must succeed")
+                .is_none()
+        );
+        for header_len in 1..4 {
+            let err = read_frame(&vec![0u8; header_len][..]).expect_err("partial header must fail");
+            assert!(
+                err.to_string().contains("truncated frame header"),
+                "unexpected error for {header_len}-byte header: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_protocol_version_is_rejected_on_read_and_write() {
+        let msg = FramedMessage {
+            version: IPC_PROTOCOL_VERSION + 1,
+            message: Message::Terminate {
+                payload: EmptyPayload::default(),
+            },
+        };
+
+        let write_err = write_frame(Vec::new(), &msg).expect_err("mismatched write must fail");
+        assert!(
+            write_err
+                .to_string()
+                .contains("unsupported runner IPC protocol version")
+        );
+
+        let payload = serde_json::to_vec(&msg).expect("serialize mismatched frame");
+        let mut encoded = (payload.len() as u32).to_le_bytes().to_vec();
+        encoded.extend_from_slice(&payload);
+        let read_err = read_frame(encoded.as_slice()).expect_err("mismatched read must fail");
+        assert!(
+            read_err
+                .to_string()
+                .contains("unsupported runner IPC protocol version")
+        );
     }
 
     #[test]

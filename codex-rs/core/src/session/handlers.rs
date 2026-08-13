@@ -256,6 +256,7 @@ pub(super) async fn user_input_or_turn_inner(
             current_context
                 .update_validation_authorization(&items)
                 .await;
+            current_context.update_source_owner_candidates(&items).await;
             current_context.session_telemetry.user_prompt(&items);
             sess.refresh_mcp_servers_if_requested(
                 &current_context,

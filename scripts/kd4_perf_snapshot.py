@@ -36,6 +36,7 @@ class Scenario:
     cwd: Path
     default_iterations: int
     category: str
+    required: bool = True
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class Sample:
 class ScenarioResult:
     name: str
     category: str
+    required: bool
     command: tuple[str, ...]
     cwd: str
     status: str
@@ -80,17 +82,25 @@ def percentile(values: Sequence[float], fraction: float) -> float:
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
-def _installed_codex_path(repo_root: Path) -> Path:
-    publish_dir = os.environ.get("CODEX_LOCAL_PUBLISH_DIR")
-    if publish_dir:
-        return Path(publish_dir) / ("codex.exe" if os.name == "nt" else "codex")
-    return repo_root.parent / "LOCAL-KD" / ("codex.exe" if os.name == "nt" else "codex")
+def _installed_codex_path(install_dir: Path | None = None) -> Path:
+    if install_dir is not None:
+        publish_dir = install_dir
+    else:
+        configured_publish_dir = os.environ.get("CODEX_LOCAL_PUBLISH_DIR")
+        publish_dir = (
+            Path(configured_publish_dir)
+            if configured_publish_dir
+            else Path.home() / "Desktop" / "LOCAL-KD"
+        )
+    return publish_dir / ("codex.exe" if os.name == "nt" else "codex")
 
 
-def scenario_catalog(repo_root: Path = REPO_ROOT) -> dict[str, Scenario]:
+def scenario_catalog(
+    repo_root: Path = REPO_ROOT, *, install_dir: Path | None = None
+) -> dict[str, Scenario]:
     repo_root = repo_root.resolve()
     codex_rs = repo_root / "codex-rs"
-    installed_codex = _installed_codex_path(repo_root)
+    installed_codex = _installed_codex_path(install_dir)
     return {
         "python-startup": Scenario(
             "python-startup",
@@ -236,6 +246,7 @@ def measure_scenario(
         return ScenarioResult(
             name=scenario.name,
             category=scenario.category,
+            required=scenario.required,
             command=scenario.command,
             cwd=str(scenario.cwd),
             status="skipped",
@@ -283,6 +294,7 @@ def measure_scenario(
     return ScenarioResult(
         name=scenario.name,
         category=scenario.category,
+        required=scenario.required,
         command=scenario.command,
         cwd=str(scenario.cwd),
         status="passed" if passed else "failed",
@@ -322,8 +334,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def environment_metadata(repo_root: Path, *, hash_binary: bool) -> dict[str, Any]:
-    installed_codex = _installed_codex_path(repo_root)
+def environment_metadata(
+    repo_root: Path, *, hash_binary: bool, install_dir: Path | None = None
+) -> dict[str, Any]:
+    installed_codex = _installed_codex_path(install_dir)
     binary: dict[str, Any] = {
         "path": str(installed_codex),
         "exists": installed_codex.is_file(),
@@ -377,6 +391,11 @@ def build_parser() -> argparse.ArgumentParser:
     catalog = scenario_catalog()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    parser.add_argument(
+        "--install-dir",
+        type=Path,
+        help="Installed Codex directory (defaults to CODEX_LOCAL_PUBLISH_DIR or the platform local-publish location).",
+    )
     parser.add_argument("--profile", choices=sorted(PROFILE_SCENARIOS), default="quick")
     parser.add_argument("--scenario", action="append", choices=sorted(catalog))
     parser.add_argument("--iterations", type=int)
@@ -407,7 +426,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo_root = args.repo_root.resolve()
-    catalog = scenario_catalog(repo_root)
+    catalog = scenario_catalog(repo_root, install_dir=args.install_dir)
     names = tuple(args.scenario or PROFILE_SCENARIOS[args.profile])
     results: list[ScenarioResult] = []
     for name in names:
@@ -428,15 +447,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     failed = [result.name for result in results if result.status == "failed"]
     skipped = [result.name for result in results if result.status == "skipped"]
-    ok = not failed and (not skipped or args.allow_incomplete)
+    skipped_required = [
+        result.name for result in results if result.status == "skipped" and result.required
+    ]
+    complete = not skipped_required
+    ok = not failed and (complete or args.allow_incomplete)
     payload = {
         "schemaVersion": 1,
         "profile": args.profile,
-        "environment": environment_metadata(repo_root, hash_binary=args.hash_binary),
+        "environment": environment_metadata(
+            repo_root, hash_binary=args.hash_binary, install_dir=args.install_dir
+        ),
         "results": [asdict(result) for result in results],
         "failedScenarios": failed,
         "skippedScenarios": skipped,
-        "incomplete": bool(skipped),
+        "skippedRequiredScenarios": skipped_required,
+        "complete": complete,
+        "incomplete": not complete,
         "allowIncomplete": args.allow_incomplete,
         "ok": ok,
     }

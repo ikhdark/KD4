@@ -17,6 +17,9 @@ use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session_startup_prewarm::SessionStartupTransportHandle;
+use crate::tool_history::ModelGenerationId;
+use crate::tool_history::ToolHistoryCandidate;
+use crate::tool_history::ToolHistoryState;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -115,6 +118,26 @@ impl SessionState {
 
     pub(crate) fn clone_history(&self) -> ContextManager {
         self.history.clone()
+    }
+
+    pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
+        self.history.set_tool_history_state(state);
+    }
+
+    pub(crate) fn tool_history_state(&self) -> ToolHistoryState {
+        self.history.tool_history_state()
+    }
+
+    pub(crate) fn register_tool_history_candidate(&mut self, candidate: ToolHistoryCandidate) {
+        self.history.register_tool_history_candidate(candidate);
+    }
+
+    pub(crate) fn mark_tool_history_consumed(
+        &mut self,
+        input: &[ResponseItem],
+        generation: ModelGenerationId,
+    ) -> bool {
+        self.history.mark_tool_history_consumed(input, generation)
     }
 
     #[cfg(test)]
@@ -330,6 +353,15 @@ impl SessionState {
             .get(environment_id)
             .cloned()
     }
+
+    pub(crate) fn soft_floor_receipt_matches(&self, identity: &str) -> bool {
+        self.auto_compact_window
+            .soft_floor_receipt_matches(identity)
+    }
+
+    pub(crate) fn record_soft_floor_receipt(&mut self, identity: String) {
+        self.auto_compact_window.record_soft_floor_receipt(identity);
+    }
 }
 
 // Sometimes new snapshots don't include credits or plan information.
@@ -348,6 +380,7 @@ fn merge_rate_limit_fields(
     if snapshot.individual_limit.is_none() {
         snapshot.individual_limit = previous.and_then(|prior| prior.individual_limit.clone());
     }
+
     if snapshot.spend_control_reached.is_none() {
         snapshot.spend_control_reached = previous.and_then(|prior| prior.spend_control_reached);
     }

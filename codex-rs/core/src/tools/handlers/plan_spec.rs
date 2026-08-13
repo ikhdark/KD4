@@ -29,7 +29,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     json!("completed"),
                 ],
                 Some(
-                    "Step status. `passed` is the caller's explicit completion acknowledgement; `completed` is a legacy alias canonicalized to `passed`. Later file or command mutations reopen passed work as implemented."
+                    "Step status. `passed` requires applicable fresh proof; `completed` is a legacy alias. Only mutations relevant to that proof reopen passed work."
                         .to_string(),
                 ),
             ),
@@ -81,6 +81,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     .to_string(),
             )),
         ),
+        ("validation_route".to_string(), validation_route_schema()),
     ]);
 
     let properties = BTreeMap::from([
@@ -91,6 +92,94 @@ pub fn create_update_plan_tool() -> ToolSpec {
             )),
         ),
         (
+            "tier".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("focused"), json!("medium"), json!("complex")],
+                Some(
+                    "Internal planning representation; it never changes collaboration mode."
+                        .to_string(),
+                ),
+            ),
+        ),
+        (
+            "facts".to_string(),
+            JsonSchema::array(
+                JsonSchema::object(
+                    BTreeMap::from([
+                        (
+                            "id".to_string(),
+                            JsonSchema::string(Some("Stable fact id.".to_string())),
+                        ),
+                        (
+                            "value".to_string(),
+                            JsonSchema::string(Some(
+                                "Established evidence-backed fact.".to_string(),
+                            )),
+                        ),
+                        (
+                            "source".to_string(),
+                            JsonSchema::string(Some("Fact source or owner.".to_string())),
+                        ),
+                    ]),
+                    Some(vec!["id".to_string(), "value".to_string()]),
+                    Some(false.into()),
+                ),
+                Some("Stable facts to add or patch; omitted facts remain active.".to_string()),
+            ),
+        ),
+        (
+            "removed_facts".to_string(),
+            reasoned_removals_schema("facts"),
+        ),
+        (
+            "removed_steps".to_string(),
+            reasoned_removals_schema("steps"),
+        ),
+        (
+            "source_owner".to_string(),
+            JsonSchema::string(Some("Authoritative owner for focused work.".to_string())),
+        ),
+        (
+            "implementation_surfaces".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(Some(
+                    "Bounded implementation file, region, or contract.".to_string(),
+                )),
+                Some("Focused implementation surfaces.".to_string()),
+            ),
+        ),
+        (
+            "acceptance_criteria".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(Some("Stable focused acceptance criterion.".to_string())),
+                Some("Acceptance criteria for the focused work unit.".to_string()),
+            ),
+        ),
+        (
+            "mutation_obligations".to_string(),
+            mutation_obligations_schema(
+                "Focused mutation obligations; focused tier accepts at most one.",
+            ),
+        ),
+        (
+            "validation_disposition".to_string(),
+            JsonSchema::string_enum(
+                vec![
+                    json!("executable"),
+                    json!("unresolved_discoverable"),
+                    json!("unavailable_blocked"),
+                    json!("not_required"),
+                ],
+                Some("Validation feasibility, distinct from proof identity.".to_string()),
+            ),
+        ),
+        ("validation_route".to_string(), validation_route_schema()),
+        (
+            "external_validation_route".to_string(),
+            external_validation_route_schema(),
+        ),
+        ("step_evidence".to_string(), step_evidence_schema()),
+        (
             "plan".to_string(),
             JsonSchema::array(
                 JsonSchema::object(
@@ -98,7 +187,10 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     Some(vec!["step".to_string(), "status".to_string()]),
                     Some(false.into()),
                 ),
-                Some("The list of steps".to_string()),
+                Some(
+                    "Stable-ID step patches. Omitted active steps remain until explicitly removed."
+                        .to_string(),
+                ),
             ),
         ),
     ]);
@@ -106,10 +198,13 @@ pub fn create_update_plan_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
         description: r#"Updates the task plan.
-Provide an optional explanation and a list of plan items, each with a step and status.
+Use focused only for one atomic owner/scope with no cross-owner contract, one mutation obligation, and one feasible validation route; it uses a stable internal work unit and an empty plan.
+Use a short evidence-first medium plan for bounded multi-surface work. Use the complete complex representation for multi-owner, architectural, generated-contract, migration, high-risk, or dependent-validation work.
+Internal tier selection never changes collaboration mode. Complexity escalation in Default mode upgrades only this representation. Omitted facts and steps remain active; removals need reasons.
+Stop exploration once owner, call path, affected contract/scope, validation route, and material risks are established. Keep focused work checklist-free and medium plans short.
 At most one step can be in_progress at a time.
-Use stable ids, dependencies, and acceptance criteria for implementation work. Editing can make a
-step implemented. Set a step to passed only when its acceptance criteria are satisfied; completion
+Use stable ids, owners, bounded surfaces, dependencies, obligations, and acceptance criteria. Edits
+record partial obligation progress. Set a step to passed only when applicable fresh proof exists; completion
 still checks declared artifacts, Desktop activation, plan structure, and blocking risks.
 "#
         .to_string(),
@@ -122,4 +217,186 @@ still checks declared artifacts, Desktop activation, plan structure, and blockin
         ),
         output_schema: None,
     })
+}
+
+fn mutation_obligations_schema(description: &str) -> JsonSchema {
+    JsonSchema::array(
+        JsonSchema::object(
+            BTreeMap::from([
+                (
+                    "id".to_string(),
+                    JsonSchema::string(Some("Stable mutation-obligation id.".to_string())),
+                ),
+                (
+                    "description".to_string(),
+                    JsonSchema::string(Some("Required implementation mutation.".to_string())),
+                ),
+                (
+                    "paths".to_string(),
+                    JsonSchema::array(
+                        JsonSchema::string(Some("Bounded obligation path.".to_string())),
+                        Some("Paths that must all receive matching successful edits.".to_string()),
+                    ),
+                ),
+            ]),
+            Some(vec!["id".to_string(), "description".to_string()]),
+            Some(false.into()),
+        ),
+        Some(description.to_string()),
+    )
+}
+
+fn external_validation_route_schema() -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "server_name".to_string(),
+                JsonSchema::string(Some("Canonical external server identity.".to_string())),
+            ),
+            (
+                "tool_name".to_string(),
+                JsonSchema::string(Some("Canonical external tool identity.".to_string())),
+            ),
+        ]),
+        Some(vec!["server_name".to_string(), "tool_name".to_string()]),
+        Some(false.into()),
+    )
+}
+
+fn step_evidence_schema() -> JsonSchema {
+    JsonSchema::array(
+        JsonSchema::object(
+            BTreeMap::from([
+                (
+                    "step_id".to_string(),
+                    JsonSchema::string(Some("Stable plan step id.".to_string())),
+                ),
+                (
+                    "source_owner".to_string(),
+                    JsonSchema::string(Some("Authoritative source owner.".to_string())),
+                ),
+                (
+                    "implementation_surfaces".to_string(),
+                    JsonSchema::array(
+                        JsonSchema::string(Some("Bounded implementation surface.".to_string())),
+                        Some("Files, regions, or contracts owned by this step.".to_string()),
+                    ),
+                ),
+                (
+                    "mutation_obligations".to_string(),
+                    mutation_obligations_schema("Declared step mutation obligations."),
+                ),
+                (
+                    "validation_disposition".to_string(),
+                    JsonSchema::string_enum(
+                        vec![
+                            json!("executable"),
+                            json!("unresolved_discoverable"),
+                            json!("unavailable_blocked"),
+                            json!("not_required"),
+                        ],
+                        Some("Step validation feasibility, distinct from proof.".to_string()),
+                    ),
+                ),
+                (
+                    "external_validation_route".to_string(),
+                    external_validation_route_schema(),
+                ),
+            ]),
+            Some(vec!["step_id".to_string()]),
+            Some(false.into()),
+        ),
+        Some("Stable-ID evidence patches for medium and complex steps.".to_string()),
+    )
+}
+
+fn validation_route_schema() -> JsonSchema {
+    let mut timeout = JsonSchema::integer(Some(
+        "Bounded execution timeout in milliseconds; it affects proof identity only when semantic_timeout is true."
+            .to_string(),
+    ));
+    timeout.minimum = Some(1.into());
+    timeout.maximum = Some(codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS.into());
+    let leaf = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "argv".to_string(),
+                JsonSchema::array(
+                    JsonSchema::string(Some("One exact direct-argv element.".to_string())),
+                    Some("Canonical direct argv; shell compounds are not accepted.".to_string()),
+                ),
+            ),
+            (
+                "covered_paths".to_string(),
+                JsonSchema::array(
+                    JsonSchema::string(Some("Repository-relative covered path.".to_string())),
+                    Some(
+                        "Explicit covered paths; an empty list means unknown coverage.".to_string(),
+                    ),
+                ),
+            ),
+            (
+                "covered_contracts".to_string(),
+                JsonSchema::array(
+                    JsonSchema::string(Some("Explicit covered contract.".to_string())),
+                    Some("Covered validation contracts.".to_string()),
+                ),
+            ),
+            ("timeout_ms".to_string(), timeout),
+            (
+                "semantic_timeout".to_string(),
+                JsonSchema::boolean(Some(
+                    "True only when the validation contract makes timeout part of proof semantics."
+                        .to_string(),
+                )),
+            ),
+        ]),
+        Some(vec![
+            "argv".to_string(),
+            "covered_paths".to_string(),
+            "covered_contracts".to_string(),
+            "timeout_ms".to_string(),
+        ]),
+        Some(false.into()),
+    );
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "leaves".to_string(),
+                JsonSchema::array(
+                    leaf,
+                    Some("Ordered independently executed validation leaves.".to_string()),
+                ),
+            ),
+            (
+                "ordering".to_string(),
+                JsonSchema::string_enum(
+                    vec![json!("stop_on_failure"), json!("run_all")],
+                    Some("Declared route short-circuit policy.".to_string()),
+                ),
+            ),
+        ]),
+        Some(vec!["leaves".to_string(), "ordering".to_string()]),
+        Some(false.into()),
+    )
+}
+
+fn reasoned_removals_schema(kind: &str) -> JsonSchema {
+    JsonSchema::array(
+        JsonSchema::object(
+            BTreeMap::from([
+                (
+                    "id".to_string(),
+                    JsonSchema::string(Some(format!("Stable {kind} id."))),
+                ),
+                (
+                    "reason".to_string(),
+                    JsonSchema::string(Some("Required audit reason.".to_string())),
+                ),
+            ]),
+            Some(vec!["id".to_string(), "reason".to_string()]),
+            Some(false.into()),
+        ),
+        Some(format!("Explicit reasoned removal of active {kind}.")),
+    )
 }

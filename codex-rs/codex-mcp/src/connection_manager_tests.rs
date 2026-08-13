@@ -120,14 +120,24 @@ async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
         tool_timeout: None,
         server_instructions: None,
         server_supports_sandbox_state_meta_capability: false,
+        server_supports_resources_capability: false,
         codex_apps_tools_cache_context: None,
     }
 }
 
 async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManagedClient {
+    create_ready_async_managed_client_with_resources(tools, false).await
+}
+
+async fn create_ready_async_managed_client_with_resources(
+    tools: Vec<ToolInfo>,
+    server_supports_resources_capability: bool,
+) -> AsyncManagedClient {
+    let mut managed_client = create_test_managed_client(tools).await;
+    managed_client.server_supports_resources_capability = server_supports_resources_capability;
     AsyncManagedClient {
         client: futures::future::ready::<Result<ManagedClient, StartupOutcomeError>>(Ok(
-            create_test_managed_client(tools).await,
+            managed_client,
         ))
         .boxed()
         .shared(),
@@ -140,6 +150,36 @@ async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManaged
         tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
         cancel_token: CancellationToken::new(),
     }
+}
+
+#[tokio::test]
+async fn ready_server_resources_capability_is_aggregated_to_one_boolean() {
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionManager::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    assert!(!manager.has_ready_server_with_resources().await);
+
+    manager.clients.insert(
+        "without-resources".to_string(),
+        create_ready_async_managed_client_with_resources(Vec::new(), false).await,
+    );
+    assert!(!manager.has_ready_server_with_resources().await);
+
+    manager.clients.insert(
+        "with-resources".to_string(),
+        create_ready_async_managed_client_with_resources(Vec::new(), true).await,
+    );
+    assert!(manager.has_ready_server_with_resources().await);
+
+    manager.clients.insert(
+        "second-with-resources".to_string(),
+        create_ready_async_managed_client_with_resources(Vec::new(), true).await,
+    );
+    assert!(manager.has_ready_server_with_resources().await);
 }
 
 fn create_test_manager_with_failed_apps_startup(

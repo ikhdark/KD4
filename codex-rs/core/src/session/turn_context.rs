@@ -42,6 +42,20 @@ impl TurnSkillsContext {
 
 pub(crate) type ShellSnapshotTask = Shared<BoxFuture<'static, Option<Arc<ShellSnapshotFile>>>>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredToolActivation {
+    pub(crate) root_task_epoch: String,
+    pub(crate) provenance: String,
+    pub(crate) capability_revision: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DeferredToolActivationState {
+    revision: u64,
+    capability_revisions: HashMap<codex_tools::ToolName, String>,
+    activations: HashMap<codex_tools::ToolName, DeferredToolActivation>,
+}
+
 #[derive(Clone)]
 pub(crate) struct TurnEnvironment {
     pub(crate) environment_id: String,
@@ -141,15 +155,15 @@ pub struct TurnContext {
     pub(crate) unified_exec_shell_mode: UnifiedExecShellMode,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
-    /// Deferred tools selected by `tool_search` during this turn. This state is
-    /// intentionally turn-scoped so prior selections do not accumulate.
-    pub(crate) activated_deferred_tools: Arc<std::sync::RwLock<HashSet<codex_tools::ToolName>>>,
+    /// Deferred tools selected during this root task, bound to exact capability revisions.
+    pub(crate) deferred_tool_activations: Arc<std::sync::RwLock<DeferredToolActivationState>>,
     pub(crate) validation_authorization: crate::validation_admission::SharedValidationAuthorization,
     pub(crate) validation_singleflight: crate::validation_admission::SharedValidationSingleflight,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
+    pub(crate) source_closure: crate::tools::handlers::source_closure::SharedSourceClosureState,
     pub(crate) terminal_error: Arc<Mutex<Option<ErrorEvent>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
@@ -161,6 +175,39 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
+    pub(crate) async fn update_source_owner_candidates(
+        &self,
+        input: &[codex_protocol::user_input::UserInput],
+    ) {
+        let Some(root) = self.environments.single_local_environment_cwd() else {
+            return;
+        };
+        let candidates = extract_source_candidates(root.as_path(), input);
+        if candidates.is_empty() {
+            return;
+        }
+        {
+            let mut state = self.source_closure.lock().await;
+            state.add_candidates(candidates.clone());
+        }
+        let repository_root = root.as_path().to_path_buf();
+        let manifest_path = repository_root.join("source_owners.toml");
+        let resolution = tokio::task::spawn_blocking(move || {
+            codex_file_search::task_locator::resolve_owner_candidates(
+                &repository_root,
+                &manifest_path,
+                &candidates,
+            )
+        })
+        .await;
+        if let Ok(resolution) = resolution {
+            self.source_closure
+                .lock()
+                .await
+                .apply_candidate_resolution(resolution);
+        }
+    }
+
     pub(crate) async fn update_validation_authorization(
         &self,
         input: &[codex_protocol::user_input::UserInput],
@@ -176,24 +223,82 @@ impl TurnContext {
         &self,
         tools: impl IntoIterator<Item = codex_tools::ToolName>,
     ) {
-        self.activated_deferred_tools
+        let mut state = self
+            .deferred_tool_activations
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(tools);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        for tool_name in tools {
+            let Some(capability_revision) = state.capability_revisions.get(&tool_name).cloned()
+            else {
+                continue;
+            };
+            let activation = DeferredToolActivation {
+                root_task_epoch: self.sub_id.clone(),
+                provenance: tool_name.to_string(),
+                capability_revision,
+            };
+            changed |= state.activations.get(&tool_name) != Some(&activation);
+            state.activations.insert(tool_name, activation);
+        }
+        if changed {
+            state.revision = state.revision.saturating_add(1);
+        }
     }
 
     pub(crate) fn deferred_tool_is_activated(&self, tool_name: &codex_tools::ToolName) -> bool {
-        self.activated_deferred_tools
+        let state = self
+            .deferred_tool_activations
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(tool_name)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(activation) = state.activations.get(tool_name) else {
+            return false;
+        };
+        activation.root_task_epoch == self.sub_id
+            && activation.provenance == tool_name.to_string()
+            && state.capability_revisions.get(tool_name) == Some(&activation.capability_revision)
     }
 
     pub(crate) fn activated_deferred_tools(&self) -> HashSet<codex_tools::ToolName> {
-        self.activated_deferred_tools
+        let state = self
+            .deferred_tool_activations
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .activations
+            .iter()
+            .filter(|(tool_name, activation)| {
+                activation.root_task_epoch == self.sub_id
+                    && activation.provenance == tool_name.to_string()
+                    && state.capability_revisions.get(*tool_name)
+                        == Some(&activation.capability_revision)
+            })
+            .map(|(tool_name, _)| tool_name)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn refresh_deferred_tool_capabilities(
+        &self,
+        capability_revisions: HashMap<codex_tools::ToolName, String>,
+    ) {
+        let mut state = self
+            .deferred_tool_activations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let capability_changed = state.capability_revisions != capability_revisions;
+        state.capability_revisions = capability_revisions;
+        let current_epoch = self.sub_id.as_str();
+        let current_revisions = state.capability_revisions.clone();
+        let before = state.activations.len();
+        state.activations.retain(|tool_name, activation| {
+            activation.root_task_epoch == current_epoch
+                && activation.provenance == tool_name.to_string()
+                && current_revisions.get(tool_name) == Some(&activation.capability_revision)
+        });
+        if capability_changed || state.activations.len() != before {
+            state.revision = state.revision.saturating_add(1);
+        }
     }
 
     pub(crate) fn item_ids_enabled(&self) -> bool {
@@ -339,13 +444,14 @@ impl TurnContext {
             unified_exec_shell_mode: self.unified_exec_shell_mode.clone(),
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
-            activated_deferred_tools: Arc::clone(&self.activated_deferred_tools),
+            deferred_tool_activations: Arc::clone(&self.deferred_tool_activations),
             validation_authorization: Arc::clone(&self.validation_authorization),
             validation_singleflight: Arc::clone(&self.validation_singleflight),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
             turn_skills: self.turn_skills.clone(),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
+            source_closure: Arc::clone(&self.source_closure),
             terminal_error: Arc::clone(&self.terminal_error),
             server_model_warning_emitted: AtomicBool::new(
                 self.server_model_warning_emitted.load(Ordering::Relaxed),
@@ -626,7 +732,9 @@ impl Session {
             unified_exec_shell_mode,
             final_output_json_schema: None,
             dynamic_tools: session_configuration.dynamic_tools.clone(),
-            activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            deferred_tool_activations: Arc::new(std::sync::RwLock::new(
+                DeferredToolActivationState::default(),
+            )),
             validation_authorization: Arc::new(tokio::sync::RwLock::new(
                 crate::validation_admission::ValidationAuthorization::default(),
             )),
@@ -637,6 +745,7 @@ impl Session {
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),
             turn_timing_state: Arc::new(TurnTimingState::default()),
+            source_closure: crate::tools::handlers::source_closure::SourceClosureState::shared(),
             terminal_error: Arc::new(Mutex::new(None)),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
@@ -946,4 +1055,63 @@ impl Session {
         let state = self.state.lock().await;
         state.session_configuration.clone()
     }
+}
+
+fn extract_source_candidates(
+    root: &std::path::Path,
+    input: &[codex_protocol::user_input::UserInput],
+) -> Vec<String> {
+    use codex_protocol::user_input::UserInput;
+
+    let mut candidates = Vec::new();
+    for item in input {
+        match item {
+            UserInput::LocalPath { path, .. } => push_candidate(root, path, &mut candidates),
+            UserInput::Mention { path, .. } if !path.contains("://") => {
+                push_candidate(root, std::path::Path::new(path), &mut candidates);
+            }
+            UserInput::Text { text, .. } => {
+                for token in text.split_whitespace().take(512) {
+                    let token = token.trim_matches(|character: char| {
+                        matches!(
+                            character,
+                            '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':'
+                        )
+                    });
+                    if (token.contains('/') || token.contains('\\'))
+                        && std::path::Path::new(token).extension().is_some()
+                    {
+                        push_candidate(root, std::path::Path::new(token), &mut candidates);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(64);
+    candidates
+}
+
+fn push_candidate(root: &std::path::Path, path: &std::path::Path, candidates: &mut Vec<String>) {
+    let relative = if path.is_absolute() {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return;
+        };
+        relative
+    } else {
+        path
+    };
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return;
+    }
+    let absolute = root.join(relative);
+    if !absolute.exists() {
+        return;
+    }
+    candidates.push(relative.to_string_lossy().replace('\\', "/"));
 }

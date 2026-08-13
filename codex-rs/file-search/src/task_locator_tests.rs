@@ -102,6 +102,79 @@ fn invalid_manifest_cannot_authoritatively_route() {
 }
 
 #[test]
+fn caller_test_generated_and_wrapper_candidates_resolve_to_the_real_primary_owner() {
+    for (relation, candidate) in [
+        ("caller", "src/callers/alpha_caller.rs"),
+        ("test", "tests/alpha_tests.rs"),
+        ("generated", "schema/alpha.generated.json"),
+        ("wrapper", "wrappers/alpha_wrapper.rs"),
+    ] {
+        let fixture = Fixture::new();
+        let candidate_path = fixture.root.path().join(candidate);
+        fs::create_dir_all(candidate_path.parent().expect("candidate parent"))
+            .expect("candidate directory");
+        fs::write(&candidate_path, "alpha locator evidence\n").expect("candidate source");
+        let mut manifest = fixture.manifest.clone();
+        match relation {
+            "caller" => manifest.owners[0].consumers.push(candidate.to_string()),
+            "test" => manifest.owners[0].tests.push(candidate.to_string()),
+            "generated" => manifest.owners[0]
+                .generated_mirrors
+                .push(candidate.to_string()),
+            "wrapper" => manifest.owners[0].contracts.push(candidate.to_string()),
+            _ => unreachable!("bounded relation table"),
+        }
+        fs::write(
+            &fixture.manifest_path,
+            toml::to_string(&manifest).expect("toml"),
+        )
+        .expect("manifest");
+
+        let resolution = resolve_owner_candidates(
+            fixture.root.path(),
+            &fixture.manifest_path,
+            &[candidate.to_string()],
+        );
+
+        let owner = resolution
+            .authoritative_owner
+            .unwrap_or_else(|| panic!("validated {relation} mapping should resolve"));
+        assert_eq!(owner.id, "alpha");
+        assert_eq!(owner.primary_entries[0].path, "src/alpha/lib.rs");
+        assert_ne!(owner.primary_entries[0].path, candidate);
+    }
+}
+
+#[test]
+fn candidates_mapping_to_multiple_valid_owners_remain_unresolved() {
+    let fixture = Fixture::new();
+    let resolution = resolve_owner_candidates(
+        fixture.root.path(),
+        &fixture.manifest_path,
+        &[
+            "src/alpha/lib.rs".to_string(),
+            "src/beta/lib.ts".to_string(),
+        ],
+    );
+
+    assert!(resolution.authoritative_owner.is_none());
+    assert_eq!(
+        resolution
+            .alternative_owners
+            .iter()
+            .map(|owner| owner.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+    assert!(
+        resolution
+            .unresolved
+            .iter()
+            .any(|reason| reason == "candidate_owner_conflict")
+    );
+}
+
+#[test]
 fn routing_enforces_anchor_conflicts_and_margin() {
     let manifest = RoutingManifest {
         schema_version: 1,
@@ -229,6 +302,106 @@ fn locate_task_is_warm_deterministic_bounded_and_closure_scoped() {
 }
 
 #[test]
+fn locate_task_bundles_primary_caller_focused_test_and_contract_in_owner_order() {
+    let fixture = Fixture::new();
+    let caller = "src/alpha/caller.rs";
+    let focused_test = "src/alpha/focused_test.rs";
+    let contract = "src/alpha/contract.md";
+    fs::write(
+        fixture.root.path().join(caller),
+        "pub fn call_alpha() { crate::locate_alpha(\"caller\"); }\n",
+    )
+    .expect("caller");
+    fs::write(
+        fixture.root.path().join(focused_test),
+        "#[test]\nfn focused_alpha() { assert!(!crate::locate_alpha(\"test\")); }\n",
+    )
+    .expect("focused test");
+    fs::write(
+        fixture.root.path().join(contract),
+        "# Alpha contract\nThe locator accepts a task string.\n",
+    )
+    .expect("contract");
+    let mut manifest = fixture.manifest.clone();
+    manifest.owners[0].consumers.push(caller.to_string());
+    manifest.owners[0].tests.push(focused_test.to_string());
+    manifest.owners[0].contracts.push(contract.to_string());
+    fs::write(
+        &fixture.manifest_path,
+        toml::to_string(&manifest).expect("manifest"),
+    )
+    .expect("manifest");
+
+    let output = locate_task(&fixture.request("change alpha locator evidence", None, None, true))
+        .expect("locate bundled evidence");
+    assert!(output.rendered.len() <= LOCATE_TASK_MAX_RENDERED_BYTES);
+    let sections = &output.decision_facts.captured_source_sections;
+    let position = |kind, path: &str| {
+        sections
+            .iter()
+            .position(|section| section.kind == kind && section.path == path)
+            .unwrap_or_else(|| panic!("missing {kind:?} section for {path}"))
+    };
+    let primary_position = position(
+        LocateTaskSourceSectionKind::PrimaryImplementation,
+        "src/alpha/lib.rs",
+    );
+    let caller_position = position(LocateTaskSourceSectionKind::Caller, caller);
+    let test_position = position(LocateTaskSourceSectionKind::Test, focused_test);
+    let contract_position = position(LocateTaskSourceSectionKind::Contract, contract);
+    assert!(primary_position < caller_position);
+    assert!(caller_position < test_position);
+    assert!(test_position < contract_position);
+    for path in ["src/alpha/lib.rs", caller, focused_test, contract] {
+        assert!(sections.iter().any(|section| {
+            section.path == path
+                && section.state == LocateTaskSourceSectionState::Materialized
+                && section.text.is_some()
+        }));
+    }
+}
+
+#[test]
+fn locator_decision_facts_are_neutral_source_closure_evidence() {
+    let fixture = Fixture::new();
+    let output = locate_task(&fixture.request("change alpha locator evidence", None, None, true))
+        .expect("locate");
+    let owner = output
+        .decision_facts
+        .authoritative_owner
+        .as_ref()
+        .expect("validated raw owner declaration");
+    assert_eq!(owner.id, "alpha");
+    assert_eq!(owner.primary_entries[0].path, "src/alpha/lib.rs");
+    let packet_seed = output
+        .owner_packet_seed
+        .as_ref()
+        .expect("bounded owner packet seed");
+    assert_eq!(packet_seed.authoritative_owner.id, "alpha");
+    assert!(!packet_seed.supporting_reads.is_empty());
+    let packet_seed_json = serde_json::to_string(packet_seed).expect("serialize packet seed");
+    assert!(!packet_seed_json.contains("fn locate_alpha"));
+
+    let encoded = serde_json::to_string(&output.decision_facts).expect("serialize facts");
+    for forbidden in [
+        "lifecycle_obligations",
+        "multi_owner_atomic_evidence",
+        "generated_source_ownership",
+        "validation_disposition",
+        "applicability",
+        "receipt_id",
+        "closure_state",
+        "artifact_line_range",
+        "projection",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "unexpected `{forbidden}` in {encoded}"
+        );
+    }
+}
+
+#[test]
 fn instructions_bypass_closure_caps_and_remain_snapshot_contributors() {
     let fixture = Fixture::new();
     let nested_instructions = fixture.root.path().join("src/alpha/AGENTS.md");
@@ -327,6 +500,130 @@ fn missing_manifest_created_during_query_is_retried_and_captured() {
             .find(|read| read.path == "source_owners.toml")
             .map(|read| read.content_hash.as_str()),
         Some(sha256_bytes(&manifest_bytes).as_str())
+    );
+}
+
+#[test]
+fn caller_change_during_capture_retries_once_and_returns_one_stable_snapshot() {
+    let fixture = Fixture::new();
+    let caller_path = "src/alpha/caller.rs";
+    fs::write(
+        fixture.root.path().join(caller_path),
+        "pub fn call() { crate::locate_alpha(\"old\"); }\n",
+    )
+    .expect("caller");
+    let mut manifest = fixture.manifest.clone();
+    manifest.owners[0].consumers.push(caller_path.to_string());
+    fs::write(
+        &fixture.manifest_path,
+        toml::to_string(&manifest).expect("manifest"),
+    )
+    .expect("manifest");
+    let changed_path = fixture.root.path().join(caller_path);
+    install_before_final_verify_hook(fixture.root.path(), move || {
+        fs::write(
+            changed_path,
+            "pub fn call() { crate::locate_alpha(\"new\"); }\n",
+        )
+        .expect("change caller");
+    });
+
+    let output = locate_task(&fixture.request("change alpha locator evidence", None, None, true))
+        .expect("stable retry");
+
+    assert_eq!(
+        output.decision_facts.selected_owner.as_deref(),
+        Some("alpha")
+    );
+    assert!(
+        !output
+            .decision_facts
+            .source_gaps
+            .contains(&"source_changed".to_string())
+    );
+    assert!(
+        output
+            .decision_facts
+            .captured_source_sections
+            .iter()
+            .all(|section| {
+                section.source_snapshot_identity == output.decision_facts.source_snapshot_identity
+            })
+    );
+    assert!(
+        output
+            .decision_facts
+            .captured_source_sections
+            .iter()
+            .filter(|section| section.path == caller_path)
+            .any(|section| section
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("new")))
+    );
+}
+
+#[test]
+fn second_source_change_returns_owner_with_incomplete_unmixed_sections() {
+    let fixture = Fixture::new();
+    let caller_path = "src/alpha/caller.rs";
+    fs::write(
+        fixture.root.path().join(caller_path),
+        "pub fn call() { crate::locate_alpha(\"first\"); }\n",
+    )
+    .expect("caller");
+    let mut manifest = fixture.manifest.clone();
+    manifest.owners[0].consumers.push(caller_path.to_string());
+    fs::write(
+        &fixture.manifest_path,
+        toml::to_string(&manifest).expect("manifest"),
+    )
+    .expect("manifest");
+    let root = fixture.root.path().to_path_buf();
+    let first_path = root.join(caller_path);
+    let second_root = root.clone();
+    install_before_final_verify_hook(&root, move || {
+        fs::write(
+            first_path,
+            "pub fn call() { crate::locate_alpha(\"second\"); }\n",
+        )
+        .expect("first change");
+        let second_path = second_root.join(caller_path);
+        install_before_final_verify_hook(&second_root, move || {
+            fs::write(
+                second_path,
+                "pub fn call() { crate::locate_alpha(\"third\"); }\n",
+            )
+            .expect("second change");
+        });
+    });
+
+    let output = locate_task(&fixture.request("change alpha locator evidence", None, None, true))
+        .expect("bounded unstable result");
+
+    assert_eq!(
+        output.decision_facts.selected_owner.as_deref(),
+        Some("alpha")
+    );
+    assert_eq!(output.decision_facts.completeness, "partial");
+    assert!(
+        output
+            .decision_facts
+            .source_gaps
+            .iter()
+            .any(|gap| gap == "source_changed")
+    );
+    assert!(
+        output
+            .decision_facts
+            .captured_source_sections
+            .iter()
+            .all(|section| {
+                section.source_snapshot_identity == output.decision_facts.source_snapshot_identity
+                    && section.state == LocateTaskSourceSectionState::NotMaterialized
+                    && section.text.is_none()
+                    && section.content_hash.is_none()
+            })
     );
 }
 

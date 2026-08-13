@@ -69,6 +69,10 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
         return false;
     };
 
+    if is_exact_version_probe(command) {
+        return true;
+    }
+
     match executable_name_lookup_key(cmd0).as_deref() {
         Some(cmd) if cfg!(target_os = "linux") && matches!(cmd, "numfmt" | "tac") => true,
 
@@ -197,6 +201,30 @@ pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
             debug_assert!(false, "unexpected git subcommand from matcher: {other}");
             false
         }
+    }
+}
+
+/// Recognizes version-only probes for development tools whose documented
+/// version switch cannot execute a project task or consume another operand.
+/// Keeping this exact (two argv values, one admitted switch) is intentional:
+/// options such as Cargo's `--list` and package-manager subcommands can execute
+/// project-controlled code even when they look informational.
+pub(crate) fn is_exact_version_probe(command: &[String]) -> bool {
+    let [executable, flag] = command else {
+        return false;
+    };
+    let Some(executable) = executable_name_lookup_key(executable) else {
+        return false;
+    };
+
+    match executable.as_str() {
+        "cargo" => matches!(flag.as_str(), "--version" | "-V"),
+        "rustc" => matches!(flag.as_str(), "--version" | "-V" | "-vV"),
+        "node" | "npm" | "pnpm" | "yarn" => matches!(flag.as_str(), "--version" | "-v"),
+        "python" | "python3" | "py" => matches!(flag.as_str(), "--version" | "-V"),
+        "rg" | "fd" | "jq" | "yq" | "delta" | "ast-grep" | "sg" | "just" | "rustfmt"
+        | "cargo-clippy" | "taplo" | "dprint" | "hyperfine" | "tokei" => flag == "--version",
+        _ => false,
     }
 }
 
@@ -780,6 +808,36 @@ mod tests {
             assert!(is_safe_powershell_words(&command));
         } else {
             assert!(!is_safe_powershell_words(&command));
+        }
+    }
+
+    #[test]
+    fn exact_development_tool_version_probes_are_safe() {
+        for command in [
+            vec_str(&["cargo", "--version"]),
+            vec_str(&["rustc", "-vV"]),
+            vec_str(&["node", "-v"]),
+            vec_str(&["python", "-V"]),
+            vec_str(&["rg", "--version"]),
+            vec_str(&["just", "--version"]),
+        ] {
+            assert!(
+                is_known_safe_command(&command),
+                "expected safe: {command:?}"
+            );
+        }
+
+        for command in [
+            vec_str(&["cargo", "check"]),
+            vec_str(&["cargo", "--version", "extra"]),
+            vec_str(&["unknown-tool", "--version"]),
+            vec_str(&["node", "--version", "script.js"]),
+            vec_str(&["cargo", "-v"]),
+        ] {
+            assert!(
+                !is_known_safe_command(&command),
+                "expected unsafe: {command:?}"
+            );
         }
     }
 

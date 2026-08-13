@@ -18,6 +18,25 @@ from scripts import vscode_runtime_proof
 
 
 class DevEnvironmentDoctorTest(unittest.TestCase):
+    def test_collect_checks_covers_required_workflow_tools(self) -> None:
+        with (
+            mock.patch.object(
+                dev_env_doctor, "package_manager_pin", return_value="pnpm@10.0.0"
+            ),
+            mock.patch.object(
+                dev_env_doctor,
+                "check_tool",
+                side_effect=lambda name, command, **kwargs: name,
+            ),
+            mock.patch.object(dev_env_doctor.os, "name", "nt"),
+        ):
+            checks = dev_env_doctor.collect_checks()
+
+        self.assertIn("uv", checks)
+        self.assertIn("rustfmt", checks)
+        self.assertIn("clippy", checks)
+        self.assertIn("pwsh", checks)
+
     def test_node_major_parses_version_prefix(self) -> None:
         self.assertEqual(dev_env_doctor.node_major("v22.13.1"), 22)
         self.assertEqual(dev_env_doctor.node_major("node 23.0.0"), 23)

@@ -419,27 +419,34 @@ where
             return Vec::new();
         }
 
+        let accounting_state = runtime.accounting_state();
+        let create: Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>> =
+            Arc::new(GoalToolExecutor::create(
+                runtime.thread_id(),
+                Arc::clone(&self.state_dbs),
+                Arc::clone(&accounting_state),
+                self.analytics.clone(),
+                self.event_emitter.clone(),
+                self.metrics.clone(),
+            ));
+        if !accounting_state.has_active_goal() {
+            return vec![create];
+        }
+
         vec![
             Arc::new(GoalToolExecutor::get(
                 runtime.thread_id(),
                 Arc::clone(&self.state_dbs),
-                runtime.accounting_state(),
+                Arc::clone(&accounting_state),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),
             )),
-            Arc::new(GoalToolExecutor::create(
-                runtime.thread_id(),
-                Arc::clone(&self.state_dbs),
-                runtime.accounting_state(),
-                self.analytics.clone(),
-                self.event_emitter.clone(),
-                self.metrics.clone(),
-            )),
+            create,
             Arc::new(GoalToolExecutor::update(
                 runtime.thread_id(),
                 Arc::clone(&self.state_dbs),
-                runtime.accounting_state(),
+                accounting_state,
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),

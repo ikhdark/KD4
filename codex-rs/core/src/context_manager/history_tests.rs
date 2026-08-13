@@ -2,6 +2,7 @@ use super::*;
 use crate::context::UserInstructions;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;
+use crate::stable_context::StableContextTarget;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_extension_api::PreviousWorldStateSection;
@@ -244,6 +245,52 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[test]
+fn finalization_projection_keeps_startup_checkpoint_and_only_requested_exact_artifact() {
+    let startup = crate::context::ContextualUserFragment::into(UserInstructions {
+        directory: None,
+        text: "stable startup instructions".to_string(),
+    });
+    let mut items = vec![startup];
+    for index in 0..200 {
+        items.push(user_msg(&format!("historical user message {index}")));
+        items.push(assistant_msg(&format!(
+            "historical assistant message {index}"
+        )));
+    }
+    for call_id in ["artifact-a", "artifact-b"] {
+        items.push(ResponseItem::FunctionCall {
+            id: None,
+            name: crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME
+                .to_string(),
+            namespace: None,
+            arguments: format!(r#"{{"artifact_id":"{call_id}"}}"#),
+            call_id: call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        items.push(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text(format!("exact output {call_id}")),
+            internal_chat_message_metadata_passthrough: None,
+        });
+    }
+    let history = create_history_with_items(items);
+    let prepared = history.prepare_for_finalization(
+        &default_input_modalities(),
+        CompletionCheckpointContext::new("checkpoint-required-material"),
+        &BTreeSet::from(["artifact-a".to_string()]),
+    );
+    let rendered = serde_json::to_string(prepared.items()).expect("projected prompt serializes");
+    assert!(rendered.contains("stable startup instructions"));
+    assert!(rendered.contains("checkpoint-required-material"));
+    assert!(rendered.contains("artifact-a"));
+    assert!(rendered.contains("exact output artifact-a"));
+    assert!(!rendered.contains("artifact-b"));
+    assert!(!rendered.contains("historical user message"));
+    assert!(!rendered.contains("historical assistant message"));
 }
 
 fn developer_msg(text: &str) -> ResponseItem {
@@ -2016,6 +2063,58 @@ fn prepared_prompt_cache_reuses_shared_items_across_non_history_changes() {
 
     assert!(Arc::ptr_eq(&first.shared_items(), &second.shared_items()));
     assert_eq!(first.fingerprint(), second.fingerprint());
+}
+
+#[test]
+fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_open() {
+    let old_repository =
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
+    let current_repository =
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
+    let history = create_history_with_items(vec![
+        user_msg(old_repository),
+        user_msg("dynamic request"),
+        user_msg(current_repository),
+    ]);
+
+    let generic = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let sampled = history
+        .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling);
+
+    assert_eq!(generic.items().len(), 3);
+    assert!(generic.stable_context_manifest().fail_open());
+    assert_eq!(sampled.items().len(), 2);
+    assert!(sampled.stable_context_manifest().projection_enabled());
+    assert!(!sampled.items().contains(&user_msg(old_repository)));
+    assert!(sampled.items().contains(&user_msg(current_repository)));
+}
+
+#[test]
+fn sampling_projection_reconstructs_current_variant_after_history_replacement() {
+    let old_repository =
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
+    let current_repository =
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
+    let mut history = ContextManager::new();
+    history.replace(vec![
+        user_msg(old_repository),
+        user_msg("compaction checkpoint summary"),
+        user_msg(current_repository),
+    ]);
+
+    let sampled = history
+        .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling);
+
+    assert_eq!(sampled.items().len(), 2);
+    assert!(!sampled.items().contains(&user_msg(old_repository)));
+    assert!(sampled.items().contains(&user_msg(current_repository)));
+    assert!(
+        sampled
+            .items()
+            .contains(&user_msg("compaction checkpoint summary"))
+    );
 }
 
 #[test]

@@ -107,6 +107,50 @@ fn update_plan_accepts_evidence_backed_step_metadata_and_states() {
 }
 
 #[test]
+fn structured_validation_route_round_trips_direct_argv_leaves() {
+    let value = json!({
+        "explanation": null,
+        "plan": [{
+            "id": "implement",
+            "step": "Implement the change",
+            "status": "implemented",
+            "validation_route": {
+                "ordering": "run_all",
+                "leaves": [{
+                    "argv": ["cargo", "test", "-p", "codex-core", "focused_case"],
+                    "covered_paths": ["core/src/validation_admission.rs"],
+                    "covered_contracts": ["focused-validation-v1"],
+                    "timeout_ms": 30000
+                }]
+            }
+        }]
+    });
+    let args = serde_json::from_value::<UpdatePlanArgs>(value.clone())
+        .expect("structured validation route should deserialize");
+
+    assert_eq!(serde_json::to_value(args).expect("serialize route"), value);
+}
+
+#[test]
+fn structured_validation_route_rejects_empty_argv_and_unbounded_timeouts() {
+    for leaf in [
+        json!({"argv": [], "timeout_ms": 1000}),
+        json!({"argv": ["cargo", "test"], "timeout_ms": 0}),
+        json!({
+            "argv": ["cargo", "test"],
+            "timeout_ms": MAX_STRUCTURED_VALIDATION_TIMEOUT_MS + 1
+        }),
+    ] {
+        let error = serde_json::from_value::<ValidationRoute>(json!({"leaves": [leaf]}))
+            .expect_err("inadmissible route leaf should fail");
+        assert!(
+            error.to_string().contains("validation route"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
 fn update_plan_rejects_missing_dependency_targets() {
     let err = serde_json::from_value::<UpdatePlanArgs>(json!({
         "plan": [{

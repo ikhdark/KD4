@@ -12,6 +12,7 @@ use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::AgentTaskBindingDraft;
 use codex_agent_task_store::AgentTaskStore;
+use codex_agent_task_store::ArchitectureContractV1;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::Attempt;
 use codex_agent_task_store::AttemptAmendment;
@@ -42,6 +43,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use serde_json::json;
 use similar::ChangeTag;
 use similar::TextDiff;
 use std::collections::BTreeSet;
@@ -232,6 +234,17 @@ async fn handle_submit_agent_receipt(
             "{SUBMIT_AGENT_RECEIPT_TOOL}: the typed task store is unavailable"
         ))
     })?;
+    let draft = args.into_receipt_draft();
+    if let Some(obligations) = store
+        .replay_required_evidence_missing(binding.attempt_id, &draft)
+        .await
+        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?
+    {
+        return Err(task_store_error(
+            SUBMIT_AGENT_RECEIPT_TOOL,
+            StoreError::RequiredEvidenceMissing { obligations },
+        ));
+    }
     // A sealed receipt makes task completion visible to other turns. Ensure any
     // command-level workspace mutation owned by this turn has terminated and
     // released both its persisted lease and its local reservation first.
@@ -255,7 +268,6 @@ async fn handle_submit_agent_receipt(
         .list_mutation_evidence(binding.attempt_id, Some(MAX_MUTATION_EVIDENCE_LIMIT))
         .await
         .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
-    let draft = args.into_receipt_draft();
     let review_reason = derive_review_reason(
         store.as_ref(),
         turn.config.cwd.as_path(),
@@ -943,6 +955,11 @@ fn require_root(
 
 fn task_store_error(tool_name: &'static str, error: StoreError) -> FunctionCallError {
     let detail = match error {
+        StoreError::RequiredEvidenceMissing { obligations } => serde_json::json!({
+            "kind": "required_evidence_missing",
+            "obligations": obligations,
+        })
+        .to_string(),
         StoreError::Io(_)
         | StoreError::Sql(_)
         | StoreError::Migration(_)
@@ -973,6 +990,8 @@ struct SubmitAgentReceiptArgs {
     blockers: Vec<String>,
     risks: Vec<String>,
     next_action: Option<String>,
+    #[serde(default)]
+    architecture_contract: Option<ArchitectureContractV1>,
 }
 
 impl SubmitAgentReceiptArgs {
@@ -994,6 +1013,7 @@ impl SubmitAgentReceiptArgs {
             blockers: self.blockers,
             risks: self.risks,
             next_action: self.next_action,
+            architecture_contract: self.architecture_contract,
         }
     }
 }
@@ -1126,6 +1146,172 @@ struct SubmitAgentReceiptResult {
     receipt: AgentReceipt,
 }
 
+const TASK_OUTPUT_INLINE_LIMIT_BYTES: usize = 8 * 1024;
+const MAX_PROJECTED_CHANGED_PATHS: usize = 8;
+const MAX_PROJECTED_PROOF_REFERENCES: usize = 8;
+const MAX_PROJECTED_VALIDATION_CALLS: usize = 8;
+const MAX_PROJECTED_EXACT_STRING_BYTES: usize = 192;
+const MAX_PROJECTED_PROSE_BYTES: usize = 512;
+
+fn bounded_receipt_projection(receipt: &AgentReceipt) -> JsonValue {
+    bounded_receipt_projection_with_proof_limit(receipt, MAX_PROJECTED_PROOF_REFERENCES)
+}
+
+fn bounded_receipt_projection_with_proof_limit(
+    receipt: &AgentReceipt,
+    proof_limit: usize,
+) -> JsonValue {
+    let (changed_paths, omitted_changed_paths) = bounded_exact_strings(
+        receipt
+            .declared_changes
+            .iter()
+            .map(|change| change.path.as_str()),
+        MAX_PROJECTED_CHANGED_PATHS,
+    );
+    let (proof_references, omitted_proof_references) = bounded_exact_strings(
+        receipt.validation_call_ids.iter().map(String::as_str),
+        proof_limit,
+    );
+    let passed = receipt
+        .criterion_results
+        .iter()
+        .filter(|result| result.status == CriterionStatus::Passed)
+        .count();
+    let failed = receipt
+        .criterion_results
+        .iter()
+        .filter(|result| result.status == CriterionStatus::Failed)
+        .count();
+    json!({
+        "assignment_id": receipt.assignment_id,
+        "attempt_id": receipt.attempt_id,
+        "status": receipt.status,
+        "proof_references": proof_references,
+        "changed_paths": changed_paths,
+        "criterion_counts": {
+            "total": receipt.criterion_results.len(),
+            "passed": passed,
+            "failed": failed,
+            "not_run": receipt.criterion_results.len().saturating_sub(passed + failed),
+        },
+        "omitted_item_counts": {
+            "changed_paths": omitted_changed_paths,
+            "proof_references": omitted_proof_references,
+            "blockers": receipt.blockers.len(),
+            "risks": receipt.risks.len(),
+            "criterion_evidence": receipt.criterion_results.len(),
+        },
+    })
+}
+
+fn bounded_exact_strings<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    limit: usize,
+) -> (Vec<String>, usize) {
+    let values = values.into_iter().collect::<Vec<_>>();
+    let retained = values
+        .iter()
+        .copied()
+        .filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES)
+        .take(limit)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let omitted = values.len().saturating_sub(retained.len());
+    (retained, omitted)
+}
+
+fn bounded_prose(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    if value.len() <= MAX_PROJECTED_PROSE_BYTES {
+        return Some(value.to_string());
+    }
+    let mut end = MAX_PROJECTED_PROSE_BYTES.saturating_sub(3);
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    Some(format!("{}...", &value[..end]))
+}
+
+fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
+    let task = &result.task;
+    let proof_references = task
+        .validation_calls
+        .iter()
+        .filter_map(|call| {
+            if call.call_id.len() > MAX_PROJECTED_EXACT_STRING_BYTES {
+                return None;
+            }
+            Some(json!({
+                "call_id": call.call_id,
+                "status": call.status,
+                "retained_output_ref": call.evidence.retained_output_ref.as_deref().filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
+                "shared_from_call_id": call.evidence.shared_from_call_id.as_deref().filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
+            }))
+        })
+        .take(MAX_PROJECTED_VALIDATION_CALLS)
+        .collect::<Vec<_>>();
+    let omitted_validation_calls = task
+        .validation_calls
+        .len()
+        .saturating_sub(proof_references.len());
+    json!({
+        "assignment_id": task.assignment.assignment_id,
+        "attempt_id": task.current_attempt.attempt_id,
+        "role": task.assignment.role,
+        "attempt_state": task.current_attempt.state,
+        "gates": task.gates.iter().map(|gate| json!({
+            "kind": gate.kind,
+            "status": gate.status,
+        })).collect::<Vec<_>>(),
+        "receipt": task.receipt.as_ref().map(|receipt| bounded_receipt_projection_with_proof_limit(receipt, 0)),
+        "proof_references": proof_references,
+        "workspace": {
+            "epoch": task.workspace_status.epoch,
+            "last_progress_at": task.workspace_status.last_progress_at,
+            "lease_state": task.workspace_status.lease_state,
+            "next_required_action": bounded_prose(task.workspace_status.next_required_action.as_deref()),
+        },
+        "omitted_item_counts": {
+            "observations": task.observations.len(),
+            "acceptance_criteria": task.assignment.acceptance_criteria.len(),
+            "read_scope": task.assignment.read_scope.len(),
+            "write_scope": task.assignment.write_scope.len(),
+            "proof_references": omitted_validation_calls,
+        },
+    })
+}
+
+fn bounded_task_projection_metadata<T: Serialize>(
+    full: &T,
+    mut essential_inline: JsonValue,
+) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+    let spillable = serde_json::to_string(full).ok()?;
+    let inline_bytes = serde_json::to_vec(&essential_inline).ok()?.len();
+    if inline_bytes > TASK_OUTPUT_INLINE_LIMIT_BYTES {
+        tracing::error!(
+            inline_bytes,
+            inline_limit = TASK_OUTPUT_INLINE_LIMIT_BYTES,
+            "bounded task output projection exceeded its hard inline limit"
+        );
+        essential_inline = json!({
+            "assignment_id": essential_inline.get("assignment_id"),
+            "attempt_id": essential_inline.get("attempt_id"),
+            "status": essential_inline.get("status").or_else(|| essential_inline.get("attempt_state")),
+            "projection_truncated": true,
+            "omitted_item_counts": essential_inline.get("omitted_item_counts"),
+        });
+    }
+    Some(codex_tools::ToolOutputProjectionMetadata {
+        outcome: codex_tools::ToolOutputOutcome::Success,
+        diagnostic_class: codex_tools::ToolOutputDiagnosticClass::Normal,
+        fragments: Vec::new(),
+        spillable_text: vec![spillable],
+        essential_inline,
+        requested_limit: Some(TASK_OUTPUT_INLINE_LIMIT_BYTES),
+        predetermined_ranges: Vec::new(),
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct SetAgentGateResult {
     gate: AgentGate,
@@ -1174,8 +1360,55 @@ macro_rules! impl_json_output {
     };
 }
 
-impl_json_output!(GetAgentTaskResult, GET_AGENT_TASK_TOOL);
-impl_json_output!(SubmitAgentReceiptResult, SUBMIT_AGENT_RECEIPT_TOOL);
+impl ToolOutput for GetAgentTaskResult {
+    fn log_preview(&self) -> String {
+        tool_output_json_text(self, GET_AGENT_TASK_TOOL)
+    }
+
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        bounded_task_projection_metadata(self, task_projection(self))
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        tool_output_response_item(call_id, payload, self, Some(true), GET_AGENT_TASK_TOOL)
+    }
+
+    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+        tool_output_code_mode_result(self, GET_AGENT_TASK_TOOL)
+    }
+}
+
+impl ToolOutput for SubmitAgentReceiptResult {
+    fn log_preview(&self) -> String {
+        tool_output_json_text(self, SUBMIT_AGENT_RECEIPT_TOOL)
+    }
+
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        bounded_task_projection_metadata(self, bounded_receipt_projection(&self.receipt))
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        tool_output_response_item(
+            call_id,
+            payload,
+            self,
+            Some(true),
+            SUBMIT_AGENT_RECEIPT_TOOL,
+        )
+    }
+
+    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+        tool_output_code_mode_result(self, SUBMIT_AGENT_RECEIPT_TOOL)
+    }
+}
 impl_json_output!(SetAgentGateResult, SET_AGENT_GATE_TOOL);
 impl_json_output!(AmendAgentTaskResult, AMEND_AGENT_TASK_TOOL);
 impl_json_output!(WaiveAgentGateResult, WAIVE_AGENT_GATE_TOOL);
@@ -1210,6 +1443,101 @@ fn get_agent_task_spec() -> ToolSpec {
 }
 
 fn submit_agent_receipt_spec() -> ToolSpec {
+    let architecture_criterion = object_schema(
+        [
+            (
+                "id",
+                JsonSchema::string(Some("Stable acceptance-criterion id.".to_string())),
+            ),
+            (
+                "text",
+                JsonSchema::string(Some("Required observable outcome.".to_string())),
+            ),
+        ],
+        &["id", "text"],
+    );
+    let architecture_scope = object_schema(
+        [
+            (
+                "path",
+                JsonSchema::string(Some("Repository-relative path.".to_string())),
+            ),
+            (
+                "recursive",
+                JsonSchema::boolean(Some(
+                    "Whether this scope includes descendants of path.".to_string(),
+                )),
+            ),
+        ],
+        &["path", "recursive"],
+    );
+    let architecture_contract = object_schema(
+        [
+            (
+                "schema_version",
+                JsonSchema::integer(Some(
+                    "ArchitectureContractV1 version; currently 1.".to_string(),
+                )),
+            ),
+            (
+                "objective",
+                JsonSchema::string(Some("Authoritative worker objective.".to_string())),
+            ),
+            (
+                "acceptance_criteria",
+                JsonSchema::array(
+                    architecture_criterion,
+                    Some("Authoritative worker acceptance criteria.".to_string()),
+                ),
+            ),
+            (
+                "read_scope",
+                JsonSchema::array(
+                    architecture_scope.clone(),
+                    Some("Canonical worker read scope.".to_string()),
+                ),
+            ),
+            (
+                "write_scope",
+                JsonSchema::array(
+                    architecture_scope,
+                    Some("Canonical worker write scope.".to_string()),
+                ),
+            ),
+            (
+                "stop_condition",
+                JsonSchema::string(Some("Authoritative worker stop condition.".to_string())),
+            ),
+            (
+                "risk_hints",
+                string_array_schema("Canonical worker risk hints."),
+            ),
+            (
+                "required_evidence",
+                string_array_schema("Canonical worker evidence requirements."),
+            ),
+            (
+                "prohibited_changes",
+                string_array_schema("Canonical worker prohibitions."),
+            ),
+            (
+                "contract_claims",
+                string_array_schema("Canonical worker contract claims."),
+            ),
+        ],
+        &[
+            "schema_version",
+            "objective",
+            "acceptance_criteria",
+            "read_scope",
+            "write_scope",
+            "stop_condition",
+            "risk_hints",
+            "required_evidence",
+            "prohibited_changes",
+            "contract_claims",
+        ],
+    );
     let criterion_result = object_schema(
         [
             (
@@ -1306,6 +1634,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
                         "Recommended next action for the root agent.".to_string(),
                     )),
                 ),
+                ("architecture_contract", architecture_contract),
             ],
             &[
                 "status",
@@ -1495,4 +1824,74 @@ fn object_schema<const N: usize>(
         Some(required.iter().map(|name| (*name).to_string()).collect()),
         Some(false.into()),
     )
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use chrono::Utc;
+    use codex_agent_task_store::AttemptId;
+
+    #[test]
+    fn oversized_receipt_projection_is_hard_bounded_and_spills_full_evidence() {
+        let receipt = AgentReceipt {
+            assignment_id: AssignmentId::new(),
+            attempt_id: AttemptId::new(),
+            status: AgentStatusClaim::Completed,
+            summary: "full durable receipt ".repeat(2_000),
+            criterion_results: (0..100)
+                .map(|index| CriterionResult {
+                    criterion_id: format!("criterion-{index}"),
+                    status: CriterionStatus::Passed,
+                    evidence: Some("detailed durable criterion evidence ".repeat(20)),
+                })
+                .collect(),
+            declared_changes: (0..100)
+                .map(|index| DeclaredChange {
+                    path: format!("src/{index:03}-{}.rs", "bounded-path-component".repeat(5)),
+                    summary: "detailed durable change summary ".repeat(20),
+                })
+                .collect(),
+            validation_call_ids: (0..100)
+                .map(|index| format!("validation-{index:03}-{}", "proof".repeat(20)))
+                .collect(),
+            blockers: vec!["durable blocker detail ".repeat(1_000)],
+            risks: vec!["durable risk detail ".repeat(1_000)],
+            next_action: Some("durable next action ".repeat(1_000)),
+            architecture_contract: None,
+            evidence_epoch: 7,
+            evidence_manifest_hash: "manifest".repeat(8),
+            sealed_at: Utc::now(),
+        };
+        let result = SubmitAgentReceiptResult {
+            receipt: receipt.clone(),
+        };
+        let metadata =
+            bounded_task_projection_metadata(&result, bounded_receipt_projection(&result.receipt))
+                .expect("bounded projection metadata");
+
+        assert!(
+            serde_json::to_vec(&metadata.essential_inline)
+                .expect("inline projection serializes")
+                .len()
+                <= TASK_OUTPUT_INLINE_LIMIT_BYTES
+        );
+        assert_eq!(
+            metadata.essential_inline["assignment_id"],
+            serde_json::to_value(receipt.assignment_id).expect("assignment id serializes")
+        );
+        assert_eq!(metadata.essential_inline["criterion_counts"]["total"], 100);
+        assert_eq!(
+            metadata.essential_inline["omitted_item_counts"]["changed_paths"],
+            92
+        );
+        assert_eq!(
+            metadata.essential_inline["omitted_item_counts"]["proof_references"],
+            92
+        );
+        assert!(
+            metadata.spillable_text[0].contains("full durable receipt"),
+            "the spill retains the complete canonical receipt"
+        );
+    }
 }

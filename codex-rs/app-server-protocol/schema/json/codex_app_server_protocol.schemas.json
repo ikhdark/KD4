@@ -9367,6 +9367,26 @@
         "title": "DeprecationNoticeNotification",
         "type": "object"
       },
+      "DeterministicContinuationClass": {
+        "enum": [
+          "unchanged_wait",
+          "source_bundle",
+          "source_coverage",
+          "artifact_range",
+          "agent_event_wait"
+        ],
+        "type": "string"
+      },
+      "DeterministicContinuationHostAction": {
+        "enum": [
+          "await_state_change",
+          "batch_source_bundle",
+          "reuse_covered_span",
+          "read_missing_ranges",
+          "drain_artifact_ranges"
+        ],
+        "type": "string"
+      },
       "DynamicToolCallOutputContentItem": {
         "oneOf": [
           {
@@ -21144,6 +21164,19 @@
           "counters": {
             "$ref": "#/definitions/v2/TurnTimingCounters"
           },
+          "deterministicContinuationReceiptOverflow": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "deterministicContinuationReceipts": {
+            "description": "Bounded, aggregated host-managed continuation receipts. Resource identities are hashes; raw paths and payloads are never included.",
+            "items": {
+              "$ref": "#/definitions/v2/TurnTimingDeterministicContinuationReceipt"
+            },
+            "type": "array"
+          },
           "exclusive": {
             "$ref": "#/definitions/v2/TurnTimingExclusive"
           },
@@ -21181,6 +21214,33 @@
             },
             "type": "array"
           },
+          "observationalNonprogressTokens": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingDiagnosticTokenAggregate"
+              }
+            ],
+            "default": {
+              "cachedInputTokens": 0,
+              "inputTokens": 0,
+              "logicalGenerations": 0,
+              "reasoningTokens": 0,
+              "totalTokens": 0,
+              "visibleOutputTokens": 0
+            },
+            "description": "Provider usage observed on generations where neither relevant structured state nor the next-correct-action changed. This is a diagnostic and is never treated as measured avoidable savings."
+          },
+          "preEditConvergence": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingPreEditConvergence"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pre-edit convergence milestones and bounded aggregate counters. Interval durations and count deltas are derived from these snapshots by analysis."
+          },
           "preFirstModelOutput": {
             "anyOf": [
               {
@@ -21194,6 +21254,22 @@
           "profileValid": {
             "type": "boolean"
           },
+          "provablyAvoidableTokens": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingDiagnosticTokenAggregate"
+              }
+            ],
+            "default": {
+              "cachedInputTokens": 0,
+              "inputTokens": 0,
+              "logicalGenerations": 0,
+              "reasoningTokens": 0,
+              "totalTokens": 0,
+              "visibleOutputTokens": 0
+            },
+            "description": "Provider input attributable only to generations carrying a matching owner-proved deterministic continuation receipt at the same state revision. This is intentionally independent from observational nonprogress."
+          },
           "schemaVersion": {
             "format": "uint16",
             "minimum": 0.0,
@@ -21206,6 +21282,44 @@
               "integer",
               "null"
             ]
+          },
+          "terminalization": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingTerminalization"
+              }
+            ],
+            "default": {
+              "candidateToValidationLaunchNs": 0,
+              "checkpointTokens": 0,
+              "completionGateNs": 0,
+              "conservativeRerunCount": 0,
+              "deliveryAttemptNs": 0,
+              "diffRefreshCount": 0,
+              "diffReuseCount": 0,
+              "durableCommitNs": 0,
+              "fenceNs": 0,
+              "finalMutationToSealNs": 0,
+              "freshnessNs": 0,
+              "gateNs": 0,
+              "hooksQuiescenceNs": 0,
+              "interactionReleaseNs": 0,
+              "postCleanupNs": 0,
+              "preparationNs": 0,
+              "proofReuseCount": 0,
+              "reviewNs": 0,
+              "reviewPreflightNs": 0,
+              "reviewerInfrastructureMemoHitCount": 0,
+              "reviewsPreventedByCorrectnessCount": 0,
+              "terminalMemoHitCount": 0,
+              "unclassifiedNs": 0,
+              "validationAggregateCount": 0,
+              "validationAggregateNs": 0,
+              "validationAggregateToGateNs": 0,
+              "validationLaunchCount": 0,
+              "validationProcessNs": 0
+            },
+            "description": "Additive terminalization phase timings. Older records deserialize to zeroes; the terminalization receipt remains authoritative for phases that occur after live dispatch."
           },
           "unions": {
             "$ref": "#/definitions/v2/TurnTimingUnions"
@@ -21279,10 +21393,81 @@
               "retry": 0
             }
           },
+          "attributableRecoveryGenerationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "clockRegressionCount": {
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
+          },
+          "completeSearchIndexCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "continuationsByDisposition": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingGenerationDispositionCounts"
+              }
+            ],
+            "default": {
+              "modelRequired": 0,
+              "ownerDrained": 0,
+              "suppressed": 0
+            }
+          },
+          "discoveryAfterOwnerResolutionCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "exactRepeatedWaitCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "failureDiagnosisCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "failureSignatureCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "generationsByPurpose": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingGenerationPurposeCounts"
+              }
+            ],
+            "default": {
+              "artifactContinuation": 0,
+              "compactionRecovery": 0,
+              "coordination": 0,
+              "failureDiagnosis": 0,
+              "implementationDecision": 0,
+              "initialReasoning": 0,
+              "postEditInspection": 0,
+              "repair": 0,
+              "sourceDiscovery": 0,
+              "sourceEvidenceInterpretation": 0,
+              "terminalCompletionReasoning": 0,
+              "validationInterpretation": 0,
+              "validationSelection": 0,
+              "wait": 0
+            }
           },
           "generationsByReason": {
             "allOf": [
@@ -21299,6 +21484,18 @@
               "subagent": 0,
               "toolContinuation": 0
             }
+          },
+          "incompleteSearchIndexCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "internallyDrainedWaitCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
           },
           "invalidTransitionCount": {
             "format": "uint32",
@@ -21332,7 +21529,92 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "noProgressDirectiveCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "permissionWaitCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planRevisionGenerationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planningFailureCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planningFixedPointIterationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planningGenerationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planningInvalidationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planningRepeatedDigestCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planningSemanticEffectCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "postEditCandidateCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "postEditInspectionCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "provenLoopActivationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "purposeAggregates": {
+            "description": "Bounded to the stable purpose enum's cardinality.",
+            "items": {
+              "$ref": "#/definitions/v2/TurnTimingGenerationPurposeAggregate"
+            },
+            "type": "array"
+          },
+          "repeatedDiscoveryCallCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "samePurposeContinuationCount": {
+            "default": 0,
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
@@ -21342,12 +21624,168 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "sourceDiscovery": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingSourceDiscoveryCounters"
+              }
+            ],
+            "default": {
+              "avoidedSingletonReadCount": 0,
+              "bundleGenerationMicros": 0,
+              "bundleOperationCount": 0,
+              "cappedZeroResultCount": 0,
+              "closureEstablishedCount": 0,
+              "directReadRequestedCount": 0,
+              "directReadReusedCount": 0,
+              "discoveryToDiscoveryBoundaryCount": 0,
+              "duplicateCappedRetryPreventedCount": 0,
+              "duplicateSearchSuppressedCount": 0,
+              "exactSearchReusedCount": 0,
+              "gitObservationsRefreshedCount": 0,
+              "gitObservationsReusedCount": 0,
+              "inlineSections": {
+                "contracts": 0,
+                "coreState": 0,
+                "directCallers": 0,
+                "focusedTests": 0,
+                "generatedRelationships": 0,
+                "otherSourceContext": 0,
+                "primaryImplementation": 0
+              },
+              "locatorOperationCount": 0,
+              "locatorToDiscoveryBoundaryCount": 0,
+              "materializedSections": {
+                "contracts": 0,
+                "coreState": 0,
+                "directCallers": 0,
+                "focusedTests": 0,
+                "generatedRelationships": 0,
+                "otherSourceContext": 0,
+                "primaryImplementation": 0
+              },
+              "newSourceBytesRead": 0,
+              "newSourceLinesRead": 0,
+              "overlapTrimmedReadCount": 0,
+              "ownerEstablishedCount": 0,
+              "postClosureSearchCount": 0,
+              "postClosureSearchWithQuestionCount": 0,
+              "readOperationCount": 0,
+              "recoveryOperationCount": 0,
+              "recoveryToRecoveryBoundaryCount": 0,
+              "searchOperationCount": 0,
+              "searchesAfterOwnerCount": 0,
+              "searchesBeforeOwnerCount": 0
+            }
+          },
+          "strictSubsetSourceRereadCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "suppressedRepeatedDispatchCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "toolCallCount": {
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
           },
+          "toolOutputArtifactCreationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputArtifactRereadCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputCanonicalByteCount": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputCanonicalTokenCount": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputModelByteCount": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputModelTokenCount": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputOmittedSectionCount": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputProjectedTokenCount": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputProjectionTruncationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputRecoveryCallCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputRecoveryRetruncationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputRecursiveSpillCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputTruncationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "truncationInducedContinuationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "userInputWaitCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "waitOnlyGenerationCount": {
+            "default": 0,
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
@@ -21365,6 +21803,89 @@
           "saturationCount",
           "toolCallCount",
           "userInputWaitCount"
+        ],
+        "type": "object"
+      },
+      "TurnTimingDeterministicContinuationReceipt": {
+        "properties": {
+          "avoidedTokenUsage": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingProviderTokenUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Populated only by an explicit paired counterfactual measurement. Normal runtime receipts leave this absent rather than estimating savings."
+          },
+          "class": {
+            "$ref": "#/definitions/v2/DeterministicContinuationClass"
+          },
+          "hostAction": {
+            "$ref": "#/definitions/v2/DeterministicContinuationHostAction"
+          },
+          "resourceIdentityHash": {
+            "type": "string"
+          },
+          "stateRevision": {
+            "type": "string"
+          },
+          "suppressedContinuationCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "class",
+          "hostAction",
+          "resourceIdentityHash",
+          "stateRevision",
+          "suppressedContinuationCount"
+        ],
+        "type": "object"
+      },
+      "TurnTimingDiagnosticTokenAggregate": {
+        "properties": {
+          "cachedInputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "inputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "logicalGenerations": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reasoningTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "totalTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "visibleOutputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cachedInputTokens",
+          "inputTokens",
+          "logicalGenerations",
+          "reasoningTokens",
+          "totalTokens",
+          "visibleOutputTokens"
         ],
         "type": "object"
       },
@@ -21432,6 +21953,211 @@
           "standaloneWorkNs",
           "toolOnlyNs",
           "unclassifiedNs"
+        ],
+        "type": "object"
+      },
+      "TurnTimingGenerationDisposition": {
+        "enum": [
+          "unknown",
+          "decision_bearing",
+          "deterministic"
+        ],
+        "type": "string"
+      },
+      "TurnTimingGenerationDispositionCounts": {
+        "properties": {
+          "modelRequired": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "ownerDrained": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "suppressed": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "TurnTimingGenerationPurpose": {
+        "enum": [
+          "initial",
+          "source_discovery",
+          "source_interpretation",
+          "implementation",
+          "wait",
+          "failure_diagnosis",
+          "validation_launch",
+          "validation_interpretation",
+          "repair",
+          "agent_coordination",
+          "deterministic_tool_continuation",
+          "compaction_recovery",
+          "terminal"
+        ],
+        "type": "string"
+      },
+      "TurnTimingGenerationPurposeAggregate": {
+        "properties": {
+          "cachedInputTokens": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "generations": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "inputTokens": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelStreamWaitNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "outputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "purpose": {
+            "$ref": "#/definitions/v2/TurnTimingGenerationPurpose"
+          },
+          "reasoningOutputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolCalls": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "totalTokens": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "visibleOutputTokens": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generations",
+          "modelStreamWaitNs",
+          "outputTokens",
+          "purpose",
+          "reasoningOutputTokens",
+          "toolCalls"
+        ],
+        "type": "object"
+      },
+      "TurnTimingGenerationPurposeCounts": {
+        "properties": {
+          "artifactContinuation": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "compactionRecovery": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "coordination": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "failureDiagnosis": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "implementationDecision": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "initialReasoning": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "postEditInspection": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "repair": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceDiscovery": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceEvidenceInterpretation": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "terminalCompletionReasoning": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "validationInterpretation": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "validationSelection": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "wait": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "compactionRecovery",
+          "failureDiagnosis",
+          "repair",
+          "sourceDiscovery",
+          "validationInterpretation",
+          "wait"
         ],
         "type": "object"
       },
@@ -21513,7 +22239,22 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "planningCompactionOverlapUnionNs": {
+            "default": 0,
+            "description": "Time simultaneously attributed to planning and compaction.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planningExclusiveUnionNs": {
+            "default": 0,
+            "description": "Planning union with nested compaction overlap removed.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "planningUnionNs": {
+            "description": "Inclusive planning union, including any nested compaction.",
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
@@ -21601,6 +22342,10 @@
               "null"
             ]
           },
+          "decisionBearing": {
+            "default": false,
+            "type": "boolean"
+          },
           "dispatchMs": {
             "format": "uint64",
             "minimum": 0.0,
@@ -21608,6 +22353,14 @@
               "integer",
               "null"
             ]
+          },
+          "disposition": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingGenerationDisposition"
+              }
+            ],
+            "default": "unknown"
           },
           "firstModelOutputMs": {
             "format": "uint64",
@@ -21623,6 +22376,17 @@
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
+          },
+          "generationPurpose": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingGenerationPurpose"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable workflow purpose for the logical generation. Physical retries inherit this value from their owning generation."
           },
           "generationReason": {
             "allOf": [
@@ -21642,17 +22406,286 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "nextStructuredActionChanged": {
+            "default": false,
+            "type": "boolean"
+          },
+          "outputTokens": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "ownerProvedPredeterminedContinuation": {
+            "description": "Exact hashed identity of the owner receipt proving that this continuation was predetermined at the recorded state revision.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "postDiscovery": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingPostDiscoveryRequest"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Observational usage for the request immediately following source-result cells. Provider fields remain whole-request usage."
+          },
+          "progressKinds": {
+            "items": {
+              "$ref": "#/definitions/v2/TurnTimingProgressKind"
+            },
+            "type": "array"
+          },
+          "reasoningOutputTokens": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "relevantStateFingerprint": {
+            "description": "A redacted hash of only the structured state relevant to this request.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tokenUsage": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingProviderTokenUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-reported usage for this physical attempt. Missing usage stays null, including failed attempts for which the provider reported none."
+          },
           "toolCallCount": {
             "default": 0,
             "description": "Tool calls emitted by this generation. Recorded on its primary attempt.",
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
+          },
+          "unchangedRelevantState": {
+            "default": false,
+            "type": "boolean"
           }
         },
         "required": [
           "isContinuation"
         ],
+        "type": "object"
+      },
+      "TurnTimingPostDiscoveryRequest": {
+        "properties": {
+          "cachedInputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "discoveryModelBoundaryCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "discoveryResultCells": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "newlyInjectedDiscoveryResultTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "replayAmplificationMicros": {
+            "description": "`(provider input / injected result tokens) * 1_000_000` when defined.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "totalProviderInputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cachedInputTokens",
+          "discoveryModelBoundaryCount",
+          "discoveryResultCells",
+          "newlyInjectedDiscoveryResultTokens",
+          "totalProviderInputTokens"
+        ],
+        "type": "object"
+      },
+      "TurnTimingPreEditConvergence": {
+        "properties": {
+          "acceptedToOwnerResolvedMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "broadDiscoveryAfterReady": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "bundleReadyToFirstAcceptedMutationMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstAcceptedMutationGenerationCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstAcceptedMutationMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstAcceptedMutationToolCallCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstSuccessfulMutationGenerationCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstSuccessfulMutationMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstSuccessfulMutationToolCallCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "implementationReadyGenerationCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "implementationReadyMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "implementationReadyToolCallCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "materialEvidenceOperations": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "mutationBeforeReady": {
+            "default": false,
+            "type": "boolean"
+          },
+          "ownerResolvedGenerationCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ownerResolvedMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ownerResolvedToBundleReadyMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ownerResolvedToolCallCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "readinessReopenCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reopenReasonCounts": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingReadinessReopenReasonCounts"
+              }
+            ],
+            "default": {
+              "contradictoryEvidence": 0,
+              "incompleteEvidence": 0,
+              "newAmbiguity": 0,
+              "sourceRevision": 0,
+              "userSteering": 0
+            }
+          }
+        },
         "type": "object"
       },
       "TurnTimingPreFirstModelOutput": {
@@ -21732,6 +22765,511 @@
           "transportReadinessNs",
           "unattributedPreOutputNs"
         ],
+        "type": "object"
+      },
+      "TurnTimingProgressKind": {
+        "enum": [
+          "new_input",
+          "new_named_evidence",
+          "source_closure",
+          "workspace_mutation",
+          "validation_result",
+          "plan_change",
+          "failure_observation",
+          "completion_state",
+          "structured_action_change"
+        ],
+        "type": "string"
+      },
+      "TurnTimingProviderTokenUsage": {
+        "properties": {
+          "cachedInputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "inputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reasoningTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "totalTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "visibleOutputTokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cachedInputTokens",
+          "inputTokens",
+          "reasoningTokens",
+          "totalTokens",
+          "visibleOutputTokens"
+        ],
+        "type": "object"
+      },
+      "TurnTimingReadinessReopenReasonCounts": {
+        "properties": {
+          "contradictoryEvidence": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "incompleteEvidence": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "newAmbiguity": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceRevision": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "userSteering": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "TurnTimingSourceDiscoveryCounters": {
+        "properties": {
+          "avoidedSingletonReadCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "bundleGenerationMicros": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "bundleOperationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "cappedZeroResultCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "closureEstablishedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "directReadRequestedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "directReadReusedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "discoveryToDiscoveryBoundaryCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "duplicateCappedRetryPreventedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "duplicateSearchSuppressedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "exactSearchReusedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "gitObservationsRefreshedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "gitObservationsReusedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "inlineSections": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingSourceSectionCategoryCounts"
+              }
+            ],
+            "default": {
+              "contracts": 0,
+              "coreState": 0,
+              "directCallers": 0,
+              "focusedTests": 0,
+              "generatedRelationships": 0,
+              "otherSourceContext": 0,
+              "primaryImplementation": 0
+            }
+          },
+          "locatorOperationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "locatorToDiscoveryBoundaryCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "materializedSections": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingSourceSectionCategoryCounts"
+              }
+            ],
+            "default": {
+              "contracts": 0,
+              "coreState": 0,
+              "directCallers": 0,
+              "focusedTests": 0,
+              "generatedRelationships": 0,
+              "otherSourceContext": 0,
+              "primaryImplementation": 0
+            }
+          },
+          "newSourceBytesRead": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "newSourceLinesRead": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "overlapTrimmedReadCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "ownerEstablishedCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "postClosureSearchCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "postClosureSearchWithQuestionCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "readOperationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "recoveryOperationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "recoveryToRecoveryBoundaryCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "searchOperationCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "searchesAfterOwnerCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "searchesBeforeOwnerCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "TurnTimingSourceSectionCategoryCounts": {
+        "properties": {
+          "contracts": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "coreState": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "directCallers": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "focusedTests": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "generatedRelationships": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "otherSourceContext": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "primaryImplementation": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "TurnTimingTerminalization": {
+        "properties": {
+          "candidateToValidationLaunchNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "checkpointTokens": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "completionGateNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "conservativeRerunCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "deliveryAttemptNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "diffRefreshCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "diffReuseCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "durableCommitNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "fenceNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "finalMutationToSealNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "freshnessNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "gateNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "hooksQuiescenceNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "interactionReleaseNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "postCleanupNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "preparationNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "proofReuseCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reviewNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reviewPreflightNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reviewerInfrastructureMemoHitCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reviewsPreventedByCorrectnessCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "terminalMemoHitCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unclassifiedNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "validationAggregateCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "validationAggregateNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "validationAggregateToGateNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "validationLaunchCount": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "validationProcessNs": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "TurnTimingUnions": {

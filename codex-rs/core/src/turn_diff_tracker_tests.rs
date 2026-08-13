@@ -50,6 +50,126 @@ fn tracker_with_root(root: &Path) -> TurnDiffTracker {
     TurnDiffTracker::with_environment_display_roots([("".to_string(), root.to_path_buf())])
 }
 
+fn source_revision(tracker: &TurnDiffTracker, content_hash: &str) -> SourceCoverageRevision {
+    SourceCoverageRevision {
+        content_hash: content_hash.to_string(),
+        size: 100,
+        created_at_ms: 10,
+        modified_at_ms: 20,
+        mutation_revision: tracker.current_mutation_revision(),
+        compaction_epoch: tracker.current_compaction_epoch(),
+    }
+}
+
+#[test]
+fn exact_source_coverage_unions_intervals_and_emits_only_missing_spans() {
+    let mut tracker = TurnDiffTracker::new();
+    let key = SourceCoverageKey::new("env-a", "repo-a", Path::new("src/lib.rs"));
+    let revision = source_revision(&tracker, "hash-a");
+
+    let first = tracker.record_source_coverage(
+        key.clone(),
+        revision.clone(),
+        SourceLineInterval {
+            start_line: 10,
+            end_line: 20,
+        },
+        false,
+    );
+    assert_eq!(
+        first.missing,
+        vec![SourceLineInterval {
+            start_line: 10,
+            end_line: 20,
+        }]
+    );
+    assert!(first.reused.is_empty());
+
+    let partial = tracker.record_source_coverage(
+        key.clone(),
+        revision.clone(),
+        SourceLineInterval {
+            start_line: 15,
+            end_line: 25,
+        },
+        false,
+    );
+    assert_eq!(
+        partial.reused,
+        vec![SourceLineInterval {
+            start_line: 15,
+            end_line: 20,
+        }]
+    );
+    assert_eq!(
+        partial.missing,
+        vec![SourceLineInterval {
+            start_line: 21,
+            end_line: 25,
+        }]
+    );
+
+    let full = tracker.record_source_coverage(
+        key,
+        revision,
+        SourceLineInterval {
+            start_line: 10,
+            end_line: 25,
+        },
+        false,
+    );
+    assert!(full.missing.is_empty());
+    assert_eq!(
+        full.reused,
+        vec![SourceLineInterval {
+            start_line: 10,
+            end_line: 25,
+        }]
+    );
+}
+
+#[test]
+fn source_coverage_fails_open_across_freshness_boundaries() {
+    let mut tracker = TurnDiffTracker::new();
+    let key = SourceCoverageKey::new("env-a", "repo-a", Path::new("src/lib.rs"));
+    let interval = SourceLineInterval {
+        start_line: 1,
+        end_line: 5,
+    };
+    let revision = source_revision(&tracker, "hash-a");
+    tracker.record_source_coverage(key.clone(), revision.clone(), interval, false);
+
+    let forced = tracker.record_source_coverage(key.clone(), revision, interval, true);
+    assert_eq!(forced.missing, vec![interval]);
+    assert!(forced.reused.is_empty());
+
+    let other_environment = SourceCoverageKey::new("env-b", "repo-a", Path::new("src/lib.rs"));
+    let other_environment_revision = source_revision(&tracker, "hash-a");
+    let other_env = tracker.record_source_coverage(
+        other_environment,
+        other_environment_revision,
+        interval,
+        false,
+    );
+    assert_eq!(other_env.missing, vec![interval]);
+
+    let changed_revision = source_revision(&tracker, "hash-b");
+    let changed_content =
+        tracker.record_source_coverage(key.clone(), changed_revision, interval, false);
+    assert_eq!(changed_content.missing, vec![interval]);
+
+    tracker.record_unknown_mutation();
+    let mutated_revision = source_revision(&tracker, "hash-b");
+    let after_mutation =
+        tracker.record_source_coverage(key.clone(), mutated_revision, interval, false);
+    assert_eq!(after_mutation.missing, vec![interval]);
+
+    tracker.record_successful_compaction();
+    let compacted_revision = source_revision(&tracker, "hash-b");
+    let after_compaction = tracker.record_source_coverage(key, compacted_revision, interval, false);
+    assert_eq!(after_compaction.missing, vec![interval]);
+}
+
 trait TestTurnDiffTrackerExt {
     fn record_exec_command_end(&mut self, command: &[String], exit_code: i32, timed_out: bool);
 }
@@ -1106,4 +1226,127 @@ fn large_rewrite_returns_promptly_and_preserves_exact_content() {
         fs::read_to_string(path).expect("read large file"),
         new_content
     );
+}
+
+fn coherent_boundary(candidate_identity: &str) -> CoherentImplementationBoundary {
+    CoherentImplementationBoundary {
+        candidate_identity: candidate_identity.to_string(),
+        batch_closed: true,
+        implementation_obligations_satisfied: true,
+        pending_mutation_obligations: false,
+        typed_children_quiescent: true,
+        default_children_quiescent: true,
+        overlapping_mutation_lease: false,
+    }
+}
+
+fn inspection_dependencies() -> PostEditInspectionDependencies {
+    PostEditInspectionDependencies {
+        source_closure_identity: "source-1".to_string(),
+        requirement_manifest_identity: "requirements-1".to_string(),
+        proof_route_identity: "proof-1".to_string(),
+        validation_identity: "validation-1".to_string(),
+        rendered_gate_identity: "gate-1".to_string(),
+    }
+}
+
+#[test]
+fn open_three_mutation_batch_inspects_once_at_final_quiescent_revision() {
+    let mut tracker = TurnDiffTracker::new();
+    let mut boundary = coherent_boundary("candidate-1");
+    boundary.batch_closed = false;
+
+    for _ in 0..3 {
+        tracker.record_unknown_mutation();
+        assert_eq!(
+            tracker.prepare_post_edit_inspection(Some(&boundary), inspection_dependencies()),
+            PostEditInspectionPreparation::FailOpen,
+        );
+    }
+
+    boundary.batch_closed = true;
+    let PostEditInspectionPreparation::Ready(bundle) =
+        tracker.prepare_post_edit_inspection(Some(&boundary), inspection_dependencies())
+    else {
+        panic!("quiescent candidate should be inspectable");
+    };
+    assert_eq!(bundle.final_mutation_revision, 3);
+    assert!(tracker.record_post_edit_inspection_outcome(
+        &bundle.fingerprint,
+        PostEditInspectionOutcome::AcceptForFocusedValidation,
+    ));
+    assert_eq!(
+        tracker.prepare_post_edit_inspection(Some(&boundary), inspection_dependencies()),
+        PostEditInspectionPreparation::Suppressed(
+            PostEditInspectionOutcome::AcceptForFocusedValidation
+        ),
+    );
+}
+
+#[test]
+fn post_edit_bundle_invalidates_only_changed_dependency_sections() {
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_unknown_mutation();
+    let boundary = coherent_boundary("candidate-1");
+    let PostEditInspectionPreparation::Ready(first) =
+        tracker.prepare_post_edit_inspection(Some(&boundary), inspection_dependencies())
+    else {
+        panic!("initial bundle should be ready");
+    };
+    assert!(tracker.record_post_edit_inspection_outcome(
+        &first.fingerprint,
+        PostEditInspectionOutcome::AcceptForFocusedValidation,
+    ));
+
+    let mut validation_changed = inspection_dependencies();
+    validation_changed.validation_identity = "validation-2".to_string();
+    let PostEditInspectionPreparation::Ready(second) =
+        tracker.prepare_post_edit_inspection(Some(&boundary), validation_changed)
+    else {
+        panic!("changed validation should rebuild its section");
+    };
+    assert_eq!(
+        second.rebuilt_sections,
+        vec![PostEditBundleSection::ProofAndValidation]
+    );
+
+    let mut requirements_changed = second.dependencies;
+    requirements_changed.requirement_manifest_identity = "requirements-2".to_string();
+    let PostEditInspectionPreparation::Ready(third) =
+        tracker.prepare_post_edit_inspection(Some(&boundary), requirements_changed)
+    else {
+        panic!("changed requirements should rebuild their section");
+    };
+    assert_eq!(
+        third.rebuilt_sections,
+        vec![PostEditBundleSection::Requirements]
+    );
+}
+
+#[test]
+fn quiescent_repair_batch_creates_one_new_candidate_inspection() {
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_unknown_mutation();
+    let initial = coherent_boundary("candidate-1");
+    let PostEditInspectionPreparation::Ready(first) =
+        tracker.prepare_post_edit_inspection(Some(&initial), inspection_dependencies())
+    else {
+        panic!("initial candidate should be ready");
+    };
+    assert!(tracker.record_post_edit_inspection_outcome(
+        &first.fingerprint,
+        PostEditInspectionOutcome::RequestRepairBatch {
+            repair_identity: "repair-1".to_string(),
+        },
+    ));
+
+    tracker.record_unknown_mutation();
+    let repair = coherent_boundary("candidate-2");
+    let PostEditInspectionPreparation::Ready(repaired) =
+        tracker.prepare_post_edit_inspection(Some(&repair), inspection_dependencies())
+    else {
+        panic!("quiescent repair candidate should be ready");
+    };
+    assert_eq!(repaired.final_mutation_revision, 2);
+    assert_eq!(repaired.candidate_identity, "candidate-2");
 }

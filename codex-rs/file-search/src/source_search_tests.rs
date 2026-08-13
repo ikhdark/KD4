@@ -1,9 +1,87 @@
 use super::*;
 use pretty_assertions::assert_eq;
+use sha2::Digest;
 use std::fs;
 
 fn search_options(repo_root: &Path, query: &str) -> SourceSearchOptions {
     SourceSearchOptions::new(repo_root.to_path_buf(), query.to_string())
+}
+
+#[test]
+fn read_preserves_crlf_and_builds_four_deterministic_chunks() {
+    let content = (1..=126)
+        .map(|line| format!("line {line}\r\n"))
+        .collect::<String>();
+
+    let output = read_file_span_from_bytes(
+        "src/fixture.rs".to_string(),
+        content.as_bytes().to_vec(),
+        1,
+        126,
+    )
+    .expect("read exact source span");
+
+    assert_eq!(output.exact_content, content);
+    assert_eq!(output.requested_bytes, content.len());
+    assert_eq!(
+        output.requested_content_sha256,
+        format!("{:x}", Sha256::digest(content.as_bytes()))
+    );
+    assert_eq!(output.chunks.len(), 4);
+    assert_eq!(
+        output
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.start_line, chunk.end_line))
+            .collect::<Vec<_>>(),
+        vec![(1, 40), (41, 80), (81, 120), (121, 126)]
+    );
+    assert!(
+        output
+            .chunks
+            .iter()
+            .all(|chunk| chunk.end_line - chunk.start_line < 40 && chunk.exact_bytes <= 8 * 1024)
+    );
+    let reconstructed = output
+        .chunks
+        .iter()
+        .map(|chunk| &output.exact_content[chunk.byte_start..chunk.byte_end])
+        .collect::<String>();
+    assert_eq!(reconstructed, content);
+    assert!(output.chunks.iter().all(|chunk| {
+        chunk.id
+            == format!(
+                "src:{}:L{}-L{}",
+                &output.requested_content_sha256[..16],
+                chunk.start_line,
+                chunk.end_line
+            )
+    }));
+}
+
+#[test]
+fn one_oversized_source_line_gets_its_own_exact_chunk() {
+    let oversized = format!("{}\r\nsmall\r\n", "x".repeat(9 * 1024));
+
+    let output = read_file_span_from_bytes(
+        "src/oversized.rs".to_string(),
+        oversized.as_bytes().to_vec(),
+        1,
+        2,
+    )
+    .expect("read source containing oversized line");
+
+    assert_eq!(output.exact_content, oversized);
+    assert_eq!(output.chunks.len(), 2);
+    assert_eq!(
+        (output.chunks[0].start_line, output.chunks[0].end_line),
+        (1, 1)
+    );
+    assert!(output.chunks[0].exact_bytes > 8 * 1024);
+    assert_eq!(
+        (output.chunks[1].start_line, output.chunks[1].end_line),
+        (2, 2)
+    );
 }
 
 #[test]
@@ -48,6 +126,53 @@ fn search_is_deterministic_and_returns_one_based_context_spans() {
 }
 
 #[test]
+fn all_twenty_two_match_identities_survive_context_projection() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let padding = "p".repeat(SOURCE_SEARCH_MAX_LINE_BYTES);
+    let mut lines = Vec::new();
+    for index in 0..22 {
+        lines.extend((0..5).map(|_| padding.clone()));
+        lines.push(format!("needle match {index} {padding}"));
+        lines.extend((0..5).map(|_| padding.clone()));
+    }
+    fs::write(repo.path().join("large.rs"), lines.join("\n")).expect("write fixture");
+    let mut options = search_options(repo.path(), "needle");
+    options.max_matches = 22;
+    options.context_lines = SOURCE_SEARCH_MAX_CONTEXT_LINES;
+
+    let output = search_source(options).expect("search");
+
+    assert_eq!(output.coverage.total_matches, 22);
+    assert_eq!(output.coverage.indexed_matches, 22);
+    assert_eq!(output.matches.len(), 22);
+    assert!(output.coverage.index_complete);
+    assert!(!output.coverage.result_cap_reached);
+    assert!(!output.coverage.context_complete);
+    assert!(output.coverage.omitted_contexts > 0);
+    assert!(output.matches.iter().all(|source_match| {
+        !source_match.id.is_empty()
+            && !source_match.file_id.is_empty()
+            && !source_match.source_revision.is_empty()
+            && source_match.matched_content.contains("needle")
+    }));
+    assert!(
+        output
+            .matches
+            .windows(2)
+            .all(|matches| matches[0].file_id == matches[1].file_id)
+    );
+    assert_eq!(
+        output
+            .matches
+            .iter()
+            .map(|source_match| source_match.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        22,
+    );
+}
+
+#[test]
 fn fixed_string_search_treats_punctuation_literally() {
     let repo = tempfile::tempdir().expect("tempdir");
     fs::write(repo.path().join("source.rs"), "alpha.beta\nalphaXbeta\n").expect("write");
@@ -56,6 +181,121 @@ fn fixed_string_search_treats_punctuation_literally() {
 
     assert_eq!(output.coverage.total_matches, 1);
     assert_eq!(output.matches[0].line_number, 1);
+}
+
+#[test]
+fn unique_complete_search_hydrates_from_the_observed_bytes() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let source = (1..=80)
+        .map(|line| {
+            if line == 40 {
+                "fn unique_needle() {}".to_string()
+            } else {
+                format!("// line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(repo.path().join("source.rs"), &source).expect("write");
+
+    let output = search_source(search_options(repo.path(), "unique_needle")).expect("search");
+
+    assert_eq!(
+        output.hydration_status,
+        SourceSearchHydrationStatus::HydratedDeterministicWindow
+    );
+    let hydrated = output.hydrated_span.expect("hydrated unique span");
+    assert_eq!(hydrated.observation.path, "source.rs");
+    assert_eq!(hydrated.observation.start_line, Some(20));
+    assert!(
+        hydrated
+            .observation
+            .lines
+            .iter()
+            .any(|line| line.text.contains("unique_needle"))
+    );
+    assert_eq!(
+        hydrated.content_hash,
+        format!("{:x}", sha2::Sha256::digest(source.as_bytes()))
+    );
+}
+
+#[test]
+fn unique_search_prefers_an_existing_authoritative_definition_span() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let source = (1..=80)
+        .map(|line| {
+            if line == 40 {
+                "let unique_needle = true;".to_string()
+            } else {
+                format!("// line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(repo.path().join("source.rs"), &source).expect("write");
+    let mut options = search_options(repo.path(), "unique_needle");
+    options.hydration_candidates = vec![SourceSearchHydrationCandidate {
+        path: "source.rs".to_string(),
+        start_line: 35,
+        end_line: 45,
+        kind: SourceSearchHydrationCandidateKind::AuthoritativeDefinition,
+    }];
+
+    let output = search_source(options).expect("search");
+
+    assert_eq!(
+        output.hydration_status,
+        SourceSearchHydrationStatus::HydratedAuthoritativeDefinition
+    );
+    let hydrated = output.hydrated_span.expect("hydrated definition");
+    assert_eq!(hydrated.observation.start_line, Some(35));
+    assert_eq!(hydrated.observation.end_line, Some(45));
+    assert_eq!(
+        hydrated.content_hash,
+        format!("{:x}", sha2::Sha256::digest(source.as_bytes()))
+    );
+}
+
+#[test]
+fn ambiguous_or_incomplete_search_does_not_hydrate() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join("source.rs"), "needle\nneedle\n").expect("write");
+    let ambiguous = search_source(search_options(repo.path(), "needle")).expect("search");
+    assert_eq!(
+        ambiguous.hydration_status,
+        SourceSearchHydrationStatus::SkippedNoUniqueMatch
+    );
+    assert!(ambiguous.hydrated_span.is_none());
+
+    let options = search_options(repo.path(), "first");
+    let mut accumulator = SourceSearchAccumulator::new(&options).expect("accumulator");
+    assert!(accumulator.consider_file(Path::new("first.rs"), 6));
+    accumulator.add_file_bytes(Path::new("first.rs"), b"first\n".to_vec());
+    accumulator.mark_filesystem_error();
+    let incomplete = accumulator.finish(vec![".".to_string()]);
+    assert_eq!(
+        incomplete.hydration_status,
+        SourceSearchHydrationStatus::SkippedCoverageIncomplete
+    );
+    assert!(incomplete.hydrated_span.is_none());
+}
+
+#[test]
+fn unique_hydration_can_be_disabled_without_changing_search_results() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join("source.rs"), "needle\n").expect("write");
+    let mut options = search_options(repo.path(), "needle");
+    options.hydrate_selected_span = false;
+
+    let output = search_source(options).expect("search");
+
+    assert_eq!(output.coverage.total_matches, 1);
+    assert_eq!(
+        output.hydration_status,
+        SourceSearchHydrationStatus::Disabled
+    );
+    assert!(output.hydrated_span.is_none());
 }
 
 #[test]
@@ -144,7 +384,8 @@ fn search_result_text_never_exceeds_result_budget() {
         output
             .matches
             .iter()
-            .all(|source_match| source_match.lines[0].text.len() <= SOURCE_SEARCH_MAX_LINE_BYTES)
+            .flat_map(|source_match| &source_match.lines)
+            .all(|line| line.text.len() <= SOURCE_SEARCH_MAX_LINE_BYTES)
     );
 }
 
@@ -583,6 +824,7 @@ fn capped_unscoped_miss_reports_only_the_scanned_portion() {
     .expect("bounded unscoped miss");
 
     assert!(!output.coverage_complete);
+    assert!(!output.coverage.index_complete);
     assert!(output.matches.is_empty());
     let note = output.coverage_note.expect("incomplete coverage note");
     assert!(note.contains("No matches were found in the scanned portion"));
@@ -669,7 +911,7 @@ fn scoped_search_stays_within_owner_bounds_and_reports_counter_invariants() {
 }
 
 #[test]
-fn projection_is_deterministic_and_keeps_the_sorted_fitting_prefix() {
+fn projection_is_deterministic_and_keeps_all_sorted_match_identities() {
     let repo = tempfile::tempdir().expect("tempdir");
     let line = format!("needle {}\n", "x".repeat(SOURCE_SEARCH_MAX_LINE_BYTES));
     fs::write(repo.path().join("b.rs"), line.repeat(100)).expect("write b");
@@ -685,7 +927,11 @@ fn projection_is_deterministic_and_keeps_the_sorted_fitting_prefix() {
         first.truncated_reason,
         Some(SourceTruncatedReason::MaxResultBytes)
     );
-    assert!(first.coverage.result_bytes <= SOURCE_SEARCH_MAX_RESULT_BYTES);
+    assert_eq!(first.matches.len(), 200);
+    assert!(!first.coverage.result_cap_reached);
+    assert!(first.coverage.index_complete);
+    assert!(!first.coverage.context_complete);
+    assert!(first.coverage.omitted_contexts > 0);
     assert!(first.matches.windows(2).all(|pair| {
         pair[0]
             .path

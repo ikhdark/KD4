@@ -220,52 +220,118 @@ pub(crate) async fn run_codex_thread_one_shot(
     final_output_json_schema: Option<Value>,
     initial_history: Option<InitialHistory>,
 ) -> Result<Codex, CodexErr> {
-    // Use a child token so we can stop the delegate after completion without
-    // requiring the caller to cancel the parent token.
-    let child_cancel = cancel_token.child_token();
-    let io = Box::pin(run_codex_thread_interactive(
+    PreparedCodexOneShot::start(
         config,
         auth_manager,
         models_manager,
         parent_session,
         parent_ctx,
-        child_cancel.clone(),
+        cancel_token,
         subagent_source,
         initial_history,
-    ))
-    .await?;
+    )
+    .await?
+    .submit_once(input, final_output_json_schema)
+    .await
+}
 
-    // Send the initial input to kick off the one-shot turn.
-    io.submit(Op::UserInput {
-        items: input,
-        final_output_json_schema,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    })
-    .await?;
+/// A one-shot child whose thread is initialized without submitting a model
+/// request. Callers can finish deterministic preflight, then either submit once
+/// or shut the child down without ever generating a turn.
+pub(crate) struct PreparedCodexOneShot {
+    io: Codex,
+    child_cancel: CancellationToken,
+    submitted: bool,
+}
 
-    // Bridge events so we can observe completion and shut down automatically.
-    let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let ops_tx = io.tx_sub.clone();
-    let agent_status = io.agent_status.clone();
-    let session = Arc::clone(&io.session);
-    let session_loop_termination = io.session_loop_termination.clone();
-    tokio::spawn(bridge_one_shot_events(io, tx_bridge, ops_tx, child_cancel));
+impl PreparedCodexOneShot {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start(
+        config: Config,
+        auth_manager: Arc<AuthManager>,
+        models_manager: SharedModelsManager,
+        parent_session: Arc<Session>,
+        parent_ctx: Arc<TurnContext>,
+        cancel_token: CancellationToken,
+        subagent_source: SubAgentSource,
+        initial_history: Option<InitialHistory>,
+    ) -> Result<Self, CodexErr> {
+        let child_cancel = cancel_token.child_token();
+        let io = Box::pin(run_codex_thread_interactive(
+            config,
+            auth_manager,
+            models_manager,
+            parent_session,
+            parent_ctx,
+            child_cancel.clone(),
+            subagent_source,
+            initial_history,
+        ))
+        .await?;
+        Ok(Self {
+            io,
+            child_cancel,
+            submitted: false,
+        })
+    }
 
-    // For one-shot usage, return a closed `tx_sub` so callers cannot submit
-    // additional ops after the initial request. Create a channel and drop the
-    // receiver to close it immediately.
-    let (tx_closed, rx_closed) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-    drop(rx_closed);
+    pub(crate) async fn submit_once(
+        mut self,
+        input: Vec<UserInput>,
+        final_output_json_schema: Option<Value>,
+    ) -> Result<Codex, CodexErr> {
+        debug_assert!(
+            !self.submitted,
+            "prepared one-shot submitted more than once"
+        );
+        self.io
+            .submit(Op::UserInput {
+                items: input,
+                final_output_json_schema,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await?;
+        self.submitted = true;
 
-    Ok(Codex {
-        rx_event: rx_bridge,
-        tx_sub: tx_closed,
-        agent_status,
-        session,
-        session_loop_termination,
-    })
+        // Bridge events so we can observe completion and shut down automatically.
+        let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let ops_tx = self.io.tx_sub.clone();
+        let agent_status = self.io.agent_status.clone();
+        let session = Arc::clone(&self.io.session);
+        let session_loop_termination = self.io.session_loop_termination.clone();
+        tokio::spawn(bridge_one_shot_events(
+            self.io,
+            tx_bridge,
+            ops_tx,
+            self.child_cancel,
+        ));
+
+        // For one-shot usage, return a closed `tx_sub` so callers cannot submit
+        // additional ops after the initial request. Create a channel and drop the
+        // receiver to close it immediately.
+        let (tx_closed, rx_closed) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+        drop(rx_closed);
+
+        Ok(Codex {
+            rx_event: rx_bridge,
+            tx_sub: tx_closed,
+            agent_status,
+            session,
+            session_loop_termination,
+        })
+    }
+
+    pub(crate) async fn shutdown(self) {
+        let _ = self.io.submit(Op::Shutdown {}).await;
+        self.child_cancel.cancel();
+        let _ = timeout(
+            Duration::from_secs(5),
+            self.io.session_loop_termination.clone(),
+        )
+        .await;
+    }
 }
 
 async fn bridge_one_shot_events(

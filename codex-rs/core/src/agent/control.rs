@@ -7,6 +7,7 @@ use crate::agent::status::is_final;
 use crate::agent::task_coordinator::AgentTaskCoordinator;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
+use crate::amplification::RootAmplificationTelemetry;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
@@ -247,6 +248,9 @@ pub(crate) struct AgentControl {
     rollout_budget: Arc<RolloutBudget>,
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
+    /// Nonpersistent, bounded measurement state shared by the root and child
+    /// sessions. It is deliberately separate from durable TaskEvidence.
+    amplification_telemetry: Arc<RootAmplificationTelemetry>,
     completion_finalization: CompletionFinalizationAdmission,
     #[cfg(test)]
     test_hooks: Arc<AgentControlTestHooks>,
@@ -286,6 +290,14 @@ impl AgentControl {
 
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
         &self.task_coordinator
+    }
+
+    pub(crate) fn amplification_telemetry(&self) -> Arc<RootAmplificationTelemetry> {
+        Arc::clone(&self.amplification_telemetry)
+    }
+
+    pub(crate) fn has_live_agents(&self) -> bool {
+        self.state.has_live_agents()
     }
 
     pub(crate) async fn admit_completion_activity(

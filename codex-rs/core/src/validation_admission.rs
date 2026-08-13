@@ -6,6 +6,8 @@ use std::sync::atomic::Ordering;
 
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -262,6 +264,43 @@ pub(crate) enum ValidationClassification {
     Opaque,
 }
 
+/// Internal pre-edit intent derived from the existing validation classifier.
+/// Unknown and non-validation commands stay unclassified so callers fail open
+/// without asking the model to label command intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreEditValidationClass {
+    FocusedImplementationEvidence,
+    KnownFinalCeremony,
+    OtherKnownValidation,
+}
+
+pub(crate) fn classify_pre_edit_validation(
+    invocation: &CommandInvocation,
+) -> Option<PreEditValidationClass> {
+    let ValidationClassification::Validation { leaves, .. } = classify_validation(invocation)
+    else {
+        return None;
+    };
+    if leaves.is_empty() {
+        return None;
+    }
+    if leaves.iter().all(|leaf| {
+        matches!(
+            leaf.breadth,
+            ValidationBreadth::Selector | ValidationBreadth::Module
+        )
+    }) {
+        return Some(PreEditValidationClass::FocusedImplementationEvidence);
+    }
+    if leaves
+        .iter()
+        .all(|leaf| leaf.breadth == ValidationBreadth::Workspace)
+    {
+        return Some(PreEditValidationClass::KnownFinalCeremony);
+    }
+    Some(PreEditValidationClass::OtherKnownValidation)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ValidationSkipReason {
@@ -456,39 +495,7 @@ pub(crate) struct ReusableValidationResult {
 ///
 /// This deliberately contains no validation-input manifest. Completed evidence
 /// freshness is decided by the durable validation evidence path instead.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct InFlightValidationKey {
-    repository: Vec<u8>,
-    cwd: String,
-    command: String,
-    environment: String,
-    toolchain: String,
-    cargo_coverage: String,
-    workspace_revision: u64,
-}
-
-impl InFlightValidationKey {
-    pub(crate) fn new(
-        repository: &[u8],
-        cwd: impl Into<String>,
-        invocation: &CommandInvocation,
-        environment: impl Into<String>,
-        toolchain: impl Into<String>,
-        workspace_revision: u64,
-    ) -> Self {
-        let command = serde_json::to_string(&invocation.hook_input()).unwrap_or_default();
-        let cargo_coverage = cargo_coverage_identity(invocation).unwrap_or_default();
-        Self {
-            repository: repository.to_vec(),
-            cwd: cwd.into(),
-            command,
-            environment: environment.into(),
-            toolchain: toolchain.into(),
-            cargo_coverage,
-            workspace_revision,
-        }
-    }
-}
+pub(crate) type InFlightValidationKey = codex_protocol::validation::ValidationProofKey;
 
 #[derive(Debug)]
 pub(crate) struct ValidationFlight {
@@ -635,7 +642,7 @@ pub(crate) type SharedValidationSingleflight =
 #[derive(Debug)]
 pub(crate) enum ValidationRegistration {
     Leader {
-        execution: ValidationLeaderOwnership,
+        execution: Box<ValidationLeaderOwnership>,
         waiter: ValidationLeader,
     },
     Follower(ValidationLeader),
@@ -669,12 +676,12 @@ pub(crate) async fn register_if_absent(
     });
     flights.insert(identity.clone(), Arc::clone(&flight));
     ValidationRegistration::Leader {
-        execution: ValidationLeaderOwnership {
+        execution: Box::new(ValidationLeaderOwnership {
             identity: identity.clone(),
             flight: Arc::clone(&flight),
             registry: Arc::clone(registry),
             committed: false,
-        },
+        }),
         waiter: ValidationLeader {
             identity,
             flight,
@@ -710,6 +717,12 @@ pub(crate) struct ValidationLaunchPlan {
     pub(crate) invocation: CommandInvocation,
     pub(crate) authorization_revision: u64,
     pub(crate) observation: Option<ValidationObservationPlan>,
+    /// Filled only after the launch-boundary admission has rechecked the
+    /// current implementation, environment, configuration, and coverage.
+    pub(crate) proof_key: Option<codex_protocol::validation::ValidationProofKey>,
+    /// The exact predeclared leaf route, when this is an automatic launch.
+    pub(crate) structured_route: Option<codex_protocol::plan_tool::ValidationRoute>,
+    pub(crate) validation_call_id: Option<String>,
 }
 
 pub(crate) async fn admit_validation(
@@ -999,18 +1012,6 @@ fn descriptor_fingerprint(descriptor: &ValidationCommandDescriptor, exact: bool)
     .into_bytes()
 }
 
-fn cargo_coverage_identity(invocation: &CommandInvocation) -> Option<String> {
-    let ValidationClassification::Validation { leaves, .. } = classify_validation(invocation)
-    else {
-        return None;
-    };
-    let rust: Vec<_> = leaves
-        .into_iter()
-        .filter(|leaf| leaf.ecosystem == ValidationEcosystem::Rust)
-        .collect();
-    (!rust.is_empty()).then(|| serde_json::to_string(&rust).unwrap_or_default())
-}
-
 pub(crate) fn validation_identity(
     repository: &[u8],
     cwd: impl Into<String>,
@@ -1019,14 +1020,58 @@ pub(crate) fn validation_identity(
     toolchain: impl Into<String>,
     workspace_revision: u64,
 ) -> InFlightValidationKey {
-    InFlightValidationKey::new(
+    validation_identity_with_scope(
         repository,
         cwd,
         invocation,
         environment,
         toolchain,
-        workspace_revision,
+        "",
+        workspace_revision.to_string(),
+        &[],
+        &[],
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validation_identity_with_scope(
+    repository: &[u8],
+    cwd: impl Into<String>,
+    invocation: &CommandInvocation,
+    environment: impl Into<String>,
+    toolchain: impl Into<String>,
+    configuration: impl Into<String>,
+    implementation_identity: impl Into<String>,
+    covered_paths: &[String],
+    covered_contracts: &[String],
+) -> InFlightValidationKey {
+    let canonical_route = serde_json::to_vec(&invocation.hook_input()).unwrap_or_default();
+    let canonical_route_hash = format!("{:x}", Sha256::digest(canonical_route));
+    let mut paths = covered_paths.to_vec();
+    paths.sort();
+    paths.dedup();
+    let mut contracts = covered_contracts.to_vec();
+    contracts.sort();
+    contracts.dedup();
+    let coverage_identity = if paths.is_empty() && contracts.is_empty() {
+        // Unknown coverage is intentionally repository-wide; never invent a
+        // narrower identity from command text.
+        "repository-wide".to_string()
+    } else {
+        let encoded = serde_json::to_vec(&(paths, contracts)).unwrap_or_default();
+        format!("{:x}", Sha256::digest(encoded))
+    };
+    InFlightValidationKey {
+        repository: String::from_utf8_lossy(repository).into_owned(),
+        cwd: cwd.into(),
+        canonical_route_hash,
+        implementation_identity: implementation_identity.into(),
+        coverage_identity,
+        environment_identity: environment.into(),
+        toolchain_identity: toolchain.into(),
+        configuration_identity: configuration.into(),
+        validation_contract_version: codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
+    }
 }
 
 fn cheaper_alternatives(descriptor: &ValidationCommandDescriptor) -> Vec<String> {
@@ -1170,14 +1215,14 @@ fn classify_argv_at_depth(
     }
 
     let descriptor = match (binary.as_str(), args.first().map(String::as_str)) {
-        ("cargo", Some("test")) => cargo_test_descriptor(args),
-        ("cargo", Some("check")) => {
+        ("cargo" | "cargo.exe", Some("test")) => cargo_test_descriptor(args),
+        ("cargo" | "cargo.exe", Some("check")) => {
             descriptor(ValidationOperation::Check, ValidationEcosystem::Rust, args)
         }
-        ("cargo", Some("clippy")) => {
+        ("cargo" | "cargo.exe", Some("clippy")) => {
             descriptor(ValidationOperation::Lint, ValidationEcosystem::Rust, args)
         }
-        ("cargo", Some("bench")) => {
+        ("cargo" | "cargo.exe", Some("bench")) => {
             descriptor(ValidationOperation::Bench, ValidationEcosystem::Rust, args)
         }
         ("pytest" | "pytest.exe" | "python" | "python3", _)
@@ -1278,6 +1323,34 @@ fn descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_edit_validation_classification_is_internal_bounded_and_fail_open() {
+        assert_eq!(
+            classify_pre_edit_validation(&CommandInvocation::Script(
+                "cargo test -p codex-core exact_pre_edit_case".into()
+            )),
+            Some(PreEditValidationClass::FocusedImplementationEvidence)
+        );
+        assert_eq!(
+            classify_pre_edit_validation(&CommandInvocation::Script(
+                "cargo test --workspace".into()
+            )),
+            Some(PreEditValidationClass::KnownFinalCeremony)
+        );
+        assert_eq!(
+            classify_pre_edit_validation(&CommandInvocation::Script(
+                "cargo test -p codex-core".into()
+            )),
+            Some(PreEditValidationClass::OtherKnownValidation)
+        );
+        assert_eq!(
+            classify_pre_edit_validation(&CommandInvocation::Script(
+                "custom-proof --opaque".into()
+            )),
+            None
+        );
+    }
 
     #[test]
     fn prohibited_validation_wrappers_fail_closed() {
@@ -1421,6 +1494,20 @@ mod tests {
             ValidationClassification::Validation { ref leaves, .. }
                 if leaves[0].breadth == ValidationBreadth::Workspace
                     && leaves[0].selector.is_none()
+        ));
+    }
+
+    #[test]
+    fn windows_cargo_executable_is_classified_as_validation() {
+        let classified = classify_validation(&CommandInvocation::Argv {
+            program: r"C:\Users\tester\.cargo\bin\cargo.exe".into(),
+            args: vec!["test".into(), "--quiet".into()],
+        });
+        assert!(matches!(
+            classified,
+            ValidationClassification::Validation { ref leaves, .. }
+                if leaves[0].operation == ValidationOperation::Test
+                    && leaves[0].ecosystem == ValidationEcosystem::Rust
         ));
     }
 
@@ -1723,5 +1810,65 @@ mod tests {
             baseline,
             validation_identity(b"repo", "codex-rs", &package, "env-a", "stable", 5)
         );
+
+        let scoped = validation_identity_with_scope(
+            b"repo",
+            "codex-rs",
+            &package,
+            "env-a",
+            "stable",
+            "features-a",
+            "implementation-a",
+            &["core/src/lib.rs".to_string()],
+            &["core-contract".to_string()],
+        );
+        for mismatch in [
+            validation_identity_with_scope(
+                b"repo",
+                "other-cwd",
+                &package,
+                "env-a",
+                "stable",
+                "features-a",
+                "implementation-a",
+                &["core/src/lib.rs".to_string()],
+                &["core-contract".to_string()],
+            ),
+            validation_identity_with_scope(
+                b"repo",
+                "codex-rs",
+                &package,
+                "env-a",
+                "stable",
+                "features-b",
+                "implementation-a",
+                &["core/src/lib.rs".to_string()],
+                &["core-contract".to_string()],
+            ),
+            validation_identity_with_scope(
+                b"repo",
+                "codex-rs",
+                &package,
+                "env-a",
+                "stable",
+                "features-a",
+                "implementation-b",
+                &["core/src/lib.rs".to_string()],
+                &["core-contract".to_string()],
+            ),
+            validation_identity_with_scope(
+                b"repo",
+                "codex-rs",
+                &package,
+                "env-a",
+                "stable",
+                "features-a",
+                "implementation-a",
+                &["core/src/other.rs".to_string()],
+                &["core-contract".to_string()],
+            ),
+        ] {
+            assert_ne!(scoped, mismatch);
+        }
     }
 }

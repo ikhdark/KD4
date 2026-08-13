@@ -10,7 +10,6 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $emptyOutput = '{}'
-$maxContextCharacters = 8000
 $stateDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $PSScriptRoot '..\harness\runs\task-continuity\v1')
 )
@@ -104,69 +103,10 @@ try {
         exit 0
     }
 
-    $lines = @(
-        'KD4 task continuity recovery (capsule v1; bounded and redacted).'
-        "Session: $($capsule.session_id)"
-        "Continuity epoch: $($capsule.continuity_epoch)"
-    )
-    if (-not [string]::IsNullOrWhiteSpace([string]$capsule.predecessor_thread_id)) {
-        $lines += "Predecessor thread: $($capsule.predecessor_thread_id)"
-    }
-    if (-not [string]::IsNullOrWhiteSpace([string]$capsule.task_label)) {
-        $lines += "Task label: $($capsule.task_label)"
-    }
-    if (-not [string]::IsNullOrWhiteSpace([string]$capsule.last_user_request)) {
-        $lines += 'Last user request:'
-        $lines += [string]$capsule.last_user_request
-    }
-    if (-not [string]::IsNullOrWhiteSpace([string]$capsule.last_assistant_result)) {
-        $lines += 'Last assistant result:'
-        $lines += [string]$capsule.last_assistant_result
-    }
-    if (-not [string]::IsNullOrWhiteSpace([string]$capsule.repository.root)) {
-        $lines += (
-            "Repository: $($capsule.repository.root) @ " +
-                [string]$capsule.repository.revision
-        )
-        $lines += "Dirty summary: $($capsule.repository.dirty_summary)"
-    }
-    $lines += "Compaction state: $($capsule.compaction.phase)"
-    if (-not [string]::IsNullOrWhiteSpace([string]$capsule.transcript_path)) {
-        $lines += "Transcript: $($capsule.transcript_path)"
-    }
-    $lines += (
-        'Treat this as recovery context only; reconcile it with the ' +
-            'current workspace and request before acting.'
-    )
-
-    $context = $lines -join "`n"
-    if ($context.IndexOf([char]0) -ge 0) {
-        throw 'recovery context contained a NUL character'
-    }
-    $context = [regex]::Replace(
-        $context,
-        '(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+',
-        'Bearer [REDACTED]'
-    )
-    $context = [regex]::Replace(
-        $context,
-        '\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b',
-        '[REDACTED]'
-    )
-    $context = [regex]::Replace(
-        $context,
-        '(?i)(\b(?:api[_-]?key|token|password|secret)\b\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
-        '$1[REDACTED]'
-    )
-    if ($context.Length -gt $maxContextCharacters) {
-        $context = $context.Substring(0, $maxContextCharacters - 3) + '...'
-    }
-    $output = (
-        '{"hookSpecificOutput":{"hookEventName":"SessionStart",' +
-            '"additionalContext":' + $json.Serialize($context) + '}}'
-    )
-    [Console]::Out.Write($output)
-    exit 0
+    # Recovery output is delegated to the validated implementation. It owns
+    # canonical full-snapshot construction, so slow/fast entrypoints emit the
+    # identical capsule representation.
+    throw 'canonical recovery capsule requires validated path'
 }
 catch {
     # The validated helper owns all ambiguous and changing paths.

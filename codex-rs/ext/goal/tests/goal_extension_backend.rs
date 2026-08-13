@@ -20,6 +20,7 @@ use codex_extension_api::ToolCall;
 use codex_extension_api::ToolCallOutcome;
 use codex_extension_api::ToolCallSource;
 use codex_extension_api::ToolExecutor;
+use codex_extension_api::ToolExposure;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::TurnErrorInput;
@@ -161,6 +162,7 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
         )
     );
 
+    let tools = harness.tools();
     let update_tool = tool_by_name(&tools, "update_goal");
     update_tool
         .handle(tool_call(
@@ -181,6 +183,58 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
     assert_eq!(json!("replacement goal"), result["goal"]["objective"]);
     assert_eq!(json!("active"), result["goal"]["status"]);
     assert_eq!(json!(0), result["goal"]["tokensUsed"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+
+    let inactive = harness.tools();
+    assert_eq!(tool_names(&inactive), ["create_goal"]);
+    assert_eq!(
+        tool_by_name(&inactive, "create_goal").exposure(),
+        ToolExposure::Deferred
+    );
+
+    tool_by_name(&inactive, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "measure lazy goal tools" }),
+        ))
+        .await?;
+
+    let active = harness.tools();
+    assert_eq!(
+        tool_names(&active),
+        ["get_goal", "create_goal", "update_goal"]
+    );
+    assert_eq!(
+        tool_by_name(&active, "get_goal").exposure(),
+        ToolExposure::Direct
+    );
+    assert_eq!(
+        tool_by_name(&active, "create_goal").exposure(),
+        ToolExposure::Deferred
+    );
+    assert_eq!(
+        tool_by_name(&active, "update_goal").exposure(),
+        ToolExposure::Direct
+    );
+
+    tool_by_name(&active, "update_goal")
+        .handle(tool_call(
+            "update_goal",
+            "call-complete-goal",
+            json!({ "status": "complete" }),
+        ))
+        .await?;
+    let inactive_again = harness.tools();
+    assert_eq!(tool_names(&inactive_again), ["create_goal"]);
     Ok(())
 }
 
@@ -784,6 +838,7 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
             ),
         )
         .await;
+    let tools = harness.tools();
     let update_tool = tool_by_name(&tools, "update_goal");
     let invocation = tool_call(
         "update_goal",

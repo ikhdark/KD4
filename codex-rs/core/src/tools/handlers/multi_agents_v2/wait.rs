@@ -5,10 +5,16 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::session::InputQueueActivity;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
+use codex_agent_task_store::NonproductiveRecovery;
 use codex_agent_task_store::WakeEventId;
 use codex_agent_task_store::WakeRead;
+use codex_protocol::protocol::DeterministicContinuationClass;
+use codex_protocol::protocol::DeterministicContinuationHostAction;
+use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_tools::ToolSpec;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -49,6 +55,7 @@ impl Handler {
             turn,
             payload,
             call_id,
+            cancellation_token,
             ..
         } = invocation;
         let arguments = function_arguments(payload)?;
@@ -146,22 +153,32 @@ impl Handler {
             _ => parsed_cursor,
         };
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        let wait_started = Instant::now();
         let mut pending_activity = pending_activity;
+        let mut unchanged_store_polls = 0_u32;
         let (outcome, wake_read) = loop {
-            let (outcome, wake_read) = wait_for_activity(
+            let wait = wait_for_activity(
                 &mut activity_rx,
                 pending_activity.take(),
                 deadline,
                 store.as_ref(),
                 root_session_id.as_deref(),
                 cursor,
-            )
-            .await
+            );
+            let (outcome, wake_read, unchanged_polls) = tokio::select! {
+                result = wait => result,
+                _ = cancellation_token.cancelled() => {
+                    return Err(FunctionCallError::RespondToModel(
+                        "wait_agent cancelled".to_string(),
+                    ));
+                }
+            }
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
                     "wait_agent could not read durable typed-task progress: {error}"
                 ))
             })?;
+            unchanged_store_polls = unchanged_store_polls.saturating_add(unchanged_polls);
             let (Some(store), Some(root_session_id), Some(next_cursor)) = (
                 store.as_ref(),
                 root_session_id.as_deref(),
@@ -221,6 +238,15 @@ impl Handler {
                         event.assignment_id
                     ))
                 })?;
+            coordinator.record_first_meaningful_progress_once(
+                event.attempt_id,
+                event.reason,
+                &turn.session_telemetry,
+            );
+            if task.receipt.is_some() {
+                coordinator
+                    .record_root_receipt_hydration_once(event.attempt_id, &turn.session_telemetry);
+            }
             typed_deltas.push(json!({
                 "event_id": event.event_id,
                 "assignment_id": event.assignment_id,
@@ -253,7 +279,7 @@ impl Handler {
             } else {
                 Vec::new()
             };
-        let result = WaitAgentResult::from_outcome(
+        let mut result = WaitAgentResult::from_outcome(
             outcome,
             wake_read
                 .latest_event_id
@@ -261,6 +287,49 @@ impl Handler {
             typed_deltas,
             wake_read.truncated_count,
             nudged_assignment_ids,
+        );
+        if unchanged_store_polls > 0 {
+            let resource_identity_hash = sha256_text(&format!(
+                "agent-event-wait\0{}\0{}",
+                root_session_id.as_deref().unwrap_or_default(),
+                consuming_agent_path,
+            ));
+            let state_revision = sha256_text(
+                &json!({
+                    "cursor": &result.cursor,
+                    "typed_deltas": &result.typed_deltas,
+                    "timed_out": result.timed_out,
+                })
+                .to_string(),
+            );
+            result.deterministic_continuation_receipts.push(
+                TurnTimingDeterministicContinuationReceipt {
+                    class: DeterministicContinuationClass::AgentEventWait,
+                    resource_identity_hash,
+                    state_revision,
+                    host_action: DeterministicContinuationHostAction::AwaitStateChange,
+                    suppressed_continuation_count: unchanged_store_polls,
+                    avoided_token_usage: None,
+                },
+            );
+        }
+        turn.session_telemetry.counter(
+            "codex.multi_agent.root_wait",
+            1,
+            &[(
+                "outcome",
+                match outcome {
+                    WaitOutcome::MailboxActivity => "mailbox",
+                    WaitOutcome::DurableActivity => "durable_progress",
+                    WaitOutcome::Steered => "steered",
+                    WaitOutcome::TimedOut => "timed_out",
+                },
+            )],
+        );
+        turn.session_telemetry.histogram(
+            "codex.multi_agent.root_wait_duration_ms",
+            i64::try_from(wait_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            &[],
         );
 
         session
@@ -291,6 +360,10 @@ fn durable_receipt_pointer(assignment_id: String, available: bool) -> JsonValue 
         "source": "get_agent_task",
         "assignment_id": assignment_id,
     })
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 #[cfg(test)]
@@ -333,6 +406,8 @@ pub(crate) struct WaitAgentResult {
     pub(crate) typed_deltas: Vec<JsonValue>,
     pub(crate) truncated_count: u64,
     pub(crate) nudged_assignment_ids: Vec<String>,
+    #[serde(skip)]
+    pub(crate) deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
 }
 
 impl WaitAgentResult {
@@ -363,6 +438,7 @@ impl WaitAgentResult {
             typed_deltas,
             truncated_count,
             nudged_assignment_ids,
+            deterministic_continuation_receipts: Vec::new(),
         }
     }
 }
@@ -403,6 +479,48 @@ async fn nudge_stalled_assignments(
         let status = session.services.agent_control.get_status(thread_id).await;
         if is_final(&status) {
             continue;
+        }
+        match store
+            .recover_nonproductive_assignment(binding.assignment_id, no_progress_before)
+            .await
+        {
+            Ok(NonproductiveRecovery::Recovered { productivity, .. }) => {
+                let _ = session
+                    .services
+                    .agent_control
+                    .interrupt_agent(thread_id)
+                    .await;
+                if productivity.cancelled_expired_operation_count > 0 {
+                    turn.session_telemetry.counter(
+                        "codex.multi_agent.bounded_operation",
+                        i64::from(productivity.cancelled_expired_operation_count),
+                        &[("outcome", "cancelled_at_deadline")],
+                    );
+                }
+                turn.session_telemetry.counter(
+                    "codex.multi_agent.nonproductive_recovery",
+                    1,
+                    &[("outcome", "abandoned")],
+                );
+                continue;
+            }
+            Ok(NonproductiveRecovery::Suspended(productivity)) => {
+                turn.session_telemetry.counter(
+                    "codex.multi_agent.bounded_operation",
+                    i64::from(productivity.active_owned_operation_count),
+                    &[("outcome", "suspended_recovery")],
+                );
+                continue;
+            }
+            Ok(NonproductiveRecovery::NotEligible) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    assignment_id = %binding.assignment_id,
+                    "failed to evaluate nonproductive typed assignment"
+                );
+                continue;
+            }
         }
         let Ok(true) = store
             .reserve_stalled_nudge(binding.assignment_id, no_progress_before)
@@ -476,6 +594,12 @@ impl ToolOutput for WaitAgentResult {
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         tool_output_code_mode_result(self, "wait_agent")
     }
+
+    fn deterministic_continuation_receipts(
+        &self,
+    ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
+        self.deterministic_continuation_receipts.clone()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -493,7 +617,7 @@ async fn wait_for_activity(
     store: Option<&std::sync::Arc<dyn codex_agent_task_store::AgentTaskStore>>,
     root_session_id: Option<&str>,
     cursor: Option<WakeEventId>,
-) -> codex_agent_task_store::StoreResult<(WaitOutcome, WakeRead)> {
+) -> codex_agent_task_store::StoreResult<(WaitOutcome, WakeRead, u32)> {
     let read_wakes = || async {
         match (store, root_session_id) {
             (Some(store), Some(root_session_id)) => {
@@ -524,6 +648,7 @@ async fn wait_for_activity(
                 truncated_count: 0,
                 timed_out: false,
             },
+            0,
         ));
     }
     if Instant::now() >= deadline {
@@ -536,12 +661,14 @@ async fn wait_for_activity(
                 truncated_count: 0,
                 timed_out: true,
             },
+            0,
         ));
     }
     let initial = read_wakes().await?;
     if !initial.updated_agents.is_empty() {
-        return Ok((WaitOutcome::DurableActivity, initial));
+        return Ok((WaitOutcome::DurableActivity, initial, 0));
     }
+    let mut unchanged_polls = 1_u32;
     loop {
         let poll_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(250));
         match timeout_at(poll_deadline, activity_rx.changed()).await {
@@ -550,16 +677,19 @@ async fn wait_for_activity(
                     InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
                     InputQueueActivity::Steer => WaitOutcome::Steered,
                 };
-                return Ok((outcome, read_wakes().await?));
+                return Ok((outcome, read_wakes().await?, unchanged_polls));
             }
-            Ok(Err(_)) => return Ok((WaitOutcome::TimedOut, read_wakes().await?)),
+            Ok(Err(_)) => {
+                return Ok((WaitOutcome::TimedOut, read_wakes().await?, unchanged_polls));
+            }
             Err(_) => {
                 let durable = read_wakes().await?;
                 if !durable.updated_agents.is_empty() {
-                    return Ok((WaitOutcome::DurableActivity, durable));
+                    return Ok((WaitOutcome::DurableActivity, durable, unchanged_polls));
                 }
+                unchanged_polls = unchanged_polls.saturating_add(1);
                 if Instant::now() >= deadline {
-                    return Ok((WaitOutcome::TimedOut, durable));
+                    return Ok((WaitOutcome::TimedOut, durable, unchanged_polls));
                 }
             }
         }

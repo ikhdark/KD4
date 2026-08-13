@@ -235,6 +235,27 @@ function Format-CargoWatchExecTargetDir {
     return $TargetDir
 }
 
+function Assert-CargoTargetDirMatchesLane {
+    param(
+        [string]$Candidate,
+        [string]$TargetDir
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Candidate)) {
+        throw "Cargo --target-dir requires a non-empty path."
+    }
+    try {
+        $candidatePath = [System.IO.Path]::GetFullPath($Candidate)
+        $lanePath = [System.IO.Path]::GetFullPath($TargetDir)
+    }
+    catch {
+        throw "Cargo --target-dir '$Candidate' is not a valid path: $($_.Exception.Message)"
+    }
+    if (-not [string]::Equals($candidatePath, $lanePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cargo --target-dir '$Candidate' does not match reserved lane target '$TargetDir'."
+    }
+}
+
 function Add-CargoWatchExecTargetDir {
     param(
         [string]$ExecCommand,
@@ -244,7 +265,30 @@ function Add-CargoWatchExecTargetDir {
     if ([string]::IsNullOrWhiteSpace($ExecCommand)) {
         return $ExecCommand
     }
-    if ($ExecCommand -match "(?:^|\s)--target-dir(?:=|\s+)") {
+    $separatorIndex = $ExecCommand.IndexOf(" -- ", [StringComparison]::Ordinal)
+    $cargoCommand = if ($separatorIndex -ge 0) {
+        $ExecCommand.Substring(0, $separatorIndex)
+    }
+    else {
+        $ExecCommand
+    }
+    $targetPattern = '(?:^|\s)--target-dir(?:=(?:"(?<double>[^\"]*)"|''(?<single>[^'']*)''|(?<bare>[^\s]+))|\s+(?:"(?<double_space>[^\"]*)"|''(?<single_space>[^'']*)''|(?<bare_space>[^\s]+)))'
+    $targetMatches = [regex]::Matches($cargoCommand, $targetPattern)
+    if ($cargoCommand -match '(?:^|\s)--target-dir(?:=|\s|$)' -and $targetMatches.Count -eq 0) {
+        throw "Cargo watch exec command has a malformed --target-dir option."
+    }
+    foreach ($targetMatch in $targetMatches) {
+        $candidate = @(
+            "double",
+            "single",
+            "bare",
+            "double_space",
+            "single_space",
+            "bare_space"
+        ) | ForEach-Object { $targetMatch.Groups[$_].Value } | Where-Object { $_.Length -gt 0 } | Select-Object -First 1
+        Assert-CargoTargetDirMatchesLane -Candidate $candidate -TargetDir $TargetDir
+    }
+    if ($targetMatches.Count -gt 0) {
         return $ExecCommand
     }
 
@@ -266,7 +310,6 @@ function Add-CargoWatchExecTargetDir {
     }
 
     $targetArgument = "--target-dir $(Format-CargoWatchExecTargetDir -TargetDir $TargetDir)"
-    $separatorIndex = $ExecCommand.IndexOf(" -- ", [StringComparison]::Ordinal)
     if ($separatorIndex -ge 0) {
         return $ExecCommand.Insert($separatorIndex, " $targetArgument")
     }
@@ -291,15 +334,12 @@ function Add-CargoWatchTargetDirArgument {
         if ($arg -eq "--") {
             return $CommandArgs
         }
-        if ($arg -eq "-s" -or $arg -eq "--shell") {
-            $i++
-            if ($i -lt $CommandArgs.Count) {
-                [void]$updated.Add($CommandArgs[$i])
-            }
-            continue
-        }
-        if ($arg.StartsWith("--shell=", [StringComparison]::Ordinal)) {
-            continue
+        if (
+            $arg -eq "-s" -or
+            $arg -eq "--shell" -or
+            $arg.StartsWith("--shell=", [StringComparison]::Ordinal)
+        ) {
+            throw "Cargo watch --shell/-s is not allowed inside a reserved lane; use --exec/-x so --target-dir can be enforced."
         }
         if ($arg -eq "-x" -or $arg -eq "--exec") {
             $i++
@@ -319,10 +359,7 @@ function Add-CargoWatchTargetDirArgument {
     $hasExec = @($CommandArgs | Where-Object {
             $_ -eq "-x" -or $_ -eq "--exec" -or $_.StartsWith("--exec=", [StringComparison]::Ordinal)
         }).Count -gt 0
-    $hasShell = @($CommandArgs | Where-Object {
-            $_ -eq "-s" -or $_ -eq "--shell" -or $_.StartsWith("--shell=", [StringComparison]::Ordinal)
-        }).Count -gt 0
-    if (-not $hasExec -and -not $hasShell) {
+    if (-not $hasExec) {
         [void]$updated.Add("-x")
         [void]$updated.Add((Add-CargoWatchExecTargetDir -ExecCommand "check" -TargetDir $TargetDir))
     }
@@ -332,19 +369,35 @@ function Add-CargoWatchTargetDirArgument {
 function Test-CargoTargetDirArgumentPresent {
     param(
         [string[]]$CommandArgs,
-        [int]$StartIndex
+        [int]$StartIndex,
+        [string]$TargetDir
     )
 
+    $present = $false
     for ($i = $StartIndex; $i -lt $CommandArgs.Count; $i++) {
         $arg = $CommandArgs[$i]
         if ($arg -eq "--") {
-            return $false
+            break
         }
-        if ($arg -eq "--target-dir" -or $arg.StartsWith("--target-dir=", [StringComparison]::Ordinal)) {
-            return $true
+        if ($arg -eq "--target-dir") {
+            if (($i + 1) -ge $CommandArgs.Count -or $CommandArgs[$i + 1] -eq "--") {
+                throw "Cargo --target-dir requires a path value."
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TargetDir)) {
+                Assert-CargoTargetDirMatchesLane -Candidate $CommandArgs[$i + 1] -TargetDir $TargetDir
+            }
+            $present = $true
+            $i++
+            continue
+        }
+        if ($arg.StartsWith("--target-dir=", [StringComparison]::Ordinal)) {
+            if (-not [string]::IsNullOrWhiteSpace($TargetDir)) {
+                Assert-CargoTargetDirMatchesLane -Candidate $arg.Substring("--target-dir=".Length) -TargetDir $TargetDir
+            }
+            $present = $true
         }
     }
-    return $false
+    return $present
 }
 
 # sccache hashes CARGO_* environment variables into its rustc cache key, so
@@ -390,7 +443,7 @@ function Add-CargoTargetDirArgument {
         if ($CommandArgs[$nextestCommandIndex] -notin @("archive", "run")) {
             return $CommandArgs
         }
-        if (Test-CargoTargetDirArgumentPresent -CommandArgs $CommandArgs -StartIndex ($nextestCommandIndex + 1)) {
+        if (Test-CargoTargetDirArgumentPresent -CommandArgs $CommandArgs -StartIndex ($nextestCommandIndex + 1) -TargetDir $TargetDir) {
             return $CommandArgs
         }
         return @(
@@ -402,7 +455,7 @@ function Add-CargoTargetDirArgument {
     if ($subcommand -notin $buildCommands) {
         return $CommandArgs
     }
-    if (Test-CargoTargetDirArgumentPresent -CommandArgs $CommandArgs -StartIndex ($subcommandIndex + 1)) {
+    if (Test-CargoTargetDirArgumentPresent -CommandArgs $CommandArgs -StartIndex ($subcommandIndex + 1) -TargetDir $TargetDir) {
         return $CommandArgs
     }
 

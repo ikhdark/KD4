@@ -54,6 +54,16 @@ try {
     else {
         $null
     }
+    $turnMatches = if (-not $inputObject.ContainsKey('turn_id')) {
+        $true
+    }
+    elseif ($null -eq $inputObject.turn_id) {
+        $null -eq $capsule.last_turn_id
+    }
+    else {
+        $inputObject.turn_id -is [string] -and
+            [string]$inputObject.turn_id -eq [string]$capsule.last_turn_id
+    }
     $commonMatches = (
         $capsule -is [Collections.IDictionary] -and
         [string]$capsule.schema_version -eq '1' -and
@@ -68,12 +78,14 @@ try {
     if ($ExpectedEvent -eq 'UserPromptSubmit' -and
         [string]$capsule.last_event -eq $ExpectedEvent -and
         $inputObject.prompt -is [string] -and
-        [string]$inputObject.prompt -eq [string]$capsule.last_user_request) {
+        [string]$inputObject.prompt -eq [string]$capsule.last_user_request -and
+        $turnMatches) {
         [Console]::Out.Write($emptyOutput)
         exit 0
     }
     if ($ExpectedEvent -eq 'Stop' -and
-        [string]$capsule.last_event -eq $ExpectedEvent) {
+        [string]$capsule.last_event -eq $ExpectedEvent -and
+        $turnMatches) {
         $assistantResult = if ($inputObject.ContainsKey('last_assistant_message')) {
             $inputObject.last_assistant_message
         }

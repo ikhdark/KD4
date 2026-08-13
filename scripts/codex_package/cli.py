@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
 
+from .archive import activate_archive
 from .archive import package_entries
 from .archive import validate_archive_output
 from .archive import write_archive
@@ -360,7 +361,7 @@ def write_archives_atomically(
                 )
                 archive_path.replace(backup_path)
                 backups.append((archive_path, backup_path))
-            staged_path.replace(archive_path)
+            activate_archive(staged_path, archive_path, force=force)
             activated.append((archive_path, staged_path))
     except BaseException:
         for archive_path, staged_path in reversed(activated):

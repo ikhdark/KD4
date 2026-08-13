@@ -35,6 +35,7 @@ mod shell;
 pub(crate) mod shell_spec;
 mod sleep;
 mod source;
+pub(crate) mod source_closure;
 pub(crate) mod source_spec;
 mod test_sync;
 pub(crate) mod test_sync_spec;

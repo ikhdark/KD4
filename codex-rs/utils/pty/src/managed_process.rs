@@ -7,9 +7,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 const MANAGED_ROOT_WARNING_THRESHOLD: usize = 384;
 const MANAGED_ROOT_LIMIT: usize = 512;
+const MANAGED_ROOT_RECLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 
 static MANAGED_ROOT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_MANAGED_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -115,9 +117,13 @@ impl ManagedRootProcess {
         })
     }
 
-    /// Reserve a root, running one serialized cross-layer reclaim pass before
-    /// rejecting a launch at the hard limit.
+    /// Reserve a root, attempting one deadline-bounded serialized cross-layer
+    /// reclaim pass before rejecting a launch at the hard limit.
     pub async fn reserve_with_reclaim() -> io::Result<Self> {
+        Self::reserve_with_reclaim_timeout(MANAGED_ROOT_RECLAIM_TIMEOUT).await
+    }
+
+    async fn reserve_with_reclaim_timeout(reclaim_timeout: Duration) -> io::Result<Self> {
         match Self::reserve() {
             Ok(root) => return Ok(root),
             Err(error) if MANAGED_ROOT_COUNT.load(Ordering::Acquire) < MANAGED_ROOT_LIMIT => {
@@ -126,40 +132,56 @@ impl ManagedRootProcess {
             Err(_) => {}
         }
 
-        let _reclaim = ADMISSION_RECLAIM_PERMIT
-            .get_or_init(|| tokio::sync::Semaphore::new(1))
-            .acquire()
-            .await
-            .map_err(|error| io::Error::other(format!("admission reclaimer closed: {error}")))?;
-        if let Ok(root) = Self::reserve() {
-            return Ok(root);
-        }
-
-        // Root finalizers release permits on drop. Drain already-ready drops
-        // before asking the runtime and app-server owners to reclaim.
-        tokio::task::yield_now().await;
-
-        let reclaimers = admission_reclaimers()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .rev()
-            .map(|(_, reclaimer)| reclaimer.clone())
-            .collect::<Vec<_>>();
-        for reclaimer in &reclaimers {
-            (reclaimer.retire_zero_lease_mcp_generations)().await;
-        }
-        if let Ok(root) = Self::reserve() {
-            return Ok(root);
-        }
-        for reclaimer in reclaimers {
-            (reclaimer.evict_one_eligible_task)().await;
+        let reclaim = async {
+            let _reclaim = ADMISSION_RECLAIM_PERMIT
+                .get_or_init(|| tokio::sync::Semaphore::new(1))
+                .acquire()
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!("admission reclaimer closed: {error}"))
+                })?;
             if let Ok(root) = Self::reserve() {
                 return Ok(root);
             }
-        }
 
-        Self::reserve()
+            // Root finalizers release permits on drop. Drain already-ready drops
+            // before asking the runtime and app-server owners to reclaim.
+            tokio::task::yield_now().await;
+
+            let reclaimers = admission_reclaimers()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .rev()
+                .map(|(_, reclaimer)| reclaimer.clone())
+                .collect::<Vec<_>>();
+            for reclaimer in &reclaimers {
+                (reclaimer.retire_zero_lease_mcp_generations)().await;
+            }
+            if let Ok(root) = Self::reserve() {
+                return Ok(root);
+            }
+            for reclaimer in reclaimers {
+                (reclaimer.evict_one_eligible_task)().await;
+                if let Ok(root) = Self::reserve() {
+                    return Ok(root);
+                }
+            }
+
+            Self::reserve()
+        };
+
+        tokio::time::timeout(reclaim_timeout, reclaim)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "managed root process reclamation timed out after {} ms at the hard limit ({MANAGED_ROOT_LIMIT})",
+                        reclaim_timeout.as_millis()
+                    ),
+                )
+            })?
     }
 
     pub fn id(&self) -> u64 {
@@ -211,8 +233,17 @@ impl Drop for ManagedRootProcess {
 mod tests {
     use super::*;
 
+    fn managed_root_test_lock() -> &'static tokio::sync::Semaphore {
+        static TEST_LOCK: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+        TEST_LOCK.get_or_init(|| tokio::sync::Semaphore::new(1))
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn managed_root_admission_reclaims_live_registrations_in_order() {
+        let _test_guard = managed_root_test_lock()
+            .acquire()
+            .await
+            .expect("test semaphore remains open");
         let roots = Arc::new(Mutex::new(
             (0..MANAGED_ROOT_LIMIT)
                 .map(|_| ManagedRootProcess::reserve().expect("reserve root"))
@@ -281,6 +312,53 @@ mod tests {
         );
         drop(admitted);
         drop(older_guard);
+        roots.lock().expect("roots lock").clear();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_root_admission_times_out_a_stalled_reclaimer() {
+        let _test_guard = managed_root_test_lock()
+            .acquire()
+            .await
+            .expect("test semaphore remains open");
+        let roots = Arc::new(Mutex::new(
+            (0..MANAGED_ROOT_LIMIT)
+                .map(|_| ManagedRootProcess::reserve().expect("reserve root"))
+                .collect::<Vec<_>>(),
+        ));
+        let stalled_guard = install_managed_root_admission_reclaimer(
+            Arc::new(|| -> ManagedRootReclaimFuture { Box::pin(std::future::pending()) }),
+            Arc::new(|| -> ManagedRootReclaimFuture { Box::pin(async {}) }),
+        );
+
+        let error =
+            match ManagedRootProcess::reserve_with_reclaim_timeout(Duration::from_millis(25)).await
+            {
+                Ok(_) => panic!("stalled reclaimer unexpectedly admitted a root"),
+                Err(error) => error,
+            };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("reclamation timed out"));
+
+        // Timing out must drop the serialized-admission permit so a later
+        // healthy reclaimer can make progress.
+        drop(stalled_guard);
+        let evict_roots = Arc::clone(&roots);
+        let healthy_guard = install_managed_root_admission_reclaimer(
+            Arc::new(|| -> ManagedRootReclaimFuture { Box::pin(async {}) }),
+            Arc::new(move || {
+                let roots = Arc::clone(&evict_roots);
+                Box::pin(async move {
+                    roots.lock().expect("roots lock").pop();
+                })
+            }),
+        );
+        let admitted = ManagedRootProcess::reserve_with_reclaim_timeout(Duration::from_millis(250))
+            .await
+            .expect("healthy reclaimer should recover after the timeout");
+
+        drop(admitted);
+        drop(healthy_guard);
         roots.lock().expect("roots lock").clear();
     }
 }

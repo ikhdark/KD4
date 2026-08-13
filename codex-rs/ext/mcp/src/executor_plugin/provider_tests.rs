@@ -407,6 +407,7 @@ fn resolved_plugin(
                 hooks: None,
             },
             interface: None,
+            tool_exposure: None,
         },
     )
     .expect("valid plugin descriptor")

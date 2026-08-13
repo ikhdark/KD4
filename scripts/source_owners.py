@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import tomllib
 
 
@@ -33,11 +35,88 @@ def confined_path(root: Path, raw_path: str) -> Path:
     return resolved
 
 
-def load_and_validate(manifest_path: Path, root: Path = REPO_ROOT) -> tuple[dict, str]:
+def _schema_errors(manifest: object) -> list[str]:
+    if not isinstance(manifest, dict):
+        return ["manifest root must be a table"]
+    errors: list[str] = []
+    owners = manifest.get("owners")
+    if not isinstance(owners, list):
+        return ["owners must be an array of tables"]
+    string_lists = (
+        "concern_ids",
+        "aliases",
+        "phrases",
+        "ambiguous_with",
+        "roots",
+        "instructions",
+        "consumers",
+        "contracts",
+        "generated_mirrors",
+        "tests",
+    )
+    for index, owner in enumerate(owners):
+        label = f"owners[{index}]"
+        if not isinstance(owner, dict):
+            errors.append(f"{label} must be a table")
+            continue
+        if not isinstance(owner.get("id"), str):
+            errors.append(f"{label}.id must be a string")
+        for field in string_lists:
+            value = owner.get(field, [])
+            if not isinstance(value, list) or any(
+                not isinstance(item, str) for item in value
+            ):
+                errors.append(f"{label}.{field} must be an array of strings")
+        primary_entries = owner.get("primary_entries", [])
+        if not isinstance(primary_entries, list):
+            errors.append(f"{label}.primary_entries must be an array of tables")
+        else:
+            for entry_index, entry in enumerate(primary_entries):
+                entry_label = f"{label}.primary_entries[{entry_index}]"
+                if not isinstance(entry, dict):
+                    errors.append(f"{entry_label} must be a table")
+                    continue
+                for field in ("path", "symbol"):
+                    if not isinstance(entry.get(field), str):
+                        errors.append(f"{entry_label}.{field} must be a string")
+                if "ambiguous" in entry and not isinstance(entry["ambiguous"], bool):
+                    errors.append(f"{entry_label}.ambiguous must be a boolean")
+        validations = owner.get("validation", [])
+        if not isinstance(validations, list):
+            errors.append(f"{label}.validation must be an array of tables")
+        else:
+            for validation_index, validation in enumerate(validations):
+                validation_label = f"{label}.validation[{validation_index}]"
+                if not isinstance(validation, dict):
+                    errors.append(f"{validation_label} must be a table")
+                    continue
+                for field in ("id", "cwd"):
+                    if not isinstance(validation.get(field), str):
+                        errors.append(f"{validation_label}.{field} must be a string")
+                argv = validation.get("argv")
+                if not isinstance(argv, list) or any(
+                    not isinstance(item, str) for item in argv
+                ):
+                    errors.append(f"{validation_label}.argv must be an array of strings")
+                if "role" in validation and not isinstance(validation["role"], str):
+                    errors.append(f"{validation_label}.role must be a string")
+    return errors
+
+
+def load_and_validate(
+    manifest_path: Path, root: Path | None = None
+) -> tuple[dict, str]:
     raw = manifest_path.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
     manifest = tomllib.loads(raw.decode("utf-8"))
-    errors: list[str] = []
+    errors = _schema_errors(manifest)
+    if errors:
+        raise ValueError(
+            "routing_manifest_invalid:\n"
+            + "\n".join(f"- {error}" for error in sorted(set(errors)))
+        )
+    if root is None:
+        root = manifest_path.resolve().parent
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"unsupported schema_version: {manifest.get('schema_version')!r}")
     owners = manifest.get("owners", [])
@@ -154,11 +233,37 @@ def replace_managed_block(source_map: str, block: str) -> str:
     return source_map[:begin] + block.rstrip() + source_map[end:]
 
 
-def expected_source_map(manifest_path: Path, source_map_path: Path) -> str:
-    manifest, digest = load_and_validate(manifest_path)
+def expected_source_map(
+    manifest_path: Path, source_map_path: Path, root: Path | None = None
+) -> str:
+    manifest, digest = load_and_validate(manifest_path, root)
     return replace_managed_block(
         source_map_path.read_text(encoding="utf-8"), render_block(manifest, digest)
     )
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    path = path.resolve()
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -166,9 +271,14 @@ def main() -> int:
     parser.add_argument("command", choices=("generate", "check"))
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--source-map", type=Path, default=DEFAULT_SOURCEMAP)
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        help="Repository root for declared paths (defaults to the manifest directory).",
+    )
     args = parser.parse_args()
     try:
-        expected = expected_source_map(args.manifest, args.source_map)
+        expected = expected_source_map(args.manifest, args.source_map, args.repo_root)
     except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
         print(error, file=sys.stderr)
         return 1
@@ -181,7 +291,7 @@ def main() -> int:
             )
             return 1
         return 0
-    args.source_map.write_text(expected, encoding="utf-8", newline="\n")
+    write_text_atomic(args.source_map, expected)
     return 0
 
 

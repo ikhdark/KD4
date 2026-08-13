@@ -24,6 +24,8 @@ use crate::tools::handlers::view_image_spec::create_view_image_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
+use codex_tools::ToolSearchInfo;
+use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 
 pub struct ViewImageHandler {
@@ -75,6 +77,18 @@ impl ToolExecutor<ToolInvocation> for ViewImageHandler {
 
     fn supports_parallel_tool_calls(&self) -> bool {
         true
+    }
+
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        ToolSearchInfo::from_tool_spec(
+            self.spec(),
+            Some(ToolSearchSourceInfo {
+                name: "Images".to_string(),
+                description: Some(
+                    "Inspect a local image when visual context is needed.".to_string(),
+                ),
+            }),
+        )
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {

@@ -14,10 +14,12 @@ use tracing::info;
 use tracing::instrument;
 use tracing::trace_span;
 
+use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
 use crate::agent::task_capabilities::classify_typed_tool;
 use crate::function_tool::FunctionCallError;
 use crate::session::reasoning_governor::SamplingRequestSignalCollector;
+use crate::session::reasoning_governor::is_accepted_mutating_operation;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::AbortedToolOutput;
@@ -146,39 +148,157 @@ impl ToolCallRuntime {
     ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
         let timing = Arc::new(ToolDispatchTiming::new(item_accepted_at, eager));
         timing.mark_first_poll();
-        let signal_ordinal = self
-            .sampling_request_signals
-            .as_ref()
-            .map(SamplingRequestSignalCollector::register_tool_call);
-        let signal_collector = self.sampling_request_signals.clone();
-        let error_call = call.clone();
-        let future = self.handle_tool_call_with_source_and_timing(
-            call,
-            ToolCallSource::Direct,
-            cancellation_token,
-            timing,
+        let collaboration_namespace = self
+            .step_context
+            .turn
+            .provider
+            .capabilities()
+            .namespace_tools
+            .then_some(
+                self.step_context
+                    .turn
+                    .config
+                    .multi_agent_v2
+                    .tool_namespace
+                    .as_deref(),
+            )
+            .flatten();
+        let tool_class = classify_typed_tool(
+            call.tool_name.namespace.as_deref(),
+            &call.tool_name.name,
+            collaboration_namespace,
         );
+        let external_mutation_intent = self
+            .step_context
+            .tool_router()
+            .map(|router| router.external_mutation_intent(&call.tool_name))
+            .unwrap_or(ExternalMutationIntent::MayMutate);
+        let accepted_mutating_operation = is_accepted_mutating_operation(
+            tool_class,
+            external_mutation_intent,
+            &call.tool_name,
+            &call.payload,
+        );
+        let signal_registration = self.sampling_request_signals.as_ref().map(|collector| {
+            collector.register_deterministic_tool_call(
+                &call.tool_name,
+                &call.payload,
+                &call.call_id,
+            )
+        });
+        let signal_collector = self.sampling_request_signals.clone();
         async move {
-            match future.await {
-                Ok(response) => {
-                    if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_result(
-                            ordinal,
-                            response.success_for_logging(),
-                            response.sampling_request_signal(),
+            if let Some(registration) = signal_registration.as_ref() {
+                if registration.repeated_discovery {
+                    self.step_context
+                        .turn
+                        .turn_timing_state
+                        .record_repeated_discovery_call();
+                }
+                if registration.discovery_after_owner_resolution {
+                    self.step_context
+                        .turn
+                        .turn_timing_state
+                        .record_discovery_after_owner_resolution();
+                }
+                if let (Some(response), Some(artifact)) = (
+                    registration.replay_response.clone(),
+                    registration.replay_artifact.as_ref(),
+                ) {
+                    if crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+                        self.step_context.turn.config.codex_home.as_path(),
+                        &self.session.thread_id().to_string(),
+                        &artifact.artifact_id,
+                        artifact.canonical_bytes,
+                        &artifact.canonical_sha256,
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        self.step_context
+                            .turn
+                            .turn_timing_state
+                            .record_suppressed_repeated_dispatch();
+                        return Ok(response);
+                    }
+                    if let (Some(key), Some(signal_collector)) = (
+                        registration.replay_fallback_key.clone(),
+                        signal_collector.as_ref(),
+                    ) {
+                        signal_collector.activate_replay_fallback(
+                            registration.ordinal,
+                            key,
+                            registration.replay_fallback_locator,
                         );
                     }
-                    Ok(response.into_response())
+                }
+            }
+            let signal_ordinal = signal_registration
+                .as_ref()
+                .map(|registration| registration.ordinal);
+            if accepted_mutating_operation {
+                self.step_context
+                    .turn
+                    .turn_timing_state
+                    .record_pre_edit_first_accepted_mutation();
+            }
+            let mutation_revision_before = if signal_ordinal.is_some() {
+                Some(self.tracker.lock().await.current_mutation_revision())
+            } else {
+                None
+            };
+            let mutation_tracker = Arc::clone(&self.tracker);
+            let error_call = call.clone();
+            let future = self.handle_tool_call_with_source_and_timing(
+                call,
+                ToolCallSource::Direct,
+                cancellation_token,
+                timing,
+            );
+            match future.await {
+                Ok(response) => {
+                    let mutation_advanced = if let Some(before) = mutation_revision_before {
+                        mutation_tracker.lock().await.current_mutation_revision() > before
+                    } else {
+                        false
+                    };
+                    let success = response.success_for_logging();
+                    let signal = response.sampling_request_signal();
+                    let receipts = response.deterministic_continuation_receipts();
+                    if let Some(collector) = &signal_collector {
+                        collector.record_deterministic_continuation_receipts(&receipts);
+                    }
+                    let response = response.into_response();
+                    if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
+                        collector.record_response_result_with_mutation(
+                            ordinal,
+                            success,
+                            signal,
+                            &response,
+                            mutation_advanced,
+                        );
+                    }
+                    Ok(response)
                 }
                 Err(FunctionCallError::Fatal(message)) => {
+                    let mutation_advanced = if let Some(before) = mutation_revision_before {
+                        mutation_tracker.lock().await.current_mutation_revision() > before
+                    } else {
+                        false
+                    };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure(ordinal);
+                        collector.record_failure_with_mutation(ordinal, mutation_advanced);
                     }
                     Err(CodexErr::Fatal(message))
                 }
                 Err(other) => {
+                    let mutation_advanced = if let Some(before) = mutation_revision_before {
+                        mutation_tracker.lock().await.current_mutation_revision() > before
+                    } else {
+                        false
+                    };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure(ordinal);
+                        collector.record_failure_with_mutation(ordinal, mutation_advanced);
                     }
                     Ok(Self::failure_response(error_call, other))
                 }
@@ -444,8 +564,10 @@ impl Drop for ToolCallTimingGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
+    use crate::session::reasoning_governor::SamplingReasoningGovernor;
     use crate::session::step_context::StepContext;
     use crate::tools::ToolRouter;
     use crate::tools::context::FunctionToolOutput;
@@ -455,6 +577,7 @@ mod tests {
     use crate::tools::registry::ToolExecutor;
     use crate::tools::registry::ToolRegistry;
     use crate::turn_diff_tracker::TurnDiffTracker;
+    use crate::turn_diff_tracker::ValidationFreshnessStatus;
     use codex_extension_api::ToolCallOutcome;
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
@@ -740,6 +863,106 @@ mod tests {
     }
 
     impl CoreToolRuntime for ImmediateHandler {}
+
+    struct CountingLargeReadHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolExecutor<ToolInvocation> for CountingLargeReadHandler {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            codex_tools::ToolName::plain("read_file_span")
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: "read_file_span".to_string(),
+                description: "Large deterministic read test tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })
+        }
+
+        fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Ok(Box::new(FunctionToolOutput::from_text(
+                    "source-byte".repeat(4_000),
+                    Some(true),
+                ))
+                    as Box<dyn crate::tools::context::ToolOutput>)
+            })
+        }
+    }
+
+    impl CoreToolRuntime for CountingLargeReadHandler {}
+
+    #[tokio::test]
+    async fn expired_duplicate_artifact_fails_open_to_normal_execution() -> anyhow::Result<()> {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingLargeReadHandler {
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn CoreToolRuntime>;
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let step_context =
+            StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker);
+        let governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let call = |call_id: &str| ToolCall {
+            tool_name: codex_tools::ToolName::plain("read_file_span"),
+            call_id: call_id.to_string(),
+            payload: ToolPayload::Function {
+                arguments: r#"{"path":"src/lib.rs","start_line":1}"#.to_string(),
+            },
+        };
+
+        let first = runtime
+            .clone()
+            .with_sampling_request_signals(governor.collector(&baselines))
+            .handle_tool_call(call("read-1"), CancellationToken::new())
+            .await?;
+        let ResponseInputItem::FunctionCallOutput { output, .. } = first else {
+            anyhow::bail!("projected source read should be a function output");
+        };
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            anyhow::bail!("projected source read should be text JSON");
+        };
+        let envelope: serde_json::Value = serde_json::from_str(&text)?;
+        let artifact_id = envelope["artifact_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("projected source read should have an artifact"))?;
+        let artifact_path = turn_context
+            .config
+            .codex_home
+            .join("tool-output")
+            .join(session.thread_id().to_string())
+            .join(format!("{artifact_id}.log"));
+        std::fs::remove_file(&artifact_path)?;
+
+        let second = runtime
+            .with_sampling_request_signals(governor.collector(&baselines))
+            .handle_tool_call(call("read-2"), CancellationToken::new())
+            .await?;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let ResponseInputItem::FunctionCallOutput { output, .. } = second else {
+            anyhow::bail!("fresh source read should be a function output");
+        };
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            anyhow::bail!("fresh source read should be text JSON");
+        };
+        let envelope: serde_json::Value = serde_json::from_str(&text)?;
+        assert_ne!(envelope["status"], "not_modified");
+        Ok(())
+    }
 
     struct ParallelImmediateHandler {
         tool_name: codex_tools::ToolName,

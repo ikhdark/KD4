@@ -72,12 +72,16 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let tool_router = built_tools(
         sess.as_ref(),
         step_context.as_ref(),
+        &[],
         &CancellationToken::new(),
     )
     .await?;
     input.push(ResponseItem::CompactionTrigger {});
     let prompt = Prompt {
         input: input.into(),
+        stable_context_fallback_input: Arc::from([]),
+        stable_context_manifest: Default::default(),
+        prompt_provenance: Default::default(),
         tools: tool_router.model_visible_specs(),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,

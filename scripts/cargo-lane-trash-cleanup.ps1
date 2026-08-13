@@ -16,6 +16,15 @@ $root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
 if (-not (Test-Path -LiteralPath $root -PathType Container)) {
     exit 0
 }
+try {
+    $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        exit 0
+    }
+}
+catch {
+    exit 0
+}
 $rootMarkerPath = Join-Path $root $cargoLanesRootMarkerName
 if (-not (Test-Path -LiteralPath $rootMarkerPath -PathType Leaf)) {
     exit 0

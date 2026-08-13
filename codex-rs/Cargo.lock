@@ -1930,6 +1930,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2248,6 +2249,9 @@ dependencies = [
  "codex-utils-cargo-bin",
  "codex-utils-path-uri",
  "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "similar",
  "tempfile",
  "thiserror 2.0.18",
@@ -2894,6 +2898,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "shlex",
  "tempfile",
  "tokio",
@@ -3666,7 +3671,6 @@ dependencies = [
  "codex-otel",
  "codex-protocol",
  "codex-utils-output-truncation",
- "codex-utils-template",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -4185,6 +4189,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio-util",
  "tracing",

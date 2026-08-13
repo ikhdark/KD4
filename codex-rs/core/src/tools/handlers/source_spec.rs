@@ -6,6 +6,7 @@ use codex_file_search::task_locator::LOCATE_TASK_MAX_SOURCE_BYTES;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use serde_json::Number;
 use std::collections::BTreeMap;
 
 pub(crate) const SEARCH_SOURCE_TOOL_NAME: &str = "search_source";
@@ -39,15 +40,23 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
         ),
         (
             "max_results".to_string(),
-            JsonSchema::integer(Some(format!(
-                "Maximum matches to return; must be between 1 and {SOURCE_SEARCH_MAX_MATCHES}."
-            ))),
+            bounded_integer(
+                1,
+                SOURCE_SEARCH_MAX_MATCHES,
+                format!(
+                    "Maximum matches to return; must be between 1 and {SOURCE_SEARCH_MAX_MATCHES}."
+                ),
+            ),
         ),
         (
             "context_lines".to_string(),
-            JsonSchema::integer(Some(format!(
-                "Context lines before and after each match; must not exceed {SOURCE_SEARCH_MAX_CONTEXT_LINES}."
-            ))),
+            bounded_integer(
+                0,
+                SOURCE_SEARCH_MAX_CONTEXT_LINES,
+                format!(
+                    "Context lines before and after each match; must not exceed {SOURCE_SEARCH_MAX_CONTEXT_LINES}."
+                ),
+            ),
         ),
         (
             "case_sensitive".to_string(),
@@ -65,12 +74,27 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
             "include_locks".to_string(),
             JsonSchema::boolean(Some("Include lockfiles.".to_string())),
         ),
+        (
+            "hydrate_selected_span".to_string(),
+            JsonSchema::boolean(Some(
+                "When complete coverage has exactly one match, include a bounded span selected from the same observed file bytes. Defaults to true."
+                    .to_string(),
+            )),
+        ),
+        (
+            "force_fresh".to_string(),
+            JsonSchema::boolean(Some(
+                "Bypass exact source-search replay and execute the fresh bounded search. This does not make incomplete coverage authoritative or reopen unrelated closure."
+                    .to_string(),
+            )),
+        ),
+        ("source_question".to_string(), source_question_schema()),
     ]);
     add_environment_id(&mut properties, options);
 
     ToolSpec::Function(ResponsesApiTool {
         name: SEARCH_SOURCE_TOOL_NAME.to_string(),
-        description: "Search repository source with fixed-string matching and hard scan/result limits. Prefer ownership-scoped paths: when the owner is unknown, call locate_task once and reuse its owner or closure paths. Use empty paths only for deliberate repository-wide work. This tool supports local environments only. Results include repo-relative 1-based line-span evidence citations."
+        description: "Search repository source with fixed-string matching and hard scan/result limits. Prefer ownership-scoped paths: when the owner is unknown, call locate_task once and reuse its owner or closure paths. Complete unique results hydrate one bounded span from the same observed bytes by default. Use empty paths only for deliberate repository-wide work. This tool supports local environments only. Results include repo-relative 1-based line-span evidence citations."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -103,15 +127,23 @@ pub(crate) fn create_locate_task_tool(options: SourceToolOptions) -> ToolSpec {
         ),
         (
             "max_files".to_string(),
-            JsonSchema::integer(Some(format!(
-                "Maximum eligible files in the selected closure; hard-capped at {LOCATE_TASK_MAX_FILES}."
-            ))),
+            bounded_integer(
+                1,
+                LOCATE_TASK_MAX_FILES,
+                format!(
+                    "Maximum eligible files in the selected closure; hard-capped at {LOCATE_TASK_MAX_FILES}."
+                ),
+            ),
         ),
         (
             "max_source_bytes".to_string(),
-            JsonSchema::integer(Some(format!(
-                "Maximum aggregate captured source bytes; hard-capped at {LOCATE_TASK_MAX_SOURCE_BYTES}."
-            ))),
+            bounded_integer(
+                1,
+                LOCATE_TASK_MAX_SOURCE_BYTES,
+                format!(
+                    "Maximum aggregate captured source bytes; hard-capped at {LOCATE_TASK_MAX_SOURCE_BYTES}."
+                ),
+            ),
         ),
         (
             "force_fresh".to_string(),
@@ -119,6 +151,7 @@ pub(crate) fn create_locate_task_tool(options: SourceToolOptions) -> ToolSpec {
                 "Discard reusable syntax evidence for this query; defaults to false.".to_string(),
             )),
         ),
+        ("source_question".to_string(), source_question_schema()),
     ]);
     add_environment_id(&mut properties, options);
 
@@ -138,19 +171,23 @@ pub(crate) fn create_read_file_span_tool(options: SourceToolOptions) -> ToolSpec
         (
             "path".to_string(),
             JsonSchema::string(Some(
-                "Repo-relative source file path, or the absolute SKILL.md path of a loaded installed skill. Other paths outside the repository are rejected."
+                "Repo-relative source path, a `skill:<opaque-id>` catalog locator, or the exact absolute SKILL.md path of a loaded skill. Other outside paths are rejected."
                     .to_string(),
             )),
         ),
         (
             "start_line".to_string(),
-            JsonSchema::integer(Some("First 1-based line to return.".to_string())),
+            integer_with_minimum(1, "First 1-based line to return.".to_string()),
         ),
         (
             "line_count".to_string(),
-            JsonSchema::integer(Some(format!(
-                "Number of lines to return; must be between 1 and {SOURCE_READ_MAX_LINES}."
-            ))),
+            bounded_integer(
+                1,
+                SOURCE_READ_MAX_LINES,
+                format!(
+                    "Number of lines to return; must be between 1 and {SOURCE_READ_MAX_LINES}."
+                ),
+            ),
         ),
         (
             "force_fresh".to_string(),
@@ -163,7 +200,7 @@ pub(crate) fn create_read_file_span_tool(options: SourceToolOptions) -> ToolSpec
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_FILE_SPAN_TOOL_NAME.to_string(),
-        description: "Read a bounded file span from the current repository or an exact loaded installed-skill path. Repository reads support local environments only. Output includes an explicit 1-based line-span evidence citation."
+        description: "Read a bounded file span from the current repository or a loaded skill selected by opaque catalog locator or exact path. Repository reads support local environments only. Output includes an explicit 1-based line-span evidence citation."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -185,6 +222,53 @@ fn add_environment_id(properties: &mut BTreeMap<String, JsonSchema>, options: So
                     .to_string(),
             )),
         );
+    }
+}
+
+fn source_question_schema() -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "kind".to_string(),
+                JsonSchema::string_enum(
+                    [
+                        "unknown_caller",
+                        "unknown_contract",
+                        "ambiguous_ownership",
+                        "incomplete_prior_result",
+                        "source_changed",
+                        "validation_dependency",
+                    ]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                    Some("Concrete reason the established source closure must expand.".to_string()),
+                ),
+            ),
+            (
+                "detail".to_string(),
+                JsonSchema::string(Some(
+                    "Non-empty missing evidence or ownership question.".to_string(),
+                )),
+            ),
+        ]),
+        Some(vec!["kind".to_string(), "detail".to_string()]),
+        Some(false.into()),
+    )
+}
+
+fn bounded_integer(minimum: usize, maximum: usize, description: String) -> JsonSchema {
+    JsonSchema {
+        minimum: Some(Number::from(minimum as u64)),
+        maximum: Some(Number::from(maximum as u64)),
+        ..JsonSchema::integer(Some(description))
+    }
+}
+
+fn integer_with_minimum(minimum: usize, description: String) -> JsonSchema {
+    JsonSchema {
+        minimum: Some(Number::from(minimum as u64)),
+        ..JsonSchema::integer(Some(description))
     }
 }
 

@@ -46,6 +46,7 @@ const TASK_CORRECTION_METRIC: &str = "codex.multi_agent.task.correction";
 const TASK_WAIVER_METRIC: &str = "codex.multi_agent.task.waiver";
 const TASK_VIOLATION_METRIC: &str = "codex.multi_agent.task.violation";
 const TASK_OUTCOME_METRIC: &str = "codex.multi_agent.task.outcome";
+const TASK_TERMINAL_STATE_METRIC: &str = "codex.multi_agent.task.terminal_state";
 
 const ROLE_TAG: &str = "role";
 const CAPABILITY_TAG: &str = "capability";
@@ -67,6 +68,7 @@ impl OpaqueId {
 pub(crate) enum RoleLabel {
     #[cfg(test)]
     Root,
+    Architect,
     Explorer,
     Worker,
     Reviewer,
@@ -81,6 +83,7 @@ impl RoleLabel {
         match self {
             #[cfg(test)]
             Self::Root => "root",
+            Self::Architect => "architect",
             Self::Explorer => "explorer",
             Self::Worker => "worker",
             Self::Reviewer => "reviewer",
@@ -95,6 +98,7 @@ impl RoleLabel {
 impl From<AgentRole> for RoleLabel {
     fn from(role: AgentRole) -> Self {
         match role {
+            AgentRole::Architect => Self::Architect,
             AgentRole::Explorer => Self::Explorer,
             AgentRole::Worker => Self::Worker,
             AgentRole::Reviewer => Self::Reviewer,
@@ -730,13 +734,35 @@ impl TaskMetricRuntime {
         task: &AgentTask,
         session_telemetry: &SessionTelemetry,
     ) -> Result<bool, MetricsError> {
-        self.recorder
+        let emitted = self
+            .recorder
             .finish_and_emit(
                 self.started_at.elapsed(),
                 terminal_input(task),
                 session_telemetry,
             )
-            .map(|metrics| metrics.is_some())
+            .map(|metrics| metrics.is_some())?;
+        if emitted {
+            session_telemetry.counter(
+                TASK_TERMINAL_STATE_METRIC,
+                1,
+                &[(
+                    "state",
+                    attempt_state_metric_label(task.current_attempt.state),
+                )],
+            );
+        }
+        Ok(emitted)
+    }
+}
+
+const fn attempt_state_metric_label(state: AttemptState) -> &'static str {
+    match state {
+        AttemptState::Active => "active",
+        AttemptState::Completed => "completed",
+        AttemptState::NeedsMain => "needs_main",
+        AttemptState::Violated => "violated",
+        AttemptState::Abandoned => "abandoned",
     }
 }
 

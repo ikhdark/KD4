@@ -175,9 +175,10 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
     def test_agents_mentions_current_checkout_not_stale_codexkd_path(self) -> None:
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        first_lines = "\n".join(text.splitlines()[:40])
+        first_lines = " ".join(" ".join(text.splitlines()[:40]).split())
 
-        self.assertIn(r"C:\Users\kuh\Desktop\kd4", first_lines)
+        self.assertIn("Treat the active repository root as the checkout location", first_lines)
+        self.assertNotIn(r"C:\Users\kuh\Desktop\kd4", text)
         self.assertNotIn(r"C:\Users\kuh\Desktop\codexKD`", text)
 
     def test_agents_desktop_boundary_is_top_level_guidance(self) -> None:
@@ -199,7 +200,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("## Validation and local-build proof", text)
         self.assertIn("Rust crates", text)
         self.assertIn("Scripts", text)
-        self.assertIn("Local publish", text)
+        self.assertIn("Do not publish unless the user explicitly asks", text)
         self.assertIn("do not hand-edit generated locks", normalized)
 
     def test_agents_scripts_policy_is_nested_and_discoverable(self) -> None:
@@ -257,11 +258,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         shell_installer_path = REPO_ROOT / "scripts" / "install" / "install.sh"
         shell_installer = shell_installer_path.read_text(encoding="utf-8")
+        shell_helpers = (
+            REPO_ROOT / "scripts" / "install" / "install_release.sh"
+        ).read_text(encoding="utf-8")
+        shell_sources = shell_helpers + "\n" + shell_installer
 
         def shell_function(name: str) -> str:
-            start = shell_installer.index(f"{name}() {{")
-            end = shell_installer.index("\n}\n", start) + 3
-            return shell_installer[start:end]
+            start = shell_sources.index(f"{name}() {{")
+            end = shell_sources.index("\n}\n", start) + 3
+            return shell_sources[start:end]
 
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
             root = Path(temp_dir)
@@ -298,7 +303,10 @@ class BuildToolingPolicyTest(unittest.TestCase):
             with (release_dir / "codex-install.env").open(
                 "w", encoding="utf-8", newline="\n"
             ) as metadata:
-                metadata.write(f"version={version}\ntarget={target}\nlayout=package\n")
+                metadata.write(
+                    f"version={version}\ntarget={target}\nlayout=package\n"
+                    "tree_sha256=placeholder\n"
+                )
             shell_probe = root / "probe.sh"
             shell_probe.write_text(
                 "\n".join(
@@ -310,10 +318,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
                         shell_function("package_metadata_number_equals"),
                         shell_function("validate_package_metadata"),
                         shell_function("version_from_binary"),
+                        shell_function("ensure_sha256"),
+                        shell_function("file_sha256"),
+                        shell_function("managed_release_digest"),
                         shell_function("release_dir_is_complete"),
                         'chmod 0755 "$1/bin/codex" "$1/codex" "$1/codex-path/rg"',
                         'if [ -e "$1/bin/codex-code-mode-host" ]; then',
                         '  chmod 0755 "$1/bin/codex-code-mode-host"',
+                        '  tree_sha256="$(managed_release_digest "$1" package "$3")"',
+                        '  printf "version=%s\\ntarget=%s\\nlayout=package\\ntree_sha256=%s\\n" "$2" "$3" "$tree_sha256" >"$1/$INSTALL_METADATA_FILE"',
                         "fi",
                         'release_dir_is_complete "$1" "$2" "$3" package',
                         "",
@@ -629,6 +642,74 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("scripts.install.test_install_sh", native_targets)
         self.assertEqual(native_skipped, [])
 
+    def test_root_maintenance_full_audit_fails_closed_on_platform_skips(
+        self,
+    ) -> None:
+        root_maintenance = load_root_maintenance_module()
+        common_patches = (
+            mock.patch.object(
+                root_maintenance, "script_source_targets", return_value=[]
+            ),
+            mock.patch.object(root_maintenance, "script_kind_map", return_value={}),
+            mock.patch.object(
+                root_maintenance, "script_audit_context_issues", return_value=[]
+            ),
+            mock.patch.object(
+                root_maintenance, "script_audit_findings", return_value=([], [])
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_test_targets",
+                return_value=([], ["native test unavailable"]),
+            ),
+            mock.patch.object(
+                root_maintenance, "script_audit_commands", return_value=([], [])
+            ),
+            mock.patch.object(
+                root_maintenance, "git_context_label", return_value="test"
+            ),
+        )
+        with contextlib.ExitStack() as stack:
+            for patcher in common_patches:
+                stack.enter_context(patcher)
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.assertEqual(
+                root_maintenance.run_script_audit(include_tests=True, strict=False),
+                1,
+            )
+        with (
+            mock.patch.object(
+                root_maintenance, "script_source_targets", return_value=[]
+            ),
+            mock.patch.object(root_maintenance, "script_kind_map", return_value={}),
+            mock.patch.object(
+                root_maintenance, "script_audit_context_issues", return_value=[]
+            ),
+            mock.patch.object(
+                root_maintenance, "script_audit_findings", return_value=([], [])
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_test_targets",
+                return_value=([], ["native test unavailable"]),
+            ),
+            mock.patch.object(
+                root_maintenance, "script_audit_commands", return_value=([], [])
+            ),
+            mock.patch.object(
+                root_maintenance, "git_context_label", return_value="test"
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                root_maintenance.run_script_audit(
+                    include_tests=True,
+                    strict=False,
+                    allow_platform_skips=True,
+                ),
+                0,
+            )
+
     def test_root_maintenance_git_paths_use_nul_delimiters(self) -> None:
         root_maintenance = load_root_maintenance_module()
         tracked = subprocess.CompletedProcess(
@@ -785,11 +866,11 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 )
         self.assertEqual(
             package["scripts"]["test:scripts:target"],
-            "python scripts/root_maintenance.py test-python --changed",
+            "node scripts/run-python.js scripts/root_maintenance.py test-python --changed",
         )
         self.assertEqual(
             package["scripts"]["test:scripts:changed"],
-            "python scripts/root_maintenance.py test-python --changed",
+            "node scripts/run-python.js scripts/root_maintenance.py test-python --changed",
         )
 
     def test_rust_package_search_start_keeps_existing_dotted_directories(self) -> None:

@@ -1,4 +1,5 @@
 use chrono::Utc;
+use codex_agent_task_store::AdmittedAssignment;
 use codex_agent_task_store::AgentReceipt;
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
@@ -8,11 +9,14 @@ use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::Assignment;
 use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
+#[cfg(test)]
 use codex_agent_task_store::Attempt;
+use codex_agent_task_store::AttemptId;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::LocalAgentTaskStore;
+use codex_agent_task_store::ObservationKind;
 use codex_agent_task_store::ReceiptDraft;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::StoreResult;
@@ -35,7 +39,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use tokio::sync::Notify;
 use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::task_metrics::TaskMetricRuntime;
@@ -75,8 +81,12 @@ struct BindingIndex {
 struct TaskMetricIndex {
     runtimes: HashMap<AssignmentId, TaskMetricRuntime>,
     active: HashSet<AssignmentId>,
+    first_progress_attempts: HashSet<AttemptId>,
+    hydrated_receipt_attempts: HashSet<AttemptId>,
     configured_capacity: Option<u32>,
 }
+
+const MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES: usize = 4_096;
 
 /// Shared typed-task persistence and identity index for one root agent tree.
 ///
@@ -89,9 +99,19 @@ pub(crate) struct AgentTaskCoordinator {
     root_session_id: Arc<OnceCell<String>>,
     bindings: Arc<RwLock<BindingIndex>>,
     metrics: Arc<Mutex<TaskMetricIndex>>,
+    validation_waiters: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
 
 impl AgentTaskCoordinator {
+    pub(crate) fn has_bindings(&self) -> bool {
+        !self
+            .bindings
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_assignment
+            .is_empty()
+    }
+
     pub(crate) async fn initialize(
         &self,
         state_runtime: Arc<StateRuntime>,
@@ -173,6 +193,57 @@ impl AgentTaskCoordinator {
         metrics.configured_capacity.get_or_insert(capacity);
     }
 
+    pub(crate) fn record_first_meaningful_progress_once(
+        &self,
+        attempt_id: AttemptId,
+        kind: ObservationKind,
+        session_telemetry: &SessionTelemetry,
+    ) -> bool {
+        if !kind.is_meaningful_progress() {
+            return false;
+        }
+        let mut metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if metrics.first_progress_attempts.contains(&attempt_id)
+            || metrics.first_progress_attempts.len() >= MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES
+        {
+            return false;
+        }
+        metrics.first_progress_attempts.insert(attempt_id);
+        session_telemetry.counter(
+            "codex.multi_agent.first_meaningful_progress",
+            1,
+            &[("kind", observation_metric_label(kind))],
+        );
+        true
+    }
+
+    pub(crate) fn record_root_receipt_hydration_once(
+        &self,
+        attempt_id: AttemptId,
+        session_telemetry: &SessionTelemetry,
+    ) -> bool {
+        let mut metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if metrics.hydrated_receipt_attempts.contains(&attempt_id)
+            || metrics.hydrated_receipt_attempts.len() >= MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES
+        {
+            return false;
+        }
+        metrics.hydrated_receipt_attempts.insert(attempt_id);
+        session_telemetry.counter(
+            "codex.multi_agent.root_evidence_hydration",
+            1,
+            &[("evidence", "sealed_child_receipt")],
+        );
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) async fn create_assignment(
         &self,
         repo_root: &Path,
@@ -195,6 +266,33 @@ impl AgentTaskCoordinator {
         let (assignment, attempt) = store.create_assignment(repo_root, draft).await?;
         self.start_task_metrics(&assignment);
         Ok((assignment, attempt))
+    }
+
+    pub(crate) async fn create_admitted_assignment(
+        &self,
+        repo_root: &Path,
+        draft: AssignmentDraft,
+        isolated_integrator_available: bool,
+    ) -> StoreResult<AdmittedAssignment> {
+        let store = self.required_store()?;
+        store
+            .register_workspace_actor(
+                repo_root,
+                WorkspaceActorRegistration {
+                    root_session_id: draft.root_session_id.clone(),
+                    actor_id: format!("root:{}", draft.root_session_id),
+                    kind: WorkspaceActorKind::Root,
+                    assignment_id: None,
+                    attempt_id: None,
+                    strategy: WorkspaceStrategy::Shared,
+                },
+            )
+            .await?;
+        let admitted = store
+            .create_admitted_assignment(repo_root, draft, isolated_integrator_available)
+            .await?;
+        self.start_task_metrics(&admitted.assignment);
+        Ok(admitted)
     }
 
     pub(crate) async fn bind_agent_task(
@@ -367,6 +465,64 @@ impl AgentTaskCoordinator {
         self.required_store()?.get_validation_call(call_id).await
     }
 
+    pub(crate) fn notify_validation_call(&self, call_id: &str) {
+        let waiter = self
+            .validation_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(call_id)
+            .cloned();
+        if let Some(waiter) = waiter {
+            waiter.notify_waiters();
+        }
+    }
+
+    /// Waits for a persisted validation call without model-visible polling.
+    ///
+    /// The notifier is installed before the first authoritative read so a
+    /// terminal transition cannot be missed. Deadline wakeup returns the last
+    /// authoritative store state to the caller for bounded recovery.
+    pub(crate) async fn wait_for_validation_call_terminal(
+        &self,
+        call_id: &str,
+        cancellation: &CancellationToken,
+        deadline: chrono::DateTime<Utc>,
+    ) -> StoreResult<Option<ValidationCall>> {
+        let waiter = {
+            let mut waiters = self
+                .validation_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            waiters
+                .entry(call_id.to_string())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone()
+        };
+        loop {
+            let current = self.get_validation_call(call_id.to_string()).await?;
+            if current
+                .as_ref()
+                .is_some_and(|call| call.status.is_terminal())
+            {
+                self.validation_waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(call_id);
+                return Ok(current);
+            }
+            let Ok(remaining) = (deadline - Utc::now()).to_std() else {
+                return Ok(current);
+            };
+            tokio::select! {
+                _ = waiter.notified() => {}
+                _ = cancellation.cancelled() => return Ok(None),
+                _ = tokio::time::sleep(remaining) => {
+                    return self.get_validation_call(call_id.to_string()).await;
+                }
+            }
+        }
+    }
+
     pub(crate) async fn heartbeat_validation_call(
         &self,
         call_id: String,
@@ -394,6 +550,24 @@ impl AgentTaskCoordinator {
         retained_output_ref: Option<String>,
         output_summary: Option<String>,
     ) -> StoreResult<()> {
+        self.finish_focused_validation_with_result(
+            token,
+            status,
+            retained_output_ref,
+            output_summary,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_focused_validation_with_result(
+        &self,
+        token: FocusedValidationToken,
+        status: ValidationCallStatus,
+        retained_output_ref: Option<String>,
+        output_summary: Option<String>,
+        validation_result: Option<serde_json::Value>,
+    ) -> StoreResult<()> {
         if !status.is_terminal() {
             return Err(StoreError::InvalidAssignment(
                 "focused validation finish requires a terminal status".to_string(),
@@ -407,6 +581,8 @@ impl AgentTaskCoordinator {
         let mut evidence = token.evidence;
         evidence.retained_output_ref = retained_output_ref;
         evidence.output_summary = output_summary;
+        evidence.validation_result = validation_result;
+        let call_id = token.call_id.clone();
         store
             .record_validation_call(ValidationCall {
                 call_id: token.call_id,
@@ -419,6 +595,7 @@ impl AgentTaskCoordinator {
                 recorded_at: Utc::now(),
             })
             .await?;
+        self.notify_validation_call(&call_id);
         Ok(())
     }
 
@@ -540,6 +717,7 @@ impl AgentTaskCoordinator {
             next_action: Some(
                 "main agent must inspect the task and decide the outcome".to_string(),
             ),
+            architecture_contract: None,
         };
         match store
             .submit_agent_receipt(binding.attempt_id, receipt)
@@ -659,6 +837,26 @@ fn saturating_active_turns(active: usize) -> u32 {
 
 fn metric_capacity(metrics: &TaskMetricIndex, active_turns: u32) -> u32 {
     metrics.configured_capacity.unwrap_or(1).max(active_turns)
+}
+
+const fn observation_metric_label(kind: ObservationKind) -> &'static str {
+    match kind {
+        ObservationKind::Accepted => "accepted",
+        ObservationKind::Starting => "starting",
+        ObservationKind::Reading => "reading",
+        ObservationKind::Editing => "editing",
+        ObservationKind::Reviewing => "reviewing",
+        ObservationKind::Validating => "validating",
+        ObservationKind::Blocked => "blocked",
+        ObservationKind::ToolCall => "tool_call",
+        ObservationKind::Mutation => "mutation",
+        ObservationKind::GateChanged => "gate_changed",
+        ObservationKind::ReceiptSealed => "receipt_sealed",
+        ObservationKind::Completed => "completed",
+        ObservationKind::NeedsMain => "needs_main",
+        ObservationKind::Violated => "violated",
+        ObservationKind::Abandoned => "abandoned",
+    }
 }
 
 async fn binding_no_longer_needs_receipt(

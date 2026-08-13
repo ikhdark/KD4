@@ -44,6 +44,7 @@ AGENTS.override.md
 .nyc_output/
 .jest/
 *.tsbuildinfo
+/target/
 
 # logs
 *.log

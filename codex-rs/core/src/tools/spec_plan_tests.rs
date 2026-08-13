@@ -37,6 +37,8 @@ use crate::config::CurrentTimeReminderConfig;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
+use crate::tools::exposure::AgentSurfaceStage;
+use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::router::ToolRouter;
@@ -101,6 +103,7 @@ struct ToolPlanInputs {
     tool_suggest_candidates: Option<ToolSuggestCandidates>,
     extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     dynamic_tools: Vec<DynamicToolSpec>,
+    exposure_identity: ToolExposureIdentity,
 }
 
 struct ToolPlanProbe {
@@ -245,6 +248,7 @@ async fn probe_with(
             deferred_mcp_tools: inputs.deferred_mcp_tools,
             extension_tool_executors: inputs.extension_tool_executors,
             dynamic_tools: inputs.dynamic_tools.as_slice(),
+            exposure_identity: inputs.exposure_identity,
         },
         &Default::default(),
     );
@@ -610,6 +614,57 @@ async fn request_user_input_tool_respects_experimental_config_gate() {
 }
 
 #[tokio::test]
+async fn request_user_input_respects_coarse_mode_and_role_eligibility() {
+    for request_user_input_eligible in [false, true] {
+        let identity = ToolExposureIdentity {
+            request_user_input_eligible,
+            ..ToolExposureIdentity::default()
+        };
+        let plan = probe_with(
+            |_| {},
+            ToolPlanInputs {
+                exposure_identity: identity,
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        if request_user_input_eligible {
+            plan.assert_visible_contains(&["request_user_input"]);
+            plan.assert_registered_contains(&["request_user_input"]);
+        } else {
+            plan.assert_visible_lacks(&["request_user_input"]);
+            plan.assert_registered_lacks(&["request_user_input"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn wait_is_registered_only_while_a_code_mode_cell_is_waitable() {
+    for wait_available in [false, true] {
+        let identity = ToolExposureIdentity {
+            wait_available,
+            ..ToolExposureIdentity::default()
+        };
+        let plan = probe_with(
+            |turn| set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]),
+            ToolPlanInputs {
+                exposure_identity: identity,
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        plan.assert_visible_contains(&[codex_code_mode::PUBLIC_TOOL_NAME]);
+        if wait_available {
+            plan.assert_visible_contains(&[codex_code_mode::WAIT_TOOL_NAME]);
+            plan.assert_registered_contains(&[codex_code_mode::WAIT_TOOL_NAME]);
+        } else {
+            plan.assert_visible_lacks(&[codex_code_mode::WAIT_TOOL_NAME]);
+            plan.assert_registered_lacks(&[codex_code_mode::WAIT_TOOL_NAME]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn request_user_input_stays_direct_in_code_mode_only() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
@@ -885,6 +940,7 @@ async fn environment_tools_follow_the_step_context() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            exposure_identity: Default::default(),
         },
         &Default::default(),
     ));
@@ -1011,6 +1067,37 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
 }
 
 #[tokio::test]
+async fn mcp_resource_tools_follow_the_aggregate_ready_server_capability() {
+    for mcp_resources_available in [false, true] {
+        let identity = ToolExposureIdentity {
+            mcp_resources_available,
+            ..ToolExposureIdentity::default()
+        };
+        let plan = probe_with(
+            |_| {},
+            ToolPlanInputs {
+                mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct", "lookup")]),
+                exposure_identity: identity,
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        let resource_tools = [
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+        ];
+        if mcp_resources_available {
+            plan.assert_visible_contains(&resource_tools);
+            plan.assert_registered_contains(&resource_tools);
+        } else {
+            plan.assert_visible_lacks(&resource_tools);
+            plan.assert_registered_lacks(&resource_tools);
+        }
+    }
+}
+
+#[tokio::test]
 async fn deferred_extension_tools_are_discoverable_with_tool_search() {
     let plan = probe_with(
         |turn| {
@@ -1123,6 +1210,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            exposure_identity: Default::default(),
         },
         &cache,
     );
@@ -1140,6 +1228,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            exposure_identity: Default::default(),
         },
         &cache,
     );
@@ -1152,6 +1241,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            exposure_identity: Default::default(),
         },
         &cache,
     );
@@ -1628,6 +1718,90 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
         ToolExposure::DirectModelOnly
     );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_surface_changes_only_at_the_four_coarse_stages() {
+    let stages = [
+        (AgentSurfaceStage::Prohibited, Vec::<&str>::new()),
+        (AgentSurfaceStage::SpawnOnly, vec!["spawn_agent"]),
+        (
+            AgentSurfaceStage::Lifecycle,
+            vec![
+                "spawn_agent",
+                "send_message",
+                "followup_task",
+                "wait_agent",
+                "interrupt_agent",
+                "list_agents",
+            ],
+        ),
+        (
+            AgentSurfaceStage::TypedAdministration,
+            vec![
+                "spawn_agent",
+                "send_message",
+                "followup_task",
+                "wait_agent",
+                "interrupt_agent",
+                "list_agents",
+                "get_agent_task",
+                "set_agent_gate",
+                "amend_agent_task",
+                "waive_agent_gate",
+                "abandon_agent_task",
+            ],
+        ),
+    ];
+
+    for (stage, expected) in stages {
+        let identity = ToolExposureIdentity {
+            agent_surface_stage: stage,
+            ..ToolExposureIdentity::default()
+        };
+        let plan = probe_with(
+            |turn| set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true),
+            ToolPlanInputs {
+                exposure_identity: identity,
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        if stage == AgentSurfaceStage::Prohibited {
+            plan.assert_visible_lacks(&[MULTI_AGENT_V2_NAMESPACE]);
+            for tool_name in [
+                "spawn_agent",
+                "send_message",
+                "followup_task",
+                "wait_agent",
+                "interrupt_agent",
+                "list_agents",
+                "get_agent_task",
+                "set_agent_gate",
+            ] {
+                plan.assert_registered_lacks(&[&ToolName::namespaced(
+                    MULTI_AGENT_V2_NAMESPACE,
+                    tool_name,
+                )
+                .to_string()]);
+            }
+            continue;
+        }
+
+        plan.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
+        let actual = plan.namespace_function_names(MULTI_AGENT_V2_NAMESPACE);
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "unexpected tools for {stage:?}"
+        );
+        for tool_name in expected {
+            assert!(
+                actual.iter().any(|actual| actual == tool_name),
+                "expected `{tool_name}` for {stage:?}, got {actual:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

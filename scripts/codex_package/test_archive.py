@@ -168,6 +168,34 @@ class WriteArchiveSafetyTest(unittest.TestCase):
             self.assertEqual(output.read_bytes(), b"previous archive")
             self.assertEqual(list(root.glob("package.zip.*.tmp")), [])
 
+    def test_non_force_write_preserves_concurrently_created_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "package"
+            package_dir.mkdir()
+            output = root / "package.zip"
+
+            def write_then_race(
+                _package_dir: Path,
+                staged_path: Path,
+                **_kwargs: object,
+            ) -> None:
+                staged_path.write_bytes(b"new archive")
+                output.write_bytes(b"concurrent archive")
+
+            with (
+                mock.patch.object(
+                    archive,
+                    "write_zip_archive",
+                    side_effect=write_then_race,
+                ),
+                self.assertRaisesRegex(RuntimeError, "already exists"),
+            ):
+                archive.write_archive(package_dir, output, force=False)
+
+            self.assertEqual(output.read_bytes(), b"concurrent archive")
+            self.assertEqual(list(root.glob("package.zip.*.tmp")), [])
+
     def test_incompatible_compression_is_rejected_before_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

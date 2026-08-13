@@ -682,6 +682,57 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         self.assertTrue(matched)
         source_output_fingerprint.assert_called_once_with(path)
 
+    def test_source_build_stamp_write_preserves_existing_file_on_replace_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_dir = Path(temp_dir) / "target"
+            stamp_path = source_build_stamp_path(target_dir)
+            stamp_path.parent.mkdir(parents=True)
+            stamp_path.write_text("previous stamp\n", encoding="utf-8")
+            outputs = cargo_module.SourceBuildOutputs(
+                entrypoint_bin=touch_file(Path(temp_dir) / "codex.exe"),
+                code_mode_host_bin=touch_file(
+                    Path(temp_dir) / "codex-code-mode-host.exe"
+                ),
+                bwrap_bin=None,
+                codex_command_runner_bin=None,
+                codex_windows_sandbox_setup_bin=None,
+            )
+
+            with (
+                mock.patch.object(
+                    cargo_module,
+                    "source_tree_fingerprint",
+                    return_value=fixed_source_fingerprint(),
+                ),
+                mock.patch.object(
+                    cargo_module.os,
+                    "fsync",
+                    wraps=os.fsync,
+                ) as fsync,
+                mock.patch.object(
+                    cargo_module.os,
+                    "replace",
+                    side_effect=OSError("replace failed"),
+                ) as replace,
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                cargo_module.write_source_build_stamp(
+                    target_dir,
+                    spec=TARGET_SPECS["x86_64-pc-windows-msvc"],
+                    profile="release",
+                    variant=PACKAGE_VARIANTS["codex"],
+                    outputs=outputs,
+                )
+
+            temporary_path, replacement_path = replace.call_args.args
+            self.assertEqual(Path(temporary_path).parent, stamp_path.parent)
+            self.assertEqual(replacement_path, stamp_path)
+            self.assertEqual(stamp_path.read_text(encoding="utf-8"), "previous stamp\n")
+            self.assertFalse(Path(temporary_path).exists())
+            fsync.assert_called_once()
+
     def test_force_rebuild_ignores_reusable_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

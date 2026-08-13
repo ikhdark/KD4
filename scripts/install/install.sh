@@ -823,13 +823,56 @@ write_install_metadata() {
   target="$3"
   layout="$4"
   tmp_metadata="$release_dir/$INSTALL_METADATA_FILE.$$"
+  tree_sha256="$(managed_release_digest "$release_dir" "$layout" "$target")"
 
   {
     printf 'version=%s\n' "$resolved_version"
     printf 'target=%s\n' "$target"
     printf 'layout=%s\n' "$layout"
+    printf 'tree_sha256=%s\n' "$tree_sha256"
   } >"$tmp_metadata"
   mv "$tmp_metadata" "$release_dir/$INSTALL_METADATA_FILE"
+}
+
+managed_release_digest() {
+  managed_release_dir="$1"
+  managed_release_layout="$2"
+  managed_release_target="$3"
+  managed_digest_manifest="$(mktemp)"
+
+  case "$managed_release_layout" in
+    package)
+      managed_release_paths="codex-package.json bin/codex bin/codex-code-mode-host codex-path/rg"
+      case "$managed_release_target" in
+        *linux*) managed_release_paths="$managed_release_paths codex-resources/bwrap" ;;
+      esac
+      case "$managed_release_target" in
+        *linux* | *apple-darwin) managed_release_paths="$managed_release_paths codex-resources/zsh/bin/zsh" ;;
+      esac
+      ;;
+    legacy-platform-npm)
+      managed_release_paths="codex codex-resources/rg"
+      case "$managed_release_target" in
+        *linux*) managed_release_paths="$managed_release_paths codex-resources/bwrap" ;;
+      esac
+      ;;
+    *)
+      rm -f "$managed_digest_manifest"
+      return 1
+      ;;
+  esac
+
+  for managed_release_path in $managed_release_paths; do
+    if [ ! -f "$managed_release_dir/$managed_release_path" ]; then
+      rm -f "$managed_digest_manifest"
+      return 1
+    fi
+    managed_file_sha256="$(file_sha256 "$managed_release_dir/$managed_release_path")"
+    printf '%s  %s\n' "$managed_file_sha256" "$managed_release_path" >>"$managed_digest_manifest"
+  done
+  managed_tree_sha256="$(file_sha256 "$managed_digest_manifest")"
+  rm -f "$managed_digest_manifest"
+  printf '%s\n' "$managed_tree_sha256"
 }
 
 release_dir_is_complete() {
@@ -848,6 +891,8 @@ release_dir_is_complete() {
     [ "$(install_metadata_field "$release_dir" target || true)" = "$expected_target" ] &&
     [ "$(install_metadata_field "$release_dir" layout || true)" = "$layout" ] ||
     return 1
+  expected_tree_sha256="$(install_metadata_field "$release_dir" tree_sha256 || true)"
+  [ -n "$expected_tree_sha256" ] || return 1
 
   case "$layout" in
     package)
@@ -886,7 +931,9 @@ release_dir_is_complete() {
       printf '%s\n' "$release_dir/codex"
     fi
   )" || true)"
-  [ "$installed_version" = "$expected_version" ]
+  [ "$installed_version" = "$expected_version" ] || return 1
+  actual_tree_sha256="$(managed_release_digest "$release_dir" "$layout" "$expected_target" || true)"
+  [ -n "$actual_tree_sha256" ] && [ "$actual_tree_sha256" = "$expected_tree_sha256" ]
 }
 
 update_current_link() {

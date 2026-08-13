@@ -799,8 +799,44 @@ def reserve_cargo_lane(
                 active_handle.close()
 
 
+def _normalized_target_dir(path: str | Path) -> str:
+    if not str(path).strip():
+        raise ValueError("Cargo --target-dir requires a non-empty path")
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Cargo --target-dir {str(path)!r} is invalid: {exc}") from exc
+    return os.path.normcase(str(resolved))
+
+
+def _require_reserved_target_dir(candidate: str, target_dir: Path) -> None:
+    if _normalized_target_dir(candidate) != _normalized_target_dir(target_dir):
+        raise ValueError(
+            f"Cargo --target-dir {candidate!r} does not match reserved lane "
+            f"target {str(target_dir)!r}"
+        )
+
+
 def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
-    if re.search(r"(?:^|\s)--target-dir(?:=|\s+)", command):
+    separator_index = command.find(" -- ")
+    cargo_command = command if separator_index < 0 else command[:separator_index]
+    target_pattern = re.compile(
+        r'(?:^|\s)--target-dir(?:=(?:"(?P<double>[^\"]*)"|'
+        r"'(?P<single>[^']*)'|(?P<bare>[^\s]+))|\s+(?:"
+        r'"(?P<double_space>[^\"]*)"|'
+        r"'(?P<single_space>[^']*)'|(?P<bare_space>[^\s]+)))"
+    )
+    target_matches = list(target_pattern.finditer(cargo_command))
+    if re.search(r"(?:^|\s)--target-dir(?:=|\s|$)", cargo_command) and not target_matches:
+        raise ValueError("Cargo watch exec command has a malformed --target-dir option")
+    for target_match in target_matches:
+        candidate = next(
+            value
+            for value in target_match.groupdict().values()
+            if value is not None
+        )
+        _require_reserved_target_dir(candidate, target_dir)
+    if target_matches:
         return command
     build_commands = {
         "bench",
@@ -826,10 +862,68 @@ def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
     else:
         quoted_target = shlex.quote(target_arg)
     insertion = f" --target-dir {quoted_target}"
-    separator_index = command.find(" -- ")
     if separator_index >= 0:
         return command[:separator_index] + insertion + command[separator_index:]
     return command + insertion
+
+
+def _cargo_subcommand_index(command: Sequence[str]) -> int | None:
+    index = 1
+    if index < len(command) and command[index].startswith("+"):
+        index += 1
+    global_options_with_values = {"--color", "--config", "-C", "-Z"}
+    global_long_options_with_values = {"--color", "--config"}
+    while index < len(command):
+        argument = command[index]
+        if argument == "--":
+            return None
+        if not argument.startswith("-"):
+            return index
+        if argument in global_options_with_values:
+            if index + 1 >= len(command):
+                raise ValueError(f"Cargo global option {argument} requires a value")
+            index += 2
+            continue
+        if any(
+            argument.startswith(f"{option}=")
+            for option in global_long_options_with_values
+        ) or any(
+            argument.startswith(option) and argument != option
+            for option in {"-C", "-Z"}
+        ):
+            index += 1
+            continue
+        index += 1
+    return None
+
+
+def _cargo_target_dir_is_present(
+    command: Sequence[str],
+    *,
+    start_index: int,
+    target_dir: Path,
+) -> bool:
+    present = False
+    index = start_index
+    while index < len(command):
+        argument = command[index]
+        if argument == "--":
+            break
+        if argument == "--target-dir":
+            if index + 1 >= len(command) or command[index + 1] == "--":
+                raise ValueError("Cargo --target-dir requires a path value")
+            _require_reserved_target_dir(command[index + 1], target_dir)
+            present = True
+            index += 2
+            continue
+        if argument.startswith("--target-dir="):
+            _require_reserved_target_dir(
+                argument.removeprefix("--target-dir="),
+                target_dir,
+            )
+            present = True
+        index += 1
+    return present
 
 
 def _cargo_command_with_target_dir(
@@ -839,41 +933,20 @@ def _cargo_command_with_target_dir(
     result = list(command)
     if len(result) < 2 or Path(result[0]).stem.lower() != "cargo":
         return result
-    subcommand_index = 1
-    if (
-        subcommand_index < len(result)
-        and result[subcommand_index].startswith("+")
-        and len(result[subcommand_index]) > 1
-    ):
-        subcommand_index += 1
-    global_options_with_values = {"--color", "--config", "--explain", "-Z"}
-    while subcommand_index < len(result):
-        argument = result[subcommand_index]
-        if argument == "--":
-            subcommand_index += 1
-            break
-        if argument in global_options_with_values:
-            subcommand_index += 2
-            continue
-        if any(
-            argument.startswith(f"{option}=")
-            for option in {"--color", "--config", "--explain"}
-        ) or (argument.startswith("-Z") and argument != "-Z"):
-            subcommand_index += 1
-            continue
-        if argument.startswith("-"):
-            subcommand_index += 1
-            continue
-        break
-    if subcommand_index >= len(result):
+    subcommand_index = _cargo_subcommand_index(result)
+    if subcommand_index is None:
         return result
     subcommand = result[subcommand_index]
     target_arg = str(target_dir)
     tail = result[subcommand_index + 1 :]
-    if any(arg == "--target-dir" or arg.startswith("--target-dir=") for arg in tail):
-        return result
     if subcommand == "nextest":
         if not tail or tail[0] not in {"archive", "run"}:
+            return result
+        if _cargo_target_dir_is_present(
+            result,
+            start_index=subcommand_index + 2,
+            target_dir=target_dir,
+        ):
             return result
         return [
             *result[: subcommand_index + 2],
@@ -883,6 +956,16 @@ def _cargo_command_with_target_dir(
         ]
     if subcommand == "watch":
         for index in range(subcommand_index + 1, len(result)):
+            if result[index] == "--":
+                break
+            if (
+                result[index] in {"-s", "--shell"}
+                or result[index].startswith("--shell=")
+            ):
+                raise ValueError(
+                    "Cargo watch --shell/-s is not allowed inside a reserved "
+                    "lane; use --exec/-x so --target-dir can be enforced"
+                )
             if result[index] in {"-x", "--exec"} and index + 1 < len(result):
                 result[index + 1] = _cargo_watch_exec_with_target_dir(
                     result[index + 1],
@@ -908,6 +991,12 @@ def _cargo_command_with_target_dir(
         "rustc",
         "test",
     }:
+        return result
+    if _cargo_target_dir_is_present(
+        result,
+        start_index=subcommand_index + 1,
+        target_dir=target_dir,
+    ):
         return result
     return [
         *result[: subcommand_index + 1],

@@ -1,5 +1,6 @@
 """Archive writers for canonical Codex package directories."""
 
+import os
 import shutil
 import subprocess
 import tarfile
@@ -64,9 +65,25 @@ def write_archive(
             )
         else:
             raise AssertionError(f"unexpected archive format: {archive_format}")
-        temp_path.replace(archive_path)
+        activate_archive(temp_path, archive_path, force=force)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def activate_archive(staged_path: Path, archive_path: Path, *, force: bool) -> None:
+    """Publish a staged archive without overwriting unless explicitly allowed."""
+    if force:
+        staged_path.replace(archive_path)
+        return
+
+    try:
+        # Staging beside the destination keeps this on one filesystem. Creating a
+        # hard link is atomic and, unlike Path.replace(), fails if another writer
+        # published the destination after our initial validation.
+        os.link(staged_path, archive_path)
+    except FileExistsError as exc:
+        raise RuntimeError(f"Archive output already exists: {archive_path}") from exc
+    staged_path.unlink()
 
 
 def validate_archive_output(

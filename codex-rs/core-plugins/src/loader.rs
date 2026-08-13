@@ -755,6 +755,7 @@ async fn load_plugin(
         manifest_name: None,
         plugin_namespace: None,
         manifest_description: None,
+        tool_exposure: None,
         root,
         enabled: plugin.enabled,
         skill_roots: Vec::new(),
@@ -824,6 +825,7 @@ async fn load_plugin(
                 Some(&plugin.mcp_servers),
             )
             .await;
+            loaded_plugin.tool_exposure = manifest.tool_exposure.clone();
             loaded_plugin.apps = load_plugin_apps(plugin_root.as_path()).await;
         }
         PluginLoadScope::HooksOnly => {}

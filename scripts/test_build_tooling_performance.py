@@ -83,7 +83,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("perf-nextest-nosccache", result.stdout)
 
     @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
-    def test_perf_env_keeps_explicit_cargo_target_dir_argument(self) -> None:
+    def test_perf_env_rejects_explicit_target_outside_reserved_lane(self) -> None:
         shell = pwsh_only()
         if shell is None:
             self.skipTest("pwsh is not available")
@@ -136,19 +136,11 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 creationflags=CREATE_NO_WINDOW,
             )
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
+        self.assertNotEqual(result.returncode, 0)
         self.assertIn("cargoTargetDir=<explicit command argument>", result.stdout)
-        self.assertIn("targetenv=", result.stdout)
-        self.assertIn(
-            subprocess.list2cmdline(["--target-dir", str(explicit_target)]),
-            result.stdout,
-        )
+        self.assertIn("does not match reserved lane target", result.stderr)
+        self.assertNotIn("targetenv=", result.stdout)
         self.assertNotIn("stale-target-env", result.stdout)
-        self.assertNotIn("perf-explicit-target", result.stdout)
 
     @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_rejects_dot_path_lane_names(self) -> None:

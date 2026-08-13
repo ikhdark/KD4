@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -564,9 +565,22 @@ def write_source_build_stamp(
     }
     path = source_build_stamp_path(target_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(stamp, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    contents = json.dumps(stamp, sort_keys=True, indent=2) + "\n"
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
     )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="\n") as file:
+            file.write(contents)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def source_build_stamp_matches(

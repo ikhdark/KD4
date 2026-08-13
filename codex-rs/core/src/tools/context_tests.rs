@@ -535,6 +535,62 @@ fn exec_command_projection_applies_hard_limit_and_reports_reduction() {
 }
 
 #[test]
+fn high_signal_validation_exposes_three_bounded_predetermined_ranges() {
+    let raw_output = (1..=300)
+        .map(|line| format!("error[E0001]: focused diagnostic line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let ranges = predetermined_validation_ranges(&raw_output, Some("cargo test -p focused"));
+
+    assert_eq!(
+        ranges,
+        vec![
+            ToolOutputProjectionRange {
+                id: "validation-head".to_string(),
+                start_line: 1,
+                end_line: 64,
+            },
+            ToolOutputProjectionRange {
+                id: "validation-middle".to_string(),
+                start_line: 119,
+                end_line: 182,
+            },
+            ToolOutputProjectionRange {
+                id: "validation-tail".to_string(),
+                start_line: 229,
+                end_line: 300,
+            },
+        ]
+    );
+    assert_eq!(
+        ranges
+            .iter()
+            .map(|range| range.end_line - range.start_line + 1)
+            .sum::<usize>(),
+        200
+    );
+}
+
+#[test]
+fn predetermined_validation_ranges_are_absent_when_not_needed() {
+    let ordinary = (1..=300)
+        .map(|line| format!("ordinary output {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(predetermined_validation_ranges(&ordinary, Some("echo ok")).is_empty());
+
+    let short_diagnostic = (1..=200)
+        .map(|line| format!("error: focused diagnostic {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        predetermined_validation_ranges(&short_diagnostic, Some("cargo check -p focused"))
+            .is_empty()
+    );
+}
+
+#[test]
 fn exec_command_tool_output_preserves_live_process_state_for_large_output() {
     let raw_output = (0..900)
         .map(|index| format!("live-process-output-{index:04}-{}", "x".repeat(72)))

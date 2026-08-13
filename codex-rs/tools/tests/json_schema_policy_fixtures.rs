@@ -140,10 +140,6 @@ fn json_schema_policy_oversized_golden_schema_triggers_compaction() {
     let absent_pointers = [
         ("/description", "drop root description"),
         ("/properties/parent/description", "drop nested descriptions"),
-        (
-            "/$defs",
-            "drop root definitions after stripping descriptions is insufficient",
-        ),
     ];
     for (pointer, message) in absent_pointers {
         assert!(
@@ -155,13 +151,13 @@ fn json_schema_policy_oversized_golden_schema_triggers_compaction() {
     let expected_values = [
         (
             "/properties/parent",
-            json!({}),
-            "rewrite local refs before dropping root definitions",
+            json!({"$ref": "#/$defs/parent"}),
+            "retain local parent validation",
         ),
         (
             "/properties/children/items",
-            json!({}),
-            "rewrite nested local refs before dropping root definitions",
+            json!({"$ref": "#/$defs/block"}),
+            "retain nested block validation",
         ),
         (
             "/properties/markdown/type",
@@ -181,6 +177,10 @@ fn json_schema_policy_oversized_golden_schema_triggers_compaction() {
             "oversized schema should {message}"
         );
     }
+    assert!(
+        parameters.pointer("/$defs").is_some(),
+        "oversized schema should retain reachable definitions"
+    );
 }
 
 fn load_fixture<T: DeserializeOwned>(path: &str) -> T {

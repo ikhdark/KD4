@@ -32,7 +32,11 @@ use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex as StdMutex;
 use toml::Value as TomlValue;
 use tracing::error;
 
@@ -46,6 +50,28 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 const MAX_CONCURRENT_DIRECTORY_SEARCHES: usize = 8;
 const MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES: usize = 3;
+const STABLE_CONTEXT_RENDER_CACHE_CAPACITY: usize = 64;
+
+#[derive(Default)]
+struct StableContextRenderCache {
+    renderings: HashMap<[u8; 32], Arc<str>>,
+    identity_by_structure: HashMap<[u8; 32], [u8; 32]>,
+    identity_by_content: HashMap<[u8; 32], [u8; 32]>,
+}
+
+static STABLE_CONTEXT_RENDER_CACHE: LazyLock<StdMutex<StableContextRenderCache>> =
+    LazyLock::new(|| StdMutex::new(StableContextRenderCache::default()));
+
+fn stable_context_identity_from_structure(
+    structure: [u8; 32],
+    rendered_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex.repository-context-identity.v1");
+    hasher.update(structure);
+    hasher.update(rendered_hash);
+    hasher.finalize().into()
+}
 
 pub(crate) struct ProjectInstructionsLoad {
     pub(crate) loaded: Option<LoadedAgentsMd>,
@@ -687,6 +713,13 @@ pub struct LoadedAgentsMd {
     entries: Vec<InstructionEntry>,
 }
 
+pub(crate) struct RepositoryStableContextBundle {
+    pub(crate) identity: [u8; 32],
+    pub(crate) rendered: Arc<str>,
+    pub(crate) reused: bool,
+    pub(crate) semantic_replacement: bool,
+}
+
 impl LoadedAgentsMd {
     /// Creates loaded instructions containing one user-level AGENTS.md entry.
     pub fn new_user(contents: String, path: AbsolutePathBuf) -> Self {
@@ -748,6 +781,124 @@ impl LoadedAgentsMd {
     /// Stable digest of the exact model-visible instruction text.
     pub(crate) fn semantic_digest(&self) -> [u8; 32] {
         Sha256::digest(self.text().as_bytes()).into()
+    }
+
+    /// Versioned identity for repository instructions used by model-input
+    /// projection. This includes scope and ordered provenance so a move or
+    /// environment change remains semantic even when rendered bytes match.
+    #[cfg(test)]
+    pub(crate) fn stable_context_identity(&self, active_cwd: &PathUri) -> [u8; 32] {
+        let rendered = self.text();
+        self.stable_context_identity_for_rendered(active_cwd, &rendered)
+    }
+
+    pub(crate) fn stable_context_bundle(
+        &self,
+        active_cwd: &PathUri,
+    ) -> RepositoryStableContextBundle {
+        let structure = self.stable_context_structure_key(active_cwd);
+        let mut cache = STABLE_CONTEXT_RENDER_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(identity) = cache.identity_by_structure.get(&structure).copied()
+            && let Some(rendered) = cache.renderings.get(&identity)
+        {
+            return RepositoryStableContextBundle {
+                identity,
+                rendered: Arc::clone(rendered),
+                reused: true,
+                semantic_replacement: false,
+            };
+        }
+
+        let rendered = self.text();
+        let rendered_hash: [u8; 32] = Sha256::digest(rendered.as_bytes()).into();
+        let identity = stable_context_identity_from_structure(structure, rendered_hash);
+        let semantic_replacement = cache
+            .identity_by_content
+            .get(&rendered_hash)
+            .is_some_and(|previous| *previous != identity);
+        cache.identity_by_structure.insert(structure, identity);
+        cache.identity_by_content.insert(rendered_hash, identity);
+        if let Some(cached) = cache.renderings.get(&identity) {
+            return RepositoryStableContextBundle {
+                identity,
+                rendered: Arc::clone(cached),
+                reused: true,
+                semantic_replacement,
+            };
+        }
+        if cache.renderings.len() >= STABLE_CONTEXT_RENDER_CACHE_CAPACITY {
+            cache.renderings.clear();
+            cache.identity_by_structure.clear();
+            cache.identity_by_content.clear();
+            cache.identity_by_structure.insert(structure, identity);
+            cache.identity_by_content.insert(rendered_hash, identity);
+        }
+        let rendered: Arc<str> = rendered.into();
+        cache.renderings.insert(identity, Arc::clone(&rendered));
+        RepositoryStableContextBundle {
+            identity,
+            rendered,
+            reused: false,
+            semantic_replacement,
+        }
+    }
+
+    #[cfg(test)]
+    fn stable_context_identity_for_rendered(
+        &self,
+        active_cwd: &PathUri,
+        rendered: &str,
+    ) -> [u8; 32] {
+        stable_context_identity_from_structure(
+            self.stable_context_structure_key(active_cwd),
+            Sha256::digest(rendered.as_bytes()).into(),
+        )
+    }
+
+    fn stable_context_structure_key(&self, active_cwd: &PathUri) -> [u8; 32] {
+        fn update_part(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex.repository-context-structure.v1");
+        update_part(
+            &mut hasher,
+            active_cwd.inferred_native_path_string().as_bytes(),
+        );
+        if let Some(instructions) = &self.user_instructions {
+            update_part(&mut hasher, b"user");
+            update_part(
+                &mut hasher,
+                PathUri::from_abs_path(&instructions.source)
+                    .inferred_native_path_string()
+                    .as_bytes(),
+            );
+            update_part(&mut hasher, &Sha256::digest(instructions.text.as_bytes()));
+        }
+        for entry in &self.entries {
+            match &entry.provenance {
+                InstructionProvenance::Project {
+                    source_path,
+                    environment_id,
+                    cwd,
+                } => {
+                    update_part(&mut hasher, b"project");
+                    update_part(&mut hasher, environment_id.as_bytes());
+                    update_part(&mut hasher, cwd.inferred_native_path_string().as_bytes());
+                    update_part(
+                        &mut hasher,
+                        source_path.inferred_native_path_string().as_bytes(),
+                    );
+                }
+                InstructionProvenance::Internal => update_part(&mut hasher, b"internal"),
+            }
+            update_part(&mut hasher, &Sha256::digest(entry.contents.as_bytes()));
+        }
+        hasher.finalize().into()
     }
 
     fn legacy_text(&self) -> String {
@@ -848,6 +999,21 @@ impl LoadedAgentsMd {
                     .iter()
                     .filter_map(|entry| entry.provenance.path()),
             )
+    }
+
+    /// Returns the exact project instruction sources and content hashes that
+    /// were validated for this request's model-visible instruction state.
+    pub(crate) fn project_source_hashes(&self) -> Vec<(PathUri, String)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.provenance {
+                InstructionProvenance::Project { source_path, .. } => Some((
+                    source_path.clone(),
+                    format!("{:x}", Sha256::digest(entry.contents.as_bytes())),
+                )),
+                InstructionProvenance::Internal => None,
+            })
+            .collect()
     }
 
     fn has_multiple_project_environments(&self) -> bool {

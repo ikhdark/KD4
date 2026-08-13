@@ -224,7 +224,13 @@ fn parse_tool_input_schema_infers_number_from_numeric_keywords() {
     }))
     .expect("parse schema");
 
-    assert_eq!(schema, JsonSchema::number(/*description*/ None));
+    assert_eq!(
+        schema,
+        JsonSchema {
+            minimum: Some(1.into()),
+            ..JsonSchema::number(/*description*/ None)
+        }
+    );
 }
 
 #[test]
@@ -242,7 +248,38 @@ fn parse_tool_input_schema_infers_number_from_multiple_of() {
     }))
     .expect("parse schema");
 
-    assert_eq!(schema, JsonSchema::number(/*description*/ None));
+    assert_eq!(
+        schema,
+        JsonSchema {
+            multiple_of: Some(5.into()),
+            ..JsonSchema::number(/*description*/ None)
+        }
+    );
+}
+
+#[test]
+fn parse_tool_input_schema_preserves_all_numeric_constraints() {
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "number",
+        "minimum": -2,
+        "maximum": 9.5,
+        "exclusiveMinimum": -3,
+        "exclusiveMaximum": 10,
+        "multipleOf": 0.5
+    }))
+    .expect("parse numeric schema");
+
+    assert_eq!(
+        serde_json::to_value(schema).expect("serialize numeric schema"),
+        serde_json::json!({
+            "type": "number",
+            "minimum": -2,
+            "maximum": 9.5,
+            "exclusiveMinimum": -3,
+            "exclusiveMaximum": 10,
+            "multipleOf": 0.5
+        })
+    );
 }
 
 #[test]
@@ -1018,7 +1055,7 @@ fn parse_large_tool_input_schema_ignores_dropped_metadata_for_budget() {
 }
 
 #[test]
-fn parse_large_tool_input_schema_stops_after_dropping_root_definitions_when_under_budget() {
+fn parse_large_tool_input_schema_preserves_reachable_definitions_over_budget() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "description": "x".repeat(5_500),
@@ -1071,7 +1108,15 @@ fn parse_large_tool_input_schema_stops_after_dropping_root_definitions_when_unde
                         }
                     }
                 },
-                "metadata": {}
+                "metadata": {
+                    "$ref": "#/$defs/metadata"
+                }
+            },
+            "$defs": {
+                "metadata": {
+                    "type": "object",
+                    "properties": many_string_properties(/*count*/ 300)
+                }
             }
         })
     );
@@ -1174,7 +1219,7 @@ fn parse_large_tool_input_schema_strips_descriptions_without_removing_descriptio
 }
 
 #[test]
-fn parse_large_tool_input_schema_prunes_compositions_as_last_resort() {
+fn parse_large_tool_input_schema_preserves_compositions_over_budget() {
     for composition_key in super::COMPOSITION_SCHEMA_KEYS {
         let variants = vec![
             serde_json::json!({
@@ -1199,7 +1244,7 @@ fn parse_large_tool_input_schema_prunes_compositions_as_last_resort() {
         let schema = parse_tool_input_schema(&serde_json::json!({
             "type": "object",
             "properties": {
-                "choice": choice
+                "choice": choice.clone()
             }
         }))
         .expect("parse schema");
@@ -1209,7 +1254,7 @@ fn parse_large_tool_input_schema_prunes_compositions_as_last_resort() {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "choice": {}
+                    "choice": choice
                 }
             })
         );
@@ -1217,7 +1262,7 @@ fn parse_large_tool_input_schema_prunes_compositions_as_last_resort() {
 }
 
 #[test]
-fn parse_large_tool_input_schema_prunes_single_composition_variant_if_still_over_budget() {
+fn parse_large_tool_input_schema_preserves_single_composition_variant_over_budget() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "properties": {
@@ -1238,8 +1283,63 @@ fn parse_large_tool_input_schema_prunes_single_composition_variant_if_still_over
         serde_json::json!({
             "type": "object",
             "properties": {
-                "choice": {}
+                "choice": {
+                    "anyOf": [
+                        {
+                            "type": "string",
+                            "enum": ["x".repeat(5_500)]
+                        }
+                    ]
+                }
             }
+        })
+    );
+}
+
+#[test]
+fn parse_large_tool_input_schema_compaction_preserves_validation_keywords() {
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "object",
+        "description": "x".repeat(5_500),
+        "properties": {
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "exclusiveMinimum": 0,
+                "exclusiveMaximum": 21,
+                "multipleOf": 1
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["fast", "safe"]
+            }
+        },
+        "required": ["count", "mode"],
+        "additionalProperties": false
+    }))
+    .expect("parse schema");
+
+    assert_eq!(
+        serde_json::to_value(schema).expect("serialize schema"),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "exclusiveMinimum": 0,
+                    "exclusiveMaximum": 21,
+                    "multipleOf": 1
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["fast", "safe"]
+                }
+            },
+            "required": ["count", "mode"],
+            "additionalProperties": false
         })
     );
 }
@@ -1282,132 +1382,6 @@ fn parse_large_tool_input_schema_preserves_object_enum_literal_descriptions() {
                             "description": "second literal",
                             "id": 2
                         }
-                    ]
-                }
-            }
-        })
-    );
-}
-
-#[test]
-fn collapse_deep_schema_objects_traverses_schema_children() {
-    let mut schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "object_parent": {
-                "type": "object",
-                "properties": {
-                    "complex": {
-                        "type": "object",
-                        "properties": {
-                            "nested": {
-                                "type": "object",
-                                "properties": {
-                                    "leaf": { "type": "string" }
-                                }
-                            }
-                        }
-                    },
-                    "scalar": {
-                        "type": "string"
-                    }
-                }
-            },
-            "array_parent": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "nested": {
-                            "type": "object",
-                            "properties": {
-                                "leaf": { "type": "string" }
-                            }
-                        }
-                    }
-                }
-            },
-            "map_parent": {
-                "type": "object",
-                "additionalProperties": {
-                    "type": "object",
-                    "properties": {
-                        "nested": {
-                            "type": "object",
-                            "properties": {
-                                "leaf": { "type": "string" }
-                            }
-                        }
-                    }
-                }
-            },
-            "union_parent": {
-                "anyOf": [
-                    {
-                        "type": "object",
-                        "properties": {
-                            "nested": {
-                                "type": "object",
-                                "properties": {
-                                    "leaf": { "type": "string" }
-                                }
-                            }
-                        }
-                    },
-                    { "type": "string" }
-                ]
-            }
-        }
-    });
-
-    super::collapse_deep_schema_objects(&mut schema, /*depth*/ 0);
-
-    assert_eq!(
-        schema,
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "object_parent": {
-                    "type": "object",
-                    "properties": {
-                        "complex": {
-                            "type": "object",
-                            "properties": {
-                                "nested": {}
-                            }
-                        },
-                        "scalar": {
-                            "type": "string"
-                        }
-                    }
-                },
-                "array_parent": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "nested": {}
-                        }
-                    }
-                },
-                "map_parent": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "object",
-                        "properties": {
-                            "nested": {}
-                        }
-                    }
-                },
-                "union_parent": {
-                    "anyOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "nested": {}
-                            }
-                        },
-                        { "type": "string" }
                     ]
                 }
             }

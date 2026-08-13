@@ -99,6 +99,10 @@ impl CodeModeService {
         self.session().await?.wait(request).await
     }
 
+    pub(crate) fn has_waitable_cells(&self) -> bool {
+        self.dispatch_broker.has_waitable_cells()
+    }
+
     pub(crate) async fn terminate(
         &self,
         cell_id: CellId,

@@ -729,6 +729,24 @@ pub(crate) async fn record_additional_contexts(
     turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
 ) {
+    let checkpoint_generation = sess.current_window_id().await;
+    let additional_contexts = additional_contexts
+        .into_iter()
+        .filter_map(|context| {
+            match crate::continuity::normalize_hook_context(context, &checkpoint_generation) {
+                crate::continuity::ContinuityContextNormalization::Unrelated(context)
+                | crate::continuity::ContinuityContextNormalization::Valid(context) => {
+                    Some(context)
+                }
+                crate::continuity::ContinuityContextNormalization::Invalid => {
+                    tracing::warn!(
+                        "invalid KD4 continuity capsule ignored; retaining prior valid state"
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
     let developer_messages = additional_context_messages(additional_contexts);
     if developer_messages.is_empty() {
         return;

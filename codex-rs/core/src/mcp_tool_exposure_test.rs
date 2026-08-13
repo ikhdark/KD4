@@ -1,9 +1,23 @@
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_analytics::InvocationType;
+use codex_analytics::SkillInvocation;
+use codex_config::types::McpServerConfig;
+use codex_config::types::McpServerTransportConfig;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ToolInfo;
+use codex_plugin::LoadedPlugin;
+use codex_plugin::PluginLoadOutcome;
+use codex_plugin::manifest::PluginSkillToolExposure;
+use codex_plugin::manifest::PluginToolExposure;
+use codex_plugin::manifest::PluginToolExposureConfig;
+use codex_protocol::protocol::SkillScope;
 use codex_tools::ToolName;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
 use rmcp::model::Meta;
@@ -95,6 +109,171 @@ fn with_visibility(mut tool: ToolInfo, visibility: &[&str]) -> ToolInfo {
     tool
 }
 
+fn selected_plugin_skill(plugin_id: &str, skill_name: &str) -> SkillInvocation {
+    SkillInvocation {
+        skill_name: skill_name.to_string(),
+        skill_scope: SkillScope::User,
+        skill_path: PathBuf::from("SKILL.md"),
+        plugin_id: Some(plugin_id.to_string()),
+        invocation_type: InvocationType::Explicit,
+    }
+}
+
+fn test_mcp_server() -> McpServerConfig {
+    McpServerConfig {
+        auth: Default::default(),
+        transport: McpServerTransportConfig::StreamableHttp {
+            url: "https://example.invalid/mcp".to_string(),
+            bearer_token_env_var: None,
+            http_headers: None,
+            env_http_headers: None,
+        },
+        environment_id: "local".to_string(),
+        enabled: true,
+        required: false,
+        supports_parallel_tool_calls: false,
+        disabled_reason: None,
+        startup_timeout_sec: None,
+        tool_timeout_sec: None,
+        default_tools_approval_mode: None,
+        enabled_tools: None,
+        disabled_tools: None,
+        scopes: None,
+        oauth: None,
+        oauth_resource: None,
+        tools: HashMap::new(),
+    }
+}
+
+fn plugin_outcome(tool_exposure: Option<PluginToolExposure>) -> PluginLoadOutcome<McpServerConfig> {
+    PluginLoadOutcome::from_plugins(vec![LoadedPlugin {
+        config_name: "repo-atlas".to_string(),
+        manifest_name: Some("repo-atlas".to_string()),
+        plugin_namespace: Some("repo-atlas".to_string()),
+        manifest_description: None,
+        tool_exposure,
+        root: AbsolutePathBuf::from_absolute_path_checked(std::env::temp_dir().join("repo-atlas"))
+            .expect("temporary path should be absolute"),
+        enabled: true,
+        skill_roots: Vec::new(),
+        disabled_skill_paths: HashSet::new(),
+        has_enabled_skills: true,
+        mcp_servers: HashMap::from([("repo-atlas".to_string(), test_mcp_server())]),
+        apps: Vec::new(),
+        hook_sources: Vec::new(),
+        hook_load_warnings: Vec::new(),
+        error: None,
+    }])
+}
+
+fn repo_atlas_tool_exposure(tool_names: &[&str]) -> PluginToolExposure {
+    PluginToolExposure::Valid(PluginToolExposureConfig {
+        skills: BTreeMap::from([(
+            "repo-atlas".to_string(),
+            PluginSkillToolExposure {
+                mcp_tools: BTreeMap::from([(
+                    "repo-atlas".to_string(),
+                    tool_names.iter().map(ToString::to_string).collect(),
+                )]),
+            },
+        )]),
+    })
+}
+
+fn repo_atlas_tools() -> Vec<ToolInfo> {
+    ["task", "trace"]
+        .into_iter()
+        .map(|tool_name| {
+            make_mcp_tool(
+                "repo-atlas",
+                tool_name,
+                "mcp__repo_atlas",
+                tool_name,
+                None,
+                None,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn selected_skill_promotes_only_declared_mcp_entrypoints() {
+    let tools = repo_atlas_tools();
+    let exposure = resolve_selected_skill_mcp_exposure(
+        &[selected_plugin_skill("repo-atlas", "repo-atlas")],
+        &plugin_outcome(Some(repo_atlas_tool_exposure(&["task"]))),
+        &tools,
+    );
+
+    assert_eq!(
+        exposure.direct_entrypoints,
+        vec![DirectMcpToolEntrypoint {
+            server_name: "repo-atlas".to_string(),
+            tool_name: "task".to_string(),
+        }]
+    );
+    assert!(exposure.selection.includes(&tools[0]));
+    assert!(!exposure.selection.includes(&tools[1]));
+    assert!(exposure.diagnostics.is_empty());
+}
+
+#[test]
+fn selected_skill_without_declaration_preserves_whole_server_promotion() {
+    let tools = repo_atlas_tools();
+    let exposure = resolve_selected_skill_mcp_exposure(
+        &[selected_plugin_skill("repo-atlas", "repo-atlas")],
+        &plugin_outcome(None),
+        &tools,
+    );
+
+    assert_eq!(
+        exposure.direct_entrypoints,
+        vec![
+            DirectMcpToolEntrypoint {
+                server_name: "repo-atlas".to_string(),
+                tool_name: "task".to_string(),
+            },
+            DirectMcpToolEntrypoint {
+                server_name: "repo-atlas".to_string(),
+                tool_name: "trace".to_string(),
+            },
+        ]
+    );
+    assert!(exposure.diagnostics.is_empty());
+}
+
+#[test]
+fn invalid_explicit_declaration_does_not_broaden_exposure() {
+    let tools = repo_atlas_tools();
+    let exposure = resolve_selected_skill_mcp_exposure(
+        &[selected_plugin_skill("repo-atlas", "repo-atlas")],
+        &plugin_outcome(Some(PluginToolExposure::Invalid(
+            "invalid fixture".to_string(),
+        ))),
+        &tools,
+    );
+
+    assert!(exposure.direct_entrypoints.is_empty());
+    assert!(!exposure.selection.includes(&tools[0]));
+    assert!(!exposure.selection.includes(&tools[1]));
+    assert_eq!(exposure.diagnostics.len(), 1);
+    assert!(exposure.diagnostics[0].contains("promoting nothing"));
+}
+
+#[test]
+fn unselected_skills_promote_nothing() {
+    let tools = repo_atlas_tools();
+    let exposure = resolve_selected_skill_mcp_exposure(
+        &[],
+        &plugin_outcome(Some(repo_atlas_tool_exposure(&["task"]))),
+        &tools,
+    );
+
+    assert!(exposure.direct_entrypoints.is_empty());
+    assert!(!exposure.selection.includes(&tools[0]));
+    assert!(!exposure.selection.includes(&tools[1]));
+}
+
 #[tokio::test]
 async fn directly_exposes_effective_tool_sets_when_search_is_unavailable() {
     let config = test_config().await;
@@ -105,7 +284,7 @@ async fn directly_exposes_effective_tool_sets_when_search_is_unavailable() {
         /*connectors*/ None,
         &config,
         /*search_tool_enabled*/ false,
-        &HashSet::new(),
+        &DirectMcpToolSelection::default(),
     );
 
     assert_eq!(tool_names(&exposure.direct_tools), tool_names(&mcp_tools));
@@ -181,7 +360,7 @@ async fn excludes_tools_hidden_from_model_exposure() {
         Some(connectors.as_slice()),
         &config,
         /*search_tool_enabled*/ false,
-        &HashSet::new(),
+        &DirectMcpToolSelection::default(),
     );
 
     assert_eq!(
@@ -233,7 +412,7 @@ enabled = true
         Some(connectors.as_slice()),
         &config,
         /*search_tool_enabled*/ false,
-        &HashSet::new(),
+        &DirectMcpToolSelection::default(),
     );
 
     assert_eq!(
@@ -253,7 +432,7 @@ async fn defers_effective_tool_sets_when_search_is_available() {
         /*connectors*/ None,
         &config,
         /*search_tool_enabled*/ true,
-        &HashSet::new(),
+        &DirectMcpToolSelection::default(),
     );
 
     assert!(exposure.direct_tools.is_empty());
@@ -290,7 +469,10 @@ async fn directly_exposes_tools_required_by_enabled_plugin_skills() {
         /*connectors*/ None,
         &config,
         /*search_tool_enabled*/ true,
-        &HashSet::from(["skill-plugin"]),
+        &DirectMcpToolSelection {
+            legacy_server_names: HashSet::from(["skill-plugin".to_string()]),
+            ..Default::default()
+        },
     );
 
     assert_eq!(
@@ -336,7 +518,7 @@ async fn defers_apps_and_non_app_mcp_tools() {
         Some(connectors.as_slice()),
         &config,
         /*search_tool_enabled*/ true,
-        &HashSet::new(),
+        &DirectMcpToolSelection::default(),
     );
 
     assert!(exposure.direct_tools.is_empty());

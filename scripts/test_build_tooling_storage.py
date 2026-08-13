@@ -77,7 +77,7 @@ def load_toml(path: Path):
 
 
 class BuildToolingStorageTest(unittest.TestCase):
-    def test_run_lane_holds_reservation_and_passes_target_without_cargo_env(
+    def test_run_lane_holds_reservation_and_passes_target_with_cargo_env(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -101,7 +101,7 @@ class BuildToolingStorageTest(unittest.TestCase):
             lines = output.read_text(encoding="utf-8").splitlines()
             self.assertEqual(result, 0)
             self.assertEqual(Path(lines[0]), (lanes_root / "unit").resolve())
-            self.assertEqual(lines[1], "False")
+            self.assertEqual(lines[1], "True")
             self.assertFalse(
                 rust_build_status.lane_active_lock_is_held(lanes_root / "unit")
             )
@@ -140,7 +140,7 @@ class BuildToolingStorageTest(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 1.0)
 
     def test_cargo_command_target_dir_is_injected_once(self) -> None:
-        target = Path("lane-target")
+        target = Path("lane-target").resolve()
         self.assertEqual(
             rust_build_status._cargo_command_with_target_dir(
                 ["cargo", "nextest", "run", "-p", "codex-core"],
@@ -156,11 +156,73 @@ class BuildToolingStorageTest(unittest.TestCase):
                 "codex-core",
             ],
         )
-        explicit = ["cargo", "check", "--target-dir", "custom"]
+        explicit = ["cargo", "check", "--target-dir", str(target)]
         self.assertEqual(
             rust_build_status._cargo_command_with_target_dir(explicit, target),
             explicit,
         )
+
+    def test_cargo_command_parses_toolchain_and_value_taking_global_options(
+        self,
+    ) -> None:
+        target = Path("lane-target").resolve()
+
+        self.assertEqual(
+            rust_build_status._cargo_command_with_target_dir(
+                [
+                    "cargo",
+                    "+nightly",
+                    "--config",
+                    "profile.dev.debug=0",
+                    "-C",
+                    "codex-rs",
+                    "-Zunstable-options",
+                    "check",
+                    "-p",
+                    "codex-core",
+                ],
+                target,
+            ),
+            [
+                "cargo",
+                "+nightly",
+                "--config",
+                "profile.dev.debug=0",
+                "-C",
+                "codex-rs",
+                "-Zunstable-options",
+                "check",
+                "--target-dir",
+                str(target),
+                "-p",
+                "codex-core",
+            ],
+        )
+
+    def test_cargo_command_rejects_target_dir_outside_reserved_lane(self) -> None:
+        target = Path("lane-target").resolve()
+
+        with self.assertRaisesRegex(ValueError, "does not match reserved lane"):
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "check", "--target-dir=custom"],
+                target,
+            )
+
+    def test_cargo_watch_rejects_shell_and_mismatched_exec_target(self) -> None:
+        target = Path("lane-target").resolve()
+
+        for shell_option in ("-s", "--shell", "--shell=powershell"):
+            with self.subTest(shell_option=shell_option):
+                with self.assertRaisesRegex(ValueError, "is not allowed"):
+                    rust_build_status._cargo_command_with_target_dir(
+                        ["cargo", "watch", shell_option, "cargo check"],
+                        target,
+                    )
+        with self.assertRaisesRegex(ValueError, "does not match reserved lane"):
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "watch", "-x", "check --target-dir custom"],
+                target,
+            )
 
     def test_cargo_config_disables_duplicate_incremental_cache_by_default(self) -> None:
         config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")

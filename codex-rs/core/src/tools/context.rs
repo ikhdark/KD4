@@ -18,11 +18,16 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
+use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
+use codex_tools::CanonicalToolResult;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputProjectionFragment;
+use codex_tools::ToolOutputProjectionFragmentKind;
 use codex_tools::ToolOutputProjectionMetadata;
+use codex_tools::ToolOutputProjectionRange;
 use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -105,6 +110,12 @@ impl ToolOutput for McpToolOutput {
         serde_json::to_value(&self.result).ok().map(|value| {
             ToolOutputProjectionMetadata::from_json(&value, self.result.success(), None)
         })
+    }
+
+    fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        serde_json::to_value(&self.result)
+            .ok()
+            .map(CanonicalToolResult::json)
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
@@ -212,6 +223,10 @@ pub struct FunctionToolOutput {
     pub body: Vec<FunctionCallOutputContentItem>,
     pub success: Option<bool>,
     pub post_tool_use_response: Option<JsonValue>,
+    /// Private signal consumed by the request-local reasoning governor. This is
+    /// never included in the model-facing tool result or public protocol.
+    pub sampling_request_signal: Option<JsonValue>,
+    pub deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
 }
 
 impl FunctionToolOutput {
@@ -220,6 +235,8 @@ impl FunctionToolOutput {
             body: vec![FunctionCallOutputContentItem::InputText { text }],
             success,
             post_tool_use_response: None,
+            sampling_request_signal: None,
+            deterministic_continuation_receipts: Vec::new(),
         }
     }
 
@@ -231,7 +248,22 @@ impl FunctionToolOutput {
             body: content,
             success,
             post_tool_use_response: None,
+            sampling_request_signal: None,
+            deterministic_continuation_receipts: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_sampling_request_signal(mut self, signal: JsonValue) -> Self {
+        self.sampling_request_signal = Some(signal);
+        self
+    }
+
+    pub(crate) fn with_deterministic_continuation_receipt(
+        mut self,
+        receipt: TurnTimingDeterministicContinuationReceipt,
+    ) -> Self {
+        self.deterministic_continuation_receipts.push(receipt);
+        self
     }
 
     pub fn into_text(self) -> String {
@@ -266,10 +298,21 @@ impl ToolOutput for FunctionToolOutput {
         }
     }
 
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        self.sampling_request_signal.clone()
+    }
+
+    fn deterministic_continuation_receipts(
+        &self,
+    ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
+        self.deterministic_continuation_receipts.clone()
+    }
+
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         Some(ToolOutputProjectionMetadata {
             outcome: self.outcome_for_logging(),
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
+            fragments: Vec::new(),
             spillable_text: self
                 .body
                 .iter()
@@ -281,6 +324,7 @@ impl ToolOutput for FunctionToolOutput {
                 .collect(),
             essential_inline: serde_json::json!({ "success": self.success }),
             requested_limit: None,
+            predetermined_ranges: Vec::new(),
         })
     }
 
@@ -316,9 +360,11 @@ impl ToolOutput for ApplyPatchToolOutput {
         Some(ToolOutputProjectionMetadata {
             outcome: ToolOutputOutcome::Success,
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
+            fragments: Vec::new(),
             spillable_text: vec![self.text.clone()],
             essential_inline: JsonValue::Object(serde_json::Map::new()),
             requested_limit: None,
+            predetermined_ranges: Vec::new(),
         })
     }
 
@@ -359,9 +405,14 @@ impl ToolOutput for AbortedToolOutput {
         Some(ToolOutputProjectionMetadata {
             outcome: ToolOutputOutcome::Failure,
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
+            fragments: vec![ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+                self.message.clone(),
+            )],
             spillable_text: vec![self.message.clone()],
             essential_inline: serde_json::json!({ "state": "aborted" }),
             requested_limit: None,
+            predetermined_ranges: Vec::new(),
         })
     }
 
@@ -415,6 +466,10 @@ impl ToolOutput for ExecCommandToolOutput {
         true
     }
 
+    fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        Some(CanonicalToolResult::bytes(self.raw_output.clone()))
+    }
+
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         let raw_output = String::from_utf8_lossy(&self.raw_output).to_string();
         let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) = self
@@ -435,6 +490,7 @@ impl ToolOutput for ExecCommandToolOutput {
         } else {
             ToolOutputOutcome::Success
         };
+        let response_text = self.response_text();
         Some(ToolOutputProjectionMetadata {
             outcome,
             diagnostic_class: match classify_diagnostic(self.hook_command.as_deref(), &raw_output) {
@@ -445,10 +501,23 @@ impl ToolOutput for ExecCommandToolOutput {
                     ToolOutputDiagnosticClass::HighSignal
                 }
             },
+            fragments: vec![
+                ToolOutputProjectionFragment::new(
+                    ToolOutputProjectionFragmentKind::ProcessFinalStatus,
+                    format!(
+                        "process final status: exit_code={:?}, session_id={:?}",
+                        self.exit_code, self.process_id
+                    ),
+                ),
+                ToolOutputProjectionFragment::new(
+                    ToolOutputProjectionFragmentKind::ContextualSpillableText,
+                    response_text.clone(),
+                ),
+            ],
             // Unified exec has already sent the exact raw bytes through the
             // existing artifact path. Project its current model text here so
             // the common boundary does not create a duplicate raw artifact.
-            spillable_text: vec![self.response_text()],
+            spillable_text: vec![response_text],
             essential_inline: serde_json::json!({
                 "chunk_id": &self.chunk_id,
                 "exit_code": self.exit_code,
@@ -460,6 +529,10 @@ impl ToolOutput for ExecCommandToolOutput {
                 "raw_output_artifact_retention_limit_hit": raw_output_artifact_retention_limit_hit,
             }),
             requested_limit: self.max_output_tokens,
+            predetermined_ranges: predetermined_validation_ranges(
+                &raw_output,
+                self.hook_command.as_deref(),
+            ),
         })
     }
 
@@ -590,14 +663,31 @@ impl ExecCommandToolOutput {
             content,
             self.model_output_limits(raw.as_ref()),
         );
+        let was_truncated = truncated.was_truncated;
+        let mut projected_text = truncated.text;
+        if (summarized.is_some() || was_truncated)
+            && let Some(original_tokens) = self.original_token_count
+        {
+            let omitted_tokens =
+                original_tokens.saturating_sub(self.truncation_policy.token_budget());
+            let marker = format!("Warning: truncated output\n{omitted_tokens} tokens truncated");
+            let limit = self.model_output_limits(raw.as_ref()).applied_limit;
+            let notice_limit = self.max_output_tokens.unwrap_or(limit).max(limit);
+            let candidate = format!("{marker}\n{projected_text}");
+            projected_text = if codex_utils_string::approx_token_count(&candidate) <= notice_limit {
+                candidate
+            } else {
+                truncate_text_to_token_ceiling(&marker, notice_limit)
+            };
+        }
         let artifact_has_more_bytes = self
             .raw_output_artifact
             .as_ref()
             .and_then(RawOutputArtifact::retained_bytes)
             .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
         ProjectedModelOutput {
-            reduced: summarized.is_some() || truncated.was_truncated || artifact_has_more_bytes,
-            text: truncated.text,
+            reduced: summarized.is_some() || was_truncated || artifact_has_more_bytes,
+            text: projected_text,
         }
     }
 
@@ -654,6 +744,41 @@ impl ExecCommandToolOutput {
 
         truncate_text_to_token_ceiling(&sections.join("\n"), max_tokens)
     }
+}
+
+fn predetermined_validation_ranges(
+    raw_output: &str,
+    command_text: Option<&str>,
+) -> Vec<ToolOutputProjectionRange> {
+    if classify_diagnostic(command_text, raw_output)
+        != codex_utils_output_truncation::OutputDiagnosticClass::HighSignal
+    {
+        return Vec::new();
+    }
+    let total_lines = raw_output.lines().count();
+    if total_lines <= 200 {
+        return Vec::new();
+    }
+    let tail_start = total_lines - 71;
+    let middle_start =
+        (total_lines.saturating_sub(64) / 2 + 1).clamp(65, tail_start.saturating_sub(64));
+    vec![
+        ToolOutputProjectionRange {
+            id: "validation-head".to_string(),
+            start_line: 1,
+            end_line: 64,
+        },
+        ToolOutputProjectionRange {
+            id: "validation-middle".to_string(),
+            start_line: middle_start,
+            end_line: middle_start + 63,
+        },
+        ToolOutputProjectionRange {
+            id: "validation-tail".to_string(),
+            start_line: tail_start,
+            end_line: total_lines,
+        },
+    ]
 }
 
 struct ProjectedModelOutput {

@@ -38,7 +38,7 @@ TOOL_RUN_TIMEOUT_SECONDS = 2.0
 SCCACHE_PROBE_TIMEOUT_SECONDS = 15.0
 CARGO_GIT_CLI_ENV_VAR = "CARGO_NET_GIT_FETCH_WITH_CLI"
 PYTHON_CPU_COUNT_ENV_VAR = "PYTHON_CPU_COUNT"
-DEFAULT_PYTHON_CPU_COUNT = "30"
+MAX_DEFAULT_PYTHON_CPU_COUNT = 30
 # One shared local default with codex_package/cargo.py and common-rust-env.ps1;
 # override everywhere with CODEX_SCCACHE_CACHE_SIZE.
 SCCACHE_CACHE_SIZE_ENV_VAR = "CODEX_SCCACHE_CACHE_SIZE"
@@ -439,7 +439,10 @@ def python_tool_env(
 def python_cpu_env(env: Mapping[str, str]) -> dict[str, str]:
     if is_ci(env) or env.get(PYTHON_CPU_COUNT_ENV_VAR):
         return {}
-    return {PYTHON_CPU_COUNT_ENV_VAR: DEFAULT_PYTHON_CPU_COUNT}
+    logical_cpus = os.cpu_count() or 1
+    return {
+        PYTHON_CPU_COUNT_ENV_VAR: str(min(MAX_DEFAULT_PYTHON_CPU_COUNT, logical_cpus))
+    }
 
 
 def prepend_path(path: str, entry: str) -> str:

@@ -2738,6 +2738,14 @@
       "additionalProperties": false,
       "description": "Per-logical-request reasoning effort overrides. Presence of this table enables deterministic phase tracking; omitted fields inherit the resolved turn effort.",
       "properties": {
+        "deterministic_continuation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Lowest-effort override for an unavoidable model request whose continuation has already been proven deterministic by its owner."
+        },
         "diagnose": {
           "$ref": "#/definitions/ReasoningEffort"
         },
@@ -4810,6 +4818,10 @@
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",
       "type": "string"
+    },
+    "completed_tool_history_projection": {
+      "description": "Whether completed textual tool outputs may be represented by bounded, exactly retrievable receipts in manually managed prompt history.",
+      "type": "boolean"
     },
     "debug": {
       "allOf": [

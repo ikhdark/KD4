@@ -1289,6 +1289,7 @@ fn plan_item(id: &str, status: StepStatus) -> PlanItemArg {
         generated_artifacts: Vec::new(),
         risks: Vec::new(),
         requires_desktop_activation: false,
+        validation_route: None,
     }
 }
 
@@ -1299,12 +1300,382 @@ fn plan_with(items: Vec<PlanItemArg>) -> UpdatePlanArgs {
     }
 }
 
+fn focused_validation_route(covered_paths: Vec<String>) -> ValidationRoute {
+    ValidationRoute {
+        leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
+            argv: vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "codex-core".to_string(),
+                "focused_validation_case".to_string(),
+            ],
+            covered_paths,
+            covered_contracts: vec!["focused-validation-v1".to_string()],
+            timeout_ms: 30_000,
+            semantic_timeout: false,
+        }],
+        ordering: ValidationRouteOrdering::StopOnFailure,
+    }
+}
+
+#[tokio::test]
+async fn focused_planning_uses_stable_work_unit_without_plan_dependencies() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("src"))
+        .await
+        .expect("source directory");
+    tokio::fs::write(repo.join("src/focused.rs"), "one")
+        .await
+        .expect("focused source");
+    let update = PlanningUpdateInput {
+        tier: Some(PlanningTier::Focused),
+        source_owner: Some("core".to_string()),
+        implementation_surfaces: vec!["src/focused.rs".to_string()],
+        acceptance_criteria: vec!["focused edit is present".to_string()],
+        mutation_obligations: vec![MutationObligationInput {
+            id: "mutation".to_string(),
+            description: "edit the focused owner".to_string(),
+            paths: vec!["src/focused.rs".to_string()],
+        }],
+        validation_disposition: Some(ValidationDisposition::NotRequired),
+        ..PlanningUpdateInput::default()
+    };
+
+    let first = ledger.record_planning_update(update.clone()).await;
+    assert_eq!(first.effect, PlanUpdateEffect::Initial);
+    assert!(first.public_update.plan.is_empty());
+    let work_unit_id = {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert!(document.plan.is_empty());
+        document
+            .planning
+            .work_unit
+            .as_ref()
+            .expect("focused work unit")
+            .id
+            .clone()
+    };
+
+    assert_eq!(
+        ledger.record_planning_update(update).await.effect,
+        PlanUpdateEffect::NoOp
+    );
+    ledger
+        .record_edit_intent("focused-edit", &repo, &[PathBuf::from("src/focused.rs")])
+        .await;
+    tokio::fs::write(repo.join("src/focused.rs"), "two")
+        .await
+        .expect("focused edit");
+    ledger.record_edit_result("focused-edit", "completed").await;
+
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert!(document.plan.is_empty());
+    let work_unit = document
+        .planning
+        .work_unit
+        .as_ref()
+        .expect("focused work unit remains");
+    assert_eq!(work_unit.id, work_unit_id);
+    assert!(work_unit.mutation_obligations[0].satisfied);
+    assert_eq!(
+        document.edit_receipts[0].work_unit_id.as_deref(),
+        Some(work_unit_id.as_str())
+    );
+    assert!(document.edit_receipts[0].step_id.is_none());
+}
+
+#[tokio::test]
+async fn structured_plan_actions_without_an_active_step_are_outside_plan() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_planning_update(PlanningUpdateInput {
+            tier: Some(PlanningTier::Medium),
+            plan: vec![plan_item("implement", StepStatus::Pending)],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
+    ledger
+        .record_command(
+            &["rg".to_string(), "owner".to_string()],
+            &PathUri::from_abs_path(&cwd),
+            0,
+            false,
+            1,
+            false,
+        )
+        .await;
+
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.planning.outside_plan_actions.len(), 1);
+    assert_eq!(document.planning.counters.outside_plan_actions, 1);
+    assert!(document.command_receipts[0].step_id.is_none());
+    assert!(document.command_receipts[0].step_revision.is_none());
+    assert!(document.command_receipts[0].work_unit_id.is_none());
+    assert_eq!(
+        document.command_receipts[0].attribution,
+        Some(ActionAttributionKind::OutsidePlan)
+    );
+}
+
+#[tokio::test]
+async fn stable_planning_patches_preserve_omissions_and_audit_reasoned_removals() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let initial = PlanningUpdateInput {
+        tier: Some(PlanningTier::Medium),
+        facts: vec![PlanningFactInput {
+            id: "owner".to_string(),
+            value: "codex-core".to_string(),
+            source: Some("SOURCEMAP.md".to_string()),
+        }],
+        plan: vec![plan_item("implement", StepStatus::InProgress)],
+        ..PlanningUpdateInput::default()
+    };
+    assert_eq!(
+        ledger.record_planning_update(initial).await.effect,
+        PlanUpdateEffect::Initial
+    );
+
+    let status_only = PlanningUpdateInput {
+        plan: vec![plan_item("implement", StepStatus::Pending)],
+        ..PlanningUpdateInput::default()
+    };
+    assert_eq!(
+        ledger
+            .record_planning_update(status_only.clone())
+            .await
+            .effect,
+        PlanUpdateEffect::StatusOnly
+    );
+    assert_eq!(
+        ledger.record_planning_update(status_only).await.effect,
+        PlanUpdateEffect::NoOp
+    );
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert_eq!(document.planning.facts["owner"].value, "codex-core");
+        assert_eq!(document.plan.len(), 1);
+        assert_eq!(document.plan[0].revision, 1);
+    }
+
+    let removal = PlanningUpdateInput {
+        removed_facts: vec![ReasonedPlanningRemoval {
+            id: "owner".to_string(),
+            reason: "owner was superseded by generated evidence".to_string(),
+        }],
+        removed_steps: vec![ReasonedPlanningRemoval {
+            id: "implement".to_string(),
+            reason: "work is no longer required".to_string(),
+        }],
+        ..PlanningUpdateInput::default()
+    };
+    assert_eq!(
+        ledger.record_planning_update(removal).await.effect,
+        PlanUpdateEffect::StructuralRevision
+    );
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert!(document.planning.facts.is_empty());
+    assert!(document.plan.is_empty());
+    assert_eq!(document.planning.audit_history.len(), 2);
+    assert_eq!(document.planning.counters.fact_removals, 1);
+    assert_eq!(document.planning.counters.step_removals, 1);
+}
+
+#[tokio::test]
+async fn multi_obligation_step_requires_all_matching_edits() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("src"))
+        .await
+        .expect("source directory");
+    for path in ["src/one.rs", "src/two.rs"] {
+        tokio::fs::write(repo.join(path), "one")
+            .await
+            .expect("source fixture");
+    }
+    ledger
+        .record_planning_update(PlanningUpdateInput {
+            tier: Some(PlanningTier::Medium),
+            step_evidence: vec![PlanStepEvidenceInput {
+                step_id: "implement".to_string(),
+                source_owner: Some("core".to_string()),
+                implementation_surfaces: vec!["src".to_string()],
+                mutation_obligations: vec![
+                    MutationObligationInput {
+                        id: "one".to_string(),
+                        description: "edit one".to_string(),
+                        paths: vec!["src/one.rs".to_string()],
+                    },
+                    MutationObligationInput {
+                        id: "two".to_string(),
+                        description: "edit two".to_string(),
+                        paths: vec!["src/two.rs".to_string()],
+                    },
+                ],
+                validation_disposition: Some(ValidationDisposition::NotRequired),
+                external_validation_route: None,
+            }],
+            plan: vec![plan_item("implement", StepStatus::InProgress)],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+
+    for (call_id, path) in [("edit-one", "src/one.rs"), ("edit-two", "src/two.rs")] {
+        ledger
+            .record_edit_intent(call_id, &repo, &[PathBuf::from(path)])
+            .await;
+        tokio::fs::write(repo.join(path), "two")
+            .await
+            .expect("source edit");
+        ledger.record_edit_result(call_id, "completed").await;
+        let status = ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .plan[0]
+            .status
+            .clone();
+        if call_id == "edit-one" {
+            assert_eq!(status, StepStatus::InProgress);
+        } else {
+            assert_eq!(status, StepStatus::Implemented);
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_batch_ack_reuses_bound_route_and_survives_only_disjoint_edits() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("src"))
+        .await
+        .expect("source directory");
+    tokio::fs::create_dir_all(repo.join("docs"))
+        .await
+        .expect("docs directory");
+    tokio::fs::write(repo.join("src/step.rs"), "one")
+        .await
+        .expect("source fixture");
+    tokio::fs::write(repo.join("docs/note.md"), "one")
+        .await
+        .expect("docs fixture");
+
+    let route = focused_validation_route(vec!["src/step.rs".to_string()]);
+    let mut initial = plan_item("step", StepStatus::InProgress);
+    initial.validation_route = Some(route.clone());
+    ledger.record_plan_update(&plan_with(vec![initial])).await;
+
+    ledger
+        .record_edit_intent(
+            "implementation-edit",
+            &repo,
+            &[PathBuf::from("src/step.rs")],
+        )
+        .await;
+    tokio::fs::write(repo.join("src/step.rs"), "two")
+        .await
+        .expect("implementation edit");
+    ledger
+        .record_edit_result("implementation-edit", "completed")
+        .await;
+    assert!(
+        ledger.auto_validation_candidate().await.is_none(),
+        "automatic edit promotion must not acknowledge the batch"
+    );
+
+    // The explicit status transition may omit a previously admitted route.
+    // The host retains and rechecks that exact route instead of requiring the
+    // model to redundantly resend it.
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
+        .await;
+    let acknowledged = ledger
+        .auto_validation_candidate()
+        .await
+        .expect("explicit acknowledgement should expose the bound route");
+    assert_eq!(acknowledged.route, route);
+
+    ledger
+        .record_edit_intent("docs-edit", &repo, &[PathBuf::from("docs/note.md")])
+        .await;
+    tokio::fs::write(repo.join("docs/note.md"), "two")
+        .await
+        .expect("disjoint edit");
+    ledger.record_edit_result("docs-edit", "completed").await;
+    let after_disjoint = ledger
+        .auto_validation_candidate()
+        .await
+        .expect("disjoint edit should preserve acknowledgement");
+    assert_eq!(
+        after_disjoint.implementation_identity,
+        acknowledged.implementation_identity
+    );
+    assert!(
+        after_disjoint.implementation_revision > acknowledged.implementation_revision,
+        "orchestration revision should still advance"
+    );
+
+    ledger
+        .record_edit_intent("relevant-edit", &repo, &[PathBuf::from("src/step.rs")])
+        .await;
+    tokio::fs::write(repo.join("src/step.rs"), "three")
+        .await
+        .expect("relevant edit");
+    ledger
+        .record_edit_result("relevant-edit", "completed")
+        .await;
+    assert!(
+        ledger.auto_validation_candidate().await.is_none(),
+        "covered mutation must invalidate the acknowledgement"
+    );
+}
+
+#[tokio::test]
+async fn unknown_coverage_acknowledgement_requires_repository_wide_quiescence() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::write(repo.join("unrelated.txt"), "one")
+        .await
+        .expect("repository fixture");
+    let mut initial = plan_item("step", StepStatus::InProgress);
+    initial.validation_route = Some(focused_validation_route(Vec::new()));
+    ledger.record_plan_update(&plan_with(vec![initial])).await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
+        .await;
+    assert!(
+        ledger
+            .auto_validation_candidate()
+            .await
+            .is_some_and(|candidate| candidate.repository_wide)
+    );
+
+    ledger
+        .record_edit_intent("repository-edit", &repo, &[PathBuf::from("unrelated.txt")])
+        .await;
+    tokio::fs::write(repo.join("unrelated.txt"), "two")
+        .await
+        .expect("repository edit");
+    ledger
+        .record_edit_result("repository-edit", "completed")
+        .await;
+    assert!(ledger.auto_validation_candidate().await.is_none());
+}
+
 fn command_receipt(id: &str) -> CommandReceipt {
     CommandReceipt {
         id: id.to_string(),
         recorded_at: timestamp(),
         epoch: 0,
         step_id: None,
+        step_revision: None,
+        work_unit_id: None,
+        attribution: None,
         command: vec!["true".to_string()],
         cwd: ".".to_string(),
         exit_code: 0,
@@ -1316,6 +1687,7 @@ fn command_receipt(id: &str) -> CommandReceipt {
         user_source_ledger_hash: None,
         requirement_manifest_hash: None,
         implementation_identity_hash: None,
+        validation_result: None,
         source_thread_id: None,
         source_agent_path: None,
     }
@@ -1334,6 +1706,9 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 recorded_at: timestamp(),
                 epoch: 2,
                 step_id: None,
+                step_revision: None,
+                work_unit_id: None,
+                attribution: None,
                 command: vec!["cargo".to_string(), "test".to_string()],
                 cwd: ".".to_string(),
                 exit_code: 0,
@@ -1345,6 +1720,7 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 user_source_ledger_hash: None,
                 requirement_manifest_hash: None,
                 implementation_identity_hash: None,
+                validation_result: None,
                 source_thread_id: None,
                 source_agent_path: None,
             },
@@ -1353,6 +1729,9 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 recorded_at: timestamp(),
                 epoch: 2,
                 step_id: None,
+                step_revision: None,
+                work_unit_id: None,
+                attribution: None,
                 command: vec!["slow-check".to_string()],
                 cwd: ".".to_string(),
                 exit_code: 124,
@@ -1364,6 +1743,7 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 user_source_ledger_hash: None,
                 requirement_manifest_hash: None,
                 implementation_identity_hash: None,
+                validation_result: None,
                 source_thread_id: None,
                 source_agent_path: None,
             },
@@ -1372,6 +1752,9 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 recorded_at: timestamp(),
                 epoch: 1,
                 step_id: None,
+                step_revision: None,
+                work_unit_id: None,
+                attribution: None,
                 command: vec!["secret-from-prior-epoch".to_string()],
                 cwd: ".".to_string(),
                 exit_code: 0,
@@ -1383,6 +1766,7 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 user_source_ledger_hash: None,
                 requirement_manifest_hash: None,
                 implementation_identity_hash: None,
+                validation_result: None,
                 source_thread_id: None,
                 source_agent_path: None,
             },
@@ -1604,6 +1988,7 @@ async fn migration_repairs_duplicate_command_receipts_without_reopening_current_
         .clone();
     document.plan = vec![EvidencePlanStep {
         id: "step".to_string(),
+        revision: 1,
         step: "step".to_string(),
         status: StepStatus::Passed,
         depends_on: Vec::new(),
@@ -1612,6 +1997,13 @@ async fn migration_repairs_duplicate_command_receipts_without_reopening_current_
         generated_artifacts: Vec::new(),
         risks: Vec::new(),
         requires_desktop_activation: false,
+        validation_route: None,
+        external_validation_route: None,
+        validation_disposition: ValidationDisposition::NotRequired,
+        source_owner: None,
+        implementation_surfaces: Vec::new(),
+        mutation_obligations: Vec::new(),
+        validation_receipt_id: None,
         edit_paths: BTreeSet::from(["src/step.rs".to_string()]),
     }];
     document.schema_version = 3;
@@ -1638,6 +2030,7 @@ async fn migration_drops_unattributed_legacy_file_hashes() {
         .clone();
     document.plan = vec![EvidencePlanStep {
         id: "step".to_string(),
+        revision: 1,
         step: "step".to_string(),
         status: StepStatus::Implemented,
         depends_on: Vec::new(),
@@ -1646,6 +2039,13 @@ async fn migration_drops_unattributed_legacy_file_hashes() {
         generated_artifacts: Vec::new(),
         risks: Vec::new(),
         requires_desktop_activation: false,
+        validation_route: None,
+        external_validation_route: None,
+        validation_disposition: ValidationDisposition::NotRequired,
+        source_owner: None,
+        implementation_surfaces: Vec::new(),
+        mutation_obligations: Vec::new(),
+        validation_receipt_id: None,
         edit_paths: BTreeSet::from(["src/owned.rs".to_string()]),
     }];
     document.latest_file_hashes = BTreeMap::from([
@@ -2547,14 +2947,15 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
         .expect("document")
         .clone();
     let mut legacy = serde_json::to_value(document).expect("serialize");
-    legacy["schema_version"] = serde_json::json!(7);
+    let newer_schema_version = TASK_EVIDENCE_SCHEMA_VERSION + 1;
+    legacy["schema_version"] = serde_json::json!(newer_schema_version);
     legacy["lifecycle"] = serde_json::json!({
         "phase": "ready",
         "outcome": "passed",
         "mutation_revision": 1,
         "accepted_evidence_revision": 1
     });
-    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v7 evidence");
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize newer evidence");
     tokio::fs::write(&evidence_path, &legacy_bytes)
         .await
         .expect("write v7 evidence");
@@ -2562,7 +2963,8 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
 
     assert!(matches!(
         load_existing_document(&evidence_path, &thread_id, &repo).await,
-        ExistingDocument::NewerSchema { schema_version: 7 }
+        ExistingDocument::NewerSchema { schema_version }
+            if schema_version == u64::from(newer_schema_version)
     ));
 
     let reloaded = TaskEvidenceLedger::load_or_new(
@@ -2575,7 +2977,7 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
     assert_eq!(
         tokio::fs::read(&evidence_path)
             .await
-            .expect("untouched v7 evidence"),
+            .expect("untouched newer evidence"),
         legacy_bytes
     );
 
@@ -3040,6 +3442,346 @@ fn set_persistence_test_failure(ledger: &TaskEvidenceLedger, fail_writes: bool) 
         .expect("persistence test control")
         .fail_writes
         .store(fail_writes, std::sync::atomic::Ordering::Release);
+}
+
+fn terminal_decision_claim(terminal_identity: &str) -> TerminalDecisionClaim {
+    TerminalDecisionClaim {
+        terminal_identity: terminal_identity.to_string(),
+        durable_outcome: "passed".to_string(),
+        deadline_exhausted_phase: None,
+        mutation_quiescent: true,
+        durable_success_established: true,
+        retained_ownership: Vec::new(),
+        phase_timings_ns: BTreeMap::from([("gate".to_string(), 17)]),
+    }
+}
+
+#[test]
+fn completion_review_dimensions_keep_skips_outcomes_and_findings_distinct() {
+    assert_eq!(
+        CompletionReviewRequirement::from_obligation_mode("disabled"),
+        CompletionReviewRequirement::Disabled
+    );
+    assert_eq!(
+        CompletionReviewRequirement::from_obligation_mode("supplemental"),
+        CompletionReviewRequirement::Supplemental
+    );
+    assert_eq!(
+        CompletionReviewRequirement::from_obligation_mode("mandatory"),
+        CompletionReviewRequirement::Mandatory
+    );
+
+    for infrastructure in [
+        "capacity",
+        "spawn_model",
+        "oversized_request",
+        "persistence",
+        "input_unavailable_or_truncated",
+        "user_source_drift",
+        "repeated_or_invalid_manifest_gap",
+        "invalid_or_incomplete_dossier",
+        "unsupported_reviewer_configuration",
+        "self_review_prohibited",
+        "candidate_changed",
+    ] {
+        assert_eq!(
+            completion_review_attempt_dimensions(
+                CompletionReviewAttemptKind::InitialReview,
+                infrastructure,
+                false,
+                false,
+            ),
+            (CompletionReviewDisposition::PreflightSkipped, None)
+        );
+    }
+    assert_eq!(
+        completion_review_attempt_dimensions(
+            CompletionReviewAttemptKind::InitialReview,
+            "timeout",
+            false,
+            false,
+        ),
+        (
+            CompletionReviewDisposition::Attempted,
+            Some(CompletionReviewAttemptedOutcome::InfrastructureFailure),
+        )
+    );
+    assert_eq!(
+        completion_review_attempt_dimensions(
+            CompletionReviewAttemptKind::InitialReview,
+            "ok",
+            true,
+            false,
+        ),
+        (
+            CompletionReviewDisposition::Attempted,
+            Some(CompletionReviewAttemptedOutcome::Clean),
+        )
+    );
+    assert_eq!(
+        completion_review_attempt_dimensions(
+            CompletionReviewAttemptKind::InitialReview,
+            "ok",
+            false,
+            true,
+        ),
+        (
+            CompletionReviewDisposition::Attempted,
+            Some(CompletionReviewAttemptedOutcome::ActionableFindings),
+        )
+    );
+    for attempt_kind in [
+        CompletionReviewAttemptKind::CorrectionEvidence,
+        CompletionReviewAttemptKind::TerminalClosure,
+    ] {
+        assert_eq!(
+            completion_review_attempt_dimensions(attempt_kind, "ok", true, false),
+            (CompletionReviewDisposition::NotApplicable, None)
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_mandatory_completion_review_proof_overlays_but_supplemental_review_does_not() {
+    let (_temp, _repo, ledger, dossier) = classified_requirement_fixture().await;
+    let requirement_id = dossier.requirements[0].requirement_id.clone();
+
+    assert!(matches!(
+        ledger
+            .synchronize_completion_review_obligation(CompletionReviewObligationInput {
+                mode: "supplemental".to_string(),
+                requirement_ids: Vec::new(),
+                obligation_hash: "supplemental-obligation".to_string(),
+                required_attempt_identity: None,
+            })
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+    assert_eq!(
+        ledger
+            .completion_gate()
+            .await
+            .expect("supplemental gate")
+            .status,
+        TaskCompletionStatus::Passed,
+        "missing optional review proof must not worsen ordinary completion"
+    );
+
+    assert!(matches!(
+        ledger
+            .synchronize_completion_review_obligation(CompletionReviewObligationInput {
+                mode: "mandatory".to_string(),
+                requirement_ids: vec![requirement_id],
+                obligation_hash: "mandatory-obligation".to_string(),
+                required_attempt_identity: Some("required-attempt".to_string()),
+            })
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+    let mandatory_gate = ledger.completion_gate().await.expect("mandatory gate");
+    assert_eq!(mandatory_gate.status, TaskCompletionStatus::Partial);
+    assert!(
+        mandatory_gate
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("mandatory completion-review proof is missing") })
+    );
+}
+
+#[tokio::test]
+async fn terminal_decision_and_delivery_claim_are_atomic_and_one_shot() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let identity = "thread:turn";
+
+    assert_eq!(
+        ledger
+            .commit_terminal_decision_and_claim(terminal_decision_claim(identity))
+            .await,
+        TerminalClaimResult::Claimed
+    );
+    assert_eq!(
+        ledger
+            .commit_terminal_decision_and_claim(terminal_decision_claim(identity))
+            .await,
+        TerminalClaimResult::AlreadyClaimed
+    );
+    assert_eq!(
+        ledger.terminalization_receipts_for_test().await,
+        vec![(
+            identity.to_string(),
+            TerminalDeliveryState::Claimed,
+            false,
+            false,
+            TerminalRecoveryState::Pending,
+        )]
+    );
+
+    assert!(
+        ledger
+            .update_terminal_interaction(TerminalInteractionUpdate {
+                terminal_identity: identity.to_string(),
+                delivery_state: TerminalDeliveryState::Delivered,
+                active_turn_detached: true,
+                terminal_interaction_released: true,
+                recovery_state: TerminalRecoveryState::None,
+                phase_timings_ns: BTreeMap::from([("delivery_attempt".to_string(), 3)]),
+            })
+            .await
+    );
+    assert_eq!(
+        ledger.terminalization_receipts_for_test().await,
+        vec![(
+            identity.to_string(),
+            TerminalDeliveryState::Delivered,
+            true,
+            true,
+            TerminalRecoveryState::None,
+        )]
+    );
+}
+
+#[tokio::test]
+async fn terminal_claim_persistence_failure_establishes_no_durable_success() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    install_persistence_supersede_control(&ledger, 0);
+    set_persistence_test_failure(&ledger, true);
+
+    assert_eq!(
+        ledger
+            .commit_terminal_decision_and_claim(terminal_decision_claim("failed:turn"))
+            .await,
+        TerminalClaimResult::Failed
+    );
+    assert!(ledger.terminalization_receipts_for_test().await.is_empty());
+}
+
+#[tokio::test]
+async fn claimed_terminal_receipt_recovers_interaction_without_resend_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let codex_home = temp.path().join("home");
+    tokio::fs::create_dir_all(repo.join(".git"))
+        .await
+        .expect("git dir");
+    tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("manifest");
+    let thread_id = ThreadId::new();
+    let identity = format!("{thread_id}:turn");
+    let ledger = TaskEvidenceLedger::load_or_new(codex_home.clone(), thread_id, &repo).await;
+    assert_eq!(
+        ledger
+            .commit_terminal_decision_and_claim(terminal_decision_claim(&identity))
+            .await,
+        TerminalClaimResult::Claimed
+    );
+    drop(ledger);
+
+    let recovered = TaskEvidenceLedger::load_or_new(codex_home, thread_id, &repo).await;
+    assert_eq!(
+        recovered.terminalization_receipts_for_test().await,
+        vec![(
+            identity,
+            TerminalDeliveryState::Claimed,
+            true,
+            true,
+            TerminalRecoveryState::Recovered,
+        )]
+    );
+}
+
+#[test]
+fn workspace_scope_expansion_reclassifies_a_retained_unrelated_event() {
+    let event = TaskAttributedWorkspaceEvent {
+        workspace_id: "workspace".to_string(),
+        epoch: 7,
+        actor_id: "root:session".to_string(),
+        paths: vec!["docs/contract.md".to_string()],
+        contracts: Vec::new(),
+        actor_kind: Some(codex_agent_task_store::WorkspaceActorKind::Root),
+        attribution_confidence: Some(codex_agent_task_store::AttributionConfidence::Definitive),
+        relevance: WorkspaceEventRelevance::Unknown,
+        classified_scope_identity: String::new(),
+    };
+    let original_scope = WorkspaceProofScope {
+        identity: "scope-a".to_string(),
+        paths: BTreeSet::from(["src/lib.rs".to_string()]),
+        contracts: BTreeSet::new(),
+    };
+    assert_eq!(
+        classify_workspace_event(&event, &original_scope),
+        WorkspaceEventRelevance::Unrelated
+    );
+
+    let expanded_scope = WorkspaceProofScope {
+        identity: "scope-b".to_string(),
+        paths: BTreeSet::from(["src/lib.rs".to_string(), "docs/contract.md".to_string()]),
+        contracts: BTreeSet::new(),
+    };
+    assert_eq!(
+        classify_workspace_event(&event, &expanded_scope),
+        WorkspaceEventRelevance::Relevant
+    );
+}
+
+#[tokio::test]
+async fn initial_workspace_event_baseline_seeds_zero_completion_epoch() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    {
+        let mut guard = ledger.document.lock().await;
+        let workspace = guard
+            .as_mut()
+            .and_then(|document| document.completion_review_v2.as_mut())
+            .expect("completion review workspace ledger");
+        workspace.completion_epoch = 0;
+        workspace.workspace_event_baseline_epoch = 0;
+        workspace.workspace_event_history_complete = false;
+    }
+
+    assert!(
+        ledger
+            .seed_workspace_event_baseline(7, BTreeSet::new())
+            .await
+    );
+
+    let guard = ledger.document.lock().await;
+    let workspace = guard
+        .as_ref()
+        .and_then(|document| document.completion_review_v2.as_ref())
+        .expect("completion review workspace ledger");
+    assert_eq!(workspace.completion_epoch, 0);
+    assert_eq!(workspace.workspace_event_baseline_epoch, 0);
+    assert_eq!(workspace.last_workspace_event_epoch, 7);
+    assert!(workspace.workspace_event_history_complete);
+}
+
+#[test]
+fn workspace_scope_change_with_incomplete_history_invalidates_conservatively() {
+    assert!(workspace_scope_history_is_unknown(true, false));
+    assert!(!workspace_scope_history_is_unknown(false, false));
+    assert!(!workspace_scope_history_is_unknown(true, true));
+
+    let repository_wide = TaskAttributedWorkspaceEvent {
+        workspace_id: "workspace".to_string(),
+        epoch: 9,
+        actor_id: "root:session".to_string(),
+        paths: vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
+        contracts: Vec::new(),
+        actor_kind: Some(codex_agent_task_store::WorkspaceActorKind::Root),
+        attribution_confidence: Some(codex_agent_task_store::AttributionConfidence::Definitive),
+        relevance: WorkspaceEventRelevance::Unknown,
+        classified_scope_identity: String::new(),
+    };
+    let disjoint_scope = WorkspaceProofScope {
+        identity: "scope".to_string(),
+        paths: BTreeSet::from(["src/lib.rs".to_string()]),
+        contracts: BTreeSet::new(),
+    };
+    assert_eq!(
+        classify_workspace_event(&repository_wide, &disjoint_scope),
+        WorkspaceEventRelevance::Unknown,
+        "repository-wide facts stay unknown without proof of the actor's complete disjoint scope"
+    );
 }
 
 async fn wait_persistence_barrier(barrier: Arc<std::sync::Barrier>) {
@@ -3766,6 +4508,8 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: true,
                 terminal_outcome: None,
+                attempt_identity: "test-attempt-identity".to_string(),
+                reviewer_contract_hash: "test-reviewer-contract".to_string(),
             },
         )
         .await
@@ -3948,6 +4692,8 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: false,
                 terminal_outcome: None,
+                attempt_identity: "test-attempt-identity".to_string(),
+                reviewer_contract_hash: "test-reviewer-contract".to_string(),
             },
         )
         .await
@@ -3985,6 +4731,8 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
                     infrastructure_outcome: "ok".to_string(),
                     review_clean: false,
                     terminal_outcome: None,
+                    attempt_identity: "test-attempt-identity".to_string(),
+                    reviewer_contract_hash: "test-reviewer-contract".to_string(),
                 },
             )
             .await,
@@ -4017,6 +4765,8 @@ async fn rereview_infrastructure_failure_survives_v5_reload() {
                 infrastructure_outcome: "timeout".to_string(),
                 review_clean: false,
                 terminal_outcome: Some("partial".to_string()),
+                attempt_identity: "test-attempt-identity".to_string(),
+                reviewer_contract_hash: "test-reviewer-contract".to_string(),
             },
         )
         .await
@@ -4096,6 +4846,8 @@ async fn last_second_mutation_invalidates_a_provisional_clean_review() {
                     infrastructure_outcome: "ok".to_string(),
                     review_clean: true,
                     terminal_outcome: None,
+                    attempt_identity: "test-attempt-identity".to_string(),
+                    reviewer_contract_hash: "test-reviewer-contract".to_string(),
                 },
             )
             .await,
@@ -4179,6 +4931,8 @@ async fn after_agent_reentry_requires_fresh_review_and_preserves_correction_use(
                     infrastructure_outcome: "ok".to_string(),
                     review_clean: true,
                     terminal_outcome: None,
+                    attempt_identity: "test-attempt-identity".to_string(),
+                    reviewer_contract_hash: "test-reviewer-contract".to_string(),
                 },
             )
             .await,
@@ -4306,6 +5060,8 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: false,
                 terminal_outcome: None,
+                attempt_identity: "test-attempt-identity".to_string(),
+                reviewer_contract_hash: "test-reviewer-contract".to_string(),
             },
             gap_materialization,
         )
@@ -4348,6 +5104,8 @@ async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_relo
         infrastructure_outcome: "ok".to_string(),
         review_clean: true,
         terminal_outcome: None,
+        attempt_identity: "test-attempt-identity".to_string(),
+        reviewer_contract_hash: "test-reviewer-contract".to_string(),
     };
     let mut missing_link = replacement.clone();
     missing_link.superseded_review_id = None;
@@ -4511,6 +5269,8 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: false,
                 terminal_outcome: None,
+                attempt_identity: "test-attempt-identity".to_string(),
+                reviewer_contract_hash: "test-reviewer-contract".to_string(),
             },
         )
         .await
@@ -4548,6 +5308,8 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
                     infrastructure_outcome: "ok".to_string(),
                     review_clean: false,
                     terminal_outcome: None,
+                    attempt_identity: "test-attempt-identity".to_string(),
+                    reviewer_contract_hash: "test-reviewer-contract".to_string(),
                 },
             )
             .await,
@@ -4589,6 +5351,8 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: false,
                 terminal_outcome: None,
+                attempt_identity: "test-attempt-identity".to_string(),
+                reviewer_contract_hash: "test-reviewer-contract".to_string(),
             },
             gap_materialization,
         )
@@ -4631,6 +5395,8 @@ async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reloa
                 infrastructure_outcome: "ok".to_string(),
                 review_clean: true,
                 terminal_outcome: None,
+                attempt_identity: "test-attempt-identity".to_string(),
+                reviewer_contract_hash: "test-reviewer-contract".to_string(),
             },
         )
         .await
@@ -4823,4 +5589,973 @@ async fn reclassification_cannot_erase_a_previously_mapped_requirement() {
         .await
         .expect("refreshed dossier");
     assert_eq!(refreshed.requirements, vec![prior_requirement]);
+}
+
+fn owner_packet_locator_facts(
+    owner_id: &str,
+    primary_path: &str,
+    content: &str,
+    caller_path: Option<&str>,
+    generated_mirrors: Vec<String>,
+    validation_routes: Vec<codex_file_search::task_locator::LocateTaskValidationRoute>,
+) -> codex_file_search::task_locator::LocateTaskDecisionFacts {
+    use codex_file_search::task_locator::ExactSpan;
+    use codex_file_search::task_locator::LocateTaskDecisionFacts;
+    use codex_file_search::task_locator::LocateTaskLocatedPath;
+    use codex_file_search::task_locator::LocateTaskSourceRelationship;
+    use codex_file_search::task_locator::LocateTaskSourceSection;
+    use codex_file_search::task_locator::LocateTaskSourceSectionKind;
+    use codex_file_search::task_locator::LocateTaskSourceSectionState;
+    use codex_file_search::task_locator::ManifestOwnerProjection;
+
+    let end_line = content.lines().count().max(1);
+    let span = ExactSpan {
+        start_line: 1,
+        end_line,
+        start_byte: 0,
+        end_byte: content.len(),
+    };
+    let file_sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let owner_root = Path::new(primary_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(primary_path))
+        .to_string_lossy()
+        .replace('\\', "/");
+    let source_relationships = caller_path
+        .map(|path| {
+            vec![LocateTaskSourceRelationship {
+                path: path.to_string(),
+                role: "caller".to_string(),
+                resolution: "one_hop".to_string(),
+                span: ExactSpan {
+                    start_line: 3,
+                    end_line: 3,
+                    start_byte: 0,
+                    end_byte: 1,
+                },
+            }]
+        })
+        .unwrap_or_default();
+    LocateTaskDecisionFacts {
+        repository_identity: "repository".to_string(),
+        source_snapshot_identity: format!("snapshot-{owner_id}"),
+        owner_manifest_revision: "manifest-v1".to_string(),
+        closure_contract_revision: "source_closure_v2".to_string(),
+        completeness: "complete".to_string(),
+        selected_owner: Some(owner_id.to_string()),
+        authoritative_owner: Some(ManifestOwnerProjection {
+            id: owner_id.to_string(),
+            roots: vec![owner_root],
+            primary_entries: vec![LocateTaskLocatedPath {
+                path: primary_path.to_string(),
+                role: "primary_implementation".to_string(),
+            }],
+            instructions: Vec::new(),
+            consumers: caller_path.into_iter().map(str::to_string).collect(),
+            contracts: Vec::new(),
+            generated_mirrors,
+            tests: Vec::new(),
+            validation: validation_routes.clone(),
+        }),
+        owner_candidates: Vec::new(),
+        primary_path: Some(primary_path.to_string()),
+        primary_symbol: Some("owner_entry".to_string()),
+        primary_span: Some(span.clone()),
+        source_relationships,
+        located_contracts: Vec::new(),
+        located_tests: Vec::new(),
+        captured_instruction_sources: Vec::new(),
+        captured_source_sections: vec![LocateTaskSourceSection {
+            section_id: format!("section-{owner_id}"),
+            kind: LocateTaskSourceSectionKind::PrimaryImplementation,
+            state: LocateTaskSourceSectionState::Materialized,
+            path: primary_path.to_string(),
+            span: Some(span),
+            content_hash: hash_line_span(content.as_bytes(), 1, end_line),
+            file_content_hash: Some(file_sha256),
+            source_snapshot_identity: format!("snapshot-{owner_id}"),
+            text: Some(content.to_string()),
+            provenance: "test_fixture".to_string(),
+        }],
+        candidate_validation_routes: validation_routes,
+        source_gaps: Vec::new(),
+        unresolved_source_ambiguity: Vec::new(),
+        truncated: false,
+    }
+}
+
+fn owner_packet_supporting_read(
+    path: &str,
+    content: &str,
+) -> codex_file_search::task_locator::SupportingRead {
+    codex_file_search::task_locator::SupportingRead {
+        path: path.to_string(),
+        content_hash: format!("{:x}", Sha256::digest(content.as_bytes())),
+    }
+}
+
+fn ready_owner_packet(owner_id: &str, path: &str, content: &str) -> OwnerPacketProjection {
+    let facts = owner_packet_locator_facts(owner_id, path, content, None, Vec::new(), Vec::new());
+    let seed = core_owner_packet_seed(
+        &facts,
+        None,
+        &[owner_packet_supporting_read(path, content)],
+        &format!("request-{owner_id}"),
+        "ordinary pure helper change",
+    )
+    .expect("authoritative owner seed");
+    let packet = owner_packet_from_seed(&seed, 1, &[]);
+    assert_eq!(packet.status, OwnerPacketStatus::Ready);
+    packet
+}
+
+#[tokio::test]
+async fn owner_packet_seed_uses_existing_evidence_and_reports_precise_readiness() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let mut step = plan_item("owner-packet", StepStatus::InProgress);
+    step.acceptance_criteria = vec!["[accept-owner] src/lib.rs remains compatible".to_string()];
+    ledger.record_plan_update(&plan_with(vec![step])).await;
+    let routes = vec![codex_file_search::task_locator::LocateTaskValidationRoute {
+        id: "core-focused".to_string(),
+        cwd: ".".to_string(),
+        argv: vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "focused".to_string(),
+        ],
+        role: "focused_test".to_string(),
+    }];
+    let facts = owner_packet_locator_facts(
+        "core-owner",
+        "src/lib.rs",
+        "pub fn run() {}\n",
+        Some("src/caller.rs"),
+        vec!["generated/lib.rs".to_string()],
+        routes,
+    );
+    let outcome = ledger
+        .record_owner_packet_from_locator(
+            &facts,
+            None,
+            &[owner_packet_supporting_read(
+                "src/lib.rs",
+                "pub fn run() {}\n",
+            )],
+            "request-owner",
+            "stateful core-owner lifecycle with cancellation and retry",
+        )
+        .await
+        .expect("packet projection");
+    assert_eq!(outcome.preview.status, "ready");
+    assert_eq!(outcome.preview.acceptance_ids, ["accept-owner"]);
+    assert_eq!(
+        outcome.preview.lifecycle_obligations,
+        ["success", "failure", "cancellation", "retry_or_recovery"]
+    );
+    assert_eq!(
+        outcome.preview.caller_dispositions[0].disposition,
+        "must_remain_compatible"
+    );
+    assert!(!outcome.preview.generated_source_ownership_enforced);
+
+    let pure_seed = core_owner_packet_seed(
+        &facts,
+        None,
+        &[owner_packet_supporting_read(
+            "src/lib.rs",
+            "pub fn run() {}\n",
+        )],
+        "request-pure",
+        "ordinary pure helper change",
+    )
+    .expect("pure packet seed");
+    let pure_packet = owner_packet_from_seed(&pure_seed, 1, &[]);
+    assert!(pure_packet.acceptance_mappings.is_empty());
+    assert!(pure_packet.lifecycle_obligations.is_empty());
+    assert!(pure_packet.generated_source_ownership.is_none());
+
+    let missing = ledger
+        .record_owner_packet_from_locator(&facts, None, &[], "request-missing", "same behavior")
+        .await
+        .expect("collecting packet");
+    assert_eq!(missing.preview.status, "collecting");
+    let error = ledger
+        .prepare_owner_patch(&[OwnerPacketChangeRegion {
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        }])
+        .await
+        .expect_err("missing supporting identity remains not ready");
+    assert_eq!(error.kind, "packet_not_ready");
+    assert!(
+        error
+            .unresolved_obligations
+            .iter()
+            .any(|item| item == "current_supporting_source_identity:src/lib.rs")
+    );
+    assert_eq!(
+        error.expected_evidence_workflow,
+        ["locate_task", "read_file_span", "update_plan"]
+    );
+}
+
+#[tokio::test]
+async fn owner_packet_refreshes_actual_post_state_and_keeps_followup_edits_current() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let before = "old\nstable\n";
+    let mut packet = ready_owner_packet("owner", "src/lib.rs", before);
+    let before_hash = format!("{:x}", Sha256::digest(before.as_bytes()));
+    packet.source_spans = vec![
+        OwnerPacketSourceSpan {
+            section_id: "changed-old".to_string(),
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            file_sha256: before_hash.clone(),
+            span_sha256: hash_line_span(before.as_bytes(), 1, 1).expect("line one"),
+            state: OwnerSourceSpanState::Current,
+        },
+        OwnerPacketSourceSpan {
+            section_id: "stable-old".to_string(),
+            path: "src/lib.rs".to_string(),
+            start_line: 2,
+            end_line: 2,
+            file_sha256: before_hash,
+            span_sha256: hash_line_span(before.as_bytes(), 2, 2).expect("line two"),
+            state: OwnerSourceSpanState::Current,
+        },
+    ];
+    let packet_id = packet.packet_id.clone();
+    {
+        let mut guard = ledger.document.lock().await;
+        guard.as_mut().expect("document").owner_packets = vec![packet];
+    }
+    let binding = ledger
+        .prepare_owner_patch(&[OwnerPacketChangeRegion {
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        }])
+        .await
+        .expect("ready first edit");
+    let after = b"new\nstable\n".to_vec();
+    let after_hash = format!("{:x}", Sha256::digest(&after));
+    let first_metrics = ledger
+        .record_owner_patch_finalization(
+            "edit-1",
+            &binding,
+            &[OwnerPacketPostMutationPath {
+                path: "src/lib.rs".to_string(),
+                existed: true,
+                file_sha256: Some(after_hash.clone()),
+                content: Some(after.clone()),
+            }],
+        )
+        .await;
+    assert_eq!(first_metrics.edits, 1);
+    assert_eq!(first_metrics.interval_invalidations, 1);
+    assert_eq!(first_metrics.span_refreshes, 1);
+    {
+        let guard = ledger.document.lock().await;
+        let packet = guard
+            .as_ref()
+            .expect("document")
+            .owner_packets
+            .iter()
+            .find(|packet| packet.packet_id == packet_id)
+            .expect("packet");
+        assert_eq!(packet.status, OwnerPacketStatus::Closed);
+        assert_eq!(packet.source_identities[0].file_sha256, after_hash);
+        assert!(packet.source_spans.iter().any(|span| {
+            span.section_id == "changed-old" && span.state == OwnerSourceSpanState::Invalidated
+        }));
+        assert!(packet.source_spans.iter().any(|span| {
+            span.section_id == "stable-old"
+                && span.state == OwnerSourceSpanState::Current
+                && span.file_sha256 == after_hash
+        }));
+    }
+
+    let followup = ledger
+        .prepare_owner_patch(&[OwnerPacketChangeRegion {
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        }])
+        .await
+        .expect("same actor can use refreshed identity");
+    let prefix_state = b"prefix\nstable\n".to_vec();
+    let second_metrics = ledger
+        .record_owner_patch_finalization(
+            "partial-prefix-edit",
+            &followup,
+            &[OwnerPacketPostMutationPath {
+                path: "src/lib.rs".to_string(),
+                existed: true,
+                file_sha256: Some(format!("{:x}", Sha256::digest(&prefix_state))),
+                content: Some(prefix_state),
+            }],
+        )
+        .await;
+    assert_eq!(second_metrics.edits, 1);
+    assert_eq!(second_metrics.same_region_revisits, 1);
+    let guard = ledger.document.lock().await;
+    let packet = &guard.as_ref().expect("document").owner_packets[0];
+    assert_eq!(packet.counters.self_owned_cas_failures, 0);
+    assert!(
+        packet
+            .source_spans
+            .iter()
+            .any(|span| { span.start_line == 1 && span.state == OwnerSourceSpanState::Current })
+    );
+}
+
+#[tokio::test]
+async fn owner_packet_blocks_when_authoritative_post_state_cannot_be_persisted() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let packet = ready_owner_packet("owner", "src/lib.rs", "old\n");
+    {
+        let mut guard = ledger.document.lock().await;
+        guard.as_mut().expect("document").owner_packets = vec![packet];
+    }
+    let binding = ledger
+        .prepare_owner_patch(&[OwnerPacketChangeRegion {
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        }])
+        .await
+        .expect("ready edit");
+    let metrics = ledger
+        .record_owner_patch_finalization("edit-missing-post", &binding, &[])
+        .await;
+    assert_eq!(metrics.interval_invalidations, 1);
+    let guard = ledger.document.lock().await;
+    let packet = &guard.as_ref().expect("document").owner_packets[0];
+    assert_eq!(packet.status, OwnerPacketStatus::Blocked);
+    assert_eq!(
+        packet.missing_obligations,
+        ["post_mutation_source_identity_unavailable"]
+    );
+    assert!(
+        packet
+            .source_spans
+            .iter()
+            .all(|span| span.state == OwnerSourceSpanState::Invalidated)
+    );
+}
+
+#[tokio::test]
+async fn owner_packet_preflight_enforces_generated_and_multi_owner_contracts() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let ordinary = ready_owner_packet("ordinary", "src/ordinary.rs", "ordinary\n");
+    let ordinary_document = {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        document.owner_packets = vec![ordinary];
+        document.clone()
+    };
+    assert!(
+        verify_owner_patch(
+            &ordinary_document,
+            &[OwnerPacketChangeRegion {
+                path: "src/ordinary.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+            }],
+        )
+        .is_ok()
+    );
+
+    let mut generated = ready_owner_packet("generated", "schema/out.rs", "generated\n");
+    generated.generated_source_ownership = Some(OwnerPacketGeneratedOwnership {
+        generated_path: "schema/out.rs".to_string(),
+        authoritative_source_path: "src/source.rs".to_string(),
+        evidence_kind: "structured_generated_file_backpointer".to_string(),
+        requires_synchronized_representations: false,
+    });
+    let generated_document = {
+        let mut document = ordinary_document.clone();
+        document.owner_packets = vec![generated];
+        document
+    };
+    let error = verify_owner_patch(
+        &generated_document,
+        &[OwnerPacketChangeRegion {
+            path: "schema/out.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        }],
+    )
+    .expect_err("generated output cannot be edited without its source");
+    assert!(
+        error
+            .unresolved_obligations
+            .iter()
+            .any(|item| item == "authoritative_generated_source:src/source.rs")
+    );
+
+    let first = ready_owner_packet("owner-a", "a/lib.rs", "a\n");
+    let second = ready_owner_packet("owner-b", "b/lib.rs", "b\n");
+    let mut mixed_document = ordinary_document;
+    mixed_document.owner_packets = vec![first, second];
+    let regions = vec![
+        OwnerPacketChangeRegion {
+            path: "a/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        },
+        OwnerPacketChangeRegion {
+            path: "b/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        },
+    ];
+    assert!(
+        verify_owner_patch(&mixed_document, &regions)
+            .expect_err("accidental mixed ownership is rejected")
+            .unresolved_obligations
+            .contains(&"multi_owner_atomic_contract".to_string())
+    );
+    mixed_document.owner_packets[0].multi_owner_atomic_evidence = true;
+    mixed_document.owner_packets[1].multi_owner_atomic_evidence = true;
+    assert_eq!(
+        verify_owner_patch(&mixed_document, &regions)
+            .expect("prepared atomic owners")
+            .len(),
+        2
+    );
+    assert!(!task_explicitly_requires_atomic_owner(
+        "change owners together in one atomic patch",
+        "owner-a",
+    ));
+    assert!(task_explicitly_requires_atomic_owner(
+        "change owner-a and owner-b together in one atomic owner patch",
+        "owner-a",
+    ));
+}
+
+#[tokio::test]
+async fn owner_packet_formatter_and_proof_routes_close_only_after_success() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let routes = vec![
+        codex_file_search::task_locator::LocateTaskValidationRoute {
+            id: "fmt".to_string(),
+            cwd: ".".to_string(),
+            argv: vec!["cargo".to_string(), "fmt".to_string()],
+            role: "format".to_string(),
+        },
+        codex_file_search::task_locator::LocateTaskValidationRoute {
+            id: "proof".to_string(),
+            cwd: ".".to_string(),
+            argv: vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "focused".to_string(),
+            ],
+            role: "focused_test".to_string(),
+        },
+    ];
+    let facts =
+        owner_packet_locator_facts("owner", "src/lib.rs", "old\n", None, Vec::new(), routes);
+    let seed = core_owner_packet_seed(
+        &facts,
+        None,
+        &[owner_packet_supporting_read("src/lib.rs", "old\n")],
+        "request",
+        "ordinary helper",
+    )
+    .expect("seed");
+    let packet = owner_packet_from_seed(&seed, 1, &[]);
+    let mut document = {
+        let guard = ledger.document.lock().await;
+        let mut document = guard.as_ref().expect("document").clone();
+        document.owner_packets = vec![packet];
+        document
+    };
+    let cwd = document.start.repository_root.clone();
+    let formatted = b"formatted\n".to_vec();
+    let mut formatter = command_receipt("command-fmt");
+    formatter.command = vec!["cargo".to_string(), "fmt".to_string()];
+    formatter.cwd = cwd.clone();
+    formatter.possible_mutation = true;
+    record_owner_packet_command_outcome(
+        &mut document,
+        &formatter,
+        &[OwnerPacketPostMutationPath {
+            path: "src/lib.rs".to_string(),
+            existed: true,
+            file_sha256: Some(format!("{:x}", Sha256::digest(&formatted))),
+            content: Some(formatted),
+        }],
+    );
+    assert_eq!(
+        document.owner_packets[0].format_status,
+        OwnerObligationStatus::Passed
+    );
+    assert_eq!(
+        document.owner_packets[0].status,
+        OwnerPacketStatus::AwaitingProof
+    );
+
+    let mut proof = command_receipt("command-proof");
+    proof.command = vec![
+        "cargo".to_string(),
+        "test".to_string(),
+        "focused".to_string(),
+    ];
+    proof.cwd = cwd;
+    record_owner_packet_command_outcome(&mut document, &proof, &[]);
+    assert_eq!(
+        document.owner_packets[0].proof_status,
+        OwnerObligationStatus::Passed
+    );
+    assert_eq!(document.owner_packets[0].status, OwnerPacketStatus::Closed);
+
+    document.owner_packets[0].format_status = OwnerObligationStatus::Pending;
+    document.owner_packets[0].status = OwnerPacketStatus::AwaitingFormat;
+    formatter.exit_code = 1;
+    record_owner_packet_command_outcome(&mut document, &formatter, &[]);
+    assert_eq!(
+        document.owner_packets[0].format_status,
+        OwnerObligationStatus::Failed
+    );
+    assert_eq!(
+        document.owner_packets[0].status,
+        OwnerPacketStatus::AwaitingFormat
+    );
+    formatter.exit_code = 127;
+    record_owner_packet_command_outcome(&mut document, &formatter, &[]);
+    assert_eq!(
+        document.owner_packets[0].format_status,
+        OwnerObligationStatus::Unavailable
+    );
+    assert_eq!(document.owner_packets[0].status, OwnerPacketStatus::Blocked);
+    assert!(
+        document.owner_packets[0]
+            .missing_obligations
+            .iter()
+            .any(|item| item == "formatter_infrastructure_unavailable:fmt")
+    );
+}
+
+#[tokio::test]
+async fn material_followup_advances_contract_epoch_but_owner_refinement_does_not() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_task_contract_source("initial", &[text_input("implement the helper")])
+        .await;
+    ledger.record_host_mutation().await;
+    ledger
+        .record_task_contract_source(
+            "owner-refinement",
+            &[text_input(
+                "the source owner is core-owner and caller is src/caller.rs",
+            )],
+        )
+        .await;
+    {
+        let guard = ledger.document.lock().await;
+        assert_eq!(guard.as_ref().expect("document").contract_epoch, 1);
+    }
+    ledger
+        .record_task_contract_source(
+            "material-followup",
+            &[text_input("also implement a new required behavior")],
+        )
+        .await;
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.contract_epoch, 2);
+    assert!(document.owner_packets.is_empty());
+}
+
+#[tokio::test]
+async fn v6_migration_seeds_bounded_owner_packet_projection_fields() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let home = ledger.codex_home.as_ref().expect("home").clone();
+    let evidence_path = ledger.evidence_path.as_ref().expect("path").clone();
+    let thread_id = ledger.thread_id.as_deref().expect("thread").to_string();
+    let mut value = serde_json::to_value(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .clone(),
+    )
+    .expect("serialize current document");
+    value["schema_version"] = serde_json::json!(FROZEN_TASK_EVIDENCE_V6_SCHEMA_VERSION);
+    let object = value.as_object_mut().expect("document object");
+    object.remove("contract_epoch");
+    object.remove("task_contract_sources");
+    object.remove("owner_packets");
+    object.remove("owner_packet_metrics");
+    object.remove("final_proof");
+    tokio::fs::write(
+        &evidence_path,
+        serde_json::to_vec_pretty(&value).expect("serialize v6"),
+    )
+    .await
+    .expect("write v6");
+    drop(ledger);
+
+    let migrated = TaskEvidenceLedger::load_or_new(
+        home,
+        ThreadId::from_string(&thread_id).expect("thread id"),
+        &repo,
+    )
+    .await;
+    let guard = migrated.document.lock().await;
+    let document = guard.as_ref().expect("migrated document");
+    assert_eq!(document.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
+    assert_eq!(document.contract_epoch, 1);
+    assert!(document.owner_packets.is_empty());
+    assert_eq!(document.owner_packet_metrics, OwnerPacketMetrics::default());
+    assert_eq!(document.final_proof, FinalProofStateV1::default());
+}
+
+#[tokio::test]
+async fn owner_packet_hot_state_remains_bounded_across_many_reads() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let packet = ready_owner_packet("owner", "src/lib.rs", "root\n");
+    {
+        let mut guard = ledger.document.lock().await;
+        guard.as_mut().expect("document").owner_packets = vec![packet];
+    }
+    for index in 0..48 {
+        ledger
+            .record_owner_source_span(
+                &format!("src/module_{index}.rs"),
+                1,
+                1,
+                &format!("file-{index}"),
+                &format!("span-{index}"),
+            )
+            .await;
+    }
+    let guard = ledger.document.lock().await;
+    let packet = &guard.as_ref().expect("document").owner_packets[0];
+    assert!(packet.source_identities.len() <= MAX_OWNER_PACKET_REFERENCES * 2);
+    assert!(packet.source_spans.len() <= MAX_OWNER_PACKET_SPANS);
+    assert!(packet.edit_call_ids.len() <= MAX_OWNER_PACKET_REFERENCES);
+    assert!(packet.edit_receipt_ids.len() <= MAX_OWNER_PACKET_REFERENCES);
+    assert!(packet.command_receipt_ids.len() <= MAX_OWNER_PACKET_REFERENCES);
+}
+
+fn final_proof_input() -> FinalProofSealInputV1 {
+    FinalProofSealInputV1 {
+        implementation_identity: "implementation-a".to_string(),
+        source_identity: "sources-a".to_string(),
+        requirement_identity: "requirements-a".to_string(),
+        workspace_epoch: 11,
+        workspace_manifest_identity: "workspace-a".to_string(),
+        environment_identity: "environment-a".to_string(),
+        toolchain_identity: "toolchain-a".to_string(),
+        features_identity: "features-a".to_string(),
+        configuration_identity: "configuration-a".to_string(),
+        child_gate_state: Vec::new(),
+        reviewer_configuration_identity: "reviewer-a".to_string(),
+        diff_snapshot: CandidateDiffSnapshotV1 {
+            candidate_id: String::new(),
+            diff_identity: "diff-a".to_string(),
+            head_identity: Some("head-a".to_string()),
+            index_identity: Some("index-a".to_string()),
+            worktree_identity: Some("worktree-a".to_string()),
+            changed_paths: vec!["src/lib.rs".to_string()],
+            bounded_hunks: "@@ focused diff @@".to_string(),
+            raw_artifact_digest: "artifact-digest-a".to_string(),
+            raw_artifact_ref: Some("artifact://diff-a".to_string()),
+            workspace_epoch: 11,
+        },
+        checkpoint_token_budget: 10_000,
+    }
+}
+
+#[tokio::test]
+async fn final_candidate_identity_ignores_observational_writes_and_covers_correctness_inputs() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let document = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .clone();
+    let input = final_proof_input();
+    let basis = completion_candidate_basis(&document, &input);
+
+    let mut observational = document.clone();
+    observational.revision = observational.revision.saturating_add(9);
+    observational.updated_at = timestamp();
+    assert_eq!(
+        basis.basis_id,
+        completion_candidate_basis(&observational, &input).basis_id
+    );
+
+    let mut evidence_changed = document.clone();
+    evidence_changed.evidence_epoch = evidence_changed.evidence_epoch.saturating_add(1);
+    assert_ne!(
+        basis.basis_id,
+        completion_candidate_basis(&evidence_changed, &input).basis_id
+    );
+    let mut host_changed = document.clone();
+    host_changed.host_mutation_revision = host_changed.host_mutation_revision.saturating_add(1);
+    assert_ne!(
+        basis.basis_id,
+        completion_candidate_basis(&host_changed, &input).basis_id
+    );
+
+    for changed in [
+        ("implementation", "implementation-b"),
+        ("source", "sources-b"),
+        ("requirement", "requirements-b"),
+        ("workspace", "workspace-b"),
+        ("environment", "environment-b"),
+        ("toolchain", "toolchain-b"),
+        ("features", "features-b"),
+        ("configuration", "configuration-b"),
+        ("reviewer", "reviewer-b"),
+        ("diff", "diff-b"),
+    ] {
+        let mut changed_input = input.clone();
+        match changed.0 {
+            "implementation" => changed_input.implementation_identity = changed.1.to_string(),
+            "source" => changed_input.source_identity = changed.1.to_string(),
+            "requirement" => changed_input.requirement_identity = changed.1.to_string(),
+            "workspace" => changed_input.workspace_manifest_identity = changed.1.to_string(),
+            "environment" => changed_input.environment_identity = changed.1.to_string(),
+            "toolchain" => changed_input.toolchain_identity = changed.1.to_string(),
+            "features" => changed_input.features_identity = changed.1.to_string(),
+            "configuration" => changed_input.configuration_identity = changed.1.to_string(),
+            "reviewer" => changed_input.reviewer_configuration_identity = changed.1.to_string(),
+            "diff" => changed_input.diff_snapshot.diff_identity = changed.1.to_string(),
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            basis.basis_id,
+            completion_candidate_basis(&document, &changed_input).basis_id,
+            "{} must affect the immutable candidate basis",
+            changed.0
+        );
+    }
+}
+
+#[tokio::test]
+async fn deterministic_validation_plan_batches_run_all_without_generation() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let mut item = plan_item("focused", StepStatus::Completed);
+    let mut route = focused_validation_route(vec!["src/focused.rs".to_string()]);
+    route.ordering = ValidationRouteOrdering::RunAll;
+    let mut second = route.leaves[0].clone();
+    second.argv.push("second".to_string());
+    route.leaves.push(second);
+    item.validation_route = Some(route);
+    ledger.record_plan_update(&plan_with(vec![item])).await;
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    let basis = completion_candidate_basis(document, &final_proof_input());
+    let plan = validation_plan_for_basis(document, &basis);
+    assert!(!plan.ambiguous_or_unmappable);
+    assert!(!plan.resolution_generation_used);
+    assert_eq!(plan.steps.len(), 2);
+    assert!(plan.steps.iter().all(|step| step.batch_group == 0));
+}
+
+#[test]
+fn incomplete_legacy_proof_is_not_reusable_and_failure_fingerprint_invalidates() {
+    let basis = CompletionCandidateBasisV1 {
+        basis_id: "basis-a".to_string(),
+        ..CompletionCandidateBasisV1::default()
+    };
+    let plan = ValidationPlanV1 {
+        plan_id: "plan-a".to_string(),
+        basis_id: basis.basis_id.clone(),
+        steps: vec![ValidationPlanStepV1 {
+            step_id: "step-a".to_string(),
+            obligation_id: "obligation-a".to_string(),
+            ..ValidationPlanStepV1::default()
+        }],
+        ..ValidationPlanV1::default()
+    };
+    let candidate = completion_candidate_for(&basis, &plan);
+    let legacy = FinalProofObservationV1 {
+        candidate_id: candidate.candidate_id.clone(),
+        plan_step_id: "step-a".to_string(),
+        obligation_id: "obligation-a".to_string(),
+        successful: true,
+        complete_identity: false,
+        ..FinalProofObservationV1::default()
+    };
+    let missing = missing_or_failed_obligations(&candidate, &plan, &[legacy]);
+    assert_eq!(missing, vec!["obligation-a".to_string()]);
+    let first = completion_failure_fingerprint(3, &candidate, &missing, &[], None);
+    let evidence_changed = completion_failure_fingerprint(4, &candidate, &missing, &[], None);
+    let obligation_changed =
+        completion_failure_fingerprint(3, &candidate, &["obligation-b".to_string()], &[], None);
+    assert_ne!(first.fingerprint, evidence_changed.fingerprint);
+    assert_ne!(first.fingerprint, obligation_changed.fingerprint);
+}
+
+#[tokio::test]
+async fn sealed_checkpoint_is_complete_and_finalization_is_exactly_memoized() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let sealed = ledger
+        .seal_final_proof_candidate(final_proof_input())
+        .await
+        .expect("KD4 final proof enabled");
+    let (candidate, checkpoint, gate) = match sealed {
+        FinalProofSealResultV1::Sealed {
+            candidate,
+            checkpoint,
+            gate,
+            ..
+        } => (candidate, checkpoint, gate),
+        other => panic!("expected sealed candidate, got {other:?}"),
+    };
+    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+    assert_eq!(checkpoint.candidate_id, candidate.candidate_id);
+    assert!(!checkpoint.checkpoint_id.is_empty());
+    assert!(!checkpoint.basis_id.is_empty());
+    assert!(!checkpoint.validation_plan_id.is_empty());
+    assert!(!checkpoint.diff_identity.is_empty());
+    assert!(checkpoint.estimated_tokens <= 10_000);
+    assert!(ledger.memoized_finalization_result().await.is_none());
+    assert!(
+        ledger
+            .record_finalization_result("final answer".to_string())
+            .await
+    );
+    assert_eq!(
+        ledger.memoized_finalization_result().await.as_deref(),
+        Some("final answer")
+    );
+}
+
+#[tokio::test]
+async fn reviewer_infrastructure_memo_is_exact_to_candidate_config_and_condition() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    assert!(
+        ledger
+            .record_reviewer_infrastructure_memo(
+                "candidate-a".to_string(),
+                "dossier-a".to_string(),
+                "reviewer-a".to_string(),
+                "capacity-unavailable".to_string(),
+                "capacity".to_string(),
+            )
+            .await
+    );
+    assert!(
+        ledger
+            .reviewer_infrastructure_memo_matches(
+                "candidate-a",
+                "dossier-a",
+                "reviewer-a",
+                "capacity-unavailable",
+            )
+            .await
+    );
+    assert!(
+        !ledger
+            .reviewer_infrastructure_memo_matches(
+                "candidate-b",
+                "dossier-a",
+                "reviewer-a",
+                "capacity-unavailable",
+            )
+            .await
+    );
+    assert!(
+        !ledger
+            .reviewer_infrastructure_memo_matches(
+                "candidate-a",
+                "dossier-a",
+                "reviewer-b",
+                "capacity-unavailable",
+            )
+            .await
+    );
+    assert!(
+        !ledger
+            .reviewer_infrastructure_memo_matches(
+                "candidate-a",
+                "dossier-a",
+                "reviewer-a",
+                "capacity-available",
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn omitted_must_change_caller_is_rejected_then_counted_as_a_repair() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let mut packet = ready_owner_packet("owner", "src/lib.rs", "owner\n");
+    packet.relationships.push(OwnerPacketRelationship {
+        path: "src/caller.rs".to_string(),
+        role: "caller".to_string(),
+        start_line: 1,
+        end_line: 1,
+        disposition: OwnerRelationshipDisposition::MustChange,
+    });
+    packet.source_identities.push(OwnerPacketSourceIdentity {
+        path: "src/caller.rs".to_string(),
+        file_sha256: format!("{:x}", Sha256::digest(b"old caller\n")),
+    });
+    packet.counters.edits = 1;
+    {
+        let mut guard = ledger.document.lock().await;
+        guard.as_mut().expect("document").owner_packets = vec![packet];
+    }
+    let error = ledger
+        .prepare_owner_patch(&[OwnerPacketChangeRegion {
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        }])
+        .await
+        .expect_err("omitted must-change caller");
+    assert!(
+        error
+            .unresolved_obligations
+            .contains(&"must_change_caller:src/caller.rs".to_string())
+    );
+
+    let caller_after = b"new caller\n".to_vec();
+    let metrics = ledger
+        .record_owner_patch_finalization(
+            "caller-repair",
+            &[OwnerPacketBinding {
+                packet_id: {
+                    let guard = ledger.document.lock().await;
+                    guard.as_ref().expect("document").owner_packets[0]
+                        .packet_id
+                        .clone()
+                },
+                owner_id: "owner".to_string(),
+                regions: vec![OwnerPacketChangeRegion {
+                    path: "src/caller.rs".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+            }],
+            &[OwnerPacketPostMutationPath {
+                path: "src/caller.rs".to_string(),
+                existed: true,
+                file_sha256: Some(format!("{:x}", Sha256::digest(&caller_after))),
+                content: Some(caller_after),
+            }],
+        )
+        .await;
+    assert_eq!(metrics.caller_repairs, 1);
+    let guard = ledger.document.lock().await;
+    assert_eq!(
+        guard.as_ref().expect("document").owner_packets[0]
+            .counters
+            .caller_repairs,
+        1
+    );
 }

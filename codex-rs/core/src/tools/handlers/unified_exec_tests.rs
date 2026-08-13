@@ -62,6 +62,21 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
     );
 
     assert_eq!(output.raw_output, raw_output);
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let canonical = output
+        .canonical_result(&payload)
+        .expect("shell output has canonical bytes");
+    assert_eq!(canonical.bytes, raw_output);
+    assert_eq!(canonical.exact_bytes, raw_output.len() as u64);
+    let projection = output
+        .projection_metadata()
+        .expect("shell output has one bounded typed projection");
+    assert_eq!(projection.spillable_text.len(), 1);
+    assert!(projection.fragments.iter().any(|fragment| {
+        fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ProcessFinalStatus
+    }));
     let repair_notice = output
         .repair_notice
         .as_deref()
@@ -69,9 +84,6 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
     assert!(repair_notice.starts_with(existing_repair_notice));
     assert!(repair_notice.contains("retry with `kind: \"powershell_script\"`"));
 
-    let payload = ToolPayload::Function {
-        arguments: "{}".to_string(),
-    };
     assert_eq!(
         output.post_tool_use_response("call-parser-failure", &payload),
         Some(serde_json::json!("ParserError: Unexpected token 'foo'"))

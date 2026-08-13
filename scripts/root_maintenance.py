@@ -689,7 +689,9 @@ def git_context_label() -> str:
     return f"{branch}; {max(0, len(lines) - 1)} changed path(s)"
 
 
-def run_script_audit(*, include_tests: bool, strict: bool) -> int:
+def run_script_audit(
+    *, include_tests: bool, strict: bool, allow_platform_skips: bool = False
+) -> int:
     audit_targets = script_source_targets()
     kind_by_target = script_kind_map()
     inventory: dict[str, int] = {}
@@ -748,12 +750,20 @@ def run_script_audit(*, include_tests: bool, strict: bool) -> int:
         print(
             "[FAIL] --strict promoted optimization advisories to failures", flush=True
         )
-    if errors or failed_commands or strict_failure:
+    skipped_test_failure = bool(skipped_tests) and not allow_platform_skips
+    if skipped_test_failure:
+        print(
+            "[FAIL] platform-specific test coverage was skipped; "
+            "rerun on a capable host or pass --allow-platform-skips",
+            flush=True,
+        )
+    if errors or failed_commands or strict_failure or skipped_test_failure:
         print(
             "SCRIPT AUDIT FAILED: "
             f"{len(errors)} internal/context failure(s), "
             f"{len(failed_commands)} command failure(s), "
-            f"{len(advisories)} advisory item(s).",
+            f"{len(advisories)} advisory item(s), "
+            f"{len(skipped_tests)} platform test skip(s).",
             flush=True,
         )
         return 1
@@ -839,6 +849,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat optimization advisories such as large or syntax-only scripts as failures.",
     )
+    script_audit.add_argument(
+        "--allow-platform-skips",
+        action="store_true",
+        help="Allow a full audit to pass when platform-specific tests cannot run on this host.",
+    )
 
     return parser
 
@@ -908,7 +923,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.command == "audit-scripts":
-        return run_script_audit(include_tests=not args.quick, strict=args.strict)
+        return run_script_audit(
+            include_tests=not args.quick,
+            strict=args.strict,
+            allow_platform_skips=args.allow_platform_skips,
+        )
 
     raise AssertionError(f"unhandled command: {args.command}")
 

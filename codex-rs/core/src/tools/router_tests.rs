@@ -4,6 +4,9 @@ use crate::config::Config;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ToolPayload;
+use crate::tools::exposure::GoalSurfaceState;
+use crate::tools::exposure::ToolExposureIdentity;
+use crate::tools::registry::ToolRegistry;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistry;
@@ -40,6 +43,31 @@ use super::ToolRouterParams;
 use super::authorize_independent_review_tool_call;
 use super::collect_proven_read_only_external_tools;
 use super::extension_tool_executors;
+
+#[tokio::test]
+async fn serialized_tool_manifest_fingerprint_includes_exposure_identity() {
+    let (_session, turn) = make_session_and_context().await;
+    let disabled = ToolExposureIdentity {
+        goal_surface_state: GoalSurfaceState::Disabled,
+        ..ToolExposureIdentity::default()
+    };
+    let inactive = ToolExposureIdentity {
+        goal_surface_state: GoalSurfaceState::Inactive,
+        ..disabled.clone()
+    };
+    let router = |identity| {
+        ToolRouter::from_parts_with_warnings_and_identity(
+            ToolRegistry::empty_for_test(),
+            Vec::new(),
+            Vec::new(),
+            identity,
+        )
+    };
+
+    let disabled_hash = router(disabled.clone()).tool_manifest(&turn).hash;
+    assert_eq!(disabled_hash, router(disabled).tool_manifest(&turn).hash);
+    assert_ne!(disabled_hash, router(inactive).tool_manifest(&turn).hash);
+}
 
 struct ExtensionEchoContributor;
 
@@ -129,6 +157,7 @@ async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow
             mcp_tools: Some(mcp_tools),
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
         },
         &Default::default(),
     );
@@ -261,6 +290,7 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
             ]),
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
         },
         &Default::default(),
     );
@@ -299,6 +329,7 @@ async fn tools_without_handlers_do_not_support_parallel() -> anyhow::Result<()> 
             mcp_tools: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
         },
         &Default::default(),
     );
@@ -357,6 +388,7 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
             mcp_tools: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &dynamic_tools,
+            exposure_identity: Default::default(),
         },
         &Default::default(),
     );
@@ -548,6 +580,7 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
             mcp_tools: None,
             extension_tool_executors: extension_tool_executors(&session),
             dynamic_tools: turn.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
         },
         &Default::default(),
     );

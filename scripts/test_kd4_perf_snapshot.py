@@ -48,7 +48,20 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         result = kd4_perf_snapshot.measure_scenario(scenario)
 
         self.assertEqual(result.status, "skipped")
-        self.assertTrue(result.passed)
+        self.assertFalse(result.passed)
+        self.assertTrue(result.required)
+
+    def test_install_dir_override_is_independent_of_checkout_location(self) -> None:
+        install_dir = Path("C:/custom/local-codex")
+
+        catalog = kd4_perf_snapshot.scenario_catalog(
+            Path("C:/unrelated/checkout"), install_dir=install_dir
+        )
+
+        self.assertEqual(
+            Path(catalog["installed-codex-version"].command[0]).parent,
+            install_dir,
+        )
 
     def test_phase0_profile_covers_required_baseline_categories(self) -> None:
         catalog = kd4_perf_snapshot.scenario_catalog()
@@ -199,6 +212,63 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         )
         self.assertIsNone(kd4_model_attempt_analysis.spearman([1.0, 1.0], [2.0, 3.0]))
 
+    def test_amplification_coverage_retries_and_algebraic_attribution(self) -> None:
+        def attempt(attempt_id: str, retry: int, input_tokens: int, unique: int) -> dict[str, object]:
+            return {
+                "event.name": "codex.model_attempt",
+                "root_task_id": "root",
+                "measurement_window_id": "window",
+                "sampling_request_id": "window",
+                "attempt_id": attempt_id,
+                "retry_index": retry,
+                "outcome": "success",
+                "request_kind": "continuation",
+                "input_token_count": input_tokens,
+                "cached_input_token_count": input_tokens - 1,
+                "amplification_measurement_complete": True,
+                "unique_new_tokens": unique,
+                "local_projected_occupancy": 60,
+                "effective_provider_occupancy": 70,
+                "compactions": 3,
+                **{field: 1 for field in kd4_model_attempt_analysis.AMPLIFICATION_CATEGORY_FIELDS},
+            }
+
+        analysis = kd4_model_attempt_analysis.analyze(
+            [attempt("one", 0, 100, 20), attempt("two", 1, 100, 0)]
+        )
+        root = analysis["amplification"]["roots"][0]
+        self.assertEqual(root["physicalAttemptCount"], 2)
+        self.assertEqual(root["requestCount"], 1)
+        self.assertEqual(root["replayAmplification"], 10.0)
+        self.assertEqual(root["categoryTotals"]["checkpoint_tokens"], 1.0)
+        self.assertEqual(root["compactions"], 3.0)
+
+        attribution = kd4_model_attempt_analysis.algebraic_attribution(10, 40, 8, 30)
+        self.assertEqual(attribution["termSum"], attribution["observedInputDifference"])
+        self.assertIn("not independent causal proof", attribution["interpretation"])
+
+    def test_amplification_is_null_when_attempt_usage_is_missing(self) -> None:
+        record = {
+            "event.name": "codex.model_attempt",
+            "root_task_id": "root",
+            "measurement_window_id": "window",
+            "sampling_request_id": "window",
+            "attempt_id": "attempt",
+            "retry_index": 0,
+            "outcome": "failed",
+            "request_kind": "initial",
+            "input_token_count": None,
+            "cached_input_token_count": None,
+            "amplification_measurement_complete": True,
+            "unique_new_tokens": 10,
+            **{field: 0 for field in kd4_model_attempt_analysis.AMPLIFICATION_CATEGORY_FIELDS},
+        }
+        root = kd4_model_attempt_analysis.analyze([record])["amplification"]["roots"][0]
+        self.assertIsNone(root["replayAmplification"])
+        self.assertEqual(
+            root["replayAmplificationNullReason"], "missing_attempt_provider_usage"
+        )
+
     def test_model_attempt_jsonl_loader_and_parser_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "attempts.jsonl"
@@ -218,6 +288,140 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         )
         self.assertEqual(args.model_attempt_jsonl, [Path("attempts.jsonl")])
         self.assertEqual(args.model_attempt_report, Path("report.txt"))
+
+    def test_model_attempt_jsonl_loader_deduplicates_overlapping_files(self) -> None:
+        attempt = {
+            "event.name": "codex.model_attempt",
+            "sampling_request_id": "request",
+            "attempt_id": "attempt",
+            "retry_index": 0,
+            "outcome": "success",
+        }
+        conflicting = {**attempt, "outcome": "failed"}
+        with tempfile.TemporaryDirectory() as tempdir:
+            first = Path(tempdir) / "first.jsonl"
+            second = Path(tempdir) / "second.jsonl"
+            first.write_text(json.dumps(attempt) + "\n", encoding="utf-8")
+            second.write_text(
+                json.dumps(attempt) + "\n" + json.dumps(conflicting) + "\n",
+                encoding="utf-8",
+            )
+
+            records, diagnostics = kd4_model_attempt_analysis.load_jsonl(
+                [first, second]
+            )
+
+        self.assertEqual(records, [attempt, conflicting])
+        self.assertEqual(diagnostics["duplicate_physical_attempt_collapsed"], 1)
+        self.assertEqual(diagnostics["conflicting_physical_attempt_duplicate"], 1)
+
+    def test_stable_context_components_join_to_every_physical_attempt(self) -> None:
+        attempt = {
+            "event.name": "codex.model_attempt",
+            "sampling_request_id": "request",
+            "attempt_id": "attempt",
+            "retry_index": 0,
+            "outcome": "success",
+            "provider_baseline": "fresh_full_replay",
+            "fresh_response_id_established": True,
+            "wire_request_bytes": 1200,
+            "input_token_count": 1000,
+            "cached_input_token_count": 750,
+        }
+        component = {
+            "event.name": "codex.model_context_component",
+            "sampling_request_id": "request",
+            "attempt_id": "attempt",
+            "retry_index": 0,
+            "component_kind": "repository",
+            "contract_version": 1,
+            "semantic_id": "repository:v1:opaque",
+            "content_hash": "abcdef012345",
+            "serialized_bytes": 4000,
+            "approx_tokens": 1000,
+            "active": True,
+            "local_reused": True,
+        }
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "attempts.jsonl"
+            path.write_text(
+                json.dumps(attempt) + "\n" + json.dumps(component) + "\n",
+                encoding="utf-8",
+            )
+            records, diagnostics = kd4_model_attempt_analysis.load_jsonl([path])
+
+        self.assertEqual(diagnostics, {})
+        stable = kd4_model_attempt_analysis.analyze(records)["stableContext"]
+        self.assertEqual(stable["averageActiveContextTokens"], 1000.0)
+        self.assertEqual(stable["peakActiveContextTokens"], 1000.0)
+        self.assertEqual(stable["localReusedBytes"], 4000.0)
+        self.assertEqual(stable["providerCachedShare"], 0.75)
+        self.assertEqual(stable["successfulRebases"], 1)
+        self.assertEqual(stable["componentVersions"][0]["requestAppearances"], 1)
+        self.assertEqual(
+            stable["componentVersions"][0]["cumulativeLogicalExposureTokens"],
+            1000.0,
+        )
+
+    def test_stable_context_exposure_counts_retries_independent_of_provider_cache(self) -> None:
+        records = []
+        for index in range(10):
+            records.append(
+                {
+                    "event.name": "codex.model_attempt",
+                    "sampling_request_id": "request" if index < 2 else f"request-{index}",
+                    "attempt_id": f"attempt-{index}",
+                    "retry_index": index if index < 2 else 0,
+                    "outcome": "success",
+                    "input_token_count": 1000,
+                    "cached_input_token_count": 900,
+                    "_stable_context_components": [
+                        {
+                            "component_kind": "repository",
+                            "contract_version": 1,
+                            "semantic_id": "repository:v1:opaque",
+                            "content_hash": "abcdef012345",
+                            "serialized_bytes": 4000,
+                            "approx_tokens": 1000,
+                            "active": True,
+                            "local_reused": index > 0,
+                        }
+                    ],
+                }
+            )
+
+        analysis = kd4_model_attempt_analysis.analyze(records)
+        stable = analysis["stableContext"]
+
+        self.assertEqual(analysis["totalPhysicalAttempts"], 10)
+        self.assertEqual(analysis["totalLogicalRequests"], 9)
+        self.assertEqual(stable["cumulativeLogicalContextTokens"], 10_000.0)
+        self.assertEqual(
+            stable["componentVersions"][0]["cumulativeLogicalExposureTokens"],
+            10_000.0,
+        )
+        self.assertEqual(stable["providerCachedShare"], 0.9)
+        self.assertEqual(stable["localConstructedBytes"], 4000.0)
+        self.assertEqual(stable["localReusedBytes"], 36_000.0)
+        self.assertEqual(stable["componentCacheHits"], 9.0)
+
+    def test_stable_context_summary_tolerates_missing_provider_cache_fields(self) -> None:
+        stable = kd4_model_attempt_analysis.analyze(
+            [
+                {
+                    "event.name": "codex.model_attempt",
+                    "sampling_request_id": "request",
+                    "attempt_id": "attempt",
+                    "retry_index": 0,
+                    "outcome": "failed",
+                    "input_token_count": None,
+                    "cached_input_token_count": None,
+                }
+            ]
+        )["stableContext"]
+
+        self.assertIsNone(stable["providerCachedShare"])
+        self.assertEqual(stable["wireRequestBytes"], 0.0)
 
 
 if __name__ == "__main__":

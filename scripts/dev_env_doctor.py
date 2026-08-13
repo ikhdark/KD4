@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -127,7 +128,7 @@ def check_tool(
 
 def collect_checks() -> list[ToolCheck]:
     pnpm_pin = package_manager_pin()
-    return [
+    checks = [
         check_tool(
             "python",
             [sys.executable, "--version"],
@@ -148,6 +149,18 @@ def collect_checks() -> list[ToolCheck]:
             guidance="Install Rust with rustup, then run `rustup component add rustfmt clippy`.",
         ),
         check_tool(
+            "rustfmt",
+            ["cargo", "fmt", "--version"],
+            required=True,
+            guidance="Install with `rustup component add rustfmt`.",
+        ),
+        check_tool(
+            "clippy",
+            ["cargo", "clippy", "--version"],
+            required=True,
+            guidance="Install with `rustup component add clippy`.",
+        ),
+        check_tool(
             "just",
             ["just", "--version"],
             required=True,
@@ -158,6 +171,12 @@ def collect_checks() -> list[ToolCheck]:
             ["cargo", "nextest", "--version"],
             required=True,
             guidance="Install with `cargo install --locked cargo-nextest`.",
+        ),
+        check_tool(
+            "uv",
+            ["uv", "--version"],
+            required=True,
+            guidance="Install uv before running maintained Python workflows.",
         ),
         check_tool(
             "node",
@@ -174,6 +193,23 @@ def collect_checks() -> list[ToolCheck]:
             required_version=package_manager_version(pnpm_pin),
         ),
     ]
+    if os.name == "nt":
+        checks.append(
+            check_tool(
+                "pwsh",
+                [
+                    "pwsh",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-Command",
+                    "$PSVersionTable.PSVersion.ToString()",
+                ],
+                required=True,
+                guidance="Install PowerShell 7.4 or newer for maintained Windows recipes.",
+                min_version=(7, 4),
+            )
+        )
+    return checks
 
 
 def tool_status(check: ToolCheck) -> str:

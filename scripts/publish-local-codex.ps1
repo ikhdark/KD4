@@ -361,6 +361,48 @@ function Test-LocalPublishBuildRelevantPath {
     $normalized -notlike "codex-rs/target/*"
 }
 
+function Invoke-GitNulDelimitedList {
+    param(
+        [string]$GitPath,
+        [string]$RepoRoot,
+        [string[]]$Arguments
+    )
+
+    foreach ($argument in $Arguments) {
+        if ($argument -match '[\s"]') {
+            throw "Invoke-GitNulDelimitedList only accepts fixed, whitespace-free Git arguments."
+        }
+    }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $GitPath
+    $startInfo.WorkingDirectory = $RepoRoot
+    $startInfo.Arguments = $Arguments -join " "
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        [void]$process.Start()
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Records = @($stdout.Split([char]0) | Where-Object { $_.Length -gt 0 })
+            Error = $stderr.Trim()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Get-TrackedSourceNewestWriteUtc {
     param(
         [string]$RepoRoot,
@@ -374,20 +416,17 @@ function Get-TrackedSourceNewestWriteUtc {
 
     $newest = $null
 
-    # Windows PowerShell 5.1 turns redirected native stderr into terminating
-    # errors while $ErrorActionPreference is "Stop"; git failures here must
-    # fall back to "freshness unknown" instead of aborting.
-    $oldErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
     try {
-        $trackedFiles = & $git.Source -c core.quotepath=false -C $RepoRoot ls-files -- codex-rs scripts/publish-local-codex.ps1 scripts/common-rust-env.ps1 justfile 2>$null
-        $trackedFilesExitCode = $LASTEXITCODE
+        $trackedResult = Invoke-GitNulDelimitedList `
+            -GitPath $git.Source `
+            -RepoRoot $RepoRoot `
+            -Arguments @("-c", "core.quotepath=false", "ls-files", "-z", "--", "codex-rs", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
     }
-    finally {
-        $ErrorActionPreference = $oldErrorActionPreference
+    catch {
+        return $null
     }
-    if ($trackedFilesExitCode -eq 0) {
-        foreach ($file in $trackedFiles) {
+    if ($trackedResult.ExitCode -eq 0) {
+        foreach ($file in $trackedResult.Records) {
             if (-not (Test-LocalPublishBuildRelevantPath -Path $file)) {
                 continue
             }
@@ -403,32 +442,38 @@ function Get-TrackedSourceNewestWriteUtc {
         }
     }
 
-    $oldErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
     try {
-        $changedFiles = & $git.Source -c core.quotepath=false -C $RepoRoot status --porcelain=v1 -uall -- 2>$null
-        $changedFilesExitCode = $LASTEXITCODE
+        $changedResult = Invoke-GitNulDelimitedList `
+            -GitPath $git.Source `
+            -RepoRoot $RepoRoot `
+            -Arguments @("-c", "core.quotepath=false", "status", "--porcelain=v1", "-z", "-uall", "--")
     }
-    finally {
-        $ErrorActionPreference = $oldErrorActionPreference
+    catch {
+        if ($RequireStatusScan) {
+            return $null
+        }
+        return $newest
     }
-    if ($changedFilesExitCode -ne 0) {
+    if ($changedResult.ExitCode -ne 0) {
         if ($RequireStatusScan) {
             return $null
         }
         return $newest
     }
 
-    foreach ($entry in $changedFiles) {
+    $changedFiles = @($changedResult.Records)
+    for ($changedIndex = 0; $changedIndex -lt $changedFiles.Count; $changedIndex++) {
+        $entry = $changedFiles[$changedIndex]
         if ([string]::IsNullOrWhiteSpace($entry) -or $entry.Length -lt 4) {
             continue
         }
         $statusCode = $entry.Substring(0, 2)
-        $file = $entry.Substring(3).Trim()
-        if ($file -match " -> ") {
-            $file = ($file -split " -> ", 2)[1]
+        $file = $entry.Substring(3)
+        if (($statusCode.Contains("R") -or $statusCode.Contains("C")) -and ($changedIndex + 1) -lt $changedFiles.Count) {
+            # In porcelain v1 -z output the destination is in the status
+            # record and the source path follows as a second NUL record.
+            $changedIndex++
         }
-        $file = $file.Trim('"')
         if (-not (Test-LocalPublishBuildRelevantPath -Path $file)) {
             continue
         }
@@ -525,8 +570,12 @@ function Get-LocalPublishBuildInputFingerprint {
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $inputPaths = @(& $git.Source -c core.quotepath=false -C $RepoRoot ls-files --cached --others --exclude-standard -- codex-rs scripts/publish-local-codex.ps1 scripts/common-rust-env.ps1 justfile 2>$null)
-        $inputPathsExitCode = $LASTEXITCODE
+        $inputPathsResult = Invoke-GitNulDelimitedList `
+            -GitPath $git.Source `
+            -RepoRoot $RepoRoot `
+            -Arguments @("-c", "core.quotepath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "codex-rs", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
+        $inputPaths = @($inputPathsResult.Records)
+        $inputPathsExitCode = $inputPathsResult.ExitCode
         $headCommit = @(& $git.Source -C $RepoRoot rev-parse --verify HEAD 2>$null)
         $headCommitExitCode = $LASTEXITCODE
     }
@@ -544,7 +593,7 @@ function Get-LocalPublishBuildInputFingerprint {
 
     $relevantPaths = [System.Collections.Generic.List[string]]::new()
     foreach ($inputPath in $inputPaths) {
-        $normalized = ([string]$inputPath).Trim().Trim('"') -replace "\\", "/"
+        $normalized = ([string]$inputPath) -replace "\\", "/"
         if (Test-LocalPublishBuildRelevantPath -Path $normalized) {
             $relevantPaths.Add($normalized)
         }
@@ -574,7 +623,7 @@ function Get-LocalPublishBuildInputFingerprint {
             }
 
             $fileInfo = [System.IO.FileInfo]::new($path)
-            $fileSha256 = Get-CachedLocalPublishFileSha256 -Path $path
+            $fileSha256 = Get-CachedLocalPublishFileSha256 -Path $path -ForceRefresh
             if (-not (Test-Sha256Text -Value $fileSha256)) {
                 return $null
             }
@@ -994,6 +1043,7 @@ function Get-RunningCodexTargetProcesses {
         foreach ($process in $candidates) {
             try {
                 $processPath = $process.Path
+                $processStartTimeUtcTicks = $process.StartTime.ToUniversalTime().Ticks
             }
             catch {
                 if (
@@ -1023,6 +1073,7 @@ function Get-RunningCodexTargetProcesses {
                 [pscustomobject]@{
                     Id = $process.Id
                     Path = $processPath
+                    StartTimeUtcTicks = $processStartTimeUtcTicks
                 }
             }
         }
@@ -1057,23 +1108,21 @@ function Get-LiveProcessesById {
             }
             try {
                 $processPath = $process.Path
+                $processStartTimeUtcTicks = $process.StartTime.ToUniversalTime().Ticks
                 if (
                     [string]::Equals(
                         [System.IO.Path]::GetFullPath($processPath),
                         [System.IO.Path]::GetFullPath([string]$candidate.Path),
                         [System.StringComparison]::OrdinalIgnoreCase
-                    )
+                    ) -and
+                    $processStartTimeUtcTicks -eq [int64]$candidate.StartTimeUtcTicks
                 ) {
                     $process
                     $process = $null
                 }
             }
             catch {
-                # The original PID still exists but its module is inaccessible.
-                # Keep treating it as live rather than confusing access denial
-                # with exit.
-                $process
-                $process = $null
+                throw "Could not revalidate process identity for pid=$($candidate.Id): $($_.Exception.Message)"
             }
             finally {
                 if ($null -ne $process) {
@@ -1090,33 +1139,34 @@ function Stop-RunningCodexTargetProcesses {
         [int]$TimeoutSeconds
     )
 
-    $ids = @($Processes | ForEach-Object { [int]$_.Id })
-    if ($ids.Count -eq 0) {
+    if ($Processes.Count -eq 0) {
         return
     }
 
     Write-ProofLine "closeRunningTarget" "requested: $(Format-ProcessProof $Processes); timeoutSeconds=$TimeoutSeconds"
 
     $closeDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    foreach ($id in $ids) {
+    foreach ($candidate in $Processes) {
+        $matchingProcesses = @(Get-LiveProcessesById -Processes @($candidate))
+        if ($matchingProcesses.Count -eq 0) {
+            continue
+        }
+        $process = $matchingProcesses[0]
         try {
-            $process = Get-Process -Id $id -ErrorAction Stop
-            try {
-                if ($process.MainWindowHandle -eq [IntPtr]::Zero) {
-                    continue
-                }
-                [void]$process.CloseMainWindow()
-                $remainingMilliseconds = [Math]::Max(
-                    0,
-                    [int][Math]::Ceiling(($closeDeadline - [DateTime]::UtcNow).TotalMilliseconds)
-                )
-                [void]$process.WaitForExit($remainingMilliseconds)
+            if ($process.MainWindowHandle -eq [IntPtr]::Zero) {
+                continue
             }
-            finally {
-                $process.Dispose()
-            }
+            [void]$process.CloseMainWindow()
+            $remainingMilliseconds = [Math]::Max(
+                0,
+                [int][Math]::Ceiling(($closeDeadline - [DateTime]::UtcNow).TotalMilliseconds)
+            )
+            [void]$process.WaitForExit($remainingMilliseconds)
         }
         catch {
+        }
+        finally {
+            $process.Dispose()
         }
     }
 
@@ -1125,7 +1175,7 @@ function Stop-RunningCodexTargetProcesses {
         Write-ProofLine "closeRunningTargetForce" (Format-ProcessProof $liveProcesses)
         foreach ($process in $liveProcesses) {
             try {
-                Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                Stop-Process -InputObject $process -Force -ErrorAction Stop
             }
             catch {
             }
@@ -3069,9 +3119,18 @@ if (
     $binaryChanged -and
     -not $DryRun -and
     -not $AllowRunningTarget -and
-    -not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError)
+    (
+        -not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError) -or
+        $script:RunningTargetProcessProbeWarnings.Count -gt 0
+    )
 ) {
-    throw "Cannot safely publish because running-target process detection failed: $script:RunningTargetProcessProbeError. Rerun after fixing process access, or explicitly use -AllowRunningTarget."
+    $probeFailure = if (-not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError)) {
+        $script:RunningTargetProcessProbeError
+    }
+    else {
+        $script:RunningTargetProcessProbeWarnings -join "; "
+    }
+    throw "Cannot safely publish because running-target process detection was indeterminate: $probeFailure. Rerun after fixing process access, or explicitly use -AllowRunningTarget."
 }
 Write-DesktopProof -BinaryChanged $binaryChanged -FastProof:$FastProof
 if ($sourceBuildStale) {
@@ -3202,6 +3261,9 @@ if ($runningTargetProcesses.Count -gt 0 -and $binaryChanged -and -not $AllowRunn
     $runningTargetProcesses = @($allRunningTargetProcesses | Sort-Object -Property Id -Unique)
     if (-not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError)) {
         throw "Cannot safely publish because the post-close running-target process probe failed: $script:RunningTargetProcessProbeError. Rerun after fixing process access, or explicitly use -AllowRunningTarget."
+    }
+    if ($script:RunningTargetProcessProbeWarnings.Count -gt 0) {
+        throw "Cannot safely publish because the post-close running-target process probe was indeterminate: $($script:RunningTargetProcessProbeWarnings -join '; '). Rerun after fixing process access, or explicitly use -AllowRunningTarget."
     }
     if ($runningTargetProcesses.Count -gt 0) {
         throw "Target Codex publish bundle is still running ($((Format-ProcessProof $runningTargetProcesses))). Close Codex Desktop or rerun with -AllowRunningTarget."
