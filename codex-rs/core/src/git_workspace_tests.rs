@@ -428,6 +428,38 @@ async fn repository_manifest_revalidates_overlay_and_rehashes_only_changed_paths
 }
 
 #[tokio::test]
+async fn repository_manifest_falls_back_when_host_mutations_prevent_cache_admission() {
+    let (_repo_dir, repo) = create_clean_git_repo().await;
+    let codex_home = TempDir::new().expect("codex home");
+    let state = StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("state runtime");
+    let store = LocalAgentTaskStore::initialize(&state)
+        .await
+        .expect("task store");
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+
+    let mutating_cache = Arc::clone(&cache);
+    let mutator = tokio::spawn(async move {
+        loop {
+            mutating_cache.note_host_workspace_mutation();
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::task::yield_now().await;
+
+    let prepared = cache
+        .prepare_repository_manifest(&store, repo.as_path())
+        .await
+        .expect("transient cache-admission races fall back to a fresh manifest")
+        .expect("prepared manifests supported");
+    mutator.abort();
+
+    assert_eq!(prepared.work().manifests_constructed, 1);
+    assert!(cache.state.lock().await.repository_manifests.is_empty());
+}
+
+#[tokio::test]
 async fn final_repository_manifest_seeds_the_post_commit_receipt_without_an_extra_scan() {
     let (_repo_dir, repo) = create_clean_git_repo().await;
     let codex_home = TempDir::new().expect("codex home");

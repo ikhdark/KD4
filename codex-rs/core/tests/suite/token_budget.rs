@@ -40,6 +40,7 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
+use regex_lite::Regex;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -571,14 +572,14 @@ async fn token_budget_reminder_uses_body_after_prefix_window() -> Result<()> {
                 ev_response_created("resp-1"),
                 ev_assistant_message("msg-1", "prefix established"),
                 ev_completed_with_usage(
-                    "resp-1", /*input_tokens*/ 80_000, /*output_tokens*/ 0,
+                    "resp-1", /*input_tokens*/ 40_000, /*output_tokens*/ 0,
                 ),
             ]),
             sse(vec![
                 ev_response_created("resp-2"),
                 ev_assistant_message("msg-2", "body grew"),
                 ev_completed_with_usage(
-                    "resp-2", /*input_tokens*/ 86_000, /*output_tokens*/ 0,
+                    "resp-2", /*input_tokens*/ 46_000, /*output_tokens*/ 0,
                 ),
             ]),
             sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
@@ -587,12 +588,12 @@ async fn token_budget_reminder_uses_body_after_prefix_window() -> Result<()> {
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(100_000);
-            config.model_auto_compact_token_limit = Some(10_000);
+            config.model_context_window = Some(1_000_000);
+            config.model_auto_compact_token_limit = Some(100_000);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
             config.token_budget = Some(TokenBudgetConfig {
-                reminder_threshold_tokens: Some(6_000),
+                reminder_threshold_tokens: Some(94_000),
                 ..TokenBudgetConfig::default()
             });
             config
@@ -609,7 +610,7 @@ async fn token_budget_reminder_uses_body_after_prefix_window() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 3);
-    let reminder = "Your context window is nearly exhausted (only 4000 tokens remaining) and will be automatically reset for you soon. Once reset, message items in current context window will be cleared in the new window, but notes and history items will be persistent across windows.";
+    let reminder = "Your context window is nearly exhausted (only 94000 tokens remaining) and will be automatically reset for you soon. Once reset, message items in current context window will be cleared in the new window, but notes and history items will be persistent across windows.";
     let second_request_developer_texts = requests[1].message_input_texts("developer");
     assert!(
         second_request_developer_texts
@@ -724,8 +725,8 @@ async fn get_context_remaining_uses_body_after_prefix_window() -> Result<()> {
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(10_000);
-            config.model_auto_compact_token_limit = Some(7_000);
+            config.model_context_window = Some(100_000);
+            config.model_auto_compact_token_limit = Some(20_000);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
             config
@@ -748,7 +749,7 @@ async fn get_context_remaining_uses_body_after_prefix_window() -> Result<()> {
         "get_context_remaining should be exposed when token budget is enabled"
     );
 
-    let remaining_context = "You have 6500 tokens left in this context window.".to_string();
+    let remaining_context = "You have 19500 tokens left in this context window.".to_string();
     assert_eq!(
         requests[2].function_call_output_content_and_success(call_id),
         Some((Some(remaining_context), None))
@@ -885,12 +886,12 @@ async fn token_budget_context_uses_new_window_after_compaction() -> Result<()> {
     );
     assert_ne!(post_compaction_window_id, initial_window_id);
     assert!(
-        !requests[1].body_contains_text("before compact"),
-        "token budget compaction should drop prior user messages"
+        requests[1].body_contains_text("before compact"),
+        "task-checkpoint replacement should retain uncategorized active user instructions"
     );
     assert!(
-        !requests[1].body_contains_text("assistant before compact"),
-        "token budget compaction should drop prior assistant messages"
+        requests[1].body_contains_text("assistant before compact"),
+        "task-checkpoint replacement should retain bounded current response state"
     );
     assert!(
         requests[1].body_contains_text("after compact"),
@@ -1018,8 +1019,8 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up() 
         Some(initial_window_id.as_str())
     );
     assert!(
-        !requests[1].body_contains_text("trigger mid-turn auto compaction"),
-        "fresh token-budget windows should drop prior user messages"
+        requests[1].body_contains_text("trigger mid-turn auto compaction"),
+        "task-checkpoint replacement should retain uncategorized active user instructions"
     );
     assert_ne!(
         follow_up_window_id, initial_window_id,
@@ -1100,8 +1101,8 @@ async fn new_context_tool_starts_new_window_before_follow_up() -> Result<()> {
     );
     assert_ne!(new_window_id, initial_window_id);
     assert!(
-        !requests[2].body_contains_text("request new context window"),
-        "new_context should drop the prior window history before continuing the turn"
+        requests[2].body_contains_text("request new context window"),
+        "new_context should retain the active uncategorized user instruction"
     );
     assert_eq!(
         requests[2].function_call_output_text(continue_call_id),
@@ -1116,6 +1117,11 @@ async fn new_context_tool_starts_new_window_before_follow_up() -> Result<()> {
         .replace(&thread_id.to_string(), "<THREAD_ID>")
         .replace(&new_first_window_id, "<FIRST_WINDOW_ID>")
         .replace(&new_window_id, "<WINDOW_ID>");
+    let semantic_hash_regex = Regex::new(r#""semantic_hash":"[0-9a-f]{64}""#)
+        .expect("semantic hash regex should compile");
+    let snapshot = semantic_hash_regex
+        .replace_all(&snapshot, r#""semantic_hash":"<SEMANTIC_HASH>""#)
+        .into_owned();
     insta::assert_snapshot!(
         "token_budget_new_context_window_tool_full_context",
         snapshot

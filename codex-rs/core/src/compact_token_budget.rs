@@ -5,6 +5,7 @@ use crate::compact::SUMMARY_PREFIX;
 use crate::compact::build_compacted_history;
 use crate::compact::collect_user_messages;
 use crate::context::world_state::WorldState;
+use crate::context_manager::estimate_item_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -26,6 +27,8 @@ use sha2::Digest;
 use sha2::Sha256;
 
 const ORDINARY_CHECKPOINT_TOKEN_BUDGET: usize = 8_000;
+const CURRENT_RESPONSE_STATE_TOKEN_BUDGET: i64 = 8_000;
+const CURRENT_RESPONSE_STATE_SERIALIZED_BYTE_BUDGET: usize = 64 * 1024;
 const CHECKPOINT_HASH_DOMAIN: &[u8] = b"codex.kd4.task-checkpoint.v1";
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,30 +137,73 @@ fn build_checkpoint_replacement_history(
     });
 
     // The established compaction contract rebuilds canonical initial context
-    // separately. Keep only provider-required compaction items plus response
-    // state emitted after the latest real user input. Raw operational calls and
-    // payloads are intentionally represented only by checkpoint proof/artifact
-    // IDs rather than being rehydrated into the active prompt.
-    retained.extend(items.iter().enumerate().filter_map(|(index, item)| {
-        use codex_protocol::models::ResponseItem;
-        let provider_required = matches!(
-            item,
-            ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
-        );
-        let after_current_user = current_turn_start.is_some_and(|start| index > start);
-        let current_response_state = after_current_user
-            && (matches!(
-                item,
-                ResponseItem::Message { role, .. } if role == "assistant"
-            ) || matches!(
-                item,
-                ResponseItem::AgentMessage { .. }
-                    | ResponseItem::Reasoning { .. }
-                    | ResponseItem::AdditionalTools { .. }
-            ));
-        (provider_required || current_response_state).then(|| item.clone())
-    }));
+    // separately. Keep provider-required compaction items plus a newest-first,
+    // hard-bounded slice of response state emitted after the latest real user
+    // input. Raw operational calls and payloads are intentionally represented
+    // only by checkpoint proof/artifact IDs rather than being rehydrated into
+    // the active prompt.
+    retained.extend(
+        items
+            .iter()
+            .filter(|item| {
+                use codex_protocol::models::ResponseItem;
+                matches!(
+                    item,
+                    ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+                )
+            })
+            .cloned(),
+    );
+    retained.extend(bounded_current_response_state(items, current_turn_start));
     retained
+}
+
+fn bounded_current_response_state(
+    items: &[codex_protocol::models::ResponseItem],
+    current_turn_start: Option<usize>,
+) -> Vec<codex_protocol::models::ResponseItem> {
+    use codex_protocol::models::ResponseItem;
+
+    let Some(current_turn_start) = current_turn_start else {
+        return Vec::new();
+    };
+    let mut remaining = CURRENT_RESPONSE_STATE_TOKEN_BUDGET;
+    // Reserve one byte beyond each item's comma allowance so the surrounding
+    // JSON array brackets also stay inside the serialized-size cap.
+    let mut remaining_serialized_bytes =
+        CURRENT_RESPONSE_STATE_SERIALIZED_BYTE_BUDGET.saturating_sub(1);
+    let mut selected_reversed = Vec::new();
+    for item in items
+        .iter()
+        .skip(current_turn_start.saturating_add(1))
+        .rev()
+    {
+        let is_current_response_state = matches!(
+            item,
+            ResponseItem::Message { role, .. } if role == "assistant"
+        ) || matches!(
+            item,
+            ResponseItem::AgentMessage { .. }
+                | ResponseItem::Reasoning { .. }
+                | ResponseItem::AdditionalTools { .. }
+        );
+        if !is_current_response_state {
+            continue;
+        }
+        let item_tokens = estimate_item_token_count(item).max(0);
+        let item_serialized_bytes = serde_json::to_vec(item)
+            .map(|serialized| serialized.len().saturating_add(1))
+            .unwrap_or(usize::MAX);
+        if item_tokens > remaining || item_serialized_bytes > remaining_serialized_bytes {
+            continue;
+        }
+        remaining = remaining.saturating_sub(item_tokens);
+        remaining_serialized_bytes =
+            remaining_serialized_bytes.saturating_sub(item_serialized_bytes);
+        selected_reversed.push(item.clone());
+    }
+    selected_reversed.reverse();
+    selected_reversed
 }
 
 fn empty_checkpoint_snapshot(thread_id: String) -> CanonicalTaskCheckpointSnapshot {
@@ -483,5 +529,79 @@ mod tests {
         assert!(encoded.contains("provider-required-compaction"));
         assert!(!encoded.contains("raw-operational-payload"));
         assert!(!encoded.contains("root:1"));
+    }
+
+    #[test]
+    fn repeated_checkpoint_projection_bounds_current_response_state() {
+        let mut history = vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "long-running task".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }];
+        history.extend((0..64).map(|index| ResponseItem::Reasoning {
+            id: None,
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some(format!("reasoning-{index}-{}", "x".repeat(4_096))),
+            internal_chat_message_metadata_passthrough: None,
+        }));
+
+        let first = build_task_checkpoint(
+            empty_checkpoint_snapshot("root".to_string()),
+            "root:1".to_string(),
+        )
+        .unwrap();
+        let first_projection = build_checkpoint_replacement_history(&history, &first);
+        let first_response_state = first_projection
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::Reasoning { .. }))
+            .collect::<Vec<_>>();
+        let first_response_tokens = first_response_state
+            .iter()
+            .map(|item| estimate_item_token_count(item))
+            .sum::<i64>();
+        let first_response_serialized_bytes =
+            serde_json::to_vec(&first_response_state).unwrap().len();
+        assert!(first_response_tokens <= CURRENT_RESPONSE_STATE_TOKEN_BUDGET);
+        assert!(first_response_serialized_bytes <= CURRENT_RESPONSE_STATE_SERIALIZED_BYTE_BUDGET);
+        assert!(first_response_state.len() < 64);
+        let first_encoded = serde_json::to_string(&first_projection).unwrap();
+        assert!(first_encoded.contains("reasoning-63-"));
+        assert!(!first_encoded.contains("reasoning-0-"));
+
+        let mut repeated_history = first_projection;
+        repeated_history.extend((64..128).map(|index| ResponseItem::Reasoning {
+            id: None,
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some(format!("reasoning-{index}-{}", "y".repeat(4_096))),
+            internal_chat_message_metadata_passthrough: None,
+        }));
+        let second = build_task_checkpoint(
+            empty_checkpoint_snapshot("root".to_string()),
+            "root:2".to_string(),
+        )
+        .unwrap();
+        let second_projection = build_checkpoint_replacement_history(&repeated_history, &second);
+        let second_response_tokens = second_projection
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::Reasoning { .. }))
+            .map(estimate_item_token_count)
+            .sum::<i64>();
+        let second_response_state = second_projection
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::Reasoning { .. }))
+            .collect::<Vec<_>>();
+        let second_response_serialized_bytes =
+            serde_json::to_vec(&second_response_state).unwrap().len();
+        assert!(second_response_tokens <= CURRENT_RESPONSE_STATE_TOKEN_BUDGET);
+        assert!(second_response_serialized_bytes <= CURRENT_RESPONSE_STATE_SERIALIZED_BYTE_BUDGET);
+        let second_encoded = serde_json::to_string(&second_projection).unwrap();
+        assert!(second_encoded.contains("reasoning-127-"));
+        assert!(!second_encoded.contains("reasoning-63-"));
     }
 }

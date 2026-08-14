@@ -92,6 +92,14 @@ fn kd4_continuation_dispatch_requires_rebase_when_baseline_is_missing() {
     );
 }
 
+#[test]
+fn kd4_compaction_requires_real_post_compaction_headroom() {
+    assert!(kd4_compaction_created_meaningful_headroom(64_000));
+    assert!(!kd4_compaction_created_meaningful_headroom(64_001));
+    assert!(!kd4_compaction_created_meaningful_headroom(68_500));
+    assert!(!kd4_compaction_created_meaningful_headroom(72_000));
+}
+
 fn run_turn_multi_thread_test_with_stack<F, Fut, T>(test_name: &'static str, test: F) -> T
 where
     F: FnOnce() -> Fut + Send + 'static,

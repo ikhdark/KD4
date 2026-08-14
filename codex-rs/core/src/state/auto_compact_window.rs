@@ -45,6 +45,9 @@ pub(super) struct AutoCompactWindow {
     /// Runtime-only proof that the current post-compaction composition has an
     /// unavoidable 72K-80K floor. It is never persisted as task evidence.
     soft_floor_receipt_identity: Option<String>,
+    /// Runtime-only circuit breaker for an operating-budget compaction that
+    /// failed to create useful headroom during the current turn.
+    ineffective_budget_compaction_turn_id: Option<String>,
 }
 
 impl AutoCompactWindow {
@@ -56,6 +59,7 @@ impl AutoCompactWindow {
             prefill_input_tokens: None,
             token_budget_reminder_delivered: false,
             soft_floor_receipt_identity: None,
+            ineffective_budget_compaction_turn_id: None,
         }
     }
 
@@ -84,6 +88,7 @@ impl AutoCompactWindow {
         self.prefill_input_tokens = None;
         self.token_budget_reminder_delivered = false;
         self.soft_floor_receipt_identity = None;
+        self.ineffective_budget_compaction_turn_id = None;
         (self.window_number, self.ids)
     }
 
@@ -97,6 +102,18 @@ impl AutoCompactWindow {
 
     pub(super) fn record_soft_floor_receipt(&mut self, identity: String) {
         self.soft_floor_receipt_identity = Some(identity);
+    }
+
+    pub(super) fn budget_compaction_blocked_for_turn(&self, turn_id: &str) -> bool {
+        self.ineffective_budget_compaction_turn_id.as_deref() == Some(turn_id)
+    }
+
+    pub(super) fn record_budget_compaction_outcome(
+        &mut self,
+        turn_id: String,
+        meaningful_headroom: bool,
+    ) {
+        self.ineffective_budget_compaction_turn_id = (!meaningful_headroom).then_some(turn_id);
     }
 
     pub(super) fn request_new_context_window(&mut self) {
@@ -258,5 +275,21 @@ mod tests {
 
         window.advance();
         assert!(!window.soft_floor_receipt_matches("identity-a"));
+    }
+
+    #[test]
+    fn ineffective_budget_compaction_blocks_only_the_same_turn_and_window() {
+        let mut window = AutoCompactWindow::new_with_ids(AutoCompactWindowIds::new_initial());
+
+        window.record_budget_compaction_outcome("turn-a".to_string(), false);
+        assert!(window.budget_compaction_blocked_for_turn("turn-a"));
+        assert!(!window.budget_compaction_blocked_for_turn("turn-b"));
+
+        window.record_budget_compaction_outcome("turn-a".to_string(), true);
+        assert!(!window.budget_compaction_blocked_for_turn("turn-a"));
+
+        window.record_budget_compaction_outcome("turn-a".to_string(), false);
+        window.advance();
+        assert!(!window.budget_compaction_blocked_for_turn("turn-a"));
     }
 }

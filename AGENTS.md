@@ -4,8 +4,7 @@
   [`openai/codex`](https://github.com/openai/codex). Treat the active repository
   root as the checkout location and treat work as fork-local unless the user
   explicitly requests upstream, product-facing, or distribution-ready changes.
-- Codex Desktop sets `CODEX_HOME` for the active Desktop configuration and
-  state. Use that environment variable rather than assuming a user-profile
+- Publishing the fork Codex Desktop sets a seperate `CODEX_HOME` which is "C:\Users\kuh\Desktop\LOCAL-KD" for the active fork Desktop configuration and state. Use that environment variable rather than assuming a user-profile
   `.codex` directory or a machine-specific absolute path.
 - [`SOURCEMAP.md`](SOURCEMAP.md) owns repository inventory, runtime entrypoints,
   package and Rust-domain routing, generated contracts, validation routes, and
@@ -29,15 +28,8 @@
 
 ## Instruction scope
 
-Read the closest relevant `AGENTS.md`. A nearer file augments this policy and
-takes precedence inside its subtree. Never rely on an instruction file that is
-absent from the working tree.
-
-When the user presents a file path, read the entire file before changing it.
-
-Use ownership maps and source-of-truth documents to identify the relevant local
-owner. Do not expand into unrelated ownership documents after the required owner
-and affected routes are clear.
+When the user presents a file path or uploaded file, you are required to read the entire file.
+Do not over-engineer implementations or plans.
 
 ## Delegated and durable workflows
 
@@ -45,48 +37,25 @@ Root sessions do not need inactive role procedures. When delegation, durable
 artifacts, or the architect-driven implementation lane is actually selected,
 load [`.codex/harness/workflow.md`](.codex/harness/workflow.md). Child agents
 receive their selected role policy plus the compact shared rules supplied by the
-runtime; do not inject unrelated role bodies.
+runtime; do not inject unrelated role bodies. If experiancing agent issues, fall back to the default agents.
 
 ## Operating defaults
-
-Use the fastest safe path that completes the accepted request correctly.
-
-* Keep work within the accepted task scope. Read or modify files outside the
-  initial target only when they define, reference, generate, depend on, validate,
-  or are directly affected by the requested change.
-* Before implementing, identify the owner, affected behavior and callers,
-  compatibility or generated-output risks, and validation route. Stop exploring
-  once those are clear unless new evidence expands the scope.
+* Do not publish unless the user explicitly asks.
+* Keep work within the accepted task scope.
 * When deleting or renaming a file, update task-relevant references, ownership
   records, manifests, generators, and documentation that would otherwise become
   incorrect.
-* You may make directly related implementation improvements when repository
-  evidence supports them and they do not materially expand the requested change.
-  Do not use a directed task as justification for broad cleanup or redesign.
-* Preserve unrelated concurrent work. When task-relevant versions compete,
-  compare them once and keep or combine the best compatible behavior.
-* Do not loop on unchanged checks, repeat searches without a new question, or
-  repeatedly revisit completed work.
-* For audits or bug checks, survey the accepted scope; classify unresolved
-  candidates and never invent findings. Do not turn a directed fix into a broad
-  fix.
-* Fix validation, test, or implementation blockers caused by the change or
-  necessary to complete the requested task. For unrelated, pre-existing, or
-  concurrently introduced blockers, avoid overwriting other agents' work; record
-  the blocker and continue where safely possible.
-* Ask the user only when a material requirement cannot be discovered safely.
+* For bug checks, never invent findings, when you find a bug, assume there are more and continue until none are found, do not claim a bug simply because you think there is a "better" verison, if the code is functional, do not touch it. 
+* Do not turn a directed fix into a broad fix.
+* Avoid blindly overwriting other agents' work, Compare both verisons and pick the better verison or combine the best compatible behavior.
+* When unsure, ask the user questions to collect intention and guidance.
 
-## Validation and local-build proof
+## Validation
 
-- Rust crates: follow `codex-rs/AGENTS.md` and the closest crate-specific
-  guidance. Use the smallest focused test or check that proves the changed
-  contract before broader validation.
-- Scripts: follow `scripts/AGENTS.md` and use the closest syntax, unit, dry-run,
-  or policy test for the edited script.
-- Do not publish unless the user explicitly asks.
-- Regenerate owned artifacts through their documented generator; do not hand-edit
-  generated locks or generated protocol/schema outputs.
-- Prefer targeted tests; avoid full crate or workspace runs unless asked.
-- Tooling success alone does not prove a behavior or runtime fix. Completion
-  requires the focused failing test or approved final gate to pass, and
-  desktop-visible changes also require the local publish/restart proof.
+- Validation must stay task-scoped. Do not run full-suite or workspace-wide tests. Run only the narrowest tests that directly cover the changed behavior and its affected contract, unless told otherwise.
+
+# Benchmarking
+
+- Do not label unit-test duration, test-binary startup time, analytical action-count projections, stale compiled binaries, or source-level estimates as runtime benchmarks.
+- "C:\Users\kuh\Desktop\LOCAL-KD\backups" contains previous fork binarys that can be used for the A/B comparisons of the previous version to the current verison.
+- "C:\Users\kuh\Desktop\LOCAL-KD\sessions" contains the rollouts for the fork which are to be used for static diagnosis. 

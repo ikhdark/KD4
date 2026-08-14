@@ -177,6 +177,7 @@ use tracing::trace_span;
 use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
+const KD4_MIN_POST_COMPACTION_HEADROOM: i64 = 8_000;
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -2931,6 +2932,7 @@ async fn enforce_kd4_dispatch_budget(
     }
 
     let mut compacted = false;
+    let mut operating_budget_compaction_before: Option<i64> = None;
     loop {
         let Some(local_projected_occupancy) = estimate_prompt_occupancy(prompt) else {
             if compacted {
@@ -2994,6 +2996,31 @@ async fn enforce_kd4_dispatch_budget(
                 .invalidate_incremental_history("provider occupancy baseline unavailable");
             continue;
         };
+        if let Some(pre_compaction_occupancy) = operating_budget_compaction_before.take() {
+            let meaningful_headroom =
+                kd4_compaction_created_meaningful_headroom(effective_provider_occupancy);
+            sess.record_budget_compaction_outcome(turn_context.sub_id.clone(), meaningful_headroom)
+                .await;
+            let reclaimed_tokens =
+                pre_compaction_occupancy.saturating_sub(effective_provider_occupancy);
+            if meaningful_headroom {
+                tracing::trace!(
+                    pre_compaction_occupancy,
+                    post_compaction_occupancy = effective_provider_occupancy,
+                    reclaimed_tokens,
+                    "KD4 operating-budget compaction created useful headroom"
+                );
+            } else {
+                tracing::warn!(
+                    turn_id = %turn_context.sub_id,
+                    pre_compaction_occupancy,
+                    post_compaction_occupancy = effective_provider_occupancy,
+                    reclaimed_tokens,
+                    required_headroom = KD4_MIN_POST_COMPACTION_HEADROOM,
+                    "KD4 operating-budget compaction was ineffective; suppressing another compaction for this turn"
+                );
+            }
+        }
 
         let status = super::context_window::context_window_token_status(
             sess.as_ref(),
@@ -3003,6 +3030,9 @@ async fn enforce_kd4_dispatch_budget(
         let receipt_identity =
             dispatch_soft_floor_identity(&status.context_identity, prompt, baseline_generation);
         let receipt_active = sess.soft_floor_receipt_matches(&receipt_identity).await;
+        let budget_compaction_blocked = sess
+            .budget_compaction_blocked_for_turn(&turn_context.sub_id)
+            .await;
         tracing::trace!(
             local_projected_occupancy,
             effective_provider_occupancy,
@@ -3011,14 +3041,17 @@ async fn enforce_kd4_dispatch_budget(
             provider_baseline_generation = ?baseline_generation,
             checkpoint_tokens = ?checkpoint_tokens(prompt.input.as_ref()),
             soft_floor_receipt_active = receipt_active,
+            ineffective_compaction_guard_active = budget_compaction_blocked,
             "KD4 final dispatch occupancy"
         );
 
         if effective_provider_occupancy >= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
             && !status.soft_floor_receipt_active
             && !receipt_active
+            && !budget_compaction_blocked
             && !compacted
         {
+            operating_budget_compaction_before = Some(effective_provider_occupancy);
             crate::compact_token_budget::run_inline_auto_compact_task(
                 Arc::clone(sess),
                 Arc::clone(step_context),
@@ -3057,7 +3090,11 @@ async fn enforce_kd4_dispatch_budget(
             sess.record_soft_floor_receipt(receipt_identity.clone())
                 .await;
         }
-        let soft_floor_status = if receipt_active || recorded_receipt {
+        let soft_floor_status = if budget_compaction_blocked
+            && effective_provider_occupancy >= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
+        {
+            "ineffective_compaction_guard"
+        } else if receipt_active || recorded_receipt {
             "receipt_active"
         } else if effective_provider_occupancy >= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
         {
@@ -3074,6 +3111,12 @@ async fn enforce_kd4_dispatch_budget(
             compactions: sess.auto_compact_window_number().await,
         }));
     }
+}
+
+fn kd4_compaction_created_meaningful_headroom(post_compaction_occupancy: i64) -> bool {
+    post_compaction_occupancy
+        <= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
+            .saturating_sub(KD4_MIN_POST_COMPACTION_HEADROOM)
 }
 
 fn dispatch_soft_floor_identity(

@@ -16,7 +16,6 @@ use std::time::SystemTime;
 
 use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::PreparedWorkspaceManifest;
-use codex_agent_task_store::StoreError;
 use codex_agent_task_store::StoreResult;
 use codex_agent_task_store::WorkspaceManifestWork;
 use codex_file_watcher::FileWatcher;
@@ -1041,9 +1040,15 @@ impl GitWorkspaceCache {
                 return Ok(Some(prepared));
             }
         }
-        Err(StoreError::WorkspaceStateInitialization(
-            "repository dependencies changed during complete manifest reconstruction".to_string(),
-        ))
+        // A stable dependency window is only required to admit the reconstructed
+        // manifest to this cache. Repository activity must not prevent callers
+        // from acquiring a fresh workspace mutation lease altogether.
+        store
+            .prepare_workspace_mutation(
+                repo_root,
+                vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
+            )
+            .await
     }
 
     async fn replace_repository_manifest_entry(

@@ -1843,6 +1843,24 @@ impl Session {
         self.state.lock().await.record_soft_floor_receipt(identity);
     }
 
+    pub(crate) async fn budget_compaction_blocked_for_turn(&self, turn_id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .budget_compaction_blocked_for_turn(turn_id)
+    }
+
+    pub(crate) async fn record_budget_compaction_outcome(
+        &self,
+        turn_id: String,
+        meaningful_headroom: bool,
+    ) {
+        self.state
+            .lock()
+            .await
+            .record_budget_compaction_outcome(turn_id, meaningful_headroom);
+    }
+
     /// Attempts terminal-event persistence within a fixed finalization budget.
     ///
     /// A timeout is intentionally distinguishable from dispatch: callers can downgrade a

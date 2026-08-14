@@ -362,6 +362,20 @@ impl SessionState {
     pub(crate) fn record_soft_floor_receipt(&mut self, identity: String) {
         self.auto_compact_window.record_soft_floor_receipt(identity);
     }
+
+    pub(crate) fn budget_compaction_blocked_for_turn(&self, turn_id: &str) -> bool {
+        self.auto_compact_window
+            .budget_compaction_blocked_for_turn(turn_id)
+    }
+
+    pub(crate) fn record_budget_compaction_outcome(
+        &mut self,
+        turn_id: String,
+        meaningful_headroom: bool,
+    ) {
+        self.auto_compact_window
+            .record_budget_compaction_outcome(turn_id, meaningful_headroom);
+    }
 }
 
 // Sometimes new snapshots don't include credits or plan information.
