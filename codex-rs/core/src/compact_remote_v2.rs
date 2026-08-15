@@ -278,7 +278,6 @@ async fn run_remote_compact_task_inner_impl(
         owned_client_session: _owned_client_session,
     } = attempt;
     if let Some(token_usage) = token_usage {
-        sess.record_rollout_budget_usage(&token_usage)?;
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
@@ -359,7 +358,6 @@ async fn run_remote_compaction_request_v2(
     let mut retries = 0;
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
-        sess.ensure_rollout_budget_available()?;
         let trace_attempt = compaction_trace.start_attempt(&RemoteCompactionV2TraceRequest {
             model: turn_context.model_info.slug.as_str(),
             instructions: prompt.base_instructions.text.as_str(),

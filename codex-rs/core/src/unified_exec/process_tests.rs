@@ -406,8 +406,6 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
             crate::tools::command_output_artifact::RawOutputArtifact::unavailable(
                 "cancelled startup fixture",
             ),
-            turn.sub_id.clone(),
-            None,
         )
         .await;
     let context =
@@ -417,8 +415,6 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
         &context,
         attempt_key,
         process_id,
-        None,
-        None,
     );
     registration.attach_process(Arc::clone(&process), None);
     registration.set_initial_exec_command_active(Arc::clone(&active));

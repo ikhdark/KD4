@@ -275,6 +275,189 @@ async fn byte_selectors_return_utf8_directly_and_non_utf8_as_base64() {
 }
 
 #[tokio::test]
+async fn artifact_recovery_search_returns_batched_exact_selectors_and_continuation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text(
+        "header\nneedle alpha\nmiddle\nneedle beta\nmore\nneedle gamma\ntail\n",
+    );
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let search = ToolOutputSelector::Search {
+        query: "needle".to_string(),
+        start_byte: 0,
+        max_results: 2,
+        context_lines: 1,
+    };
+
+    let indexed = read_tool_output_selectors(temp.path(), "thread", &artifact_id, vec![search])
+        .await
+        .expect("search canonical artifact");
+    let result = &indexed.results[0];
+    assert_eq!(result.status, ToolOutputSelectorStatus::Ok);
+    assert!(!result.complete);
+    assert_eq!(
+        result.child_selectors,
+        vec![ToolOutputSelector::Lines { start: 1, end: 5 }],
+        "overlapping and adjacent match context should be coalesced",
+    );
+    assert_eq!(result.value.as_ref().unwrap()["total_matches"], 3);
+    assert_eq!(result.value.as_ref().unwrap()["matches_returned"], 2);
+    assert_eq!(result.value.as_ref().unwrap()["remaining_match_count"], 1);
+    let hydrated = result.value.as_ref().unwrap()["hydrated_ranges"]
+        .as_array()
+        .expect("search hydrates exact context in the same call");
+    assert_eq!(hydrated.len(), 1);
+    assert!(
+        hydrated[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("needle alpha") && text.contains("needle beta"))
+    );
+
+    let selected = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        result.child_selectors.clone(),
+    )
+    .await
+    .expect("select indexed match context in one batch");
+    assert_eq!(selected.results.len(), 1);
+    assert!(
+        selected.results[0]
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("needle alpha") && text.contains("needle beta"))
+    );
+
+    let continuation = result.continuation.clone().expect("search continuation");
+    let resumed =
+        read_tool_output_selectors(temp.path(), "thread", &artifact_id, vec![continuation])
+            .await
+            .expect("resume canonical artifact search");
+    let resumed = &resumed.results[0];
+    assert!(resumed.complete);
+    assert_eq!(resumed.value.as_ref().unwrap()["total_matches"], 1);
+    assert_eq!(
+        resumed.child_selectors,
+        vec![ToolOutputSelector::Lines { start: 5, end: 7 }],
+    );
+}
+
+#[tokio::test]
+async fn artifact_recovery_search_page_fits_its_ceiling_and_advances() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text(
+        (1..=200)
+            .map(|line| format!("needle at historical line {line:04}\n"))
+            .collect::<String>(),
+    );
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let search = ToolOutputSelector::Search {
+        query: "needle".to_string(),
+        start_byte: 0,
+        max_results: ARTIFACT_SEARCH_MAX_RESULTS,
+        context_lines: 0,
+    };
+
+    let indexed = read_tool_output_selectors_with_ceiling(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![search.clone()],
+        512,
+    )
+    .await
+    .expect("search canonical artifact within a nested ceiling");
+
+    assert!(response_fits_recovery_token_ceiling(&indexed, 512));
+    let result = &indexed.results[0];
+    assert_eq!(result.status, ToolOutputSelectorStatus::Ok);
+    let matches_returned = result.value.as_ref().unwrap()["matches_returned"]
+        .as_u64()
+        .expect("returned match count") as usize;
+    assert!(matches_returned > 0);
+    assert!(matches_returned < ARTIFACT_SEARCH_MAX_RESULTS);
+    let continuation = result.continuation.as_ref().expect("search continuation");
+    assert_ne!(
+        continuation, &search,
+        "pagination must advance after a fitting page"
+    );
+    assert!(matches!(
+        continuation,
+        ToolOutputSelector::Search { start_byte, .. } if *start_byte > 0
+    ));
+}
+
+#[tokio::test]
+async fn artifact_recovery_sparse_search_avoids_a_historical_line_sweep() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text(
+        (1..=1_082)
+            .map(|line| {
+                if matches!(line, 17 | 541 | 1_077) {
+                    format!("historical line {line:04}: recovery target\n")
+                } else {
+                    format!("historical line {line:04}: ordinary output\n")
+                }
+            })
+            .collect::<String>(),
+    );
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+
+    let indexed = read_tool_output_selectors_with_ceiling(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Search {
+            query: "recovery target".to_string(),
+            start_byte: 0,
+            max_results: ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS,
+            context_lines: 1,
+        }],
+        3_488,
+    )
+    .await
+    .expect("search historical-sized artifact");
+    let search = &indexed.results[0];
+    assert_eq!(search.status, ToolOutputSelectorStatus::Ok);
+    assert!(search.complete);
+    assert_eq!(search.value.as_ref().unwrap()["total_matches"], 3);
+    assert_eq!(search.child_selectors.len(), 3);
+    assert!(
+        search.value.as_ref().unwrap()["hydrated_ranges"]
+            .as_array()
+            .is_some_and(|ranges| {
+                ranges.len() == 3
+                    && ranges.iter().all(|range| {
+                        range["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("recovery target"))
+                    })
+            })
+    );
+
+    let selected = read_tool_output_selectors_with_ceiling(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        search.child_selectors.clone(),
+        3_488,
+    )
+    .await
+    .expect("recover all sparse match context in one batch");
+    assert!(response_fits_recovery_token_ceiling(&selected, 3_488));
+    assert!(selected.results.iter().all(|result| {
+        result.status == ToolOutputSelectorStatus::Ok
+            && result
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("recovery target"))
+    }));
+}
+
+#[tokio::test]
 async fn oversized_json_pointer_exposes_exact_chunkable_canonical_range() {
     let temp = tempfile::tempdir().expect("tempdir");
     let canonical = CanonicalToolResult::json(serde_json::json!({

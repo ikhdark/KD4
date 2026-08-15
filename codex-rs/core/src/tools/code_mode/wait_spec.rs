@@ -80,10 +80,10 @@ mod tests {
                         ),
                         (
                             "max_tokens".to_string(),
-                            JsonSchema::number(Some(
-                                "Output token budget for this wait call. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics."
-                                    .to_string(),
-                            )),
+                            JsonSchema::number(Some(format!(
+                                "Output token budget for this wait call. {}.",
+                                adaptive_output_budget_description()
+                            ))),
                         ),
                         (
                             "terminate".to_string(),

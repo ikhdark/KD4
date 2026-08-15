@@ -5,7 +5,6 @@ import type { TurnTimingAttemptKind } from "./TurnTimingAttemptKind";
 import type { TurnTimingGenerationDisposition } from "./TurnTimingGenerationDisposition";
 import type { TurnTimingGenerationPurpose } from "./TurnTimingGenerationPurpose";
 import type { TurnTimingGenerationReason } from "./TurnTimingGenerationReason";
-import type { TurnTimingPostDiscoveryRequest } from "./TurnTimingPostDiscoveryRequest";
 import type { TurnTimingProgressKind } from "./TurnTimingProgressKind";
 import type { TurnTimingProviderTokenUsage } from "./TurnTimingProviderTokenUsage";
 
@@ -35,9 +34,4 @@ toolCallCount: number, outputTokens: bigint, reasoningOutputTokens: bigint,
  * Provider-reported usage for this physical attempt. Missing usage stays
  * null, including failed attempts for which the provider reported none.
  */
-tokenUsage?: TurnTimingProviderTokenUsage,
-/**
- * Observational usage for the request immediately following source-result
- * cells. Provider fields remain whole-request usage.
- */
-postDiscovery?: TurnTimingPostDiscoveryRequest, dispatchMs?: number | null, firstModelOutputMs?: number | null, completedMs?: number | null, };
+tokenUsage?: TurnTimingProviderTokenUsage, dispatchMs?: number | null, firstModelOutputMs?: number | null, completedMs?: number | null, };

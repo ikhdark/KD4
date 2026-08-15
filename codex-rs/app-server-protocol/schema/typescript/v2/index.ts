@@ -536,14 +536,9 @@ export type { TurnTimingGenerationReasonCounts } from "./TurnTimingGenerationRea
 export type { TurnTimingLocal } from "./TurnTimingLocal";
 export type { TurnTimingMilestones } from "./TurnTimingMilestones";
 export type { TurnTimingModelRequest } from "./TurnTimingModelRequest";
-export type { TurnTimingPostDiscoveryRequest } from "./TurnTimingPostDiscoveryRequest";
-export type { TurnTimingPreEditConvergence } from "./TurnTimingPreEditConvergence";
 export type { TurnTimingPreFirstModelOutput } from "./TurnTimingPreFirstModelOutput";
 export type { TurnTimingProgressKind } from "./TurnTimingProgressKind";
 export type { TurnTimingProviderTokenUsage } from "./TurnTimingProviderTokenUsage";
-export type { TurnTimingReadinessReopenReasonCounts } from "./TurnTimingReadinessReopenReasonCounts";
-export type { TurnTimingSourceDiscoveryCounters } from "./TurnTimingSourceDiscoveryCounters";
-export type { TurnTimingSourceSectionCategoryCounts } from "./TurnTimingSourceSectionCategoryCounts";
 export type { TurnTimingTerminalization } from "./TurnTimingTerminalization";
 export type { TurnTimingUnions } from "./TurnTimingUnions";
 export type { TurnsPage } from "./TurnsPage";

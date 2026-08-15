@@ -25,8 +25,8 @@ unused placeholder sections instead of filling artifacts for completeness.
 
 Resolve a preflight manifest with
 `just workflow-preflight <manifest> <receipt>`. The command atomically
-checks and publishes against the repository's active-receipt registry so path,
-named-contract, and Cargo target-lane overlap is rejected before work begins.
+checks and publishes against the repository's active-receipt registry. Path,
+named-contract, and Cargo target-lane overlap is reported as advisory metadata.
 Release it with `just workflow-preflight-release <assignment-id>` when the
 assignment becomes terminal. The resolved receipt captures the
 assignment and root-task identities, repository-lineage and concrete-workspace

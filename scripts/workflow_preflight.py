@@ -308,7 +308,7 @@ def normalize_lane_path(value: Any, field: str, root: Path) -> str:
     path = Path(nonempty_string(value, field))
     if not path.is_absolute():
         path = root / path
-    return os.path.normcase(str(path.resolve(strict=False)))
+    return str(path.resolve(strict=False))
 
 
 def manifest_fingerprint(manifest: dict[str, Any]) -> str:
@@ -432,6 +432,7 @@ def resolve_manifest(
             "cargo_home": cargo_home,
         },
         "workspace_strategy": strategy,
+        "advisories": [],
         "recorded_at": recorded_at.isoformat(),
         "expires_at": (recorded_at + timedelta(seconds=lease_seconds)).isoformat(),
     }
@@ -473,11 +474,13 @@ def resolve_manifest(
             strategy == "isolated" or active_strategy == "isolated"
         )
         if (overlap or shared_contracts) and not isolated_elsewhere:
-            raise PreflightError(
-                "active claim conflict with "
-                f"{active.get('assignment_id')}: paths={overlap}, "
-                f"contracts={shared_contracts}; use a separate isolated worktree "
-                "for deliberate competition"
+            resolved["advisories"].append(
+                {
+                    "kind": "claim_overlap",
+                    "assignment_id": active.get("assignment_id"),
+                    "paths": overlap,
+                    "contracts": shared_contracts,
+                }
             )
         active_lane = active.get("cargo_lane")
         active_target_dir = (
@@ -489,21 +492,18 @@ def resolve_manifest(
             if isinstance(active_lane, dict)
             else None
         )
-        if active_target_dir == target_dir:
-            raise PreflightError(
-                f"Cargo target lane is already owned by {active.get('assignment_id')}: "
-                f"{target_dir}"
+        if (
+            active_target_dir is not None
+            and os.path.normcase(active_target_dir) == os.path.normcase(target_dir)
+        ):
+            resolved["advisories"].append(
+                {
+                    "kind": "cargo_lane_overlap",
+                    "assignment_id": active.get("assignment_id"),
+                    "target_dir": target_dir,
+                }
             )
 
-    ending_commit = git(repository_root, "rev-parse", "HEAD").strip()
-    ending_workspace_fingerprint = workspace_fingerprint(repository_root)
-    if (
-        ending_commit != commit
-        or ending_workspace_fingerprint != starting_workspace_fingerprint
-    ):
-        raise PreflightError(
-            "repository changed while workflow preflight was being resolved; retry after the current writer finishes"
-        )
     resolved["manifest_fingerprint"] = manifest_fingerprint(resolved)
     return resolved
 
@@ -539,7 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         action="append",
         default=[],
-        help="Resolved active manifest to check for path, contract, and Cargo conflicts.",
+        help="Resolved active manifest to report path, contract, and Cargo overlap advisories.",
     )
     parser.add_argument(
         "--output",

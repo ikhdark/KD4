@@ -55,6 +55,10 @@ const MAX_RETENTION_INDEX_RECORDS: usize = 8_192;
 const RETENTION_RECONCILIATION_INTERVAL: u64 = 128;
 const RETENTION_BYTE_GUARD_BAND: u64 = MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
 pub(crate) const RECOVERY_AGGREGATE_TOKEN_CEILING: usize = 10_000;
+pub(crate) const ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS: usize = 20;
+pub(crate) const ARTIFACT_SEARCH_MAX_RESULTS: usize = 100;
+pub(crate) const ARTIFACT_SEARCH_MAX_CONTEXT_LINES: usize = 20;
+pub(crate) const ARTIFACT_SEARCH_MAX_QUERY_BYTES: usize = 1_024;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
 const MAX_DETERMINISTIC_RECOVERY_CACHE_ENTRIES: usize = 128;
 
@@ -70,10 +74,33 @@ static DETERMINISTIC_RECOVERY_CACHE: OnceLock<StdMutex<DeterministicRecoveryCach
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ToolOutputSelector {
-    Bytes { start: u64, end: u64 },
-    Lines { start: usize, end: usize },
-    Section { id: String },
-    JsonPointer { pointer: String },
+    Bytes {
+        start: u64,
+        end: u64,
+    },
+    Lines {
+        start: usize,
+        end: usize,
+    },
+    Section {
+        id: String,
+    },
+    JsonPointer {
+        pointer: String,
+    },
+    Search {
+        query: String,
+        #[serde(default)]
+        start_byte: u64,
+        #[serde(default = "artifact_search_default_max_results")]
+        max_results: usize,
+        #[serde(default)]
+        context_lines: usize,
+    },
+}
+
+const fn artifact_search_default_max_results() -> usize {
+    ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1303,7 +1330,7 @@ impl RawOutputArtifact {
             "full retained output"
         };
         Some(format!(
-            "[command output reduced; {scope} is available as artifact {id}.\nUse read_tool_output with that id and a narrow line range.]"
+            "[command output reduced; {scope} is available as artifact {id}.\nUse read_tool_output with that id; search once for targets or batch exact ranges in one call.]"
         ))
     }
 
@@ -3061,7 +3088,214 @@ fn selector_range_and_children(
                 Ok((section.canonical_range, children, section.value.clone()))
             }
         }
+        ToolOutputSelector::Search { .. } => Err(ToolOutputSelectorStatus::Invalid),
     }
+}
+
+fn invalid_selector_result(
+    selector: ToolOutputSelector,
+    message: impl Into<String>,
+) -> ToolOutputSelectorResult {
+    let mut result = ToolOutputSelectorResult::state(selector, ToolOutputSelectorStatus::Invalid);
+    result.message = Some(message.into());
+    result
+}
+
+fn search_logical_artifact(
+    path: &Path,
+    metadata: &LogicalArtifactMetadata,
+    selector: ToolOutputSelector,
+    token_ceiling: usize,
+) -> ToolOutputSelectorResult {
+    let (query, start_byte, max_results, context_lines) = match &selector {
+        ToolOutputSelector::Search {
+            query,
+            start_byte,
+            max_results,
+            context_lines,
+        } => (query.clone(), *start_byte, *max_results, *context_lines),
+        _ => unreachable!("search helper requires a search selector"),
+    };
+    if query.is_empty() || query.len() > ARTIFACT_SEARCH_MAX_QUERY_BYTES {
+        return invalid_selector_result(
+            selector,
+            format!("search query must contain 1..={ARTIFACT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes"),
+        );
+    }
+    if max_results == 0 || max_results > ARTIFACT_SEARCH_MAX_RESULTS {
+        return invalid_selector_result(
+            selector,
+            format!("max_results must be between 1 and {ARTIFACT_SEARCH_MAX_RESULTS}"),
+        );
+    }
+    if context_lines > ARTIFACT_SEARCH_MAX_CONTEXT_LINES {
+        return invalid_selector_result(
+            selector,
+            format!("context_lines must not exceed {ARTIFACT_SEARCH_MAX_CONTEXT_LINES}"),
+        );
+    }
+    if start_byte > metadata.retained_bytes {
+        return invalid_selector_result(
+            selector,
+            format!(
+                "start_byte must be within retained bytes 0..{}",
+                metadata.retained_bytes
+            ),
+        );
+    }
+    // Search and exact hydration share one physical artifact read. Retaining
+    // the prefix is necessary when a continued search match asks for context
+    // lines that begin before `start_byte`.
+    let bytes = match read_logical_range(
+        path,
+        metadata,
+        CanonicalByteRange::new(0, metadata.retained_bytes),
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => return invalid_selector_result(selector, err.for_model()),
+    };
+
+    let query_bytes = query.as_bytes();
+    let search_offset = usize::try_from(start_byte).unwrap_or(usize::MAX);
+    let search_bytes = bytes.get(search_offset..).unwrap_or_default();
+    let mut cursor = 0_usize;
+    let mut total_matches = 0_usize;
+    let mut indexed_matches = Vec::with_capacity(max_results);
+    while cursor <= search_bytes.len().saturating_sub(query_bytes.len()) {
+        let Some(relative_start) = search_bytes[cursor..]
+            .windows(query_bytes.len())
+            .position(|window| window == query_bytes)
+        else {
+            break;
+        };
+        let relative_match_start = cursor.saturating_add(relative_start);
+        let relative_match_end = relative_match_start.saturating_add(query_bytes.len());
+        let match_start = search_offset.saturating_add(relative_match_start);
+        let match_end = search_offset.saturating_add(relative_match_end);
+        total_matches = total_matches.saturating_add(1);
+        if indexed_matches.len() < max_results {
+            indexed_matches.push((match_start, match_end));
+        }
+        cursor = relative_match_end;
+    }
+
+    let build_result = |matches_returned: usize| {
+        let mut matches = Vec::with_capacity(matches_returned);
+        let mut child_selectors = Vec::<ToolOutputSelector>::new();
+        for (match_start, match_end) in indexed_matches.iter().copied().take(matches_returned) {
+            let line = metadata
+                .line_starts
+                .partition_point(|line_start| *line_start <= match_start as u64)
+                .max(1);
+            let end_line = metadata
+                .line_starts
+                .partition_point(|line_start| *line_start <= match_end.saturating_sub(1) as u64)
+                .max(line);
+            let context_start = line.saturating_sub(context_lines).max(1);
+            let context_end = end_line
+                .saturating_add(context_lines)
+                .min(metadata.line_starts.len());
+            matches.push(serde_json::json!({
+                "line": line,
+                "end_line": end_line,
+                "start_byte": match_start,
+                "end_byte": match_end,
+            }));
+            match child_selectors.last_mut() {
+                Some(ToolOutputSelector::Lines { end, .. })
+                    if context_start <= end.saturating_add(1) =>
+                {
+                    *end = (*end).max(context_end);
+                }
+                _ => child_selectors.push(ToolOutputSelector::Lines {
+                    start: context_start,
+                    end: context_end,
+                }),
+            }
+        }
+
+        let remaining_match_count = total_matches.saturating_sub(matches_returned);
+        let continuation = (remaining_match_count > 0).then(|| ToolOutputSelector::Search {
+            query: query.clone(),
+            start_byte: indexed_matches
+                .get(matches_returned.saturating_sub(1))
+                .map(|(_, end)| *end as u64)
+                .unwrap_or(start_byte),
+            max_results,
+            context_lines,
+        });
+        let hydrated_ranges = child_selectors
+            .iter()
+            .filter_map(|child| {
+                let (range, _, _) = selector_range_and_children(child, metadata).ok()?;
+                let range = range?;
+                let start = usize::try_from(range.start).ok()?;
+                let end = usize::try_from(range.end).ok()?;
+                let exact = bytes.get(start..end)?;
+                let mut hydrated = serde_json::json!({
+                    "selector": child,
+                    "canonical_range": range,
+                    "exact_bytes": range.len(),
+                });
+                if let Ok(text) = std::str::from_utf8(exact) {
+                    hydrated["text"] = Value::String(text.to_string());
+                } else {
+                    hydrated["data_base64"] = Value::String(BASE64_STANDARD.encode(exact));
+                }
+                Some(hydrated)
+            })
+            .collect::<Vec<_>>();
+        let mut result =
+            ToolOutputSelectorResult::state(selector.clone(), ToolOutputSelectorStatus::Ok);
+        result.complete = metadata.complete && continuation.is_none();
+        result.value = Some(serde_json::json!({
+            "query": query,
+            "start_byte": start_byte,
+            "coverage_complete": metadata.complete,
+            "total_matches": total_matches,
+            "matches_returned": matches_returned,
+            "remaining_match_count": remaining_match_count,
+            "matches": matches,
+            "hydrated_ranges": hydrated_ranges,
+        }));
+        result.child_selectors = child_selectors;
+        result.continuation = continuation;
+        result.message = match (!metadata.complete, remaining_match_count > 0) {
+            (true, true) => Some(
+                "more retained matches are available; the canonical artifact also has unavailable ranges"
+                    .to_string(),
+            ),
+            (true, false) => Some(
+                "search covered all retained bytes, but the canonical artifact has unavailable ranges"
+                    .to_string(),
+            ),
+            (false, true) => Some(
+                "more matches are available; exact context for this page is already hydrated and continuation advances to the next page"
+                    .to_string(),
+            ),
+            (false, false) => None,
+        };
+        result
+    };
+
+    let mut result = build_result(0);
+    for matches_returned in 1..=indexed_matches.len() {
+        let candidate = build_result(matches_returned);
+        let response = ReadToolOutputResult {
+            artifact_id: metadata.artifact_id.clone(),
+            canonical_sha256: metadata.canonical_sha256.clone(),
+            canonical_bytes: metadata.canonical_bytes,
+            retained_bytes: metadata.retained_bytes,
+            complete: metadata.complete,
+            unavailable_ranges: metadata.unavailable_ranges.clone(),
+            results: vec![candidate.clone()],
+        };
+        if !response_fits_recovery_token_ceiling(&response, token_ceiling) {
+            break;
+        }
+        result = candidate;
+    }
+    result
 }
 
 fn too_large_result(
@@ -3129,6 +3363,9 @@ fn select_logical_artifact(
     selector: ToolOutputSelector,
     token_ceiling: usize,
 ) -> ToolOutputSelectorResult {
+    if matches!(&selector, ToolOutputSelector::Search { .. }) {
+        return search_logical_artifact(path, metadata, selector, token_ceiling);
+    }
     let (range, children, directory_value) = match selector_range_and_children(&selector, metadata)
     {
         Ok(result) => result,
@@ -3181,7 +3418,7 @@ fn select_logical_artifact(
                     Err(_) => result.data_base64 = Some(BASE64_STANDARD.encode(&bytes)),
                 }
             }
-            ToolOutputSelector::Bytes { .. } => unreachable!(),
+            ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Search { .. } => unreachable!(),
         }
         result
     };
@@ -3200,6 +3437,7 @@ fn select_logical_artifact(
     result
 }
 
+#[cfg(test)]
 pub(crate) async fn read_tool_output_selectors(
     codex_home: &Path,
     thread_id: &str,
@@ -3402,6 +3640,7 @@ pub(crate) async fn read_tool_output_artifact(
 /// Read the exact retained artifact bytes for crate-private deterministic
 /// evidence replay. This keeps the same UUID, thread confinement, regular-file,
 /// retention, and writer-lock protections as the model-visible line reader.
+#[cfg(test)]
 pub(crate) async fn read_exact_tool_output_artifact(
     codex_home: &Path,
     thread_id: &str,
@@ -3422,6 +3661,7 @@ pub(crate) async fn read_exact_tool_output_artifact(
         .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
 }
 
+#[cfg(test)]
 fn read_exact_tool_output_artifact_blocking(path: &Path) -> Result<Vec<u8>, ReadToolOutputError> {
     let (mut file, total_bytes) = open_regular_artifact(path)?;
     if total_bytes > MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64 {

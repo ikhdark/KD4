@@ -83,21 +83,6 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             <= categories
         )
 
-    def test_phase0_profile_runs_source_tools_promotion_gates(self) -> None:
-        catalog = kd4_perf_snapshot.scenario_catalog()
-        phase0 = kd4_perf_snapshot.PROFILE_SCENARIOS["phase0"]
-
-        self.assertIn("source-tools-runtime-test", phase0)
-        self.assertIn("source-tools-bounded-search-test", phase0)
-        self.assertEqual(
-            catalog["source-tools-runtime-test"].command[-1],
-            "test(source_tools_execute_search_and_read_end_to_end)",
-        )
-        self.assertEqual(
-            catalog["source-tools-bounded-search-test"].command[-1],
-            "test(representative_large_repository_search_stays_within_walk_and_output_bounds)",
-        )
-
     def test_atomic_json_writer_replaces_target(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             target = Path(tempdir) / "snapshot.json"

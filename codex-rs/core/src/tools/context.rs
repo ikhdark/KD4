@@ -691,6 +691,20 @@ impl ToolOutput for ExecCommandToolOutput {
                 None => (None, None, None),
             };
         let model_output = self.projected_model_output();
+        let output = self.output_with_reduction_notice(model_output);
+        let output = if output.is_empty() {
+            match (self.exit_code, self.process_id) {
+                (Some(exit_code), _) => {
+                    format!("Command completed with no output (exit code {exit_code}).")
+                }
+                (None, Some(_)) => {
+                    "Command is still running and has not produced output.".to_string()
+                }
+                (None, None) => "Command returned no output.".to_string(),
+            }
+        } else {
+            output
+        };
 
         let result = UnifiedExecCodeModeResult {
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
@@ -702,7 +716,7 @@ impl ToolOutput for ExecCommandToolOutput {
             raw_output_artifact_bytes,
             raw_output_artifact_error,
             repair: self.repair_notice.clone(),
-            output: self.output_with_reduction_notice(model_output),
+            output,
         };
 
         serde_json::to_value(result).unwrap_or_else(|err| {

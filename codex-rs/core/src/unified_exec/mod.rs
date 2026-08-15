@@ -47,7 +47,6 @@ use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
-use crate::tools::command_execution::RunningWorkspaceMutation;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::known_delta_store::PreparedKnownDelta;
@@ -140,12 +139,6 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
-    /// Mutation ownership is moved into the process manager on its first poll.
-    /// If the manager future is never polled, `Drop` finalizes this unstarted lease.
-    pub workspace_mutation: Option<RunningWorkspaceMutation>,
-    /// Held until the terminal command-evidence event is emitted, including for detached
-    /// processes whose repository lease has already been finalized.
-    pub completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
     pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
     pub validation_observation:
         Arc<StdMutex<Option<crate::validation_admission::ValidationObservationToken>>>,
@@ -153,29 +146,6 @@ pub(crate) struct ExecCommandRequest {
         Arc<StdMutex<Option<crate::validation_admission::ValidationLeaderOwnership>>>,
     pub validation_waiter: Option<crate::validation_admission::ValidationLeader>,
     pub known_delta: Option<PreparedKnownDelta>,
-}
-
-impl Drop for ExecCommandRequest {
-    fn drop(&mut self) {
-        let Some(workspace_mutation) = self.workspace_mutation.take() else {
-            return;
-        };
-        workspace_mutation.cancel_owner();
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::error!(
-                "cannot finalize an unstarted unified exec mutation without a Tokio runtime"
-            );
-            return;
-        };
-        runtime.spawn(async move {
-            if let Err(error) = workspace_mutation.finish().await {
-                tracing::error!(
-                    %error,
-                    "failed to finalize an unstarted unified exec workspace mutation"
-                );
-            }
-        });
-    }
 }
 
 /// Retains every process created by sandbox retries until startup is either

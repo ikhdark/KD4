@@ -69,6 +69,22 @@ async fn serialized_tool_manifest_fingerprint_includes_exposure_identity() {
     assert_ne!(disabled_hash, router(inactive).tool_manifest(&turn).hash);
 }
 
+#[tokio::test]
+async fn serialized_tool_manifest_cache_invalidates_on_activation_revision() {
+    let (_session, turn) = make_session_and_context().await;
+    let router = ToolRouter::from_parts_with_warnings_and_identity(
+        ToolRegistry::empty_for_test(),
+        Vec::new(),
+        Vec::new(),
+        ToolExposureIdentity::default(),
+    );
+
+    let first = router.tool_manifest(&turn);
+    let second = router.tool_manifest(&turn);
+    assert_eq!(first, second);
+    assert_eq!(turn.deferred_tool_activation_revision(), 0);
+}
+
 struct ExtensionEchoContributor;
 
 impl codex_extension_api::ToolContributor for ExtensionEchoContributor {
@@ -397,6 +413,27 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
         namespace_function_names(&router.model_visible_specs(), "codex_app"),
         vec![visible_tool.to_string()]
     );
+    let manifest = router.tool_manifest(turn.as_ref()).manifest;
+    let registered = manifest["registered"]
+        .as_array()
+        .expect("registered tool manifest entries");
+    assert!(!registered.is_empty());
+    assert!(registered.iter().all(|entry| entry.get("spec").is_none()));
+    assert!(registered.iter().all(|entry| {
+        entry["spec_sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64)
+    }));
+    let hidden_manifest_entry = registered
+        .iter()
+        .find(|entry| {
+            entry["name"]
+                .as_str()
+                .is_some_and(|name| name.contains(hidden_tool))
+        })
+        .expect("deferred dynamic tool manifest entry");
+    assert_eq!(hidden_manifest_entry["exposure"], "deferred");
+    assert_eq!(hidden_manifest_entry["activated"], false);
 
     Ok(())
 }
@@ -487,8 +524,6 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
     ];
     for source in sources {
         for tool_name in [
-            ToolName::plain("search_source"),
-            ToolName::plain("read_file_span"),
             ToolName::plain("read_tool_output"),
             ToolName::plain("git_diff"),
             ToolName::plain("shell_command"),

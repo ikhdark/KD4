@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Component;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -63,8 +61,6 @@ use crate::session::TurnInput;
 use crate::session::reasoning_governor::AuthoritativeWaitResolution;
 use crate::session::reasoning_governor::ContinuationDisposition;
 use crate::session::reasoning_governor::GenerationRequestDisposition;
-use crate::session::reasoning_governor::InstructionSnapshotIdentity;
-use crate::session::reasoning_governor::PreEditConvergenceSeed;
 use crate::session::reasoning_governor::SamplingConvergenceDecision;
 use crate::session::reasoning_governor::SamplingGenerationDisposition;
 use crate::session::reasoning_governor::SamplingReasoningGovernor;
@@ -156,7 +152,6 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::protocol::SamplingBoundaryItem;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
@@ -359,19 +354,11 @@ pub(crate) async fn run_turn(
     let mut logical_generation_ordinal = 0_u32;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
-    let pre_edit_display_roots = display_roots.clone();
-    let pre_edit_seed = build_pre_edit_convergence_seed(
-        &input,
-        turn_context.as_ref(),
-        first_step_context.as_ref(),
-        &pre_edit_display_roots,
-    );
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
         TurnDiffTracker::with_environment_display_roots(display_roots),
     ));
-    let mut reasoning_governor = SamplingReasoningGovernor::new_with_pre_edit(
+    let mut reasoning_governor = SamplingReasoningGovernor::new_with_timing(
         turn_context.config.reasoning_phase_efforts.as_ref(),
-        pre_edit_seed,
         Arc::clone(&turn_context.turn_timing_state),
     );
 
@@ -397,50 +384,24 @@ pub(crate) async fn run_turn(
         let recorded_input =
             run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await;
         if recorded_input.accepted_user_input {
-            let instruction_snapshot_identity = instruction_snapshot_identity(
-                sess.services
-                    .agents_md_manager
-                    .get_loaded()
-                    .await
-                    .as_deref(),
-            );
-            let seed = build_pre_edit_convergence_seed_without_step(
-                &pending_input,
-                turn_context.as_ref(),
-                &pre_edit_display_roots,
-                instruction_snapshot_identity,
-            );
-            reasoning_governor.accepted_user_input_with_seed(seed);
+            reasoning_governor.accepted_user_input();
         }
         if recorded_input.should_stop {
             break;
         }
 
         let window_id = sess.current_window_id().await;
-        super::rollout_budget::maybe_record_reminder(
-            sess.as_ref(),
-            turn_context.as_ref(),
-            &window_id,
-        )
-        .await;
-
         // Capture once so context, advertised tools, and tool calls share one request view.
         let step_context = match next_step_context.take() {
             Some(step_context) => step_context,
             None => sess.capture_step_context(Arc::clone(&turn_context)).await,
         };
-        let source_closure_identity = turn_context
-            .source_closure
-            .lock()
-            .await
-            .dependency_identity();
         let request_baselines = {
             let tracker = turn_diff_tracker.lock().await;
-            reasoning_governor.baselines_with_source_identity(
+            reasoning_governor.baselines(
                 tracker.current_mutation_revision(),
                 tracker.validation_freshness_status(),
                 tracker.last_successful_validation_revision(),
-                source_closure_identity,
             )
         };
         let request_signals = reasoning_governor.collector(&request_baselines);
@@ -581,7 +542,7 @@ pub(crate) async fn run_turn(
                 if authoritative_wait_terminal_surface.is_some() {
                     needs_follow_up = false;
                 }
-                let next_generation_request = needs_follow_up.then(|| {
+                let mut next_generation_request = needs_follow_up.then(|| {
                     reasoning_governor.continuation_generation_request(
                         &request_baselines,
                         &request_signals,
@@ -590,6 +551,18 @@ pub(crate) async fn run_turn(
                         server_end_turn_false && !tool_result_continuation && !has_pending_input,
                     )
                 });
+                if next_generation_request
+                    .as_ref()
+                    .is_some_and(
+                        super::reasoning_governor::GenerationRequestDisposition::completes_protocol_turn_deterministically,
+                    )
+                {
+                    // The only remaining action is host-owned protocol
+                    // completion. Sampling here would spend an entire model
+                    // generation to rediscover an already-proved action.
+                    needs_follow_up = false;
+                    next_generation_request = None;
+                }
                 turn_context.turn_timing_state.record_generation_outcome(
                     progress_kinds.clone(),
                     next_generation_request
@@ -656,10 +629,6 @@ pub(crate) async fn run_turn(
                             .await;
                         return Ok(TurnTaskResult::default());
                     }
-                    turn_diff_tracker
-                        .lock()
-                        .await
-                        .record_successful_compaction();
                     can_drain_pending_input = !model_needs_follow_up;
                     reasoning_governor.host_retain();
                     pending_generation_request = None;
@@ -950,11 +919,9 @@ pub(crate) async fn run_turn(
                             .record_proven_loop_activation();
                     }
                     if let Some(directive) = decision.directive {
-                        if !decision.readiness_handoff {
-                            turn_context
-                                .turn_timing_state
-                                .record_no_progress_directive();
-                        }
+                        turn_context
+                            .turn_timing_state
+                            .record_no_progress_directive();
                         let directive_item = ResponseItem::Message {
                             id: None,
                             role: "developer".to_string(),
@@ -968,22 +935,6 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                     }
-                }
-                if !has_pending_input
-                    && let Some(guidance) = reasoning_governor.model_evidence_guidance()
-                {
-                    let guidance_item = ResponseItem::Message {
-                        id: None,
-                        role: "developer".to_string(),
-                        content: vec![ContentItem::InputText { text: guidance }],
-                        phase: None,
-                        internal_chat_message_metadata_passthrough: None,
-                    };
-                    sess.record_conversation_items(
-                        &turn_context,
-                        std::slice::from_ref(&guidance_item),
-                    )
-                    .await;
                 }
                 debug_assert!(pending_continuation_cause.is_some());
                 continue;
@@ -1106,149 +1057,6 @@ pub(crate) async fn run_hooks_and_record_inputs(
     run_hooks_and_record_inputs_detailed(sess, turn_context, input)
         .await
         .should_stop
-}
-
-fn build_pre_edit_convergence_seed(
-    input: &[TurnInput],
-    turn_context: &TurnContext,
-    step_context: &StepContext,
-    display_roots: &[(String, PathBuf)],
-) -> PreEditConvergenceSeed {
-    build_pre_edit_convergence_seed_without_step(
-        input,
-        turn_context,
-        display_roots,
-        instruction_snapshot_identity(step_context.loaded_agents_md.as_deref()),
-    )
-}
-
-fn build_pre_edit_convergence_seed_without_step(
-    input: &[TurnInput],
-    turn_context: &TurnContext,
-    display_roots: &[(String, PathBuf)],
-    instruction_snapshot_identity: InstructionSnapshotIdentity,
-) -> PreEditConvergenceSeed {
-    let mut text = String::new();
-    let mut owner_candidates = Vec::new();
-    for item in input {
-        let TurnInput::UserInput { content, .. } = item else {
-            continue;
-        };
-        for content in content {
-            match content {
-                UserInput::Text {
-                    text: user_text, ..
-                } => {
-                    if text.len() < 4096 {
-                        text.extend(user_text.chars().take(4096 - text.len()));
-                        text.push('\n');
-                    }
-                    owner_candidates.extend(text_path_candidates(user_text, display_roots));
-                }
-                UserInput::LocalPath { path, .. } => {
-                    if let Some(path) = repository_relative_candidate(path, display_roots) {
-                        owner_candidates.push(path);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    owner_candidates.sort();
-    owner_candidates.dedup();
-    owner_candidates.truncate(8);
-    let normalized = text.to_ascii_lowercase();
-    let mutation_oriented = mutation_intent_is_explicit(&normalized);
-    let normal_mode = turn_context.collaboration_mode.mode == ModeKind::Default;
-    let read_only_session = matches!(
-        turn_context.session_source,
-        SessionSource::SubAgent(SubAgentSource::Review | SubAgentSource::Compact)
-    );
-    let task_mandated_proof = ["before editing, run ", "before you edit, run "]
-        .iter()
-        .any(|phrase| normalized.contains(phrase));
-    PreEditConvergenceSeed {
-        active: mutation_oriented && normal_mode && !read_only_session,
-        owner_candidates,
-        instruction_snapshot_identity,
-        task_mandated_proof,
-    }
-}
-
-fn instruction_snapshot_identity(
-    loaded: Option<&crate::agents_md::LoadedAgentsMd>,
-) -> InstructionSnapshotIdentity {
-    loaded.map_or(InstructionSnapshotIdentity::Empty, |instructions| {
-        InstructionSnapshotIdentity::loaded(instructions.semantic_digest())
-    })
-}
-
-fn mutation_intent_is_explicit(text: &str) -> bool {
-    let words = text
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .filter(|word| !word.is_empty())
-        .collect::<HashSet<_>>();
-    [
-        "implement",
-        "fix",
-        "change",
-        "modify",
-        "update",
-        "remove",
-        "delete",
-        "rename",
-        "refactor",
-        "migrate",
-        "replace",
-        "create",
-        "patch",
-    ]
-    .iter()
-    .any(|word| words.contains(word))
-        || (words.contains("add") && !words.contains("explain"))
-}
-
-fn text_path_candidates(text: &str, display_roots: &[(String, PathBuf)]) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|token| {
-            let token = token.trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
-                )
-            });
-            let token = token
-                .rsplit_once(':')
-                .filter(|(_, suffix)| suffix.chars().all(|character| character.is_ascii_digit()))
-                .map_or(token, |(path, _)| path);
-            if !token.contains(['/', '\\']) {
-                return None;
-            }
-            repository_relative_candidate(Path::new(token), display_roots)
-        })
-        .collect()
-}
-
-fn repository_relative_candidate(
-    path: &Path,
-    display_roots: &[(String, PathBuf)],
-) -> Option<String> {
-    let relative = if path.is_absolute() {
-        display_roots
-            .iter()
-            .find_map(|(_, root)| path.strip_prefix(root).ok())?
-            .to_path_buf()
-    } else {
-        path.to_path_buf()
-    };
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
 struct RecordedInputOutcome {
@@ -2623,10 +2431,8 @@ async fn run_sampling_request(
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
-    let prebuilt_router = prebuilt_router
-        .take()
-        .filter(|_| crate::latency_switches::stage2_critical_path_enabled());
-    let router = match prebuilt_router {
+    let cached_router = prebuilt_router.take();
+    let router = match cached_router {
         Some(router)
             if finalized_router_matches_exposure(
                 router.as_ref(),
@@ -2659,6 +2465,10 @@ async fn run_sampling_request(
                 None,
             )
         })?;
+    // Retain the finalized router for the next sampling boundary in this turn.
+    // Its exposure identity is revalidated above, so genuine surface changes
+    // still rebuild while ordinary tool continuations reuse the same registry.
+    *prebuilt_router = Some(Arc::clone(&router));
     let base_instructions = sess.get_base_instructions().await;
     sess.persist_rollout_items(&[codex_protocol::protocol::RolloutItem::ToolManifest(
         router.tool_manifest(turn_context.as_ref()),
@@ -3753,7 +3563,6 @@ async fn try_run_sampling_request(
         }
         return Err(CodexErr::TurnAborted);
     }
-    sess.ensure_rollout_budget_available()?;
     let request_policy = crate::session::reasoning_governor::resolve_request_policy_for_generation(
         reasoning_phase,
         turn_context.config.reasoning_phase_efforts.as_ref(),
@@ -4489,18 +4298,12 @@ async fn try_run_sampling_request(
         return Err(CodexErr::TurnAborted);
     }
 
-    let source_closure_identity = turn_context
-        .source_closure
-        .lock()
-        .await
-        .dependency_identity();
     let settled_state = {
         let tracker = turn_diff_tracker.lock().await;
         SamplingRequestSettledState {
             mutation_revision: tracker.current_mutation_revision(),
             validation_status: tracker.validation_freshness_status(),
             validation_revision: tracker.last_successful_validation_revision(),
-            source_closure_identity,
         }
     };
     let outcome = outcome.map(|result| SamplingRequestResult {

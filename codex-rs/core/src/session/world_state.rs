@@ -6,7 +6,6 @@ use crate::context::world_state::AgentsMdState;
 use crate::context::world_state::AppsInstructionsState;
 use crate::context::world_state::EnvironmentsState;
 use crate::context::world_state::PluginsInstructionsState;
-use crate::context::world_state::SourceClosureWorldState;
 use crate::context::world_state::WorldState;
 use codex_extension_api::WorldStateContributionInput;
 use futures::StreamExt;
@@ -76,8 +75,6 @@ impl Session {
         world_state.add_section(PluginsInstructionsState::new(
             step_context.mcp.plugins_available(),
         ));
-        let source_closure_summary = turn_context.source_closure.lock().await.summary();
-        world_state.add_section(SourceClosureWorldState::new(source_closure_summary));
         let environments = step_context.environments.to_selections();
         let ready_selected_capability_roots = step_context
             .selected_capability_roots

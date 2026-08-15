@@ -17,16 +17,13 @@ use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
-use crate::tools::handlers::LocateTaskHandler;
 use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::PlanHandler;
-use crate::tools::handlers::ReadFileSpanHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
 use crate::tools::handlers::ReadToolOutputHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
-use crate::tools::handlers::SearchSourceHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
@@ -776,21 +773,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add(PlanHandler);
-    }
-
-    if features.enabled(Feature::SourceTools)
-        && environment_mode.has_environment()
-        && context
-            .step_context
-            .environments
-            .turn_environments
-            .iter()
-            .any(|environment| !environment.environment.is_remote())
-    {
-        let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
-        planned_tools.add(LocateTaskHandler::new(include_environment_id));
-        planned_tools.add(SearchSourceHandler::new(include_environment_id));
-        planned_tools.add(ReadFileSpanHandler::new(include_environment_id));
     }
 
     if features.enabled(Feature::DeferredExecutor)

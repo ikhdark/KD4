@@ -87,13 +87,9 @@ use crate::WakeEvent;
 use crate::WakeEventId;
 use crate::WakeRead;
 use crate::WorkspaceActorRegistration;
-use crate::WorkspaceMutationLease;
-use crate::WorkspaceMutationRequest;
-use crate::WorkspaceMutationResult;
 use crate::WorkspaceRevision;
 use crate::WorkspaceStrategy;
 use crate::WorkspaceTaskStatus;
-use crate::WriteClaimConflict;
 use crate::scope::RepositoryIdentity;
 use crate::scope::absolute_repo_path;
 use crate::scope::normalize_repo_path;
@@ -332,7 +328,7 @@ impl LocalAgentTaskStore {
         crate::workspace::ensure_workspace_tx(&mut transaction, &repository).await?;
         assignment.start_epoch =
             crate::workspace::current_epoch_tx(&mut transaction, &repository.workspace_id).await?;
-        // The assignment insert acquires SQLite's writer lock before dependency and claim
+        // The assignment insert acquires SQLite's writer lock before dependency and coordination
         // validation. Any validation failure rolls the row back, so no dormant task is exposed.
         sqlx::query(
             "INSERT INTO assignments (assignment_id, root_session_id, body_json, created_at) VALUES (?, ?, ?, ?)",
@@ -382,46 +378,7 @@ impl LocalAgentTaskStore {
                 IntegrationPlan::SingleWriter,
             )
         };
-        let mutation_conflicts =
-            workspace_mutation_claim_conflicts_tx(&mut transaction, &assignment).await?;
-        if !mutation_conflicts.is_empty() {
-            return Err(StoreError::WorkspaceClaimConflict {
-                details: mutation_conflicts,
-            });
-        }
-        let (supersedes, conflicts) =
-            plan_write_claim_tx(&mut transaction, &assignment, None).await?;
-        if !conflicts.is_empty() {
-            return Err(StoreError::WriteClaimConflict { conflicts });
-        }
-        let contract_conflicts = sqlx::query(
-            "SELECT claims.contract_name, claims.assignment_id
-             FROM contract_claims claims
-             JOIN write_claims writes ON writes.assignment_id = claims.assignment_id
-             WHERE claims.workspace_id = ? AND claims.active = 1 AND writes.active = 1",
-        )
-        .bind(&repository.workspace_id)
-        .fetch_all(&mut *transaction)
-        .await?
-        .into_iter()
-        .filter_map(|row| {
-            let contract = row.get::<String, _>("contract_name");
-            let owner = row.get::<String, _>("assignment_id");
-            if supersedes.iter().any(|id| id.to_string() == owner) {
-                return None;
-            }
-            assignment
-                .contract_claims
-                .iter()
-                .any(|requested| requested == &contract)
-                .then(|| format!("contract {contract} is already claimed by assignment {owner}"))
-        })
-        .collect::<Vec<_>>();
-        if !contract_conflicts.is_empty() {
-            return Err(StoreError::WorkspaceClaimConflict {
-                details: contract_conflicts,
-            });
-        }
+        let supersedes = planned_claim_supersessions_tx(&mut transaction, &assignment).await?;
         insert_attempt(&mut transaction, &attempt).await?;
         claim_isolated_handoffs_tx(&mut transaction, &assignment).await?;
         for superseded in &supersedes {
@@ -1983,29 +1940,6 @@ impl LocalAgentTaskStore {
             created_at: Utc::now(),
             sealed_at: None,
         };
-        let mutation_conflicts =
-            workspace_mutation_claim_conflicts_tx(&mut transaction, &assignment).await?;
-        if !mutation_conflicts.is_empty() {
-            return Err(StoreError::WorkspaceClaimConflict {
-                details: mutation_conflicts,
-            });
-        }
-        if !assignment.write_scope.is_empty() {
-            let claim = sqlx::query("SELECT attempt_id FROM write_claims WHERE assignment_id = ?")
-                .bind(assignment_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?;
-            if claim.as_ref().is_none_or(|claim| {
-                claim.get::<String, _>("attempt_id") != current.attempt_id.to_string()
-            }) {
-                return Err(StoreError::WriteClaimInactive(assignment_id));
-            }
-            let (_, conflicts) =
-                plan_write_claim_tx(&mut transaction, &assignment, Some(assignment_id)).await?;
-            if !conflicts.is_empty() {
-                return Err(StoreError::WriteClaimConflict { conflicts });
-            }
-        }
         insert_attempt(&mut transaction, &next).await?;
         let binding_attempt = sqlx::query_scalar::<_, String>(
             "SELECT attempt_id FROM agent_task_bindings WHERE assignment_id = ?",
@@ -2036,24 +1970,46 @@ impl LocalAgentTaskStore {
             }
         }
         if !assignment.write_scope.is_empty() {
-            let updated = sqlx::query("UPDATE write_claims SET attempt_id = ?, active = 1, released_at = NULL, superseded_by = NULL WHERE assignment_id = ? AND attempt_id = ?")
-                .bind(next.attempt_id.to_string())
-                .bind(assignment_id.to_string())
-                .bind(current.attempt_id.to_string())
-                .execute(&mut *transaction)
-                .await?;
-            if updated.rows_affected() != 1 {
-                return Err(StoreError::WriteClaimInactive(assignment_id));
-            }
+            sqlx::query(
+                "INSERT INTO write_claims (
+                    assignment_id, attempt_id, scopes_json, supersedes_json, active, created_at,
+                    released_at, superseded_by
+                 ) VALUES (?, ?, ?, ?, 1, ?, NULL, NULL)
+                 ON CONFLICT(assignment_id) DO UPDATE SET
+                    attempt_id = excluded.attempt_id,
+                    scopes_json = excluded.scopes_json,
+                    supersedes_json = excluded.supersedes_json,
+                    active = 1,
+                    released_at = NULL,
+                    superseded_by = NULL",
+            )
+            .bind(assignment_id.to_string())
+            .bind(next.attempt_id.to_string())
+            .bind(encode(&assignment.write_scope)?)
+            .bind(encode(&Vec::<AssignmentId>::new())?)
+            .bind(encode(&next.created_at)?)
+            .execute(&mut *transaction)
+            .await?;
         }
-        sqlx::query(
-            "UPDATE contract_claims SET attempt_id = ?, active = 1, released_at = NULL
-             WHERE assignment_id = ?",
-        )
-        .bind(next.attempt_id.to_string())
-        .bind(assignment_id.to_string())
-        .execute(&mut *transaction)
-        .await?;
+        for contract in &assignment.contract_claims {
+            sqlx::query(
+                "INSERT INTO contract_claims (
+                    workspace_id, contract_name, assignment_id, attempt_id, active,
+                    created_at, released_at
+                 ) VALUES (?, ?, ?, ?, 1, ?, NULL)
+                 ON CONFLICT(workspace_id, contract_name, assignment_id) DO UPDATE SET
+                    attempt_id = excluded.attempt_id,
+                    active = 1,
+                    released_at = NULL",
+            )
+            .bind(&assignment.workspace_id)
+            .bind(contract)
+            .bind(assignment_id.to_string())
+            .bind(next.attempt_id.to_string())
+            .bind(encode(&next.created_at)?)
+            .execute(&mut *transaction)
+            .await?;
+        }
         sqlx::query(
             "UPDATE workspace_actors SET actor_id = ?, attempt_id = ?, state = 'active',
              last_progress_at = ?, lease_expires_at = ?, nudge_sent_at = NULL
@@ -2832,7 +2788,6 @@ impl LocalAgentTaskStore {
         let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
         let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
         require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
-        require_active_claim_tx(&mut transaction, &assignment, attempt_id, &normalized).await?;
         let existing = sqlx::query(
             "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
         )
@@ -2971,7 +2926,6 @@ impl LocalAgentTaskStore {
         let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
         let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
         require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
-        require_active_claim_tx(&mut transaction, &assignment, attempt_id, &normalized).await?;
         let existing = sqlx::query(
             "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
         )
@@ -3680,43 +3634,6 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         )
     }
 
-    fn record_supporting_read<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        actor_id: String,
-        paths: Vec<String>,
-    ) -> TaskStoreFuture<'a, WorkspaceRevision> {
-        Box::pin(async move {
-            crate::workspace::record_supporting_read(&self.pool, repo_root, &actor_id, paths).await
-        })
-    }
-
-    fn record_supporting_read_entries<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        actor_id: String,
-        entries: Vec<crate::WorkspaceManifestEntry>,
-    ) -> TaskStoreFuture<'a, WorkspaceRevision> {
-        Box::pin(async move {
-            crate::workspace::record_supporting_read_entries(
-                &self.pool, repo_root, &actor_id, entries,
-            )
-            .await
-        })
-    }
-
-    fn supporting_read_manifest<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        actor_id: String,
-        paths: Vec<String>,
-    ) -> TaskStoreFuture<'a, Vec<crate::WorkspaceManifestEntry>> {
-        Box::pin(async move {
-            crate::workspace::supporting_read_manifest(&self.pool, repo_root, &actor_id, paths)
-                .await
-        })
-    }
-
     fn read_workspace_events<'a>(
         &'a self,
         repo_root: &'a Path,
@@ -3734,166 +3651,6 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
     ) -> TaskStoreFuture<'a, ()> {
         Box::pin(async move {
             crate::workspace::register_actor(&self.pool, repo_root, registration).await
-        })
-    }
-
-    fn begin_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        request: WorkspaceMutationRequest,
-    ) -> TaskStoreFuture<'a, WorkspaceMutationLease> {
-        Box::pin(
-            async move { crate::workspace::begin_mutation(&self.pool, repo_root, request).await },
-        )
-    }
-
-    fn prepare_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        paths: Vec<String>,
-    ) -> TaskStoreFuture<'a, Option<crate::PreparedWorkspaceManifest>> {
-        Box::pin(async move {
-            crate::workspace::prepare_mutation(&self.pool, repo_root, paths)
-                .await
-                .map(Some)
-        })
-    }
-
-    fn workspace_manifest_overlay_paths<'a>(
-        &'a self,
-        repo_root: &'a Path,
-    ) -> TaskStoreFuture<'a, Option<Vec<String>>> {
-        Box::pin(async move {
-            crate::workspace::repository_overlay_paths(repo_root)
-                .await
-                .map(Some)
-        })
-    }
-
-    fn refresh_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        prepared: crate::PreparedWorkspaceManifest,
-        overlay_paths: Vec<String>,
-        changed_paths: Vec<String>,
-    ) -> TaskStoreFuture<'a, Option<crate::PreparedWorkspaceManifest>> {
-        Box::pin(async move {
-            crate::workspace::refresh_mutation(
-                &self.pool,
-                repo_root,
-                prepared,
-                overlay_paths,
-                changed_paths,
-            )
-            .await
-            .map(Some)
-        })
-    }
-
-    fn begin_workspace_mutation_prepared<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        request: WorkspaceMutationRequest,
-        prepared: crate::PreparedWorkspaceManifest,
-    ) -> TaskStoreFuture<'a, WorkspaceMutationLease> {
-        Box::pin(async move {
-            crate::workspace::begin_mutation_prepared(&self.pool, repo_root, request, prepared)
-                .await
-        })
-    }
-
-    fn workspace_mutation_epoch<'a>(
-        &'a self,
-        repo_root: &'a Path,
-    ) -> TaskStoreFuture<'a, Option<u64>> {
-        Box::pin(async move { crate::workspace::mutation_epoch(&self.pool, repo_root).await })
-    }
-
-    fn heartbeat_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        lease_id: String,
-        actor_id: String,
-    ) -> TaskStoreFuture<'a, bool> {
-        Box::pin(async move {
-            crate::workspace::heartbeat_mutation(&self.pool, repo_root, &lease_id, &actor_id).await
-        })
-    }
-
-    fn finish_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        lease: WorkspaceMutationLease,
-    ) -> TaskStoreFuture<'a, WorkspaceMutationResult> {
-        Box::pin(
-            async move { crate::workspace::finish_mutation(&self.pool, repo_root, lease).await },
-        )
-    }
-
-    fn finish_workspace_mutation_with_receipt<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        lease: WorkspaceMutationLease,
-    ) -> TaskStoreFuture<'a, crate::WorkspaceMutationFinishOutcome> {
-        Box::pin(async move {
-            crate::workspace::finish_mutation_with_receipt(&self.pool, repo_root, lease).await
-        })
-    }
-
-    fn begin_workspace_finalization<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        root_session_id: String,
-    ) -> TaskStoreFuture<'a, crate::WorkspaceFinalizationFence> {
-        Box::pin(async move {
-            crate::workspace::begin_finalization(&self.pool, repo_root, &root_session_id).await
-        })
-    }
-
-    fn seal_workspace_finalization_dispatch<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        fence: crate::WorkspaceFinalizationFence,
-    ) -> TaskStoreFuture<'a, crate::WorkspaceFinalizationFence> {
-        Box::pin(async move {
-            crate::workspace::seal_finalization_dispatch(&self.pool, repo_root, fence).await
-        })
-    }
-
-    fn heartbeat_workspace_finalization<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        fence_id: String,
-        root_session_id: String,
-    ) -> TaskStoreFuture<'a, bool> {
-        Box::pin(async move {
-            crate::workspace::heartbeat_finalization(
-                &self.pool,
-                repo_root,
-                &fence_id,
-                &root_session_id,
-            )
-            .await
-        })
-    }
-
-    fn release_workspace_finalization<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        fence: crate::WorkspaceFinalizationFence,
-    ) -> TaskStoreFuture<'a, ()> {
-        Box::pin(async move {
-            crate::workspace::release_finalization(&self.pool, repo_root, fence).await
-        })
-    }
-
-    fn assert_workspace_unclaimed<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        actor_attempt_id: Option<AttemptId>,
-    ) -> TaskStoreFuture<'a, ()> {
-        Box::pin(async move {
-            crate::workspace::assert_unclaimed(&self.pool, repo_root, actor_attempt_id).await
         })
     }
 
@@ -6067,7 +5824,6 @@ async fn validate_completed_mutation_evidence_tx(
             ));
         }
         change.path = normalize_repo_path(repo_root, &change.path)?;
-        require_active_claim_tx(transaction, assignment, attempt_id, &change.path).await?;
         if !declared.insert(change.path.clone()) {
             return Err(StoreError::InvalidAssignment(format!(
                 "duplicate declared change {}",
@@ -6232,97 +5988,6 @@ async fn selective_admission_tx(
         if !existing.write_scope.is_empty() {
             active_writer_count = active_writer_count.saturating_add(1);
             writer_in_another_workspace |= existing_workspace_id != assignment.workspace_id;
-            let intentional_integration_overlap = assignment.role == AgentRole::Integrator
-                && assignment.relation.as_ref().is_some_and(|relation| {
-                    relation.kind == RelationKind::Integration
-                        && relation
-                            .target_assignment_ids
-                            .contains(&existing.assignment_id)
-                });
-            let intentional_legacy_delegation_overlap =
-                is_intentional_legacy_delegation_overlap(assignment, &existing);
-            let write_conflicts = existing
-                .write_scope
-                .iter()
-                .flat_map(|existing_scope| {
-                    assignment
-                        .write_scope
-                        .iter()
-                        .filter(move |requested_scope| existing_scope.overlaps(requested_scope))
-                        .map(move |requested_scope| WriteClaimConflict {
-                            assignment_id: existing.assignment_id,
-                            existing_scope: existing_scope.clone(),
-                            requested_scope: requested_scope.clone(),
-                        })
-                })
-                .collect::<Vec<_>>();
-            if !intentional_integration_overlap
-                && !intentional_legacy_delegation_overlap
-                && !write_conflicts.is_empty()
-            {
-                return Err(StoreError::WriteClaimConflict {
-                    conflicts: write_conflicts,
-                });
-            }
-        }
-
-        if assignment.write_scope.is_empty()
-            || !matches!(
-                existing.role,
-                AgentRole::Explorer | AgentRole::Reviewer | AgentRole::Verifier
-            )
-        {
-            continue;
-        }
-        let scope_conflict = existing.read_scope.iter().any(|read_scope| {
-            assignment
-                .write_scope
-                .iter()
-                .any(|write_scope| read_scope.overlaps(write_scope))
-        });
-        let contract_conflict = existing
-            .contract_claims
-            .iter()
-            .any(|claim| assignment.contract_claims.contains(claim));
-        if scope_conflict || contract_conflict {
-            return Err(StoreError::AdmissionRejected {
-                reason: AdmissionRejectionReason::CorrectnessSensitiveReadConflict,
-            });
-        }
-    }
-
-    if !assignment.write_scope.is_empty() {
-        let validation_rows = sqlx::query(
-            "SELECT validation_calls.body_json
-             FROM validation_calls
-             JOIN attempts ON attempts.attempt_id = validation_calls.attempt_id
-             JOIN assignment_repositories repositories
-               ON repositories.assignment_id = attempts.assignment_id
-             WHERE repositories.workspace_id = ? AND validation_calls.status = ?",
-        )
-        .bind(&assignment.workspace_id)
-        .bind(encode(&ValidationCallStatus::Running)?)
-        .fetch_all(&mut **transaction)
-        .await?;
-        for row in validation_rows {
-            let call: ValidationCall = decode(row.get::<String, _>("body_json").as_str())?;
-            let scope_conflict = call.evidence.repository_wide
-                || call.evidence.covered_scopes.iter().any(|covered_scope| {
-                    assignment
-                        .write_scope
-                        .iter()
-                        .any(|write_scope| covered_scope.overlaps(write_scope))
-                });
-            let contract_conflict = call
-                .evidence
-                .covered_contracts
-                .iter()
-                .any(|claim| assignment.contract_claims.contains(claim));
-            if scope_conflict || contract_conflict {
-                return Err(StoreError::AdmissionRejected {
-                    reason: AdmissionRejectionReason::ActiveValidationConflict,
-                });
-            }
         }
     }
 
@@ -6492,85 +6157,12 @@ pub(crate) async fn release_orphaned_claims_tx(
     Ok(released)
 }
 
-async fn workspace_mutation_claim_conflicts_tx(
+async fn planned_claim_supersessions_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
-) -> StoreResult<Vec<String>> {
-    let rows = sqlx::query(
-        "SELECT actor_id, paths_json, contracts_json
-         FROM workspace_mutation_leases
-         WHERE workspace_id = ? AND root_session_id = ? AND state = 'active'
-           AND julianday(json_extract(expires_at, '$')) >= julianday(json_extract(?, '$'))",
-    )
-    .bind(&assignment.workspace_id)
-    .bind(&assignment.root_session_id)
-    .bind(encode(&comparison_now())?)
-    .fetch_all(&mut **transaction)
-    .await?;
-    let mut conflicts = BTreeSet::new();
-    for row in rows {
-        let actor_id = row.get::<String, _>("actor_id");
-        let paths: Vec<String> = decode(&row.get::<String, _>("paths_json"))?;
-        let contracts: Vec<String> = decode(&row.get::<String, _>("contracts_json"))?;
-        for path in &paths {
-            if assignment
-                .write_scope
-                .iter()
-                .any(|scope| mutation_path_overlaps_scope(path, scope))
-            {
-                conflicts.insert(format!(
-                    "active mutation path {path} held by {actor_id} overlaps the requested write scope"
-                ));
-            }
-        }
-        let contract_overlap = assignment
-            .contract_claims
-            .iter()
-            .filter(|contract| contracts.contains(contract))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !contract_overlap.is_empty() {
-            conflicts.insert(format!(
-                "active mutation held by {actor_id} overlaps contracts {}",
-                contract_overlap.join(", ")
-            ));
-        } else if paths.iter().any(|path| path == crate::REPOSITORY_WIDE_PATH)
-            && !assignment.contract_claims.is_empty()
-        {
-            conflicts.insert(format!(
-                "repository-wide mutation held by {actor_id} overlaps requested contract claims"
-            ));
-        }
-    }
-    Ok(conflicts.into_iter().collect())
-}
-
-fn mutation_path_overlaps_scope(path: &str, scope: &RepoScope) -> bool {
-    if path == crate::REPOSITORY_WIDE_PATH {
-        return true;
-    }
-    let path = if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_string()
-    };
-    let scope_path = if cfg!(windows) {
-        scope.path.to_lowercase()
-    } else {
-        scope.path.clone()
-    };
-    path == scope_path
-        || scope.recursive && path.starts_with(&format!("{scope_path}/"))
-        || scope_path.starts_with(&format!("{path}/"))
-}
-
-async fn plan_write_claim_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    assignment: &Assignment,
-    exclude_assignment_id: Option<AssignmentId>,
-) -> StoreResult<(Vec<AssignmentId>, Vec<WriteClaimConflict>)> {
-    if assignment.write_scope.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+) -> StoreResult<Vec<AssignmentId>> {
+    if assignment.write_scope.is_empty() || assignment.role != AgentRole::Integrator {
+        return Ok(Vec::new());
     }
     let binding = sqlx::query(
         "SELECT repository_id, workspace_id FROM assignment_repositories WHERE assignment_id = ?",
@@ -6601,23 +6193,21 @@ async fn plan_write_claim_tx(
     } else {
         HashSet::new()
     };
-    let rows = if let Some(excluded) = exclude_assignment_id {
-        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root, a.body_json FROM write_claims wc JOIN assignments a ON a.assignment_id = wc.assignment_id LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL) AND wc.assignment_id <> ?")
-            .bind(&bound_workspace_id)
-            .bind(excluded.to_string())
-            .fetch_all(&mut **transaction)
-            .await?
-    } else {
-        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root, a.body_json FROM write_claims wc JOIN assignments a ON a.assignment_id = wc.assignment_id LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL)")
-            .bind(&bound_workspace_id)
-            .fetch_all(&mut **transaction)
-            .await?
-    };
+    let rows = sqlx::query(
+        "SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root
+         FROM write_claims wc
+         LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id
+         WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL)",
+    )
+    .bind(&bound_workspace_id)
+    .fetch_all(&mut **transaction)
+    .await?;
     let mut supersedes = HashSet::new();
-    let mut conflicts = Vec::new();
     for row in rows {
         let existing_id = AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?;
-        let existing: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
+        if !integrator_targets.contains(&existing_id) {
+            continue;
+        }
         let existing_repository_id = row.get::<Option<String>, _>("repository_id");
         let mut scopes: Vec<RepoScope> = decode(row.get::<String, _>("scopes_json").as_str())?;
         if let Some(canonical_root) = row.get::<Option<String>, _>("canonical_root") {
@@ -6629,67 +6219,19 @@ async fn plan_write_claim_tx(
                 })
                 .collect::<StoreResult<Vec<_>>>()?;
         }
-        let overlaps = scopes
-            .iter()
-            .flat_map(|existing_scope| {
-                assignment
-                    .write_scope
-                    .iter()
-                    .filter(move |requested_scope| existing_scope.overlaps(requested_scope))
-                    .map(move |requested_scope| (existing_scope, requested_scope))
-            })
-            .collect::<Vec<_>>();
-        if overlaps.is_empty() {
-            continue;
-        }
-        if is_intentional_legacy_delegation_overlap(assignment, &existing) {
-            continue;
-        }
         let fully_covered = scopes.iter().all(|existing_scope| {
             assignment
                 .write_scope
                 .iter()
                 .any(|requested_scope| requested_scope.covers_scope(existing_scope))
         });
-        if existing_repository_id.is_some()
-            && integrator_targets.contains(&existing_id)
-            && fully_covered
-        {
+        if existing_repository_id.is_some() && fully_covered {
             supersedes.insert(existing_id);
-            continue;
-        }
-        for (existing_scope, requested_scope) in overlaps {
-            conflicts.push(WriteClaimConflict {
-                assignment_id: existing_id,
-                existing_scope: existing_scope.clone(),
-                requested_scope: requested_scope.clone(),
-            });
         }
     }
     let mut supersedes: Vec<_> = supersedes.into_iter().collect();
     supersedes.sort();
-    conflicts.sort_by(|left, right| {
-        left.assignment_id
-            .cmp(&right.assignment_id)
-            .then_with(|| left.existing_scope.path.cmp(&right.existing_scope.path))
-            .then_with(|| left.requested_scope.path.cmp(&right.requested_scope.path))
-    });
-    Ok((supersedes, conflicts))
-}
-
-fn is_intentional_legacy_delegation_overlap(
-    assignment: &Assignment,
-    existing: &Assignment,
-) -> bool {
-    matches!(
-        assignment.admission_origin,
-        crate::AssignmentAdmissionOrigin::LegacyMessage {
-            parent_assignment_id: Some(parent_assignment_id),
-        } if parent_assignment_id == existing.assignment_id
-    ) && matches!(
-        existing.admission_origin,
-        crate::AssignmentAdmissionOrigin::LegacyMessage { .. }
-    )
+    Ok(supersedes)
 }
 
 async fn require_repository_identity_tx(
@@ -6722,38 +6264,6 @@ async fn require_repository_identity_tx(
         || !root_matches
     {
         return Err(StoreError::RepositoryMismatch(assignment.assignment_id));
-    }
-    Ok(())
-}
-
-async fn require_active_claim_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    assignment: &Assignment,
-    attempt_id: AttemptId,
-    path: &str,
-) -> StoreResult<()> {
-    let row = sqlx::query("SELECT wc.attempt_id, wc.scopes_json, wc.active, ar.canonical_root FROM write_claims wc LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.assignment_id = ?")
-    .bind(assignment.assignment_id.to_string())
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let Some(row) = row else {
-        return Err(StoreError::MutationOutsideClaim(path.to_string()));
-    };
-    let mut scopes: Vec<RepoScope> = decode(row.get::<String, _>("scopes_json").as_str())?;
-    if let Some(canonical_root) = row.get::<Option<String>, _>("canonical_root") {
-        scopes = scopes
-            .into_iter()
-            .map(|scope| {
-                normalize_repo_scopes(Path::new(&canonical_root), std::slice::from_ref(&scope))
-                    .map(|mut scopes| scopes.remove(0))
-            })
-            .collect::<StoreResult<Vec<_>>>()?;
-    }
-    if row.get::<i64, _>("active") == 0
-        || row.get::<String, _>("attempt_id") != attempt_id.to_string()
-        || !scopes.iter().any(|scope| scope.covers_path(path))
-    {
-        return Err(StoreError::MutationOutsideClaim(path.to_string()));
     }
     Ok(())
 }

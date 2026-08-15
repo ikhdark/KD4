@@ -214,7 +214,11 @@ pub(super) async fn handle_runtime_response(
     max_output_tokens: Option<usize>,
     started_at: std::time::Instant,
 ) -> Result<FunctionToolOutput, String> {
-    let hard_limit = TruncationPolicy::from(exec.turn.model_info.truncation_policy).token_budget();
+    // Nested tool results have already crossed their owning tool boundary. Keep
+    // one coherent, model-safe exec packet here instead of applying the much
+    // smaller generic per-tool diagnostic budget a second time.
+    let hard_limit = codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+        .min(TruncationPolicy::from(exec.turn.model_info.truncation_policy).token_budget());
     let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
     Ok(format_runtime_response(
@@ -538,6 +542,24 @@ mod tests {
         };
         assert!(text.starts_with("Warning: truncated output"));
         assert!(text.contains("95 tokens truncated"));
+    }
+
+    #[test]
+    fn default_outer_success_budget_preserves_a_multi_tool_evidence_packet() {
+        let text = "x".repeat(24_000);
+        assert!(codex_utils_string::approx_token_count(&text) > 4_000);
+        let items = vec![FunctionCallOutputContentItem::InputText { text: text.clone() }];
+
+        let projected = truncate_code_mode_result(items, None, OutputOutcome::Success, usize::MAX);
+
+        assert_eq!(
+            projected,
+            vec![FunctionCallOutputContentItem::InputText { text }]
+        );
+        assert_eq!(
+            codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
+            codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        );
     }
 
     #[tokio::test]

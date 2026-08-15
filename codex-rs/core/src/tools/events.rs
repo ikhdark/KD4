@@ -598,6 +598,12 @@ async fn emit_exec_stage(
 ) {
     match stage {
         ToolEventStage::Begin => {
+            if crate::turn_diff_tracker::command_may_mutate(exec_input.command) {
+                ctx.session
+                    .services
+                    .git_workspace
+                    .note_host_workspace_mutation();
+            }
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -670,6 +676,12 @@ async fn emit_exec_end(
     exec_result: ExecCommandResult,
 ) {
     let possible_mutation = crate::turn_diff_tracker::command_may_mutate(exec_input.command);
+    if possible_mutation && exec_result.status != ExecCommandStatus::Declined {
+        ctx.session
+            .services
+            .git_workspace
+            .note_host_workspace_mutation();
+    }
     if let Some(tracker) = ctx.turn_diff_tracker {
         let native_cwd = exec_input.cwd.to_abs_path().ok();
         tracker.lock().await.record_exec_command_end_at(

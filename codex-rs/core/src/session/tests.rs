@@ -416,7 +416,7 @@ fn skill_message(text: &str) -> ResponseItem {
 }
 
 #[tokio::test]
-async fn regular_turn_cancels_unfinished_startup_prewarm_without_waiting() {
+async fn regular_turn_bounds_unfinished_startup_prewarm_handoff() {
     let _trace_test_context = install_test_tracing("codex-core-tests");
     let request_parent = W3cTraceContext {
         traceparent: Some("00-00000000000000000000000000000011-0000000000000022-01".into()),
@@ -464,17 +464,18 @@ async fn regular_turn_cancels_unfinished_startup_prewarm_without_waiting() {
     assert_eq!(turn_started.turn_id, tc.sub_id);
     assert_eq!(turn_started.trace_id, tc.trace_id);
     tokio::time::timeout(
-        std::time::Duration::from_millis(200),
+        crate::session_startup_prewarm::FIRST_TURN_PREWARM_HANDOFF_TIMEOUT
+            + std::time::Duration::from_millis(500),
         startup_prewarm_tx.closed(),
     )
     .await
-    .expect("expected regular turn to cancel unfinished startup prewarm");
+    .expect("expected regular turn to cancel prewarm after the bounded handoff window");
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]
-async fn unfinished_startup_prewarm_falls_back_without_join_or_handle_reuse() {
+async fn unfinished_startup_prewarm_falls_back_after_bounded_handoff() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -502,15 +503,16 @@ async fn unfinished_startup_prewarm_falls_back_without_join_or_handle_reuse() {
     .await;
 
     let resolution = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
+        crate::session_startup_prewarm::FIRST_TURN_PREWARM_HANDOFF_TIMEOUT
+            + std::time::Duration::from_millis(500),
         sess.consume_startup_prewarm_for_regular_turn(&CancellationToken::new()),
     )
     .await
-    .expect("ordinary dispatch should not join an unfinished startup prewarm");
+    .expect("ordinary dispatch should bound an unfinished startup prewarm");
     assert!(matches!(
         resolution,
         crate::session_startup_prewarm::SessionStartupPrewarmResolution::Unavailable {
-            status: "not_ready",
+            status: "handoff_timeout",
             ..
         }
     ));
@@ -543,6 +545,31 @@ async fn completed_startup_prewarm_is_reused() {
     let resolution = sess
         .consume_startup_prewarm_for_regular_turn(&CancellationToken::new())
         .await;
+    assert!(matches!(
+        resolution,
+        crate::session_startup_prewarm::SessionStartupPrewarmResolution::Ready(_)
+    ));
+}
+
+#[tokio::test]
+async fn startup_prewarm_completing_during_handoff_is_reused() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let handle = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        Ok(test_model_client_session())
+    });
+    sess.set_session_startup_prewarm(
+        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            handle,
+            std::time::Instant::now(),
+        ),
+    )
+    .await;
+
+    let resolution = sess
+        .consume_startup_prewarm_for_regular_turn(&CancellationToken::new())
+        .await;
+
     assert!(matches!(
         resolution,
         crate::session_startup_prewarm::SessionStartupPrewarmResolution::Ready(_)
@@ -9873,41 +9900,6 @@ impl SessionTask for NeverEndingTask {
     }
 }
 
-#[derive(Clone, Copy)]
-struct MutationFinalizingOnCancellationTask {
-    process_id: i32,
-}
-
-impl SessionTask for MutationFinalizingOnCancellationTask {
-    fn kind(&self) -> TaskKind {
-        TaskKind::Regular
-    }
-
-    fn span_name(&self) -> &'static str {
-        "session_task.mutation_finalizing_on_cancellation"
-    }
-
-    async fn run(
-        self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
-        _ctx: Arc<TurnContext>,
-        _input: Vec<TurnInput>,
-        cancellation_token: CancellationToken,
-    ) -> SessionTaskResult {
-        cancellation_token.cancelled().await;
-        assert!(
-            session
-                .clone_session()
-                .services
-                .command_execution
-                .mark_running_process_completed(self.process_id, 130)
-                .await,
-            "the fixture mutation should still be tracked"
-        );
-        Ok(crate::tasks::TurnTaskResult::default())
-    }
-}
-
 #[derive(Clone)]
 struct BlockingAbortTask {
     abort_started: Arc<tokio::sync::Notify>,
@@ -10219,90 +10211,6 @@ async fn abort_gracefully_emits_marker_before_turn_aborted() {
     }
     // No extra events should be emitted after an abort.
     assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interrupt_cancels_task_before_waiting_for_workspace_mutation_cleanup() {
-    let (sess, tc, rx) = make_session_and_context_with_rx().await;
-    let codex_home = tempfile::TempDir::new().expect("codex home tempdir");
-    let repo = tempfile::TempDir::new().expect("repository tempdir");
-    let state = codex_state::StateRuntime::init(
-        codex_home.path().to_path_buf(),
-        "test-provider".to_string(),
-    )
-    .await
-    .expect("state runtime initializes");
-    let store = Arc::new(
-        codex_agent_task_store::LocalAgentTaskStore::initialize(&state)
-            .await
-            .expect("task store initializes"),
-    );
-    let reservation = sess
-        .services
-        .command_execution
-        .reserve_workspace_mutation(repo.path())
-        .await;
-    let lease = codex_agent_task_store::AgentTaskStore::begin_workspace_mutation(
-        store.as_ref(),
-        repo.path(),
-        codex_agent_task_store::WorkspaceMutationRequest {
-            root_session_id: "owner-root".to_string(),
-            actor_id: "root:owner-root".to_string(),
-            kind: codex_agent_task_store::WorkspaceActorKind::Root,
-            attempt_id: None,
-            paths: vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
-            contracts: Vec::new(),
-            expected_manifest: Vec::new(),
-        },
-    )
-    .await
-    .expect("workspace mutation starts");
-    let task_store: Arc<dyn codex_agent_task_store::AgentTaskStore> = store;
-    let mutation = crate::tools::command_execution::RunningWorkspaceMutation::new(
-        task_store,
-        repo.path().to_path_buf(),
-        lease,
-        CancellationToken::new(),
-        reservation,
-    );
-    let process_id = 42_424;
-    sess.services
-        .command_execution
-        .track_running_process(
-            process_id,
-            crate::tools::command_execution::CommandAttemptKey::new(
-                "exec_command",
-                "local",
-                repo.path().display().to_string(),
-                &["long-running-mutation".to_string()],
-            ),
-            crate::tools::command_output_artifact::RawOutputArtifact::unavailable("fixture"),
-            tc.sub_id.clone(),
-            Some(mutation),
-        )
-        .await;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        MutationFinalizingOnCancellationTask { process_id },
-    )
-    .await;
-
-    timeout(
-        Duration::from_secs(2),
-        sess.abort_all_tasks(TurnAbortReason::Interrupted),
-    )
-    .await
-    .expect("interrupt should not wait forever for mutating command cleanup");
-
-    let event = recv_terminal_event(&rx, TerminalEventKind::TurnAborted).await;
-    assert!(matches!(
-        event.msg,
-        EventMsg::TurnAborted(TurnAbortedEvent {
-            reason: TurnAbortReason::Interrupted,
-            ..
-        })
-    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

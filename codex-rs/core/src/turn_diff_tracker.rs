@@ -6,7 +6,6 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 use codex_utils_path::normalize_for_path_comparison;
-use serde::Serialize;
 use sha1::digest::Output;
 #[cfg(test)]
 use sha2::Digest;
@@ -35,7 +34,6 @@ pub(crate) struct CoherentImplementationBoundary {
     pub(crate) pending_mutation_obligations: bool,
     pub(crate) typed_children_quiescent: bool,
     pub(crate) default_children_quiescent: bool,
-    pub(crate) overlapping_mutation_lease: bool,
 }
 
 #[cfg(test)]
@@ -46,14 +44,12 @@ impl CoherentImplementationBoundary {
             && !self.pending_mutation_obligations
             && self.typed_children_quiescent
             && self.default_children_quiescent
-            && !self.overlapping_mutation_lease
     }
 }
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PostEditInspectionDependencies {
-    pub(crate) source_closure_identity: String,
     pub(crate) requirement_manifest_identity: String,
     pub(crate) proof_route_identity: String,
     pub(crate) validation_identity: String,
@@ -71,7 +67,6 @@ pub(crate) enum PostEditInspectionOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PostEditBundleSection {
     Diff,
-    SourceClosure,
     Requirements,
     ProofAndValidation,
     CompletionGates,
@@ -127,131 +122,6 @@ struct DiffCacheKey {
     right_revision: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SourceCoverageKey {
-    environment_id: String,
-    repository_identity: String,
-    path: PathBuf,
-}
-
-impl SourceCoverageKey {
-    pub(crate) fn new(environment_id: &str, repository_identity: &str, path: &Path) -> Self {
-        Self {
-            environment_id: environment_id.to_string(),
-            repository_identity: repository_identity.to_string(),
-            path: normalize_tracked_path(path),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SourceCoverageRevision {
-    pub(crate) content_hash: String,
-    pub(crate) size: u64,
-    pub(crate) created_at_ms: i64,
-    pub(crate) modified_at_ms: i64,
-    pub(crate) mutation_revision: u64,
-    pub(crate) compaction_epoch: u64,
-    pub(crate) watcher_generation: u64,
-    pub(crate) host_mutation_generation: u64,
-    pub(crate) stable_file_identity: String,
-    pub(crate) freshness_identity: String,
-}
-
-impl SourceCoverageRevision {
-    fn permits_reuse(&self, current: &Self) -> bool {
-        self.content_hash == current.content_hash
-            && self.size == current.size
-            && self.created_at_ms == current.created_at_ms
-            && self.modified_at_ms == current.modified_at_ms
-            && self.mutation_revision == current.mutation_revision
-            && self.compaction_epoch == current.compaction_epoch
-            && self.stable_file_identity == current.stable_file_identity
-            && self.freshness_identity == current.freshness_identity
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct SourceLineInterval {
-    pub(crate) start_line: usize,
-    pub(crate) end_line: usize,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct SourceCoverageDecision {
-    pub(crate) missing: Vec<SourceLineInterval>,
-    pub(crate) reused: Vec<SourceLineInterval>,
-}
-
-fn normalize_source_intervals(intervals: &mut Vec<SourceLineInterval>) {
-    intervals.retain(|interval| interval.start_line <= interval.end_line);
-    intervals.sort_unstable_by_key(|interval| (interval.start_line, interval.end_line));
-    let mut merged: Vec<SourceLineInterval> = Vec::with_capacity(intervals.len());
-    for interval in intervals.drain(..) {
-        if let Some(previous) = merged.last_mut()
-            && interval.start_line <= previous.end_line.saturating_add(1)
-        {
-            previous.end_line = previous.end_line.max(interval.end_line);
-        } else {
-            merged.push(interval);
-        }
-    }
-    *intervals = merged;
-}
-
-fn intersect_intervals(
-    intervals: &[SourceLineInterval],
-    requested: SourceLineInterval,
-) -> Vec<SourceLineInterval> {
-    intervals
-        .iter()
-        .filter_map(|interval| {
-            let start_line = interval.start_line.max(requested.start_line);
-            let end_line = interval.end_line.min(requested.end_line);
-            (start_line <= end_line).then_some(SourceLineInterval {
-                start_line,
-                end_line,
-            })
-        })
-        .collect()
-}
-
-fn subtract_intervals(
-    requested: SourceLineInterval,
-    covered: &[SourceLineInterval],
-) -> Vec<SourceLineInterval> {
-    if requested.start_line > requested.end_line {
-        return Vec::new();
-    }
-    let mut missing = Vec::new();
-    let mut cursor = requested.start_line;
-    for interval in covered {
-        if cursor < interval.start_line {
-            missing.push(SourceLineInterval {
-                start_line: cursor,
-                end_line: interval.start_line.saturating_sub(1),
-            });
-        }
-        cursor = cursor.max(interval.end_line.saturating_add(1));
-        if cursor > requested.end_line {
-            break;
-        }
-    }
-    if cursor <= requested.end_line {
-        missing.push(SourceLineInterval {
-            start_line: cursor,
-            end_line: requested.end_line,
-        });
-    }
-    missing
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SourceCoverageEntry {
-    revision: SourceCoverageRevision,
-    intervals: Vec<SourceLineInterval>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValidationFreshnessStatus {
     None,
@@ -303,8 +173,6 @@ pub struct TurnDiffTracker {
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     next_revision: u64,
     mutation_revision: u64,
-    source_mutation_revisions: HashMap<TrackedPath, u64>,
-    unknown_source_mutation_revision: u64,
     rendered_diffs: HashMap<DiffCacheKey, Option<String>>,
     unified_diff: Option<String>,
     unvalidated_paths: HashSet<TrackedPath>,
@@ -314,8 +182,6 @@ pub struct TurnDiffTracker {
     last_post_mutation_validation_status: ValidationFreshnessStatus,
     #[cfg(test)]
     post_edit_inspection_bundle: Option<PostEditInspectionBundle>,
-    source_coverage: HashMap<SourceCoverageKey, SourceCoverageEntry>,
-    compaction_epoch: u64,
     #[cfg(test)]
     rendered_diff_count: std::cell::Cell<usize>,
 }
@@ -330,8 +196,6 @@ impl Default for TurnDiffTracker {
             origin_by_current_path: HashMap::new(),
             next_revision: 0,
             mutation_revision: 0,
-            source_mutation_revisions: HashMap::new(),
-            unknown_source_mutation_revision: 0,
             rendered_diffs: HashMap::new(),
             unified_diff: None,
             unvalidated_paths: HashSet::new(),
@@ -341,8 +205,6 @@ impl Default for TurnDiffTracker {
             last_post_mutation_validation_status: ValidationFreshnessStatus::None,
             #[cfg(test)]
             post_edit_inspection_bundle: None,
-            source_coverage: HashMap::new(),
-            compaction_epoch: 0,
             #[cfg(test)]
             rendered_diff_count: std::cell::Cell::new(0),
         }
@@ -469,104 +331,6 @@ impl TurnDiffTracker {
         self.mutation_revision
     }
 
-    pub(crate) fn current_compaction_epoch(&self) -> u64 {
-        self.compaction_epoch
-    }
-
-    pub(crate) fn current_source_mutation_revision(
-        &self,
-        environment_id: &str,
-        paths: &[PathBuf],
-    ) -> u64 {
-        self.source_mutation_revisions
-            .iter()
-            .filter(|(tracked, _)| {
-                tracked.environment_id == environment_id
-                    && paths
-                        .iter()
-                        .any(|path| self.tracked_path_overlaps(tracked, path))
-            })
-            .map(|(_, revision)| *revision)
-            .fold(self.unknown_source_mutation_revision, u64::max)
-    }
-
-    pub(crate) fn record_successful_compaction(&mut self) {
-        self.compaction_epoch = self.compaction_epoch.saturating_add(1);
-        self.source_coverage.clear();
-    }
-
-    /// Records only normalized inclusive intervals and revision metadata. The
-    /// caller must stable-read and hash the file before invoking this method.
-    pub(crate) fn record_source_coverage(
-        &mut self,
-        key: SourceCoverageKey,
-        revision: SourceCoverageRevision,
-        requested: SourceLineInterval,
-        force_fresh: bool,
-    ) -> SourceCoverageDecision {
-        let intervals = if force_fresh {
-            Vec::new()
-        } else {
-            self.source_coverage
-                .get(&key)
-                .filter(|entry| entry.revision.permits_reuse(&revision))
-                .map(|entry| entry.intervals.clone())
-                .unwrap_or_default()
-        };
-        let reused = intersect_intervals(&intervals, requested);
-        let missing = subtract_intervals(requested, &reused);
-        let mut updated = intervals;
-        updated.push(requested);
-        normalize_source_intervals(&mut updated);
-        self.source_coverage.insert(
-            key,
-            SourceCoverageEntry {
-                revision,
-                intervals: updated,
-            },
-        );
-        SourceCoverageDecision { missing, reused }
-    }
-
-    /// Returns coverage for the current file metadata and turn revision without
-    /// mutating the ledger. This lets source tools suppress a fully covered
-    /// read before opening the file again.
-    // The independent revision dimensions are intentionally explicit here:
-    // callers must supply every freshness fence before a read can be reused.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn current_source_coverage(
-        &self,
-        key: &SourceCoverageKey,
-        size: u64,
-        created_at_ms: i64,
-        modified_at_ms: i64,
-        _watcher_generation: u64,
-        _host_mutation_generation: u64,
-        stable_file_identity: &str,
-        freshness_identity: &str,
-        requested: SourceLineInterval,
-    ) -> Option<(SourceCoverageRevision, SourceCoverageDecision)> {
-        let entry = self.source_coverage.get(key)?;
-        let source_mutation_revision = self
-            .current_source_mutation_revision(&key.environment_id, std::slice::from_ref(&key.path));
-        if entry.revision.size != size
-            || entry.revision.created_at_ms != created_at_ms
-            || entry.revision.modified_at_ms != modified_at_ms
-            || entry.revision.mutation_revision != source_mutation_revision
-            || entry.revision.compaction_epoch != self.compaction_epoch
-            || entry.revision.stable_file_identity != stable_file_identity
-            || entry.revision.freshness_identity != freshness_identity
-        {
-            return None;
-        }
-        let reused = intersect_intervals(&entry.intervals, requested);
-        let missing = subtract_intervals(requested, &reused);
-        Some((
-            entry.revision.clone(),
-            SourceCoverageDecision { missing, reused },
-        ))
-    }
-
     pub(crate) fn validation_freshness_status(&self) -> ValidationFreshnessStatus {
         if self.has_unvalidated_mutation() {
             self.last_post_mutation_validation_status.clone()
@@ -619,7 +383,6 @@ impl TurnDiffTracker {
             || {
                 vec![
                     PostEditBundleSection::Diff,
-                    PostEditBundleSection::SourceClosure,
                     PostEditBundleSection::Requirements,
                     PostEditBundleSection::ProofAndValidation,
                     PostEditBundleSection::CompletionGates,
@@ -632,11 +395,6 @@ impl TurnDiffTracker {
                     || existing.diff_identity != diff_identity
                 {
                     sections.push(PostEditBundleSection::Diff);
-                }
-                if existing.dependencies.source_closure_identity
-                    != dependencies.source_closure_identity
-                {
-                    sections.push(PostEditBundleSection::SourceClosure);
                 }
                 if existing.dependencies.requirement_manifest_identity
                     != dependencies.requirement_manifest_identity
@@ -730,21 +488,6 @@ impl TurnDiffTracker {
 
     fn record_mutation(&mut self, paths: HashSet<TrackedPath>) {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
-        if paths.is_empty() {
-            self.unknown_source_mutation_revision = self.mutation_revision;
-            self.source_coverage.clear();
-        } else {
-            for path in &paths {
-                self.source_mutation_revisions
-                    .insert(path.clone(), self.mutation_revision);
-            }
-            let display_roots = &self.display_roots_by_environment;
-            self.source_coverage.retain(|key, _| {
-                !paths.iter().any(|tracked| {
-                    source_coverage_key_overlaps_tracked_path(display_roots, key, tracked)
-                })
-            });
-        }
         self.last_post_mutation_validation_status = if self.has_successful_validation {
             ValidationFreshnessStatus::StaleAfterLastMutation
         } else {
@@ -755,12 +498,6 @@ impl TurnDiffTracker {
         } else {
             self.unvalidated_paths.extend(paths);
         }
-    }
-
-    fn tracked_path_overlaps(&self, tracked: &TrackedPath, path: &Path) -> bool {
-        let tracked_path = tracked_path_for_comparison(&self.display_roots_by_environment, tracked);
-        let path = normalize_tracked_path(path);
-        tracked_path == path || tracked_path.starts_with(&path) || path.starts_with(&tracked_path)
     }
 
     fn refresh_unified_diff(&mut self) {
@@ -1104,11 +841,10 @@ fn post_edit_fingerprint(
     dependencies: &PostEditInspectionDependencies,
 ) -> String {
     let canonical = format!(
-        "candidate={}\nmutation={}\ndiff={}\nsource={}\nrequirements={}\nproof={}\nvalidation={}\ngate={}",
+        "candidate={}\nmutation={}\ndiff={}\nrequirements={}\nproof={}\nvalidation={}\ngate={}",
         boundary.candidate_identity,
         mutation_revision,
         diff_identity,
-        dependencies.source_closure_identity,
         dependencies.requirement_manifest_identity,
         dependencies.proof_route_identity,
         dependencies.validation_identity,
@@ -1131,33 +867,6 @@ fn normalize_tracked_path(path: &Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     normalized
-}
-
-fn tracked_path_for_comparison(
-    display_roots: &HashMap<String, PathBuf>,
-    tracked: &TrackedPath,
-) -> PathBuf {
-    if tracked.path.is_absolute() {
-        tracked.path.clone()
-    } else {
-        display_roots
-            .get(&tracked.environment_id)
-            .map_or_else(|| tracked.path.clone(), |root| root.join(&tracked.path))
-    }
-}
-
-fn source_coverage_key_overlaps_tracked_path(
-    display_roots: &HashMap<String, PathBuf>,
-    key: &SourceCoverageKey,
-    tracked: &TrackedPath,
-) -> bool {
-    if key.environment_id != tracked.environment_id {
-        return false;
-    }
-    let tracked_path = tracked_path_for_comparison(display_roots, tracked);
-    key.path == tracked_path
-        || key.path.starts_with(&tracked_path)
-        || tracked_path.starts_with(&key.path)
 }
 
 fn normalize_from_existing_ancestor(path: &Path) -> Option<PathBuf> {

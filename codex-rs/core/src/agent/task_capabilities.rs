@@ -41,13 +41,6 @@ pub(crate) enum ExternalMutationIntent {
     MayMutate,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TypedToolRequest<'a> {
-    pub class: TypedToolClass,
-    pub external_mutation_intent: ExternalMutationIntent,
-    pub repo_paths: &'a [String],
-}
-
 pub(crate) fn is_independent_review_source(source: &SessionSource) -> bool {
     match source {
         SessionSource::SubAgent(SubAgentSource::Review) => true,
@@ -93,17 +86,8 @@ pub(crate) fn validate_independent_review_stdin(
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum CapabilityPolicyError {
-    #[error("tool class {class:?} is not available to capability profile {profile:?}")]
-    ToolDenied {
-        profile: CapabilityProfile,
-        class: TypedToolClass,
-    },
     #[error("root task-control tools are not available to typed subagents")]
     RootTaskControlDenied,
-    #[error("dynamic, MCP, and extension tools may not mutate for typed agents")]
-    ExternalMutationDenied,
-    #[error("unknown tools are denied for typed agents")]
-    UnknownToolDenied,
     #[error("assignment repository {expected} does not match active repository {actual}")]
     RepositoryMismatch { expected: String, actual: String },
     #[error("assignment workspace {expected} does not match active workspace {actual}")]
@@ -116,12 +100,8 @@ pub(crate) enum CapabilityPolicyError {
     },
     #[error("repository root {path:?} cannot be canonicalized: {reason}")]
     InvalidRepositoryRoot { path: String, reason: String },
-    #[error("structured edits require at least one repository-relative path")]
-    MissingStructuredEditPaths,
     #[error("invalid repository-relative path {path:?}: {reason}")]
     InvalidRepoPath { path: String, reason: String },
-    #[error("structured edit path {0:?} is outside the assignment write scope")]
-    PathOutsideWriteScope(String),
     #[error("cold-review mutation evidence belongs to assignment {actual}, expected {expected}")]
     ColdReviewAssignmentMismatch {
         expected: AssignmentId,
@@ -134,12 +114,6 @@ pub(crate) enum CapabilityPolicyError {
     },
     #[error("cold-review mutation evidence contains duplicate path {0:?}")]
     DuplicateColdReviewWritePath(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AuthorizedToolCall {
-    /// Normalized paths are populated only for structured edits.
-    pub normalized_repo_paths: Vec<String>,
 }
 
 /// The only mutation evidence exposed to a cold reviewer. Event chronology and worker-authored
@@ -253,9 +227,6 @@ pub(crate) fn classify_typed_tool(
     if matches_name(
         name,
         &[
-            "locate_task",
-            "search_source",
-            "read_file_span",
             "read_tool_output",
             "tool_search",
             "view_image",
@@ -291,40 +262,12 @@ pub(crate) fn classify_typed_tool(
     TypedToolClass::Unknown
 }
 
-/// Applies the typed capability profile to a classified tool call.
-///
-/// Shell authorization is intentionally coarse here. Shell execution handlers admit only commands
-/// that the shared command-safety classifier proves read-only.
-/// Source mutation is authorized only for structured edits whose complete path set is in scope.
-pub(crate) fn authorize_typed_tool(
-    assignment: &Assignment,
-    repo_root: &Path,
-    request: TypedToolRequest<'_>,
-) -> Result<AuthorizedToolCall, CapabilityPolicyError> {
-    verify_assignment_authority(assignment, repo_root)?;
-    let profile = assignment.capability_profile;
-    match request.class {
-        TypedToolClass::AgentCommunication
-        | TypedToolClass::OwnTask
-        | TypedToolClass::ReadSearch
-        // Code mode is only a control envelope. Each nested call is routed back through this
-        // policy and authorized according to its actual tool class.
-        | TypedToolClass::CodeModeControl => Ok(empty_authorization()),
+/// Keeps lifecycle task control root-only while giving active non-review typed agents the same
+/// tool authority as their root turn.
+pub(crate) fn authorize_typed_tool(class: TypedToolClass) -> Result<(), CapabilityPolicyError> {
+    match class {
         TypedToolClass::RootTaskControl => Err(CapabilityPolicyError::RootTaskControlDenied),
-        TypedToolClass::Diff if profile_allows_diff(profile) => Ok(empty_authorization()),
-        TypedToolClass::Shell if profile_allows_shell(profile) => Ok(empty_authorization()),
-        TypedToolClass::StructuredEdit => {
-            authorize_structured_edit(assignment, repo_root, request.repo_paths)
-        }
-        TypedToolClass::DynamicExternal => {
-            if request.external_mutation_intent == ExternalMutationIntent::MayMutate {
-                Err(CapabilityPolicyError::ExternalMutationDenied)
-            } else {
-                Ok(empty_authorization())
-            }
-        }
-        TypedToolClass::Unknown => Err(CapabilityPolicyError::UnknownToolDenied),
-        class => Err(CapabilityPolicyError::ToolDenied { profile, class }),
+        _ => Ok(()),
     }
 }
 
@@ -424,63 +367,6 @@ fn classify_collaboration_tool(name: &str) -> TypedToolClass {
     } else {
         TypedToolClass::Unknown
     }
-}
-
-fn empty_authorization() -> AuthorizedToolCall {
-    AuthorizedToolCall {
-        normalized_repo_paths: Vec::new(),
-    }
-}
-
-fn authorize_structured_edit(
-    assignment: &Assignment,
-    repo_root: &Path,
-    paths: &[String],
-) -> Result<AuthorizedToolCall, CapabilityPolicyError> {
-    if !matches!(
-        assignment.capability_profile,
-        CapabilityProfile::ScopedSourceWrite | CapabilityProfile::IntegratorSourceWrite
-    ) {
-        return Err(CapabilityPolicyError::ToolDenied {
-            profile: assignment.capability_profile,
-            class: TypedToolClass::StructuredEdit,
-        });
-    }
-    if paths.is_empty() {
-        return Err(CapabilityPolicyError::MissingStructuredEditPaths);
-    }
-    let mut normalized_repo_paths = Vec::with_capacity(paths.len());
-    for path in paths {
-        let normalized = normalize_repo_relative_path(repo_root, path)?;
-        if !scopes_cover_path(repo_root, &assignment.write_scope, &normalized)? {
-            return Err(CapabilityPolicyError::PathOutsideWriteScope(normalized));
-        }
-        normalized_repo_paths.push(normalized);
-    }
-    normalized_repo_paths.sort_by(|left, right| compare_repo_paths(left, right));
-    normalized_repo_paths.dedup_by(|left, right| repo_paths_equal(left, right));
-    Ok(AuthorizedToolCall {
-        normalized_repo_paths,
-    })
-}
-
-fn profile_allows_diff(profile: CapabilityProfile) -> bool {
-    matches!(
-        profile,
-        CapabilityProfile::ReadSearchDiff
-            | CapabilityProfile::ScopedSourceWrite
-            | CapabilityProfile::IntegratorSourceWrite
-    )
-}
-
-fn profile_allows_shell(profile: CapabilityProfile) -> bool {
-    matches!(
-        profile,
-        CapabilityProfile::ReadSearchDiff
-            | CapabilityProfile::ReadSearchShell
-            | CapabilityProfile::ScopedSourceWrite
-            | CapabilityProfile::IntegratorSourceWrite
-    )
 }
 
 fn scopes_cover_path(

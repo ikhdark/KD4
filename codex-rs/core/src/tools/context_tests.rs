@@ -940,7 +940,22 @@ fn exec_code_mode_exposes_artifact_id_not_path() {
 }
 
 #[test]
-fn exec_reduction_notice_appears_when_model_output_is_reduced() {
+fn exec_code_mode_makes_empty_completion_explicit() {
+    let (mut output, _, _, _retained_root) = artifact_backed_exec_output(b"", Some(1_000));
+    output.raw_output_artifact = None;
+
+    let result = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+
+    assert_eq!(
+        result["output"],
+        "Command completed with no output (exit code 0)."
+    );
+}
+
+#[test]
+fn artifact_recovery_notice_appears_when_model_output_is_reduced() {
     let raw_output = "word ".repeat(200);
     let (output, artifact_id, _, _retained_root) =
         artifact_backed_exec_output(raw_output.as_bytes(), Some(4));
@@ -950,7 +965,9 @@ fn exec_reduction_notice_appears_when_model_output_is_reduced() {
     assert!(response.contains(&format!(
         "[command output reduced; full retained output is available as artifact {artifact_id}."
     )));
-    assert!(response.contains("Use read_tool_output with that id and a narrow line range.]"));
+    assert!(response.contains(
+        "Use read_tool_output with that id; search once for targets or batch exact ranges in one call.]"
+    ));
 }
 
 #[test]

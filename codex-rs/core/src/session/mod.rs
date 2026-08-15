@@ -222,7 +222,6 @@ mod mcp_runtime;
 pub(crate) mod multi_agents;
 pub(crate) mod reasoning_governor;
 mod review;
-mod rollout_budget;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
@@ -4489,7 +4488,6 @@ impl Session {
                 }
                 state.token_info()
             };
-            let budget_result = self.record_rollout_budget_usage(token_usage);
             if let Some(token_info) = token_info.as_ref() {
                 for contributor in self.services.extensions.token_usage_contributors() {
                     contributor
@@ -4510,7 +4508,6 @@ impl Session {
                     token_usage.total_tokens.max(0) as u64,
                     1,
                 );
-            budget_result?;
         }
         let coordinator = self.services.agent_control.task_coordinator();
         if let Some(binding) = coordinator.binding_for_source(&turn_context.session_source) {
@@ -4641,8 +4638,8 @@ impl Session {
         input: &[UserInput],
         client_id: Option<String>,
     ) {
-        // Mint the durable user item before history persistence so the private KD4 source
-        // ledger can bind exact pre-compaction inputs to the same stable item identity.
+        // Mint the durable user item before history persistence so the private KD4 ledger can
+        // bind exact pre-compaction inputs to the same stable item identity.
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_id = client_id;
         let completion_evidence_eligible = self.services.task_evidence.allows_kd4_completion()
@@ -4650,12 +4647,6 @@ impl Session {
                 turn_context.session_source,
                 SessionSource::SubAgent(SubAgentSource::Review)
             );
-        if completion_evidence_eligible {
-            self.services
-                .task_evidence
-                .record_task_contract_source(&user_message_item.id, input)
-                .await;
-        }
         if turn_context
             .config
             .features
@@ -4853,9 +4844,6 @@ impl Session {
             .update_validation_authorization(&input)
             .await;
         active_turn_context.update_multi_agent_spawn_authorization(&input);
-        active_turn_context
-            .update_source_owner_candidates(&input)
-            .await;
         let input_for_telemetry = input.clone();
 
         let additional_context_input = {

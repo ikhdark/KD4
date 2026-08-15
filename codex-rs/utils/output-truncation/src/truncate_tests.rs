@@ -347,7 +347,10 @@ fn byte_count_conversion_clamps_non_positive_values() {
 }
 
 #[test]
-fn adaptive_output_limits_resolve_defaults_override_and_hard_ceiling() {
+fn optimization_priority_coherent_packet_defaults_precede_trimming() {
+    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
+    assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
+    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
     assert_eq!(
         resolve_output_limits(None, OutputOutcome::Success, Some("echo ok"), "ok", 20_000),
         OutputLimitResolution {
@@ -429,7 +432,7 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
             usize::MAX,
         )
         .applied_limit,
-        1_000
+        DEFAULT_SUCCESS_OUTPUT_TOKENS
     );
     assert_eq!(
         resolve_projected_output_limits(
@@ -439,7 +442,7 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
             usize::MAX,
         )
         .applied_limit,
-        2_000
+        DEFAULT_FAILURE_OUTPUT_TOKENS
     );
     assert_eq!(
         resolve_projected_output_limits(
@@ -449,7 +452,7 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
             usize::MAX,
         )
         .applied_limit,
-        2_000
+        DEFAULT_FAILURE_OUTPUT_TOKENS
     );
     assert_eq!(
         resolve_projected_output_limits(

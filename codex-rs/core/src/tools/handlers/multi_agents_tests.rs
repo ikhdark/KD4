@@ -1115,7 +1115,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
 }
 
 #[tokio::test]
-async fn multi_agent_v2_typed_spawn_rejects_conflicting_write_claims() {
+async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
     let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
@@ -1178,14 +1178,14 @@ async fn multi_agent_v2_typed_spawn_rejects_conflicting_write_claims() {
     let (content, _) = expect_text_output(first);
     let first_result: serde_json::Value =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
-    let assignment_id = codex_agent_task_store::AssignmentId::parse(
+    let first_assignment_id = codex_agent_task_store::AssignmentId::parse(
         first_result["assignment_id"]
             .as_str()
             .expect("typed spawn should return assignment id"),
     )
     .expect("assignment id should parse");
 
-    let error = SpawnAgentHandlerV2::default()
+    let second = SpawnAgentHandlerV2::default()
         .handle(invocation(
             Arc::clone(&session),
             Arc::clone(&turn),
@@ -1205,53 +1205,58 @@ async fn multi_agent_v2_typed_spawn_rejects_conflicting_write_claims() {
             })),
         ))
         .await
-        .err()
-        .expect("overlapping typed writers must not both acquire claims");
-    assert!(matches!(
-        error,
-        FunctionCallError::RespondToModel(message)
-            if message.contains("active write claims overlap")
-    ));
-
-    let binding = agent_control
-        .task_coordinator()
-        .binding_for_assignment(assignment_id)
-        .expect("first typed writer should remain bound after the conflict");
-    let child_thread_id = ThreadId::from_string(
-        binding
-            .thread_id
-            .as_deref()
-            .expect("typed binding should retain the child thread id"),
+        .expect("overlapping typed writers should both be admitted");
+    let (content, _) = expect_text_output(second);
+    let second_result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let second_assignment_id = codex_agent_task_store::AssignmentId::parse(
+        second_result["assignment_id"]
+            .as_str()
+            .expect("typed spawn should return assignment id"),
     )
-    .expect("typed binding thread id should parse");
-    agent_control
-        .task_coordinator()
-        .store()
-        .expect("typed task store should remain available")
-        .abandon_agent_task(
-            codex_agent_task_store::TaskActor::Root,
-            assignment_id,
-            "test cleanup".to_string(),
-        )
-        .await
-        .expect("test cleanup should release the first claim");
-    assert!(
-        agent_control
-            .task_coordinator()
-            .remove_agent_task_binding(assignment_id)
-            .await
-            .expect("test cleanup should remove the sealed binding")
-    );
-    assert!(
-        agent_control
+    .expect("assignment id should parse");
+
+    for assignment_id in [first_assignment_id, second_assignment_id] {
+        let binding = agent_control
             .task_coordinator()
             .binding_for_assignment(assignment_id)
-            .is_none()
-    );
-    let _ = agent_control
-        .shutdown_live_agent(child_thread_id)
-        .await
-        .expect("typed child shutdown should submit");
+            .expect("each overlapping typed writer should remain bound");
+        let child_thread_id = ThreadId::from_string(
+            binding
+                .thread_id
+                .as_deref()
+                .expect("typed binding should retain the child thread id"),
+        )
+        .expect("typed binding thread id should parse");
+        agent_control
+            .task_coordinator()
+            .store()
+            .expect("typed task store should remain available")
+            .abandon_agent_task(
+                codex_agent_task_store::TaskActor::Root,
+                assignment_id,
+                "test cleanup".to_string(),
+            )
+            .await
+            .expect("test cleanup should release the diagnostic claim");
+        assert!(
+            agent_control
+                .task_coordinator()
+                .remove_agent_task_binding(assignment_id)
+                .await
+                .expect("test cleanup should remove the sealed binding")
+        );
+        assert!(
+            agent_control
+                .task_coordinator()
+                .binding_for_assignment(assignment_id)
+                .is_none()
+        );
+        let _ = agent_control
+            .shutdown_live_agent(child_thread_id)
+            .await
+            .expect("typed child shutdown should submit");
+    }
 }
 
 #[tokio::test]

@@ -3,8 +3,6 @@ use crate::AssignmentId;
 use crate::AttemptId;
 use crate::DependencyBlocker;
 use crate::MissingEvidenceObligation;
-use crate::WorkspaceCasMismatchDetail;
-use crate::WriteClaimConflict;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -32,22 +30,6 @@ pub enum StoreError {
     ReceiptAlreadySealed(AttemptId),
     #[error("dependency validation failed: {blockers:?}")]
     DependencyBlocked { blockers: Vec<DependencyBlocker> },
-    #[error("active write claims overlap: {conflicts:?}")]
-    WriteClaimConflict { conflicts: Vec<WriteClaimConflict> },
-    #[error("workspace mutation overlaps an active claim: {details:?}")]
-    WorkspaceClaimConflict { details: Vec<String> },
-    #[error("workspace file changed after the supporting read: {details:?}")]
-    WorkspaceCasMismatch {
-        details: Vec<WorkspaceCasMismatchDetail>,
-    },
-    #[error("workspace mutation lease {0} is unavailable, expired, or already released")]
-    WorkspaceLeaseUnavailable(String),
-    #[error("workspace finalization is already active for root session {root_session_id}")]
-    WorkspaceFinalizationActive { root_session_id: String },
-    #[error("workspace finalization cannot begin while mutation leases are active: {lease_ids:?}")]
-    WorkspaceFinalizationNotQuiescent { lease_ids: Vec<String> },
-    #[error("workspace state initialization failed: {0}")]
-    WorkspaceStateInitialization(String),
     #[error("validation evidence was superseded by workspace changes: {call_ids:?}")]
     EvidenceSuperseded { call_ids: Vec<String> },
     #[error(
@@ -60,8 +42,6 @@ pub enum StoreError {
     AmendmentLimitReached(AssignmentId),
     #[error("only worker assignments may create a correction attempt: {0}")]
     WorkerCorrectionRequired(AssignmentId),
-    #[error("the active write claim changed before assignment {0} could be amended")]
-    WriteClaimInactive(AssignmentId),
     #[error("operation requires root authority")]
     RootAuthorityRequired,
     #[error("actor is not authorized to set the {gate} gate")]
@@ -117,8 +97,6 @@ pub enum StoreError {
         "private mutation snapshot hash does not match retained evidence for {path} under attempt {attempt_id}"
     )]
     SnapshotHashMismatch { attempt_id: AttemptId, path: String },
-    #[error("mutation path is not covered by the active write claim: {0}")]
-    MutationOutsideClaim(String),
     #[error("mutation evidence for {path} has not been started under attempt {attempt_id}")]
     MutationNotStarted { attempt_id: AttemptId, path: String },
     #[error("mutation evidence for {path} has not been finalized under attempt {attempt_id}")]

@@ -38,7 +38,7 @@ Choose one:
 
 - Follow the root and nearest scoped `AGENTS.md`.
 - Do not recurse into more agents unless explicitly approved.
-- Reject accidental path, named-contract, and Cargo target-lane overlap.
+- Record path, named-contract, and Cargo target-lane overlap as advisories.
 - Route deliberate competing implementations to separate isolated worktrees.
 - Each agent reports inspected scope, findings, and validation evidence.
 
@@ -48,5 +48,5 @@ Choose one:
 - Integration files:
 - Versioned isolated-worktree handoffs:
 - Required validation:
-- Quiescence check for linked assignments, validations, gates, and claims:
+- Quiescence check for linked assignments, validations, and gates:
 - Remaining risk:

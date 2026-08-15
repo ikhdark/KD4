@@ -18,7 +18,10 @@ fn shell_projection_uses_shared_success_default_and_reports_reduction() {
     );
     assert!(projected.reduced);
     assert!(projected.text.contains("Warning: truncated output"));
-    assert!(approx_token_count(&projected.text) <= 1_000);
+    assert!(
+        approx_token_count(&projected.text)
+            <= codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS
+    );
 }
 
 #[test]

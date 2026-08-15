@@ -105,25 +105,10 @@ impl RepoFixture {
     }
 }
 
-fn request(class: TypedToolClass) -> TypedToolRequest<'static> {
-    TypedToolRequest {
-        class,
-        external_mutation_intent: ExternalMutationIntent::ProvenReadOnly,
-        repo_paths: &[],
-    }
-}
-
 fn recursive_scope(path: &str) -> RepoScope {
     RepoScope {
         path: path.to_string(),
         recursive: true,
-    }
-}
-
-fn exact_scope(path: &str) -> RepoScope {
-    RepoScope {
-        path: path.to_string(),
-        recursive: false,
     }
 }
 
@@ -156,8 +141,6 @@ fn tool_classification_separates_typed_authority() {
         );
     }
     for (name, class) in [
-        ("search_source", TypedToolClass::ReadSearch),
-        ("read_file_span", TypedToolClass::ReadSearch),
         ("read_tool_output", TypedToolClass::ReadSearch),
         (
             codex_code_mode::PUBLIC_TOOL_NAME,
@@ -199,7 +182,7 @@ fn namespaces_cannot_spoof_core_or_collaboration_tools() {
         TypedToolClass::DynamicExternal
     );
     assert_eq!(
-        classify_typed_tool(Some(""), "search_source", None),
+        classify_typed_tool(Some(""), "read_tool_output", None),
         TypedToolClass::DynamicExternal
     );
     assert_eq!(
@@ -213,111 +196,24 @@ fn namespaces_cannot_spoof_core_or_collaboration_tools() {
 }
 
 #[test]
-fn read_search_profile_can_enter_code_mode_without_gaining_write_access() {
-    let fixture = RepoFixture::new();
-    let assignment = fixture.assignment(CapabilityProfile::ReadSearch, Vec::new());
-
-    for name in [
-        codex_code_mode::PUBLIC_TOOL_NAME,
-        codex_code_mode::WAIT_TOOL_NAME,
+fn typed_agents_inherit_every_non_root_tool_class() {
+    for class in [
+        TypedToolClass::AgentCommunication,
+        TypedToolClass::OwnTask,
+        TypedToolClass::ReadSearch,
+        TypedToolClass::CodeModeControl,
+        TypedToolClass::Diff,
+        TypedToolClass::Shell,
+        TypedToolClass::StructuredEdit,
+        TypedToolClass::DynamicExternal,
+        TypedToolClass::Unknown,
     ] {
-        let class = classify_typed_tool(None, name, None);
-        assert_eq!(class, TypedToolClass::CodeModeControl);
-        assert!(
-            authorize_typed_tool(&assignment, fixture.path(), request(class)).is_ok(),
-            "read-search profiles must be able to use the code-mode {name} envelope"
-        );
+        assert!(authorize_typed_tool(class).is_ok());
     }
-
-    let nested_read = classify_typed_tool(None, "read_file_span", None);
-    assert!(authorize_typed_tool(&assignment, fixture.path(), request(nested_read)).is_ok());
-
-    let nested_write = classify_typed_tool(None, "apply_patch", None);
-    assert!(matches!(
-        authorize_typed_tool(&assignment, fixture.path(), request(nested_write)),
-        Err(CapabilityPolicyError::ToolDenied {
-            profile: CapabilityProfile::ReadSearch,
-            class: TypedToolClass::StructuredEdit,
-        })
-    ));
-}
-
-#[test]
-fn profiles_receive_only_their_declared_tool_classes() {
-    let fixture = RepoFixture::new();
-    let profiles = [
-        CapabilityProfile::ReadSearch,
-        CapabilityProfile::ReadSearchDiff,
-        CapabilityProfile::ReadSearchShell,
-        CapabilityProfile::ScopedSourceWrite,
-        CapabilityProfile::IntegratorSourceWrite,
-    ];
-    for profile in profiles {
-        let assignment = fixture.assignment(profile, vec![recursive_scope("src")]);
-        for class in [
-            TypedToolClass::AgentCommunication,
-            TypedToolClass::OwnTask,
-            TypedToolClass::ReadSearch,
-            TypedToolClass::CodeModeControl,
-        ] {
-            assert!(authorize_typed_tool(&assignment, fixture.path(), request(class)).is_ok());
-        }
-        assert_eq!(
-            authorize_typed_tool(
-                &assignment,
-                fixture.path(),
-                request(TypedToolClass::RootTaskControl)
-            ),
-            Err(CapabilityPolicyError::RootTaskControlDenied)
-        );
-        assert_eq!(
-            authorize_typed_tool(&assignment, fixture.path(), request(TypedToolClass::Diff))
-                .is_ok(),
-            matches!(
-                profile,
-                CapabilityProfile::ReadSearchDiff
-                    | CapabilityProfile::ScopedSourceWrite
-                    | CapabilityProfile::IntegratorSourceWrite
-            )
-        );
-        assert_eq!(
-            authorize_typed_tool(&assignment, fixture.path(), request(TypedToolClass::Shell))
-                .is_ok(),
-            matches!(
-                profile,
-                CapabilityProfile::ReadSearchDiff
-                    | CapabilityProfile::ReadSearchShell
-                    | CapabilityProfile::ScopedSourceWrite
-                    | CapabilityProfile::IntegratorSourceWrite
-            )
-        );
-        assert_eq!(
-            authorize_typed_tool(
-                &assignment,
-                fixture.path(),
-                request(TypedToolClass::StructuredEdit)
-            ),
-            if matches!(
-                profile,
-                CapabilityProfile::ScopedSourceWrite | CapabilityProfile::IntegratorSourceWrite
-            ) {
-                Err(CapabilityPolicyError::MissingStructuredEditPaths)
-            } else {
-                Err(CapabilityPolicyError::ToolDenied {
-                    profile,
-                    class: TypedToolClass::StructuredEdit,
-                })
-            }
-        );
-        assert_eq!(
-            authorize_typed_tool(
-                &assignment,
-                fixture.path(),
-                request(TypedToolClass::Unknown)
-            ),
-            Err(CapabilityPolicyError::UnknownToolDenied)
-        );
-    }
+    assert_eq!(
+        authorize_typed_tool(TypedToolClass::RootTaskControl),
+        Err(CapabilityPolicyError::RootTaskControlDenied)
+    );
 }
 
 #[test]
@@ -360,277 +256,6 @@ fn independent_review_shell_policy_is_read_only_on_every_shell_route() {
 
     assert!(validate_independent_review_shell(&SessionSource::Cli, false, true, true).is_ok());
     assert!(validate_independent_review_stdin(&SessionSource::Cli, "y\n").is_ok());
-}
-
-#[test]
-fn root_controls_and_external_mutations_fail_closed_for_every_profile() {
-    let fixture = RepoFixture::new();
-    for profile in [
-        CapabilityProfile::ReadSearch,
-        CapabilityProfile::ReadSearchDiff,
-        CapabilityProfile::ReadSearchShell,
-        CapabilityProfile::ScopedSourceWrite,
-        CapabilityProfile::IntegratorSourceWrite,
-    ] {
-        let assignment = fixture.assignment(profile, vec![recursive_scope("src")]);
-        assert!(
-            authorize_typed_tool(
-                &assignment,
-                fixture.path(),
-                request(TypedToolClass::DynamicExternal)
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            authorize_typed_tool(
-                &assignment,
-                fixture.path(),
-                TypedToolRequest {
-                    class: TypedToolClass::DynamicExternal,
-                    external_mutation_intent: ExternalMutationIntent::MayMutate,
-                    repo_paths: &[],
-                },
-            ),
-            Err(CapabilityPolicyError::ExternalMutationDenied)
-        );
-    }
-}
-
-#[test]
-fn forged_role_profile_pairs_fail_closed() {
-    let fixture = RepoFixture::new();
-    let mut assignment = fixture.assignment(CapabilityProfile::ReadSearch, Vec::new());
-    assignment.capability_profile = CapabilityProfile::ScopedSourceWrite;
-    assert!(matches!(
-        authorize_typed_tool(
-            &assignment,
-            fixture.path(),
-            request(TypedToolClass::ReadSearch)
-        ),
-        Err(CapabilityPolicyError::RoleProfileMismatch {
-            role: AgentRole::Explorer,
-            expected: CapabilityProfile::ReadSearch,
-            actual: CapabilityProfile::ScopedSourceWrite,
-        })
-    ));
-}
-
-#[test]
-fn structured_edits_require_complete_canonical_scope_coverage() {
-    let fixture = RepoFixture::new();
-    let paths = vec![
-        "src\\nested\\mod.rs".to_string(),
-        "Cargo.toml".to_string(),
-        "src/lib.rs".to_string(),
-        "src/lib.rs".to_string(),
-    ];
-    for profile in [
-        CapabilityProfile::ScopedSourceWrite,
-        CapabilityProfile::IntegratorSourceWrite,
-    ] {
-        let assignment = fixture.assignment(
-            profile,
-            vec![exact_scope("Cargo.toml"), recursive_scope("src")],
-        );
-        assert_eq!(
-            authorize_typed_tool(
-                &assignment,
-                fixture.path(),
-                TypedToolRequest {
-                    class: TypedToolClass::StructuredEdit,
-                    external_mutation_intent: ExternalMutationIntent::MayMutate,
-                    repo_paths: &paths,
-                },
-            )
-            .expect("scoped structured edit")
-            .normalized_repo_paths,
-            vec![
-                "Cargo.toml".to_string(),
-                "src/lib.rs".to_string(),
-                "src/nested/mod.rs".to_string(),
-            ]
-        );
-    }
-
-    let worker = fixture.assignment(
-        CapabilityProfile::ScopedSourceWrite,
-        vec![exact_scope("Cargo.toml"), recursive_scope("src")],
-    );
-    for outside in ["src2/lib.rs", "Cargo.toml/child"] {
-        let paths = vec![outside.to_string()];
-        assert_eq!(
-            authorize_typed_tool(
-                &worker,
-                fixture.path(),
-                TypedToolRequest {
-                    class: TypedToolClass::StructuredEdit,
-                    external_mutation_intent: ExternalMutationIntent::MayMutate,
-                    repo_paths: &paths,
-                },
-            ),
-            Err(CapabilityPolicyError::PathOutsideWriteScope(
-                outside.to_string()
-            ))
-        );
-    }
-}
-
-#[test]
-fn invalid_repository_paths_are_rejected_before_authorization() {
-    let fixture = RepoFixture::new();
-    let worker = fixture.assignment(
-        CapabilityProfile::ScopedSourceWrite,
-        vec![recursive_scope("src")],
-    );
-    for invalid in [
-        "",
-        "   ",
-        "/tmp/file",
-        "../file",
-        "src/../file",
-        "src/./file",
-        "src//file",
-        "C:\\outside\\file",
-        "\\\\server\\share\\file",
-        "src/\0file",
-    ] {
-        let paths = vec![invalid.to_string()];
-        assert!(matches!(
-            authorize_typed_tool(
-                &worker,
-                fixture.path(),
-                TypedToolRequest {
-                    class: TypedToolClass::StructuredEdit,
-                    external_mutation_intent: ExternalMutationIntent::MayMutate,
-                    repo_paths: &paths,
-                },
-            ),
-            Err(CapabilityPolicyError::InvalidRepoPath { .. })
-        ));
-    }
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_scope_matching_is_separator_and_case_insensitive() {
-    let fixture = RepoFixture::new();
-    let worker = fixture.assignment(
-        CapabilityProfile::ScopedSourceWrite,
-        vec![recursive_scope("src")],
-    );
-    let paths = vec!["SRC\\LIB.RS".to_string(), "src/lib.rs".to_string()];
-    assert_eq!(
-        authorize_typed_tool(
-            &worker,
-            fixture.path(),
-            TypedToolRequest {
-                class: TypedToolClass::StructuredEdit,
-                external_mutation_intent: ExternalMutationIntent::MayMutate,
-                repo_paths: &paths,
-            },
-        )
-        .expect("Windows path aliases are in scope")
-        .normalized_repo_paths,
-        vec!["SRC/LIB.RS".to_string()]
-    );
-}
-
-#[test]
-fn assignments_are_bound_to_their_canonical_repository() {
-    let first = RepoFixture::new();
-    let second = RepoFixture::new();
-    let assignment = first.assignment(CapabilityProfile::ReadSearch, Vec::new());
-    assert!(
-        authorize_typed_tool(
-            &assignment,
-            &first.path().join("."),
-            request(TypedToolClass::ReadSearch)
-        )
-        .is_ok()
-    );
-    assert!(matches!(
-        authorize_typed_tool(
-            &assignment,
-            second.path(),
-            request(TypedToolClass::ReadSearch)
-        ),
-        Err(CapabilityPolicyError::RepositoryMismatch { .. })
-    ));
-
-    let missing_root = first.path().join("missing-repository");
-    assert!(matches!(
-        authorize_typed_tool(
-            &assignment,
-            &missing_root,
-            request(TypedToolClass::ReadSearch)
-        ),
-        Err(CapabilityPolicyError::InvalidRepositoryRoot { .. })
-    ));
-}
-
-#[test]
-fn symlink_and_dangling_symlink_escapes_fail_closed() {
-    let fixture = RepoFixture::new();
-    let worker = fixture.assignment(
-        CapabilityProfile::ScopedSourceWrite,
-        vec![recursive_scope("src")],
-    );
-    let outside = tempfile::tempdir().expect("outside directory");
-    if create_dir_symlink(outside.path(), &fixture.path().join("src/escape")).is_err() {
-        // Creating symlinks may require an opt-in privilege on Windows.
-        return;
-    }
-    let escaped = vec!["src/escape/new.rs".to_string()];
-    assert!(matches!(
-        authorize_typed_tool(
-            &worker,
-            fixture.path(),
-            TypedToolRequest {
-                class: TypedToolClass::StructuredEdit,
-                external_mutation_intent: ExternalMutationIntent::MayMutate,
-                repo_paths: &escaped,
-            },
-        ),
-        Err(CapabilityPolicyError::InvalidRepoPath { .. })
-    ));
-
-    let dangling_target = outside.path().join("not-created.rs");
-    if create_file_symlink(&dangling_target, &fixture.path().join("src/dangling.rs")).is_err() {
-        return;
-    }
-    let dangling = vec!["src/dangling.rs".to_string()];
-    assert!(matches!(
-        authorize_typed_tool(
-            &worker,
-            fixture.path(),
-            TypedToolRequest {
-                class: TypedToolClass::StructuredEdit,
-                external_mutation_intent: ExternalMutationIntent::MayMutate,
-                repo_paths: &dangling,
-            },
-        ),
-        Err(CapabilityPolicyError::InvalidRepoPath { .. })
-    ));
-}
-
-#[cfg(unix)]
-fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(unix)]
-fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
-fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_dir(target, link)
-}
-
-#[cfg(windows)]
-fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(target, link)
 }
 
 #[test]

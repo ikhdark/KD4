@@ -67,7 +67,7 @@ The editable set intentionally includes all behavior and policy surfaces:
   rollout, history, and evidence behavior;
 - model providers, model requests, retries, streaming, diagnostics, telemetry,
   caching, WebSockets, MCP, plugins, skills, connectors, and extensions;
-- tools, code mode, shell commands, patching, file search, source search,
+- tools, code mode, shell commands, patching, file search,
   filesystem access, approvals, execution policy, sandboxing, and process
   lifecycle;
 - CLI, exec, app-server, protocol, TUI, configuration, feature flags, tests,

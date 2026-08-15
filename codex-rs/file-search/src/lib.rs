@@ -23,7 +23,6 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-pub mod task_locator;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -39,8 +38,6 @@ use nucleo::pattern::AtomKind;
 use nucleo::pattern::Pattern;
 
 mod cli;
-pub mod source_routes;
-pub mod source_search;
 
 pub use cli::Cli;
 

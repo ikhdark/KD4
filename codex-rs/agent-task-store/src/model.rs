@@ -195,8 +195,6 @@ pub struct AdmissionOverlapSummary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionRejectionReason {
     DuplicateExplorerInvestigation,
-    CorrectnessSensitiveReadConflict,
-    ActiveValidationConflict,
     IsolatedIntegratorUnavailable,
 }
 
@@ -204,8 +202,6 @@ impl std::fmt::Display for AdmissionRejectionReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
             Self::DuplicateExplorerInvestigation => "duplicate_explorer_investigation",
-            Self::CorrectnessSensitiveReadConflict => "correctness_sensitive_read_conflict",
-            Self::ActiveValidationConflict => "active_validation_conflict",
             Self::IsolatedIntegratorUnavailable => "isolated_integrator_unavailable",
         };
         formatter.write_str(value)
@@ -606,15 +602,6 @@ pub struct WorkspaceManifestEntry {
     pub existed: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceCasMismatchDetail {
-    pub path: String,
-    pub expected: Option<WorkspaceManifestEntry>,
-    pub current: Option<WorkspaceManifestEntry>,
-    pub current_epoch: Option<u64>,
-    pub last_writer: Option<String>,
-}
-
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceRevision {
     pub repository_id: String,
@@ -633,228 +620,6 @@ pub struct WorkspaceActorRegistration {
     pub attempt_id: Option<AttemptId>,
     #[serde(default)]
     pub strategy: WorkspaceStrategy,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceMutationRequest {
-    pub root_session_id: String,
-    pub actor_id: String,
-    pub kind: WorkspaceActorKind,
-    pub attempt_id: Option<AttemptId>,
-    pub paths: Vec<String>,
-    #[serde(default)]
-    pub contracts: Vec<String>,
-    #[serde(default)]
-    pub expected_manifest: Vec<WorkspaceManifestEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceMutationLease {
-    pub lease_id: String,
-    pub repository_id: String,
-    pub workspace_id: String,
-    pub root_session_id: String,
-    pub actor_id: String,
-    pub kind: WorkspaceActorKind,
-    pub attempt_id: Option<AttemptId>,
-    pub start_epoch: u64,
-    pub paths: Vec<String>,
-    pub contracts: Vec<String>,
-    pub expected_manifest: Vec<WorkspaceManifestEntry>,
-    pub state: LeaseState,
-    pub expires_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceMutationResult {
-    pub lease_id: String,
-    pub start_epoch: u64,
-    pub end_epoch: u64,
-    pub changed_paths: Vec<String>,
-    pub drift_paths: Vec<String>,
-}
-
-/// Internal optimization receipt for a strongly constructed workspace manifest.
-/// This is deliberately not serialized into command or protocol schemas.
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkspaceManifestReceipt {
-    pub(crate) repository_id: String,
-    pub(crate) workspace_id: String,
-    pub(crate) epoch: u64,
-    pub(crate) paths: Vec<String>,
-    pub(crate) manifest_id: String,
-    pub(crate) entries: Vec<WorkspaceManifestEntry>,
-}
-
-impl WorkspaceManifestReceipt {
-    pub fn repository_id(&self) -> &str {
-        &self.repository_id
-    }
-
-    pub fn workspace_id(&self) -> &str {
-        &self.workspace_id
-    }
-
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    pub fn paths(&self) -> &[String] {
-        &self.paths
-    }
-
-    pub fn manifest_id(&self) -> &str {
-        &self.manifest_id
-    }
-
-    pub fn entries(&self) -> &[WorkspaceManifestEntry] {
-        &self.entries
-    }
-}
-
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct WorkspaceManifestWork {
-    pub overlay_traversals: u64,
-    pub files_examined: u64,
-    pub files_hashed: u64,
-    pub bytes_hashed: u64,
-    pub git_subprocesses: u64,
-    pub manifests_constructed: u64,
-    pub full_constructions: u64,
-    pub incremental_constructions: u64,
-    pub reuse_hits: u64,
-    pub reuse_rejections: u64,
-    pub unique_payloads: u64,
-    pub payload_reuses: u64,
-    pub manifest_bytes_persisted: u64,
-    pub reference_bytes_persisted: u64,
-    pub sqlite_statements: u64,
-    pub transaction_micros: u64,
-    pub duration_micros: u64,
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedWorkspaceManifest {
-    pub(crate) receipt: WorkspaceManifestReceipt,
-    pub(crate) canonical: crate::manifest_storage::CanonicalManifest,
-    pub(crate) dependency_identity: Option<String>,
-    pub(crate) work: WorkspaceManifestWork,
-}
-
-impl PreparedWorkspaceManifest {
-    pub(crate) fn new(
-        receipt: WorkspaceManifestReceipt,
-        work: WorkspaceManifestWork,
-    ) -> StoreResult<Self> {
-        let canonical = crate::manifest_storage::canonical_manifest(&receipt.entries)?;
-        if canonical.manifest_hash != receipt.manifest_id {
-            return Err(StoreError::CorruptData(
-                "prepared workspace receipt hash does not match its canonical payload".to_string(),
-            ));
-        }
-        Ok(Self {
-            receipt,
-            canonical,
-            dependency_identity: None,
-            work,
-        })
-    }
-
-    pub fn receipt(&self) -> &WorkspaceManifestReceipt {
-        &self.receipt
-    }
-
-    pub fn work(&self) -> WorkspaceManifestWork {
-        self.work
-    }
-
-    pub fn canonical_byte_count(&self) -> usize {
-        self.canonical.bytes.len()
-    }
-
-    pub fn dependency_identity(&self) -> Option<&str> {
-        self.dependency_identity.as_deref()
-    }
-
-    pub fn with_dependency_identity(mut self, dependency_identity: String) -> Self {
-        self.dependency_identity = Some(dependency_identity);
-        self
-    }
-
-    pub fn reused_after_validation(
-        mut self,
-        overlay_traversals: u64,
-        files_examined: u64,
-        git_subprocesses: u64,
-        duration_micros: u64,
-    ) -> Self {
-        self.work = WorkspaceManifestWork {
-            overlay_traversals,
-            files_examined,
-            git_subprocesses,
-            reuse_hits: 1,
-            duration_micros,
-            ..WorkspaceManifestWork::default()
-        };
-        self
-    }
-
-    pub fn with_revalidation_work(
-        mut self,
-        overlay_traversals: u64,
-        files_examined: u64,
-        git_subprocesses: u64,
-        reuse_rejections: u64,
-        duration_micros: u64,
-    ) -> Self {
-        self.work.overlay_traversals = self
-            .work
-            .overlay_traversals
-            .saturating_add(overlay_traversals);
-        self.work.files_examined = self.work.files_examined.saturating_add(files_examined);
-        self.work.git_subprocesses = self.work.git_subprocesses.saturating_add(git_subprocesses);
-        self.work.reuse_rejections = self.work.reuse_rejections.saturating_add(reuse_rejections);
-        self.work.duration_micros = self.work.duration_micros.saturating_add(duration_micros);
-        self
-    }
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkspaceMutationFinishOutcome {
-    pub(crate) result: WorkspaceMutationResult,
-    pub(crate) final_manifest: Option<PreparedWorkspaceManifest>,
-    pub(crate) work: WorkspaceManifestWork,
-}
-
-impl WorkspaceMutationFinishOutcome {
-    pub fn result(&self) -> &WorkspaceMutationResult {
-        &self.result
-    }
-
-    pub fn final_manifest(&self) -> Option<&PreparedWorkspaceManifest> {
-        self.final_manifest.as_ref()
-    }
-
-    pub fn work(&self) -> WorkspaceManifestWork {
-        self.work
-    }
-
-    pub fn into_result(self) -> WorkspaceMutationResult {
-        self.result
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceFinalizationFence {
-    pub fence_id: String,
-    pub repository_id: String,
-    pub workspace_id: String,
-    pub root_session_id: String,
-    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -910,8 +675,6 @@ pub struct QuiescenceStatus {
     pub running_validation_call_ids: Vec<String>,
     pub pending_gate_assignment_ids: Vec<AssignmentId>,
     pub active_claim_assignment_ids: Vec<AssignmentId>,
-    #[serde(default)]
-    pub active_mutation_lease_ids: Vec<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -1288,13 +1051,6 @@ pub struct WriteClaim {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub released_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WriteClaimConflict {
-    pub assignment_id: AssignmentId,
-    pub existing_scope: RepoScope,
-    pub requested_scope: RepoScope,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

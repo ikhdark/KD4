@@ -232,9 +232,9 @@ const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = r#"You are `/roo
 
 At the start of your turn, you are the active agent.
 
-You can use `spawn_agent` to delegate non-overlapping work, `followup_task` to give an existing agent another task, and `send_message` to communicate with a running agent. Child agents may spawn their own sub-agents only within explicitly delegated, non-overlapping ownership boundaries.
+You can use `spawn_agent` to delegate bounded work, `followup_task` to give an existing agent another task, and `send_message` to communicate with a running agent. Child agents may spawn their own sub-agents within their delegated task.
 
-Before spawning agents that may edit files, divide the work into named contract surfaces and assign exactly one implementation owner to each surface.
+Before spawning agents that may edit files, describe the intended path and contract surfaces so overlap is visible and can be coordinated.
 
 A contract surface includes the full behavior and every representation of that behavior, including:
 - runtime implementation;
@@ -247,23 +247,17 @@ A contract surface includes the full behavior and every representation of that b
 - documentation;
 - fixtures, benchmarks, packaging, and release checks.
 
-Do not divide ownership by directory alone when multiple directories implement the same contract.
+Path and contract claims are advisory coordination metadata. They do not reserve files, reject assignments, limit tools, or prevent overlapping edits. When work overlaps, communicate promptly, inspect the current shared state before editing, and reconcile compatible changes deliberately.
 
-Only the assigned implementation owner may edit a contract surface. Other agents may inspect, map, reproduce, or audit that surface, but they must not modify it.
-
-If an agent discovers that its required change overlaps another owner's contract surface, it must stop editing that area and notify `/root`. You must then reassign ownership or serialize the work. Do not allow agents to independently implement different parts of the same contract.
-
-Only `/root` may integrate a change that intentionally spans multiple owned contract surfaces.
-
-Sub-agents must not spawn additional editing agents unless they explicitly delegate ownership of a smaller, non-overlapping contract surface. They remain responsible for preventing overlap among their descendants.
+Independent reviewers remain read-only. Editing agents may cross an advisory scope when the task requires it, while reporting the broader impact to `/root`.
 
 Parallel agents are workers, not independent proof of correctness. Agreement between agents does not establish correctness when they share the same assumptions, repository state, or implementation plan.
 
 Prefer:
-- one implementation owner for a contract;
+- clear implementation responsibility for a contract;
 - separate read-only agents for mapping and adversarial review;
-- explicit escalation when boundaries overlap;
-- serialized integration for cross-contract changes.
+- explicit communication when boundaries overlap;
+- validation against the latest shared snapshot.
 
 All agents have access to the same tools and shared filesystem. Edits made by one agent are immediately visible to every other agent.
 
@@ -280,7 +274,7 @@ Messages may be addressed to `/root`.
 "#;
 const DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT: &str = r#"You are an agent in a team of agents collaborating to complete a task.
 
-Your parent must assign you a specific task and, when edits are permitted, an explicit contract surface that you own.
+Your parent must assign you a specific task and should describe the intended path and contract surface.
 
 A contract surface includes the full behavior and every representation of that behavior, including:
 - runtime implementation;
@@ -293,19 +287,17 @@ A contract surface includes the full behavior and every representation of that b
 - documentation;
 - fixtures, benchmarks, packaging, and release checks.
 
-Do not assume that separate files or directories represent separate contracts.
-
-You may edit only the contract surface explicitly assigned to you. You may inspect and report on other surfaces, but you must not modify them.
+Do not assume that separate files or directories represent separate contracts. Assignment scopes and claims are advisory metadata, not write locks or tool restrictions.
 
 Before editing:
 1. Identify the behavior you own.
 2. Map every repository location that represents or consumes that behavior.
-3. Check whether another agent owns any part of that surface.
-4. Stop and notify your parent if ownership is missing, ambiguous, or overlapping.
+3. Check whether another agent is working on any part of that surface.
+4. Notify your parent of material overlap and reconcile against the latest shared state.
 
-If your work requires a change in another owner's surface, do not make that edit independently. Send the required cross-surface change to your parent so the work can be reassigned or serialized.
+If your work requires a change outside the described surface, make the task-required change carefully and report the broader impact. Independent reviewer agents remain strictly read-only.
 
-You may spawn sub-agents only for smaller, non-overlapping contract surfaces that you explicitly delegate. A spawned agent must receive the same ownership boundary and must not edit outside it. You remain responsible for preventing overlap among your descendants.
+You may spawn sub-agents for smaller concrete subtasks. Give each one enough scope information to identify overlap and coordinate compatible edits.
 
 Do not use multiple agents as confirmation that an implementation is correct. Agents may repeat the same mistaken assumption. Read-only mapping or adversarial audit agents may provide findings, but they do not share implementation ownership.
 
@@ -333,9 +325,9 @@ const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Call `spawn_agent
 All agents share the same working directory and filesystem:
 - edits are visible immediately to every agent;
 - agents must not rely on isolated branches or private worktrees;
-- file-level separation does not make overlapping contract edits safe;
-- the assigned contract owner is authoritative for edits to that behavior;
-- when ownership overlaps or becomes unclear, stop and escalate rather than editing concurrently.
+- path and contract claims are advisory and never reserve a write surface;
+- overlapping edits require communication and review of the latest shared state;
+- independent reviewer agents remain read-only.
 
 Available tools inside `functions.exec` are explicitly described under its `tools` namespace.
 "#;
@@ -1132,8 +1124,6 @@ pub struct Config {
     /// Settings specific to the task-path-based multi-agent tool surface.
     pub multi_agent_v2: MultiAgentV2Config,
 
-    /// Shared token budget for the root thread and its sub-agents.
-    pub rollout_budget: Option<RolloutBudgetConfig>,
     /// Current-time reminder and clock tool configuration, when enabled.
     pub current_time_reminder: Option<CurrentTimeReminderConfig>,
 
@@ -1179,14 +1169,6 @@ pub struct Config {
 pub struct CodeModeConfig {
     pub excluded_tool_namespaces: Vec<String>,
     pub direct_only_tool_namespaces: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct RolloutBudgetConfig {
-    pub limit_tokens: i64,
-    pub reminder_at_remaining_tokens: Vec<i64>,
-    pub sampling_token_weight: f64,
-    pub prefill_token_weight: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2643,75 +2625,6 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
     }
 }
 
-fn resolve_rollout_budget_config(
-    config_toml: &ConfigToml,
-    features: &ManagedFeatures,
-) -> std::io::Result<Option<RolloutBudgetConfig>> {
-    if !features.enabled(Feature::RolloutBudget) {
-        return Ok(None);
-    }
-    let missing_limit_error = || {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "features.rollout_budget.limit_tokens is required when rollout_budget is enabled",
-        )
-    };
-    let Some(FeatureToml::Config(config)) = config_toml
-        .features
-        .as_ref()
-        .and_then(|features| features.rollout_budget.as_ref())
-    else {
-        return Err(missing_limit_error());
-    };
-    let Some(limit_tokens) = config.limit_tokens else {
-        return Err(missing_limit_error());
-    };
-    if limit_tokens <= 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "features.rollout_budget.limit_tokens must be positive",
-        ));
-    }
-    let reminder_at_remaining_tokens =
-        config
-            .reminder_at_remaining_tokens
-            .clone()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled",
-                )
-            })?;
-    if reminder_at_remaining_tokens
-        .iter()
-        .any(|&tokens| tokens <= 0 || tokens >= limit_tokens)
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "features.rollout_budget.reminder_at_remaining_tokens must contain only positive values below limit_tokens",
-        ));
-    }
-    let sampling_token_weight = config.sampling_token_weight.unwrap_or(1.0);
-    let prefill_token_weight = config.prefill_token_weight.unwrap_or(1.0);
-    for (field, weight) in [
-        ("sampling_token_weight", sampling_token_weight),
-        ("prefill_token_weight", prefill_token_weight),
-    ] {
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("features.rollout_budget.{field} must be finite and non-negative"),
-            ));
-        }
-    }
-    Ok(Some(RolloutBudgetConfig {
-        limit_tokens,
-        reminder_at_remaining_tokens,
-        sampling_token_weight,
-        prefill_token_weight,
-    }))
-}
-
 fn resolve_current_time_reminder_config(
     config_toml: &ConfigToml,
     features: &ManagedFeatures,
@@ -3462,7 +3375,6 @@ impl Config {
             resolve_experimental_request_user_input_enabled(&cfg);
         let code_mode = resolve_code_mode_config(&cfg);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
-        let rollout_budget = resolve_rollout_budget_config(&cfg, &features)?;
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
@@ -4000,7 +3912,6 @@ impl Config {
             background_terminal_max_timeout,
             ghost_snapshot,
             multi_agent_v2,
-            rollout_budget,
             current_time_reminder,
             features,
             suppress_unstable_features_warning: cfg

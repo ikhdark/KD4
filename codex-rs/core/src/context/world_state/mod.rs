@@ -2,7 +2,6 @@ mod agents_md;
 mod apps_instructions;
 mod environment;
 mod plugins_instructions;
-mod source_closure;
 
 use crate::context::ContextualUserFragment;
 use codex_context_fragments::ModelContextBudget;
@@ -24,7 +23,6 @@ pub(crate) use agents_md::AgentsMdState;
 pub(crate) use apps_instructions::AppsInstructionsState;
 pub(crate) use environment::EnvironmentsState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
-pub(crate) use source_closure::SourceClosureWorldState;
 
 trait ErasedWorldStateSection: Send + Sync {
     fn snapshot(&self) -> Option<Value>;

@@ -257,8 +257,6 @@ pub(super) struct PendingProcessRegistration {
     session: Arc<crate::session::session::Session>,
     attempt_key: crate::tools::command_execution::CommandAttemptKey,
     process_id: i32,
-    workspace_mutation: Option<crate::tools::command_execution::RunningWorkspaceMutation>,
-    completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
     pending_spawns: PendingSpawnRegistration,
     primary_process: Option<Arc<UnifiedExecProcess>>,
     network_approval: Option<DeferredNetworkApproval>,
@@ -272,11 +270,9 @@ struct PendingProcessCleanup {
     session: Arc<crate::session::session::Session>,
     attempt_key: crate::tools::command_execution::CommandAttemptKey,
     process_id: i32,
-    workspace_mutation: Option<crate::tools::command_execution::RunningWorkspaceMutation>,
     processes: Vec<PendingProcessToTerminate>,
     primary_process: Option<Arc<UnifiedExecProcess>>,
     network_approval: Option<DeferredNetworkApproval>,
-    _completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
 }
 
 #[derive(Clone)]
@@ -291,16 +287,12 @@ impl PendingProcessRegistration {
         context: &UnifiedExecContext,
         attempt_key: crate::tools::command_execution::CommandAttemptKey,
         process_id: i32,
-        workspace_mutation: Option<crate::tools::command_execution::RunningWorkspaceMutation>,
-        completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
     ) -> Self {
         Self {
             process_store,
             session: Arc::clone(&context.session),
             attempt_key,
             process_id,
-            workspace_mutation,
-            completion_activity,
             pending_spawns: PendingSpawnRegistration::default(),
             primary_process: None,
             network_approval: None,
@@ -326,12 +318,6 @@ impl PendingProcessRegistration {
         self.initial_exec_command_active = Some(active);
     }
 
-    fn lease_lost_token(&self) -> Option<CancellationToken> {
-        self.workspace_mutation
-            .as_ref()
-            .map(crate::tools::command_execution::RunningWorkspaceMutation::lease_lost_token)
-    }
-
     fn cleanup_payload(&self) -> PendingProcessCleanup {
         let mut processes = self.pending_spawns.snapshot();
         if let Some(primary_process) = self.primary_process.as_ref()
@@ -353,11 +339,9 @@ impl PendingProcessRegistration {
             session: Arc::clone(&self.session),
             attempt_key: self.attempt_key.clone(),
             process_id: self.process_id,
-            workspace_mutation: self.workspace_mutation.clone(),
             processes,
             primary_process: self.primary_process.clone(),
             network_approval: self.network_approval.clone(),
-            _completion_activity: self.completion_activity.clone(),
         }
     }
 
@@ -367,15 +351,12 @@ impl PendingProcessRegistration {
         }
         cleanup_pending_process_registration(self.cleanup_payload()).await?;
         self.committed = true;
-        self.workspace_mutation.take();
-        self.completion_activity.take();
         self.pending_spawns.clear();
         Ok(())
     }
 
     fn commit(&mut self) {
         self.committed = true;
-        self.workspace_mutation.take();
         self.pending_spawns.clear();
     }
 }
@@ -387,9 +368,6 @@ impl Drop for PendingProcessRegistration {
         }
         if let Some(active) = self.initial_exec_command_active.as_ref() {
             active.store(false, Ordering::Release);
-        }
-        if let Some(workspace_mutation) = self.workspace_mutation.as_ref() {
-            workspace_mutation.cancel_owner();
         }
         let cleanup = self.cleanup_payload();
         for pending_process in &cleanup.processes {
@@ -463,9 +441,6 @@ fn pending_process_cleanup_sender()
 async fn cleanup_pending_process_registration(
     cleanup: PendingProcessCleanup,
 ) -> Result<(), String> {
-    if let Some(workspace_mutation) = cleanup.workspace_mutation.as_ref() {
-        workspace_mutation.cancel_owner();
-    }
     let mut first_termination_error = None;
     for pending_process in &cleanup.processes {
         if pending_process.requires_confirmed_termination
@@ -526,10 +501,8 @@ async fn cleanup_pending_process_registration(
             .session
             .services
             .command_execution
-            .finish_running_process_checked(cleanup.process_id, Some(exit_code))
-            .await?;
-    } else if let Some(workspace_mutation) = cleanup.workspace_mutation.as_ref() {
-        workspace_mutation.finish().await?;
+            .finish_running_process(cleanup.process_id, Some(exit_code))
+            .await;
     }
     Ok(())
 }
@@ -756,15 +729,11 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         debug_assert_eq!(request.process_id, process_id_reservation.process_id());
-        let workspace_mutation = request.workspace_mutation.take();
-        let completion_activity = request.completion_activity.take();
         let mut registration = PendingProcessRegistration::new(
             Arc::clone(&self.process_store),
             context,
             request.attempt_key.clone(),
             request.process_id,
-            workspace_mutation,
-            completion_activity,
         );
         let result = self
             .exec_command_inner(
@@ -883,22 +852,6 @@ impl UnifiedExecProcessManager {
             }
         };
         registration.attach_process(Arc::clone(&process), deferred_network_approval.clone());
-        if let Some(lease_lost) = registration.lease_lost_token() {
-            let leased_process = Arc::clone(&process);
-            let process_exited = process.cancellation_token();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = process_exited.cancelled() => {}
-                    _ = lease_lost.cancelled() => {
-                        if !leased_process.has_exited()
-                            && let Err(error) = leased_process.terminate_confirmed().await
-                        {
-                            tracing::error!(%error, "failed to terminate process after mutation lease loss");
-                        }
-                    }
-                }
-            });
-        }
         let executor_was_ready =
             self.deferred_executor_enabled && self.executor_ready.swap(true, Ordering::AcqRel);
         let tool_execution_timing_guard = context.turn.turn_timing_state.begin_tool_execution();
@@ -1517,8 +1470,6 @@ impl UnifiedExecProcessManager {
                 process_id,
                 attempt_key,
                 raw_output_artifact.clone(),
-                context.turn.sub_id.clone(),
-                registration.workspace_mutation.clone(),
                 validation_launch,
                 started_at,
             )
@@ -1536,7 +1487,6 @@ impl UnifiedExecProcessManager {
             transcript,
             started_at,
             context.tracker.clone(),
-            registration.completion_activity.take(),
             validation_observation,
             validation_leader,
             validation_waiter,

@@ -13,7 +13,6 @@ use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME;
 use crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use crate::turn_timing::SourceDiscoveryTimingEvent;
 use codex_tools::JsonToolOutput;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -24,10 +23,12 @@ const DEFAULT_LINE_COUNT: usize = 200;
 const MAX_LEGACY_RANGES: usize = 16;
 const MAX_AGGREGATE_LINES: usize = 2_000;
 // A nested result is serialized into a code-mode cell and then into the outer
-// exec result. Keep exact recovery below the smallest supported outer budget;
-// oversized selectors return their deterministic byte subdivision instead of
-// being recursively truncated into another artifact.
-const CODE_MODE_RECOVERY_TOKEN_CEILING: usize = 512;
+// exec result. Reserve enough space for that outer envelope so a fitting exact
+// recovery cannot be recursively truncated into another artifact.
+const CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS: usize = 4_000;
+const CODE_MODE_RECOVERY_TOKEN_CEILING: usize =
+    codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS
+        .saturating_sub(CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,10 +124,6 @@ async fn handle_read_tool_output(
         .turn
         .turn_timing_state
         .record_tool_output_recovery(recovery_retruncation_count(&output));
-    invocation
-        .turn
-        .turn_timing_state
-        .record_source_discovery(SourceDiscoveryTimingEvent::Recovery);
 
     let output = serde_json::to_value(output).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
@@ -301,6 +298,15 @@ mod tests {
         };
 
         assert_eq!(recovery_retruncation_count(&output), 2);
+    }
+
+    #[test]
+    fn artifact_recovery_leaves_space_for_the_outer_exec_envelope() {
+        assert_eq!(
+            CODE_MODE_RECOVERY_TOKEN_CEILING + CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS,
+            codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
+        );
+        assert_eq!(CODE_MODE_RECOVERY_TOKEN_CEILING, 6_000);
     }
 
     #[test]

@@ -2,88 +2,23 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::Weak;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 
-use codex_agent_task_store::AgentTaskStore;
-use codex_agent_task_store::StoreError;
-use codex_agent_task_store::WorkspaceMutationLease;
-use codex_agent_task_store::WorkspaceMutationRequest;
-use codex_agent_task_store::WorkspaceMutationResult;
 use codex_protocol::plan_tool::ValidationRoute;
 use codex_protocol::validation::ValidationFreshness;
 use codex_protocol::validation::ValidationProofKey;
 use codex_protocol::validation::ValidationResult;
 use codex_protocol::validation::ValidationTerminalStatus;
 use tokio::sync::Mutex;
-use tokio::sync::OwnedMutexGuard;
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 
-use crate::git_workspace::GitWorkspaceCache;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::validation_admission::ValidationLaunchPlan;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
 const MAX_COMPLETED_VALIDATION_PROOFS: usize = 128;
-const WORKSPACE_MUTATION_RETRY_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(250);
-const WORKSPACE_MUTATION_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-const WORKSPACE_MUTATION_FINALIZATION_MAX_WAIT: std::time::Duration =
-    std::time::Duration::from_secs(10);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum WorkspaceMutationScope {
-    None,
-    ExactPaths(Vec<String>),
-    Repository,
-}
-
-impl WorkspaceMutationScope {
-    pub(crate) fn for_shell(
-        typed_binding: bool,
-        independent_review: bool,
-        inspection_command: bool,
-        intercepted_apply_patch: bool,
-        admitted_nonmutating_validation: bool,
-    ) -> Self {
-        if typed_binding
-            || independent_review
-            || inspection_command
-            || intercepted_apply_patch
-            || admitted_nonmutating_validation
-        {
-            Self::None
-        } else {
-            Self::Repository
-        }
-    }
-
-    pub(crate) fn exact_paths(paths: Vec<String>) -> Self {
-        Self::ExactPaths(paths)
-    }
-
-    pub(crate) fn into_paths(self) -> Option<Vec<String>> {
-        match self {
-            Self::None => None,
-            Self::ExactPaths(paths) => Some(paths),
-            Self::Repository => Some(vec![
-                codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string(),
-            ]),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CommandAttemptKey {
     tool_name: String,
@@ -274,9 +209,7 @@ struct AttemptEntry {
 pub(crate) struct RunningCommand {
     pub(crate) key: CommandAttemptKey,
     pub(crate) artifact: RawOutputArtifact,
-    owner_turn_id: String,
     completed_exit_code: Option<i32>,
-    workspace_mutation: Option<RunningWorkspaceMutation>,
     validation_launch: Option<ValidationLaunchPlan>,
     started_at: Instant,
 }
@@ -310,535 +243,6 @@ struct CompletedValidationProof {
     artifact: RawOutputArtifact,
 }
 
-#[derive(Clone)]
-pub(crate) struct RunningWorkspaceMutation {
-    inner: Arc<RunningWorkspaceMutationInner>,
-}
-
-pub(crate) struct WorkspaceMutationReservation {
-    _guard: OwnedMutexGuard<()>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceMutationReservationAcquireError {
-    Cancelled,
-    TimedOut,
-}
-
-pub(crate) struct WorkspaceMutationGuard {
-    store: Arc<dyn AgentTaskStore>,
-    repo_root: PathBuf,
-    lease: WorkspaceMutationLease,
-    finalized: bool,
-    git_workspace_cache: Option<Arc<GitWorkspaceCache>>,
-    _reservation: WorkspaceMutationReservation,
-}
-
-impl WorkspaceMutationGuard {
-    #[cfg(test)]
-    pub(crate) fn new(
-        store: Arc<dyn AgentTaskStore>,
-        repo_root: PathBuf,
-        lease: WorkspaceMutationLease,
-        reservation: WorkspaceMutationReservation,
-    ) -> Self {
-        Self {
-            store,
-            repo_root,
-            lease,
-            finalized: false,
-            git_workspace_cache: None,
-            _reservation: reservation,
-        }
-    }
-
-    pub(crate) fn new_with_cache(
-        store: Arc<dyn AgentTaskStore>,
-        repo_root: PathBuf,
-        lease: WorkspaceMutationLease,
-        reservation: WorkspaceMutationReservation,
-        git_workspace_cache: Arc<GitWorkspaceCache>,
-    ) -> Self {
-        Self {
-            store,
-            repo_root,
-            lease,
-            finalized: false,
-            git_workspace_cache: Some(git_workspace_cache),
-            _reservation: reservation,
-        }
-    }
-
-    pub(crate) fn store(&self) -> Arc<dyn AgentTaskStore> {
-        Arc::clone(&self.store)
-    }
-
-    pub(crate) fn repo_root(&self) -> &Path {
-        &self.repo_root
-    }
-
-    pub(crate) fn lease(&self) -> &WorkspaceMutationLease {
-        &self.lease
-    }
-
-    pub(crate) async fn finish(mut self) -> Result<(), StoreError> {
-        finish_workspace_mutation_and_seed(
-            self.store.as_ref(),
-            &self.repo_root,
-            self.lease.clone(),
-            self.git_workspace_cache.as_deref(),
-        )
-        .await?;
-        self.finalized = true;
-        Ok(())
-    }
-}
-
-impl Drop for WorkspaceMutationGuard {
-    fn drop(&mut self) {
-        if self.finalized {
-            return;
-        }
-        let lease = self.lease.clone();
-        let store = Arc::clone(&self.store);
-        let repo_root = self.repo_root.clone();
-        let cleanup = DroppedWorkspaceMutationCleanup {
-            store,
-            repo_root,
-            lease,
-            git_workspace_cache: self.git_workspace_cache.clone(),
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(finalize_dropped_workspace_mutation(cleanup));
-        } else {
-            enqueue_dropped_workspace_mutation_cleanup(cleanup);
-        }
-    }
-}
-
-struct DroppedWorkspaceMutationCleanup {
-    store: Arc<dyn AgentTaskStore>,
-    repo_root: PathBuf,
-    lease: WorkspaceMutationLease,
-    git_workspace_cache: Option<Arc<GitWorkspaceCache>>,
-}
-
-async fn finalize_dropped_workspace_mutation(cleanup: DroppedWorkspaceMutationCleanup) {
-    if let Err(error) = finish_workspace_mutation_and_seed(
-        cleanup.store.as_ref(),
-        &cleanup.repo_root,
-        cleanup.lease,
-        cleanup.git_workspace_cache.as_deref(),
-    )
-    .await
-    {
-        tracing::error!(%error, "failed to finalize a dropped workspace mutation");
-    }
-}
-
-fn enqueue_dropped_workspace_mutation_cleanup(cleanup: DroppedWorkspaceMutationCleanup) {
-    static CLEANUP_SENDER: OnceLock<
-        Option<std::sync::mpsc::Sender<DroppedWorkspaceMutationCleanup>>,
-    > = OnceLock::new();
-    let sender = CLEANUP_SENDER.get_or_init(|| {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                tracing::error!(%error, "failed to start workspace mutation cleanup runtime");
-                return None;
-            }
-        };
-        let (sender, receiver) = std::sync::mpsc::channel::<DroppedWorkspaceMutationCleanup>();
-        match std::thread::Builder::new()
-            .name("codex-workspace-mutation-cleanup".to_string())
-            .spawn(move || {
-                while let Ok(cleanup) = receiver.recv() {
-                    runtime.block_on(finalize_dropped_workspace_mutation(cleanup));
-                }
-            }) {
-            Ok(_handle) => Some(sender),
-            Err(error) => {
-                tracing::error!(%error, "failed to spawn workspace mutation cleanup thread");
-                None
-            }
-        }
-    });
-    let Some(sender) = sender else {
-        tracing::error!("workspace mutation cleanup worker is unavailable");
-        return;
-    };
-    if let Err(error) = sender.send(cleanup) {
-        tracing::error!(%error, "failed to queue dropped workspace mutation cleanup");
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum WorkspaceMutationAcquireError {
-    Cancelled,
-    TimedOut { details: Vec<String> },
-    Store(StoreError),
-}
-
-#[cfg(test)]
-pub(crate) async fn acquire_workspace_mutation_lease(
-    store: &dyn AgentTaskStore,
-    repo_root: &Path,
-    request: &WorkspaceMutationRequest,
-    cancellation: &CancellationToken,
-) -> Result<WorkspaceMutationLease, WorkspaceMutationAcquireError> {
-    acquire_workspace_mutation_lease_with_max_wait(
-        store,
-        repo_root,
-        request,
-        cancellation,
-        WORKSPACE_MUTATION_MAX_WAIT,
-    )
-    .await
-}
-
-pub(crate) async fn acquire_workspace_mutation_lease_cached(
-    store: &dyn AgentTaskStore,
-    git_workspace_cache: &GitWorkspaceCache,
-    repo_root: &Path,
-    request: &WorkspaceMutationRequest,
-    cancellation: &CancellationToken,
-) -> Result<WorkspaceMutationLease, WorkspaceMutationAcquireError> {
-    let deadline = tokio::time::Instant::now() + WORKSPACE_MUTATION_MAX_WAIT;
-    loop {
-        if cancellation.is_cancelled() {
-            return Err(WorkspaceMutationAcquireError::Cancelled);
-        }
-        let prepared = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                return Err(WorkspaceMutationAcquireError::Cancelled);
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                return Err(WorkspaceMutationAcquireError::TimedOut {
-                    details: vec!["repository manifest preparation did not become ready".to_string()],
-                });
-            }
-            prepared = git_workspace_cache.prepare_repository_manifest(store, repo_root) => {
-                prepared.map_err(WorkspaceMutationAcquireError::Store)?
-            }
-        };
-        let lease = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                return Err(WorkspaceMutationAcquireError::Cancelled);
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                return Err(WorkspaceMutationAcquireError::TimedOut {
-                    details: vec!["workspace mutation admission did not become ready".to_string()],
-                });
-            }
-            lease = async {
-                if let Some(prepared) = prepared {
-                    store
-                        .begin_workspace_mutation_prepared(repo_root, request.clone(), prepared)
-                        .await
-                } else {
-                    store
-                        .begin_workspace_mutation(repo_root, request.clone())
-                        .await
-                }
-            } => lease,
-        };
-
-        match lease {
-            Ok(lease) => return Ok(lease),
-            Err(StoreError::WorkspaceClaimConflict { details }) => {
-                tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        return Err(WorkspaceMutationAcquireError::Cancelled);
-                    }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        return Err(WorkspaceMutationAcquireError::TimedOut { details });
-                    }
-                    _ = tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL) => {}
-                }
-            }
-            Err(StoreError::WorkspaceCasMismatch { .. }) => {
-                // The next iteration performs one fresh preparation because the
-                // narrow workspace epoch no longer matches the cached receipt.
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(WorkspaceMutationAcquireError::TimedOut {
-                        details: vec![
-                            "workspace manifest remained stale during admission".to_string(),
-                        ],
-                    });
-                }
-            }
-            Err(error) => return Err(WorkspaceMutationAcquireError::Store(error)),
-        }
-    }
-}
-
-pub(crate) async fn finish_workspace_mutation_and_seed(
-    store: &dyn AgentTaskStore,
-    repo_root: &Path,
-    lease: WorkspaceMutationLease,
-    git_workspace_cache: Option<&GitWorkspaceCache>,
-) -> Result<WorkspaceMutationResult, StoreError> {
-    let Some(cache) = git_workspace_cache else {
-        return store.finish_workspace_mutation(repo_root, lease).await;
-    };
-    let finalization_guard = cache
-        .begin_repository_manifest_finalization(repo_root)
-        .await;
-    let outcome = store
-        .finish_workspace_mutation_with_receipt(repo_root, lease)
-        .await?;
-    #[cfg(test)]
-    cache.record_final_manifest_work(outcome.work());
-    let host_mutation_recorded =
-        record_finalized_workspace_mutation(cache, repo_root, outcome.result());
-    if let (Some(prepared), Some(finalization_guard)) =
-        (outcome.final_manifest().cloned(), finalization_guard)
-    {
-        cache
-            .publish_final_repository_manifest(
-                store,
-                repo_root,
-                prepared,
-                finalization_guard,
-                host_mutation_recorded,
-            )
-            .await?;
-    }
-    Ok(outcome.into_result())
-}
-
-pub(crate) fn workspace_mutation_result_reports_change(result: &WorkspaceMutationResult) -> bool {
-    result.end_epoch > result.start_epoch
-        || !result.changed_paths.is_empty()
-        || !result.drift_paths.is_empty()
-}
-
-pub(crate) fn record_finalized_workspace_mutation(
-    cache: &GitWorkspaceCache,
-    repo_root: &Path,
-    result: &WorkspaceMutationResult,
-) -> bool {
-    if !workspace_mutation_result_reports_change(result) {
-        return false;
-    }
-
-    let exact_paths_are_complete = !result.changed_paths.is_empty()
-        && result.drift_paths.is_empty()
-        && result
-            .changed_paths
-            .iter()
-            .all(|path| path != codex_agent_task_store::REPOSITORY_WIDE_PATH);
-    if exact_paths_are_complete {
-        cache.note_host_workspace_mutation_paths(repo_root, &result.changed_paths);
-    } else {
-        cache.note_host_workspace_mutation();
-    }
-    true
-}
-
-#[cfg(test)]
-async fn acquire_workspace_mutation_lease_with_max_wait(
-    store: &dyn AgentTaskStore,
-    repo_root: &Path,
-    request: &WorkspaceMutationRequest,
-    cancellation: &CancellationToken,
-    max_wait: std::time::Duration,
-) -> Result<WorkspaceMutationLease, WorkspaceMutationAcquireError> {
-    let deadline = tokio::time::Instant::now() + max_wait;
-    loop {
-        if cancellation.is_cancelled() {
-            return Err(WorkspaceMutationAcquireError::Cancelled);
-        }
-
-        match store
-            .begin_workspace_mutation(repo_root, request.clone())
-            .await
-        {
-            Ok(lease) => return Ok(lease),
-            Err(StoreError::WorkspaceClaimConflict { details }) => {
-                tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        return Err(WorkspaceMutationAcquireError::Cancelled);
-                    }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        return Err(WorkspaceMutationAcquireError::TimedOut { details });
-                    }
-                    _ = tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL) => {}
-                }
-            }
-            Err(error) => return Err(WorkspaceMutationAcquireError::Store(error)),
-        }
-    }
-}
-
-struct RunningWorkspaceMutationInner {
-    store: Arc<dyn AgentTaskStore>,
-    repo_root: PathBuf,
-    lease: WorkspaceMutationLease,
-    stop: CancellationToken,
-    lease_lost: CancellationToken,
-    finalized: Arc<Mutex<bool>>,
-    finalization_complete: CancellationToken,
-    reservation: Mutex<Option<WorkspaceMutationReservation>>,
-    _heartbeat_task: AbortOnDropHandle<()>,
-    git_workspace_cache: Option<Arc<GitWorkspaceCache>>,
-}
-
-impl std::fmt::Debug for RunningWorkspaceMutation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RunningWorkspaceMutation")
-            .field("repo_root", &self.inner.repo_root)
-            .field("lease_id", &self.inner.lease.lease_id)
-            .finish()
-    }
-}
-
-impl RunningWorkspaceMutation {
-    #[cfg(test)]
-    pub(crate) fn new(
-        store: Arc<dyn AgentTaskStore>,
-        repo_root: PathBuf,
-        lease: WorkspaceMutationLease,
-        owner_cancelled: CancellationToken,
-        reservation: WorkspaceMutationReservation,
-    ) -> Self {
-        Self::new_inner(store, repo_root, lease, owner_cancelled, reservation, None)
-    }
-
-    pub(crate) fn new_with_cache(
-        store: Arc<dyn AgentTaskStore>,
-        repo_root: PathBuf,
-        lease: WorkspaceMutationLease,
-        owner_cancelled: CancellationToken,
-        reservation: WorkspaceMutationReservation,
-        git_workspace_cache: Arc<GitWorkspaceCache>,
-    ) -> Self {
-        Self::new_inner(
-            store,
-            repo_root,
-            lease,
-            owner_cancelled,
-            reservation,
-            Some(git_workspace_cache),
-        )
-    }
-
-    fn new_inner(
-        store: Arc<dyn AgentTaskStore>,
-        repo_root: PathBuf,
-        lease: WorkspaceMutationLease,
-        owner_cancelled: CancellationToken,
-        reservation: WorkspaceMutationReservation,
-        git_workspace_cache: Option<Arc<GitWorkspaceCache>>,
-    ) -> Self {
-        let stop = CancellationToken::new();
-        let heartbeat_stop = stop.clone();
-        let lease_lost = CancellationToken::new();
-        let heartbeat_lease_lost = lease_lost.clone();
-        let heartbeat_store = store.clone();
-        let heartbeat_root = repo_root.clone();
-        let lease_id = lease.lease_id.clone();
-        let actor_id = lease.actor_id.clone();
-        let heartbeat_task = AbortOnDropHandle::new(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = heartbeat_stop.cancelled() => break,
-                    _ = owner_cancelled.cancelled() => {
-                        // A mutating process must not outlive the turn that owns its
-                        // repository authority. The process manager observes lease_lost,
-                        // terminates the process tree, and the exit watcher finalizes the
-                        // lease only after termination is confirmed.
-                        heartbeat_lease_lost.cancel();
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        match heartbeat_store
-                            .heartbeat_workspace_mutation(
-                                &heartbeat_root,
-                                lease_id.clone(),
-                                actor_id.clone(),
-                            )
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                tracing::warn!(
-                                    %lease_id,
-                                    "workspace mutation lease was lost"
-                                );
-                                heartbeat_lease_lost.cancel();
-                                break;
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    %lease_id,
-                                    "unified exec workspace mutation heartbeat failed"
-                                );
-                                heartbeat_lease_lost.cancel();
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }));
-        Self {
-            inner: Arc::new(RunningWorkspaceMutationInner {
-                store,
-                repo_root,
-                lease,
-                stop,
-                lease_lost,
-                finalized: Arc::new(Mutex::new(false)),
-                finalization_complete: CancellationToken::new(),
-                reservation: Mutex::new(Some(reservation)),
-                _heartbeat_task: heartbeat_task,
-                git_workspace_cache,
-            }),
-        }
-    }
-
-    pub(crate) fn lease_lost_token(&self) -> CancellationToken {
-        self.inner.lease_lost.clone()
-    }
-
-    pub(crate) fn cancel_owner(&self) {
-        self.inner.stop.cancel();
-        self.inner.lease_lost.cancel();
-    }
-
-    pub(crate) async fn finish(&self) -> Result<(), String> {
-        let mut finalized = Arc::clone(&self.inner.finalized).lock_owned().await;
-        if *finalized {
-            return Ok(());
-        }
-        finish_workspace_mutation_and_seed(
-            self.inner.store.as_ref(),
-            &self.inner.repo_root,
-            self.inner.lease.clone(),
-            self.inner.git_workspace_cache.as_deref(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        *finalized = true;
-        self.inner.stop.cancel();
-        self.inner.reservation.lock().await.take();
-        self.inner.finalization_complete.cancel();
-        Ok(())
-    }
-
-    async fn wait_until_finalized(&self) {
-        self.inner.finalization_complete.cancelled().await;
-    }
-}
-
 #[derive(Default)]
 struct CommandExecutionState {
     attempts: HashMap<CommandAttemptKey, AttemptEntry>,
@@ -851,94 +255,15 @@ struct CommandExecutionState {
     completed_validation_order: VecDeque<ValidationProofKey>,
     validation_results_by_call: HashMap<String, ValidationResult>,
     validation_result_call_order: VecDeque<String>,
-    workspace_admission_blocks: HashMap<(CommandAttemptKey, String), String>,
-    workspace_admission_block_order: VecDeque<(CommandAttemptKey, String)>,
 }
 
 #[derive(Default)]
 pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
-    workspace_mutation_gates: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     bound_auto_validations: Mutex<HashMap<String, BoundAutoValidationLeaf>>,
-    #[cfg(test)]
-    workspace_lease_diagnostics: WorkspaceLeaseDiagnostics,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct WorkspaceLeaseDiagnostics {
-    logical_requests: AtomicU64,
-    skipped_read_only: AtomicU64,
-    exact_path_leases: AtomicU64,
-    repository_wide_leases: AtomicU64,
 }
 
 impl CommandExecutionLedger {
-    pub(crate) async fn workspace_admission_block(
-        &self,
-        key: &CommandAttemptKey,
-        turn_id: &str,
-    ) -> Option<String> {
-        self.state
-            .lock()
-            .await
-            .workspace_admission_blocks
-            .get(&(key.clone(), turn_id.to_string()))
-            .cloned()
-    }
-
-    pub(crate) async fn record_workspace_admission_block(
-        &self,
-        key: &CommandAttemptKey,
-        turn_id: &str,
-        reason: String,
-    ) {
-        let identity = (key.clone(), turn_id.to_string());
-        let mut state = self.state.lock().await;
-        if state
-            .workspace_admission_blocks
-            .insert(identity.clone(), reason)
-            .is_none()
-        {
-            state.workspace_admission_block_order.push_back(identity);
-        }
-        while state.workspace_admission_block_order.len() > MAX_TRACKED_COMMANDS {
-            let Some(expired) = state.workspace_admission_block_order.pop_front() else {
-                break;
-            };
-            state.workspace_admission_blocks.remove(&expired);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_workspace_mutation_scope(
-        &self,
-        scope: &WorkspaceMutationScope,
-        skipped_read_only: bool,
-    ) {
-        self.workspace_lease_diagnostics
-            .logical_requests
-            .fetch_add(1, Ordering::Relaxed);
-        match scope {
-            WorkspaceMutationScope::None if skipped_read_only => {
-                self.workspace_lease_diagnostics
-                    .skipped_read_only
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            WorkspaceMutationScope::ExactPaths(_) => {
-                self.workspace_lease_diagnostics
-                    .exact_path_leases
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            WorkspaceMutationScope::Repository => {
-                self.workspace_lease_diagnostics
-                    .repository_wide_leases
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            WorkspaceMutationScope::None => {}
-        }
-    }
-
     pub(crate) async fn bind_auto_validation_leaf(
         &self,
         call_id: String,
@@ -1034,65 +359,6 @@ impl CommandExecutionLedger {
             "focused validation was superseded by a newer relevant implementation".to_string(),
         );
         Some(result.clone())
-    }
-
-    async fn workspace_mutation_gate(&self, repo_root: &Path) -> Arc<Mutex<()>> {
-        let mut gates = self.workspace_mutation_gates.lock().await;
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(repo_root).and_then(Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(Mutex::new(()));
-        gates.insert(repo_root.to_path_buf(), Arc::downgrade(&gate));
-        gate
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn reserve_workspace_mutation(
-        &self,
-        repo_root: &Path,
-    ) -> WorkspaceMutationReservation {
-        let gate = self.workspace_mutation_gate(repo_root).await;
-        WorkspaceMutationReservation {
-            _guard: gate.lock_owned().await,
-        }
-    }
-
-    pub(crate) async fn reserve_workspace_mutation_until_cancelled(
-        &self,
-        repo_root: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<WorkspaceMutationReservation, WorkspaceMutationReservationAcquireError> {
-        self.reserve_workspace_mutation_with_max_wait(
-            repo_root,
-            cancellation,
-            WORKSPACE_MUTATION_MAX_WAIT,
-        )
-        .await
-    }
-
-    async fn reserve_workspace_mutation_with_max_wait(
-        &self,
-        repo_root: &Path,
-        cancellation: &CancellationToken,
-        max_wait: Duration,
-    ) -> Result<WorkspaceMutationReservation, WorkspaceMutationReservationAcquireError> {
-        let gate = self.workspace_mutation_gate(repo_root).await;
-        // A terminated tool call can leave its in-process work pending while the caller is gone.
-        // Do not let that orphaned reservation prevent every later command from reaching the
-        // persistent lease, whose wait is already bounded separately.
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                Err(WorkspaceMutationReservationAcquireError::Cancelled)
-            }
-            _ = tokio::time::sleep(max_wait) => {
-                Err(WorkspaceMutationReservationAcquireError::TimedOut)
-            }
-            guard = gate.lock_owned() => {
-                Ok(WorkspaceMutationReservation { _guard: guard })
-            }
-        }
     }
 
     pub(crate) async fn observe_repository_revision(
@@ -1202,15 +468,11 @@ impl CommandExecutionLedger {
         process_id: i32,
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
-        owner_turn_id: String,
-        workspace_mutation: Option<RunningWorkspaceMutation>,
     ) {
         self.track_running_process_with_validation_contract(
             process_id,
             key,
             artifact,
-            owner_turn_id,
-            workspace_mutation,
             None,
             Instant::now(),
         )
@@ -1223,8 +485,6 @@ impl CommandExecutionLedger {
         process_id: i32,
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
-        owner_turn_id: String,
-        workspace_mutation: Option<RunningWorkspaceMutation>,
         validation_launch: Option<ValidationLaunchPlan>,
         started_at: Instant,
     ) {
@@ -1239,9 +499,7 @@ impl CommandExecutionLedger {
             RunningCommand {
                 key,
                 artifact,
-                owner_turn_id,
                 completed_exit_code: None,
-                workspace_mutation,
                 validation_launch,
                 started_at,
             },
@@ -1252,55 +510,8 @@ impl CommandExecutionLedger {
         self.state.lock().await.running.get(&process_id).cloned()
     }
 
-    pub(crate) async fn cancel_mutations_for_turn(&self, turn_id: &str) {
-        let mutations = {
-            let state = self.state.lock().await;
-            state
-                .running
-                .values()
-                .filter(|running| running.owner_turn_id == turn_id)
-                .filter_map(|running| running.workspace_mutation.clone())
-                .collect::<Vec<_>>()
-        };
-        for mutation in &mutations {
-            mutation.cancel_owner();
-        }
-        for mutation in mutations {
-            if tokio::time::timeout(
-                WORKSPACE_MUTATION_FINALIZATION_MAX_WAIT,
-                mutation.wait_until_finalized(),
-            )
-            .await
-            .is_err()
-            {
-                tracing::warn!(
-                    turn_id,
-                    "timed out waiting for cancelled workspace mutation finalization"
-                );
-            }
-        }
-    }
-
-    pub(crate) async fn cancel_mutations_for_turn_with_timeout(
-        &self,
-        turn_id: &str,
-        timeout: Duration,
-    ) -> bool {
-        tokio::time::timeout(timeout, self.cancel_mutations_for_turn(turn_id))
-            .await
-            .is_ok()
-    }
-
-    pub(crate) async fn cancel_mutations_for_terminal_turn_with_timeout(
-        &self,
-        turn_id: &str,
-        timeout: Duration,
-    ) -> bool {
-        let completed = self
-            .cancel_mutations_for_turn_with_timeout(turn_id, timeout)
-            .await;
+    pub(crate) async fn finish_turn(&self, turn_id: &str) {
         self.forget_turn_repository_revision(turn_id).await;
-        completed
     }
 
     async fn forget_turn_repository_revision(&self, turn_id: &str) {
@@ -1343,7 +554,7 @@ impl CommandExecutionLedger {
         process_id: i32,
         exit_code: i32,
     ) -> bool {
-        let workspace_mutation = {
+        {
             let mut state = self.state.lock().await;
             let Some(running) = state.running.get_mut(&process_id) else {
                 return false;
@@ -1353,23 +564,7 @@ impl CommandExecutionLedger {
             }
             running.completed_exit_code = Some(exit_code);
             let running = running.clone();
-            let workspace_mutation = running.workspace_mutation.clone();
             record_running_exit_locked(&mut state, &running, exit_code);
-            workspace_mutation
-        };
-        if let Some(workspace_mutation) = workspace_mutation
-            && let Err(error) = workspace_mutation.finish().await
-        {
-            // Keep the shared mutation handle on the running entry so a later poll can
-            // retry finalization, but stop renewing authority for a process that has
-            // already exited so an unpolled cleanup error cannot strand the repository.
-            workspace_mutation.cancel_owner();
-            tracing::warn!(
-                %error,
-                process_id,
-                "workspace mutation finalization after process exit failed"
-            );
-            return false;
         }
         self.publish_completed_validation_if_ready(process_id).await;
         true
@@ -1520,27 +715,10 @@ impl CommandExecutionLedger {
         process_id: i32,
         exit_code: Option<i32>,
     ) -> bool {
-        match self
-            .finish_running_process_checked(process_id, exit_code)
-            .await
         {
-            Ok(finished) => finished,
-            Err(error) => {
-                tracing::warn!(%error, process_id, "workspace mutation finalization failed");
-                false
-            }
-        }
-    }
-
-    pub(crate) async fn finish_running_process_checked(
-        &self,
-        process_id: i32,
-        exit_code: Option<i32>,
-    ) -> Result<bool, String> {
-        let running = {
             let mut state = self.state.lock().await;
             let Some(mut running) = state.running.remove(&process_id) else {
-                return Ok(false);
+                return false;
             };
             state.running_order.retain(|tracked| *tracked != process_id);
             if running.completed_exit_code.is_none()
@@ -1549,23 +727,12 @@ impl CommandExecutionLedger {
                 running.completed_exit_code = Some(exit_code);
                 record_running_exit_locked(&mut state, &running, exit_code);
             }
-            running
-        };
-        if let Some(workspace_mutation) = running.workspace_mutation.as_ref()
-            && let Err(error) = workspace_mutation.finish().await
-        {
-            let mut state = self.state.lock().await;
-            if !state.running.contains_key(&process_id) {
-                state.running_order.push_back(process_id);
-                state.running.insert(process_id, running);
-            }
-            return Err(error);
         }
         let mut state = self.state.lock().await;
         while state.attempts.len() > MAX_TRACKED_COMMANDS
             && evict_oldest_inactive_attempt_locked(&mut state)
         {}
-        Ok(true)
+        true
     }
 
     #[cfg(test)]
@@ -1643,61 +810,6 @@ fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttempt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_agent_task_store::LocalAgentTaskStore;
-    use codex_agent_task_store::REPOSITORY_WIDE_PATH;
-    use codex_agent_task_store::WorkspaceActorKind;
-    use codex_agent_task_store::WorkspaceMutationRequest;
-    use codex_state::StateRuntime;
-    use tempfile::TempDir;
-
-    async fn running_workspace_mutation(
-        owner_cancelled: CancellationToken,
-    ) -> (
-        TempDir,
-        TempDir,
-        Arc<LocalAgentTaskStore>,
-        Arc<CommandExecutionLedger>,
-        RunningWorkspaceMutation,
-    ) {
-        let codex_home = TempDir::new().expect("codex home tempdir");
-        let repo = TempDir::new().expect("repository tempdir");
-        let state =
-            StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
-                .await
-                .expect("state runtime initializes");
-        let store = Arc::new(
-            LocalAgentTaskStore::initialize(&state)
-                .await
-                .expect("task store initializes"),
-        );
-        let ledger = Arc::new(CommandExecutionLedger::default());
-        let reservation = ledger.reserve_workspace_mutation(repo.path()).await;
-        let lease = store
-            .begin_workspace_mutation(
-                repo.path(),
-                WorkspaceMutationRequest {
-                    root_session_id: "owner-root".to_string(),
-                    actor_id: "root:owner-root".to_string(),
-                    kind: WorkspaceActorKind::Root,
-                    attempt_id: None,
-                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-                    contracts: Vec::new(),
-                    expected_manifest: Vec::new(),
-                },
-            )
-            .await
-            .expect("workspace mutation starts");
-        let trait_store: Arc<dyn AgentTaskStore> = store.clone();
-        let running = RunningWorkspaceMutation::new(
-            trait_store,
-            repo.path().to_path_buf(),
-            lease,
-            owner_cancelled,
-            reservation,
-        );
-        (codex_home, repo, store, ledger, running)
-    }
-
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
     }
@@ -1725,283 +837,6 @@ mod tests {
             structured_route: None,
             validation_call_id: None,
         }
-    }
-
-    #[tokio::test]
-    async fn completion_hook_authoritative_mutation_without_paths_uses_broad_invalidation() {
-        let repo = TempDir::new().expect("repository tempdir");
-        let first = repo.path().join("first.rs");
-        let second = repo.path().join("second.rs");
-        std::fs::write(&first, "first\n").expect("first source fixture");
-        std::fs::write(&second, "second\n").expect("second source fixture");
-        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-        let first_registration = cache
-            .register_source_freshness_paths([first])
-            .expect("first source freshness registration");
-        let second_registration = cache
-            .register_source_freshness_paths([second])
-            .expect("second source freshness registration");
-        let result = WorkspaceMutationResult {
-            lease_id: "legacy-completion-hook".to_string(),
-            start_epoch: 8,
-            end_epoch: 9,
-            changed_paths: Vec::new(),
-            drift_paths: Vec::new(),
-        };
-
-        assert!(record_finalized_workspace_mutation(
-            cache.as_ref(),
-            repo.path(),
-            &result,
-        ));
-        assert!(!cache.source_registration_is_current(&first_registration));
-        assert!(!cache.source_registration_is_current(&second_registration));
-    }
-
-    #[tokio::test]
-    async fn structural_workspace_admission_block_is_scoped_to_attempt_and_turn() {
-        let ledger = CommandExecutionLedger::default();
-        let blocked = key("node inspect.js").with_repository_epoch(4);
-        ledger
-            .record_workspace_admission_block(
-                &blocked,
-                "turn-1",
-                "workspace state initialization failed".to_string(),
-            )
-            .await;
-
-        assert_eq!(
-            ledger.workspace_admission_block(&blocked, "turn-1").await,
-            Some("workspace state initialization failed".to_string())
-        );
-        assert_eq!(
-            ledger.workspace_admission_block(&blocked, "turn-2").await,
-            None,
-            "a new turn is a fresh runtime-state observation"
-        );
-        assert_eq!(
-            ledger
-                .workspace_admission_block(
-                    &key("node inspect.js").with_repository_epoch(5),
-                    "turn-1",
-                )
-                .await,
-            None,
-            "a repository revision change must unblock admission"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_mutation_reservations_serialize_per_repository() {
-        let ledger = Arc::new(CommandExecutionLedger::default());
-        let first_repo = TempDir::new().expect("first repository tempdir");
-        let second_repo = TempDir::new().expect("second repository tempdir");
-        let first = ledger.reserve_workspace_mutation(first_repo.path()).await;
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let waiting_ledger = Arc::clone(&ledger);
-        let waiting_repo = first_repo.path().to_path_buf();
-        let waiter = tokio::spawn(async move {
-            started_tx.send(()).expect("waiter starts");
-            waiting_ledger
-                .reserve_workspace_mutation(&waiting_repo)
-                .await
-        });
-        started_rx.await.expect("waiter reports startup");
-        tokio::task::yield_now().await;
-        assert!(
-            !waiter.is_finished(),
-            "a same-repository mutation reservation must wait"
-        );
-
-        let different_repo = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            ledger.reserve_workspace_mutation(second_repo.path()),
-        )
-        .await
-        .expect("a different repository remains independent");
-        drop(different_repo);
-        drop(first);
-        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .expect("same-repository waiter proceeds after release")
-            .expect("same-repository waiter task succeeds");
-    }
-
-    #[tokio::test]
-    async fn workspace_mutation_reservation_wait_is_cancellable() {
-        let ledger = Arc::new(CommandExecutionLedger::default());
-        let repo = TempDir::new().expect("repository tempdir");
-        let first = ledger.reserve_workspace_mutation(repo.path()).await;
-        let cancellation = CancellationToken::new();
-        let waiting_ledger = Arc::clone(&ledger);
-        let waiting_repo = repo.path().to_path_buf();
-        let waiting_cancellation = cancellation.clone();
-        let waiter = tokio::spawn(async move {
-            waiting_ledger
-                .reserve_workspace_mutation_until_cancelled(&waiting_repo, &waiting_cancellation)
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished(), "the reservation wait is exercised");
-        cancellation.cancel();
-        let reservation = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .expect("cancellation promptly stops the reservation wait")
-            .expect("reservation waiter task succeeds");
-        assert!(
-            matches!(
-                reservation,
-                Err(WorkspaceMutationReservationAcquireError::Cancelled)
-            ),
-            "cancelled wait acquires no reservation"
-        );
-        drop(first);
-    }
-
-    #[tokio::test]
-    async fn workspace_mutation_reservation_wait_is_bounded() {
-        let ledger = CommandExecutionLedger::default();
-        let repo = TempDir::new().expect("repository tempdir");
-        let _first = ledger.reserve_workspace_mutation(repo.path()).await;
-
-        let result = ledger
-            .reserve_workspace_mutation_with_max_wait(
-                repo.path(),
-                &CancellationToken::new(),
-                std::time::Duration::from_millis(10),
-            )
-            .await;
-
-        assert!(
-            matches!(
-                result,
-                Err(WorkspaceMutationReservationAcquireError::TimedOut)
-            ),
-            "occupied reservation must time out"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_mutation_lease_wait_is_serialized_and_cancellable() {
-        let codex_home = TempDir::new().expect("codex home tempdir");
-        let repo = TempDir::new().expect("repository tempdir");
-        let state =
-            StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
-                .await
-                .expect("state runtime initializes");
-        let store = Arc::new(
-            LocalAgentTaskStore::initialize(&state)
-                .await
-                .expect("task store initializes"),
-        );
-        let owner_request = WorkspaceMutationRequest {
-            root_session_id: "owner-root".to_string(),
-            actor_id: "root:owner-root".to_string(),
-            kind: WorkspaceActorKind::Root,
-            attempt_id: None,
-            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-            contracts: Vec::new(),
-            expected_manifest: Vec::new(),
-        };
-        let waiter_request = owner_request.clone();
-        let owner_lease = store
-            .begin_workspace_mutation(repo.path(), owner_request.clone())
-            .await
-            .expect("owner lease starts");
-        let waiter_store: Arc<dyn AgentTaskStore> = store.clone();
-        let waiter_repo = repo.path().to_path_buf();
-        let waiter_cancellation = CancellationToken::new();
-        let waiter = tokio::spawn({
-            let waiter_cancellation = waiter_cancellation.clone();
-            let waiter_request = waiter_request.clone();
-            async move {
-                acquire_workspace_mutation_lease(
-                    waiter_store.as_ref(),
-                    &waiter_repo,
-                    &waiter_request,
-                    &waiter_cancellation,
-                )
-                .await
-            }
-        });
-
-        tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL * 2).await;
-        assert!(
-            !waiter.is_finished(),
-            "a conflicting active lease must keep the waiter serialized"
-        );
-        store
-            .finish_workspace_mutation(repo.path(), owner_lease)
-            .await
-            .expect("owner lease finishes");
-        let waiter_lease = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
-            .await
-            .expect("waiter proceeds after the owner releases the lease")
-            .expect("waiter task succeeds")
-            .expect("waiter acquires the lease");
-        store
-            .finish_workspace_mutation(repo.path(), waiter_lease)
-            .await
-            .expect("waiter lease finishes");
-
-        let owner_lease = store
-            .begin_workspace_mutation(repo.path(), owner_request)
-            .await
-            .expect("replacement owner lease starts");
-        let waiter_store: Arc<dyn AgentTaskStore> = store.clone();
-        let waiter_repo = repo.path().to_path_buf();
-        let cancellation = CancellationToken::new();
-        let cancelled_waiter_request = waiter_request.clone();
-        let cancelled_waiter = tokio::spawn({
-            let cancellation = cancellation.clone();
-            async move {
-                acquire_workspace_mutation_lease(
-                    waiter_store.as_ref(),
-                    &waiter_repo,
-                    &cancelled_waiter_request,
-                    &cancellation,
-                )
-                .await
-            }
-        });
-        tokio::time::sleep(WORKSPACE_MUTATION_RETRY_INTERVAL * 2).await;
-        assert!(
-            !cancelled_waiter.is_finished(),
-            "a conflicting lease must not be bypassed"
-        );
-        cancellation.cancel();
-        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), cancelled_waiter)
-            .await
-            .expect("cancelled waiter exits promptly")
-            .expect("cancelled waiter task succeeds")
-            .expect_err("cancelled waiter reports cancellation");
-        assert!(matches!(
-            cancelled,
-            WorkspaceMutationAcquireError::Cancelled
-        ));
-
-        let timed_out = acquire_workspace_mutation_lease_with_max_wait(
-            store.as_ref(),
-            repo.path(),
-            &waiter_request,
-            &CancellationToken::new(),
-            WORKSPACE_MUTATION_RETRY_INTERVAL * 2,
-        )
-        .await
-        .expect_err("a persistent conflicting lease reports a bounded wait");
-        let WorkspaceMutationAcquireError::TimedOut { details } = timed_out else {
-            panic!("persistent conflict should report a timeout, got {timed_out:?}");
-        };
-        assert!(
-            !details.is_empty(),
-            "the timeout must retain the conflict that blocked process launch"
-        );
-
-        store
-            .finish_workspace_mutation(repo.path(), owner_lease)
-            .await
-            .expect("replacement owner lease finishes");
     }
 
     #[tokio::test]
@@ -2127,8 +962,6 @@ mod tests {
                     owned_path: None,
                     bytes: 0,
                 },
-                "turn-1".to_string(),
-                None,
             )
             .await;
 
@@ -2158,8 +991,6 @@ mod tests {
                 42,
                 command_key.clone(),
                 RawOutputArtifact::unavailable("initial watcher artifact"),
-                "turn-1".to_string(),
-                None,
                 Some(validation_launch()),
                 Instant::now() - Duration::from_millis(25),
             )
@@ -2195,8 +1026,6 @@ mod tests {
                 43,
                 command_key.clone(),
                 RawOutputArtifact::unavailable("initial handler artifact"),
-                "turn-1".to_string(),
-                None,
                 Some(validation_launch()),
                 Instant::now() - Duration::from_millis(25),
             )
@@ -2205,14 +1034,8 @@ mod tests {
             .update_running_artifact(43, finalized_artifact.clone())
             .await;
 
-        assert_eq!(
-            ledger.finish_running_process_checked(43, Some(9)).await,
-            Ok(true)
-        );
-        assert_eq!(
-            ledger.finish_running_process_checked(43, Some(9)).await,
-            Ok(false)
-        );
+        assert!(ledger.finish_running_process(43, Some(9)).await);
+        assert!(!ledger.finish_running_process(43, Some(9)).await);
 
         let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
         assert_eq!(snapshot.consecutive_failures, 1);
@@ -2238,8 +1061,6 @@ mod tests {
                 44,
                 command_key.clone(),
                 RawOutputArtifact::unavailable("successful validation artifact"),
-                "turn-1".to_string(),
-                None,
                 Some(validation_launch()),
                 Instant::now(),
             )
@@ -2256,252 +1077,6 @@ mod tests {
             .begin_attempt(&command_key, false)
             .await
             .expect("successful tracked validation permits another attempt");
-    }
-
-    #[tokio::test]
-    async fn background_completion_releases_mutation_before_poll() {
-        let (_codex_home, repo, store, ledger, mutation) =
-            running_workspace_mutation(CancellationToken::new()).await;
-        let command_key = key("background-success.exe");
-        ledger
-            .track_running_process(
-                42,
-                command_key,
-                RawOutputArtifact::unavailable("fixture"),
-                "turn-1".to_string(),
-                Some(mutation),
-            )
-            .await;
-
-        assert!(ledger.mark_running_process_completed(42, 0).await);
-        assert!(
-            ledger.running_process(42).await.is_some(),
-            "completed metadata remains available for a later poll"
-        );
-        let _next_reservation = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            ledger.reserve_workspace_mutation(repo.path()),
-        )
-        .await
-        .expect("background completion releases the same-repository reservation");
-
-        let replacement = store
-            .begin_workspace_mutation(
-                repo.path(),
-                WorkspaceMutationRequest {
-                    root_session_id: "replacement-root".to_string(),
-                    actor_id: "root:replacement-root".to_string(),
-                    kind: WorkspaceActorKind::Root,
-                    attempt_id: None,
-                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-                    contracts: Vec::new(),
-                    expected_manifest: Vec::new(),
-                },
-            )
-            .await
-            .expect("confirmed background exit releases the repository lease");
-        store
-            .finish_workspace_mutation(repo.path(), replacement)
-            .await
-            .expect("replacement mutation finishes");
-        assert!(ledger.finish_running_process(42, Some(0)).await);
-    }
-
-    #[tokio::test]
-    async fn owner_cancellation_stops_heartbeat_and_signals_process_termination() {
-        let owner_cancelled = CancellationToken::new();
-        let (_codex_home, _repo, _store, _ledger, mutation) =
-            running_workspace_mutation(owner_cancelled.clone()).await;
-        let lease_lost = mutation.lease_lost_token();
-
-        owner_cancelled.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(1), lease_lost.cancelled())
-            .await
-            .expect("owner cancellation signals mutation lease loss");
-        mutation
-            .finish()
-            .await
-            .expect("test mutation finalizes after cancellation");
-    }
-
-    #[tokio::test]
-    async fn terminal_turn_revokes_only_its_mutating_background_process() {
-        let (_codex_home, repo, store, ledger, mutation) =
-            running_workspace_mutation(CancellationToken::new()).await;
-        let lease_lost = mutation.lease_lost_token();
-        ledger
-            .track_running_process(
-                42,
-                key("turn-owned-background.exe"),
-                RawOutputArtifact::unavailable("fixture"),
-                "owner-turn".to_string(),
-                Some(mutation),
-            )
-            .await;
-
-        ledger.cancel_mutations_for_turn("other-turn").await;
-        assert!(!lease_lost.is_cancelled());
-        let cancellation = {
-            let ledger = Arc::clone(&ledger);
-            tokio::spawn(async move {
-                ledger.cancel_mutations_for_turn("owner-turn").await;
-            })
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(1), lease_lost.cancelled())
-            .await
-            .expect("terminal owner turn signals process termination");
-        assert!(
-            !cancellation.is_finished(),
-            "turn cancellation must wait for process exit and mutation finalization"
-        );
-        assert!(ledger.mark_running_process_completed(42, -1).await);
-        tokio::time::timeout(std::time::Duration::from_secs(1), cancellation)
-            .await
-            .expect("turn cancellation finishes after process exit")
-            .expect("turn cancellation task succeeds");
-
-        let replacement_reservation = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            ledger.reserve_workspace_mutation(repo.path()),
-        )
-        .await
-        .expect("terminal completion releases the local mutation reservation");
-        let replacement = store
-            .begin_workspace_mutation(
-                repo.path(),
-                WorkspaceMutationRequest {
-                    root_session_id: "replacement-root".to_string(),
-                    actor_id: "root:replacement-root".to_string(),
-                    kind: WorkspaceActorKind::Root,
-                    attempt_id: None,
-                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-                    contracts: Vec::new(),
-                    expected_manifest: Vec::new(),
-                },
-            )
-            .await
-            .expect("terminal completion releases the persisted mutation lease");
-        store
-            .finish_workspace_mutation(repo.path(), replacement)
-            .await
-            .expect("replacement mutation finishes");
-        drop(replacement_reservation);
-    }
-
-    #[tokio::test]
-    async fn terminal_turn_mutation_cleanup_can_be_bounded() {
-        let (_codex_home, _repo, _store, ledger, mutation) =
-            running_workspace_mutation(CancellationToken::new()).await;
-        let lease_lost = mutation.lease_lost_token();
-        ledger
-            .track_running_process(
-                42,
-                key("turn-owned-background.exe"),
-                RawOutputArtifact::unavailable("fixture"),
-                "owner-turn".to_string(),
-                Some(mutation.clone()),
-            )
-            .await;
-        ledger.observe_repository_revision("owner-turn", 1).await;
-
-        assert!(
-            !ledger
-                .cancel_mutations_for_terminal_turn_with_timeout(
-                    "owner-turn",
-                    std::time::Duration::from_millis(1),
-                )
-                .await,
-            "terminal cleanup must return after its deadline even if process exit is never observed"
-        );
-        assert!(
-            lease_lost.is_cancelled(),
-            "bounded cleanup must still revoke the process mutation authority"
-        );
-        assert!(
-            !ledger
-                .state
-                .lock()
-                .await
-                .observed_turn_mutation_revisions
-                .contains_key("owner-turn"),
-            "terminal cleanup must forget the revision baseline even after its mutation wait times out"
-        );
-
-        mutation
-            .finish()
-            .await
-            .expect("test mutation remains finalizable after bounded cancellation");
-    }
-
-    #[tokio::test]
-    async fn dropped_workspace_mutation_guard_releases_lease_for_next_task() {
-        let codex_home = TempDir::new().expect("codex home tempdir");
-        let repo = TempDir::new().expect("repository tempdir");
-        let state =
-            StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
-                .await
-                .expect("state runtime initializes");
-        let store = Arc::new(
-            LocalAgentTaskStore::initialize(&state)
-                .await
-                .expect("task store initializes"),
-        );
-        let ledger = Arc::new(CommandExecutionLedger::default());
-        let reservation = ledger.reserve_workspace_mutation(repo.path()).await;
-        let lease = store
-            .begin_workspace_mutation(
-                repo.path(),
-                WorkspaceMutationRequest {
-                    root_session_id: "completed-review-root".to_string(),
-                    actor_id: "root:completed-review-root".to_string(),
-                    kind: WorkspaceActorKind::Root,
-                    attempt_id: None,
-                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-                    contracts: Vec::new(),
-                    expected_manifest: Vec::new(),
-                },
-            )
-            .await
-            .expect("completed review acquires mutation lease");
-        let trait_store: Arc<dyn AgentTaskStore> = store.clone();
-        drop(WorkspaceMutationGuard::new(
-            trait_store,
-            repo.path().to_path_buf(),
-            lease,
-            reservation,
-        ));
-
-        let _replacement_reservation = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            ledger.reserve_workspace_mutation(repo.path()),
-        )
-        .await
-        .expect("dropped review releases its local mutation reservation");
-        let replacement_request = WorkspaceMutationRequest {
-            root_session_id: "bug-fix-root".to_string(),
-            actor_id: "root:bug-fix-root".to_string(),
-            kind: WorkspaceActorKind::Root,
-            attempt_id: None,
-            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-            contracts: Vec::new(),
-            expected_manifest: Vec::new(),
-        };
-        let replacement = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            acquire_workspace_mutation_lease(
-                store.as_ref(),
-                repo.path(),
-                &replacement_request,
-                &CancellationToken::new(),
-            ),
-        )
-        .await
-        .expect("next task does not wait for the stale lease timeout")
-        .expect("next task acquires repository-wide mutation ownership");
-        store
-            .finish_workspace_mutation(repo.path(), replacement)
-            .await
-            .expect("replacement mutation finishes");
     }
 
     #[test]
@@ -2562,33 +1137,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_cancellation_keeps_repository_revision_for_same_turn_retry() {
-        let ledger = CommandExecutionLedger::default();
-
-        assert_eq!(
-            ledger.observe_repository_revision("retrying-turn", 1).await,
-            1
-        );
-        ledger.cancel_mutations_for_turn("retrying-turn").await;
-
-        assert_eq!(
-            ledger.observe_repository_revision("retrying-turn", 1).await,
-            1
-        );
-    }
-
-    #[tokio::test]
     async fn terminal_turn_cleanup_forgets_its_observed_repository_revision() {
         let ledger = CommandExecutionLedger::default();
 
         ledger.observe_repository_revision("finished-turn", 1).await;
         ledger.observe_repository_revision("active-turn", 2).await;
-        ledger
-            .cancel_mutations_for_terminal_turn_with_timeout(
-                "finished-turn",
-                std::time::Duration::from_millis(1),
-            )
-            .await;
+        ledger.finish_turn("finished-turn").await;
 
         let state = ledger.state.lock().await;
         assert!(
@@ -2609,13 +1163,7 @@ mod tests {
         let key = key("stored-process-failure.exe");
         ledger.begin_attempt(&key, false).await.expect("attempt");
         ledger
-            .track_running_process(
-                42,
-                key.clone(),
-                RawOutputArtifact::unavailable("fixture"),
-                "turn-1".to_string(),
-                None,
-            )
+            .track_running_process(42, key.clone(), RawOutputArtifact::unavailable("fixture"))
             .await;
 
         assert!(ledger.finish_running_process(42, Some(-1)).await);
@@ -2637,8 +1185,6 @@ mod tests {
                     process_id as i32,
                     key.clone(),
                     RawOutputArtifact::unavailable("fixture"),
-                    "turn-1".to_string(),
-                    None,
                 )
                 .await;
         }
@@ -2652,8 +1198,6 @@ mod tests {
                 64,
                 replacement_key.clone(),
                 RawOutputArtifact::unavailable("replacement fixture"),
-                "turn-1".to_string(),
-                None,
             )
             .await;
 
@@ -2688,45 +1232,5 @@ mod tests {
         );
         assert!(ledger.snapshot(&keys[0]).await.is_some());
         assert!(ledger.snapshot(&keys[1]).await.is_none());
-    }
-
-    #[test]
-    fn workspace_lease_diagnostics_separate_read_only_exact_and_repository_paths() {
-        let ledger = CommandExecutionLedger::default();
-        ledger.record_workspace_mutation_scope(&WorkspaceMutationScope::None, true);
-        ledger.record_workspace_mutation_scope(
-            &WorkspaceMutationScope::exact_paths(vec!["one.txt".to_string()]),
-            false,
-        );
-        ledger.record_workspace_mutation_scope(&WorkspaceMutationScope::Repository, false);
-
-        assert_eq!(
-            ledger
-                .workspace_lease_diagnostics
-                .logical_requests
-                .load(Ordering::Relaxed),
-            3
-        );
-        assert_eq!(
-            ledger
-                .workspace_lease_diagnostics
-                .skipped_read_only
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            ledger
-                .workspace_lease_diagnostics
-                .exact_path_leases
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            ledger
-                .workspace_lease_diagnostics
-                .repository_wide_leases
-                .load(Ordering::Relaxed),
-            1
-        );
     }
 }

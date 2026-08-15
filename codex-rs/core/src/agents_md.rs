@@ -779,6 +779,7 @@ impl LoadedAgentsMd {
     }
 
     /// Stable digest of the exact model-visible instruction text.
+    #[cfg(test)]
     pub(crate) fn semantic_digest(&self) -> [u8; 32] {
         Sha256::digest(self.text().as_bytes()).into()
     }
@@ -999,21 +1000,6 @@ impl LoadedAgentsMd {
                     .iter()
                     .filter_map(|entry| entry.provenance.path()),
             )
-    }
-
-    /// Returns the exact project instruction sources and content hashes that
-    /// were validated for this request's model-visible instruction state.
-    pub(crate) fn project_source_hashes(&self) -> Vec<(PathUri, String)> {
-        self.entries
-            .iter()
-            .filter_map(|entry| match &entry.provenance {
-                InstructionProvenance::Project { source_path, .. } => Some((
-                    source_path.clone(),
-                    format!("{:x}", Sha256::digest(entry.contents.as_bytes())),
-                )),
-                InstructionProvenance::Internal => None,
-            })
-            .collect()
     }
 
     fn has_multiple_project_environments(&self) -> bool {

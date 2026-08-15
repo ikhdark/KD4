@@ -164,7 +164,6 @@ pub struct TurnContext {
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
-    pub(crate) source_closure: crate::tools::handlers::source_closure::SharedSourceClosureState,
     pub(crate) terminal_error: Arc<Mutex<Option<ErrorEvent>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
@@ -176,39 +175,6 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
-    pub(crate) async fn update_source_owner_candidates(
-        &self,
-        input: &[codex_protocol::user_input::UserInput],
-    ) {
-        let Some(root) = self.environments.single_local_environment_cwd() else {
-            return;
-        };
-        let candidates = extract_source_candidates(root.as_path(), input);
-        if candidates.is_empty() {
-            return;
-        }
-        {
-            let mut state = self.source_closure.lock().await;
-            state.add_candidates(candidates.clone());
-        }
-        let repository_root = root.as_path().to_path_buf();
-        let manifest_path = repository_root.join("source_owners.toml");
-        let resolution = tokio::task::spawn_blocking(move || {
-            codex_file_search::task_locator::resolve_owner_candidates(
-                &repository_root,
-                &manifest_path,
-                &candidates,
-            )
-        })
-        .await;
-        if let Ok(resolution) = resolution {
-            self.source_closure
-                .lock()
-                .await
-                .apply_candidate_resolution(resolution);
-        }
-    }
-
     pub(crate) async fn update_validation_authorization(
         &self,
         input: &[codex_protocol::user_input::UserInput],
@@ -269,6 +235,13 @@ impl TurnContext {
         activation.root_task_epoch == self.sub_id
             && activation.provenance == tool_name.to_string()
             && state.capability_revisions.get(tool_name) == Some(&activation.capability_revision)
+    }
+
+    pub(crate) fn deferred_tool_activation_revision(&self) -> u64 {
+        self.deferred_tool_activations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revision
     }
 
     pub(crate) fn activated_deferred_tools(&self) -> HashSet<codex_tools::ToolName> {
@@ -466,7 +439,6 @@ impl TurnContext {
             extension_data: Arc::clone(&self.extension_data),
             turn_skills: self.turn_skills.clone(),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
-            source_closure: Arc::clone(&self.source_closure),
             terminal_error: Arc::clone(&self.terminal_error),
             server_model_warning_emitted: AtomicBool::new(
                 self.server_model_warning_emitted.load(Ordering::Relaxed),
@@ -762,7 +734,6 @@ impl Session {
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),
             turn_timing_state: Arc::new(TurnTimingState::default()),
-            source_closure: crate::tools::handlers::source_closure::SourceClosureState::shared(),
             terminal_error: Arc::new(Mutex::new(None)),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
@@ -1073,63 +1044,4 @@ impl Session {
         let state = self.state.lock().await;
         state.session_configuration.clone()
     }
-}
-
-fn extract_source_candidates(
-    root: &std::path::Path,
-    input: &[codex_protocol::user_input::UserInput],
-) -> Vec<String> {
-    use codex_protocol::user_input::UserInput;
-
-    let mut candidates = Vec::new();
-    for item in input {
-        match item {
-            UserInput::LocalPath { path, .. } => push_candidate(root, path, &mut candidates),
-            UserInput::Mention { path, .. } if !path.contains("://") => {
-                push_candidate(root, std::path::Path::new(path), &mut candidates);
-            }
-            UserInput::Text { text, .. } => {
-                for token in text.split_whitespace().take(512) {
-                    let token = token.trim_matches(|character: char| {
-                        matches!(
-                            character,
-                            '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':'
-                        )
-                    });
-                    if (token.contains('/') || token.contains('\\'))
-                        && std::path::Path::new(token).extension().is_some()
-                    {
-                        push_candidate(root, std::path::Path::new(token), &mut candidates);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates.truncate(64);
-    candidates
-}
-
-fn push_candidate(root: &std::path::Path, path: &std::path::Path, candidates: &mut Vec<String>) {
-    let relative = if path.is_absolute() {
-        let Ok(relative) = path.strip_prefix(root) else {
-            return;
-        };
-        relative
-    } else {
-        path
-    };
-    if relative
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return;
-    }
-    let absolute = root.join(relative);
-    if !absolute.exists() {
-        return;
-    }
-    candidates.push(relative.to_string_lossy().replace('\\', "/"));
 }

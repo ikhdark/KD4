@@ -100,7 +100,6 @@ pub use tool_executor::ToolExecutorFuture;
 pub use tool_executor::ToolExposure;
 pub use tool_output::CanonicalByteRange;
 pub use tool_output::CanonicalJsonPointer;
-pub use tool_output::CanonicalRetentionPolicy;
 pub use tool_output::CanonicalToolResult;
 pub use tool_output::CanonicalToolResultKind;
 pub use tool_output::CodeModeToolSearchStatus;

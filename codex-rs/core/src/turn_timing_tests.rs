@@ -25,8 +25,6 @@ use pretty_assertions::assert_eq;
 use super::ClockSample;
 use super::ContinuationCause;
 use super::InteractiveWaitKind;
-use super::PreEditReopenReason;
-use super::SourceDiscoveryTimingEvent;
 use super::TimeSample;
 use super::TurnClock;
 use super::TurnLocalPhase;
@@ -448,48 +446,6 @@ fn model_requests_record_dispatch_output_completion_and_continuation() {
 }
 
 #[test]
-fn post_discovery_usage_counts_result_cells_and_only_emits_a_ratio_with_usage() {
-    let (_clock, state) = timing();
-    state.mark_turn_started();
-    state.record_discovery_result_cell(25);
-    state.record_discovery_result_cell(15);
-    drop(state.begin_model_request_wait());
-    state.record_generation_token_usage(Some(&TokenUsage {
-        input_tokens: 200,
-        cached_input_tokens: 80,
-        output_tokens: 10,
-        reasoning_output_tokens: 4,
-        total_tokens: 210,
-    }));
-
-    let turn_timing = state.complete_snapshot().protocol_timing();
-    let observation = turn_timing.model_requests[0]
-        .post_discovery
-        .as_ref()
-        .expect("post-discovery observation");
-    assert_eq!(observation.newly_injected_discovery_result_tokens, 40);
-    assert_eq!(observation.discovery_result_cells, 2);
-    assert_eq!(observation.discovery_model_boundary_count, 1);
-    assert_eq!(observation.total_provider_input_tokens, 200);
-    assert_eq!(observation.cached_input_tokens, 80);
-    assert_eq!(observation.replay_amplification_micros, Some(5_000_000));
-
-    let (_clock, state) = timing();
-    state.mark_turn_started();
-    state.record_discovery_result_cell(40);
-    drop(state.begin_model_request_wait());
-    let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(
-        timing.model_requests[0]
-            .post_discovery
-            .as_ref()
-            .expect("post-discovery observation")
-            .replay_amplification_micros,
-        None,
-    );
-}
-
-#[test]
 fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     let (_clock, state) = timing();
     state.mark_turn_started();
@@ -667,11 +623,11 @@ fn continuation_receipts_aggregate_saturate_and_bound_distinct_groups() {
     for index in 0..64 {
         state.record_accepted_deterministic_continuation_receipts(&[
             TurnTimingDeterministicContinuationReceipt {
-                class: DeterministicContinuationClass::SourceCoverage,
+                class: DeterministicContinuationClass::ArtifactRange,
                 wire_identity: String::new(),
                 resource_identity_hash: format!("resource-{index}"),
                 state_revision: "revision".to_string(),
-                host_action: DeterministicContinuationHostAction::ReuseCoveredSpan,
+                host_action: DeterministicContinuationHostAction::DrainArtifactRanges,
                 action_bounds_hash: format!("bounds-{index}"),
                 suppressed_continuation_count: 1,
             },
@@ -860,130 +816,6 @@ fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
             Some(TurnTimingGenerationPurpose::ValidationInterpretation),
         ]
     );
-}
-
-#[test]
-fn source_discovery_operations_boundaries_and_section_cells_are_independent() {
-    let (_clock, state) = timing();
-    state.mark_turn_started();
-    state.record_source_discovery(SourceDiscoveryTimingEvent::Locator);
-    state.record_source_discovery(SourceDiscoveryTimingEvent::Bundle {
-        generation_micros: 17,
-        materialized: [1, 2, 3, 4, 5, 6, 7],
-        inline: [1, 1, 1, 1, 1, 1, 1],
-        avoided_singleton_reads: 3,
-    });
-    state.record_source_discovery(SourceDiscoveryTimingEvent::SearchAfterOwner);
-    state.record_source_discovery(SourceDiscoveryTimingEvent::Recovery);
-    state.record_source_discovery(SourceDiscoveryTimingEvent::Recovery);
-    state.record_source_discovery(SourceDiscoveryTimingEvent::DirectReadRequested);
-
-    let counters = state
-        .complete_snapshot()
-        .protocol_timing()
-        .counters
-        .source_discovery;
-    assert_eq!(counters.locator_operation_count, 1);
-    assert_eq!(counters.bundle_operation_count, 1);
-    assert_eq!(counters.search_operation_count, 1);
-    assert_eq!(counters.recovery_operation_count, 2);
-    assert_eq!(counters.read_operation_count, 1);
-    assert_eq!(counters.locator_to_discovery_boundary_count, 1);
-    assert_eq!(counters.discovery_to_discovery_boundary_count, 1);
-    assert_eq!(counters.recovery_to_recovery_boundary_count, 1);
-    assert_eq!(counters.searches_after_owner_count, 1);
-    assert_eq!(counters.materialized_sections.primary_implementation, 1);
-    assert_eq!(counters.materialized_sections.direct_callers, 2);
-    assert_eq!(counters.inline_sections.primary_implementation, 1);
-    assert_eq!(counters.avoided_singleton_read_count, 3);
-    assert_eq!(counters.bundle_generation_micros, 17);
-}
-
-#[test]
-fn pre_edit_convergence_records_fake_clock_milestones_and_bounded_counters() {
-    let (clock, state) = timing();
-    state.mark_turn_started();
-    state.activate_pre_edit_convergence();
-
-    let mut pending = None;
-    state.begin_model_generation(&mut pending, &SessionSource::Cli);
-    state.record_tool_call();
-    clock.set_ms(10);
-    state.record_pre_edit_owner_resolved();
-
-    state.record_tool_call();
-    clock.set_ms(20);
-    state.record_pre_edit_implementation_ready();
-    state.record_pre_edit_material_evidence();
-    state.record_source_discovery(SourceDiscoveryTimingEvent::PostClosureSearch {
-        has_question: false,
-    });
-    state.record_pre_edit_reopen(PreEditReopenReason::IncompleteEvidence);
-
-    let mut pending = Some(ContinuationCause::ToolResult);
-    state.begin_model_generation(&mut pending, &SessionSource::Cli);
-    state.record_tool_call();
-    clock.set_ms(30);
-    state.record_pre_edit_first_accepted_mutation();
-    clock.set_ms(35);
-    state.record_pre_edit_first_successful_mutation();
-    clock.set_ms(50);
-    state.record_pre_edit_first_successful_mutation();
-
-    let convergence = state
-        .complete_snapshot()
-        .protocol_timing()
-        .pre_edit_convergence
-        .expect("activated convergence timing");
-    assert_eq!(convergence.owner_resolved_ms, Some(10));
-    assert_eq!(convergence.accepted_to_owner_resolved_ms, Some(10));
-    assert_eq!(convergence.owner_resolved_generation_count, Some(1));
-    assert_eq!(convergence.owner_resolved_tool_call_count, Some(1));
-    assert_eq!(convergence.implementation_ready_ms, Some(20));
-    assert_eq!(convergence.implementation_ready_generation_count, Some(1));
-    assert_eq!(convergence.implementation_ready_tool_call_count, Some(2));
-    assert_eq!(convergence.owner_resolved_to_bundle_ready_ms, Some(10));
-    assert_eq!(convergence.first_accepted_mutation_ms, Some(30));
-    assert_eq!(
-        convergence.bundle_ready_to_first_accepted_mutation_ms,
-        Some(10)
-    );
-    assert!(!convergence.mutation_before_ready);
-    assert_eq!(convergence.first_successful_mutation_ms, Some(35));
-    assert_eq!(
-        convergence.first_successful_mutation_generation_count,
-        Some(2)
-    );
-    assert_eq!(
-        convergence.first_successful_mutation_tool_call_count,
-        Some(3)
-    );
-    assert_eq!(convergence.material_evidence_operations, 1);
-    assert_eq!(convergence.broad_discovery_after_ready, 1);
-    assert_eq!(convergence.readiness_reopen_count, 1);
-    assert_eq!(convergence.reopen_reason_counts.incomplete_evidence, 1);
-}
-
-#[test]
-fn accepted_mutation_before_bundle_ready_is_recorded_separately() {
-    let (clock, state) = timing();
-    state.mark_turn_started();
-    state.activate_pre_edit_convergence();
-    clock.set_ms(7);
-    state.record_pre_edit_first_accepted_mutation();
-    clock.set_ms(12);
-    state.record_pre_edit_first_accepted_mutation();
-    clock.set_ms(15);
-    state.record_pre_edit_implementation_ready();
-
-    let convergence = state
-        .complete_snapshot()
-        .protocol_timing()
-        .pre_edit_convergence
-        .expect("activated convergence timing");
-    assert_eq!(convergence.first_accepted_mutation_ms, Some(7));
-    assert!(convergence.mutation_before_ready);
-    assert_eq!(convergence.bundle_ready_to_first_accepted_mutation_ms, None);
 }
 
 #[test]
@@ -1277,13 +1109,11 @@ fn completion_snapshot_is_immutable() {
 }
 
 #[test]
-fn parallel_latency_counters_are_additive() {
+fn wait_and_tool_output_counters_are_additive() {
     let (_clock, state) = timing();
 
     state.record_wait_only_generation();
     state.record_internally_drained_waits(7);
-    state.record_repeated_discovery_call();
-    state.record_discovery_after_owner_resolution();
     state.record_no_progress_directive();
     state.record_proven_loop_activation();
     state.record_tool_output_projection(100);
@@ -1292,18 +1122,12 @@ fn parallel_latency_counters_are_additive() {
     state.record_tool_output_projection_facts(500, 125, 200, 50, false, false, 1);
     state.record_tool_output_artifact_reread();
     state.record_tool_output_recovery(2);
-    state.record_search_index(true);
-    state.record_search_index(false);
-    state.record_strict_subset_source_reread();
     state.record_truncation_induced_continuation();
 
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.wait_only_generation_count, 1);
     assert_eq!(counters.internally_drained_wait_count, 7);
     assert_eq!(counters.suppressed_deterministic_continuation_count, 0);
-    assert_eq!(counters.suppressed_repeated_dispatch_count, 0);
-    assert_eq!(counters.repeated_discovery_call_count, 1);
-    assert_eq!(counters.discovery_after_owner_resolution_count, 1);
     assert_eq!(counters.no_progress_directive_count, 1);
     assert_eq!(counters.proven_loop_activation_count, 1);
     assert_eq!(counters.tool_output_truncation_count, 2);
@@ -1319,9 +1143,6 @@ fn parallel_latency_counters_are_additive() {
     assert_eq!(counters.tool_output_recovery_call_count, 1);
     assert_eq!(counters.tool_output_recovery_retruncation_count, 2);
     assert_eq!(counters.tool_output_recursive_spill_count, 0);
-    assert_eq!(counters.strict_subset_source_reread_count, 1);
-    assert_eq!(counters.complete_search_index_count, 1);
-    assert_eq!(counters.incomplete_search_index_count, 1);
     assert_eq!(counters.truncation_induced_continuation_count, 1);
 }
 

@@ -179,7 +179,6 @@ impl TurnCodexErrorFact {
 #[serde(rename_all = "snake_case")]
 pub enum CodexErrKind {
     TurnAborted,
-    SessionBudgetExceeded,
     Stream,
     ContextWindowExceeded,
     ThreadNotFound,
@@ -236,7 +235,6 @@ impl From<&CodexErr> for CodexErrKind {
     fn from(error: &CodexErr) -> Self {
         match error {
             CodexErr::TurnAborted => CodexErrKind::TurnAborted,
-            CodexErr::SessionBudgetExceeded => CodexErrKind::SessionBudgetExceeded,
             CodexErr::Stream(..) => CodexErrKind::Stream,
             CodexErr::ContextWindowExceeded => CodexErrKind::ContextWindowExceeded,
             CodexErr::ThreadNotFound(_) => CodexErrKind::ThreadNotFound,

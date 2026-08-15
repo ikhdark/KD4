@@ -100,8 +100,8 @@ async fn handle_spawn_agent(
     let typed_role = if args.assignment.is_some() {
         parse_typed_role(args.agent_type.as_deref())?
     } else {
-        // The legacy message shape remains accepted, but it is admitted as a conservative
-        // repository-scoped worker claim so it cannot bypass durable identity/overlap checks.
+        // The legacy message shape remains accepted and receives a durable repository-scoped
+        // diagnostic claim so its identity and overlap remain visible without blocking work.
         AgentRole::Worker
     };
     let fork_mode = args.fork_mode(
@@ -204,7 +204,11 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), role_locks)?;
+    let runtime_role_locks = AgentRoleLocks {
+        permissions: typed_role == AgentRole::Reviewer && role_locks.permissions,
+        ..role_locks
+    };
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), runtime_role_locks)?;
 
     let spawn_source = thread_spawn_source(
         session.thread_id,
@@ -713,7 +717,6 @@ fn emit_admission_overlap_metrics(
 }
 
 fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: &StoreError) {
-    const MAX_RECORDED_OVERLAP_COUNT: i64 = 1_024;
     let (reason, overlap_kind, overlap_count) = match error {
         StoreError::AdmissionRejected { reason } => match reason {
             AdmissionRejectionReason::DuplicateExplorerInvestigation => (
@@ -721,34 +724,10 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
                 Some("duplicated_primary_investigation"),
                 1,
             ),
-            AdmissionRejectionReason::CorrectnessSensitiveReadConflict => (
-                "correctness_sensitive_read_conflict",
-                Some("conflicting_write_read"),
-                1,
-            ),
-            AdmissionRejectionReason::ActiveValidationConflict => (
-                "active_validation_conflict",
-                Some("conflicting_write_read"),
-                1,
-            ),
             AdmissionRejectionReason::IsolatedIntegratorUnavailable => {
                 ("isolated_integrator_unavailable", None, 0)
             }
         },
-        StoreError::WriteClaimConflict { conflicts } => (
-            "conflicting_write_write",
-            Some("conflicting_write_write"),
-            i64::try_from(conflicts.len())
-                .unwrap_or(MAX_RECORDED_OVERLAP_COUNT)
-                .clamp(1, MAX_RECORDED_OVERLAP_COUNT),
-        ),
-        StoreError::WorkspaceClaimConflict { details } => (
-            "conflicting_write_read",
-            Some("conflicting_write_read"),
-            i64::try_from(details.len())
-                .unwrap_or(MAX_RECORDED_OVERLAP_COUNT)
-                .clamp(1, MAX_RECORDED_OVERLAP_COUNT),
-        ),
         _ => ("other", None, 0),
     };
     session_telemetry.counter(

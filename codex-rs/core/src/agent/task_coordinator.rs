@@ -166,9 +166,7 @@ impl AgentTaskCoordinator {
                 .get_or_try_init(|| async move {
                     StateRuntime::init(sqlite_home, default_provider)
                         .await
-                        .map_err(|error| {
-                            StoreError::WorkspaceStateInitialization(error.to_string())
-                        })
+                        .map_err(|error| StoreError::Io(std::io::Error::other(error.to_string())))
                 })
                 .await?
                 .clone(),
@@ -695,7 +693,11 @@ impl AgentTaskCoordinator {
             if binding_no_longer_needs_receipt(store.as_ref(), &binding).await? {
                 return Ok(None);
             }
-            return Err(error);
+            tracing::warn!(
+                %error,
+                attempt_id = %binding.attempt_id,
+                "typed mutation evidence finalization was unavailable; sealing the missing receipt anyway"
+            );
         }
         let receipt = ReceiptDraft {
             status: AgentStatusClaim::NeedsMain,

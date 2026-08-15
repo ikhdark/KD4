@@ -31,14 +31,9 @@ use codex_protocol::protocol::TurnTimingGenerationReasonCounts;
 use codex_protocol::protocol::TurnTimingLocal;
 use codex_protocol::protocol::TurnTimingMilestones;
 use codex_protocol::protocol::TurnTimingModelRequest;
-use codex_protocol::protocol::TurnTimingPostDiscoveryRequest;
-use codex_protocol::protocol::TurnTimingPreEditConvergence;
 use codex_protocol::protocol::TurnTimingPreFirstModelOutput;
 use codex_protocol::protocol::TurnTimingProgressKind;
 use codex_protocol::protocol::TurnTimingProviderTokenUsage;
-use codex_protocol::protocol::TurnTimingReadinessReopenReasonCounts;
-use codex_protocol::protocol::TurnTimingSourceDiscoveryCounters;
-use codex_protocol::protocol::TurnTimingSourceSectionCategoryCounts;
 use codex_protocol::protocol::TurnTimingTerminalization;
 use codex_protocol::protocol::TurnTimingUnions;
 
@@ -59,15 +54,6 @@ pub(crate) enum ContinuationCause {
     StopHook,
     CompletionReviewRepair,
     InvalidImageRecovery,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PreEditReopenReason {
-    SourceRevision,
-    ContradictoryEvidence,
-    IncompleteEvidence,
-    NewAmbiguity,
-    UserSteering,
 }
 
 pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEvent) {
@@ -308,57 +294,6 @@ impl TurnTimingSnapshot {
                         &mut saturation_count,
                     ),
                 });
-        let pre_edit_convergence = profile.pre_edit_convergence.as_ref().map(|timing| {
-            let mut convert = |value: Option<PreEditMilestoneSnapshot>| {
-                value.map(|value| {
-                    (
-                        public_ms(value.at_ns, &mut saturation_count),
-                        value.generation_count,
-                        value.tool_call_count,
-                    )
-                })
-            };
-            let owner = convert(timing.owner_resolved);
-            let ready = convert(timing.implementation_ready);
-            let accepted_mutation = convert(timing.first_accepted_mutation);
-            let mutation = convert(timing.first_successful_mutation);
-            TurnTimingPreEditConvergence {
-                accepted_to_owner_resolved_ms: owner.map(|value| value.0),
-                owner_resolved_ms: owner.map(|value| value.0),
-                owner_resolved_generation_count: owner.map(|value| value.1),
-                owner_resolved_tool_call_count: owner.map(|value| value.2),
-                owner_resolved_to_bundle_ready_ms: owner
-                    .zip(ready)
-                    .map(|(owner, ready)| ready.0.saturating_sub(owner.0)),
-                implementation_ready_ms: ready.map(|value| value.0),
-                implementation_ready_generation_count: ready.map(|value| value.1),
-                implementation_ready_tool_call_count: ready.map(|value| value.2),
-                first_accepted_mutation_ms: accepted_mutation.map(|value| value.0),
-                first_accepted_mutation_generation_count: accepted_mutation.map(|value| value.1),
-                first_accepted_mutation_tool_call_count: accepted_mutation.map(|value| value.2),
-                bundle_ready_to_first_accepted_mutation_ms: if timing.mutation_before_ready {
-                    None
-                } else {
-                    ready
-                        .zip(accepted_mutation)
-                        .map(|(ready, mutation)| mutation.0.saturating_sub(ready.0))
-                },
-                mutation_before_ready: timing.mutation_before_ready,
-                first_successful_mutation_ms: mutation.map(|value| value.0),
-                first_successful_mutation_generation_count: mutation.map(|value| value.1),
-                first_successful_mutation_tool_call_count: mutation.map(|value| value.2),
-                material_evidence_operations: timing.material_evidence_operations,
-                broad_discovery_after_ready: timing.broad_discovery_after_ready,
-                readiness_reopen_count: timing.readiness_reopen_count,
-                reopen_reason_counts: TurnTimingReadinessReopenReasonCounts {
-                    source_revision: timing.reopen_reason_counts.source_revision,
-                    contradictory_evidence: timing.reopen_reason_counts.contradictory_evidence,
-                    incomplete_evidence: timing.reopen_reason_counts.incomplete_evidence,
-                    new_ambiguity: timing.reopen_reason_counts.new_ambiguity,
-                    user_steering: timing.reopen_reason_counts.user_steering,
-                },
-            }
-        });
         let model_requests = profile
             .model_requests
             .iter()
@@ -381,7 +316,6 @@ impl TurnTimingSnapshot {
                 output_tokens: request.output_tokens,
                 reasoning_output_tokens: request.reasoning_output_tokens,
                 token_usage: request.token_usage.clone(),
-                post_discovery: request.post_discovery.clone(),
                 dispatch_ms: request
                     .dispatch_ns
                     .map(|value| public_ms(value, &mut saturation_count)),
@@ -442,12 +376,6 @@ impl TurnTimingSnapshot {
             mcp_elicitation_wait_count: profile.counters.mcp_elicitation_wait_count,
             wait_only_generation_count: profile.counters.wait_only_generation_count,
             internally_drained_wait_count: profile.counters.internally_drained_wait_count,
-            suppressed_repeated_dispatch_count: profile.counters.suppressed_repeated_dispatch_count,
-            repeated_discovery_call_count: profile.counters.repeated_discovery_call_count,
-            discovery_after_owner_resolution_count: profile
-                .counters
-                .discovery_after_owner_resolution_count,
-            source_discovery: profile.counters.source_discovery.clone(),
             no_progress_directive_count: profile.counters.no_progress_directive_count,
             proven_loop_activation_count: profile.counters.proven_loop_activation_count,
             tool_output_truncation_count: profile.counters.tool_output_truncation_count,
@@ -469,9 +397,6 @@ impl TurnTimingSnapshot {
                 .counters
                 .tool_output_recovery_retruncation_count,
             tool_output_recursive_spill_count: profile.counters.tool_output_recursive_spill_count,
-            strict_subset_source_reread_count: profile.counters.strict_subset_source_reread_count,
-            complete_search_index_count: profile.counters.complete_search_index_count,
-            incomplete_search_index_count: profile.counters.incomplete_search_index_count,
             attributable_recovery_generation_count: profile
                 .counters
                 .attributable_recovery_generation_count,
@@ -507,7 +432,6 @@ impl TurnTimingSnapshot {
             deterministic_continuation_receipt_overflow: profile
                 .deterministic_continuation_receipt_overflow,
             pre_first_model_output,
-            pre_edit_convergence,
         }
     }
 }
@@ -531,7 +455,6 @@ pub(crate) struct TurnTimingProfile {
     pub(crate) deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
     pub(crate) deterministic_continuation_receipt_overflow: u32,
     pub(crate) pre_first_model_output: Option<PreFirstModelOutputTiming>,
-    pub(crate) pre_edit_convergence: Option<PreEditConvergenceTiming>,
     pub(crate) terminalization: TurnTimingTerminalization,
 }
 
@@ -551,7 +474,6 @@ pub(crate) struct ModelRequestTiming {
     output_tokens: u64,
     reasoning_output_tokens: u64,
     token_usage: Option<TurnTimingProviderTokenUsage>,
-    post_discovery: Option<TurnTimingPostDiscoveryRequest>,
     dispatch_ns: Option<u128>,
     first_model_output_ns: Option<u128>,
     completed_ns: Option<u128>,
@@ -571,35 +493,6 @@ pub(crate) struct PreFirstModelOutputTiming {
     request_transformation_ns: u128,
     serialization_ns: u128,
     transport_readiness_ns: u128,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PreEditMilestoneSnapshot {
-    at_ns: u128,
-    generation_count: u32,
-    tool_call_count: u32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PreEditConvergenceTiming {
-    owner_resolved: Option<PreEditMilestoneSnapshot>,
-    implementation_ready: Option<PreEditMilestoneSnapshot>,
-    first_accepted_mutation: Option<PreEditMilestoneSnapshot>,
-    first_successful_mutation: Option<PreEditMilestoneSnapshot>,
-    mutation_before_ready: bool,
-    material_evidence_operations: u32,
-    broad_discovery_after_ready: u32,
-    readiness_reopen_count: u32,
-    reopen_reason_counts: PreEditReopenReasonCounts,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct PreEditReopenReasonCounts {
-    source_revision: u32,
-    contradictory_evidence: u32,
-    incomplete_evidence: u32,
-    new_ambiguity: u32,
-    user_steering: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -715,10 +608,6 @@ pub(crate) struct TimingCounters {
     pub(crate) mcp_elicitation_wait_count: u32,
     pub(crate) wait_only_generation_count: u32,
     pub(crate) internally_drained_wait_count: u32,
-    pub(crate) suppressed_repeated_dispatch_count: u32,
-    pub(crate) repeated_discovery_call_count: u32,
-    pub(crate) discovery_after_owner_resolution_count: u32,
-    pub(crate) source_discovery: TurnTimingSourceDiscoveryCounters,
     pub(crate) no_progress_directive_count: u32,
     pub(crate) proven_loop_activation_count: u32,
     pub(crate) tool_output_truncation_count: u32,
@@ -734,54 +623,11 @@ pub(crate) struct TimingCounters {
     pub(crate) tool_output_recovery_call_count: u32,
     pub(crate) tool_output_recovery_retruncation_count: u32,
     pub(crate) tool_output_recursive_spill_count: u32,
-    pub(crate) strict_subset_source_reread_count: u32,
-    pub(crate) complete_search_index_count: u32,
-    pub(crate) incomplete_search_index_count: u32,
     pub(crate) attributable_recovery_generation_count: u32,
     pub(crate) truncation_induced_continuation_count: u32,
     pub(crate) invalid_transition_count: u32,
     pub(crate) clock_regression_count: u32,
     pub(crate) saturation_count: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum SourceDiscoveryTimingEvent {
-    Locator,
-    Bundle {
-        generation_micros: u64,
-        materialized: [u32; 7],
-        inline: [u32; 7],
-        avoided_singleton_reads: u32,
-    },
-    Recovery,
-    OwnerEstablished,
-    ClosureEstablished,
-    SearchBeforeOwner,
-    SearchAfterOwner,
-    PostClosureSearch {
-        has_question: bool,
-    },
-    SearchReused {
-        capped_zero: bool,
-    },
-    DuplicateSearchSuppressed,
-    DirectReadRequested,
-    DirectReadReused,
-    OverlapTrimmedRead,
-    NewRead {
-        lines: u64,
-        bytes: u64,
-    },
-    GitObservationReused,
-    GitObservationRefreshed,
-    CappedZeroResult,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SourceDiscoveryOperationKind {
-    Locator,
-    Discovery,
-    Recovery,
 }
 
 #[derive(Debug, Default)]
@@ -807,15 +653,11 @@ struct TurnTimingStateInner {
     client_critical_phases: ClientCriticalPhaseTiming,
     dispatch_ready_snapshot: Option<(u128, u128, ClientCriticalPhaseTiming)>,
     pre_first_model_output: Option<PreFirstModelOutputTiming>,
-    pre_edit_convergence: Option<PreEditConvergenceTiming>,
     terminalization: TurnTimingTerminalization,
     tool_output_projection_pending_continuation: bool,
     deterministic_continuation_receipts:
         BTreeMap<String, TurnTimingDeterministicContinuationReceipt>,
     deterministic_continuation_receipt_overflow: u32,
-    pending_discovery_result_tokens: u64,
-    pending_discovery_result_cells: u32,
-    last_source_discovery_operation: Option<SourceDiscoveryOperationKind>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -957,16 +799,6 @@ pub(crate) struct TurnTimingGuard {
     timing: Arc<TurnTimingState>,
     kind: GuardKind,
     active: bool,
-}
-
-fn add_source_category_counts(counts: &mut TurnTimingSourceSectionCategoryCounts, delta: [u32; 7]) {
-    counts.primary_implementation = counts.primary_implementation.saturating_add(delta[0]);
-    counts.direct_callers = counts.direct_callers.saturating_add(delta[1]);
-    counts.focused_tests = counts.focused_tests.saturating_add(delta[2]);
-    counts.contracts = counts.contracts.saturating_add(delta[3]);
-    counts.generated_relationships = counts.generated_relationships.saturating_add(delta[4]);
-    counts.other_source_context = counts.other_source_context.saturating_add(delta[5]);
-    counts.core_state = counts.core_state.saturating_add(delta[6]);
 }
 
 impl TurnTimingState {
@@ -1156,106 +988,6 @@ impl TurnTimingState {
             state.counters.planning_failure_count.saturating_add(1);
     }
 
-    pub(crate) fn activate_pre_edit_convergence(&self) {
-        self.state().pre_edit_convergence.get_or_insert_default();
-    }
-
-    pub(crate) fn record_pre_edit_owner_resolved(&self) {
-        self.record_pre_edit_milestone(|timing| &mut timing.owner_resolved);
-    }
-
-    pub(crate) fn record_pre_edit_implementation_ready(&self) {
-        self.record_pre_edit_milestone(|timing| &mut timing.implementation_ready);
-    }
-
-    pub(crate) fn record_pre_edit_first_accepted_mutation(&self) {
-        let sample = self.clock.sample();
-        let mut state = self.state();
-        state.advance(sample.time.monotonic_ns);
-        let at_ns = state
-            .started_sample
-            .map(|started| {
-                sample
-                    .time
-                    .monotonic_ns
-                    .saturating_sub(started.time.monotonic_ns)
-            })
-            .unwrap_or_default();
-        let generation_count = state.counters.logical_generation_count;
-        let tool_call_count = state.counters.tool_call_count;
-        let Some(timing) = state.pre_edit_convergence.as_mut() else {
-            return;
-        };
-        if timing.first_accepted_mutation.is_some() {
-            return;
-        }
-        timing.mutation_before_ready = timing.implementation_ready.is_none();
-        timing.first_accepted_mutation = Some(PreEditMilestoneSnapshot {
-            at_ns,
-            generation_count,
-            tool_call_count,
-        });
-    }
-
-    pub(crate) fn record_pre_edit_first_successful_mutation(&self) {
-        self.record_pre_edit_milestone(|timing| &mut timing.first_successful_mutation);
-    }
-
-    fn record_pre_edit_milestone(
-        &self,
-        select: impl FnOnce(&mut PreEditConvergenceTiming) -> &mut Option<PreEditMilestoneSnapshot>,
-    ) {
-        let sample = self.clock.sample();
-        let mut state = self.state();
-        state.advance(sample.time.monotonic_ns);
-        let at_ns = state
-            .started_sample
-            .map(|started| {
-                sample
-                    .time
-                    .monotonic_ns
-                    .saturating_sub(started.time.monotonic_ns)
-            })
-            .unwrap_or_default();
-        let snapshot = PreEditMilestoneSnapshot {
-            at_ns,
-            generation_count: state.counters.logical_generation_count,
-            tool_call_count: state.counters.tool_call_count,
-        };
-        let timing = state.pre_edit_convergence.get_or_insert_default();
-        select(timing).get_or_insert(snapshot);
-    }
-
-    pub(crate) fn record_pre_edit_material_evidence(&self) {
-        let mut state = self.state();
-        let timing = state.pre_edit_convergence.get_or_insert_default();
-        timing.material_evidence_operations = timing.material_evidence_operations.saturating_add(1);
-    }
-
-    pub(crate) fn record_pre_edit_broad_discovery_after_ready(&self) {
-        let mut state = self.state();
-        let timing = state.pre_edit_convergence.get_or_insert_default();
-        timing.broad_discovery_after_ready = timing.broad_discovery_after_ready.saturating_add(1);
-    }
-
-    pub(crate) fn record_pre_edit_reopen(&self, reason: PreEditReopenReason) {
-        let mut state = self.state();
-        let timing = state.pre_edit_convergence.get_or_insert_default();
-        timing.readiness_reopen_count = timing.readiness_reopen_count.saturating_add(1);
-        let target = match reason {
-            PreEditReopenReason::SourceRevision => &mut timing.reopen_reason_counts.source_revision,
-            PreEditReopenReason::ContradictoryEvidence => {
-                &mut timing.reopen_reason_counts.contradictory_evidence
-            }
-            PreEditReopenReason::IncompleteEvidence => {
-                &mut timing.reopen_reason_counts.incomplete_evidence
-            }
-            PreEditReopenReason::NewAmbiguity => &mut timing.reopen_reason_counts.new_ambiguity,
-            PreEditReopenReason::UserSteering => &mut timing.reopen_reason_counts.user_steering,
-        };
-        *target = target.saturating_add(1);
-    }
-
     pub(crate) fn record_wait_only_generation(&self) {
         let mut state = self.state();
         state.counters.wait_only_generation_count =
@@ -1320,30 +1052,7 @@ impl TurnTimingState {
                 reasoning_tokens,
                 total_tokens: u64::try_from(usage.total_tokens.max(0)).unwrap_or(u64::MAX),
             });
-            if let Some(observation) = request.post_discovery.as_mut() {
-                observation.total_provider_input_tokens =
-                    u64::try_from(usage.input_tokens.max(0)).unwrap_or(u64::MAX);
-                observation.cached_input_tokens =
-                    u64::try_from(usage.cached_input_tokens.max(0)).unwrap_or(u64::MAX);
-                observation.replay_amplification_micros =
-                    (observation.newly_injected_discovery_result_tokens > 0).then(|| {
-                        observation
-                            .total_provider_input_tokens
-                            .saturating_mul(1_000_000)
-                            .checked_div(observation.newly_injected_discovery_result_tokens)
-                            .unwrap_or(u64::MAX)
-                    });
-            }
         }
-    }
-
-    pub(crate) fn record_discovery_result_cell(&self, injected_tokens: u64) {
-        let mut state = self.state();
-        state.pending_discovery_result_tokens = state
-            .pending_discovery_result_tokens
-            .saturating_add(injected_tokens);
-        state.pending_discovery_result_cells =
-            state.pending_discovery_result_cells.saturating_add(1);
     }
 
     pub(crate) fn record_accepted_deterministic_continuation_receipts(
@@ -1383,186 +1092,6 @@ impl TurnTimingState {
             state
                 .deterministic_continuation_receipts
                 .insert(identity, receipt.clone());
-        }
-    }
-
-    pub(crate) fn record_repeated_discovery_call(&self) {
-        let mut state = self.state();
-        state.counters.repeated_discovery_call_count = state
-            .counters
-            .repeated_discovery_call_count
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_suppressed_repeated_dispatch(&self) {
-        let mut state = self.state();
-        state.counters.suppressed_repeated_dispatch_count = state
-            .counters
-            .suppressed_repeated_dispatch_count
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_discovery_after_owner_resolution(&self) {
-        let mut state = self.state();
-        state.counters.discovery_after_owner_resolution_count = state
-            .counters
-            .discovery_after_owner_resolution_count
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_source_discovery(&self, event: SourceDiscoveryTimingEvent) {
-        let mut state = self.state();
-        if matches!(event, SourceDiscoveryTimingEvent::PostClosureSearch { .. })
-            && state.pre_edit_convergence.as_ref().is_some_and(|timing| {
-                timing.implementation_ready.is_some() && timing.first_accepted_mutation.is_none()
-            })
-        {
-            let timing = state.pre_edit_convergence.get_or_insert_default();
-            timing.broad_discovery_after_ready =
-                timing.broad_discovery_after_ready.saturating_add(1);
-        }
-        let operation = match event {
-            SourceDiscoveryTimingEvent::Locator => Some(SourceDiscoveryOperationKind::Locator),
-            SourceDiscoveryTimingEvent::Bundle { .. }
-            | SourceDiscoveryTimingEvent::SearchBeforeOwner
-            | SourceDiscoveryTimingEvent::SearchAfterOwner
-            | SourceDiscoveryTimingEvent::DirectReadRequested => {
-                Some(SourceDiscoveryOperationKind::Discovery)
-            }
-            SourceDiscoveryTimingEvent::Recovery => Some(SourceDiscoveryOperationKind::Recovery),
-            _ => None,
-        };
-        let boundary =
-            operation.map(|operation| (state.last_source_discovery_operation, operation));
-        if let Some(operation) = operation {
-            state.last_source_discovery_operation = Some(operation);
-        }
-        let counters = &mut state.counters.source_discovery;
-        if let Some((previous, operation)) = boundary {
-            match (previous, operation) {
-                (
-                    Some(SourceDiscoveryOperationKind::Locator),
-                    SourceDiscoveryOperationKind::Discovery,
-                ) => {
-                    counters.locator_to_discovery_boundary_count = counters
-                        .locator_to_discovery_boundary_count
-                        .saturating_add(1);
-                }
-                (
-                    Some(SourceDiscoveryOperationKind::Discovery),
-                    SourceDiscoveryOperationKind::Discovery,
-                ) => {
-                    counters.discovery_to_discovery_boundary_count = counters
-                        .discovery_to_discovery_boundary_count
-                        .saturating_add(1);
-                }
-                (
-                    Some(SourceDiscoveryOperationKind::Recovery),
-                    SourceDiscoveryOperationKind::Recovery,
-                ) => {
-                    counters.recovery_to_recovery_boundary_count = counters
-                        .recovery_to_recovery_boundary_count
-                        .saturating_add(1);
-                }
-                _ => {}
-            }
-        }
-        match event {
-            SourceDiscoveryTimingEvent::Locator => {
-                counters.locator_operation_count =
-                    counters.locator_operation_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::Bundle {
-                generation_micros,
-                materialized,
-                inline,
-                avoided_singleton_reads,
-            } => {
-                counters.bundle_operation_count = counters.bundle_operation_count.saturating_add(1);
-                counters.bundle_generation_micros = counters
-                    .bundle_generation_micros
-                    .saturating_add(generation_micros);
-                counters.avoided_singleton_read_count = counters
-                    .avoided_singleton_read_count
-                    .saturating_add(avoided_singleton_reads);
-                add_source_category_counts(&mut counters.materialized_sections, materialized);
-                add_source_category_counts(&mut counters.inline_sections, inline);
-            }
-            SourceDiscoveryTimingEvent::Recovery => {
-                counters.recovery_operation_count =
-                    counters.recovery_operation_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::OwnerEstablished => {
-                counters.owner_established_count =
-                    counters.owner_established_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::ClosureEstablished => {
-                counters.closure_established_count =
-                    counters.closure_established_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::SearchBeforeOwner => {
-                counters.search_operation_count = counters.search_operation_count.saturating_add(1);
-                counters.searches_before_owner_count =
-                    counters.searches_before_owner_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::SearchAfterOwner => {
-                counters.search_operation_count = counters.search_operation_count.saturating_add(1);
-                counters.searches_after_owner_count =
-                    counters.searches_after_owner_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::PostClosureSearch { has_question } => {
-                counters.post_closure_search_count =
-                    counters.post_closure_search_count.saturating_add(1);
-                if has_question {
-                    counters.post_closure_search_with_question_count = counters
-                        .post_closure_search_with_question_count
-                        .saturating_add(1);
-                }
-            }
-            SourceDiscoveryTimingEvent::SearchReused { capped_zero } => {
-                counters.exact_search_reused_count =
-                    counters.exact_search_reused_count.saturating_add(1);
-                if capped_zero {
-                    counters.duplicate_capped_retry_prevented_count = counters
-                        .duplicate_capped_retry_prevented_count
-                        .saturating_add(1);
-                }
-            }
-            SourceDiscoveryTimingEvent::DuplicateSearchSuppressed => {
-                counters.duplicate_search_suppressed_count =
-                    counters.duplicate_search_suppressed_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::DirectReadRequested => {
-                counters.read_operation_count = counters.read_operation_count.saturating_add(1);
-                counters.direct_read_requested_count =
-                    counters.direct_read_requested_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::DirectReadReused => {
-                counters.direct_read_reused_count =
-                    counters.direct_read_reused_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::OverlapTrimmedRead => {
-                counters.overlap_trimmed_read_count =
-                    counters.overlap_trimmed_read_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::NewRead { lines, bytes } => {
-                counters.new_source_lines_read =
-                    counters.new_source_lines_read.saturating_add(lines);
-                counters.new_source_bytes_read =
-                    counters.new_source_bytes_read.saturating_add(bytes);
-            }
-            SourceDiscoveryTimingEvent::GitObservationReused => {
-                counters.git_observations_reused_count =
-                    counters.git_observations_reused_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::GitObservationRefreshed => {
-                counters.git_observations_refreshed_count =
-                    counters.git_observations_refreshed_count.saturating_add(1);
-            }
-            SourceDiscoveryTimingEvent::CappedZeroResult => {
-                counters.capped_zero_result_count =
-                    counters.capped_zero_result_count.saturating_add(1);
-            }
         }
     }
 
@@ -1713,27 +1242,6 @@ impl TurnTimingState {
         timing.diff_reuse_count = timing.diff_reuse_count.saturating_add(diff_reuse_count);
     }
 
-    pub(crate) fn record_search_index(&self, complete: bool) {
-        let mut state = self.state();
-        if complete {
-            state.counters.complete_search_index_count =
-                state.counters.complete_search_index_count.saturating_add(1);
-        } else {
-            state.counters.incomplete_search_index_count = state
-                .counters
-                .incomplete_search_index_count
-                .saturating_add(1);
-        }
-    }
-
-    pub(crate) fn record_strict_subset_source_reread(&self) {
-        let mut state = self.state();
-        state.counters.strict_subset_source_reread_count = state
-            .counters
-            .strict_subset_source_reread_count
-            .saturating_add(1);
-    }
-
     pub(crate) fn record_tool_output_artifact_reread(&self) {
         let mut state = self.state();
         state.counters.tool_output_artifact_reread_count = state
@@ -1773,21 +1281,6 @@ impl TurnTimingState {
             let disposition = state.current_generation_disposition;
             let relevant_state_fingerprint = state.current_relevant_state_fingerprint.clone();
             let attempt_kind = std::mem::take(&mut state.next_attempt_kind);
-            let post_discovery = if attempt_kind == TurnTimingAttemptKind::Primary
-                && state.pending_discovery_result_cells > 0
-            {
-                let observation = TurnTimingPostDiscoveryRequest {
-                    newly_injected_discovery_result_tokens: state.pending_discovery_result_tokens,
-                    discovery_result_cells: state.pending_discovery_result_cells,
-                    discovery_model_boundary_count: 1,
-                    ..Default::default()
-                };
-                state.pending_discovery_result_tokens = 0;
-                state.pending_discovery_result_cells = 0;
-                Some(observation)
-            } else {
-                None
-            };
             state.model_requests.push(ModelRequestTiming {
                 generation_index,
                 generation_reason,
@@ -1795,7 +1288,6 @@ impl TurnTimingState {
                 disposition,
                 relevant_state_fingerprint,
                 attempt_kind,
-                post_discovery,
                 is_continuation,
                 ..Default::default()
             });
@@ -2027,12 +1519,6 @@ impl TurnTimingStateInner {
             let purpose_count = match purpose {
                 TurnTimingGenerationPurpose::InitialReasoning => {
                     &mut self.counters.generations_by_purpose.initial_reasoning
-                }
-                TurnTimingGenerationPurpose::SourceEvidenceInterpretation => {
-                    &mut self
-                        .counters
-                        .generations_by_purpose
-                        .source_evidence_interpretation
                 }
                 TurnTimingGenerationPurpose::ImplementationDecision => {
                     &mut self.counters.generations_by_purpose.implementation_decision
@@ -2395,7 +1881,6 @@ impl TurnTimingStateInner {
             deterministic_continuation_receipt_overflow: self
                 .deterministic_continuation_receipt_overflow,
             pre_first_model_output: self.pre_first_model_output.clone(),
-            pre_edit_convergence: self.pre_edit_convergence.clone(),
             terminalization: self.terminalization.clone(),
         };
         let legacy_profile = self
@@ -2845,9 +2330,8 @@ fn purpose_aggregates(
     requests: &[ModelRequestTiming],
     saturation_count: &mut u32,
 ) -> Vec<TurnTimingGenerationPurposeAggregate> {
-    const PURPOSES: [TurnTimingGenerationPurpose; 11] = [
+    const PURPOSES: [TurnTimingGenerationPurpose; 10] = [
         TurnTimingGenerationPurpose::InitialReasoning,
-        TurnTimingGenerationPurpose::SourceEvidenceInterpretation,
         TurnTimingGenerationPurpose::ImplementationDecision,
         TurnTimingGenerationPurpose::Wait,
         TurnTimingGenerationPurpose::FailureDiagnosis,

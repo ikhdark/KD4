@@ -41,12 +41,12 @@ struct PersistenceProbeHandler {
 
 impl ToolExecutor<ToolInvocation> for PersistenceProbeHandler {
     fn tool_name(&self) -> codex_tools::ToolName {
-        codex_tools::ToolName::plain("search_source")
+        codex_tools::ToolName::plain("persistence_probe")
     }
 
     fn spec(&self) -> codex_tools::ToolSpec {
         codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
-            name: "search_source".to_string(),
+            name: "persistence_probe".to_string(),
             description: "Persistence ordering probe.".to_string(),
             strict: false,
             defer_loading: None,
@@ -447,7 +447,7 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
     );
     let item = ResponseItem::FunctionCall {
         id: None,
-        name: "search_source".to_string(),
+        name: "persistence_probe".to_string(),
         namespace: None,
         arguments: "{}".to_string(),
         call_id: "persisted-read".to_string(),

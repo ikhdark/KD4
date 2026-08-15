@@ -264,43 +264,6 @@ pub(crate) enum ValidationClassification {
     Opaque,
 }
 
-/// Internal pre-edit intent derived from the existing validation classifier.
-/// Unknown and non-validation commands stay unclassified so callers fail open
-/// without asking the model to label command intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PreEditValidationClass {
-    FocusedImplementationEvidence,
-    KnownFinalCeremony,
-    OtherKnownValidation,
-}
-
-pub(crate) fn classify_pre_edit_validation(
-    invocation: &CommandInvocation,
-) -> Option<PreEditValidationClass> {
-    let ValidationClassification::Validation { leaves, .. } = classify_validation(invocation)
-    else {
-        return None;
-    };
-    if leaves.is_empty() {
-        return None;
-    }
-    if leaves.iter().all(|leaf| {
-        matches!(
-            leaf.breadth,
-            ValidationBreadth::Selector | ValidationBreadth::Module
-        )
-    }) {
-        return Some(PreEditValidationClass::FocusedImplementationEvidence);
-    }
-    if leaves
-        .iter()
-        .all(|leaf| leaf.breadth == ValidationBreadth::Workspace)
-    {
-        return Some(PreEditValidationClass::KnownFinalCeremony);
-    }
-    Some(PreEditValidationClass::OtherKnownValidation)
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ValidationSkipReason {
@@ -1326,34 +1289,6 @@ fn descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pre_edit_validation_classification_is_internal_bounded_and_fail_open() {
-        assert_eq!(
-            classify_pre_edit_validation(&CommandInvocation::Script(
-                "cargo test -p codex-core exact_pre_edit_case".into()
-            )),
-            Some(PreEditValidationClass::FocusedImplementationEvidence)
-        );
-        assert_eq!(
-            classify_pre_edit_validation(&CommandInvocation::Script(
-                "cargo test --workspace".into()
-            )),
-            Some(PreEditValidationClass::KnownFinalCeremony)
-        );
-        assert_eq!(
-            classify_pre_edit_validation(&CommandInvocation::Script(
-                "cargo test -p codex-core".into()
-            )),
-            Some(PreEditValidationClass::OtherKnownValidation)
-        );
-        assert_eq!(
-            classify_pre_edit_validation(&CommandInvocation::Script(
-                "custom-proof --opaque".into()
-            )),
-            None
-        );
-    }
 
     #[test]
     fn prohibited_validation_wrappers_fail_closed() {

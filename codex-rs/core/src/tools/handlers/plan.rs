@@ -289,42 +289,6 @@ async fn run_bound_validation_route(
     let repository = turn.config.cwd.to_path_buf();
     let repository = codex_git_utils::get_git_repo_root(&repository).unwrap_or(repository);
 
-    // A fresh authoritative mutation-state read is part of the launch boundary.
-    // Root-owned live mutations always defer. Unknown coverage additionally
-    // treats repository-lineage mutation warnings as non-disjoint.
-    if let Some(store) = session.services.agent_control.task_coordinator().store()
-        && let Some(root_session_id) = session
-            .services
-            .agent_control
-            .task_coordinator()
-            .root_session_id()
-    {
-        match store.inspect_quiescence(root_session_id).await {
-            Ok(state)
-                if !(state.active_mutation_lease_ids.is_empty()
-                    || turn.session_source.is_non_root_agent()
-                        && state.active_mutation_lease_ids.len() == 1
-                        && state.running_validation_call_ids.is_empty())
-                    || (candidate.repository_wide
-                        && state
-                            .warnings
-                            .iter()
-                            .any(|warning| warning.contains("active mutation"))) =>
-            {
-                tracing::info!(
-                    step_id = %candidate.step_id,
-                    "auto-validation deferred because implementation scope is not quiescent"
-                );
-                return Vec::new();
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(%error, "auto-validation quiescence admission failed");
-                return Vec::new();
-            }
-        }
-    }
-
     let mut results = Vec::with_capacity(candidate.route.leaves.len());
     let route_started_at = std::time::Instant::now();
     if candidate.route.ordering == ValidationRouteOrdering::RunAll {

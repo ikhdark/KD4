@@ -81,6 +81,7 @@ class WorkflowPreflightTest(unittest.TestCase):
         self.assertIn("workspace_id", resolved)
         self.assertEqual(resolved["validation_owner"], "root:one")
         self.assertEqual(resolved["generated_output_owner"], "none")
+        self.assertEqual(resolved["advisories"], [])
         self.assertIn("manifest_fingerprint", resolved)
         self.assertIn("expires_at", resolved)
 
@@ -120,17 +121,18 @@ class WorkflowPreflightTest(unittest.TestCase):
         with self.assertRaisesRegex(workflow_preflight.PreflightError, "stale"):
             self.resolve(value)
 
-    def test_overlap_and_shared_cargo_lane_are_rejected(self) -> None:
+    def test_overlap_and_shared_cargo_lane_are_advisory(self) -> None:
         active = self.resolve(self.manifest("root:first"))
         contender = self.manifest("root:second")
         contender["cargo_lane"] = {
             "target_dir": "target/root-first",
             "cargo_home": ".cargo-home",
         }
-        with self.assertRaisesRegex(
-            workflow_preflight.PreflightError, "active claim conflict"
-        ):
-            self.resolve(contender, (active,))
+        resolved = self.resolve(contender, (active,))
+        self.assertEqual(
+            [advisory["kind"] for advisory in resolved["advisories"]],
+            ["claim_overlap", "cargo_lane_overlap"],
+        )
 
     def test_case_only_claim_aliases_overlap_on_case_insensitive_filesystems(
         self,
@@ -151,7 +153,7 @@ class WorkflowPreflightTest(unittest.TestCase):
         second = workflow_preflight.workspace_fingerprint(self.repo)
         self.assertNotEqual(first, second)
 
-    def test_cargo_lane_aliases_are_rejected(self) -> None:
+    def test_cargo_lane_aliases_are_advisory(self) -> None:
         active = self.resolve(self.manifest("root:first"))
         contender = self.manifest("root:second")
         contender["path_claims"] = [{"path": "docs", "recursive": True}]
@@ -160,10 +162,17 @@ class WorkflowPreflightTest(unittest.TestCase):
             "target_dir": "./target/root-first",
             "cargo_home": ".cargo-home",
         }
-        with self.assertRaisesRegex(
-            workflow_preflight.PreflightError, "Cargo target lane"
-        ):
-            self.resolve(contender, (active,))
+        resolved = self.resolve(contender, (active,))
+        self.assertEqual(
+            resolved["advisories"],
+            [
+                {
+                    "kind": "cargo_lane_overlap",
+                    "assignment_id": "root:first",
+                    "target_dir": str((self.repo / "target/root-first").resolve()),
+                }
+            ],
+        )
 
     def test_isolated_worktree_allows_intentional_overlap_with_distinct_lane(
         self,
@@ -231,7 +240,7 @@ class WorkflowPreflightTest(unittest.TestCase):
         ):
             self.resolve(value)
 
-    def test_main_registers_conflicts_atomically_and_release_removes_them(self) -> None:
+    def test_main_registers_overlaps_with_advisories_and_release_removes_receipts(self) -> None:
         first = self.manifest("root:first")
         first_path = self.repo / "first.json"
         first_path.write_text(json.dumps(first), encoding="utf-8")
@@ -240,7 +249,7 @@ class WorkflowPreflightTest(unittest.TestCase):
         second = self.manifest("root:second")
         second_path = self.repo / "second.json"
         second_path.write_text(json.dumps(second), encoding="utf-8")
-        self.assertEqual(workflow_preflight.main([str(second_path)]), 2)
+        self.assertEqual(workflow_preflight.main([str(second_path)]), 0)
 
         self.assertEqual(
             workflow_preflight.main(

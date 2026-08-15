@@ -309,25 +309,3 @@ async fn no_sandbox_attempt_has_no_file_system_context() {
         None
     );
 }
-
-#[test]
-fn cas_excerpt_is_hunk_local_and_bounded() {
-    let text = (1..=1_000)
-        .map(|line| format!("line {line:04} {}", "x".repeat(16)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let excerpt = current_excerpt(text.as_bytes(), 500, 502).expect("bounded excerpt");
-    assert!(excerpt.contains("line 0495"));
-    assert!(excerpt.contains("line 0507"));
-    assert!(!excerpt.contains("line 0494"));
-    assert!(!excerpt.contains("line 0508"));
-    assert!(excerpt.len() <= 4096);
-}
-
-#[test]
-fn changed_line_range_unions_all_proposed_hunks() {
-    assert_eq!(
-        changed_line_range("@@ -1,2 +3,4 @@\n-old\n+new\n@@ -20 +25,2 @@\n-old\n+new"),
-        Some((3, 26))
-    );
-}

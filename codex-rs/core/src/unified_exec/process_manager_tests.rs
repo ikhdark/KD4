@@ -43,11 +43,11 @@ async fn dropped_process_id_reservation_is_released_before_store_transfer() {
 }
 
 #[test]
-fn adaptive_output_budget_uses_4k_8k_10k_and_honors_override() {
+fn coherent_packet_budget_uses_10k_and_honors_override() {
     const HARD_LIMIT: usize = 20_000;
 
-    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 4_000);
-    assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 8_000);
+    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
+    assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
     assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
     assert_eq!(
         resolve_output_limits(
@@ -621,8 +621,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
-        workspace_mutation: None,
-        completion_activity: None,
         validation_launch: None,
         validation_observation: Arc::new(std::sync::Mutex::new(None)),
         validation_leader: Arc::new(std::sync::Mutex::new(None)),

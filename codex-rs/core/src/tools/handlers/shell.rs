@@ -1,9 +1,6 @@
 use chrono::Utc;
-use codex_agent_task_store::StoreError;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
-use codex_agent_task_store::WorkspaceActorKind;
-use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_features::Feature;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
@@ -21,21 +18,15 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::agent::task_capabilities::is_independent_review_source;
 use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::exec::ExecExpiration;
 use crate::exec::ExecParams;
-use crate::exec::cancel_when_either;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
-use crate::tools::command_execution::WorkspaceMutationAcquireError;
-use crate::tools::command_execution::WorkspaceMutationGuard;
-use crate::tools::command_execution::WorkspaceMutationScope;
-use crate::tools::command_execution::acquire_workspace_mutation_lease_cached;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
@@ -359,42 +350,6 @@ struct OwnedOperationLease {
     terminal: bool,
 }
 
-struct ShellOperationTimeout {
-    cancellation: CancellationToken,
-    _timer: Option<AbortOnDropHandle<()>>,
-}
-
-impl ShellOperationTimeout {
-    fn new(timeout_ms: Option<u64>) -> Self {
-        let cancellation = CancellationToken::new();
-        let timer = timeout_ms.map(|timeout_ms| {
-            let cancellation = cancellation.clone();
-            AbortOnDropHandle::new(tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
-                cancellation.cancel();
-            }))
-        });
-        Self {
-            cancellation,
-            _timer: timer,
-        }
-    }
-
-    fn token(&self) -> CancellationToken {
-        self.cancellation.clone()
-    }
-
-    fn timed_out(&self) -> bool {
-        self.cancellation.is_cancelled()
-    }
-}
-
-impl Drop for ShellOperationTimeout {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-    }
-}
-
 impl OwnedOperationLease {
     fn new(
         call_id: String,
@@ -485,17 +440,9 @@ fn operation_lease_deadline(hard_deadline: Option<chrono::DateTime<Utc>>) -> chr
     })
 }
 
-fn is_structural_workspace_admission_block(error: &StoreError) -> bool {
-    matches!(error, StoreError::WorkspaceStateInitialization(_))
-}
-
 pub(super) async fn run_exec_like_with_exit_code(
     mut args: RunExecLikeArgs,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
-    // The public timeout covers admission and cleanup as well as the spawned
-    // process. Previously the process timeout did not start until after lease
-    // admission, so a command could yield a live cell without ever spawning.
-    let operation_timeout = ShellOperationTimeout::new(args.exec_params.expiration.timeout_ms());
     let coordinator = args
         .session
         .services
@@ -504,21 +451,7 @@ pub(super) async fn run_exec_like_with_exit_code(
         .clone();
     let validation_session = args.session.clone();
     let session_source = args.turn.session_source.clone();
-    let typed_binding = coordinator.binding_for_source(&session_source);
-    let independent_review = is_independent_review_source(&session_source);
     let inspection_command = is_known_safe_command(&args.safety_command);
-    if (typed_binding.is_some() || independent_review)
-        && (args
-            .exec_params
-            .sandbox_permissions
-            .requests_sandbox_override()
-            || args.additional_permissions.is_some())
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "typed assignments and independent reviewers cannot request shell sandbox overrides or additional permissions"
-                .to_string(),
-        ));
-    }
     validate_independent_review_shell(
         &session_source,
         inspection_command,
@@ -554,11 +487,6 @@ pub(super) async fn run_exec_like_with_exit_code(
     }
     let repo_root = get_git_repo_root(args.exec_params.cwd.as_path())
         .unwrap_or_else(|| args.exec_params.cwd.to_path_buf());
-    let apply_patch_cwd = PathUri::from_abs_path(&args.exec_params.cwd);
-    let intercepted_apply_patch = !matches!(
-        codex_apply_patch::maybe_parse_apply_patch(&args.exec_params.command, &apply_patch_cwd),
-        codex_apply_patch::MaybeApplyPatch::NotApplyPatch
-    );
     let focused_validation_admission = (!inspection_command).then(|| {
         focused_validation_command_summary(
             &args.safety_command,
@@ -574,218 +502,20 @@ pub(super) async fn run_exec_like_with_exit_code(
             args.prefix_rule.is_some(),
         )
     });
-    let admitted_nonmutating_validation = focused_validation_admission
-        .as_ref()
-        .is_some_and(Result::is_ok);
-    let mut workspace_mutation = None;
-    let workspace_mutation_scope = WorkspaceMutationScope::for_shell(
-        typed_binding.is_some(),
-        independent_review,
-        inspection_command,
-        intercepted_apply_patch,
-        admitted_nonmutating_validation,
-    );
-    if !intercepted_apply_patch {
-        #[cfg(test)]
-        args.session
-            .services
-            .command_execution
-            .record_workspace_mutation_scope(
-                &workspace_mutation_scope,
-                inspection_command || admitted_nonmutating_validation,
-            );
-    }
-    if let Some(mutation_paths) = workspace_mutation_scope.into_paths() {
-        args.cancellation_token =
-            cancel_when_either(args.cancellation_token.clone(), operation_timeout.token());
-        if !args.force_fresh
-            && let Some(attempt_key) = args.attempt_key.as_ref()
-            && let Some(reason) = args
-                .session
-                .services
-                .command_execution
-                .workspace_admission_block(attempt_key, &args.turn.sub_id)
-                .await
-        {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "shell execution lane is structurally blocked for the current repository state: {reason}; equivalent admission was suppressed until repository or turn state changes"
-            )));
-        }
-        let reservation = args
-            .session
-            .services
-            .command_execution
-            .reserve_workspace_mutation_until_cancelled(&repo_root, &args.cancellation_token)
-            .await
-            .map_err(|error| {
-                use crate::tools::command_execution::WorkspaceMutationReservationAcquireError;
-
-                let message = match error {
-                    WorkspaceMutationReservationAcquireError::Cancelled => {
-                        if operation_timeout.timed_out() {
-                            "shell command timed out before process spawn while waiting for mutation admission"
-                        } else {
-                            "shell command mutation-reservation wait was cancelled"
-                        }
-                    }
-                    WorkspaceMutationReservationAcquireError::TimedOut => {
-                        "shell command could not reserve repository-wide mutation execution within 10 seconds"
-                    }
-                };
-                FunctionCallError::RespondToModel(message.to_string())
-            })?;
-        if coordinator.store().is_none() {
-            tokio::select! {
-                biased;
-                _ = args.cancellation_token.cancelled() => {
-                    return Err(FunctionCallError::RespondToModel(if operation_timeout.timed_out() {
-                        "shell command timed out before process spawn while initializing workspace coordination".to_string()
-                    } else {
-                        "shell workspace coordination initialization was cancelled".to_string()
-                    }));
-                }
-                result = coordinator.initialize_for_workspace_coordination(
-                    args.session.services.state_db.clone(),
-                    args.turn.config.sqlite_home.clone(),
-                    args.turn.config.model_provider_id.clone(),
-                    args.session.services.agent_control.session_id().to_string(),
-                ) => result.map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "shell workspace coordination could not initialize: {error}"
-                    ))
-                })?,
-            }
-        }
-        let store = coordinator.store().ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "shell workspace coordination store is unavailable".to_string(),
-            )
-        })?;
-        let root_session_id = coordinator.root_session_id().ok_or_else(|| {
-            FunctionCallError::RespondToModel("shell root task identity is unavailable".to_string())
-        })?;
-        let agent_path = session_source
-            .get_agent_path()
-            .map(|path| path.to_string())
-            .unwrap_or_else(|| "/root".to_string());
-        let kind = if session_source.is_non_root_agent() {
-            WorkspaceActorKind::Legacy
-        } else {
-            WorkspaceActorKind::Root
-        };
-        let actor_id = match kind {
-            WorkspaceActorKind::Root => format!("root:{root_session_id}"),
-            WorkspaceActorKind::Legacy => format!("legacy:{root_session_id}:{agent_path}"),
-            WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
-        };
-        tokio::select! {
-            biased;
-            _ = args.cancellation_token.cancelled() => {
-                return Err(FunctionCallError::RespondToModel(if operation_timeout.timed_out() {
-                    "shell command timed out before process spawn while reconciling workspace actors".to_string()
-                } else {
-                    "shell workspace actor reconciliation was cancelled".to_string()
-                }));
-            }
-            result = args.session.services.agent_control.reconcile_live_typed_actor_heartbeats() => {
-                result.map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "shell typed-agent liveness could not be reconciled: {error}"
-                    ))
-                })?;
-            }
-        }
-        let request = WorkspaceMutationRequest {
-            root_session_id,
-            actor_id,
-            kind,
-            attempt_id: None,
-            paths: mutation_paths,
-            contracts: Vec::new(),
-            expected_manifest: Vec::new(),
-        };
-        let lease = acquire_workspace_mutation_lease_cached(
-            store.as_ref(),
-            args.session.services.git_workspace.as_ref(),
-            &repo_root,
-            &request,
-            &args.cancellation_token,
-        )
-        .await;
-        let lease = match lease {
-            Ok(lease) => lease,
-            Err(WorkspaceMutationAcquireError::Cancelled) => {
-                return Err(FunctionCallError::RespondToModel(
-                    if operation_timeout.timed_out() {
-                        "shell command timed out before process spawn while waiting for the repository-wide mutation lease".to_string()
-                    } else {
-                        "shell command mutation-lease wait was cancelled".to_string()
-                    },
-                ));
-            }
-            Err(WorkspaceMutationAcquireError::TimedOut { details }) => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "shell command could not acquire the repository-wide mutation lease within 10 seconds: {}",
-                    details.join("; ")
-                )));
-            }
-            Err(WorkspaceMutationAcquireError::Store(error)) => {
-                let reason = error.to_string();
-                if is_structural_workspace_admission_block(&error)
-                    && let Some(attempt_key) = args.attempt_key.as_ref()
-                {
-                    args.session
-                        .services
-                        .command_execution
-                        .record_workspace_admission_block(
-                            attempt_key,
-                            &args.turn.sub_id,
-                            reason.clone(),
-                        )
-                        .await;
-                }
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "shell command could not acquire the repository-wide mutation lease: {reason}"
-                )));
-            }
-        };
-        workspace_mutation = Some(WorkspaceMutationGuard::new_with_cache(
-            store,
-            repo_root.clone(),
-            lease,
-            reservation,
-            Arc::clone(&args.session.services.git_workspace),
-        ));
-    }
-    let focused_validation_command = if typed_binding.is_some() && !inspection_command {
-        let command_summary = focused_validation_admission
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "typed assignment shell command validation admission was not evaluated"
-                        .to_string(),
+    let focused_validation_command =
+        focused_validation_admission
+            .and_then(Result::ok)
+            .and_then(|command_summary| {
+                pin_focused_validation_executable(
+                    &mut args.exec_params.command,
+                    &args.safety_command,
+                    &args.exec_params.env,
+                    args.exec_params.cwd.as_path(),
+                    repo_root.as_path(),
                 )
-            })?
-            .map_err(|reason| {
-                FunctionCallError::RespondToModel(format!(
-                    "typed assignment shell command is not admitted focused validation: {reason}"
-                ))
-            })?;
-        let resolved_executable = pin_focused_validation_executable(
-            &mut args.exec_params.command,
-            &args.safety_command,
-            &args.exec_params.env,
-            args.exec_params.cwd.as_path(),
-            repo_root.as_path(),
-        )
-        .map_err(|reason| {
-            FunctionCallError::RespondToModel(format!(
-                "typed assignment validation executable is not trusted: {reason}"
-            ))
-        })?;
-        Some((command_summary, resolved_executable))
-    } else {
-        None
-    };
+                .ok()
+                .map(|resolved_executable| (command_summary, resolved_executable))
+            });
     let call_id = args.call_id.clone();
     let retained_output_ref = format!("tool-call:{}:{call_id}", args.session.thread_id);
     let operation_hard_deadline = match &args.exec_params.expiration {
@@ -1118,51 +848,6 @@ pub(super) async fn run_exec_like_with_exit_code(
             }
         }))
     });
-    let workspace_heartbeat_stop = CancellationToken::new();
-    let workspace_heartbeat_task = workspace_mutation.as_ref().map(|workspace_mutation| {
-        let store = workspace_mutation.store();
-        let repo_root = workspace_mutation.repo_root().to_path_buf();
-        let lease_id = workspace_mutation.lease().lease_id.clone();
-        let actor_id = workspace_mutation.lease().actor_id.clone();
-        let workspace_heartbeat_stop = workspace_heartbeat_stop.clone();
-        let command_cancellation = args.cancellation_token.clone();
-        AbortOnDropHandle::new(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = workspace_heartbeat_stop.cancelled() => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        match store
-                            .heartbeat_workspace_mutation(
-                                &repo_root,
-                                lease_id.clone(),
-                                actor_id.clone(),
-                            )
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                tracing::warn!(
-                                    %lease_id,
-                                    "workspace mutation lease expired before heartbeat"
-                                );
-                                command_cancellation.cancel();
-                                break;
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    %lease_id,
-                                    "workspace mutation heartbeat failed"
-                                );
-                                command_cancellation.cancel();
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }))
-    });
     let cancellation_token = args.cancellation_token.clone();
     if focused_validation.is_some() {
         args.turn.session_telemetry.counter(
@@ -1210,45 +895,9 @@ pub(super) async fn run_exec_like_with_exit_code(
     {
         tracing::warn!(%error, "validation heartbeat task failed");
     }
-    workspace_heartbeat_stop.cancel();
-    if let Some(workspace_heartbeat_task) = workspace_heartbeat_task
-        && let Err(error) = workspace_heartbeat_task.await
-    {
-        tracing::warn!(%error, "workspace mutation heartbeat task failed");
-    }
-    let workspace_record_result = match workspace_mutation {
-        Some(workspace_mutation) => tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => {
-                Err(FunctionCallError::RespondToModel(if operation_timeout.timed_out() {
-                    "shell command timed out while finalizing its workspace mutation; cleanup continues in the background".to_string()
-                } else {
-                    "shell workspace mutation finalization was cancelled; cleanup continues in the background".to_string()
-                }))
-            }
-            result = workspace_mutation.finish() => result.map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "shell workspace mutation could not be finalized: {error}"
-                ))
-            }),
-        },
-        None => Ok(()),
-    };
     let Some(token) = focused_validation else {
-        return match (result, workspace_record_result) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(record_error)) => {
-                tracing::warn!(
-                    %record_error,
-                    "failed to finalize shell workspace mutation after command failure"
-                );
-                Err(error)
-            }
-        };
+        return result;
     };
-    workspace_record_result?;
     let status = match (&result, cancellation_token.is_cancelled()) {
         (_, true) => ValidationCallStatus::Cancelled,
         (Ok(result), false) => match result.validation_execution_outcome() {
@@ -1630,26 +1279,6 @@ fn collect_focused_validation_argv_violations(
         violations.push(violation);
     }
     violations
-}
-
-#[cfg(test)]
-fn requires_repository_wide_mutation_lease(
-    typed_binding: bool,
-    independent_review: bool,
-    inspection_command: bool,
-    intercepted_apply_patch: bool,
-    admitted_nonmutating_validation: bool,
-) -> bool {
-    matches!(
-        WorkspaceMutationScope::for_shell(
-            typed_binding,
-            independent_review,
-            inspection_command,
-            intercepted_apply_patch,
-            admitted_nonmutating_validation,
-        ),
-        WorkspaceMutationScope::Repository
-    )
 }
 
 fn validate_cargo_validation(args: &[String]) -> Result<(), String> {
@@ -2305,7 +1934,10 @@ async fn run_exec_like_with_exit_code_inner(
     let known_delta = if turn.config.features.enabled(Feature::KnownDeltaStore)
         && !focused_validation
         && !exec_params.command.is_empty()
-    {
+        && known_delta_store::is_immutable_git_show_candidate(
+            &exec_params.command[0],
+            &exec_params.command[1..],
+        ) {
         let project_namespace = if let Some(source) = turn.turn_metadata_state.git_metadata_source()
             && exec_params.cwd.starts_with(source.repo_root().as_path())
         {

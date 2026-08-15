@@ -12,114 +12,9 @@ fn nested_code_mode_projection_is_not_provider_visible() {
 }
 
 #[test]
-fn only_stable_locate_task_fragments_force_a_canonical_artifact() {
-    let stable = ToolOutputProjectionFragment::new(
-        ToolOutputProjectionFragmentKind::SourcePrimaryImplementation,
-        "source",
-    )
-    .with_id("section-id");
-    let anonymous = ToolOutputProjectionFragment::new(
-        ToolOutputProjectionFragmentKind::SourcePrimaryImplementation,
-        "source",
-    );
-
-    assert!(requires_canonical_projection_artifact(
-        "locate_task",
-        std::slice::from_ref(&stable),
-    ));
-    assert!(!requires_canonical_projection_artifact(
-        "locate_task",
-        &[anonymous],
-    ));
-    assert!(!requires_canonical_projection_artifact(
-        "search_source",
-        std::slice::from_ref(&stable),
-    ));
-    assert!(requires_canonical_projection_artifact(
-        "read_file_span",
-        &[stable],
-    ));
-}
-
-#[test]
-fn complete_skill_source_read_uses_bounded_four_thousand_token_projection() {
-    let body = "complete skill instruction coverage ".repeat(280);
-    let output = format!(
-        "Source file evidence:\ncitation: C:\\skills\\repo-atlas\\SKILL.md:1-126\ntotal_lines: 126 bytes_returned: {} truncated: false\nsource_route: core\n{body}",
-        body.len()
-    );
-    assert!(approx_token_count(&output) > 1_000);
-    assert!(approx_token_count(&output) < COMPLETE_SKILL_READ_TOKEN_LIMIT);
-
-    let requested_limit = skill_read_projection_limit("read_file_span", &output);
-    assert_eq!(requested_limit, Some(COMPLETE_SKILL_READ_TOKEN_LIMIT));
-    assert_eq!(
-        skill_read_projection_limit("functions.read_file_span", &output),
-        Some(COMPLETE_SKILL_READ_TOKEN_LIMIT)
-    );
-    let limits = resolve_projected_output_limits(
-        requested_limit,
-        OutputOutcome::Success,
-        OutputDiagnosticClass::Normal,
-        DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
-    );
-    assert_eq!(limits.applied_limit, COMPLETE_SKILL_READ_TOKEN_LIMIT);
-    let projected = formatted_truncate_text_with_output_limit(&output, limits);
-
-    assert!(!projected.was_truncated);
-    assert_eq!(projected.text, output);
-
-    let wrapped = format!("Script completed\nWall time 0.1 seconds\nOutput:\n\n{output}");
-    assert_eq!(
-        skill_read_projection_limit("functions.exec", &wrapped),
-        Some(COMPLETE_SKILL_READ_TOKEN_LIMIT)
-    );
-    let escaped = wrapped.replace('\n', "\\n");
-    assert_eq!(
-        skill_read_projection_limit("functions.exec", &escaped),
-        Some(COMPLETE_SKILL_READ_TOKEN_LIMIT)
-    );
-}
-
-#[test]
-fn ordinary_and_oversized_skill_outputs_keep_safe_projection_behavior() {
-    assert_eq!(
-        skill_read_projection_limit("read_file_span", "ordinary tool output"),
-        None
-    );
-    assert_eq!(
-        skill_read_projection_limit(
-            "read_file_span",
-            "citation: /skills/repo-atlas/SKILL.md:1-126\nSource file evidence:\nordinary output"
-        ),
-        None
-    );
-    let complete_envelope = "Source file evidence:\ncitation: /skills/repo-atlas/SKILL.md:1-126\ntotal_lines: 126 bytes_returned: 10 truncated: false\nsource_route: core\ninstructions";
-    assert_eq!(
-        skill_read_projection_limit("mcp__untrusted__tool", complete_envelope),
-        None
-    );
-    let ordinary_limits = resolve_projected_output_limits(
-        None,
-        OutputOutcome::Success,
-        OutputDiagnosticClass::Normal,
-        usize::MAX,
-    );
-    assert_eq!(ordinary_limits.applied_limit, 1_000);
-
-    let oversized = format!(
-        "Source file evidence:\ncitation: /skills/large/SKILL.md:1-900\ntotal_lines: 900 bytes_returned: 24000 truncated: false\nsource_route: core\n{}",
-        "large skill instruction ".repeat(1_000)
-    );
-    let skill_limits = resolve_projected_output_limits(
-        skill_read_projection_limit("read_file_span", &oversized),
-        OutputOutcome::Success,
-        OutputDiagnosticClass::Normal,
-        usize::MAX,
-    );
-    let projected = formatted_truncate_text_with_output_limit(&oversized, skill_limits);
-    assert_eq!(skill_limits.applied_limit, COMPLETE_SKILL_READ_TOKEN_LIMIT);
-    assert!(projected.was_truncated);
+fn optimization_priority_owner_continuations_form_a_full_packet_before_trimming() {
+    assert_eq!(projection_packet_token_limit(false, 4_000, 10_000), 4_000);
+    assert_eq!(projection_packet_token_limit(true, 4_000, 10_000), 10_000);
 }
 
 #[test]
@@ -188,29 +83,21 @@ fn projection_limit_retains_a_native_minimal_fallback() {
 
 #[test]
 fn typed_projection_prioritizes_sections_with_stable_exact_deduplication() {
-    let citation_one = ToolOutputProjectionFragment::new(
-        ToolOutputProjectionFragmentKind::CitationOrExactSpan,
-        "citation-one",
+    let diagnostic_one = ToolOutputProjectionFragment::new(
+        ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+        "diagnostic-one",
     );
     let fragments = vec![
         ToolOutputProjectionFragment::new(
             ToolOutputProjectionFragmentKind::ContextualSpillableText,
             "context-one",
         ),
-        citation_one.clone(),
+        diagnostic_one.clone(),
         ToolOutputProjectionFragment::new(
             ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
-            "error-one",
+            "diagnostic-two",
         ),
-        ToolOutputProjectionFragment::new(
-            ToolOutputProjectionFragmentKind::CitationOrExactSpan,
-            "citation-two",
-        ),
-        citation_one,
-        ToolOutputProjectionFragment::new(
-            ToolOutputProjectionFragmentKind::SearchMatchOrDefinition,
-            "match-one",
-        ),
+        diagnostic_one,
         ToolOutputProjectionFragment::new(
             ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary,
             "validation-one",
@@ -228,26 +115,24 @@ fn typed_projection_prioritizes_sections_with_stable_exact_deduplication() {
         facts,
         ProjectionSelectionFacts {
             mode: "typed_fragments",
-            available_fragments: 8,
-            selected_fragments: 7,
+            available_fragments: 6,
+            selected_fragments: 5,
             exact_duplicates_removed: 1,
             selected_ids: Vec::new(),
             omitted_inline_ids: Vec::new(),
             partial_ids: Vec::new(),
         }
     );
-    assert_eq!(projected.matches("citation-one").count(), 1);
+    assert_eq!(projected.matches("diagnostic-one").count(), 1);
     assert!(
-        projected.find("citation-one").expect("first citation")
-            < projected.find("citation-two").expect("second citation")
+        projected.find("diagnostic-one").expect("first diagnostic")
+            < projected.find("diagnostic-two").expect("second diagnostic")
     );
     assert!(
         projected
-            .find("[citations and exact spans]")
-            .expect("citation section")
-            < projected
-                .find("[errors and diagnostics]")
-                .expect("diagnostic section")
+            .find("[errors and diagnostics]")
+            .expect("diagnostic section")
+            < projected.find("[validation]").expect("validation section")
     );
     assert!(
         projected
@@ -278,24 +163,6 @@ fn structured_fixtures_stay_within_baseline_budget_and_reduce_recovery() {
     let fixtures = [
         (
             format!(
-                "{}\ncitation: src/owner.rs:40-44\ndefinition: owner_symbol\n{}",
-                "irrelevant discovery context ".repeat(300),
-                "unrelated search tail ".repeat(300),
-            ),
-            vec![
-                ToolOutputProjectionFragment::new(
-                    ToolOutputProjectionFragmentKind::CitationOrExactSpan,
-                    "citation: src/owner.rs:40-44",
-                ),
-                ToolOutputProjectionFragment::new(
-                    ToolOutputProjectionFragmentKind::SearchMatchOrDefinition,
-                    "definition: owner_symbol",
-                ),
-            ],
-            ["citation: src/owner.rs:40-44", "definition: owner_symbol"],
-        ),
-        (
-            format!(
                 "{}\nerror: expected Ready, found Pending\nvalidation failed: cache ownership\n{}",
                 "irrelevant validation setup ".repeat(300),
                 "unrelated compiler context ".repeat(300),
@@ -317,7 +184,7 @@ fn structured_fixtures_stay_within_baseline_budget_and_reduce_recovery() {
         ),
         (
             format!(
-                "{}\nprocess final status: exit 1\ncitation: tests/race.rs:9-12\n{}",
+                "{}\nprocess final status: exit 1\ndiagnostic: worker unavailable\n{}",
                 "irrelevant process output ".repeat(300),
                 "unrelated terminal tail ".repeat(300),
             ),
@@ -327,13 +194,13 @@ fn structured_fixtures_stay_within_baseline_budget_and_reduce_recovery() {
                     "process final status: exit 1",
                 ),
                 ToolOutputProjectionFragment::new(
-                    ToolOutputProjectionFragmentKind::CitationOrExactSpan,
-                    "citation: tests/race.rs:9-12",
+                    ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+                    "diagnostic: worker unavailable",
                 ),
             ],
             [
                 "process final status: exit 1",
-                "citation: tests/race.rs:9-12",
+                "diagnostic: worker unavailable",
             ],
         ),
     ];
@@ -696,15 +563,15 @@ async fn one_predetermined_range_is_recovered_in_the_original_return() {
         preserved_content: Vec::new(),
         codex_home: temp.path().to_path_buf(),
         thread_id: "single-predetermined-thread".to_string(),
-        tool_name: "read_file_span".to_string(),
+        tool_name: "sample_reader".to_string(),
         original_output_sha256: canonical.sha256.clone(),
         original_output_tokens: canonical.approximate_tokens,
         canonical,
-        semantic_class: "source_evidence".to_string(),
+        semantic_class: "test_projection".to_string(),
         projection_eligible: true,
         projection_truncated: true,
         predetermined_ranges: vec![ToolOutputProjectionRange {
-            id: "omitted-source-chunk".to_string(),
+            id: "omitted-chunk".to_string(),
             start_line: 2,
             end_line: 2,
         }],
@@ -1009,11 +876,11 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         preserved_content: Vec::new(),
         codex_home: temp.path().to_path_buf(),
         thread_id: "thread".to_string(),
-        tool_name: "read_file_span".to_string(),
+        tool_name: "sample_reader".to_string(),
         canonical: inner_canonical.clone(),
         original_output_sha256: inner_canonical.sha256.clone(),
         original_output_tokens: inner_canonical.approximate_tokens,
-        semantic_class: "source_evidence".to_string(),
+        semantic_class: "test_projection".to_string(),
         projection_eligible: true,
         projection_truncated: true,
         predetermined_ranges: vec![ToolOutputProjectionRange {

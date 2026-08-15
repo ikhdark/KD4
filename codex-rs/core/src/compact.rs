@@ -292,12 +292,6 @@ async fn run_compact_task_inner_impl(
             Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
                 return Err(err);
             }
-            Err(e @ CodexErr::SessionBudgetExceeded) => {
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
-                return Err(e);
-            }
             Err(e @ CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
@@ -776,7 +770,6 @@ async fn drain_to_completed(
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
 ) -> CodexResult<()> {
-    sess.ensure_rollout_budget_available()?;
     let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
     let stream_result = client_session
         .stream(

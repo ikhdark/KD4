@@ -433,69 +433,6 @@ path = "codex-rs/core/src/tools/spec_plan_tests.rs"
 contains = "tool_search_cache_rebuilds_when_deferred_sources_change"
 
 [[features]]
-id = "source-tools"
-version = 1
-status = "enabled"
-runtime_status = "enabled"
-runtime_status_source = "codex-rs/features/src/lib.rs"
-runtime_feature_key = "features.source_tools"
-capability_kind = "runtime"
-owner = "codex-rs/file-search"
-summary = "Feature-gated structured source search and bounded file-span reads."
-upstream_equivalent = "none"
-config_keys = ["features.source_tools"]
-
-[[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/core/src/tools/handlers/source.rs"
-contains = "pub struct SearchSourceHandler"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tools/spec_plan.rs"
-contains = "features.enabled(Feature::SourceTools)"
-
-[[features.evidence]]
-kind = "config"
-path = "codex-rs/features/src/lib.rs"
-contains = "key: \"source_tools\""
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/spec_plan_tests.rs"
-contains = "source_tools_follow_default_and_explicit_disable"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/tests/suite/source_tools.rs"
-contains = "source_tools_execute_search_and_read_end_to_end"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/source_tests.rs"
-contains = "source_handlers_select_local_environment_and_reject_remote_environment"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/source_tests.rs"
-contains = "read_file_span_handler_rejects_symlink_or_junction_escape"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tools/handlers/source_tests.rs"
-contains = "read_file_span_handler_reads_exact_loaded_skill_path"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/file-search/src/source_search_tests.rs"
-contains = "representative_large_repository_search_stays_within_walk_and_output_bounds"
-
-[[features.evidence]]
-kind = "workflow"
-path = "scripts/kd4_perf_snapshot.py"
-contains = "source-tools-runtime-test"
-
-[[features]]
 id = "config-explain"
 version = 1
 status = "enabled"
@@ -542,7 +479,7 @@ version = 11
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Persisted schema-v11 task evidence, including bounded owner/source projections, explicit plan acknowledgement, versioned manifests, candidate-bound proof identity, atomic completion-review and terminal-delivery lineage, authenticated Desktop activation receipts, and migration from older schemas."
+summary = "Persisted schema-v11 task evidence, including explicit plan acknowledgement, versioned manifests, candidate-bound proof identity, atomic completion-review and terminal-delivery lineage, authenticated Desktop activation receipts, and migration from older schemas."
 upstream_equivalent = "none"
 config_keys = []
 
@@ -570,26 +507,6 @@ contains = ".record_edit_intent_with_provenance("
 kind = "registration"
 path = "codex-rs/core/src/tools/events.rs"
 contains = ".record_command_bound_with_validation_result("
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tools/handlers/source.rs"
-contains = ".record_owner_packet_from_locator("
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/file-search/src/task_locator.rs"
-contains = "pub owner_packet_seed: Option<LocateTaskOwnerPacketSeed>"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tools/runtimes/apply_patch.rs"
-contains = ".record_owner_patch_finalization("
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/agent-task-store/src/workspace.rs"
-contains = "upsert_actor_supporting_read_entries_tx("
 
 [[features.evidence]]
 kind = "registration"
@@ -623,13 +540,8 @@ contains = "frozen_v4_loader_refuses_v5_without_modifying_the_file"
 
 [[features.evidence]]
 kind = "test"
-path = "codex-rs/core/src/task_evidence_tests.rs"
-contains = "owner_packet_refreshes_actual_post_state_and_keeps_followup_edits_current"
-
-[[features.evidence]]
-kind = "test"
 path = "codex-rs/agent-task-store/src/tests.rs"
-contains = "mutation_finalization_refreshes_the_same_actors_supporting_identity"
+contains = "mutation_evidence_and_receipts_are_not_gated_by_claim_metadata"
 
 [[features]]
 id = "task-completion-reviewer"
@@ -716,11 +628,11 @@ config_keys = []
 
 [[features]]
 id = "shared-worktree-reliability"
-version = 1
+version = 2
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/agent-task-store"
-summary = "Repository-global epochs, root/legacy/typed claims, version-bound evidence, bounded stale recovery, durable wake and lease state, validation singleflight, quiescence, and versioned isolated-worktree handoffs."
+summary = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
 upstream_equivalent = "none"
 config_keys = []
 
@@ -741,13 +653,13 @@ contains = "Durable typed-task progress is available."
 
 [[features.evidence]]
 kind = "registration"
-path = "codex-rs/core/src/tools/handlers/shell.rs"
-contains = "shared_from_call_id"
+path = "codex-rs/core/src/tools/events.rs"
+contains = "note_host_workspace_mutation"
 
 [[features.evidence]]
 kind = "workflow"
 path = "scripts/workflow_preflight.py"
-contains = "starting_revision"
+contains = '"advisories": []'
 
 [[features.evidence]]
 kind = "test"

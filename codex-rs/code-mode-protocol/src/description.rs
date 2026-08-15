@@ -12,7 +12,9 @@ To find one, filter `ALL_TOOLS` by `name` and `description`."#;
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate tool calls in a fresh async V8 isolate.
 - Input is JavaScript source, not JSON, quotes, or a Markdown fence. Node, filesystem, network, and console APIs are unavailable.
 - Nested tools are normalized methods on `tools` (for example `await tools.exec_command(...)`); methods accept the documented string or object and return the documented object or string.
-- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`. `yield_time_ms` controls the internal observation/progress cadence for an unchanged cell and defaults to 10000; empty observations do not cause a model-visible yield or a new model generation. `max_output_tokens` limits direct output.
+- Treat one `exec` as the evidence packet for the current generation: call all independent tools with `Promise.all`, perform deterministic dependent calls in the same script, and emit one coherent result after the packet is complete.
+- Prefer a sufficiently large complete packet over yielding for another model generation. Use `yield_control()` only when the model must make a new decision before the script can continue.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` defaults to 10000 and controls the internal observation/progress cadence; empty observations do not cause a model-visible yield or a new model generation. `max_output_tokens` bounds the outer result only after the coherent nested evidence packet is formed and defaults to 10000, subject to the model hard limit.
 - When evaluation ends, unawaited work is discarded.
 
 Global helpers:
@@ -28,7 +30,7 @@ Global helpers:
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
 - `yield_time_ms` controls the internal observation/progress cadence for an unchanged cell. Empty observations remain host-internal and do not cause a model-visible yield or a new model generation. Defaults to 10000 ms.
-- `max_tokens` limits how much new output this wait call returns. Model projections are capped at 1000 tokens for success, 2000 for failure/timeout, and 4000 for high-signal diagnostics; a lower requested value is honored.
+- `max_tokens` limits how much new output this wait call returns. Model projections default to a coherent packet of up to 10000 tokens; a lower requested value is honored and every result remains bounded by the model hard limit.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` returns only meaningful new output or state changes since the last model-visible result, or the final completion or termination result for that cell.
 - New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.
@@ -155,7 +157,7 @@ pub struct ParsedExecSource {
 pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
     if input.trim().is_empty() {
         return Err(
-            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}`.".to_string(),
+            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 10000}`.".to_string(),
         );
     }
 
@@ -893,7 +895,7 @@ bar"
     }
 
     #[test]
-    fn common_exec_description_keeps_inline_image_and_audio_without_rich_mcp_types() {
+    fn optimization_priority_common_exec_description_requires_generation_level_batching() {
         let description =
             build_exec_tool_description(&[], &[], &BTreeMap::new(), /*code_mode_only*/ false);
 
@@ -904,13 +906,16 @@ bar"
         assert!(description.contains("type: \"image\""));
         assert!(description.contains("type: \"audio\""));
         assert!(description.contains("unawaited work is discarded"));
+        assert!(description.contains("call all independent tools with `Promise.all`"));
+        assert!(description.contains("deterministic dependent calls in the same script"));
+        assert!(description.contains("Prefer a sufficiently large complete packet"));
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
         const HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES: usize = 3_337;
         assert!(
-            EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 65,
-            "common exec description must retain at least a 35% reduction"
+            EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 85,
+            "generation-level batching guidance takes priority over marginal descriptor savings"
         );
     }
 

@@ -370,7 +370,7 @@ mod built_in {
                     "architect".to_string(),
                     AgentRoleConfig {
                         description: Some(
-                            "Define and seal one authoritative ArchitectureContractV1 for dependent workers. Remain read-only; architecture authority does not permit source mutation."
+                            "Define and seal one authoritative ArchitectureContractV1 for dependent workers. Tool authority follows the root turn; task lifecycle and root-only controls still apply."
                                 .to_string(),
                         ),
                         config_file: Some("architect.toml".to_string().parse().unwrap_or_default()),
@@ -381,7 +381,7 @@ mod built_in {
                     "explorer".to_string(),
                     AgentRoleConfig {
                         description: Some(r#"Use `explorer` for specific codebase questions.
-Explorers are fast, authoritative, and read-only.
+Explorers are fast, authoritative, and investigation-focused.
 They must be used to ask specific, well-scoped questions on the codebase.
 Rules:
 - In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
@@ -421,7 +421,7 @@ Rules:
                     "verifier".to_string(),
                     AgentRoleConfig {
                         description: Some(
-                            "Run focused validation for one completed assignment. Remain read-only for source and report reproducible evidence."
+                            "Run focused validation for one completed assignment and report reproducible evidence. Tool authority follows the root turn; task lifecycle and root-only controls still apply."
                                 .to_string(),
                         ),
                         config_file: Some("verifier.toml".to_string().parse().unwrap_or_default()),

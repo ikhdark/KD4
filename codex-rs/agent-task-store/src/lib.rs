@@ -7,7 +7,6 @@
 mod error;
 mod id;
 mod local;
-mod manifest_storage;
 mod model;
 mod scope;
 mod store;

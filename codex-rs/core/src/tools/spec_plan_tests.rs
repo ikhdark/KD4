@@ -451,61 +451,6 @@ fn duplicate_primary_environment(turn: &mut TurnContext) {
     turn.environments.turn_environments.push(second_environment);
 }
 
-fn replace_primary_environment_with_remote(turn: &mut TurnContext) {
-    let primary = &mut turn.environments.turn_environments[0];
-    primary.environment_id = "remote".to_string();
-    primary.environment = Arc::new(
-        codex_exec_server::Environment::create_for_tests(Some(
-            "ws://127.0.0.1:1/source-tools-remote".to_string(),
-        ))
-        .expect("remote test environment"),
-    );
-}
-
-#[tokio::test]
-async fn source_tools_follow_default_and_explicit_disable() {
-    let disabled = probe(|turn| {
-        set_feature(turn, Feature::SourceTools, /*enabled*/ false);
-    })
-    .await;
-    disabled.assert_visible_lacks(&["locate_task", "search_source", "read_file_span"]);
-    disabled.assert_registered_lacks(&["locate_task", "search_source", "read_file_span"]);
-
-    let enabled = probe(|_| {}).await;
-    enabled.assert_visible_contains(&["locate_task", "search_source", "read_file_span"]);
-    enabled.assert_registered_contains(&["locate_task", "search_source", "read_file_span"]);
-    assert!(!has_parameter(
-        enabled.visible_spec("locate_task"),
-        "environment_id"
-    ));
-
-    let multiple = probe(|turn| {
-        set_feature(turn, Feature::SourceTools, /*enabled*/ true);
-        duplicate_primary_environment(turn);
-    })
-    .await;
-    assert!(has_parameter(
-        multiple.visible_spec("locate_task"),
-        "environment_id"
-    ));
-
-    let empty = probe(|turn| {
-        set_feature(turn, Feature::SourceTools, /*enabled*/ true);
-        turn.environments.turn_environments.clear();
-    })
-    .await;
-    empty.assert_visible_lacks(&["locate_task", "search_source", "read_file_span"]);
-    empty.assert_registered_lacks(&["locate_task", "search_source", "read_file_span"]);
-
-    let remote_only = probe(|turn| {
-        set_feature(turn, Feature::SourceTools, /*enabled*/ true);
-        replace_primary_environment_with_remote(turn);
-    })
-    .await;
-    remote_only.assert_visible_lacks(&["locate_task", "search_source", "read_file_span"]);
-    remote_only.assert_registered_lacks(&["locate_task", "search_source", "read_file_span"]);
-}
-
 fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
     ToolInfo {
         server_name: server.to_string(),

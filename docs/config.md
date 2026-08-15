@@ -6,9 +6,6 @@ For advanced configuration instructions, see [this documentation](https://develo
 
 For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
 
-For the experimental local source-search and bounded file-read tools, see
-[Source tools](source-tools.md).
-
 ## Lifecycle hooks
 
 Admins can set top-level `allow_managed_hooks_only = true` in

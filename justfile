@@ -53,11 +53,6 @@ tui-with-exec-server *args:
 file-search *args:
     cargo run --bin codex-file-search -- {args}
 
-# Run the structured source content search wrapper.
-[no-cd]
-source-search *args:
-    cargo run --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" --bin codex-source-search -- {args}
-
 # Build the CLI and run the app-server test client in one target lane.
 [unix]
 app-server-test-client *args:

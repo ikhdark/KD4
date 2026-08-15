@@ -231,6 +231,9 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     turn: &TurnContext,
     role_locks: AgentRoleLocks,
 ) -> Result<(), FunctionCallError> {
+    if !role_locks.permissions {
+        config.permissions = turn.config.permissions.clone();
+    }
     config
         .permissions
         .approval_policy
@@ -242,14 +245,6 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     #[allow(deprecated)]
     let turn_cwd = turn.cwd.clone();
     config.cwd = turn_cwd;
-    if !role_locks.permissions {
-        config
-            .permissions
-            .set_permission_profile(turn.permission_profile())
-            .map_err(|err| {
-                FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
-            })?;
-    }
     Ok(())
 }
 

@@ -74,18 +74,6 @@ impl WriteStdinHandler {
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
         validate_independent_review_stdin(&turn.session_source, &args.chars)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
-        if session
-            .services
-            .agent_control
-            .task_coordinator()
-            .binding_for_source(&turn.session_source)
-            .is_some()
-        {
-            return Err(FunctionCallError::RespondToModel(
-                "typed agents cannot use write_stdin; use a bounded shell_command so mutation admission and validation evidence remain attributable"
-                    .to_string(),
-            ));
-        }
         let mut response = session
             .services
             .unified_exec_manager
@@ -122,13 +110,8 @@ impl WriteStdinHandler {
                 session
                     .services
                     .command_execution
-                    .finish_running_process_checked(args.session_id, response.exit_code)
-                    .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "write_stdin workspace mutation finalization failed: {error}"
-                        ))
-                    })?;
+                    .finish_running_process(args.session_id, response.exit_code)
+                    .await;
             }
         }
 

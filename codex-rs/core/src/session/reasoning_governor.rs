@@ -1,9 +1,6 @@
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -24,7 +21,6 @@ use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_protocol::protocol::TurnTimingGenerationDisposition;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::TurnTimingProgressKind;
-use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolOutputOutcomeContext;
@@ -34,137 +30,15 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
-use tokio::sync::watch;
 
-use crate::agent::task_capabilities::ExternalMutationIntent;
-use crate::agent::task_capabilities::TypedToolClass;
 use crate::tools::handlers::command_shape::CommandInvocation;
-use crate::tools::handlers::source_closure::AuthoritativeSourceBasis;
-use crate::tools::handlers::source_closure::ObligationIdentity;
-use crate::tools::handlers::source_closure::SourceEvidenceRange;
 use crate::turn_diff_tracker::ValidationFreshnessStatus;
-use crate::turn_timing::PreEditReopenReason;
 use crate::turn_timing::TurnTimingState;
-use crate::validation_admission::PreEditValidationClass;
-use crate::validation_admission::classify_pre_edit_validation;
+use crate::validation_admission::ValidationClassification;
+use crate::validation_admission::classify_validation;
 
 pub(crate) type SamplingReasoningPhase = ReasoningPolicyPhase;
 pub(crate) type SamplingRequestPolicySource = ReasoningPolicySource;
-
-/// A closed, bounded set of evidence questions that may be active together.
-/// The enum order is the deterministic primary-obligation priority.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum EvidenceObligation {
-    Owner,
-    GoverningInstructions,
-    CallerOrContractClosure,
-    ImplementationQuestion,
-    FailureCause,
-    FocusedValidationRoute,
-    FocusedValidationProof,
-    TerminalProof,
-}
-
-impl EvidenceObligation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Owner => "owner",
-            Self::GoverningInstructions => "governing_instructions",
-            Self::CallerOrContractClosure => "caller_or_contract_closure",
-            Self::ImplementationQuestion => "implementation_question",
-            Self::FailureCause => "failure_cause",
-            Self::FocusedValidationRoute => "focused_validation_route",
-            Self::FocusedValidationProof => "focused_validation_proof",
-            Self::TerminalProof => "terminal_proof",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "owner" => Some(Self::Owner),
-            "governing_instructions" => Some(Self::GoverningInstructions),
-            "caller_or_contract_closure" => Some(Self::CallerOrContractClosure),
-            "implementation_question" => Some(Self::ImplementationQuestion),
-            "failure_cause" => Some(Self::FailureCause),
-            "focused_validation_route" => Some(Self::FocusedValidationRoute),
-            "focused_validation_proof" => Some(Self::FocusedValidationProof),
-            "terminal_proof" => Some(Self::TerminalProof),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct EvidenceObligationSet(BTreeSet<EvidenceObligation>);
-
-impl EvidenceObligationSet {
-    fn discovery() -> Self {
-        Self(BTreeSet::from([
-            EvidenceObligation::Owner,
-            EvidenceObligation::GoverningInstructions,
-            EvidenceObligation::CallerOrContractClosure,
-            EvidenceObligation::FocusedValidationRoute,
-        ]))
-    }
-
-    pub(crate) fn primary(&self) -> Option<EvidenceObligation> {
-        self.0.first().copied()
-    }
-
-    fn insert(&mut self, obligation: EvidenceObligation) {
-        self.0.insert(obligation);
-    }
-
-    fn remove(&mut self, obligation: EvidenceObligation) {
-        self.0.remove(&obligation);
-    }
-
-    fn remove_all(&mut self, obligations: &Self) {
-        self.0
-            .retain(|obligation| !obligations.0.contains(obligation));
-    }
-
-    fn intersection(&self, other: &Self) -> Self {
-        Self(self.0.intersection(&other.0).copied().collect())
-    }
-
-    fn extend(&mut self, other: &Self) {
-        self.0.extend(other.0.iter().copied());
-    }
-
-    fn from_signal_array(value: Option<&Value>) -> Self {
-        let obligations = value
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .filter_map(EvidenceObligation::parse)
-            .collect();
-        Self(obligations)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum EvidenceOperationRelationship {
-    KnownAdvances(EvidenceObligationSet),
-    KnownNoAdvance,
-    Unknown,
-}
-
-impl EvidenceOperationRelationship {
-    fn from_signal(signal: Option<&Value>) -> Self {
-        let Some(relationship) = signal.and_then(|value| value.get("relationship")) else {
-            return Self::Unknown;
-        };
-        match relationship.get("kind").and_then(Value::as_str) {
-            Some("known_advances") => Self::KnownAdvances(
-                EvidenceObligationSet::from_signal_array(relationship.get("obligations")),
-            ),
-            Some("known_no_advance") => Self::KnownNoAdvance,
-            _ => Self::Unknown,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ContinuationDisposition {
@@ -198,6 +72,21 @@ impl GenerationRequestDisposition {
                 TurnTimingGenerationDisposition::Deterministic
             }
         }
+    }
+
+    /// Returns true when the governor has proved that the protocol-requested
+    /// continuation has exactly one host-owned outcome. In that case another
+    /// model generation cannot add a decision and must be elided.
+    pub(crate) fn completes_protocol_turn_deterministically(&self) -> bool {
+        matches!(
+            &self.sampling,
+            SamplingGenerationDisposition::ResidualDeterministic(
+                ResidualDeterministicSamplingProof {
+                    exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
+                    ..
+                }
+            )
+        )
     }
 }
 
@@ -339,22 +228,18 @@ pub(crate) struct SamplingRequestBaselines {
     validation_status: ValidationFreshnessStatus,
     validation_revision: Option<u64>,
     plan_revision: u64,
-    mutation_obligation_revision: u64,
     input_revision: u64,
-    source_closure_identity: Option<String>,
 }
 
 impl SamplingRequestBaselines {
     fn revision_key(&self) -> String {
         format!(
-            "mutation={};validation_status={:?};validation_revision={:?};plan={};mutation_obligation={};input={};source={:?}",
+            "mutation={};validation_status={:?};validation_revision={:?};plan={};input={}",
             self.mutation_revision,
             self.validation_status,
             self.validation_revision,
             self.plan_revision,
-            self.mutation_obligation_revision,
             self.input_revision,
-            self.source_closure_identity,
         )
     }
 
@@ -368,7 +253,6 @@ pub(crate) struct SamplingRequestSettledState {
     pub(crate) mutation_revision: u64,
     pub(crate) validation_status: ValidationFreshnessStatus,
     pub(crate) validation_revision: Option<u64>,
-    pub(crate) source_closure_identity: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -387,9 +271,6 @@ struct SamplingToolOutcome {
     kind: SamplingToolOutcomeKind,
     skip_disposition: Option<ToolOutputSkipDisposition>,
     plan: Option<UpdatePlanArgs>,
-    advances: EvidenceObligationSet,
-    reopens: EvidenceObligationSet,
-    relationship: EvidenceOperationRelationship,
 }
 
 impl SamplingToolOutcome {
@@ -400,26 +281,11 @@ impl SamplingToolOutcome {
         signal: Option<&Value>,
     ) -> Self {
         let kind = sampling_tool_outcome_kind(outcome_context.outcome, signal);
-        let mut reopens =
-            EvidenceObligationSet::from_signal_array(signal.and_then(|value| value.get("reopens")));
-        if outcome_reopens_failure_evidence(kind, outcome_context.skip_disposition)
-            && reopens.0.is_empty()
-        {
-            reopens.extend(&validation_failure_obligation_delta(signal));
-            if reopens.0.is_empty() {
-                reopens.insert(EvidenceObligation::FailureCause);
-            }
-        }
         Self {
             ordinal,
             kind,
             skip_disposition: outcome_context.skip_disposition,
             plan,
-            advances: EvidenceObligationSet::from_signal_array(
-                signal.and_then(|value| value.get("advances")),
-            ),
-            reopens,
-            relationship: EvidenceOperationRelationship::from_signal(signal),
         }
     }
 
@@ -454,49 +320,6 @@ fn outcome_reopens_failure_evidence(
         | SamplingToolOutcomeKind::Timeout
         | SamplingToolOutcomeKind::RecoverableCancellation => true,
     }
-}
-
-/// Maps only producer-supplied structured validation classifications. Rendered
-/// stderr and arbitrary summaries never participate in this decision.
-fn validation_failure_obligation_delta(signal: Option<&Value>) -> EvidenceObligationSet {
-    let mut obligations = EvidenceObligationSet::default();
-    match signal
-        .and_then(|value| value.get("validation_failure_class"))
-        .and_then(Value::as_str)
-    {
-        Some("caller_or_contract") => {
-            obligations.insert(EvidenceObligation::CallerOrContractClosure);
-            obligations.insert(EvidenceObligation::ImplementationQuestion);
-        }
-        Some("compile_or_type") => {
-            obligations.insert(EvidenceObligation::ImplementationQuestion);
-        }
-        Some("platform") => {
-            obligations.insert(EvidenceObligation::ImplementationQuestion);
-            obligations.insert(EvidenceObligation::FailureCause);
-        }
-        Some("owner_contradiction") => {
-            obligations.insert(EvidenceObligation::Owner);
-        }
-        Some("unclassified") => {
-            obligations.insert(EvidenceObligation::FailureCause);
-        }
-        _ => {}
-    }
-    obligations
-}
-
-#[derive(Clone, Debug)]
-struct PendingDeterministicDispatch {
-    key: String,
-    locator: bool,
-}
-
-#[derive(Clone, Debug)]
-struct DeterministicCycleEntry {
-    ordinal: u64,
-    key: String,
-    outcome: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -550,1408 +373,16 @@ struct WaitConvergenceHandle {
     retained_result: AuthoritativeWaitOwnerResult,
 }
 
-#[derive(Clone, Debug)]
-struct DeterministicDispatchRecord {
-    original_call_id: String,
-    original_result_identity: String,
-    original_execution_status: String,
-    state_revision: Option<String>,
-    artifact: DeterministicReplayArtifact,
-    response: ResponseInputItem,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PreDispatchSuppressionKind {
-    StaleFinalValidation,
-}
-
-impl PreDispatchSuppressionKind {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::StaleFinalValidation => "stale_final_validation",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PreDispatchSuppression {
-    pub(crate) kind: PreDispatchSuppressionKind,
-    pub(crate) reason: String,
-    pub(crate) mutation_obligation_revision: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ValidationSuppressionDisposition {
-    Deferred,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ValidationSuppressionOutcome {
-    NotExecuted,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct DeferredValidationSuppressionResult<'a> {
-    kind: &'static str,
-    disposition: ValidationSuppressionDisposition,
-    outcome: ValidationSuppressionOutcome,
-    reason_code: &'static str,
-    suppression: &'static str,
-    reason: &'a str,
-    mutation_obligation_revision: u64,
-}
-
-impl PreDispatchSuppression {
-    pub(crate) fn deferred_validation_result(&self) -> DeferredValidationSuppressionResult<'_> {
-        DeferredValidationSuppressionResult {
-            kind: "validation_suppression",
-            disposition: ValidationSuppressionDisposition::Deferred,
-            outcome: ValidationSuppressionOutcome::NotExecuted,
-            reason_code: "pending_mutation_obligation",
-            suppression: self.kind.as_str(),
-            reason: &self.reason,
-            mutation_obligation_revision: self.mutation_obligation_revision,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PreDispatchAdvisory {
-    pub(crate) reason: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DeterministicReplayArtifact {
-    pub(crate) artifact_id: String,
-    pub(crate) canonical_sha256: String,
-    pub(crate) canonical_bytes: u64,
-}
-
 struct DeterministicDispatchLedger {
-    completed: BTreeMap<String, DeterministicDispatchRecord>,
-    active_obligations: EvidenceObligationSet,
-    pre_edit: PreEditConvergence,
     blocked_wait_gate: Option<BlockedWaitGate>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum PreEditConvergenceState {
-    #[default]
-    OwnerUnresolved,
-    OwnerResolved,
-    ClosureIncomplete,
-    ImplementationReady,
-    ImplementationStarted,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SourceOwnerReceiptState {
-    OwnerUnresolved,
-    OwnerResolved,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SourceClosureReceiptState {
-    BundleIncomplete,
-    BundleReady,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct OwnerEvidenceReceiptV2 {
-    pub(crate) receipt_id: String,
-    pub(crate) task_contract_epoch: String,
-    pub(crate) owner_id: Option<String>,
-    pub(crate) source_snapshot_identity: String,
-    pub(crate) instruction_snapshot_identity: InstructionSnapshotIdentity,
-    pub(crate) closure_contract_revision: String,
-    pub(crate) owner_state: SourceOwnerReceiptState,
-    pub(crate) closure_state: SourceClosureReceiptState,
-    pub(crate) unresolved_ids: BTreeSet<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct PreEditConvergenceSeed {
-    pub(crate) active: bool,
-    pub(crate) owner_candidates: Vec<String>,
-    pub(crate) instruction_snapshot_identity: InstructionSnapshotIdentity,
-    pub(crate) task_mandated_proof: bool,
-}
-
-/// Exact identity of the frozen instructions visible to the model for this
-/// convergence cycle. `Unknown` is fail-closed compatibility state for callers
-/// that cannot prove a semantic snapshot; it replaces the legacy `"captured"`
-/// sentinel rather than treating that sentinel as a digest.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "state", content = "sha256")]
-pub(crate) enum InstructionSnapshotIdentity {
-    #[default]
-    Unknown,
-    Empty,
-    Loaded(String),
-}
-
-impl InstructionSnapshotIdentity {
-    pub(crate) fn loaded(digest: [u8; 32]) -> Self {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut encoded = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        Self::Loaded(encoded)
-    }
-
-    fn is_known(&self) -> bool {
-        !matches!(self, Self::Unknown)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreEditObligationKind {
-    Primary,
-    Caller,
-    Test,
-    Contract,
-    Generated,
-    Platform,
-    Truncation,
-    Ambiguity,
-    TaskProof,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RangedEvidenceCoverage {
-    source_basis: AuthoritativeSourceBasis,
-    obligation_identity: ObligationIdentity,
-    observed_ranges: Vec<SourceEvidenceRange>,
-}
-
-struct PreEditConvergence {
-    active: bool,
-    state: PreEditConvergenceState,
-    owner_candidates: BTreeSet<String>,
-    authoritative_owner: Option<String>,
-    primary_surface: Option<String>,
-    instruction_snapshot_identity: InstructionSnapshotIdentity,
-    mechanism_evidence: bool,
-    closure: BTreeSet<String>,
-    obligations: BTreeMap<String, PreEditObligationKind>,
-    required_path_ranges: BTreeMap<String, Vec<SourceEvidenceRange>>,
-    ranged_evidence: BTreeMap<String, RangedEvidenceCoverage>,
-    bundle_question_details: BTreeMap<String, String>,
-    validation_route: Option<String>,
-    receipt: Option<OwnerEvidenceReceiptV2>,
-    locator_request_identity: Option<String>,
-    last_source_snapshot: Option<String>,
-    readiness_handoff_pending: bool,
-    readiness_handoff_emitted: bool,
-    workspace_untouched: bool,
-    first_successful_mutation: bool,
-    unfinished_mutation_obligation: Option<bool>,
-    unfinished_mutation_obligation_revision: u64,
     timing: Arc<TurnTimingState>,
 }
 
-impl PreEditConvergence {
-    fn new(seed: PreEditConvergenceSeed, timing: Arc<TurnTimingState>) -> Self {
-        let active = seed.active;
-        if active {
-            timing.activate_pre_edit_convergence();
-        }
-        Self {
-            active,
-            state: PreEditConvergenceState::OwnerUnresolved,
-            owner_candidates: seed
-                .owner_candidates
-                .into_iter()
-                .map(|path| normalize_source_path(&path))
-                .filter(|path| !path.is_empty())
-                .take(8)
-                .collect(),
-            authoritative_owner: None,
-            primary_surface: None,
-            instruction_snapshot_identity: seed.instruction_snapshot_identity,
-            mechanism_evidence: false,
-            closure: BTreeSet::new(),
-            obligations: if seed.task_mandated_proof {
-                BTreeMap::from([(
-                    "task-mandated-proof".to_string(),
-                    PreEditObligationKind::TaskProof,
-                )])
-            } else {
-                BTreeMap::new()
-            },
-            required_path_ranges: BTreeMap::new(),
-            ranged_evidence: BTreeMap::new(),
-            bundle_question_details: BTreeMap::new(),
-            validation_route: None,
-            receipt: None,
-            locator_request_identity: None,
-            last_source_snapshot: None,
-            readiness_handoff_pending: false,
-            readiness_handoff_emitted: false,
-            workspace_untouched: true,
-            first_successful_mutation: false,
-            unfinished_mutation_obligation: None,
-            unfinished_mutation_obligation_revision: 0,
-            timing,
-        }
-    }
-
-    fn owner_resolved(&self) -> bool {
-        self.authoritative_owner.is_some()
-    }
-
-    fn is_ready(&self) -> bool {
-        self.state == PreEditConvergenceState::ImplementationReady
-    }
-
-    fn validation_suppression(
-        &self,
-        class: PreEditValidationClass,
-    ) -> Option<PreDispatchSuppression> {
-        (self.active
-            && self.workspace_untouched
-            && self.is_ready()
-            && self.unfinished_mutation_obligation == Some(true)
-            && class == PreEditValidationClass::KnownFinalCeremony)
-            .then(|| PreDispatchSuppression {
-                kind: PreDispatchSuppressionKind::StaleFinalValidation,
-                reason: "final validation was not run because a proven mutation obligation remains pending"
-                    .to_string(),
-                mutation_obligation_revision: self.unfinished_mutation_obligation_revision,
-            })
-    }
-
-    fn refresh_readiness(&mut self) {
-        if !self.active
-            || !self.workspace_untouched
-            || !self.owner_resolved()
-            || self.primary_surface.is_none()
-            || !self.instruction_snapshot_identity.is_known()
-        {
-            return;
-        }
-        self.state = if !self.obligations.is_empty() || !self.mechanism_evidence {
-            PreEditConvergenceState::ClosureIncomplete
-        } else {
-            PreEditConvergenceState::ImplementationReady
-        };
-        if self.state == PreEditConvergenceState::ImplementationReady
-            && !self.readiness_handoff_emitted
-            && !self.readiness_handoff_pending
-        {
-            self.readiness_handoff_pending = true;
-            self.timing.record_pre_edit_implementation_ready();
-        }
-    }
-
-    fn reopen(&mut self, reason: PreEditReopenReason) {
-        if self.is_ready() || self.readiness_handoff_emitted {
-            self.timing.record_pre_edit_reopen(reason);
-        }
-        self.readiness_handoff_pending = false;
-        self.readiness_handoff_emitted = false;
-        if self.owner_resolved() {
-            self.state = PreEditConvergenceState::ClosureIncomplete;
-        }
-    }
-
-    fn record_mutation_advance(&mut self, successful: bool) {
-        if !self.active {
-            return;
-        }
-        self.workspace_untouched = false;
-        self.readiness_handoff_pending = false;
-        self.obligations.insert(
-            "source-revision-after-mutation".to_string(),
-            PreEditObligationKind::Ambiguity,
-        );
-        if successful && !self.first_successful_mutation {
-            self.first_successful_mutation = true;
-            self.state = PreEditConvergenceState::ImplementationStarted;
-            self.timing.record_pre_edit_first_successful_mutation();
-        } else if !self.first_successful_mutation {
-            self.reopen(PreEditReopenReason::SourceRevision);
-        }
-    }
-
-    fn source_advisory(
-        &self,
-        tool_name: &ToolName,
-        payload: &ToolPayload,
-    ) -> Option<PreDispatchAdvisory> {
-        if !self.active
-            || !self.workspace_untouched
-            || !self.is_ready()
-            || !self.owner_resolved()
-            || !self.obligations.is_empty()
-        {
-            return None;
-        }
-        if self.source_operation_relationship(tool_name, payload)
-            != EvidenceOperationRelationship::KnownNoAdvance
-        {
-            return None;
-        }
-        Some(PreDispatchAdvisory {
-            reason: "Pre-edit convergence classifies this source operation as unsupported expansion after authoritative owner and hydration-complete closure resolution. Execution remains advisory-only."
-                .to_string(),
-        })
-    }
-
-    fn source_operation_relationship(
-        &self,
-        tool_name: &ToolName,
-        payload: &ToolPayload,
-    ) -> EvidenceOperationRelationship {
-        let Some(operation) = source_operation(tool_name, payload) else {
-            return EvidenceOperationRelationship::Unknown;
-        };
-        let known_no_advance = match operation {
-            SourceOperation::ArtifactRecovery => false,
-            SourceOperation::Read { path, force_fresh } => {
-                !force_fresh && !self.source_target_is_supported(&path)
-            }
-            SourceOperation::Search {
-                paths,
-                force_fresh,
-                introduces_uncertainty,
-            } => {
-                !force_fresh
-                    && !introduces_uncertainty
-                    && (paths.is_empty()
-                        || paths
-                            .iter()
-                            .all(|path| !self.source_target_is_supported(path)))
-            }
-            SourceOperation::Locate {
-                path_anchor,
-                force_fresh,
-                introduces_uncertainty,
-            } => {
-                path_anchor.is_some_and(|path| !self.source_target_is_supported(&path))
-                    && !force_fresh
-                    && !introduces_uncertainty
-            }
-        };
-        if known_no_advance {
-            EvidenceOperationRelationship::KnownNoAdvance
-        } else {
-            EvidenceOperationRelationship::Unknown
-        }
-    }
-
-    fn source_target_is_supported(&self, target: &str) -> bool {
-        let target = normalize_source_path(target);
-        self.owner_candidates.contains(&target)
-            || self.closure.iter().any(|path| {
-                path == &target
-                    || path.starts_with(&format!("{target}/"))
-                    || target.starts_with(&format!("{path}/"))
-            })
-            || self
-                .obligations
-                .keys()
-                .any(|obligation| obligation_path(obligation) == Some(target.as_str()))
-    }
-
-    fn apply_source_signal(&mut self, signal: &Value) {
-        if !self.active || signal.get("kind").and_then(Value::as_str) != Some("source_evidence") {
-            return;
-        }
-        if signal.get("progress_only").and_then(Value::as_bool) == Some(true) {
-            return;
-        }
-        if signal.get("owner_state").is_some() {
-            self.apply_owner_bundle_signal(signal);
-            return;
-        }
-        match signal.get("operation").and_then(Value::as_str) {
-            Some("locate_task") => self.apply_locator_signal(signal),
-            Some("read_file_span") => self.apply_read_signal(signal),
-            Some("search_source") => self.apply_search_signal(signal),
-            _ => {}
-        }
-    }
-
-    fn apply_plan_signal(&mut self, signal: &Value) {
-        if signal.get("kind").and_then(Value::as_str) != Some("plan_update") {
-            return;
-        }
-        let unfinished = signal
-            .get("unfinished_mutation_obligation")
-            .and_then(Value::as_bool);
-        self.unfinished_mutation_obligation = unfinished;
-        self.unfinished_mutation_obligation_revision = self
-            .unfinished_mutation_obligation_revision
-            .saturating_add(1);
-    }
-
-    fn apply_locator_signal(&mut self, signal: &Value) {
-        if signal.get("owner_state").is_some() {
-            self.apply_owner_bundle_signal(signal);
-            return;
-        }
-        let Some(result) = signal.get("result").and_then(Value::as_object) else {
-            return;
-        };
-        let material_before = (
-            self.authoritative_owner.clone(),
-            self.primary_surface.clone(),
-            self.mechanism_evidence,
-            self.obligations.clone(),
-            self.validation_route.clone(),
-        );
-        let snapshot = signal
-            .get("snapshot_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let locator_request_identity = signal
-            .get("locator_request_identity")
-            .or_else(|| signal.get("request_identity"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let prior_snapshot = self.last_source_snapshot.clone();
-        if self.is_ready()
-            && self.last_source_snapshot.is_some()
-            && snapshot != self.last_source_snapshot
-        {
-            self.reopen(PreEditReopenReason::SourceRevision);
-        }
-        self.last_source_snapshot = snapshot.clone();
-
-        let routing = result.get("routing").and_then(Value::as_object);
-        let status = routing
-            .and_then(|routing| routing.get("status"))
-            .and_then(Value::as_str);
-        let owner = routing
-            .and_then(|routing| routing.get("owner_id"))
-            .and_then(Value::as_str);
-        let primary = result
-            .get("primary")
-            .and_then(Value::as_object)
-            .and_then(|primary| primary.get("path"))
-            .and_then(Value::as_str)
-            .map(normalize_source_path);
-        if status != Some("selected") || owner.is_none() || primary.is_none() {
-            if self.is_ready() {
-                self.reopen(PreEditReopenReason::NewAmbiguity);
-            }
-            return;
-        }
-        let owner = owner.unwrap_or_default().to_string();
-        let primary = primary.unwrap_or_default();
-        let evidence_basis_rebound = prior_snapshot != snapshot
-            || self
-                .authoritative_owner
-                .as_ref()
-                .is_some_and(|current| current != &owner)
-            || self.locator_request_identity != locator_request_identity;
-        if evidence_basis_rebound {
-            self.ranged_evidence.clear();
-            self.required_path_ranges.clear();
-        }
-        if self
-            .authoritative_owner
-            .as_ref()
-            .is_some_and(|current| current != &owner)
-            || self
-                .primary_surface
-                .as_ref()
-                .is_some_and(|current| current != &primary)
-        {
-            self.reopen(PreEditReopenReason::ContradictoryEvidence);
-        }
-        let newly_resolved = !self.owner_resolved();
-        self.authoritative_owner = Some(owner);
-        self.locator_request_identity = locator_request_identity;
-        self.primary_surface = Some(primary.clone());
-        self.state = PreEditConvergenceState::OwnerResolved;
-        self.closure.insert(primary.clone());
-
-        let neighborhood_paths = value_paths(result.get("source_neighborhoods"));
-        self.mechanism_evidence = neighborhood_paths.iter().any(|path| path == &primary)
-            || result
-                .get("primary")
-                .and_then(|value| value.get("resolution"))
-                .and_then(Value::as_str)
-                .is_some_and(|resolution| resolution == "exact");
-        self.closure.extend(neighborhood_paths.iter().cloned());
-        self.closure
-            .extend(value_paths(result.get("relationships")));
-        self.closure.extend(value_paths(result.get("contracts")));
-        self.closure.extend(value_paths(result.get("tests")));
-        self.closure.extend(value_paths(result.get("instructions")));
-
-        self.obligations.retain(|_, kind| {
-            matches!(
-                *kind,
-                PreEditObligationKind::TaskProof | PreEditObligationKind::Truncation
-            )
-        });
-        for unresolved in result
-            .get("unresolved")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .take(16)
-        {
-            self.obligations.insert(
-                format!("ambiguity:{unresolved}"),
-                PreEditObligationKind::Ambiguity,
-            );
-        }
-        for truncation in result
-            .get("truncation")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .take(8)
-        {
-            let collection = truncation
-                .get("collection")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            self.obligations.insert(
-                format!("truncation:{collection}"),
-                PreEditObligationKind::Truncation,
-            );
-        }
-        let previous_required_ranges = std::mem::take(&mut self.required_path_ranges);
-        if let Some(range) = source_evidence_range(result.get("primary")) {
-            self.required_path_ranges
-                .entry(primary)
-                .or_default()
-                .push(range);
-        }
-        self.add_path_obligations(
-            result.get("relationships"),
-            &neighborhood_paths,
-            PreEditObligationKind::Caller,
-            |role| role.contains("caller") || role.contains("consumer"),
-        );
-        self.add_path_obligations(
-            result.get("contracts"),
-            &neighborhood_paths,
-            PreEditObligationKind::Contract,
-            |role| role == "contract",
-        );
-        self.add_path_obligations(
-            result.get("contracts"),
-            &neighborhood_paths,
-            PreEditObligationKind::Generated,
-            |role| role.contains("generated"),
-        );
-        canonicalize_required_ranges(&mut self.required_path_ranges);
-        self.ranged_evidence.retain(|path, coverage| {
-            self.required_path_ranges.get(path)
-                == Some(&coverage.obligation_identity.required_ranges)
-                && previous_required_ranges.get(path)
-                    == Some(&coverage.obligation_identity.required_ranges)
-        });
-        if let Some(validation) = result.get("validation").and_then(Value::as_array) {
-            for route in validation.iter().take(8) {
-                let role = route
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if role.contains("platform")
-                    || role.contains("schema")
-                    || role.contains("generated")
-                {
-                    self.validation_route = route
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    if self.validation_route.is_none() {
-                        self.obligations.insert(
-                            format!("validation:{role}"),
-                            PreEditObligationKind::Platform,
-                        );
-                    }
-                }
-            }
-        }
-        if newly_resolved {
-            self.timing.record_pre_edit_owner_resolved();
-        }
-        let material_after = (
-            self.authoritative_owner.clone(),
-            self.primary_surface.clone(),
-            self.mechanism_evidence,
-            self.obligations.clone(),
-            self.validation_route.clone(),
-        );
-        if material_before != material_after {
-            self.timing.record_pre_edit_material_evidence();
-        }
-        self.refresh_readiness();
-    }
-
-    fn apply_owner_bundle_signal(&mut self, signal: &Value) {
-        let material_before = (
-            self.authoritative_owner.clone(),
-            self.primary_surface.clone(),
-            self.mechanism_evidence,
-            self.obligations.clone(),
-            self.validation_route.clone(),
-        );
-        let owner_state = match signal.get("owner_state").and_then(Value::as_str) {
-            Some("owner_resolved") => SourceOwnerReceiptState::OwnerResolved,
-            _ => SourceOwnerReceiptState::OwnerUnresolved,
-        };
-        let closure_state = match signal.get("closure_state").and_then(Value::as_str) {
-            Some("bundle_ready") => SourceClosureReceiptState::BundleReady,
-            _ => SourceClosureReceiptState::BundleIncomplete,
-        };
-        let snapshot = signal
-            .get("snapshot_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let locator_request_identity = signal
-            .get("locator_request_identity")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let unresolved_ids = signal
-            .get("unresolved_ids")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(ToOwned::to_owned)
-            .collect::<BTreeSet<_>>();
-        self.bundle_question_details = signal
-            .get("unresolved_questions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|question| {
-                Some((
-                    question.get("id")?.as_str()?.to_string(),
-                    question.get("detail")?.as_str()?.trim().to_string(),
-                ))
-            })
-            .filter(|(id, detail)| unresolved_ids.contains(id) && !detail.is_empty())
-            .collect();
-        let receipt = OwnerEvidenceReceiptV2 {
-            receipt_id: signal
-                .get("receipt_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            task_contract_epoch: signal
-                .get("task_contract_epoch")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            owner_id: signal
-                .get("owner_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            source_snapshot_identity: snapshot.clone(),
-            instruction_snapshot_identity: self.instruction_snapshot_identity.clone(),
-            closure_contract_revision: signal
-                .get("closure_contract_revision")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            owner_state,
-            closure_state,
-            unresolved_ids: unresolved_ids.clone(),
-        };
-        let receipt_epoch_changed = self.receipt.as_ref().is_some_and(|current| {
-            current.task_contract_epoch != receipt.task_contract_epoch
-                || current.closure_contract_revision != receipt.closure_contract_revision
-        });
-        let evidence_basis_rebound = self.last_source_snapshot.as_deref()
-            != Some(snapshot.as_str())
-            || self.locator_request_identity != locator_request_identity
-            || self.authoritative_owner.as_deref() != receipt.owner_id.as_deref()
-            || receipt_epoch_changed;
-        if evidence_basis_rebound {
-            self.ranged_evidence.clear();
-            self.required_path_ranges.clear();
-        }
-        if self.is_ready()
-            && ((self.last_source_snapshot.is_some()
-                && self.last_source_snapshot.as_deref() != Some(snapshot.as_str()))
-                || receipt_epoch_changed)
-        {
-            self.reopen(PreEditReopenReason::SourceRevision);
-        }
-        self.last_source_snapshot = Some(snapshot);
-        self.locator_request_identity = locator_request_identity;
-        self.receipt = Some(receipt.clone());
-        if owner_state != SourceOwnerReceiptState::OwnerResolved || receipt.owner_id.is_none() {
-            if self.is_ready() {
-                self.reopen(PreEditReopenReason::NewAmbiguity);
-            }
-            self.state = PreEditConvergenceState::OwnerUnresolved;
-            return;
-        }
-
-        let newly_resolved = self.authoritative_owner.is_none();
-        let Some(owner) = receipt.owner_id else {
-            return;
-        };
-        if self
-            .authoritative_owner
-            .as_ref()
-            .is_some_and(|current| current != &owner)
-        {
-            self.reopen(PreEditReopenReason::ContradictoryEvidence);
-        }
-        self.authoritative_owner = Some(owner);
-        if let Some(primary) = signal
-            .get("primary_path")
-            .and_then(Value::as_str)
-            .map(normalize_source_path)
-        {
-            self.primary_surface = Some(primary.clone());
-            self.closure.insert(primary);
-        }
-        let materialized_paths = signal
-            .get("materialized_paths")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(normalize_source_path)
-            .collect::<BTreeSet<_>>();
-        self.mechanism_evidence = self
-            .primary_surface
-            .as_ref()
-            .is_some_and(|primary| materialized_paths.contains(primary));
-        self.closure.extend(materialized_paths.iter().cloned());
-        self.validation_route = signal
-            .get("validation_route")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        self.obligations.retain(|_, kind| {
-            matches!(
-                *kind,
-                PreEditObligationKind::TaskProof | PreEditObligationKind::Truncation
-            )
-        });
-        let previous_required_ranges = std::mem::take(&mut self.required_path_ranges);
-        for unresolved_id in unresolved_ids {
-            self.obligations.insert(
-                format!("bundle:{unresolved_id}"),
-                PreEditObligationKind::Ambiguity,
-            );
-        }
-        for section in signal
-            .get("required_source_sections")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(path) = section.get("path").and_then(Value::as_str) else {
-                continue;
-            };
-            let path = normalize_source_path(path);
-            if path.is_empty() || materialized_paths.contains(&path) {
-                continue;
-            }
-            let kind = match section.get("obligation_kind").and_then(Value::as_str) {
-                Some("primary") => PreEditObligationKind::Primary,
-                Some("caller") => PreEditObligationKind::Caller,
-                Some("test") => PreEditObligationKind::Test,
-                Some("contract") => PreEditObligationKind::Contract,
-                Some("generated") => PreEditObligationKind::Generated,
-                _ => continue,
-            };
-            self.obligations.insert(format!("path:{path}"), kind);
-            if let Some(range) = source_evidence_range(Some(section)) {
-                self.required_path_ranges
-                    .entry(path)
-                    .or_default()
-                    .push(range);
-            }
-        }
-        canonicalize_required_ranges(&mut self.required_path_ranges);
-        self.ranged_evidence.retain(|path, coverage| {
-            let obligation_kind = self.obligations.get(&format!("path:{path}")).copied();
-            self.required_path_ranges.get(path)
-                == Some(&coverage.obligation_identity.required_ranges)
-                && previous_required_ranges.get(path)
-                    == Some(&coverage.obligation_identity.required_ranges)
-                && obligation_kind.map(pre_edit_obligation_kind_name)
-                    == Some(coverage.obligation_identity.obligation_kind.as_str())
-        });
-        self.state = PreEditConvergenceState::OwnerResolved;
-        if newly_resolved {
-            self.timing.record_pre_edit_owner_resolved();
-        }
-        if closure_state == SourceClosureReceiptState::BundleReady && self.obligations.is_empty() {
-            self.mechanism_evidence = true;
-        }
-        let material_after = (
-            self.authoritative_owner.clone(),
-            self.primary_surface.clone(),
-            self.mechanism_evidence,
-            self.obligations.clone(),
-            self.validation_route.clone(),
-        );
-        if material_before != material_after {
-            self.timing.record_pre_edit_material_evidence();
-        }
-        self.refresh_readiness();
-    }
-
-    fn add_path_obligations(
-        &mut self,
-        evidence: Option<&Value>,
-        represented_paths: &BTreeSet<String>,
-        kind: PreEditObligationKind,
-        relevant: impl Fn(&str) -> bool,
-    ) {
-        for item in evidence
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .take(16)
-        {
-            let Some(path) = item.get("path").and_then(Value::as_str) else {
-                continue;
-            };
-            let role = item.get("role").and_then(Value::as_str).unwrap_or_default();
-            let path = normalize_source_path(path);
-            if relevant(role) && !represented_paths.contains(&path) {
-                self.obligations.insert(format!("path:{path}"), kind);
-                if let Some(range) = source_evidence_range(Some(item)) {
-                    self.required_path_ranges
-                        .entry(path)
-                        .or_default()
-                        .push(range);
-                }
-            }
-        }
-    }
-
-    fn apply_read_signal(&mut self, signal: &Value) {
-        let Some(path) = signal.get("path").and_then(Value::as_str) else {
-            return;
-        };
-        let path = normalize_source_path(path);
-        let obligations_before = self.obligations.clone();
-        let truncated = signal
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let mechanism_before = self.mechanism_evidence;
-        let required_ranges = self
-            .required_path_ranges
-            .get(&path)
-            .cloned()
-            .unwrap_or_default();
-        let ranged_evidence_complete = !truncated
-            && !required_ranges.is_empty()
-            && self.record_ranged_read(&path, &required_ranges, signal);
-        let grants_path_credit =
-            !truncated && (required_ranges.is_empty() || ranged_evidence_complete);
-        if grants_path_credit {
-            if self.owner_resolved() && self.source_target_is_supported(&path) {
-                self.closure.insert(path.clone());
-            }
-            if self.primary_surface.as_deref() == Some(path.as_str()) {
-                self.mechanism_evidence = true;
-            }
-            self.obligations.remove(&format!("path:{path}"));
-            self.obligations.remove(&format!("truncation:{path}"));
-            self.obligations.remove(&format!("hydration:{path}"));
-            if !self
-                .obligations
-                .keys()
-                .any(|obligation| obligation.starts_with("hydration:"))
-            {
-                self.obligations.remove("hydration-status:search");
-            }
-        } else {
-            if truncated {
-                if self.is_ready() {
-                    self.reopen(PreEditReopenReason::IncompleteEvidence);
-                }
-                self.obligations.insert(
-                    format!("truncation:{path}"),
-                    PreEditObligationKind::Truncation,
-                );
-            }
-        }
-        if obligations_before != self.obligations || mechanism_before != self.mechanism_evidence {
-            self.timing.record_pre_edit_material_evidence();
-        }
-        self.refresh_readiness();
-    }
-
-    fn record_ranged_read(
-        &mut self,
-        path: &str,
-        required_ranges: &[SourceEvidenceRange],
-        signal: &Value,
-    ) -> bool {
-        let Some(basis_value) = signal.get("authoritative_source_basis") else {
-            self.ranged_evidence.remove(path);
-            return false;
-        };
-        if basis_value.is_null() {
-            self.ranged_evidence.remove(path);
-            return false;
-        }
-        let Ok(mut source_basis) =
-            serde_json::from_value::<AuthoritativeSourceBasis>(basis_value.clone())
-        else {
-            self.ranged_evidence.remove(path);
-            return false;
-        };
-        let Some(obligation_value) = signal.get("obligation_identity") else {
-            self.ranged_evidence.remove(path);
-            return false;
-        };
-        let Ok(mut obligation_identity) =
-            serde_json::from_value::<ObligationIdentity>(obligation_value.clone())
-        else {
-            self.ranged_evidence.remove(path);
-            return false;
-        };
-        source_basis.path = normalize_source_path(&source_basis.path);
-        canonicalize_ranges(&mut obligation_identity.required_ranges);
-        let full_file_sha256 = signal
-            .get("full_file_sha256")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let obligation_kind = self.obligations.get(&format!("path:{path}")).copied();
-        let context_matches = source_basis.path == path
-            && !source_basis.source_snapshot_identity.is_empty()
-            && !obligation_identity.locator_request_identity.is_empty()
-            && !obligation_identity.owner_id.is_empty()
-            && !obligation_identity.task_contract_epoch.is_empty()
-            && !full_file_sha256.is_empty()
-            && full_file_sha256 == source_basis.file_content_hash
-            && self.last_source_snapshot.as_deref()
-                == Some(source_basis.source_snapshot_identity.as_str())
-            && self.locator_request_identity.as_deref()
-                == Some(obligation_identity.locator_request_identity.as_str())
-            && self.authoritative_owner.as_deref() == Some(obligation_identity.owner_id.as_str())
-            && self.receipt.as_ref().is_some_and(|receipt| {
-                receipt.owner_state == SourceOwnerReceiptState::OwnerResolved
-                    && receipt.owner_id.as_deref() == Some(obligation_identity.owner_id.as_str())
-                    && receipt.task_contract_epoch == obligation_identity.task_contract_epoch
-            })
-            && obligation_kind.map(pre_edit_obligation_kind_name)
-                == Some(obligation_identity.obligation_kind.as_str())
-            && obligation_identity.required_ranges == required_ranges;
-        if !context_matches {
-            self.ranged_evidence.remove(path);
-            return false;
-        }
-        let (Some(start_line), Some(end_line)) = (
-            signal.get("start_line").and_then(Value::as_u64),
-            signal.get("end_line").and_then(Value::as_u64),
-        ) else {
-            return false;
-        };
-        let (Ok(start_line), Ok(end_line)) =
-            (usize::try_from(start_line), usize::try_from(end_line))
-        else {
-            return false;
-        };
-        let total_lines = signal
-            .get("total_lines")
-            .and_then(Value::as_u64)
-            .and_then(|total| usize::try_from(total).ok());
-        if start_line == 0
-            || end_line < start_line
-            || total_lines.is_some_and(|total| end_line > total)
-        {
-            return false;
-        }
-        let coverage = self
-            .ranged_evidence
-            .entry(path.to_string())
-            .or_insert_with(|| RangedEvidenceCoverage {
-                source_basis: source_basis.clone(),
-                obligation_identity: obligation_identity.clone(),
-                observed_ranges: Vec::new(),
-            });
-        if coverage.source_basis != source_basis
-            || coverage.obligation_identity != obligation_identity
-        {
-            *coverage = RangedEvidenceCoverage {
-                source_basis,
-                obligation_identity,
-                observed_ranges: Vec::new(),
-            };
-        }
-        coverage.observed_ranges.push(SourceEvidenceRange {
-            start_line,
-            end_line,
-        });
-        canonicalize_ranges(&mut coverage.observed_ranges);
-        ranges_cover(&coverage.observed_ranges, required_ranges)
-    }
-
-    fn apply_search_signal(&mut self, signal: &Value) {
-        let obligations_before = self.obligations.clone();
-        let closure_before = self.closure.clone();
-        let mechanism_before = self.mechanism_evidence;
-        let match_paths = signal_string_set(signal.get("match_paths"));
-        let match_count = signal
-            .get("match_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(match_paths.len() as u64);
-        let mut hydrated_paths = signal_string_set(signal.get("hydrated_paths"));
-        if let Some(path) = signal.get("hydrated_path").and_then(Value::as_str) {
-            let path = normalize_source_path(path);
-            if !path.is_empty() {
-                hydrated_paths.insert(path);
-            }
-        }
-        let coverage_incomplete = signal
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || !signal
-                .get("coverage_complete")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
-            || !signal
-                .get("index_complete")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-        if coverage_incomplete {
-            if self.is_ready() {
-                self.reopen(PreEditReopenReason::IncompleteEvidence);
-            }
-            self.obligations.insert(
-                "truncation:search".to_string(),
-                PreEditObligationKind::Truncation,
-            );
-        }
-
-        let hydration_status = signal
-            .get("hydration_status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let omission_count = signal
-            .get("hydration_omission_count")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let hydration_truncated = signal
-            .get("hydration_truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let status_is_exact = matches!(
-            hydration_status,
-            "hydrated_authoritative_definition"
-                | "hydrated_structured_context"
-                | "hydrated_deterministic_window"
-                | "hydrated_bounded_packet"
-        );
-        let hydration_complete = if match_count == 0 {
-            hydration_status == "skipped_no_unique_match"
-                && !coverage_incomplete
-                && omission_count == 0
-        } else {
-            status_is_exact
-                && omission_count == 0
-                && !hydration_truncated
-                && match_count > 0
-                && !match_paths.is_empty()
-                && match_paths.is_subset(&hydrated_paths)
-        };
-
-        if coverage_incomplete || !hydration_complete {
-            self.obligations.insert(
-                "truncation:search".to_string(),
-                PreEditObligationKind::Truncation,
-            );
-        } else {
-            self.obligations.remove("truncation:search");
-        }
-
-        for path in &hydrated_paths {
-            self.closure.insert(path.clone());
-            if !self.required_path_ranges.contains_key(path) {
-                self.obligations.remove(&format!("path:{path}"));
-                self.obligations.remove(&format!("truncation:{path}"));
-                if self.primary_surface.as_deref() == Some(path.as_str()) {
-                    self.mechanism_evidence = true;
-                }
-            }
-            self.obligations.remove(&format!("hydration:{path}"));
-        }
-        if hydration_complete {
-            if !self
-                .obligations
-                .keys()
-                .any(|obligation| obligation.starts_with("hydration:"))
-            {
-                self.obligations.remove("hydration-status:search");
-            }
-            if let Some(resolved_detail) = signal
-                .get("resolved_question_detail")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|detail| !detail.is_empty())
-            {
-                let resolved_ids = self
-                    .bundle_question_details
-                    .iter()
-                    .filter(|(_, detail)| detail.trim() == resolved_detail)
-                    .map(|(id, _)| id.clone())
-                    .collect::<Vec<_>>();
-                for id in resolved_ids {
-                    self.bundle_question_details.remove(&id);
-                    self.obligations.remove(&format!("bundle:{id}"));
-                }
-            }
-        } else if match_count > 0 {
-            if self.is_ready() {
-                self.reopen(PreEditReopenReason::IncompleteEvidence);
-            }
-            self.obligations.insert(
-                "hydration-status:search".to_string(),
-                PreEditObligationKind::Truncation,
-            );
-            for path in match_paths.difference(&hydrated_paths) {
-                self.obligations.insert(
-                    format!("hydration:{path}"),
-                    PreEditObligationKind::Truncation,
-                );
-            }
-        }
-        if obligations_before != self.obligations
-            || closure_before != self.closure
-            || mechanism_before != self.mechanism_evidence
-        {
-            self.timing.record_pre_edit_material_evidence();
-        }
-        self.refresh_readiness();
-    }
-
-    fn take_readiness_handoff(&mut self) -> Option<String> {
-        if !self.readiness_handoff_pending || !self.workspace_untouched {
-            return None;
-        }
-        self.readiness_handoff_pending = false;
-        self.readiness_handoff_emitted = true;
-        self.timing.record_pre_edit_material_evidence();
-        Some(format!(
-            "Pre-edit convergence reached: authoritative owner `{}` and implementation surface `{}` are established; implementation-affecting closure is complete. Proceed with the pending mutation. Routine post-edit validation routing does not block this edit.",
-            self.authoritative_owner.as_deref().unwrap_or("unknown"),
-            self.primary_surface.as_deref().unwrap_or("unknown"),
-        ))
-    }
-
-    fn apply_validation_result(&mut self, class: PreEditValidationClass, success: bool) {
-        if !self.active || !self.workspace_untouched || !success {
-            return;
-        }
-        let before = self.obligations.len();
-        self.obligations.remove("task-mandated-proof");
-        if class == PreEditValidationClass::FocusedImplementationEvidence {
-            self.obligations
-                .retain(|_, kind| *kind != PreEditObligationKind::Platform);
-            self.validation_route = Some("focused-pre-edit-evidence".to_string());
-        }
-        if before != self.obligations.len() {
-            self.timing.record_pre_edit_material_evidence();
-        }
-        self.refresh_readiness();
-    }
-}
-
-enum SourceOperation {
-    Locate {
-        path_anchor: Option<String>,
-        force_fresh: bool,
-        introduces_uncertainty: bool,
-    },
-    Read {
-        path: String,
-        force_fresh: bool,
-    },
-    Search {
-        paths: Vec<String>,
-        force_fresh: bool,
-        introduces_uncertainty: bool,
-    },
-    ArtifactRecovery,
-}
-
-fn source_operation(tool_name: &ToolName, payload: &ToolPayload) -> Option<SourceOperation> {
-    if tool_name_matches(tool_name, "read_tool_output") {
-        return Some(SourceOperation::ArtifactRecovery);
-    }
-    let ToolPayload::Function { arguments } = payload else {
-        return None;
-    };
-    let arguments = serde_json::from_str::<Value>(arguments).ok()?;
-    if tool_name_matches(tool_name, "locate_task") {
-        return Some(SourceOperation::Locate {
-            path_anchor: arguments
-                .get("path_anchor")
-                .and_then(Value::as_str)
-                .map(normalize_source_path),
-            force_fresh: arguments
-                .get("force_fresh")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            introduces_uncertainty: source_question_introduces_uncertainty(&arguments),
-        });
-    }
-    if tool_name_matches(tool_name, "read_file_span") {
-        return Some(SourceOperation::Read {
-            path: normalize_source_path(arguments.get("path")?.as_str()?),
-            force_fresh: arguments
-                .get("force_fresh")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        });
-    }
-    if tool_name_matches(tool_name, "search_source") {
-        let paths = arguments
-            .get("paths")
-            .and_then(Value::as_array)
-            .map(|paths| {
-                paths
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(normalize_source_path)
-                    .filter(|path| !path.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        return Some(SourceOperation::Search {
-            paths,
-            force_fresh: arguments
-                .get("force_fresh")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            introduces_uncertainty: source_question_introduces_uncertainty(&arguments),
-        });
-    }
-    None
-}
-
-fn source_question_introduces_uncertainty(arguments: &Value) -> bool {
-    arguments
-        .get("source_question")
-        .and_then(Value::as_object)
-        .and_then(|question| question.get("detail"))
-        .and_then(Value::as_str)
-        .is_some_and(|detail| !detail.trim().is_empty())
-}
-
-fn value_paths(value: Option<&Value>) -> BTreeSet<String> {
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.get("path").and_then(Value::as_str))
-        .map(normalize_source_path)
-        .collect()
-}
-
-fn signal_string_set(value: Option<&Value>) -> BTreeSet<String> {
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(normalize_source_path)
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
-fn source_evidence_range(value: Option<&Value>) -> Option<SourceEvidenceRange> {
-    let span = value?.get("span")?;
-    let start_line = usize::try_from(span.get("start_line")?.as_u64()?).ok()?;
-    let end_line = usize::try_from(span.get("end_line")?.as_u64()?).ok()?;
-    (start_line > 0 && end_line >= start_line).then_some(SourceEvidenceRange {
-        start_line,
-        end_line,
-    })
-}
-
-fn canonicalize_required_ranges(required_ranges: &mut BTreeMap<String, Vec<SourceEvidenceRange>>) {
-    for ranges in required_ranges.values_mut() {
-        canonicalize_ranges(ranges);
-    }
-    required_ranges.retain(|_, ranges| !ranges.is_empty());
-}
-
-fn canonicalize_ranges(ranges: &mut Vec<SourceEvidenceRange>) {
-    ranges.sort_by_key(|range| (range.start_line, range.end_line));
-    let mut merged: Vec<SourceEvidenceRange> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        if let Some(previous) = merged.last_mut()
-            && range.start_line <= previous.end_line.saturating_add(1)
-        {
-            previous.end_line = previous.end_line.max(range.end_line);
-        } else {
-            merged.push(range);
-        }
-    }
-    *ranges = merged;
-}
-
-fn ranges_cover(observed: &[SourceEvidenceRange], required: &[SourceEvidenceRange]) -> bool {
-    required.iter().all(|required_range| {
-        observed.iter().any(|observed_range| {
-            observed_range.start_line <= required_range.start_line
-                && observed_range.end_line >= required_range.end_line
-        })
-    })
-}
-
-fn pre_edit_obligation_kind_name(kind: PreEditObligationKind) -> &'static str {
-    match kind {
-        PreEditObligationKind::Primary => "primary",
-        PreEditObligationKind::Caller => "caller",
-        PreEditObligationKind::Test => "test",
-        PreEditObligationKind::Contract => "contract",
-        PreEditObligationKind::Generated => "generated",
-        PreEditObligationKind::Platform => "platform",
-        PreEditObligationKind::Truncation => "truncation",
-        PreEditObligationKind::Ambiguity => "ambiguity",
-        PreEditObligationKind::TaskProof => "task_proof",
-    }
-}
-
-fn normalize_source_path(path: &str) -> String {
-    path.trim()
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .to_string()
-}
-
-fn obligation_path(obligation: &str) -> Option<&str> {
-    obligation
-        .strip_prefix("path:")
-        .or_else(|| obligation.strip_prefix("hydration:"))
-}
-
 impl DeterministicDispatchLedger {
-    fn new(seed: PreEditConvergenceSeed, timing: Arc<TurnTimingState>) -> Self {
-        let active_obligations = if seed.active {
-            EvidenceObligationSet::discovery()
-        } else {
-            EvidenceObligationSet::default()
-        };
+    fn new(timing: Arc<TurnTimingState>) -> Self {
         Self {
-            completed: BTreeMap::new(),
-            active_obligations,
-            pre_edit: PreEditConvergence::new(seed, timing),
             blocked_wait_gate: None,
+            timing,
         }
     }
 }
@@ -1959,14 +390,8 @@ impl DeterministicDispatchLedger {
 #[derive(Default)]
 struct SamplingRequestSignalState {
     outcomes: Vec<SamplingToolOutcome>,
-    pending_dispatches: BTreeMap<u64, PendingDeterministicDispatch>,
-    pending_pre_edit_validation: BTreeMap<u64, PreEditValidationClass>,
-    deterministic_cycle: Vec<DeterministicCycleEntry>,
     registered_count: usize,
     wait_call_count: usize,
-    has_unknown_identity: bool,
-    saw_source_discovery: bool,
-    saw_source_evidence: bool,
     saw_artifact_read: bool,
     saw_validation: bool,
     saw_mutation: bool,
@@ -1975,114 +400,6 @@ struct SamplingRequestSignalState {
     direct_code_mode_exec_count: usize,
     code_mode_nested_tool_count: usize,
     authoritative_wait_observations: Vec<AuthoritativeWaitObservation>,
-    same_generation_reads: BTreeMap<String, SameGenerationReadFlight>,
-}
-
-#[derive(Clone)]
-struct SameGenerationReadFlight {
-    leader_ordinal: u64,
-    sender: watch::Sender<SameGenerationReadOutcome>,
-}
-
-#[derive(Clone, Debug)]
-enum SameGenerationReadOutcome {
-    Pending,
-    Shareable(Box<SameGenerationSharedRead>),
-    RetryIndependently,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SameGenerationSharedRead {
-    pub(crate) authoritative_execution_identity: String,
-    response: ResponseInputItem,
-    pub(crate) transitions_committed: bool,
-    pub(crate) joined_projection_supported: bool,
-}
-
-impl SameGenerationSharedRead {
-    pub(crate) fn project_for_call(&self, call_id: &str) -> Option<ResponseInputItem> {
-        if !self.transitions_committed || !self.joined_projection_supported {
-            return None;
-        }
-        match &self.response {
-            ResponseInputItem::FunctionCallOutput { output, .. } => {
-                Some(ResponseInputItem::FunctionCallOutput {
-                    call_id: call_id.to_string(),
-                    output: output.clone(),
-                })
-            }
-            _ => None,
-        }
-    }
-}
-
-pub(crate) struct SameGenerationSingleflightLeader {
-    key: String,
-    pub(crate) ordinal: u64,
-    pub(crate) authoritative_execution_identity: String,
-    sender: watch::Sender<SameGenerationReadOutcome>,
-    state: Arc<Mutex<SamplingRequestSignalState>>,
-    resolved: Arc<AtomicBool>,
-}
-
-impl SameGenerationSingleflightLeader {
-    fn resolve(&self, outcome: SameGenerationReadOutcome) {
-        if self.resolved.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.sender.send_replace(outcome);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
-            .same_generation_reads
-            .get(&self.key)
-            .is_some_and(|flight| flight.leader_ordinal == self.ordinal)
-        {
-            state.same_generation_reads.remove(&self.key);
-        }
-    }
-}
-
-impl Drop for SameGenerationSingleflightLeader {
-    fn drop(&mut self) {
-        self.resolve(SameGenerationReadOutcome::RetryIndependently);
-    }
-}
-
-pub(crate) struct SameGenerationSingleflightFollower {
-    pub(crate) leader_ordinal: u64,
-    pub(crate) authoritative_execution_identity: String,
-    receiver: watch::Receiver<SameGenerationReadOutcome>,
-}
-
-impl SameGenerationSingleflightFollower {
-    pub(crate) async fn wait_for_shareable(
-        &mut self,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Option<SameGenerationSharedRead> {
-        loop {
-            match self.receiver.borrow().clone() {
-                SameGenerationReadOutcome::Pending => {}
-                SameGenerationReadOutcome::Shareable(shared) => return Some(*shared),
-                SameGenerationReadOutcome::RetryIndependently => return None,
-            }
-            tokio::select! {
-                _ = cancellation.cancelled() => return None,
-                changed = self.receiver.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub(crate) enum SameGenerationSingleflightRegistration {
-    Leader(SameGenerationSingleflightLeader),
-    Follower(SameGenerationSingleflightFollower),
 }
 
 #[derive(Clone, Debug)]
@@ -2095,22 +412,12 @@ pub(crate) struct PendingOwnerDrainedContinuation {
 pub(crate) struct SamplingRequestSignalCollector {
     next_ordinal: Arc<AtomicU64>,
     state: Arc<Mutex<SamplingRequestSignalState>>,
-    state_revision: Option<String>,
     dispatch_ledger: Option<Arc<Mutex<DeterministicDispatchLedger>>>,
 }
 
 pub(crate) struct SamplingToolCallRegistration {
     pub(crate) ordinal: u64,
-    pub(crate) suppression: Option<PreDispatchSuppression>,
     pub(crate) blocked_wait_guard: Option<BlockedWaitGuard>,
-    pub(crate) replay_response: Option<ResponseInputItem>,
-    pub(crate) replay_artifact: Option<DeterministicReplayArtifact>,
-    pub(crate) replay_fallback_key: Option<String>,
-    pub(crate) replay_fallback_locator: bool,
-    pub(crate) repeated_discovery: bool,
-    pub(crate) discovery_after_owner_resolution: bool,
-    pub(crate) source_advisory: Option<PreDispatchAdvisory>,
-    pub(crate) same_generation_singleflight: Option<SameGenerationSingleflightRegistration>,
 }
 
 impl SamplingRequestSignalCollector {
@@ -2122,7 +429,6 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.registered_count = state.registered_count.saturating_add(1);
-        state.has_unknown_identity = true;
         ordinal
     }
 
@@ -2130,31 +436,13 @@ impl SamplingRequestSignalCollector {
         &self,
         tool_name: &ToolName,
         payload: &ToolPayload,
-        current_call_id: &str,
+        _current_call_id: &str,
     ) -> SamplingToolCallRegistration {
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
-        let discovery = is_owner_discovery_tool(tool_name);
         let wait = is_wait_tool(tool_name);
         let direct_code_mode_exec = crate::tools::code_mode::is_exec_tool_name(tool_name);
-        let identity =
-            deterministic_dispatch_identity(tool_name, payload, self.state_revision.as_deref());
         let action_identity = deterministic_action_identity(tool_name, payload);
-        let pre_edit_validation = pre_edit_validation_class(tool_name, payload);
-
-        let mut repeated_discovery = false;
-        let mut discovery_after_owner_resolution = false;
-        let mut prior_outcome = None;
-        let mut replay_response = None;
-        let mut replay_artifact = None;
-        let suppression = pre_edit_validation.and_then(|class| {
-            let ledger = self.dispatch_ledger.as_ref()?;
-            ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pre_edit
-                .validation_suppression(class)
-        });
-        let mut source_advisory = None;
+        let validation = is_validation_invocation(tool_name, payload);
         let blocked_wait_guard = action_identity.as_ref().and_then(|action_identity| {
             let ledger = self.dispatch_ledger.as_ref()?;
             ledger
@@ -2165,28 +453,7 @@ impl SamplingRequestSignalCollector {
                 .filter(|gate| gate.action_identity == *action_identity)
                 .map(|gate| gate.guard.clone())
         });
-        if let (Some(identity), Some(ledger)) = (identity.as_ref(), self.dispatch_ledger.as_ref()) {
-            let ledger = ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let prior = ledger.completed.get(identity).cloned();
-            prior_outcome = prior.as_ref().and_then(|record| {
-                serde_json::to_value(&record.response)
-                    .ok()
-                    .map(canonicalize_json)
-                    .and_then(|value| serde_json::to_string(&value).ok())
-            });
-            repeated_discovery = prior_outcome.is_some() && discovery;
-            discovery_after_owner_resolution = discovery && ledger.pre_edit.owner_resolved();
-            if let Some(prior) = prior {
-                replay_response = Some(provenance_preserving_replay(&prior, current_call_id));
-                replay_artifact = Some(prior.artifact);
-            } else if suppression.is_none() {
-                source_advisory = ledger.pre_edit.source_advisory(tool_name, payload);
-            }
-        }
 
-        let signal_state = Arc::clone(&self.state);
         let mut state = self
             .state
             .lock()
@@ -2198,97 +465,14 @@ impl SamplingRequestSignalCollector {
         if direct_code_mode_exec {
             state.direct_code_mode_exec_count = state.direct_code_mode_exec_count.saturating_add(1);
         }
-        state.saw_source_discovery |= discovery;
-        state.saw_source_evidence |= is_source_evidence_tool(tool_name);
         state.saw_artifact_read |= tool_name_matches(tool_name, "read_tool_output");
-        state.saw_validation |= pre_edit_validation.is_some();
+        state.saw_validation |= validation;
         state.saw_mutation |= is_mutation_tool(tool_name);
         state.saw_coordination |= is_coordination_tool(tool_name);
-        if let Some(class) = pre_edit_validation {
-            state.pending_pre_edit_validation.insert(ordinal, class);
-        }
-        let same_generation_singleflight = if replay_response.is_none()
-            && let Some(key) = identity.as_ref()
-        {
-            let authoritative_execution_identity =
-                format!("sha256:{:x}", Sha256::digest(key.as_bytes()));
-            if let Some(flight) = state.same_generation_reads.get(key) {
-                Some(SameGenerationSingleflightRegistration::Follower(
-                    SameGenerationSingleflightFollower {
-                        leader_ordinal: flight.leader_ordinal,
-                        authoritative_execution_identity,
-                        receiver: flight.sender.subscribe(),
-                    },
-                ))
-            } else {
-                let (sender, _receiver) = watch::channel(SameGenerationReadOutcome::Pending);
-                state.same_generation_reads.insert(
-                    key.clone(),
-                    SameGenerationReadFlight {
-                        leader_ordinal: ordinal,
-                        sender: sender.clone(),
-                    },
-                );
-                Some(SameGenerationSingleflightRegistration::Leader(
-                    SameGenerationSingleflightLeader {
-                        key: key.clone(),
-                        ordinal,
-                        authoritative_execution_identity,
-                        sender,
-                        state: signal_state,
-                        resolved: Arc::new(AtomicBool::new(false)),
-                    },
-                ))
-            }
-        } else {
-            None
-        };
-        let replay_fallback_key = replay_response.as_ref().and(identity.clone());
-        match (identity, prior_outcome, replay_response.is_some()) {
-            (Some(key), Some(outcome), true) => {
-                state.deterministic_cycle.push(DeterministicCycleEntry {
-                    ordinal,
-                    key,
-                    outcome,
-                });
-                state.outcomes.push(SamplingToolOutcome::plain(
-                    ordinal,
-                    SamplingToolOutcomeKind::Success,
-                    None,
-                ));
-            }
-            (Some(key), prior_outcome, false) => {
-                if let Some(outcome) = prior_outcome {
-                    state.deterministic_cycle.push(DeterministicCycleEntry {
-                        ordinal,
-                        key: key.clone(),
-                        outcome,
-                    });
-                }
-                state.pending_dispatches.insert(
-                    ordinal,
-                    PendingDeterministicDispatch {
-                        key,
-                        locator: discovery,
-                    },
-                );
-            }
-            (None, _, _) => state.has_unknown_identity = true,
-            (Some(_), None, true) => unreachable!("replay records always have a response body"),
-        }
 
         SamplingToolCallRegistration {
             ordinal,
-            suppression,
             blocked_wait_guard,
-            replay_response,
-            replay_artifact,
-            replay_fallback_key,
-            replay_fallback_locator: discovery,
-            repeated_discovery,
-            discovery_after_owner_resolution,
-            source_advisory,
-            same_generation_singleflight,
         }
     }
 
@@ -2306,152 +490,16 @@ impl SamplingRequestSignalCollector {
         }
     }
 
-    pub(crate) fn record_suppressed_result(&self, ordinal: u64, response: &ResponseInputItem) {
-        let outcome =
-            canonical_response_body(response).and_then(|value| serde_json::to_string(&value).ok());
+    pub(crate) fn record_suppressed_result(&self, ordinal: u64, _response: &ResponseInputItem) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending = state.pending_dispatches.remove(&ordinal);
-        state.pending_pre_edit_validation.remove(&ordinal);
-        match (pending, outcome) {
-            (Some(pending), Some(outcome)) => {
-                state.deterministic_cycle.push(DeterministicCycleEntry {
-                    ordinal,
-                    key: pending.key,
-                    outcome,
-                });
-            }
-            (Some(_), None) => state.has_unknown_identity = true,
-            (None, _) => {}
-        }
         state.outcomes.push(SamplingToolOutcome::plain(
             ordinal,
             SamplingToolOutcomeKind::Success,
             None,
         ));
-    }
-
-    pub(crate) fn record_deferred_validation_result(
-        &self,
-        ordinal: u64,
-        response: &ResponseInputItem,
-    ) {
-        let outcome =
-            canonical_response_body(response).and_then(|value| serde_json::to_string(&value).ok());
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending = state.pending_dispatches.remove(&ordinal);
-        state.pending_pre_edit_validation.remove(&ordinal);
-        match (pending, outcome) {
-            (Some(pending), Some(outcome)) => {
-                state.deterministic_cycle.push(DeterministicCycleEntry {
-                    ordinal,
-                    key: pending.key,
-                    outcome,
-                });
-            }
-            (Some(_), None) => state.has_unknown_identity = true,
-            (None, _) => {}
-        }
-        state.outcomes.push(SamplingToolOutcome::from_signal(
-            ordinal,
-            ToolOutputOutcomeContext::skipped(Some(ToolOutputSkipDisposition::Deferred)),
-            None,
-            None,
-        ));
-    }
-
-    pub(crate) fn record_source_advisory_physical_operation(&self) {
-        if let Some(ledger) = &self.dispatch_ledger {
-            ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pre_edit
-                .timing
-                .record_pre_edit_broad_discovery_after_ready();
-        }
-    }
-
-    pub(crate) fn complete_same_generation_leader(
-        &self,
-        leader: &SameGenerationSingleflightLeader,
-        outcome_context: ToolOutputOutcomeContext,
-        response: &ResponseInputItem,
-    ) {
-        if same_generation_response_is_safely_shareable(outcome_context, response) {
-            leader.resolve(SameGenerationReadOutcome::Shareable(Box::new(
-                SameGenerationSharedRead {
-                    authoritative_execution_identity: leader
-                        .authoritative_execution_identity
-                        .clone(),
-                    response: response.clone(),
-                    transitions_committed: true,
-                    joined_projection_supported: true,
-                },
-            )));
-        } else {
-            leader.resolve(SameGenerationReadOutcome::RetryIndependently);
-        }
-    }
-
-    pub(crate) fn fail_same_generation_leader(&self, leader: &SameGenerationSingleflightLeader) {
-        leader.resolve(SameGenerationReadOutcome::RetryIndependently);
-    }
-
-    pub(crate) fn record_joined_same_generation_result(
-        &self,
-        ordinal: u64,
-        response: &ResponseInputItem,
-        authoritative_execution_identity: &str,
-    ) {
-        let outcome = canonical_response_body(response).and_then(|result| {
-            serde_json::to_string(&canonicalize_json(serde_json::json!({
-                "disposition": "joined_reused",
-                "authoritative_execution_identity": authoritative_execution_identity,
-                "result": result,
-            })))
-            .ok()
-        });
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending = state.pending_dispatches.remove(&ordinal);
-        state.pending_pre_edit_validation.remove(&ordinal);
-        match (pending, outcome) {
-            (Some(pending), Some(outcome)) => {
-                state.deterministic_cycle.push(DeterministicCycleEntry {
-                    ordinal,
-                    key: pending.key,
-                    outcome,
-                });
-            }
-            (Some(_), None) => state.has_unknown_identity = true,
-            (None, _) => {}
-        }
-        state.outcomes.push(SamplingToolOutcome::plain(
-            ordinal,
-            SamplingToolOutcomeKind::Success,
-            None,
-        ));
-    }
-
-    pub(crate) fn activate_replay_fallback(&self, ordinal: u64, key: String, locator: bool) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.outcomes.retain(|outcome| outcome.ordinal != ordinal);
-        state
-            .deterministic_cycle
-            .retain(|entry| entry.ordinal != ordinal);
-        state
-            .pending_dispatches
-            .insert(ordinal, PendingDeterministicDispatch { key, locator });
     }
 
     pub(crate) fn record_accepted_deterministic_continuation_receipts(
@@ -2466,7 +514,6 @@ impl SamplingRequestSignalCollector {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             ledger
-                .pre_edit
                 .timing
                 .record_accepted_deterministic_continuation_receipts(receipts);
         }
@@ -2545,49 +592,16 @@ impl SamplingRequestSignalCollector {
         state.authoritative_wait_observations.first().cloned()
     }
 
-    pub(crate) fn record_failure_with_mutation(&self, ordinal: u64, mutation_advanced: bool) {
+    pub(crate) fn record_failure_with_mutation(&self, ordinal: u64, _mutation_advanced: bool) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.pending_dispatches.remove(&ordinal);
-        state.pending_pre_edit_validation.remove(&ordinal);
-        state.has_unknown_identity = true;
         state.outcomes.push(SamplingToolOutcome::plain(
             ordinal,
             SamplingToolOutcomeKind::Failure,
             None,
         ));
-        drop(state);
-        if let Some(ledger) = self.dispatch_ledger.as_ref() {
-            let mut ledger = ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if mutation_advanced {
-                ledger.pre_edit.record_mutation_advance(false);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_response_result(
-        &self,
-        ordinal: u64,
-        success: bool,
-        signal: Option<Value>,
-        response: &ResponseInputItem,
-    ) {
-        self.record_response_result_with_mutation(
-            ordinal,
-            ToolOutputOutcomeContext::new(if success {
-                ToolOutputOutcome::Success
-            } else {
-                ToolOutputOutcome::Failure
-            }),
-            signal,
-            response,
-            false,
-        );
     }
 
     pub(crate) fn record_response_result_with_mutation(
@@ -2595,111 +609,20 @@ impl SamplingRequestSignalCollector {
         ordinal: u64,
         outcome_context: ToolOutputOutcomeContext,
         signal: Option<Value>,
-        response: &ResponseInputItem,
-        mutation_advanced: bool,
+        _response: &ResponseInputItem,
+        _mutation_advanced: bool,
     ) {
-        let kind = sampling_tool_outcome_kind(outcome_context.outcome, signal.as_ref());
         let plan = sampling_plan(signal.as_ref());
-        let outcome =
-            canonical_response_body(response).and_then(|value| serde_json::to_string(&value).ok());
-        let (pending, pre_edit_validation) = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pending = state.pending_dispatches.remove(&ordinal);
-            let pre_edit_validation = state.pending_pre_edit_validation.remove(&ordinal);
-            match (pending.as_ref(), outcome.as_ref()) {
-                (Some(pending), Some(outcome)) => {
-                    state.deterministic_cycle.push(DeterministicCycleEntry {
-                        ordinal,
-                        key: pending.key.clone(),
-                        outcome: outcome.clone(),
-                    });
-                }
-                (Some(_), None) => state.has_unknown_identity = true,
-                (None, _) => {}
-            }
-            state.outcomes.push(SamplingToolOutcome::from_signal(
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcomes
+            .push(SamplingToolOutcome::from_signal(
                 ordinal,
                 outcome_context,
                 plan,
                 signal.as_ref(),
             ));
-            (pending, pre_edit_validation)
-        };
-
-        if let Some(ledger) = self.dispatch_ledger.as_ref() {
-            let mut ledger = ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if kind == SamplingToolOutcomeKind::Success
-                && outcome_context.skip_disposition.is_none()
-                && let (Some(pending), Some(outcome)) = (pending, outcome)
-                && let Some(artifact) = projection_artifact_identity(response)
-            {
-                let record = DeterministicDispatchRecord {
-                    original_call_id: response_input_call_id(response).unwrap_or_default(),
-                    original_result_identity: format!(
-                        "sha256:{:x}",
-                        Sha256::digest(outcome.as_bytes())
-                    ),
-                    original_execution_status: response_execution_status(response)
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    state_revision: self.state_revision.clone(),
-                    artifact,
-                    response: response.clone(),
-                };
-                let locator_reusable = !pending.locator
-                    || signal
-                        .as_ref()
-                        .and_then(|value| value.get("locator_reusable"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                if locator_reusable {
-                    ledger.completed.insert(pending.key.clone(), record.clone());
-                }
-                if pending.locator
-                    && locator_reusable
-                    && let Some(dependency_identity) = signal
-                        .as_ref()
-                        .and_then(|value| value.get("source_dependency_identity"))
-                        .and_then(Value::as_str)
-                    && let Some(alias) =
-                        locator_post_result_alias(&pending.key, dependency_identity)
-                {
-                    ledger.completed.insert(alias, record);
-                }
-            }
-            if mutation_advanced {
-                ledger
-                    .pre_edit
-                    .record_mutation_advance(outcome_context.outcome == ToolOutputOutcome::Success);
-            }
-            if let Some(class) = pre_edit_validation {
-                match outcome_context.outcome {
-                    ToolOutputOutcome::Success => {
-                        ledger.pre_edit.apply_validation_result(class, true)
-                    }
-                    ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => {
-                        ledger.pre_edit.apply_validation_result(class, false);
-                    }
-                    ToolOutputOutcome::Skipped
-                        if outcome_context.skip_disposition
-                            == Some(ToolOutputSkipDisposition::BlockingRequiredOperation) =>
-                    {
-                        ledger.pre_edit.apply_validation_result(class, false);
-                    }
-                    ToolOutputOutcome::Skipped => {}
-                }
-            }
-            if kind == SamplingToolOutcomeKind::Success
-                && let Some(signal) = signal.as_ref()
-            {
-                ledger.pre_edit.apply_source_signal(signal);
-                ledger.pre_edit.apply_plan_signal(signal);
-            }
-        }
     }
 
     fn deterministic_cycle_key(&self) -> Option<String> {
@@ -2710,18 +633,7 @@ impl SamplingRequestSignalCollector {
         if state.registered_count == 0 {
             return Some("empty".to_string());
         }
-        if state.has_unknown_identity || state.deterministic_cycle.len() != state.registered_count {
-            return None;
-        }
-        let mut entries = state.deterministic_cycle.clone();
-        entries.sort_by_key(|entry| entry.ordinal);
-        serde_json::to_string(
-            &entries
-                .into_iter()
-                .map(|entry| (entry.key, entry.outcome))
-                .collect::<Vec<_>>(),
-        )
-        .ok()
+        None
     }
 
     pub(crate) fn is_wait_only(&self) -> bool {
@@ -2775,11 +687,6 @@ impl SamplingRequestSignalCollector {
             })
         } else if state.saw_coordination {
             Some(TurnTimingGenerationPurpose::Coordination)
-        } else if state.saw_source_discovery
-            || state.saw_source_evidence
-            || settled.source_closure_identity != baselines.source_closure_identity
-        {
-            Some(TurnTimingGenerationPurpose::SourceEvidenceInterpretation)
         } else if state.registered_count > 0 && state.wait_call_count == state.registered_count {
             Some(TurnTimingGenerationPurpose::Wait)
         } else if state.saw_artifact_read {
@@ -2810,19 +717,6 @@ impl SamplingRequestSignalCollector {
             || settled.validation_revision != baselines.validation_revision
         {
             progress.push(TurnTimingProgressKind::ValidationResult);
-        }
-        if state.saw_source_discovery {
-            progress.push(TurnTimingProgressKind::SourceClosure);
-        }
-        if settled.source_closure_identity != baselines.source_closure_identity
-            && !progress.contains(&TurnTimingProgressKind::SourceClosure)
-        {
-            progress.push(TurnTimingProgressKind::SourceClosure);
-        }
-        if state.saw_source_evidence {
-            // A named source read is progress even when it does not mutate the
-            // workspace. No reasoning text is inspected.
-            progress.push(TurnTimingProgressKind::NewNamedEvidence);
         }
         if state
             .outcomes
@@ -2887,48 +781,8 @@ fn sampling_plan(signal: Option<&Value>) -> Option<UpdatePlanArgs> {
         .and_then(|value| serde_json::from_value::<UpdatePlanArgs>(value.clone()).ok())
 }
 
-fn deterministic_dispatch_identity(
-    tool_name: &ToolName,
-    payload: &ToolPayload,
-    state_revision: Option<&str>,
-) -> Option<String> {
-    if !supports_deterministic_identity(tool_name) {
-        return None;
-    }
-    let ToolPayload::Function { arguments } = payload else {
-        return None;
-    };
-    let revision = state_revision?;
-    let arguments = serde_json::from_str::<Value>(arguments).ok()?;
-    if arguments.get("force_fresh").and_then(Value::as_bool) == Some(true) {
-        return None;
-    }
-    let required_identity_field = if tool_name_matches(tool_name, "locate_task") {
-        "task"
-    } else if tool_name_matches(tool_name, "read_file_span") {
-        "path"
-    } else if tool_name_matches(tool_name, "search_source") {
-        "query"
-    } else {
-        return None;
-    };
-    if arguments
-        .get(required_identity_field)
-        .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty())
-    {
-        return None;
-    }
-    let arguments = serde_json::to_string(&canonicalize_json(arguments)).ok()?;
-    let action_class = serde_json::to_string(tool_name).ok()?;
-    Some(format!("{action_class}\n{arguments}\n{revision}"))
-}
-
 fn deterministic_action_identity(tool_name: &ToolName, payload: &ToolPayload) -> Option<String> {
-    if !supports_deterministic_identity(tool_name)
-        && !tool_name_matches(tool_name, "wait")
-        && !tool_name_matches(tool_name, "wait_agent")
-    {
+    if !tool_name_matches(tool_name, "wait") && !tool_name_matches(tool_name, "wait_agent") {
         return None;
     }
     let ToolPayload::Function { arguments } = payload else {
@@ -2941,14 +795,6 @@ fn deterministic_action_identity(tool_name: &ToolName, payload: &ToolPayload) ->
     let arguments = serde_json::to_string(&canonicalize_json(arguments)).ok()?;
     let action_class = serde_json::to_string(tool_name).ok()?;
     Some(format!("{action_class}\n{arguments}"))
-}
-
-fn locator_post_result_alias(key: &str, source_dependency_identity: &str) -> Option<String> {
-    let (prefix, _) = key.rsplit_once(";source=")?;
-    Some(format!(
-        "{prefix};source={:?}",
-        Some(source_dependency_identity)
-    ))
 }
 
 fn canonicalize_json(value: Value) -> Value {
@@ -2983,16 +829,6 @@ fn canonical_authoritative_result(response: &ResponseInputItem) -> Option<Value>
         .or_else(|| canonical_response_body(response))
 }
 
-fn response_input_call_id(response: &ResponseInputItem) -> Option<String> {
-    match response {
-        ResponseInputItem::FunctionCallOutput { call_id, .. }
-        | ResponseInputItem::CustomToolCallOutput { call_id, .. }
-        | ResponseInputItem::McpToolCallOutput { call_id, .. } => Some(call_id.clone()),
-        ResponseInputItem::ToolSearchOutput { call_id, .. } => Some(call_id.clone()),
-        ResponseInputItem::Message { .. } => None,
-    }
-}
-
 fn response_output_text(response: &ResponseInputItem) -> Option<&str> {
     let output = match response {
         ResponseInputItem::FunctionCallOutput { output, .. }
@@ -3003,50 +839,6 @@ fn response_output_text(response: &ResponseInputItem) -> Option<&str> {
         codex_protocol::models::FunctionCallOutputBody::Text(text) => Some(text),
         codex_protocol::models::FunctionCallOutputBody::ContentItems(_) => None,
     }
-}
-
-fn response_execution_status(response: &ResponseInputItem) -> Option<String> {
-    serde_json::from_str::<Value>(response_output_text(response)?)
-        .ok()?
-        .get("outcome")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn projection_artifact_identity(
-    response: &ResponseInputItem,
-) -> Option<DeterministicReplayArtifact> {
-    let envelope = serde_json::from_str::<Value>(response_output_text(response)?).ok()?;
-    if envelope.get("version").and_then(Value::as_u64) != Some(1)
-        || envelope.get("canonical_complete").and_then(Value::as_bool) != Some(true)
-    {
-        return None;
-    }
-    let artifact_id = envelope.get("artifact_id")?.as_str()?.to_string();
-    let canonical_sha256 = envelope.get("canonical_sha256")?.as_str()?.to_string();
-    let canonical_bytes = envelope.get("canonical_bytes")?.as_u64()?;
-    if artifact_id.is_empty() || canonical_sha256.len() != 64 {
-        return None;
-    }
-    Some(DeterministicReplayArtifact {
-        artifact_id,
-        canonical_sha256,
-        canonical_bytes,
-    })
-}
-
-fn same_generation_response_is_safely_shareable(
-    outcome_context: ToolOutputOutcomeContext,
-    response: &ResponseInputItem,
-) -> bool {
-    outcome_context.outcome == ToolOutputOutcome::Success
-        && outcome_context.skip_disposition.is_none()
-        && projection_artifact_identity(response).is_some()
-        && matches!(
-            response,
-            ResponseInputItem::FunctionCallOutput { output, .. }
-                if output.success == Some(true)
-        )
 }
 
 fn authoritative_wait_observation(
@@ -3137,53 +929,16 @@ fn canonical_tool_payload(payload: &ToolPayload) -> Value {
     })
 }
 
-fn provenance_preserving_replay(
-    prior: &DeterministicDispatchRecord,
-    current_call_id: &str,
-) -> ResponseInputItem {
-    let body = serde_json::json!({
-        "version": 1,
-        "status": "not_modified",
-        "original_call_id": prior.original_call_id,
-        "original_result_identity": prior.original_result_identity,
-        "original_execution_status": prior.original_execution_status,
-        "state_revision": prior.state_revision,
-        "artifact_id": prior.artifact.artifact_id,
-        "canonical_sha256": prior.artifact.canonical_sha256,
-        "canonical_bytes": prior.artifact.canonical_bytes,
-    })
-    .to_string();
-    let success = match &prior.response {
-        ResponseInputItem::FunctionCallOutput { output, .. }
-        | ResponseInputItem::CustomToolCallOutput { output, .. } => output.success,
-        _ => None,
-    };
-    ResponseInputItem::FunctionCallOutput {
-        call_id: current_call_id.to_string(),
-        output: codex_protocol::models::FunctionCallOutputPayload {
-            body: codex_protocol::models::FunctionCallOutputBody::Text(body),
-            success,
-        },
-    }
-}
-
-fn supports_deterministic_identity(tool_name: &ToolName) -> bool {
-    ["locate_task", "read_file_span", "search_source"]
-        .iter()
-        .any(|candidate| tool_name_matches(tool_name, candidate))
-}
-
-fn pre_edit_validation_class(
-    tool_name: &ToolName,
-    payload: &ToolPayload,
-) -> Option<PreEditValidationClass> {
+fn is_validation_invocation(tool_name: &ToolName, payload: &ToolPayload) -> bool {
     if !is_validation_tool(tool_name) {
-        return None;
+        return false;
     }
     let ToolPayload::Function { arguments } = payload else {
-        return None;
+        return false;
     };
-    let arguments = serde_json::from_str::<Value>(arguments).ok()?;
+    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
+        return false;
+    };
     let script_field = if tool_name_matches(tool_name, "shell_command") {
         "command"
     } else {
@@ -3199,7 +954,7 @@ fn pre_edit_validation_class(
             .collect::<Vec<_>>()
     });
     let script_body = arguments.get("script_body").and_then(Value::as_str);
-    let invocation = CommandInvocation::from_parts(
+    let Ok(invocation) = CommandInvocation::from_parts(
         tool_name.name.as_str(),
         script_field,
         script,
@@ -3207,23 +962,17 @@ fn pre_edit_validation_class(
         program,
         args.as_deref(),
         script_body,
+    ) else {
+        return false;
+    };
+    matches!(
+        classify_validation(&invocation),
+        ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
     )
-    .ok()?;
-    classify_pre_edit_validation(&invocation)
-}
-
-fn is_owner_discovery_tool(tool_name: &ToolName) -> bool {
-    tool_name_matches(tool_name, "locate_task")
 }
 
 fn is_wait_tool(tool_name: &ToolName) -> bool {
     tool_name_matches(tool_name, "wait")
-}
-
-fn is_source_evidence_tool(tool_name: &ToolName) -> bool {
-    ["locate_task", "read_file_span", "search_source"]
-        .iter()
-        .any(|candidate| tool_name_matches(tool_name, candidate))
 }
 
 fn is_validation_tool(tool_name: &ToolName) -> bool {
@@ -3236,73 +985,6 @@ fn is_mutation_tool(tool_name: &ToolName) -> bool {
     ["apply_patch", "apply_patch_tool"]
         .iter()
         .any(|candidate| tool_name_matches(tool_name, candidate))
-}
-
-pub(crate) fn is_accepted_mutating_operation(
-    class: TypedToolClass,
-    external_mutation_intent: ExternalMutationIntent,
-    tool_name: &ToolName,
-    payload: &ToolPayload,
-) -> bool {
-    if is_mutation_tool(tool_name) {
-        return true;
-    }
-    match class {
-        TypedToolClass::Shell => !shell_payload_is_known_read_only(payload),
-        TypedToolClass::StructuredEdit => true,
-        TypedToolClass::DynamicExternal => {
-            external_mutation_intent == ExternalMutationIntent::MayMutate
-        }
-        TypedToolClass::Unknown => false,
-        TypedToolClass::AgentCommunication
-        | TypedToolClass::OwnTask
-        | TypedToolClass::RootTaskControl
-        | TypedToolClass::ReadSearch
-        | TypedToolClass::CodeModeControl
-        | TypedToolClass::Diff => false,
-    }
-}
-
-fn shell_payload_is_known_read_only(payload: &ToolPayload) -> bool {
-    let ToolPayload::Function { arguments } = payload else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
-        return false;
-    };
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    if let Some(program) = object.get("program").and_then(Value::as_str) {
-        let mut command = vec![program.to_string()];
-        let Some(args) = object.get("args").and_then(Value::as_array) else {
-            return is_known_safe_command(&command);
-        };
-        let Some(args) = args.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
-            return false;
-        };
-        command.extend(args.into_iter().map(str::to_string));
-        return is_known_safe_command(&command);
-    }
-    let script = object
-        .get("command")
-        .or_else(|| object.get("cmd"))
-        .or_else(|| object.get("script_body"))
-        .and_then(Value::as_str);
-    let Some(script) = script else {
-        return false;
-    };
-    let command = if cfg!(windows) {
-        vec![
-            "powershell".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            script.to_string(),
-        ]
-    } else {
-        vec!["bash".to_string(), "-lc".to_string(), script.to_string()]
-    };
-    is_known_safe_command(&command)
 }
 
 fn is_coordination_tool(tool_name: &ToolName) -> bool {
@@ -3336,23 +1018,17 @@ pub(crate) struct SamplingConvergenceDecision {
     pub(crate) continuation: ContinuationDisposition,
     pub(crate) directive: Option<String>,
     pub(crate) proven_loop_activated: bool,
-    pub(crate) readiness_handoff: bool,
     pub(crate) authoritative_wait: Option<AuthoritativeWaitResolution>,
 }
 
 impl SamplingReasoningGovernor {
     #[cfg(test)]
     pub(crate) fn new(config: Option<&ReasoningPhaseEfforts>) -> Self {
-        Self::new_with_pre_edit(
-            config,
-            PreEditConvergenceSeed::default(),
-            Arc::new(TurnTimingState::default()),
-        )
+        Self::new_with_timing(config, Arc::new(TurnTimingState::default()))
     }
 
-    pub(crate) fn new_with_pre_edit(
+    pub(crate) fn new_with_timing(
         config: Option<&ReasoningPhaseEfforts>,
-        seed: PreEditConvergenceSeed,
         timing: Arc<TurnTimingState>,
     ) -> Self {
         Self {
@@ -3362,7 +1038,7 @@ impl SamplingReasoningGovernor {
             plan: None,
             plan_revision: 0,
             input_revision: 0,
-            dispatch_ledger: Arc::new(Mutex::new(DeterministicDispatchLedger::new(seed, timing))),
+            dispatch_ledger: Arc::new(Mutex::new(DeterministicDispatchLedger::new(timing))),
             consecutive_no_progress: 0,
             last_cycle: None,
             last_state_revision: None,
@@ -3372,48 +1048,28 @@ impl SamplingReasoningGovernor {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn baselines(
         &self,
         mutation_revision: u64,
         validation_status: ValidationFreshnessStatus,
         validation_revision: Option<u64>,
     ) -> SamplingRequestBaselines {
-        self.baselines_with_source_identity(
-            mutation_revision,
-            validation_status,
-            validation_revision,
-            None,
-        )
-    }
-
-    pub(crate) fn baselines_with_source_identity(
-        &self,
-        mutation_revision: u64,
-        validation_status: ValidationFreshnessStatus,
-        validation_revision: Option<u64>,
-        source_closure_identity: Option<String>,
-    ) -> SamplingRequestBaselines {
-        let mutation_obligation_revision = self.current_mutation_obligation_revision();
         SamplingRequestBaselines {
             mutation_revision,
             validation_status,
             validation_revision,
             plan_revision: self.plan_revision,
-            mutation_obligation_revision,
             input_revision: self.input_revision,
-            source_closure_identity,
         }
     }
 
     pub(crate) fn collector(
         &self,
-        baselines: &SamplingRequestBaselines,
+        _baselines: &SamplingRequestBaselines,
     ) -> SamplingRequestSignalCollector {
         SamplingRequestSignalCollector {
             next_ordinal: Arc::new(AtomicU64::new(0)),
             state: Arc::new(Mutex::new(SamplingRequestSignalState::default())),
-            state_revision: Some(baselines.revision_key()),
             dispatch_ledger: Some(Arc::clone(&self.dispatch_ledger)),
         }
     }
@@ -3479,9 +1135,7 @@ impl SamplingReasoningGovernor {
             || settled.mutation_revision != baselines.mutation_revision
             || settled.validation_status != baselines.validation_status
             || settled.validation_revision != baselines.validation_revision
-            || settled.source_closure_identity != baselines.source_closure_identity
             || self.plan_revision != baselines.plan_revision
-            || self.current_mutation_obligation_revision() != baselines.mutation_obligation_revision
             || self.input_revision != baselines.input_revision
         {
             return None;
@@ -3495,12 +1149,7 @@ impl SamplingReasoningGovernor {
         // residual low-effort path is only the protocol-required resample
         // after a response that made no tool call and changed no relevant
         // state; its exact action is therefore already known.
-        if state.registered_count != 0
-            || !state.outcomes.is_empty()
-            || !state.pending_dispatches.is_empty()
-            || !state.pending_pre_edit_validation.is_empty()
-            || state.has_unknown_identity
-        {
+        if state.registered_count != 0 || !state.outcomes.is_empty() {
             return None;
         }
 
@@ -3533,43 +1182,15 @@ impl SamplingReasoningGovernor {
         self.trigger
     }
 
-    pub(crate) fn model_evidence_guidance(&self) -> Option<String> {
-        if !self.enabled {
-            return None;
-        }
-        let primary = self
-            .dispatch_ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_obligations
-            .primary()
-            .map(EvidenceObligation::as_str)
-            .unwrap_or("none");
-        Some(format!(
-            "next_evidence_obligation: {primary}\nblocked_by: none"
-        ))
-    }
-
-    #[cfg(test)]
     pub(crate) fn accepted_user_input(&mut self) {
-        self.accepted_user_input_with_seed(PreEditConvergenceSeed::default());
-    }
-
-    pub(crate) fn accepted_user_input_with_seed(&mut self, seed: PreEditConvergenceSeed) {
         self.input_revision = self.input_revision.saturating_add(1);
         self.reset_convergence();
         let mut ledger = self
             .dispatch_ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if ledger.pre_edit.is_ready() {
-            ledger
-                .pre_edit
-                .timing
-                .record_pre_edit_reopen(PreEditReopenReason::UserSteering);
-        }
-        let timing = Arc::clone(&ledger.pre_edit.timing);
-        *ledger = DeterministicDispatchLedger::new(seed, timing);
+        let timing = Arc::clone(&ledger.timing);
+        *ledger = DeterministicDispatchLedger::new(timing);
         drop(ledger);
         self.transition_to(
             SamplingReasoningPhase::Orient,
@@ -3585,11 +1206,6 @@ impl SamplingReasoningGovernor {
     }
 
     pub(crate) fn host_mutation(&mut self) {
-        self.dispatch_ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pre_edit
-            .record_mutation_advance(true);
         self.transition_to(
             SamplingReasoningPhase::Implement,
             ReasoningPolicyTrigger::WorkspaceMutation,
@@ -3612,32 +1228,11 @@ impl SamplingReasoningGovernor {
         collector: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
     ) -> SamplingConvergenceDecision {
-        let readiness_handoff = {
-            self.dispatch_ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pre_edit
-                .take_readiness_handoff()
-        };
-        if let Some(directive) = readiness_handoff {
-            self.wait_convergence = None;
-            self.transition_to(
-                SamplingReasoningPhase::Implement,
-                ReasoningPolicyTrigger::HostOverride,
-            );
-            return SamplingConvergenceDecision {
-                directive: Some(directive),
-                readiness_handoff: true,
-                ..Default::default()
-            };
-        }
         let settled_revision = self.settled_revision_key(settled);
         if settled.mutation_revision != baselines.mutation_revision
             || settled.validation_status != baselines.validation_status
             || settled.validation_revision != baselines.validation_revision
-            || settled.source_closure_identity != baselines.source_closure_identity
             || self.plan_revision != baselines.plan_revision
-            || self.current_mutation_obligation_revision() != baselines.mutation_obligation_revision
             || self.input_revision != baselines.input_revision
         {
             self.reset_convergence();
@@ -3722,7 +1317,6 @@ impl SamplingReasoningGovernor {
                             authoritative_wait: Some(AuthoritativeWaitResolution::Blocked(
                                 observation.result,
                             )),
-                            ..Default::default()
                         }
                     }
                 };
@@ -3775,7 +1369,6 @@ impl SamplingReasoningGovernor {
             continuation: ContinuationDisposition::ModelRequired,
             directive: Some(directive.to_string()),
             proven_loop_activated,
-            readiness_handoff: false,
             authoritative_wait: None,
         }
     }
@@ -3790,25 +1383,14 @@ impl SamplingReasoningGovernor {
     }
 
     fn settled_revision_key(&self, settled: &SamplingRequestSettledState) -> String {
-        let mutation_obligation_revision = self.current_mutation_obligation_revision();
         format!(
-            "mutation={};validation_status={:?};validation_revision={:?};plan={};mutation_obligation={};input={};source={:?}",
+            "mutation={};validation_status={:?};validation_revision={:?};plan={};input={}",
             settled.mutation_revision,
             settled.validation_status,
             settled.validation_revision,
             self.plan_revision,
-            mutation_obligation_revision,
             self.input_revision,
-            settled.source_closure_identity,
         )
-    }
-
-    fn current_mutation_obligation_revision(&self) -> u64 {
-        self.dispatch_ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pre_edit
-            .unfinished_mutation_obligation_revision
     }
 
     pub(crate) fn settle(
@@ -3821,7 +1403,6 @@ impl SamplingReasoningGovernor {
             return;
         }
         let outcomes = collector.snapshot();
-        self.settle_evidence_obligations(baselines, settled, &outcomes);
         let latest_plan = outcomes
             .iter()
             .filter(|outcome| outcome.kind == SamplingToolOutcomeKind::Success)
@@ -3912,75 +1493,6 @@ impl SamplingReasoningGovernor {
                 SamplingReasoningPhase::Finalize => SamplingReasoningPhase::Finalize,
             };
             self.transition_to(next_phase, ReasoningPolicyTrigger::ReadOnlyToolSuccess);
-        }
-    }
-
-    fn settle_evidence_obligations(
-        &self,
-        baselines: &SamplingRequestBaselines,
-        settled: &SamplingRequestSettledState,
-        outcomes: &[SamplingToolOutcome],
-    ) {
-        let mut ledger = self
-            .dispatch_ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let active_before = ledger.active_obligations.clone();
-        let mut advances = EvidenceObligationSet::default();
-        let mut reopens = EvidenceObligationSet::default();
-
-        // Every result in a parallel batch is evaluated against the same
-        // pre-batch set. Only after collecting all deltas do we apply their
-        // union, allowing independent operations to close independent work.
-        for outcome in outcomes {
-            if outcome.kind == SamplingToolOutcomeKind::Success {
-                advances.extend(&outcome.advances);
-                if let EvidenceOperationRelationship::KnownAdvances(related) = &outcome.relationship
-                {
-                    advances.extend(related);
-                }
-            }
-            reopens.extend(&outcome.reopens);
-        }
-        let effective_advances = advances.intersection(&active_before);
-        ledger.active_obligations.remove_all(&effective_advances);
-        ledger.active_obligations.extend(&reopens);
-
-        if settled.mutation_revision > baselines.mutation_revision {
-            ledger
-                .active_obligations
-                .remove(EvidenceObligation::ImplementationQuestion);
-            ledger
-                .active_obligations
-                .remove(EvidenceObligation::FailureCause);
-            ledger
-                .active_obligations
-                .insert(EvidenceObligation::FocusedValidationProof);
-            ledger
-                .active_obligations
-                .insert(EvidenceObligation::TerminalProof);
-        }
-
-        let fresh_validation = settled.validation_revision != baselines.validation_revision
-            && settled.validation_revision == Some(settled.mutation_revision)
-            && settled.validation_status == ValidationFreshnessStatus::PassedAfterLastMutation;
-        if fresh_validation {
-            ledger
-                .active_obligations
-                .remove(EvidenceObligation::FocusedValidationProof);
-            ledger
-                .active_obligations
-                .insert(EvidenceObligation::TerminalProof);
-        } else if matches!(
-            settled.validation_status,
-            ValidationFreshnessStatus::FailedAfterLastMutation
-                | ValidationFreshnessStatus::TimedOut
-        ) && settled.validation_status != baselines.validation_status
-            && reopens.0.is_empty()
-        {
-            ledger
-                .active_obligations
-                .insert(EvidenceObligation::FailureCause);
         }
     }
 }
@@ -4200,45 +1712,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn accepted_mutation_classification_reuses_tool_and_command_safety_contracts() {
-        let read_only_shell = ToolPayload::Function {
-            arguments: json!({"program": "rg", "args": ["needle", "src"]}).to_string(),
-        };
-        assert!(!is_accepted_mutating_operation(
-            TypedToolClass::Shell,
-            ExternalMutationIntent::MayMutate,
-            &ToolName::plain("shell_command"),
-            &read_only_shell,
-        ));
-
-        let potentially_mutating_shell = ToolPayload::Function {
-            arguments: json!({"program": "cargo", "args": ["check"]}).to_string(),
-        };
-        assert!(is_accepted_mutating_operation(
-            TypedToolClass::Shell,
-            ExternalMutationIntent::MayMutate,
-            &ToolName::plain("shell_command"),
-            &potentially_mutating_shell,
-        ));
-        assert!(is_accepted_mutating_operation(
-            TypedToolClass::DynamicExternal,
-            ExternalMutationIntent::MayMutate,
-            &ToolName::namespaced("external", "write"),
-            &ToolPayload::Function {
-                arguments: "{}".to_string(),
-            },
-        ));
-        assert!(!is_accepted_mutating_operation(
-            TypedToolClass::DynamicExternal,
-            ExternalMutationIntent::ProvenReadOnly,
-            &ToolName::namespaced("external", "read"),
-            &ToolPayload::Function {
-                arguments: "{}".to_string(),
-            },
-        ));
-    }
-
     fn model(levels: &[ReasoningEffort], default: ReasoningEffort) -> ModelInfo {
         let mut model: ModelInfo = serde_json::from_value(json!({
             "slug": "test-model",
@@ -4324,7 +1797,6 @@ mod tests {
             mutation_revision,
             validation_status,
             validation_revision,
-            source_closure_identity: None,
         }
     }
 
@@ -4341,898 +1813,6 @@ mod tests {
             &collector,
             &settled(0, ValidationFreshnessStatus::None, None),
         );
-    }
-
-    fn active_pre_edit(
-        owner_candidates: &[&str],
-        task_mandated_proof: bool,
-    ) -> (PreEditConvergence, Arc<TurnTimingState>) {
-        let timing = Arc::new(TurnTimingState::default());
-        timing.mark_turn_started();
-        let convergence = PreEditConvergence::new(
-            PreEditConvergenceSeed {
-                active: true,
-                owner_candidates: owner_candidates
-                    .iter()
-                    .map(|candidate| (*candidate).to_string())
-                    .collect(),
-                instruction_snapshot_identity: InstructionSnapshotIdentity::loaded([1; 32]),
-                task_mandated_proof,
-            },
-            Arc::clone(&timing),
-        );
-        (convergence, timing)
-    }
-
-    fn owner_bundle_signal(
-        owner_state: &str,
-        closure_state: &str,
-        unresolved_ids: &[&str],
-    ) -> Value {
-        json!({
-            "kind": "source_evidence",
-            "operation": "locate_task",
-            "snapshot_id": "snapshot-v1",
-            "locator_request_identity": "locator-v1",
-            "receipt_id": "receipt-v1",
-            "task_contract_epoch": "contract-1",
-            "closure_contract_revision": "source_closure_v2",
-            "owner_state": owner_state,
-            "closure_state": closure_state,
-            "owner_id": (owner_state == "owner_resolved").then_some("core-runtime"),
-            "primary_path": "src/owner.rs",
-            "materialized_paths": ["src/owner.rs"],
-            "unresolved_ids": unresolved_ids,
-        })
-    }
-
-    fn ranged_owner_bundle(locator_request_identity: &str) -> Value {
-        let mut signal = owner_bundle_signal("owner_resolved", "bundle_incomplete", &[]);
-        signal["locator_request_identity"] = json!(locator_request_identity);
-        signal["required_source_sections"] = json!([{
-            "path": "src/caller.rs",
-            "obligation_kind": "caller",
-            "span": {"start_line": 1, "end_line": 100},
-        }]);
-        signal
-    }
-
-    fn ranged_read_signal(
-        start_line: usize,
-        end_line: usize,
-        file_content_hash: &str,
-        locator_request_identity: &str,
-        reset_generation: u64,
-    ) -> Value {
-        json!({
-            "kind": "source_evidence",
-            "operation": "read_file_span",
-            "path": "src/caller.rs",
-            "start_line": start_line,
-            "end_line": end_line,
-            "total_lines": 150,
-            "truncated": false,
-            "full_file_sha256": file_content_hash,
-            "authoritative_source_basis": {
-                "path": "src/caller.rs",
-                "file_content_hash": file_content_hash,
-                "source_snapshot_identity": "snapshot-v1",
-            },
-            "obligation_identity": {
-                "locator_request_identity": locator_request_identity,
-                "owner_id": "core-runtime",
-                "task_contract_epoch": "contract-1",
-                "obligation_kind": "caller",
-                "required_ranges": [{"start_line": 1, "end_line": 100}],
-                "reset_generation": reset_generation,
-            },
-        })
-    }
-
-    fn source_payload(arguments: Value) -> ToolPayload {
-        ToolPayload::Function {
-            arguments: arguments.to_string(),
-        }
-    }
-
-    #[test]
-    fn unknown_instruction_snapshot_identity_cannot_complete_convergence() {
-        let timing = Arc::new(TurnTimingState::default());
-        let mut convergence = PreEditConvergence::new(
-            PreEditConvergenceSeed {
-                active: true,
-                owner_candidates: vec!["src/owner.rs".to_string()],
-                instruction_snapshot_identity: InstructionSnapshotIdentity::Unknown,
-                task_mandated_proof: false,
-            },
-            Arc::clone(&timing),
-        );
-        convergence.authoritative_owner = Some("core".to_string());
-        convergence.primary_surface = Some("src/owner.rs".to_string());
-        convergence.mechanism_evidence = true;
-        convergence.refresh_readiness();
-        assert_ne!(
-            convergence.state,
-            PreEditConvergenceState::ImplementationReady
-        );
-
-        convergence.instruction_snapshot_identity = InstructionSnapshotIdentity::Empty;
-        convergence.refresh_readiness();
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ImplementationReady
-        );
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        assert_eq!(
-            convergence
-                .receipt
-                .expect("owner evidence receipt")
-                .instruction_snapshot_identity,
-            InstructionSnapshotIdentity::Empty
-        );
-    }
-
-    #[test]
-    fn explicit_owner_candidate_uses_bounded_read_then_typed_fast_path() {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        assert_eq!(convergence.state, PreEditConvergenceState::OwnerUnresolved);
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("read_file_span"),
-                &source_payload(json!({"path": "src/owner.rs"})),
-            ),
-            None
-        );
-        convergence.apply_source_signal(&json!({
-            "kind": "source_evidence",
-            "operation": "read_file_span",
-            "path": "src/owner.rs",
-            "truncated": false,
-        }));
-        assert_eq!(convergence.state, PreEditConvergenceState::OwnerUnresolved);
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("search_source"),
-                &source_payload(json!({"query": "owner", "paths": []})),
-            ),
-            None
-        );
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("locate_task"),
-                &source_payload(json!({
-                    "task": "confirm owner",
-                    "path_anchor": "src/owner.rs",
-                })),
-            ),
-            None
-        );
-
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ImplementationReady
-        );
-        assert_eq!(
-            convergence.authoritative_owner.as_deref(),
-            Some("core-runtime")
-        );
-        assert_eq!(convergence.primary_surface.as_deref(), Some("src/owner.rs"));
-    }
-
-    #[test]
-    fn unknown_owner_requires_typed_locator_resolution_and_rejects_incomplete_output() {
-        let (mut convergence, _) = active_pre_edit(&[], false);
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("read_file_span"),
-                &source_payload(json!({"path": "src/guess.rs"})),
-            ),
-            None
-        );
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("locate_task"),
-                &source_payload(json!({"task": "find the implementation owner"})),
-            ),
-            None
-        );
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_unresolved",
-            "bundle_incomplete",
-            &["owner-ambiguous"],
-        ));
-        assert_eq!(convergence.state, PreEditConvergenceState::OwnerUnresolved);
-        assert!(convergence.authoritative_owner.is_none());
-
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ImplementationReady
-        );
-    }
-
-    #[test]
-    fn complete_focused_search_retires_matching_bundle_question() {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        let mut bundle =
-            owner_bundle_signal("owner_resolved", "bundle_incomplete", &["question-1"]);
-        bundle["unresolved_questions"] = json!([{
-            "id": "question-1",
-            "category": "source_gap",
-            "detail": "find the unknown caller",
-        }]);
-        convergence.apply_source_signal(&bundle);
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ClosureIncomplete
-        );
-        assert!(convergence.obligations.contains_key("bundle:question-1"));
-
-        convergence.apply_source_signal(&json!({
-            "kind": "source_evidence",
-            "operation": "search_source",
-            "match_count": 0,
-            "match_paths": [],
-            "truncated": false,
-            "coverage_complete": true,
-            "index_complete": true,
-            "hydration_status": "skipped_no_unique_match",
-            "hydrated_paths": [],
-            "hydration_omission_count": 0,
-            "hydration_truncated": false,
-            "resolved_question_detail": "find the unknown caller",
-        }));
-
-        assert!(!convergence.obligations.contains_key("bundle:question-1"));
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ImplementationReady
-        );
-    }
-
-    #[test]
-    fn owner_bundle_receipt_is_replaced_on_contract_epoch_or_snapshot_change() {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        let first = convergence.receipt.clone().expect("first receipt");
-
-        let mut changed_epoch = owner_bundle_signal("owner_resolved", "bundle_ready", &[]);
-        changed_epoch["receipt_id"] = json!("receipt-v2");
-        changed_epoch["task_contract_epoch"] = json!("contract-2");
-        convergence.apply_source_signal(&changed_epoch);
-        let second = convergence.receipt.clone().expect("replacement receipt");
-        assert_ne!(first.receipt_id, second.receipt_id);
-        assert_eq!(second.task_contract_epoch, "contract-2");
-
-        let mut changed_snapshot = changed_epoch;
-        changed_snapshot["receipt_id"] = json!("receipt-v3");
-        changed_snapshot["snapshot_id"] = json!("snapshot-v2");
-        convergence.apply_source_signal(&changed_snapshot);
-        let third = convergence.receipt.expect("snapshot replacement receipt");
-        assert_eq!(third.source_snapshot_identity, "snapshot-v2");
-        assert_eq!(third.receipt_id, "receipt-v3");
-    }
-
-    #[test]
-    fn compatible_adjacent_reads_accumulate_across_progress_only_receipts() {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        let bundle = ranged_owner_bundle("locator-v1");
-        convergence.apply_source_signal(&bundle);
-
-        convergence.apply_source_signal(&ranged_read_signal(1, 50, "hash-a", "locator-v1", 1));
-        assert!(convergence.obligations.contains_key("path:src/caller.rs"));
-        convergence.apply_source_signal(&json!({
-            "kind": "source_evidence",
-            "operation": "locate_task",
-            "owner_state": "owner_resolved",
-            "evidence_revision": 10,
-            "progress_only": true,
-        }));
-        assert_eq!(
-            convergence.ranged_evidence["src/caller.rs"].observed_ranges,
-            vec![SourceEvidenceRange {
-                start_line: 1,
-                end_line: 50,
-            }]
-        );
-
-        let mut progress_receipt = bundle;
-        progress_receipt["receipt_id"] = json!("receipt-progress-2");
-        progress_receipt["evidence_revision"] = json!(11);
-        convergence.apply_source_signal(&progress_receipt);
-        convergence.apply_source_signal(&ranged_read_signal(51, 100, "hash-a", "locator-v1", 1));
-
-        assert!(!convergence.obligations.contains_key("path:src/caller.rs"));
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ImplementationReady
-        );
-    }
-
-    #[test]
-    fn ranged_reads_fail_closed_without_one_stable_evidence_basis() {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&ranged_owner_bundle("locator-v1"));
-
-        let mut missing_basis = ranged_read_signal(1, 50, "hash-a", "locator-v1", 1);
-        missing_basis["authoritative_source_basis"] = Value::Null;
-        convergence.apply_source_signal(&missing_basis);
-        assert!(convergence.ranged_evidence.is_empty());
-
-        let mut mismatched_hash = ranged_read_signal(1, 50, "hash-a", "locator-v1", 1);
-        mismatched_hash["full_file_sha256"] = json!("hash-b");
-        convergence.apply_source_signal(&mismatched_hash);
-        assert!(convergence.ranged_evidence.is_empty());
-
-        convergence.apply_source_signal(&ranged_read_signal(1, 50, "hash-a", "locator-v1", 1));
-        convergence.apply_source_signal(&ranged_read_signal(51, 100, "hash-b", "locator-v1", 2));
-        assert!(convergence.obligations.contains_key("path:src/caller.rs"));
-        assert_eq!(
-            convergence.ranged_evidence["src/caller.rs"].observed_ranges,
-            vec![SourceEvidenceRange {
-                start_line: 51,
-                end_line: 100,
-            }],
-            "revision B must replace, never merge with, revision A coverage"
-        );
-    }
-
-    #[test]
-    fn stale_late_read_is_ignored_after_obligation_rebinding() {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&ranged_owner_bundle("locator-v1"));
-        convergence.apply_source_signal(&ranged_read_signal(1, 50, "hash-a", "locator-v1", 1));
-
-        convergence.apply_source_signal(&ranged_owner_bundle("locator-v2"));
-        assert!(convergence.ranged_evidence.is_empty());
-        convergence.apply_source_signal(&ranged_read_signal(51, 100, "hash-a", "locator-v1", 1));
-
-        assert!(convergence.ranged_evidence.is_empty());
-        assert!(convergence.obligations.contains_key("path:src/caller.rs"));
-    }
-
-    #[test]
-    fn implementation_affecting_closure_blocks_but_routine_validation_route_does_not() {
-        let (mut ordinary, _) = active_pre_edit(&["src/owner.rs"], false);
-        ordinary.apply_source_signal(&owner_bundle_signal("owner_resolved", "bundle_ready", &[]));
-        assert_eq!(ordinary.validation_route, None);
-        assert_eq!(ordinary.state, PreEditConvergenceState::ImplementationReady);
-
-        let (mut closure, _) = active_pre_edit(&["src/owner.rs"], false);
-        closure.apply_source_signal(&json!({
-            "kind": "source_evidence",
-            "operation": "locate_task",
-            "snapshot_id": "snapshot-v1",
-            "result": {
-                "routing": {"status": "selected", "owner_id": "core-runtime"},
-                "primary": {"path": "src/owner.rs", "resolution": "exact"},
-                "source_neighborhoods": [{"path": "src/owner.rs", "role": "primary"}],
-                "relationships": [{"path": "src/caller.rs", "role": "direct_caller"}],
-                "contracts": [
-                    {"path": "src/contract.rs", "role": "contract"},
-                    {"path": "schema/generated.json", "role": "generated_mirror"}
-                ],
-                "validation": [{"role": "platform_schema"}],
-                "tests": [],
-                "instructions": [],
-                "unresolved": [],
-                "truncation": [],
-            }
-        }));
-        assert_eq!(closure.state, PreEditConvergenceState::ClosureIncomplete);
-        assert!(
-            closure
-                .obligations
-                .values()
-                .any(|kind| *kind == PreEditObligationKind::Caller)
-        );
-        assert!(
-            closure
-                .obligations
-                .values()
-                .any(|kind| *kind == PreEditObligationKind::Contract)
-        );
-        assert!(
-            closure
-                .obligations
-                .values()
-                .any(|kind| *kind == PreEditObligationKind::Generated)
-        );
-        assert!(
-            closure
-                .obligations
-                .values()
-                .any(|kind| *kind == PreEditObligationKind::Platform)
-        );
-
-        let (mut task_proof, _) = active_pre_edit(&["src/owner.rs"], true);
-        task_proof.apply_source_signal(&owner_bundle_signal("owner_resolved", "bundle_ready", &[]));
-        assert_eq!(task_proof.state, PreEditConvergenceState::ClosureIncomplete);
-        task_proof.apply_validation_result(PreEditValidationClass::OtherKnownValidation, true);
-        assert_eq!(
-            task_proof.state,
-            PreEditConvergenceState::ImplementationReady
-        );
-    }
-
-    #[test]
-    fn pre_edit_validation_allows_evidence_suppresses_only_stale_final_ceremony_and_reopens_after_mutation()
-     {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        assert_eq!(
-            convergence
-                .validation_suppression(PreEditValidationClass::FocusedImplementationEvidence),
-            None
-        );
-        assert_eq!(
-            convergence.validation_suppression(PreEditValidationClass::OtherKnownValidation),
-            None
-        );
-        assert_eq!(
-            convergence.validation_suppression(PreEditValidationClass::KnownFinalCeremony),
-            None,
-            "mutation-oriented readiness without a durable unfinished mutation obligation must fail open"
-        );
-        convergence.apply_plan_signal(&json!({
-            "kind": "plan_update",
-            "unfinished_mutation_obligation": true,
-        }));
-        let suppression = convergence
-            .validation_suppression(PreEditValidationClass::KnownFinalCeremony)
-            .expect("a proven pending mutation defers final ceremony");
-        let result = serde_json::to_value(suppression.deferred_validation_result())
-            .expect("typed suppression result serializes");
-        assert_eq!(result["disposition"], "deferred");
-        assert_eq!(result["outcome"], "not_executed");
-        assert!(result.get("success").is_none());
-        assert!(result.get("exit_code").is_none());
-        let proven_revision = convergence.unfinished_mutation_obligation_revision;
-        convergence.apply_plan_signal(&json!({
-            "kind": "plan_update",
-            "unfinished_mutation_obligation": null,
-        }));
-        assert_eq!(
-            convergence.validation_suppression(PreEditValidationClass::KnownFinalCeremony),
-            None,
-            "an uncertain status-only or no-op update must fail open"
-        );
-        assert!(convergence.unfinished_mutation_obligation_revision > proven_revision);
-        convergence.apply_plan_signal(&json!({
-            "kind": "plan_update",
-            "unfinished_mutation_obligation": false,
-        }));
-        assert_eq!(
-            convergence.validation_suppression(PreEditValidationClass::KnownFinalCeremony),
-            None,
-            "a no-edit or terminal plan conclusion must restore normal validation"
-        );
-        convergence.apply_plan_signal(&json!({
-            "kind": "plan_update",
-            "unfinished_mutation_obligation": true,
-        }));
-        convergence.record_mutation_advance(false);
-        assert_eq!(
-            convergence.validation_suppression(PreEditValidationClass::KnownFinalCeremony),
-            None
-        );
-    }
-
-    #[test]
-    fn deterministic_registration_observes_source_and_enforces_validation_suppression() {
-        let timing = Arc::new(TurnTimingState::default());
-        let governor = SamplingReasoningGovernor::new_with_pre_edit(
-            Some(&config()),
-            PreEditConvergenceSeed {
-                active: true,
-                owner_candidates: vec!["src/owner.rs".to_string()],
-                instruction_snapshot_identity: InstructionSnapshotIdentity::loaded([1; 32]),
-                task_mandated_proof: false,
-            },
-            Arc::clone(&timing),
-        );
-        {
-            let mut ledger = governor
-                .dispatch_ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ledger.pre_edit.apply_source_signal(&owner_bundle_signal(
-                "owner_resolved",
-                "bundle_ready",
-                &[],
-            ));
-        }
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        let source_collector = governor.collector(&baselines);
-        let source_registration = source_collector.register_deterministic_tool_call(
-            &ToolName::plain("search_source"),
-            &source_payload(json!({"query": "redundant", "paths": []})),
-            "search-suppressed",
-        );
-        assert!(source_registration.suppression.is_none());
-        assert!(source_registration.source_advisory.is_some());
-        assert_eq!(
-            timing
-                .complete_snapshot()
-                .protocol_timing()
-                .pre_edit_convergence
-                .expect("active convergence timing")
-                .broad_discovery_after_ready,
-            0,
-            "classification is not a physical-operation observation"
-        );
-        source_collector.record_source_advisory_physical_operation();
-        assert_eq!(
-            timing
-                .complete_snapshot()
-                .protocol_timing()
-                .pre_edit_convergence
-                .expect("active convergence timing")
-                .broad_discovery_after_ready,
-            1
-        );
-
-        let validation_payload = source_payload(json!({"command": "cargo test --workspace"}));
-        let no_plan_registration = governor
-            .collector(&baselines)
-            .register_deterministic_tool_call(
-                &ToolName::plain("shell_command"),
-                &validation_payload,
-                "validation-fail-open",
-            );
-        assert!(no_plan_registration.suppression.is_none());
-
-        governor
-            .dispatch_ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pre_edit
-            .apply_plan_signal(&json!({
-                "kind": "plan_update",
-                "unfinished_mutation_obligation": true,
-            }));
-        let validation_registration = governor
-            .collector(&baselines)
-            .register_deterministic_tool_call(
-                &ToolName::plain("shell_command"),
-                &validation_payload,
-                "validation-suppressed",
-            );
-        assert_eq!(
-            validation_registration
-                .suppression
-                .as_ref()
-                .map(|suppression| suppression.kind),
-            Some(PreDispatchSuppressionKind::StaleFinalValidation)
-        );
-    }
-
-    #[test]
-    fn post_ready_targeted_reads_are_allowed_broad_rediscovery_is_advisory_and_ambiguity_fails_open()
-     {
-        let (mut convergence, timing) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("read_file_span"),
-                &source_payload(json!({"path": "src/owner.rs"})),
-            ),
-            None
-        );
-        assert!(
-            convergence
-                .source_advisory(
-                    &ToolName::plain("search_source"),
-                    &source_payload(json!({"query": "anything", "paths": []})),
-                )
-                .is_some()
-        );
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("search_source"),
-                &ToolPayload::Function {
-                    arguments: "not-json".to_string(),
-                },
-            ),
-            None
-        );
-        let recorded = timing
-            .complete_snapshot()
-            .protocol_timing()
-            .pre_edit_convergence
-            .expect("active timing");
-        assert_eq!(
-            recorded.broad_discovery_after_ready, 0,
-            "classification alone must not report a physical operation"
-        );
-    }
-
-    #[test]
-    fn hydration_obligations_prevent_known_no_advance_until_exact_reads_clear_them() {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        convergence
-            .obligations
-            .insert("path:src/lib.rs".to_string(), PreEditObligationKind::Caller);
-        convergence.obligations.insert(
-            "path:src/other.rs".to_string(),
-            PreEditObligationKind::Caller,
-        );
-        convergence.apply_source_signal(&json!({
-            "kind": "source_evidence",
-            "operation": "search_source",
-            "match_count": 2,
-            "match_paths": ["src/lib.rs", "src/other.rs"],
-            "truncated": false,
-            "coverage_complete": true,
-            "hydration_status": "partially_hydrated_bounded_packet",
-            "hydrated_paths": ["src/lib.rs"],
-            "hydration_omission_count": 1,
-            "hydration_truncated": false,
-        }));
-
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ClosureIncomplete
-        );
-        assert!(convergence.closure.contains("src/lib.rs"));
-        assert!(!convergence.closure.contains("src/other.rs"));
-        assert!(!convergence.obligations.contains_key("path:src/lib.rs"));
-        assert!(convergence.obligations.contains_key("path:src/other.rs"));
-        assert!(
-            convergence
-                .obligations
-                .contains_key("hydration:src/other.rs")
-        );
-        assert!(convergence.obligations.contains_key("truncation:search"));
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("search_source"),
-                &source_payload(json!({"query": "anything", "paths": []})),
-            ),
-            None,
-            "complete coverage alone must not establish KnownNoAdvance"
-        );
-
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ClosureIncomplete,
-            "owner resolution must not erase outstanding hydration obligations"
-        );
-        assert!(
-            convergence
-                .obligations
-                .contains_key("hydration:src/other.rs")
-        );
-
-        convergence.apply_source_signal(&json!({
-            "kind": "source_evidence",
-            "operation": "read_file_span",
-            "path": "src/other.rs",
-            "truncated": false,
-        }));
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ClosureIncomplete
-        );
-        assert!(
-            !convergence
-                .obligations
-                .contains_key("hydration:src/other.rs")
-        );
-        assert!(
-            !convergence
-                .obligations
-                .contains_key("hydration-status:search")
-        );
-        assert!(
-            convergence.obligations.contains_key("truncation:search"),
-            "incomplete hydration must retain the search truncation obligation"
-        );
-    }
-
-    #[test]
-    fn zero_match_complete_search_creates_no_hydration_obligation() {
-        let (mut convergence, _) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        convergence.apply_source_signal(&json!({
-            "kind": "source_evidence",
-            "operation": "search_source",
-            "match_count": 0,
-            "match_paths": [],
-            "truncated": false,
-            "coverage_complete": true,
-            "hydration_status": "skipped_no_unique_match",
-            "hydrated_paths": [],
-            "hydration_omission_count": 0,
-            "hydration_truncated": false,
-        }));
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ImplementationReady
-        );
-        assert!(
-            !convergence
-                .obligations
-                .keys()
-                .any(|obligation| obligation.starts_with("hydration"))
-        );
-    }
-
-    #[test]
-    fn readiness_handoff_uses_next_sampling_boundary_without_a_generation() {
-        let timing = Arc::new(TurnTimingState::default());
-        timing.mark_turn_started();
-        let mut governor = SamplingReasoningGovernor::new_with_pre_edit(
-            Some(&config()),
-            PreEditConvergenceSeed {
-                active: true,
-                owner_candidates: vec!["src/owner.rs".to_string()],
-                instruction_snapshot_identity: InstructionSnapshotIdentity::loaded([1; 32]),
-                task_mandated_proof: false,
-            },
-            Arc::clone(&timing),
-        );
-        governor
-            .dispatch_ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pre_edit
-            .apply_source_signal(&owner_bundle_signal("owner_resolved", "bundle_ready", &[]));
-        let generations_before = timing
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .logical_generation_count;
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        let collector = governor.collector(&baselines);
-        let decision = governor.evaluate_convergence(
-            &baselines,
-            &collector,
-            &settled(0, ValidationFreshnessStatus::None, None),
-        );
-        assert!(decision.readiness_handoff);
-        assert!(decision.directive.is_some());
-        assert_eq!(
-            timing
-                .complete_snapshot()
-                .protocol_timing()
-                .counters
-                .logical_generation_count,
-            generations_before
-        );
-        assert_eq!(
-            governor
-                .dispatch_ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pre_edit
-                .take_readiness_handoff(),
-            None
-        );
-    }
-
-    #[test]
-    fn partial_failed_mutation_reopens_without_milestone_then_success_records_once() {
-        let (mut convergence, timing) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        convergence.record_mutation_advance(false);
-        assert!(!convergence.workspace_untouched);
-        assert!(!convergence.first_successful_mutation);
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ClosureIncomplete
-        );
-        assert_eq!(
-            convergence.source_advisory(
-                &ToolName::plain("search_source"),
-                &source_payload(json!({"query": "refresh", "paths": []})),
-            ),
-            None
-        );
-        assert!(
-            timing
-                .complete_snapshot()
-                .protocol_timing()
-                .pre_edit_convergence
-                .expect("active timing")
-                .first_successful_mutation_ms
-                .is_none()
-        );
-
-        convergence.record_mutation_advance(true);
-        let first = timing
-            .complete_snapshot()
-            .protocol_timing()
-            .pre_edit_convergence
-            .expect("active timing")
-            .first_successful_mutation_ms;
-        convergence.record_mutation_advance(true);
-        let second = timing
-            .complete_snapshot()
-            .protocol_timing()
-            .pre_edit_convergence
-            .expect("active timing")
-            .first_successful_mutation_ms;
-        assert_eq!(
-            convergence.state,
-            PreEditConvergenceState::ImplementationStarted
-        );
-        assert!(first.is_some());
-        assert_eq!(second, first);
-    }
-
-    #[test]
-    fn every_supported_readiness_reopen_reason_is_counted() {
-        let (mut convergence, timing) = active_pre_edit(&["src/owner.rs"], false);
-        convergence.apply_source_signal(&owner_bundle_signal(
-            "owner_resolved",
-            "bundle_ready",
-            &[],
-        ));
-        for reason in [
-            PreEditReopenReason::SourceRevision,
-            PreEditReopenReason::ContradictoryEvidence,
-            PreEditReopenReason::IncompleteEvidence,
-            PreEditReopenReason::NewAmbiguity,
-            PreEditReopenReason::UserSteering,
-        ] {
-            convergence.state = PreEditConvergenceState::ImplementationReady;
-            convergence.reopen(reason);
-        }
-        let recorded = timing
-            .complete_snapshot()
-            .protocol_timing()
-            .pre_edit_convergence
-            .expect("active timing");
-        assert_eq!(recorded.readiness_reopen_count, 5);
-        assert_eq!(recorded.reopen_reason_counts.source_revision, 1);
-        assert_eq!(recorded.reopen_reason_counts.contradictory_evidence, 1);
-        assert_eq!(recorded.reopen_reason_counts.incomplete_evidence, 1);
-        assert_eq!(recorded.reopen_reason_counts.new_ambiguity, 1);
-        assert_eq!(recorded.reopen_reason_counts.user_steering, 1);
     }
 
     #[test]
@@ -5345,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_deterministic_sampling_requires_unchanged_input_free_tool_free_state() {
+    fn optimization_priority_elides_proven_residual_generation_only_for_unchanged_state() {
         let governor = SamplingReasoningGovernor::new(Some(&ReasoningPhaseEfforts::default()));
         let baselines = governor.baselines(7, ValidationFreshnessStatus::None, None);
         let unchanged = settled(7, ValidationFreshnessStatus::None, None);
@@ -5362,6 +1942,7 @@ mod tests {
             &proven.sampling,
             SamplingGenerationDisposition::ResidualDeterministic(_)
         ));
+        assert!(proven.completes_protocol_turn_deterministically());
         assert_eq!(
             proven.timing_disposition(),
             TurnTimingGenerationDisposition::Deterministic
@@ -5380,6 +1961,7 @@ mod tests {
             tool_result.sampling,
             SamplingGenerationDisposition::DecisionBearing
         );
+        assert!(!tool_result.completes_protocol_turn_deterministically());
         assert_eq!(
             tool_result.timing_disposition(),
             TurnTimingGenerationDisposition::DecisionBearing
@@ -6163,189 +2745,6 @@ mod tests {
         assert_eq!(disabled.phase, SamplingReasoningPhase::Orient);
     }
 
-    #[test]
-    fn unanchored_source_relationships_and_structured_uncertainty_fail_open() {
-        let timing = Arc::new(TurnTimingState::default());
-        let mut convergence = PreEditConvergence::new(
-            PreEditConvergenceSeed {
-                active: true,
-                owner_candidates: vec!["src/owner.rs".to_string()],
-                instruction_snapshot_identity: InstructionSnapshotIdentity::loaded([2; 32]),
-                task_mandated_proof: false,
-            },
-            timing,
-        );
-
-        let unanchored_search = ToolPayload::Function {
-            arguments: json!({"query": "Owner"}).to_string(),
-        };
-        assert_eq!(
-            convergence.source_advisory(&ToolName::plain("search_source"), &unanchored_search,),
-            None,
-            "an unanchored search has an unknown relationship and must execute",
-        );
-
-        convergence.authoritative_owner = Some("core".to_string());
-        convergence.primary_surface = Some("src/owner.rs".to_string());
-        convergence.mechanism_evidence = true;
-        convergence.closure.insert("src/owner.rs".to_string());
-        convergence.state = PreEditConvergenceState::ImplementationReady;
-
-        let unanchored_locator = ToolPayload::Function {
-            arguments: json!({"task": "verify the current owner"}).to_string(),
-        };
-        assert_eq!(
-            convergence.source_advisory(&ToolName::plain("locate_task"), &unanchored_locator,),
-            None,
-            "an unanchored locator relationship remains unknown after closure",
-        );
-
-        let structured_uncertainty = ToolPayload::Function {
-            arguments: json!({
-                "task": "verify the current owner",
-                "path_anchor": "outside/current/closure.rs",
-                "source_question": {
-                    "kind": "ambiguous_ownership",
-                    "detail": "the recorded owner contradicts a new exact contract"
-                },
-            })
-            .to_string(),
-        };
-        assert_eq!(
-            convergence.source_advisory(&ToolName::plain("locate_task"), &structured_uncertainty,),
-            None,
-            "structured uncertainty must reach the locator and reopen closure",
-        );
-
-        let truncation_recovery = ToolPayload::Function {
-            arguments: json!({
-                "query": "Owner",
-                "paths": [],
-                "source_question": {
-                    "kind": "incomplete_prior_result",
-                    "detail": "the prior search result was truncated"
-                },
-            })
-            .to_string(),
-        };
-        assert_eq!(
-            convergence.source_advisory(&ToolName::plain("search_source"), &truncation_recovery,),
-            None,
-            "structured ambiguity or truncation recovery must remain ordinary discovery",
-        );
-
-        let proven_irrelevant_read = ToolPayload::Function {
-            arguments: json!({"path": "outside/current/closure.rs"}).to_string(),
-        };
-        assert!(
-            convergence
-                .source_advisory(&ToolName::plain("read_file_span"), &proven_irrelevant_read,)
-                .is_some(),
-            "an exact unsupported path can still be declined as KnownNoAdvance",
-        );
-    }
-
-    #[test]
-    fn active_obligation_batch_applies_union_while_guidance_stays_singular() {
-        let timing = Arc::new(TurnTimingState::default());
-        let mut governor = SamplingReasoningGovernor::new_with_pre_edit(
-            Some(&config()),
-            PreEditConvergenceSeed {
-                active: true,
-                ..Default::default()
-            },
-            timing,
-        );
-        assert_eq!(
-            governor.model_evidence_guidance().as_deref(),
-            Some("next_evidence_obligation: owner\nblocked_by: none")
-        );
-
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        let batch = governor.collector(&baselines);
-        for (ordinal, obligations) in [
-            (0, json!(["governing_instructions"])),
-            (1, json!(["caller_or_contract_closure"])),
-            (2, json!(["focused_validation_route"])),
-        ] {
-            batch.push(SamplingToolOutcome::from_signal(
-                ordinal,
-                ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-                None,
-                Some(&json!({
-                    "relationship": {
-                        "kind": "known_advances",
-                        "obligations": obligations,
-                    }
-                })),
-            ));
-        }
-        governor.settle(
-            &baselines,
-            &batch,
-            &settled(0, ValidationFreshnessStatus::None, None),
-        );
-        assert_eq!(
-            governor.model_evidence_guidance().as_deref(),
-            Some("next_evidence_obligation: owner\nblocked_by: none")
-        );
-        let active = &governor
-            .dispatch_ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_obligations;
-        assert_eq!(active.0, BTreeSet::from([EvidenceObligation::Owner]));
-    }
-
-    #[test]
-    fn structured_validation_failures_reopen_only_supported_obligations() {
-        let cases = [
-            (
-                "caller_or_contract",
-                BTreeSet::from([
-                    EvidenceObligation::CallerOrContractClosure,
-                    EvidenceObligation::ImplementationQuestion,
-                ]),
-            ),
-            (
-                "compile_or_type",
-                BTreeSet::from([EvidenceObligation::ImplementationQuestion]),
-            ),
-            (
-                "platform",
-                BTreeSet::from([
-                    EvidenceObligation::ImplementationQuestion,
-                    EvidenceObligation::FailureCause,
-                ]),
-            ),
-            (
-                "owner_contradiction",
-                BTreeSet::from([EvidenceObligation::Owner]),
-            ),
-            (
-                "unclassified",
-                BTreeSet::from([EvidenceObligation::FailureCause]),
-            ),
-        ];
-        for (class, expected) in cases {
-            assert_eq!(
-                validation_failure_obligation_delta(Some(&json!({
-                    "validation_failure_class": class,
-                    "stderr": "text that must not affect classification",
-                })))
-                .0,
-                expected,
-                "class {class}"
-            );
-        }
-        assert_eq!(
-            validation_failure_obligation_delta(Some(&json!({
-                "stderr": "owner contradiction compile failure platform"
-            }))),
-            EvidenceObligationSet::default()
-        );
-    }
-
     fn unchanged_state(
         governor: &SamplingReasoningGovernor,
     ) -> (SamplingRequestBaselines, SamplingRequestSettledState) {
@@ -6354,7 +2753,6 @@ mod tests {
             mutation_revision: 7,
             validation_status: ValidationFreshnessStatus::None,
             validation_revision: None,
-            source_closure_identity: None,
         };
         (baselines, settled)
     }
@@ -6556,7 +2954,6 @@ mod tests {
             state.saw_mutation = true;
             state.saw_validation = true;
             state.saw_coordination = true;
-            state.saw_source_evidence = true;
             state.registered_count = 1;
             state.wait_call_count = 1;
             state.outcomes.push(SamplingToolOutcome::plain(
@@ -6577,7 +2974,6 @@ mod tests {
         fn validation_and_later(state: &mut SamplingRequestSignalState) {
             state.saw_validation = true;
             state.saw_coordination = true;
-            state.saw_source_evidence = true;
             state.registered_count = 1;
             state.wait_call_count = 1;
         }
@@ -6588,23 +2984,12 @@ mod tests {
 
         fn coordination_and_later(state: &mut SamplingRequestSignalState) {
             state.saw_coordination = true;
-            state.saw_source_evidence = true;
             state.registered_count = 1;
             state.wait_call_count = 1;
         }
         assert_eq!(
             classify(coordination_and_later, false, true),
             Some(TurnTimingGenerationPurpose::Coordination)
-        );
-
-        fn source_and_wait(state: &mut SamplingRequestSignalState) {
-            state.saw_source_evidence = true;
-            state.registered_count = 1;
-            state.wait_call_count = 1;
-        }
-        assert_eq!(
-            classify(source_and_wait, false, true),
-            Some(TurnTimingGenerationPurpose::SourceEvidenceInterpretation)
         );
 
         fn wait_only(state: &mut SamplingRequestSignalState) {
@@ -6628,366 +3013,6 @@ mod tests {
             Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning)
         );
         assert_eq!(classify(|_| {}, false, false), None);
-    }
-
-    fn deterministic_read(
-        collector: &SamplingRequestSignalCollector,
-        arguments: &str,
-    ) -> SamplingToolCallRegistration {
-        collector.register_deterministic_tool_call(
-            &ToolName::plain("read_file_span"),
-            &ToolPayload::Function {
-                arguments: arguments.to_string(),
-            },
-            "read-current",
-        )
-    }
-
-    fn record_read_result(
-        collector: &SamplingRequestSignalCollector,
-        registration: &SamplingToolCallRegistration,
-    ) {
-        collector.record_response_result(
-            registration.ordinal,
-            true,
-            None,
-            &ResponseInputItem::FunctionCallOutput {
-                call_id: "read-1".to_string(),
-                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                    "same structured span".to_string(),
-                ),
-            },
-        );
-    }
-
-    #[test]
-    fn source_specific_semantics_keep_generic_identity_diagnostic_only() {
-        let governor = SamplingReasoningGovernor::new(None);
-        let (baselines, _) = unchanged_state(&governor);
-        let first = governor.collector(&baselines);
-        let registration = deterministic_read(&first, r#"{"path":"src/lib.rs","start_line":1}"#);
-        record_read_result(&first, &registration);
-
-        let repeated = governor.collector(&baselines);
-        let _registration =
-            deterministic_read(&repeated, r#"{"start_line":1,"path":"src/lib.rs"}"#);
-        assert!(repeated.deterministic_cycle_key().is_some());
-
-        let changed_revision = governor.baselines(8, ValidationFreshnessStatus::None, None);
-        let changed = governor.collector(&changed_revision);
-        let _registration = deterministic_read(&changed, r#"{"path":"src/lib.rs","start_line":1}"#);
-        assert!(changed.deterministic_cycle_key().is_none());
-    }
-
-    #[test]
-    fn exact_duplicate_with_complete_artifact_returns_not_modified_receipt() {
-        let governor = SamplingReasoningGovernor::new(None);
-        let (baselines, _) = unchanged_state(&governor);
-        let first = governor.collector(&baselines);
-        let first_registration =
-            deterministic_read(&first, r#"{"path":"src/lib.rs","start_line":1}"#);
-        first.record_response_result(
-            first_registration.ordinal,
-            true,
-            None,
-            &ResponseInputItem::FunctionCallOutput {
-                call_id: "read-1".to_string(),
-                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                    json!({
-                        "version": 1,
-                        "canonical_complete": true,
-                        "canonical_bytes": 10,
-                        "canonical_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "artifact_id": "01900000-0000-7000-8000-000000000000",
-                        "outcome": "success",
-                        "result": { "artifact": { "complete": true, "retained_bytes": 10 } }
-                    })
-                    .to_string(),
-                ),
-            },
-        );
-
-        let repeated = governor.collector(&baselines);
-        let registration = repeated.register_deterministic_tool_call(
-            &ToolName::plain("read_file_span"),
-            &ToolPayload::Function {
-                arguments: r#"{"start_line":1,"path":"src/lib.rs"}"#.to_string(),
-            },
-            "read-2",
-        );
-
-        assert!(repeated.deterministic_cycle_key().is_some());
-        let ResponseInputItem::FunctionCallOutput { call_id, output } = registration
-            .replay_response
-            .expect("duplicate should replay")
-        else {
-            panic!("duplicate replay should be a function output");
-        };
-        assert_eq!(call_id, "read-2");
-        let codex_protocol::models::FunctionCallOutputBody::Text(text) = output.body else {
-            panic!("duplicate replay should be text JSON");
-        };
-        let replay: Value = serde_json::from_str(&text).expect("valid replay JSON");
-        assert_eq!(replay["status"], "not_modified");
-        assert_eq!(replay["original_call_id"], "read-1");
-        assert_eq!(
-            replay["artifact_id"],
-            "01900000-0000-7000-8000-000000000000"
-        );
-        assert_eq!(replay["canonical_bytes"], 10);
-    }
-
-    #[test]
-    fn failed_artifact_is_not_inserted_for_replay() {
-        let governor = SamplingReasoningGovernor::new(None);
-        let (baselines, _) = unchanged_state(&governor);
-        let first = governor.collector(&baselines);
-        let registration = deterministic_read(&first, r#"{"path":"src/lib.rs"}"#);
-        first.record_response_result(
-            registration.ordinal,
-            false,
-            None,
-            &ResponseInputItem::FunctionCallOutput {
-                call_id: "read-failed".to_string(),
-                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                    json!({
-                        "version": 1,
-                        "canonical_complete": true,
-                        "canonical_bytes": 10,
-                        "canonical_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "artifact_id": "01900000-0000-7000-8000-000000000001",
-                        "outcome": "failure"
-                    })
-                    .to_string(),
-                ),
-            },
-        );
-
-        let repeated = governor.collector(&baselines);
-        let registration = deterministic_read(&repeated, r#"{"path":"src/lib.rs"}"#);
-        assert!(registration.replay_response.is_none());
-    }
-
-    #[test]
-    fn only_explicit_success_with_complete_projection_is_singleflight_shareable() {
-        let mut output = codex_protocol::models::FunctionCallOutputPayload::from_text(
-            json!({
-                "version": 1,
-                "canonical_complete": true,
-                "canonical_bytes": 10,
-                "canonical_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "artifact_id": "01900000-0000-7000-8000-000000000002",
-                "outcome": "success"
-            })
-            .to_string(),
-        );
-        output.success = Some(true);
-        let response = ResponseInputItem::FunctionCallOutput {
-            call_id: "shareable-read".to_string(),
-            output,
-        };
-        assert!(same_generation_response_is_safely_shareable(
-            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-            &response,
-        ));
-        for context in [
-            ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
-            ToolOutputOutcomeContext::new(ToolOutputOutcome::TimedOut),
-            ToolOutputOutcomeContext::skipped(Some(ToolOutputSkipDisposition::Deferred)),
-        ] {
-            assert!(!same_generation_response_is_safely_shareable(
-                context, &response,
-            ));
-        }
-
-        let mut malformed_output =
-            codex_protocol::models::FunctionCallOutputPayload::from_text("not-json".to_string());
-        malformed_output.success = Some(true);
-        assert!(!same_generation_response_is_safely_shareable(
-            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-            &ResponseInputItem::FunctionCallOutput {
-                call_id: "malformed-read".to_string(),
-                output: malformed_output,
-            },
-        ));
-    }
-
-    #[test]
-    fn source_locator_reuse_is_deferred_to_source_preflight() {
-        let governor = SamplingReasoningGovernor::new(None);
-        let first_baseline = governor.baselines(7, ValidationFreshnessStatus::None, None);
-        let first = governor.collector(&first_baseline);
-        let first_registration = first.register_deterministic_tool_call(
-            &ToolName::plain("locate_task"),
-            &ToolPayload::Function {
-                arguments: r#"{"task":"find owner","path_anchor":"src/lib.rs"}"#.to_string(),
-            },
-            "locate-1",
-        );
-        first.record_response_result(
-            first_registration.ordinal,
-            true,
-            Some(json!({
-                "kind": "source_evidence",
-                "operation": "locate_task",
-                "locator_reusable": true,
-                "source_dependency_identity": "snapshot-a",
-                "relationship": {
-                    "kind": "known_advances",
-                    "obligations": ["owner"]
-                },
-                "advances": ["owner"]
-            })),
-            &ResponseInputItem::FunctionCallOutput {
-                call_id: "locate-1".to_string(),
-                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                    r#"{"process_id":"stable-17","owner":"core"}"#.to_string(),
-                ),
-            },
-        );
-
-        let matching_baseline = governor.baselines_with_source_identity(
-            7,
-            ValidationFreshnessStatus::None,
-            None,
-            Some("snapshot-a".to_string()),
-        );
-        let matching = governor.collector(&matching_baseline);
-        let _matching_registration = matching.register_deterministic_tool_call(
-            &ToolName::plain("locate_task"),
-            &ToolPayload::Function {
-                arguments: r#"{"path_anchor":"src/lib.rs","task":"find owner"}"#.to_string(),
-            },
-            "locate-2",
-        );
-
-        let changed_question = governor.collector(&matching_baseline);
-        let _changed_question_registration = changed_question.register_deterministic_tool_call(
-            &ToolName::plain("locate_task"),
-            &ToolPayload::Function {
-                arguments: r#"{"task":"find validation owner","path_anchor":"src/lib.rs"}"#
-                    .to_string(),
-            },
-            "locate-3",
-        );
-
-        let changed_snapshot = governor.baselines_with_source_identity(
-            7,
-            ValidationFreshnessStatus::None,
-            None,
-            Some("snapshot-b".to_string()),
-        );
-        let changed_snapshot = governor.collector(&changed_snapshot);
-        let _changed_snapshot_registration = changed_snapshot.register_deterministic_tool_call(
-            &ToolName::plain("locate_task"),
-            &ToolPayload::Function {
-                arguments: r#"{"task":"find owner","path_anchor":"src/lib.rs"}"#.to_string(),
-            },
-            "locate-4",
-        );
-    }
-
-    #[test]
-    fn artifact_recovery_is_never_deterministically_suppressed() {
-        assert!(!supports_deterministic_identity(&ToolName::plain(
-            "read_tool_output",
-        )));
-        assert!(deterministic_dispatch_identity(
-            &ToolName::plain("read_tool_output"),
-            &ToolPayload::Function {
-                arguments: r#"{"artifact_id":"01900000-0000-7000-8000-000000000000","selectors":[{"kind":"bytes","start":0,"end":4}]}"#
-                    .to_string(),
-            },
-            Some("revision"),
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn force_fresh_bypasses_deterministic_suppression_identity() {
-        assert!(
-            deterministic_dispatch_identity(
-                &ToolName::plain("read_file_span"),
-                &ToolPayload::Function {
-                    arguments: r#"{"path":"src/lib.rs","force_fresh":true}"#.to_string(),
-                },
-                Some("revision"),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn incomplete_read_identity_is_never_singleflight_eligible() {
-        assert!(
-            deterministic_dispatch_identity(
-                &ToolName::plain("read_file_span"),
-                &ToolPayload::Function {
-                    arguments: r#"{"start_line":1}"#.to_string(),
-                },
-                Some("revision"),
-            )
-            .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn unprojectable_duplicate_read_fails_open_instead_of_sharing() {
-        let governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        let collector = governor.collector(&baselines);
-        let payload = ToolPayload::Function {
-            arguments: r#"{"path":"src/lib.rs","start_line":1}"#.to_string(),
-        };
-        let leader = collector.register_deterministic_tool_call(
-            &ToolName::plain("read_file_span"),
-            &payload,
-            "read-leader",
-        );
-        let mut follower = collector.register_deterministic_tool_call(
-            &ToolName::plain("read_file_span"),
-            &payload,
-            "read-follower",
-        );
-        assert!(collector.deterministic_cycle_key().is_none());
-        assert!(matches!(
-            leader.same_generation_singleflight.as_ref(),
-            Some(SameGenerationSingleflightRegistration::Leader(_))
-        ));
-        assert!(matches!(
-            follower.same_generation_singleflight.as_ref(),
-            Some(SameGenerationSingleflightRegistration::Follower(_))
-        ));
-
-        let response = ResponseInputItem::FunctionCallOutput {
-            call_id: "read-leader".to_string(),
-            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                "canonical source bytes".to_string(),
-            ),
-        };
-        collector.record_response_result(leader.ordinal, true, None, &response);
-        let Some(SameGenerationSingleflightRegistration::Leader(leader_flight)) =
-            leader.same_generation_singleflight.as_ref()
-        else {
-            panic!("first duplicate should own execution");
-        };
-        collector.complete_same_generation_leader(
-            leader_flight,
-            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-            &response,
-        );
-        let Some(SameGenerationSingleflightRegistration::Follower(follower_flight)) =
-            follower.same_generation_singleflight.as_mut()
-        else {
-            panic!("second duplicate should join");
-        };
-        assert!(
-            follower_flight
-                .wait_for_shareable(&tokio_util::sync::CancellationToken::new())
-                .await
-                .is_none(),
-            "a successful body without the complete projection artifact contract must execute independently"
-        );
     }
 
     #[test]
@@ -7017,28 +3042,6 @@ mod tests {
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
             assert_eq!(decision.directive.is_some(), generation >= 3);
             assert!(!decision.proven_loop_activated);
-        }
-    }
-
-    #[test]
-    fn only_repeated_deterministic_cycle_after_directive_activates_loop_guard() {
-        let mut governor = SamplingReasoningGovernor::new(None);
-        let (baselines, settled) = unchanged_state(&governor);
-
-        let first = governor.collector(&baselines);
-        let registration = deterministic_read(&first, r#"{"path":"src/lib.rs"}"#);
-        record_read_result(&first, &registration);
-        assert_eq!(
-            governor.evaluate_convergence(&baselines, &first, &settled),
-            SamplingConvergenceDecision::default()
-        );
-
-        for repeated_generation in 1..=4 {
-            let collector = governor.collector(&baselines);
-            let _registration = deterministic_read(&collector, r#"{"path":"src/lib.rs"}"#);
-            let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), repeated_generation >= 3);
-            assert_eq!(decision.proven_loop_activated, repeated_generation == 4);
         }
     }
 

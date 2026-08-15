@@ -454,8 +454,7 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         StableContextKind::RootCoordinator | StableContextKind::MultiAgent => {
             PromptContextCategory::AgentRole
         }
-        StableContextKind::CompactionCheckpoint
-        | StableContextKind::RequestUserInput
+        StableContextKind::RequestUserInput
         | StableContextKind::Wait
         | StableContextKind::DynamicHistory => PromptContextCategory::OtherInjected,
     }

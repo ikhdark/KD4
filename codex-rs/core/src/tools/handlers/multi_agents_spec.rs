@@ -678,7 +678,7 @@ fn spawn_agent_common_properties_v2(
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Plain-text task admitted as a durable repository-wide worker claim. Use a typed assignment with narrower scopes when safe parallel overlap is required."
+                "Plain-text task admitted with a durable repository-wide diagnostic claim. Claims record coordination risk but do not block overlapping work."
                     .to_string(),
             ))
             .with_encrypted(),
@@ -907,7 +907,7 @@ fn typed_assignment_schema() -> JsonSchema {
             (
                 "contract_claims".to_string(),
                 string_array(
-                    "Exclusive named behavioral contracts owned by this assignment.",
+                    "Named behavioral contracts touched by this assignment; overlaps are advisory metadata.",
                 ),
             ),
             (
@@ -925,7 +925,7 @@ fn typed_assignment_schema() -> JsonSchema {
                 JsonSchema::string_enum(
                     vec![json!("auto"), json!("shared"), json!("isolated")],
                     Some(
-                        "Use shared for disjoint claims and isolated for deliberate competing implementations."
+                        "Use shared for the common workspace, including coordinated overlap, and isolated for deliberate competing implementations."
                             .to_string(),
                     ),
                 ),
@@ -1008,18 +1008,18 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 - Narrow the delegated ask to the concrete output you need next.
 - For coding tasks, prefer delegating concrete code-change worker subtasks over read-only explorer analysis when the subagent can make a bounded patch in a clear write scope.
 - When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.
-- For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
+- For code-edit subtasks, describe intended write sets and call out known overlap so agents can reconcile shared changes.
 
 ### After you delegate
 - Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
-- Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.
-- While the subagent is running in the background, do meaningful non-overlapping work immediately.
+- Do not redo delegated subagent tasks yourself; focus on integrating results or tackling useful parallel work.
+- While the subagent is running in the background, do meaningful work immediately and communicate before touching the same contract surface.
 - Do not repeatedly wait by reflex.
 - When a delegated coding task returns, quickly review the uploaded changes, then integrate or refine them.
 
 ### Parallel delegation patterns
 - Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
-- Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
+- Split implementation into clear codebase slices; overlapping scopes are admitted but should be explicit and reconciled against the latest shared state.
 - Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
 - The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#
     )
@@ -1040,12 +1040,12 @@ fn spawn_agent_tool_description_v2(
         {agent_role_guidance}
         Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
 You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
-The spawned agent receives a durable task binding. Explicitly typed agents cannot spawn additional subagents; compatibility `message` agents may delegate another compatibility task, which remains bound to and overlap-checked against its parent.
+The spawned agent receives a durable task binding. Explicitly typed agents cannot spawn additional subagents; compatibility `message` agents may delegate another compatibility task, which remains bound to its parent while overlap is recorded as advisory metadata.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
-Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted as a repository-wide worker claim; exactly one is required. Both forms are durably admitted, checked for overlap, and return an `assignment_id`. Typed assignments require an explicit typed-capable `agent_type` (a built-in role or its configured `kd4_` alias).
+Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted with a repository-wide diagnostic claim; exactly one is required. Both forms are durably admitted, record overlap without rejecting it, and return an `assignment_id`. Typed assignments require an explicit typed-capable `agent_type` (a built-in role or its configured `kd4_` alias).
 
     {full_history_override_guidance}
 Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#

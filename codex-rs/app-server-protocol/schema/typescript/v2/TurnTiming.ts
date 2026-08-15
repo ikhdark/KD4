@@ -8,7 +8,6 @@ import type { TurnTimingExclusive } from "./TurnTimingExclusive";
 import type { TurnTimingLocal } from "./TurnTimingLocal";
 import type { TurnTimingMilestones } from "./TurnTimingMilestones";
 import type { TurnTimingModelRequest } from "./TurnTimingModelRequest";
-import type { TurnTimingPreEditConvergence } from "./TurnTimingPreEditConvergence";
 import type { TurnTimingPreFirstModelOutput } from "./TurnTimingPreFirstModelOutput";
 import type { TurnTimingTerminalization } from "./TurnTimingTerminalization";
 import type { TurnTimingUnions } from "./TurnTimingUnions";
@@ -44,9 +43,4 @@ observationalNonprogressTokens: TurnTimingDiagnosticTokenAggregate,
  * Bounded, aggregated host-managed continuation receipts. Resource
  * identities are hashes; raw paths and payloads are never included.
  */
-deterministicContinuationReceipts?: Array<TurnTimingDeterministicContinuationReceipt>, deterministicContinuationReceiptOverflow: number, preFirstModelOutput?: TurnTimingPreFirstModelOutput,
-/**
- * Pre-edit convergence milestones and bounded aggregate counters. Interval
- * durations and count deltas are derived from these snapshots by analysis.
- */
-preEditConvergence?: TurnTimingPreEditConvergence, };
+deterministicContinuationReceipts?: Array<TurnTimingDeterministicContinuationReceipt>, deterministicContinuationReceiptOverflow: number, preFirstModelOutput?: TurnTimingPreFirstModelOutput, };

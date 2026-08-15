@@ -25,7 +25,6 @@ use crate::MutationEvidence;
 use crate::MutationSnapshotChunk;
 use crate::MutationSnapshotVersion;
 use crate::ObservationKind;
-use crate::PreparedWorkspaceManifest;
 use crate::QuiescenceStatus;
 use crate::ReceiptDraft;
 use crate::RuntimeObservation;
@@ -36,11 +35,6 @@ use crate::ValidationCall;
 use crate::WakeEventId;
 use crate::WakeRead;
 use crate::WorkspaceActorRegistration;
-use crate::WorkspaceManifestEntry;
-use crate::WorkspaceMutationFinishOutcome;
-use crate::WorkspaceMutationLease;
-use crate::WorkspaceMutationRequest;
-use crate::WorkspaceMutationResult;
 use crate::WorkspaceRevision;
 use chrono::DateTime;
 use chrono::Utc;
@@ -254,27 +248,6 @@ pub trait AgentTaskStore: Send + Sync {
         paths: Vec<String>,
     ) -> TaskStoreFuture<'a, WorkspaceRevision>;
 
-    fn record_supporting_read<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        actor_id: String,
-        paths: Vec<String>,
-    ) -> TaskStoreFuture<'a, WorkspaceRevision>;
-
-    fn record_supporting_read_entries<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        actor_id: String,
-        entries: Vec<WorkspaceManifestEntry>,
-    ) -> TaskStoreFuture<'a, WorkspaceRevision>;
-
-    fn supporting_read_manifest<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        actor_id: String,
-        paths: Vec<String>,
-    ) -> TaskStoreFuture<'a, Vec<crate::WorkspaceManifestEntry>>;
-
     fn read_workspace_events<'a>(
         &'a self,
         repo_root: &'a Path,
@@ -287,145 +260,10 @@ pub trait AgentTaskStore: Send + Sync {
         registration: WorkspaceActorRegistration,
     ) -> TaskStoreFuture<'a, ()>;
 
-    fn begin_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        request: WorkspaceMutationRequest,
-    ) -> TaskStoreFuture<'a, WorkspaceMutationLease>;
-
-    /// Returns a strongly constructed internal manifest when this store can
-    /// provide prepared admission. Legacy implementations retain their fresh
-    /// manifest behavior by returning `None`.
-    #[doc(hidden)]
-    fn prepare_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        paths: Vec<String>,
-    ) -> TaskStoreFuture<'a, Option<PreparedWorkspaceManifest>> {
-        Box::pin(async move {
-            let _ = (repo_root, paths);
-            Ok(None)
-        })
-    }
-
-    #[doc(hidden)]
-    fn workspace_manifest_overlay_paths<'a>(
-        &'a self,
-        repo_root: &'a Path,
-    ) -> TaskStoreFuture<'a, Option<Vec<String>>> {
-        Box::pin(async move {
-            let _ = repo_root;
-            Ok(None)
-        })
-    }
-
-    #[doc(hidden)]
-    fn refresh_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        prepared: PreparedWorkspaceManifest,
-        overlay_paths: Vec<String>,
-        changed_paths: Vec<String>,
-    ) -> TaskStoreFuture<'a, Option<PreparedWorkspaceManifest>> {
-        Box::pin(async move {
-            let _ = (repo_root, prepared, overlay_paths, changed_paths);
-            Ok(None)
-        })
-    }
-
-    /// Begins against an internal strong-manifest receipt. The default ignores
-    /// it and preserves legacy fresh-manifest admission.
-    #[doc(hidden)]
-    fn begin_workspace_mutation_prepared<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        request: WorkspaceMutationRequest,
-        prepared: PreparedWorkspaceManifest,
-    ) -> TaskStoreFuture<'a, WorkspaceMutationLease> {
-        let _ = prepared;
-        self.begin_workspace_mutation(repo_root, request)
-    }
-
-    /// Reads only the committed repository-mutation epoch. `None` means the
-    /// store cannot establish this narrow identity and reuse must be skipped.
-    #[doc(hidden)]
-    fn workspace_mutation_epoch<'a>(
-        &'a self,
-        repo_root: &'a Path,
-    ) -> TaskStoreFuture<'a, Option<u64>> {
-        Box::pin(async move {
-            let _ = repo_root;
-            Ok(None)
-        })
-    }
-
-    fn heartbeat_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        lease_id: String,
-        actor_id: String,
-    ) -> TaskStoreFuture<'a, bool>;
-
-    fn finish_workspace_mutation<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        lease: WorkspaceMutationLease,
-    ) -> TaskStoreFuture<'a, WorkspaceMutationResult>;
-
-    /// Finishes with the authoritative post-commit manifest when supported.
-    #[doc(hidden)]
-    fn finish_workspace_mutation_with_receipt<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        lease: WorkspaceMutationLease,
-    ) -> TaskStoreFuture<'a, WorkspaceMutationFinishOutcome> {
-        Box::pin(async move {
-            let result = self.finish_workspace_mutation(repo_root, lease).await?;
-            Ok(WorkspaceMutationFinishOutcome {
-                result,
-                final_manifest: None,
-                work: crate::WorkspaceManifestWork::default(),
-            })
-        })
-    }
-
-    fn begin_workspace_finalization<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        root_session_id: String,
-    ) -> TaskStoreFuture<'a, crate::WorkspaceFinalizationFence>;
-
-    /// Atomically seals an active, unexpired finalization fence for terminal dispatch.
-    /// Successful sealing refreshes the bounded lease and returns the updated fence.
-    fn seal_workspace_finalization_dispatch<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        fence: crate::WorkspaceFinalizationFence,
-    ) -> TaskStoreFuture<'a, crate::WorkspaceFinalizationFence>;
-
-    fn heartbeat_workspace_finalization<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        fence_id: String,
-        root_session_id: String,
-    ) -> TaskStoreFuture<'a, bool>;
-
-    fn release_workspace_finalization<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        fence: crate::WorkspaceFinalizationFence,
-    ) -> TaskStoreFuture<'a, ()>;
-
-    fn assert_workspace_unclaimed<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        actor_attempt_id: Option<AttemptId>,
-    ) -> TaskStoreFuture<'a, ()>;
-
     fn check_quiescence(&self, root_session_id: String) -> TaskStoreFuture<'_, QuiescenceStatus>;
 
-    /// Read the already-reconciled quiescence state without expiring leases,
-    /// releasing claims, or refreshing validation evidence.
+    /// Read the already-reconciled quiescence state without releasing claim metadata or
+    /// refreshing validation evidence.
     fn inspect_quiescence(&self, root_session_id: String) -> TaskStoreFuture<'_, QuiescenceStatus>;
 
     fn begin_mutation<'a>(

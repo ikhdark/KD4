@@ -6,7 +6,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. For repository source reads or searches, prefer `read_file_span` or `search_source` when available. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane.";
+const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandToolOptions {
@@ -62,7 +62,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Prefer `read_file_span` or `search_source` for repository source inspection. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
                     .to_string(),
             )),
         ),
@@ -224,7 +224,7 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Prefer `read_file_span` or `search_source` for repository source inspection. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
                     .to_string(),
             )),
         ),

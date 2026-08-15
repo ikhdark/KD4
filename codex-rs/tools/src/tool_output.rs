@@ -63,14 +63,6 @@ pub enum CanonicalToolResultKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CanonicalRetentionPolicy {
-    Inline,
-    ArtifactIfProjected,
-    ArtifactRequired,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ToolProjectionInclusion {
     Included,
     Omitted,
@@ -109,7 +101,6 @@ pub struct CanonicalToolResult {
     pub complete: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_ranges: Vec<CanonicalByteRange>,
-    pub retention_policy: CanonicalRetentionPolicy,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub json_pointers: BTreeMap<String, CanonicalJsonPointer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -154,15 +145,9 @@ impl CanonicalToolResult {
             value,
             complete: true,
             unavailable_ranges: Vec::new(),
-            retention_policy: CanonicalRetentionPolicy::ArtifactIfProjected,
             json_pointers,
             sections: Vec::new(),
         }
-    }
-
-    pub fn with_retention_policy(mut self, policy: CanonicalRetentionPolicy) -> Self {
-        self.retention_policy = policy;
-        self
     }
 }
 
@@ -340,13 +325,6 @@ pub fn code_mode_tool_search_result(
 /// protocol and producers remain free to omit fragments entirely.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ToolOutputProjectionFragmentKind {
-    SourcePrimaryImplementation,
-    SourceCaller,
-    SourceTest,
-    SourceContractOrGenerated,
-    CoreInstructionOrTaskState,
-    CitationOrExactSpan,
-    SearchMatchOrDefinition,
     ErrorOrDiagnostic,
     ValidationFailureOrFinalSummary,
     ProcessFinalStatus,

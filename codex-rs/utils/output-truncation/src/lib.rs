@@ -9,10 +9,12 @@ use codex_utils_string::truncate_middle_with_token_budget;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 
-/// Model-projection ceilings. Callers may request less, but never more.
-pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 1_000;
-pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 2_000;
-pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 4_000;
+/// Coherent-packet model-projection defaults. Formation happens before token
+/// minimization, and explicit requests remain bounded by the caller-supplied
+/// model hard limit.
+pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 10_000;
+pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 10_000;
+pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputOutcome {
@@ -59,9 +61,9 @@ pub struct TruncatedTextOutput {
 
 pub fn adaptive_output_budget_description() -> String {
     format!(
-        "Defaults adaptively to {DEFAULT_SUCCESS_OUTPUT_TOKENS} tokens for success, \
-         {DEFAULT_FAILURE_OUTPUT_TOKENS} for failure/timeout, and \
-         {DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS} for high-signal diagnostics"
+        "Defaults to a coherent packet of up to {DEFAULT_SUCCESS_OUTPUT_TOKENS} tokens; \
+         failure/timeout and high-signal diagnostics use up to \
+         {DEFAULT_FAILURE_OUTPUT_TOKENS} and {DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS} tokens respectively"
     )
 }
 

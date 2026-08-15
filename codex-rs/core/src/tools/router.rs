@@ -1,7 +1,5 @@
-use crate::agent::task_capabilities::CapabilityPolicyError;
 use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
-use crate::agent::task_capabilities::TypedToolRequest;
 use crate::agent::task_capabilities::authorize_typed_tool;
 use crate::agent::task_capabilities::classify_typed_tool;
 use crate::agent::task_capabilities::is_independent_review_source;
@@ -19,7 +17,6 @@ use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::build_tool_router;
 use crate::tools::tool_dispatch_trace::record_authorization_state_coordination;
 use codex_agent_task_store::AttemptState;
-use codex_git_utils::get_git_repo_root;
 use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
@@ -36,16 +33,13 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
-use tracing::warn;
 
 pub use crate::tools::context::ToolCallSource;
-
-const READ_COORDINATION_MAX_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall {
@@ -66,6 +60,7 @@ pub struct ToolRouter {
     planning_warnings: Vec<String>,
     proven_read_only_external_tools: HashSet<ToolName>,
     exposure_identity: ToolExposureIdentity,
+    manifest_cache: Mutex<Option<(String, u64, ToolManifestItem)>>,
 }
 
 pub(crate) struct ToolRouterParams<'a> {
@@ -90,14 +85,6 @@ pub(crate) struct ToolSuggestCandidates {
 }
 
 impl ToolRouter {
-    pub(crate) fn external_mutation_intent(&self, tool_name: &ToolName) -> ExternalMutationIntent {
-        if self.proven_read_only_external_tools.contains(tool_name) {
-            ExternalMutationIntent::ProvenReadOnly
-        } else {
-            ExternalMutationIntent::MayMutate
-        }
-    }
-
     pub(crate) fn from_context(
         step_context: &StepContext,
         params: ToolRouterParams<'_>,
@@ -143,6 +130,7 @@ impl ToolRouter {
             planning_warnings,
             proven_read_only_external_tools: HashSet::new(),
             exposure_identity,
+            manifest_cache: Mutex::new(None),
         }
     }
 
@@ -176,11 +164,30 @@ impl ToolRouter {
         &self,
         turn: &crate::session::turn_context::TurnContext,
     ) -> ToolManifestItem {
+        let activation_revision = turn.deferred_tool_activation_revision();
+        let turn_id = turn.sub_id.clone();
+        if let Some((_, _, manifest)) = self
+            .manifest_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(cached_turn, cached_revision, _)| {
+                cached_turn == &turn_id && *cached_revision == activation_revision
+            })
+        {
+            return manifest.clone();
+        }
         let registered = self
             .registry
             .manifest_entries()
             .into_iter()
             .map(|(name, exposure, spec)| {
+                let canonical_spec =
+                    canonicalize_json(serde_json::to_value(spec).unwrap_or_default());
+                let spec_sha256 = format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&canonical_spec).unwrap_or_default())
+                );
                 let exposure_name = match exposure {
                     crate::tools::registry::ToolExposure::Direct => "direct",
                     crate::tools::registry::ToolExposure::Deferred => "deferred",
@@ -192,7 +199,10 @@ impl ToolRouter {
                     "exposure": exposure_name,
                     "activated": exposure != crate::tools::registry::ToolExposure::Deferred
                         || turn.deferred_tool_is_activated(&name),
-                    "spec": spec,
+                    // Full schemas already live in `model_visible` or the deferred
+                    // discovery index. Persist only their canonical identity here so
+                    // the rollout manifest does not scale with every registered schema.
+                    "spec_sha256": spec_sha256,
                 })
             })
             .collect::<Vec<_>>();
@@ -205,10 +215,16 @@ impl ToolRouter {
             "tool_exposure_identity": &self.exposure_identity,
         });
         let encoded = serde_json::to_vec(&fingerprint_input).unwrap_or_default();
-        ToolManifestItem {
+        let item = ToolManifestItem {
             hash: format!("{:x}", Sha256::digest(encoded)),
             manifest,
-        }
+        };
+        *self
+            .manifest_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((turn_id, activation_revision, item.clone()));
+        item
     }
 
     pub(crate) fn planning_warnings(&self) -> &[String] {
@@ -518,7 +534,7 @@ async fn authorize_bound_typed_tool_call(
     session: &Session,
     step_context: &StepContext,
     call: &ToolCall,
-    external_mutation_intent: ExternalMutationIntent,
+    _external_mutation_intent: ExternalMutationIntent,
 ) -> Result<(), FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator();
     let Some(binding) = coordinator.binding_for_source(&step_context.turn.session_source) else {
@@ -543,45 +559,15 @@ async fn authorize_bound_typed_tool_call(
         &call.tool_name.name,
         collaboration_namespace,
     );
-    let task_result = if class == TypedToolClass::ReadSearch {
-        match tokio::time::timeout(
-            READ_COORDINATION_MAX_WAIT,
-            coordinator.get_agent_task(binding.assignment_id, Some(0)),
-        )
+    let task = coordinator
+        .get_agent_task(binding.assignment_id, Some(0))
         .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                warn!(
-                    assignment_id = %binding.assignment_id,
-                    max_wait_ms = READ_COORDINATION_MAX_WAIT.as_millis(),
-                    "typed task lookup exceeded its time budget; allowing confined read/search"
-                );
-                return Ok(());
-            }
-        }
-    } else {
-        coordinator
-            .get_agent_task(binding.assignment_id, Some(0))
-            .await
-    };
-    let task = match task_result {
-        Ok(task) => task,
-        Err(error) if class == TypedToolClass::ReadSearch => {
-            warn!(
-                %error,
-                tool_name = %call.tool_name.name,
-                "allowing confined typed read/search while assignment state is unavailable"
-            );
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(FunctionCallError::RespondToModel(format!(
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
                 "{}: typed assignment state is unavailable: {error}",
                 call.tool_name.name
-            )));
-        }
-    };
+            ))
+        })?;
     if task.current_attempt.attempt_id != binding.attempt_id
         || task.current_attempt.state != AttemptState::Active
     {
@@ -591,81 +577,21 @@ async fn authorize_bound_typed_tool_call(
         )));
     }
 
-    let cwd = match step_context.environments.primary() {
-        Some(environment) => environment
-            .cwd()
-            .to_abs_path()
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "{}: typed assignments require a local filesystem environment: {error}",
-                    call.tool_name.name
-                ))
-            })?
-            .to_path_buf(),
-        None => step_context.turn.config.cwd.to_path_buf(),
-    };
-    let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-    let authorization = authorize_typed_tool(
-        &task.assignment,
-        &repo_root,
-        TypedToolRequest {
-            class,
-            external_mutation_intent,
-            repo_paths: &[],
-        },
-    );
-    match authorization {
-        Ok(_) => {}
-        Err(CapabilityPolicyError::MissingStructuredEditPaths)
-            if class == TypedToolClass::StructuredEdit =>
-        {
-            // The verified apply-patch runtime owns complete path extraction and repeats
-            // authorization with that closed path set immediately before execution.
-        }
-        Err(error) => {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "{}: typed assignment capability denied: {error}",
-                call.tool_name.name
-            )));
-        }
-    }
-    let heartbeat_result = if class == TypedToolClass::ReadSearch {
-        match tokio::time::timeout(
-            READ_COORDINATION_MAX_WAIT,
-            coordinator.heartbeat_typed_actor_binding(&binding),
-        )
+    authorize_typed_tool(class).map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "{}: typed assignment capability denied: {error}",
+            call.tool_name.name
+        ))
+    })?;
+    let heartbeated = coordinator
+        .heartbeat_typed_actor_binding(&binding)
         .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                warn!(
-                    assignment_id = %binding.assignment_id,
-                    max_wait_ms = READ_COORDINATION_MAX_WAIT.as_millis(),
-                    "typed task heartbeat exceeded its time budget; allowing confined read/search"
-                );
-                return Ok(());
-            }
-        }
-    } else {
-        coordinator.heartbeat_typed_actor_binding(&binding).await
-    };
-    let heartbeated = match heartbeat_result {
-        Ok(heartbeated) => heartbeated,
-        Err(error) if class == TypedToolClass::ReadSearch => {
-            warn!(
-                %error,
-                tool_name = %call.tool_name.name,
-                "allowing confined typed read/search without persisting its heartbeat"
-            );
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(FunctionCallError::RespondToModel(format!(
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
                 "{}: typed assignment heartbeat failed: {error}",
                 call.tool_name.name
-            )));
-        }
-    };
+            ))
+        })?;
     if !heartbeated {
         return Err(FunctionCallError::RespondToModel(format!(
             "{}: the bound typed assignment attempt is no longer active",

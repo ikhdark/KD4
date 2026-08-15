@@ -10,14 +10,10 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use codex_agent_task_store::AgentTaskStore;
-use codex_agent_task_store::WorkspaceFinalizationFence;
 use codex_extension_api::ExtensionData;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -107,8 +103,6 @@ const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TERMINAL_MUTATION_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
 const TERMINALIZATION_DEADLINE: Duration = Duration::from_secs(5);
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
-const WORKSPACE_FINALIZATION_DISPATCH_SEAL_FAILED_REASON: &str =
-    "the workspace finalization fence could not be sealed for terminal dispatch";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TurnTaskResult {
@@ -574,8 +568,6 @@ struct TerminalFinalization {
     coordinator: Arc<TurnTerminalCoordinator>,
     outcome: TurnTerminalOutcome,
     permit: Option<TurnTerminalPermit>,
-    completion_finalization_permit: Option<crate::agent::control::CompletionFinalizationPermit>,
-    workspace_finalization_guard: Option<WorkspaceFinalizationGuard>,
     deadline: TerminalDeadline,
     mutation_quiescent: bool,
     pending_turn_profile: Option<TurnProfileFact>,
@@ -585,166 +577,6 @@ struct TerminalInteractionMilestone {
     live_attempted: bool,
     live_delivered: bool,
     cleared_active_turn: bool,
-}
-
-struct WorkspaceFinalizationGuard {
-    store: Arc<dyn AgentTaskStore>,
-    repo_root: PathBuf,
-    fence: Option<WorkspaceFinalizationFence>,
-    heartbeat_cancel: CancellationToken,
-    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
-    healthy: Arc<AtomicBool>,
-}
-
-impl WorkspaceFinalizationGuard {
-    fn new(
-        store: Arc<dyn AgentTaskStore>,
-        repo_root: PathBuf,
-        fence: WorkspaceFinalizationFence,
-    ) -> Self {
-        let heartbeat_cancel = CancellationToken::new();
-        let healthy = Arc::new(AtomicBool::new(true));
-        let heartbeat_task = {
-            let store = Arc::clone(&store);
-            let repo_root = repo_root.clone();
-            let fence_id = fence.fence_id.clone();
-            let root_session_id = fence.root_session_id.clone();
-            let cancel = heartbeat_cancel.clone();
-            let healthy = Arc::clone(&healthy);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval_at(
-                    tokio::time::Instant::now() + Duration::from_secs(30),
-                    Duration::from_secs(30),
-                );
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = interval.tick() => {
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                result = store.heartbeat_workspace_finalization(
-                                    &repo_root,
-                                    fence_id.clone(),
-                                    root_session_id.clone(),
-                                ) => {
-                                    match result {
-                                        Ok(true) => {}
-                                        Ok(false) | Err(_) => {
-                                            healthy.store(false, Ordering::Release);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-        };
-        Self {
-            store,
-            repo_root,
-            fence: Some(fence),
-            heartbeat_cancel,
-            heartbeat_task: Some(heartbeat_task),
-            healthy,
-        }
-    }
-
-    fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Acquire)
-    }
-
-    async fn seal_for_terminal_dispatch(
-        &mut self,
-        deadline: &TerminalDeadline,
-    ) -> Result<(), String> {
-        if !self.is_healthy() {
-            return Err("workspace finalization fence is unhealthy".to_string());
-        }
-        let Some(fence) = self.fence.clone() else {
-            self.healthy.store(false, Ordering::Release);
-            return Err("workspace finalization fence is missing".to_string());
-        };
-        let seal_result = deadline
-            .run(
-                "fence",
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.store
-                    .seal_workspace_finalization_dispatch(&self.repo_root, fence),
-            )
-            .await;
-        match seal_result {
-            Err(_) => {
-                self.healthy.store(false, Ordering::Release);
-                Err("timed out sealing the workspace finalization fence".to_string())
-            }
-            Ok(Ok(sealed_fence)) => {
-                self.fence = Some(sealed_fence);
-                if self.is_healthy() {
-                    Ok(())
-                } else {
-                    Err("workspace finalization fence became unhealthy while sealing".to_string())
-                }
-            }
-            Ok(Err(error)) => {
-                self.healthy.store(false, Ordering::Release);
-                Err(error.to_string())
-            }
-        }
-    }
-
-    async fn release(&mut self) -> Result<(), String> {
-        self.heartbeat_cancel.cancel();
-        if let Some(task) = self.heartbeat_task.take() {
-            // Do not wait for task-store I/O already in progress inside the heartbeat.
-            task.abort();
-            let _ = task.await;
-        }
-        let Some(fence) = self.fence.clone() else {
-            return Ok(());
-        };
-        let release_result = tokio::time::timeout(
-            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-            self.store
-                .release_workspace_finalization(&self.repo_root, fence),
-        )
-        .await;
-        match release_result {
-            Ok(Ok(())) => {
-                self.fence = None;
-                Ok(())
-            }
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => Err("timed out releasing the workspace finalization fence".to_string()),
-        }
-    }
-}
-
-async fn seal_passed_completion_for_terminal_dispatch(
-    completion: &mut Option<TaskCompletionGate>,
-    guard: Option<&mut WorkspaceFinalizationGuard>,
-    deadline: &TerminalDeadline,
-) -> Option<&'static str> {
-    if !completion
-        .as_ref()
-        .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed)
-    {
-        return None;
-    }
-    let guard = guard?;
-    if let Err(error) = guard.seal_for_terminal_dispatch(deadline).await {
-        warn!(%error, "failed to seal workspace finalization fence for terminal dispatch");
-        if let Some(gate) = completion.as_mut() {
-            gate.status = TaskCompletionStatus::Partial;
-            gate.reasons
-                .push(WORKSPACE_FINALIZATION_DISPATCH_SEAL_FAILED_REASON.to_string());
-            gate.reasons.sort();
-            gate.reasons.dedup();
-        }
-        return Some(WORKSPACE_FINALIZATION_DISPATCH_SEAL_FAILED_REASON);
-    }
-    None
 }
 
 async fn seal_terminal_final_proof(
@@ -919,46 +751,6 @@ fn final_proof_hash(label: &str, value: &impl serde::Serialize) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-impl Drop for WorkspaceFinalizationGuard {
-    fn drop(&mut self) {
-        self.heartbeat_cancel.cancel();
-        if let Some(task) = self.heartbeat_task.take() {
-            task.abort();
-        }
-        let Some(fence) = self.fence.take() else {
-            return;
-        };
-        let store = Arc::clone(&self.store);
-        let repo_root = self.repo_root.clone();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            warn!(
-                fence_id = %fence.fence_id,
-                "workspace finalization fence will rely on lease expiry because no runtime is available"
-            );
-            return;
-        };
-        handle.spawn(async move {
-            match tokio::time::timeout(
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                store.release_workspace_finalization(&repo_root, fence.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!(
-                    fence_id = %fence.fence_id,
-                    %error,
-                    "failed to release workspace finalization fence during cleanup"
-                ),
-                Err(_) => warn!(
-                    fence_id = %fence.fence_id,
-                    "timed out releasing workspace finalization fence during cleanup; relying on lease expiry"
-                ),
-            }
-        });
-    }
-}
-
 struct WorkerDoneNotifier(Arc<Notify>);
 
 impl Drop for WorkerDoneNotifier {
@@ -1009,25 +801,6 @@ impl Session {
             turn_context.multi_agent_version,
             &turn_context.session_source,
         ) {
-            Ok(guard) => guard,
-            Err(err) => {
-                if let Some(taskless_placeholder) = taskless_placeholder.as_ref() {
-                    self.clear_taskless_placeholder(taskless_placeholder).await;
-                }
-                self.send_event(
-                    turn_context.as_ref(),
-                    EventMsg::Error(err.to_error_event(None)),
-                )
-                .await;
-                return;
-            }
-        };
-        let completion_activity_guard = match self
-            .services
-            .agent_control
-            .default_child_completion_activity(&turn_context.session_source)
-            .await
-        {
             Ok(guard) => guard,
             Err(err) => {
                 if let Some(taskless_placeholder) = taskless_placeholder.as_ref() {
@@ -1150,7 +923,6 @@ impl Session {
             turn_context: Arc::clone(&turn_context),
             turn_extension_data,
             _agent_execution_guard: agent_execution_guard,
-            _completion_activity_guard: completion_activity_guard,
         };
         turn.task = Some(running_task);
         turn.terminal = Some(terminal);
@@ -1322,10 +1094,8 @@ impl Session {
                     coordinator: finalizer_coordinator,
                     outcome,
                     permit: Some(permit),
-                    completion_finalization_permit: None,
-                    workspace_finalization_guard: None,
                     deadline: terminal_deadline,
-                    mutation_quiescent: false,
+                    mutation_quiescent: true,
                     pending_turn_profile: None,
                 };
                 let result = AssertUnwindSafe(
@@ -1383,11 +1153,7 @@ impl Session {
 
     async fn detach_terminal_turn(&self, finalization: &mut TerminalFinalization) -> bool {
         let started = tokio::time::Instant::now();
-        // Completion finalization admission and execution/activity guards are part of the
-        // interactive turn fence. Release them before notifying abort/replacement waiters.
-        drop(finalization.completion_finalization_permit.take());
         drop(finalization.task._agent_execution_guard.take());
-        drop(finalization.task._completion_activity_guard.take());
         let active_turn_detached = {
             let mut active = self.active_turn.lock().await;
             if let Some(active_turn) = active.as_ref()
@@ -1475,12 +1241,9 @@ impl Session {
         let claim = TerminalDecisionClaim {
             authoritative_event: candidate_authority.clone(),
             deadline_exhausted_phase: finalization.deadline.exhausted_phase(),
-            mutation_quiescent: finalization.mutation_quiescent,
+            mutation_quiescent: true,
             durable_success_established,
-            retained_ownership: (!finalization.mutation_quiescent)
-                .then(|| "turn-owned mutation lease or fence".to_string())
-                .into_iter()
-                .collect(),
+            retained_ownership: Vec::new(),
             phase_timings_ns: finalization.deadline.phase_timings_ns(),
         };
         let claim_result = finalization
@@ -2071,86 +1834,18 @@ impl Session {
         let turn_context = self.new_default_turn_with_sub_id(turn_id.clone()).await;
         let mut failure_reasons = Vec::new();
 
-        let mutation_quiescent = self
-            .services
-            .command_execution
-            .cancel_mutations_for_terminal_turn_with_timeout(
-                &turn_id,
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-            )
-            .await;
-        if !mutation_quiescent {
-            failure_reasons.push(
-                "restart recovery could not re-establish terminal mutation quiescence".to_string(),
-            );
+        self.services.command_execution.finish_turn(&turn_id).await;
+        let inputs = completion_review::refresh_authoritative_review_inputs(self).await;
+        failure_reasons.extend(inputs.partial_reasons.iter().cloned());
+        if !inputs.typed_quiescent {
+            failure_reasons
+                .push("typed task ownership was not quiescent during recovery".to_string());
         }
-
-        let completion_permit = if failure_reasons.is_empty() {
-            match self
-                .services
-                .agent_control
-                .begin_completion_finalization()
-                .await
-            {
-                Ok(permit) => Some(permit),
-                Err(error) => {
-                    failure_reasons.push(format!(
-                        "restart recovery could not acquire completion finalization: {error}"
-                    ));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let authoritative_inputs = if completion_permit.is_some() {
-            let inputs = completion_review::refresh_authoritative_review_inputs(self).await;
-            failure_reasons.extend(inputs.partial_reasons.iter().cloned());
-            if !inputs.typed_quiescent {
-                failure_reasons
-                    .push("typed task ownership was not quiescent during recovery".to_string());
-            }
-            if !inputs.default_children_quiescent {
-                failure_reasons
-                    .push("default child ownership was not quiescent during recovery".to_string());
-            }
-            Some(inputs)
-        } else {
-            None
-        };
-
-        let mut workspace_guard = None;
-        if failure_reasons.is_empty() {
-            let coordinator = self.services.agent_control.task_coordinator();
-            match (
-                coordinator.store(),
-                coordinator.root_session_id(),
-                self.services.task_evidence.repository_root(),
-            ) {
-                (Some(store), Some(root_session_id), Some(repo_root)) => {
-                    match store
-                        .begin_workspace_finalization(repo_root, root_session_id)
-                        .await
-                    {
-                        Ok(fence) => {
-                            workspace_guard = Some(WorkspaceFinalizationGuard::new(
-                                store,
-                                repo_root.to_path_buf(),
-                                fence,
-                            ));
-                        }
-                        Err(error) => failure_reasons.push(format!(
-                            "restart recovery could not acquire the workspace fence: {error}"
-                        )),
-                    }
-                }
-                (None, None, _) => {}
-                _ => failure_reasons.push(
-                    "restart recovery found partially initialized workspace ownership".to_string(),
-                ),
-            }
+        if !inputs.default_children_quiescent {
+            failure_reasons
+                .push("default child ownership was not quiescent during recovery".to_string());
         }
+        let authoritative_inputs = Some(inputs);
 
         let mut completion_gate = None;
         if failure_reasons.is_empty() {
@@ -2232,18 +1927,6 @@ impl Session {
             }
         }
 
-        if failure_reasons.is_empty()
-            && let Some(guard) = workspace_guard.as_mut()
-        {
-            let recovery_deadline = TerminalDeadline::start();
-            if let Err(error) = guard.seal_for_terminal_dispatch(&recovery_deadline).await {
-                completion_gate = None;
-                failure_reasons.push(format!(
-                    "restart recovery could not seal the workspace fence: {error}"
-                ));
-            }
-        }
-
         failure_reasons.sort();
         failure_reasons.dedup();
         let (event, outcome) = if failure_reasons.is_empty() {
@@ -2285,14 +1968,8 @@ impl Session {
                 "partial_recovery".to_string(),
             )
         };
-        self.establish_recovered_terminal_event(&turn_context, event, outcome, mutation_quiescent)
+        self.establish_recovered_terminal_event(&turn_context, event, outcome, true)
             .await;
-        drop(completion_permit);
-        if let Some(mut guard) = workspace_guard
-            && let Err(error) = guard.release().await
-        {
-            warn!(%error, "failed to release restart-recovery workspace fence");
-        }
     }
 
     async fn establish_recovered_terminal_event(
@@ -2547,31 +2224,10 @@ impl Session {
             finalization.task.cancellation_token.cancel();
         }
 
-        // A mutating command can only finish its ledger cleanup after its task observes
-        // cancellation. Signal the task before waiting for that cleanup, otherwise an
-        // interrupt can deadlock here and the app server never receives TurnAborted.
-        let mutation_cleanup_completed = matches!(
-            finalization
-                .deadline
-                .run(
-                    "hooks_quiescence",
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    self.services
-                        .command_execution
-                        .cancel_mutations_for_terminal_turn_with_timeout(
-                            &turn_context.sub_id,
-                            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                        ),
-                )
-                .await,
-            Ok(true)
-        );
-        if !mutation_cleanup_completed {
-            warn!(
-                turn_id = %turn_context.sub_id,
-                "timed out waiting for turn-owned workspace mutations to finalize"
-            );
-        }
+        self.services
+            .command_execution
+            .finish_turn(&turn_context.sub_id)
+            .await;
         if requires_abort_cleanup {
             tokio::select! {
                 _ = finalization.task.done.notified() => {},
@@ -2732,26 +2388,9 @@ impl Session {
         if terminal_lifecycle_result.is_err() {
             warn!(turn_id = %turn_context.sub_id, "mutation-capable terminal lifecycle hook did not quiesce");
         }
-        let post_hook_mutation_cleanup_completed = matches!(
-            finalization
-                .deadline
-                .run(
-                    "hooks_quiescence",
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    self.services
-                        .command_execution
-                        .cancel_mutations_for_terminal_turn_with_timeout(
-                            &turn_context.sub_id,
-                            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                        ),
-                )
-                .await,
-            Ok(true)
-        );
-        finalization.mutation_quiescent = mutation_cleanup_completed
-            && pending_input_result.is_ok()
-            && terminal_lifecycle_result.is_ok()
-            && post_hook_mutation_cleanup_completed;
+        let terminal_hooks_complete =
+            pending_input_result.is_ok() && terminal_lifecycle_result.is_ok();
+        finalization.mutation_quiescent = true;
 
         let (
             turn_had_memory_citation,
@@ -2783,11 +2422,9 @@ impl Session {
                 vec!["terminal preparation timed out before state capture".to_string()],
             ),
         };
-        if !finalization.mutation_quiescent {
-            completion_review_partial_reasons.push(
-                "terminal mutation quiescence could not be established before the absolute deadline"
-                    .to_string(),
-            );
+        if !terminal_hooks_complete {
+            completion_review_partial_reasons
+                .push("terminal hooks did not finish before completion review".to_string());
         }
         let mut atomically_persisted_completion = None;
         let mut terminal_authoritative_inputs = None;
@@ -2823,22 +2460,9 @@ impl Session {
                 dossier.cycle_phase
                     == Some(crate::task_evidence::CompletionReviewCyclePhase::ProvisionalClean)
             }) {
-                match self
-                    .services
-                    .agent_control
-                    .begin_completion_finalization()
-                    .await
-                {
-                    Ok(permit) => finalization.completion_finalization_permit = Some(permit),
-                    Err(error) => completion_review_partial_reasons.push(format!(
-                        "completion finalization admission could not be acquired: {error}"
-                    )),
-                }
-
                 if completion_review_partial_reasons.is_empty() {
-                    // The completion permit waits for admitted root/default-child work. Reconcile
-                    // authoritative evidence once more before the workspace fence makes the typed
-                    // store read-only.
+                    // Reconcile authoritative evidence immediately before reviewing the current
+                    // workspace snapshot. Writers remain live throughout completion review.
                     let refreshed =
                         completion_review::refresh_authoritative_review_inputs(self).await;
                     completion_review_partial_reasons
@@ -2858,42 +2482,6 @@ impl Session {
                     completion_review_partial_reasons.sort();
                     completion_review_partial_reasons.dedup();
                     terminal_authoritative_inputs = Some(refreshed);
-                }
-
-                if completion_review_partial_reasons.is_empty() {
-                    let coordinator = self.services.agent_control.task_coordinator();
-                    match (
-                        coordinator.store(),
-                        coordinator.root_session_id(),
-                        self.services.task_evidence.repository_root(),
-                    ) {
-                        (Some(store), Some(root_session_id), Some(repo_root)) => {
-                            let repo_root = repo_root.to_path_buf();
-                            match tokio::time::timeout(
-                                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                                store.begin_workspace_finalization(&repo_root, root_session_id),
-                            )
-                            .await
-                            {
-                                Ok(Ok(fence)) => {
-                                    finalization.workspace_finalization_guard = Some(
-                                        WorkspaceFinalizationGuard::new(store, repo_root, fence),
-                                    );
-                                }
-                                Ok(Err(error)) => completion_review_partial_reasons.push(format!(
-                                    "workspace finalization fence could not be acquired: {error}"
-                                )),
-                                Err(_) => completion_review_partial_reasons.push(
-                                    "workspace finalization fence acquisition timed out".to_string(),
-                                ),
-                            }
-                        }
-                        (None, None, _) => {}
-                        _ => completion_review_partial_reasons.push(
-                            "typed-work finalization state was only partially initialized"
-                                .to_string(),
-                        ),
-                    }
                 }
 
                 if completion_review_partial_reasons.is_empty() {
@@ -2919,11 +2507,7 @@ impl Session {
                             if dossier.cycle_phase
                                 == Some(
                                     crate::task_evidence::CompletionReviewCyclePhase::ProvisionalClean,
-                                )
-                                && finalization
-                                    .workspace_finalization_guard
-                                    .as_ref()
-                                    .is_none_or(WorkspaceFinalizationGuard::is_healthy) =>
+                                ) =>
                         {
                             if !completion_review::user_sources_still_current(&dossier).await {
                                 let _ = self
@@ -3068,31 +2652,6 @@ impl Session {
                 }
             }
         }
-        if atomically_persisted_completion.is_some()
-            && finalization
-                .workspace_finalization_guard
-                .as_ref()
-                .is_some_and(|guard| !guard.is_healthy())
-        {
-            let reason = "the workspace finalization fence was lost before terminal emission";
-            let _ = finalization
-                .deadline
-                .run(
-                    "freshness",
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    self.services
-                        .task_evidence
-                        .invalidate_completion_after_terminal_emission_failure(reason),
-                )
-                .await;
-            if let Some(gate) = atomically_persisted_completion.as_mut() {
-                gate.status = TaskCompletionStatus::Partial;
-                gate.reasons.push(reason.to_string());
-                gate.reasons.sort();
-                gate.reasons.dedup();
-            }
-            completion_review_partial_reasons.push(reason.to_string());
-        }
         let completion_was_review_finalized = atomically_persisted_completion.is_some();
         let mut completion = if abort_reason.is_none() {
             match atomically_persisted_completion {
@@ -3151,7 +2710,7 @@ impl Session {
                         Ok(status) => {
                             let reason = (!status.quiescent).then(|| {
                                 format!(
-                                    "linked typed work is not quiescent: active assignments [{}]; running validations [{}]; pending gates [{}]; active claims [{}]; active mutation leases [{}]",
+                                    "linked typed work is not quiescent: active assignments [{}]; running validations [{}]; pending gates [{}]",
                                     status
                                         .active_assignment_ids
                                         .iter()
@@ -3165,13 +2724,6 @@ impl Session {
                                         .map(ToString::to_string)
                                         .collect::<Vec<_>>()
                                         .join(", "),
-                                    status
-                                        .active_claim_assignment_ids
-                                        .iter()
-                                        .map(ToString::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join(", "),
-                                    status.active_mutation_lease_ids.join(", "),
                                 )
                             });
                             (reason, status.warnings)
@@ -3221,12 +2773,6 @@ impl Session {
             && self.services.task_evidence.allows_kd4_completion()
         {
             let mut final_proof_child_gate_state = completion_review_partial_reasons.clone();
-            if !finalization.mutation_quiescent {
-                final_proof_child_gate_state.push(
-                    "terminal mutation quiescence was not established before candidate sealing"
-                        .to_string(),
-                );
-            }
             if let Some(gate) = completion
                 .as_ref()
                 .filter(|gate| gate.status != TaskCompletionStatus::Passed)
@@ -3236,210 +2782,145 @@ impl Session {
             final_proof_child_gate_state.sort();
             final_proof_child_gate_state.dedup();
 
-            if finalization.completion_finalization_permit.is_none() {
-                match finalization
-                    .deadline
-                    .run(
-                        "gate",
-                        TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                        self.services.agent_control.begin_completion_finalization(),
-                    )
-                    .await
-                {
-                    Ok(Ok(permit)) => finalization.completion_finalization_permit = Some(permit),
-                    Ok(Err(error)) => final_proof_child_gate_state.push(format!(
-                        "completion finalization admission could not be acquired: {error}"
-                    )),
-                    Err(_) => final_proof_child_gate_state
-                        .push("completion finalization admission timed out".to_string()),
-                }
-            }
-            if finalization.completion_finalization_permit.is_some()
-                && finalization.workspace_finalization_guard.is_none()
-            {
-                let coordinator = self.services.agent_control.task_coordinator();
-                match (
-                    coordinator.store(),
-                    coordinator.root_session_id(),
-                    self.services.task_evidence.repository_root(),
-                ) {
-                    (Some(store), Some(root_session_id), Some(repo_root)) => {
-                        let repo_root = repo_root.to_path_buf();
-                        match finalization
+            finalization
+                .deadline
+                .record_elapsed("diff_refresh", Duration::ZERO);
+            let sealed = finalization
+                .deadline
+                .run(
+                    "final_proof_gate",
+                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                    seal_terminal_final_proof(
+                        self,
+                        &turn_context,
+                        last_agent_message.as_deref(),
+                        final_proof_child_gate_state,
+                    ),
+                )
+                .await;
+            match sealed {
+                Ok(Some(result)) => {
+                    let freshness_diagnostics = self.services.task_evidence.freshness_diagnostics();
+                    let proof_reuse_count =
+                        u32::try_from(freshness_diagnostics.strong_hashes_reused)
+                            .unwrap_or(u32::MAX);
+                    let conservative_rerun_count =
+                        u32::try_from(freshness_diagnostics.conservative_reruns)
+                            .unwrap_or(u32::MAX);
+                    let gate = match result {
+                        FinalProofSealResultV1::Sealed {
+                            checkpoint,
+                            telemetry,
+                            gate,
+                            ..
+                        } => {
+                            turn_context.turn_timing_state.record_final_proof_telemetry(
+                                checkpoint.estimated_tokens,
+                                telemetry.validation_launch_count,
+                                telemetry.validation_process_ns,
+                                telemetry.validation_aggregate_ns,
+                                1,
+                                proof_reuse_count,
+                                conservative_rerun_count,
+                                0,
+                            );
+                            gate
+                        }
+                        FinalProofSealResultV1::Memoized {
+                            gate,
+                            checkpoint_tokens,
+                            telemetry,
+                        } => {
+                            turn_context.turn_timing_state.record_final_proof_telemetry(
+                                checkpoint_tokens,
+                                telemetry.validation_launch_count,
+                                telemetry.validation_process_ns,
+                                telemetry.validation_aggregate_ns,
+                                1,
+                                proof_reuse_count,
+                                conservative_rerun_count,
+                                1,
+                            );
+                            gate
+                        }
+                        FinalProofSealResultV1::PreflightFailed(gate) => gate,
+                    };
+                    if gate.status == TaskCompletionStatus::Passed {
+                        let memoized = finalization
                             .deadline
                             .run(
-                                "fence",
+                                "completion_finalization",
                                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                                store.begin_workspace_finalization(&repo_root, root_session_id),
+                                self.services
+                                    .task_evidence
+                                    .memoized_finalization_result(&turn_context.sub_id),
                             )
-                            .await
+                            .await;
+                        if let Ok(Some(memoized)) = memoized
+                            && surfaced_result.is_none()
                         {
-                            Ok(Ok(fence)) => {
-                                finalization.workspace_finalization_guard =
-                                    Some(WorkspaceFinalizationGuard::new(store, repo_root, fence));
-                            }
-                            Ok(Err(error)) => final_proof_child_gate_state.push(format!(
-                                "workspace finalization fence could not be acquired: {error}"
-                            )),
-                            Err(_) => final_proof_child_gate_state.push(
-                                "workspace finalization fence acquisition timed out".to_string(),
-                            ),
-                        }
-                    }
-                    (None, None, _) => {}
-                    _ => final_proof_child_gate_state.push(
-                        "typed-work finalization state was only partially initialized".to_string(),
-                    ),
-                }
-            }
-            let fence_ready = finalization
-                .workspace_finalization_guard
-                .as_ref()
-                .is_none_or(WorkspaceFinalizationGuard::is_healthy);
-            if finalization.completion_finalization_permit.is_some() && fence_ready {
-                finalization
-                    .deadline
-                    .record_elapsed("diff_refresh", Duration::ZERO);
-                let sealed = finalization
-                    .deadline
-                    .run(
-                        "final_proof_gate",
-                        TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                        seal_terminal_final_proof(
-                            self,
-                            &turn_context,
-                            last_agent_message.as_deref(),
-                            final_proof_child_gate_state,
-                        ),
-                    )
-                    .await;
-                match sealed {
-                    Ok(Some(result)) => {
-                        let freshness_diagnostics =
-                            self.services.task_evidence.freshness_diagnostics();
-                        let proof_reuse_count =
-                            u32::try_from(freshness_diagnostics.strong_hashes_reused)
-                                .unwrap_or(u32::MAX);
-                        let conservative_rerun_count =
-                            u32::try_from(freshness_diagnostics.conservative_reruns)
-                                .unwrap_or(u32::MAX);
-                        let gate = match result {
-                            FinalProofSealResultV1::Sealed {
-                                checkpoint,
-                                telemetry,
-                                gate,
-                                ..
-                            } => {
-                                turn_context.turn_timing_state.record_final_proof_telemetry(
-                                    checkpoint.estimated_tokens,
-                                    telemetry.validation_launch_count,
-                                    telemetry.validation_process_ns,
-                                    telemetry.validation_aggregate_ns,
-                                    1,
-                                    proof_reuse_count,
-                                    conservative_rerun_count,
-                                    0,
-                                );
-                                gate
-                            }
-                            FinalProofSealResultV1::Memoized {
-                                gate,
-                                checkpoint_tokens,
-                                telemetry,
-                            } => {
-                                turn_context.turn_timing_state.record_final_proof_telemetry(
-                                    checkpoint_tokens,
-                                    telemetry.validation_launch_count,
-                                    telemetry.validation_process_ns,
-                                    telemetry.validation_aggregate_ns,
-                                    1,
-                                    proof_reuse_count,
-                                    conservative_rerun_count,
-                                    1,
-                                );
-                                gate
-                            }
-                            FinalProofSealResultV1::PreflightFailed(gate) => gate,
-                        };
-                        if gate.status == TaskCompletionStatus::Passed {
-                            let memoized = finalization
+                            finalization
+                                .deadline
+                                .record_elapsed("terminal_memo_hit", Duration::ZERO);
+                            last_agent_message = Some(memoized);
+                        } else if let Some(message) = last_agent_message.clone() {
+                            let _ = finalization
                                 .deadline
                                 .run(
                                     "completion_finalization",
                                     TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                                    self.services
-                                        .task_evidence
-                                        .memoized_finalization_result(&turn_context.sub_id),
+                                    async {
+                                        let Some((_checkpoint_id, payload)) = self
+                                            .services
+                                            .task_evidence
+                                            .completion_checkpoint_payload()
+                                            .await
+                                        else {
+                                            return false;
+                                        };
+                                        let Ok(checkpoint) =
+                                            serde_json::from_str::<CompletionCheckpointV1>(
+                                                &payload,
+                                            )
+                                        else {
+                                            return false;
+                                        };
+                                        let requested_artifacts = checkpoint
+                                            .evidence_artifact_references
+                                            .into_iter()
+                                            .collect::<BTreeSet<_>>();
+                                        let history = self.clone_history().await;
+                                        let projected = history.prepare_for_finalization(
+                                            &turn_context.model_info.input_modalities,
+                                            crate::context::CompletionCheckpointContext::new(
+                                                payload,
+                                            ),
+                                            &requested_artifacts,
+                                        );
+                                        if projected.items().is_empty() {
+                                            return false;
+                                        }
+                                        self.services
+                                            .task_evidence
+                                            .record_finalization_result(
+                                                turn_context.sub_id.clone(),
+                                                message,
+                                                finalization.mutation_quiescent,
+                                                finalization.mutation_quiescent,
+                                            )
+                                            .await
+                                    },
                                 )
                                 .await;
-                            if let Ok(Some(memoized)) = memoized
-                                && surfaced_result.is_none()
-                            {
-                                finalization
-                                    .deadline
-                                    .record_elapsed("terminal_memo_hit", Duration::ZERO);
-                                last_agent_message = Some(memoized);
-                            } else if let Some(message) = last_agent_message.clone() {
-                                let _ = finalization
-                                    .deadline
-                                    .run(
-                                        "completion_finalization",
-                                        TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                                        async {
-                                            let Some((_checkpoint_id, payload)) = self
-                                                .services
-                                                .task_evidence
-                                                .completion_checkpoint_payload()
-                                                .await
-                                            else {
-                                                return false;
-                                            };
-                                            let Ok(checkpoint) =
-                                                serde_json::from_str::<CompletionCheckpointV1>(
-                                                    &payload,
-                                                )
-                                            else {
-                                                return false;
-                                            };
-                                            let requested_artifacts = checkpoint
-                                                .evidence_artifact_references
-                                                .into_iter()
-                                                .collect::<BTreeSet<_>>();
-                                            let history = self.clone_history().await;
-                                            let projected = history.prepare_for_finalization(
-                                                &turn_context.model_info.input_modalities,
-                                                crate::context::CompletionCheckpointContext::new(
-                                                    payload,
-                                                ),
-                                                &requested_artifacts,
-                                            );
-                                            if projected.items().is_empty() {
-                                                return false;
-                                            }
-                                            self.services
-                                                .task_evidence
-                                                .record_finalization_result(
-                                                    turn_context.sub_id.clone(),
-                                                    message,
-                                                    finalization.mutation_quiescent,
-                                                    finalization.mutation_quiescent,
-                                                )
-                                                .await
-                                        },
-                                    )
-                                    .await;
-                            }
                         }
-                        completion = Some(gate);
                     }
-                    Ok(None) => {}
-                    Err(_) => merge_completion_review_partial(
-                        &mut completion,
-                        vec!["final-proof candidate sealing timed out".to_string()],
-                    ),
+                    completion = Some(gate);
                 }
-            } else {
-                merge_completion_review_partial(&mut completion, final_proof_child_gate_state);
+                Ok(None) => {}
+                Err(_) => merge_completion_review_partial(
+                    &mut completion,
+                    vec!["final-proof candidate sealing timed out".to_string()],
+                ),
             }
         }
         if abort_reason.is_none() {
@@ -3498,13 +2979,9 @@ impl Session {
                 .as_ref()
                 .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed)
         {
-            let terminal_invalidation_reason = if finalization
-                .workspace_finalization_guard
-                .as_ref()
-                .is_some_and(|guard| !guard.is_healthy())
+            let terminal_invalidation_reason = if let Some(authoritative) =
+                terminal_authoritative_inputs.as_ref()
             {
-                Some("the workspace finalization fence was lost before terminal emission")
-            } else if let Some(authoritative) = terminal_authoritative_inputs.as_ref() {
                 let validation = finalization
                     .deadline
                     .run("freshness", TERMINAL_MUTATION_FINALIZATION_TIMEOUT, async {
@@ -3539,13 +3016,6 @@ impl Session {
             } else {
                 Some("the final authoritative completion snapshot was unavailable")
             };
-            let terminal_invalidation_reason = terminal_invalidation_reason.or_else(|| {
-                finalization
-                    .workspace_finalization_guard
-                    .as_ref()
-                    .is_some_and(|guard| !guard.is_healthy())
-                    .then_some("the workspace finalization fence was lost before terminal emission")
-            });
             if let Some(reason) = terminal_invalidation_reason {
                 if let Some(gate) = completion.as_mut() {
                     gate.status = TaskCompletionStatus::Partial;
@@ -3576,52 +3046,6 @@ impl Session {
             )
             .await
             .unwrap_or(None);
-        if abort_reason.is_none()
-            && completion
-                .as_ref()
-                .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed)
-            && finalization
-                .workspace_finalization_guard
-                .as_ref()
-                .is_some_and(|guard| !guard.is_healthy())
-        {
-            let reason = "the workspace finalization fence was lost before terminal emission";
-            if let Some(gate) = completion.as_mut() {
-                gate.status = TaskCompletionStatus::Partial;
-                gate.reasons.push(reason.to_string());
-                gate.reasons.sort();
-                gate.reasons.dedup();
-            }
-            let _ = finalization
-                .deadline
-                .run(
-                    "freshness",
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    self.services
-                        .task_evidence
-                        .invalidate_completion_after_terminal_emission_failure(reason),
-                )
-                .await;
-        }
-        if abort_reason.is_none()
-            && let Some(reason) = seal_passed_completion_for_terminal_dispatch(
-                &mut completion,
-                finalization.workspace_finalization_guard.as_mut(),
-                &finalization.deadline,
-            )
-            .await
-        {
-            let _ = finalization
-                .deadline
-                .run(
-                    "freshness",
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    self.services
-                        .task_evidence
-                        .invalidate_completion_after_terminal_emission_failure(reason),
-                )
-                .await;
-        }
         let mut passed_root_completion = abort_reason.is_none()
             && !turn_context.session_source.is_non_root_agent()
             && completion
@@ -3772,11 +3196,6 @@ impl Session {
                 self.set_last_passed_root_completion_turn_id(Some(turn_context.sub_id.clone())),
             )
             .await;
-        }
-        if let Some(mut guard) = finalization.workspace_finalization_guard.take()
-            && let Err(error) = guard.release().await
-        {
-            warn!(%error, "failed to release workspace finalization fence after terminal emission");
         }
         let circuit_breaker_cleanup = async {
             self.services
@@ -3936,29 +3355,11 @@ impl Session {
         finalization: &mut TerminalFinalization,
     ) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
-        let mutation_cleanup_completed = matches!(
-            finalization
-                .deadline
-                .run(
-                    "hooks_quiescence",
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                    self.services
-                        .command_execution
-                        .cancel_mutations_for_terminal_turn_with_timeout(
-                            &turn_context.sub_id,
-                            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                        ),
-                )
-                .await,
-            Ok(true)
-        );
-        finalization.mutation_quiescent &= mutation_cleanup_completed;
-        if !mutation_cleanup_completed {
-            warn!(
-                turn_id = %turn_context.sub_id,
-                "timed out waiting for turn-owned workspace mutations during fail-safe finalization"
-            );
-        }
+        self.services
+            .command_execution
+            .finish_turn(&turn_context.sub_id)
+            .await;
+        finalization.mutation_quiescent = true;
         finalization.task.cancellation_token.cancel();
         finalization.task.worker_abort_handle.abort();
         turn_context
@@ -4097,11 +3498,6 @@ impl Session {
             .is_err()
         {
             warn!(turn_id = %turn_context.sub_id, "timed out emitting fail-safe reasoning summary");
-        }
-        if let Some(mut guard) = finalization.workspace_finalization_guard.take()
-            && let Err(error) = guard.release().await
-        {
-            warn!(%error, "failed to release workspace finalization fence during fail-safe cleanup");
         }
         let circuit_breaker_cleanup = async {
             self.services

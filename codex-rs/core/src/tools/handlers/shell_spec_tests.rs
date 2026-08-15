@@ -34,7 +34,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "cmd".to_string(),
             JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. For repository source reads or searches, prefer `read_file_span` or `search_source` when available. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane."
+                "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane."
                     .to_string(),
             )),
         ),
@@ -69,7 +69,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Prefer `read_file_span` or `search_source` for repository source inspection. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
                     .to_string(),
             )),
         ),
@@ -101,9 +101,10 @@ fn exec_command_tool_matches_expected_spec() {
         ),
         (
             "max_output_tokens".to_string(),
-            JsonSchema::number(Some(
-                    "Output token budget. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics; larger requests may be capped by policy.".to_string(),
-                )),
+            JsonSchema::number(Some(format!(
+                "Output token budget. {}; larger requests may be capped by policy.",
+                codex_utils_output_truncation::adaptive_output_budget_description()
+            ))),
         ),
         (
             "login".to_string(),
@@ -175,9 +176,10 @@ fn write_stdin_tool_matches_expected_spec() {
         ),
         (
             "max_output_tokens".to_string(),
-            JsonSchema::number(Some(
-                "Output token budget. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics; larger requests may be capped by policy.".to_string(),
-            )),
+            JsonSchema::number(Some(format!(
+                "Output token budget. {}; larger requests may be capped by policy.",
+                codex_utils_output_truncation::adaptive_output_budget_description()
+            ))),
         ),
     ]);
 
@@ -269,7 +271,7 @@ Examples of valid command strings:
         (
             "command".to_string(),
             JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. For repository source reads or searches, prefer `read_file_span` or `search_source` when available. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane."
+                "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane."
                     .to_string(),
             )),
         ),
@@ -304,7 +306,7 @@ Examples of valid command strings:
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Prefer `read_file_span` or `search_source` for repository source inspection. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime. Read-only PowerShell that uses variables, loops, or script blocks may require the repository mutation lane."
                     .to_string(),
             )),
         ),

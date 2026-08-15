@@ -9,9 +9,7 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
-use crate::config::RolloutBudgetConfig;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use crate::rollout_budget::RolloutBudget;
 use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
@@ -47,11 +45,6 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use tokio::sync::OwnedRwLockReadGuard;
-use tokio::sync::OwnedRwLockWriteGuard;
-use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -61,52 +54,6 @@ use self::residency::V2Residency;
 
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
 const TYPED_ACTOR_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-const COMPLETION_FINALIZATION_DRAIN_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30);
-
-#[derive(Clone, Default)]
-struct CompletionFinalizationAdmission {
-    finalizing: Arc<AtomicBool>,
-    activities: Arc<RwLock<()>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct CompletionActivityPermit {
-    _guard: Arc<OwnedRwLockReadGuard<()>>,
-}
-
-impl std::fmt::Debug for CompletionActivityPermit {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CompletionActivityPermit")
-            .finish_non_exhaustive()
-    }
-}
-
-pub(crate) struct CompletionFinalizationPermit {
-    admission: CompletionFinalizationAdmission,
-    _guard: OwnedRwLockWriteGuard<()>,
-}
-
-struct PendingCompletionFinalization {
-    admission: CompletionFinalizationAdmission,
-    committed: bool,
-}
-
-impl Drop for PendingCompletionFinalization {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.admission.finalizing.store(false, Ordering::Release);
-        }
-    }
-}
-
-impl Drop for CompletionFinalizationPermit {
-    fn drop(&mut self) {
-        self.admission.finalizing.store(false, Ordering::Release);
-    }
-}
-
 mod execution;
 mod legacy;
 mod residency;
@@ -243,29 +190,19 @@ pub(crate) struct AgentControl {
     v2_load_flights:
         Arc<std::sync::Mutex<HashMap<ThreadId, Arc<watch::Sender<V2AgentLoadCompletion>>>>>,
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
-    /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
-    rollout_budget: Arc<RolloutBudget>,
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
-    completion_finalization: CompletionFinalizationAdmission,
     #[cfg(test)]
     test_hooks: Arc<AgentControlTestHooks>,
 }
 
 impl AgentControl {
     /// Construct a new `AgentControl` that can spawn/message agents via the given manager state.
-    pub(crate) fn new(
-        manager: Weak<ThreadManagerState>,
-        rollout_budget: Option<RolloutBudgetConfig>,
-    ) -> Self {
-        let control = Self {
+    pub(crate) fn new(manager: Weak<ThreadManagerState>) -> Self {
+        Self {
             manager,
             ..Default::default()
-        };
-        if let Some(rollout_budget) = rollout_budget {
-            control.rollout_budget.configure(rollout_budget);
         }
-        control
     }
 
     pub(crate) fn with_session_id(mut self, session_id: SessionId, max_threads: usize) -> Self {
@@ -280,51 +217,12 @@ impl AgentControl {
         self.session_id
     }
 
-    pub(crate) fn rollout_budget(&self) -> &RolloutBudget {
-        self.rollout_budget.as_ref()
-    }
-
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
         &self.task_coordinator
     }
 
     pub(crate) fn has_live_agents(&self) -> bool {
         self.state.has_live_agents()
-    }
-
-    pub(crate) async fn admit_completion_activity(
-        &self,
-    ) -> Result<CompletionActivityPermit, String> {
-        let admission = &self.completion_finalization;
-        if admission.finalizing.load(Ordering::Acquire) {
-            return Err("completion finalization is already in progress".to_string());
-        }
-        let guard = Arc::clone(&admission.activities).read_owned().await;
-        if admission.finalizing.load(Ordering::Acquire) {
-            drop(guard);
-            return Err("completion finalization began before activity admission".to_string());
-        }
-        Ok(CompletionActivityPermit {
-            _guard: Arc::new(guard),
-        })
-    }
-
-    pub(crate) async fn default_child_completion_activity(
-        &self,
-        session_source: &SessionSource,
-    ) -> CodexResult<Option<CompletionActivityPermit>> {
-        if !session_source.is_non_root_agent()
-            || self
-                .task_coordinator()
-                .binding_for_source(session_source)
-                .is_some()
-        {
-            return Ok(None);
-        }
-        self.admit_completion_activity()
-            .await
-            .map(Some)
-            .map_err(CodexErr::UnsupportedOperation)
     }
 
     pub(crate) async fn completion_evidence_target(
@@ -360,33 +258,6 @@ impl AgentControl {
                 source_agent_path: agent_path.to_string(),
             }),
         )
-    }
-
-    pub(crate) async fn begin_completion_finalization(
-        &self,
-    ) -> Result<CompletionFinalizationPermit, String> {
-        let admission = self.completion_finalization.clone();
-        admission
-            .finalizing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| "completion finalization is already in progress".to_string())?;
-        let mut pending = PendingCompletionFinalization {
-            admission: admission.clone(),
-            committed: false,
-        };
-        let guard = tokio::time::timeout(
-            COMPLETION_FINALIZATION_DRAIN_TIMEOUT,
-            Arc::clone(&admission.activities).write_owned(),
-        )
-        .await
-        .map_err(|_| {
-            "completion activity did not quiesce before the finalization deadline".to_string()
-        })?;
-        pending.committed = true;
-        Ok(CompletionFinalizationPermit {
-            admission,
-            _guard: guard,
-        })
     }
 
     pub(crate) async fn default_children_quiescence(&self) -> (bool, Vec<String>) {

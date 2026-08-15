@@ -960,7 +960,7 @@ impl ThreadManager {
         options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
     ) -> CodexResult<NewThread> {
-        let agent_control = self.agent_control_for_config(&options.config);
+        let agent_control = self.agent_control();
         let (resumed_session_source, resumed_thread_source) = options
             .initial_history
             .get_resumed_session_sources()
@@ -1139,7 +1139,7 @@ impl ThreadManager {
                 )
             });
         self.validate_environment_selections(&environments)?;
-        let agent_control = self.agent_control_for_config(&config);
+        let agent_control = self.agent_control();
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
@@ -1193,7 +1193,7 @@ impl ThreadManager {
         user_shell_override: crate::shell::Shell,
         supports_openai_form_elicitation: bool,
     ) -> CodexResult<NewThread> {
-        let agent_control = self.agent_control_for_config(&config);
+        let agent_control = self.agent_control();
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
             &config.cwd,
@@ -1225,7 +1225,7 @@ impl ThreadManager {
         user_shell_override: crate::shell::Shell,
         supports_openai_form_elicitation: bool,
     ) -> CodexResult<NewThread> {
-        let agent_control = self.agent_control_for_config(&config);
+        let agent_control = self.agent_control();
         let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
@@ -1502,7 +1502,7 @@ impl ThreadManager {
                 )
             });
         self.validate_environment_selections(&environments)?;
-        let agent_control = self.agent_control_for_config(&config);
+        let agent_control = self.agent_control();
         let new_thread = Box::pin(self.state.spawn_thread(
             config,
             history,
@@ -1537,11 +1537,7 @@ impl ThreadManager {
     }
 
     pub(crate) fn agent_control(&self) -> AgentControl {
-        AgentControl::new(Arc::downgrade(&self.state), /*rollout_budget*/ None)
-    }
-
-    fn agent_control_for_config(&self, config: &Config) -> AgentControl {
-        AgentControl::new(Arc::downgrade(&self.state), config.rollout_budget.clone())
+        AgentControl::new(Arc::downgrade(&self.state))
     }
 
     #[cfg(test)]

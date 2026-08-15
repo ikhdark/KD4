@@ -226,7 +226,7 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
     #[cfg(test)]
     test_observation::record_immutable_git_show_identity();
     let started = Instant::now();
-    if !is_git_program(program) || args.len() != 2 || args[0] != "show" {
+    if !is_immutable_git_show_candidate(program, args) {
         return None;
     }
     let requested = &args[1];
@@ -260,6 +260,13 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
         provenance: format!("git-object:{requested}"),
         fingerprint_cost: started.elapsed(),
     })
+}
+
+/// Cheap syntax-only gate for the narrow immutable command class supported by
+/// Known Delta. Callers use this before computing repository identity so an
+/// ordinary `rg`, status, or shell command never spawns fingerprinting Git.
+pub(crate) fn is_immutable_git_show_candidate(program: &str, args: &[String]) -> bool {
+    is_git_program(program) && args.len() == 2 && args[0] == "show"
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -680,6 +687,22 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immutable_git_show_gate_rejects_ordinary_commands_before_fingerprinting() {
+        assert!(is_immutable_git_show_candidate(
+            "git",
+            &["show".to_string(), "HEAD:file.rs".to_string()]
+        ));
+        assert!(!is_immutable_git_show_candidate(
+            "git",
+            &["status".to_string(), "--short".to_string()]
+        ));
+        assert!(!is_immutable_git_show_candidate(
+            "rg",
+            &["pattern".to_string(), "src".to_string()]
+        ));
+    }
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 

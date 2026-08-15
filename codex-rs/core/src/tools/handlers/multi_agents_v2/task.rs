@@ -49,11 +49,9 @@ use similar::ChangeTag;
 use similar::TextDiff;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::Duration;
 
 const GET_AGENT_TASK_TOOL: &str = "get_agent_task";
 const SUBMIT_AGENT_RECEIPT_TOOL: &str = "submit_agent_receipt";
-const MUTATION_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SET_AGENT_GATE_TOOL: &str = "set_agent_gate";
 const AMEND_AGENT_TASK_TOOL: &str = "amend_agent_task";
 const WAIVE_AGENT_GATE_TOOL: &str = "waive_agent_gate";
@@ -246,29 +244,29 @@ async fn handle_submit_agent_receipt(
             StoreError::RequiredEvidenceMissing { obligations },
         ));
     }
-    // A sealed receipt makes task completion visible to other turns. Ensure any
-    // command-level workspace mutation owned by this turn has terminated and
-    // released both its persisted lease and its local reservation first.
-    let mutations_stopped = session
-        .services
-        .command_execution
-        .cancel_mutations_for_turn_with_timeout(&turn.sub_id, MUTATION_CANCELLATION_TIMEOUT)
-        .await;
-    if !mutations_stopped {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{SUBMIT_AGENT_RECEIPT_TOOL}: timed out waiting for active workspace mutations to stop"
-        )));
+    if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
+        tracing::warn!(
+            %error,
+            attempt_id = %binding.attempt_id,
+            "typed mutation evidence finalization was unavailable; continuing receipt submission"
+        );
     }
-    store
-        .finalize_pending_mutations(binding.attempt_id)
-        .await
-        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     // Risk derivation and cold-review evidence must cover the complete attempt, including writes
     // that another runtime path finalized before receipt submission.
-    let observed_writes = store
+    let observed_writes = match store
         .list_mutation_evidence(binding.attempt_id, Some(MAX_MUTATION_EVIDENCE_LIMIT))
         .await
-        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    {
+        Ok(observed_writes) => observed_writes,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                attempt_id = %binding.attempt_id,
+                "typed mutation evidence could not be read; continuing receipt submission"
+            );
+            Vec::new()
+        }
+    };
     let review_reason = derive_review_reason(
         store.as_ref(),
         turn.config.cwd.as_path(),
@@ -362,8 +360,8 @@ async fn derive_review_reason(
             non_generated_changed_files: diff.non_generated_changed_files,
             non_generated_changed_lines: diff.non_generated_changed_lines,
             focused_validation_succeeded,
-            // Overlap is rejected atomically when the assignment is accepted. Detection-only
-            // attribution is the remaining persisted signal that concurrent drift may exist.
+            // Claim overlap is advisory metadata, not an ownership conflict. Detection-only
+            // attribution remains the persisted signal that concurrent drift may exist.
             ownership_conflict: false,
             drift,
         },

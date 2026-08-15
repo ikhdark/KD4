@@ -43,7 +43,6 @@ pub(crate) enum StableContextKind {
     Plugins,
     EnvironmentPermissions,
     RootCoordinator,
-    CompactionCheckpoint,
     MultiAgent,
     ToolSchemas,
     RequestUserInput,
@@ -64,7 +63,6 @@ impl StableContextKind {
             Self::Plugins => "plugins",
             Self::EnvironmentPermissions => "environment_permissions",
             Self::RootCoordinator => "root_coordinator",
-            Self::CompactionCheckpoint => "compaction_checkpoint",
             Self::MultiAgent => "multi_agent",
             Self::ToolSchemas => "tool_schemas",
             Self::RequestUserInput => "request_user_input",
@@ -281,7 +279,6 @@ enum StableContextSlot {
     Permissions,
     MultiAgent,
     RootCoordinator,
-    RolloutBudget,
 }
 
 impl StableContextSlot {
@@ -297,7 +294,6 @@ impl StableContextSlot {
             Self::Permissions => StableContextKind::EnvironmentPermissions,
             Self::MultiAgent => StableContextKind::MultiAgent,
             Self::RootCoordinator => StableContextKind::RootCoordinator,
-            Self::RolloutBudget => StableContextKind::CompactionCheckpoint,
         }
     }
 
@@ -313,7 +309,6 @@ impl StableContextSlot {
             Self::Permissions => "environment_permissions",
             Self::MultiAgent => "multi_agent",
             Self::RootCoordinator => "root_coordinator",
-            Self::RolloutBudget => "rollout_budget",
         }
     }
 }
@@ -644,11 +639,6 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
             "</multi_agent_mode>",
             StableContextSlot::MultiAgent,
         ),
-        (
-            "<rollout_budget>",
-            "</rollout_budget>",
-            StableContextSlot::RolloutBudget,
-        ),
     ]
     .into_iter()
     .find_map(|(open, close, slot)| marked(text, open, close).then_some(slot))
@@ -665,7 +655,6 @@ fn contains_known_open_marker(text: &str) -> bool {
         PLUGINS_INSTRUCTIONS_OPEN_TAG,
         "<permissions instructions>",
         MULTI_AGENT_MODE_OPEN_TAG,
-        "<rollout_budget>",
     ]
     .iter()
     .any(|marker| text.trim_start().starts_with(marker))

@@ -11,8 +11,8 @@ without redefining repository implementation policy.
 - `.codex/harness` owns optional durable task artifacts and lifecycle guidance.
 - This file owns delegated-role and architect-lane procedure; load it only when
   such a workflow is active.
-- Give every mutating root task and subagent a durable identity. One owner holds
-  each path and named-contract claim at a time in a shared worktree.
+- Give every mutating root task and subagent a durable identity. Path and
+  named-contract claims are diagnostic coordination metadata and may overlap.
 
 ## Phase 1: Intake
 
@@ -40,14 +40,15 @@ registry and checks every registered receipt atomically. Use
 terminal. Receipts are leases (one hour by default); long-running assignments
 must rerun the same preflight before expiry to renew them, or pass a bounded
 `--lease-seconds` value to the script. Expired and legacy non-lease receipts are
-removed under the registry lock so a crashed process cannot block the repository
-forever. The preflight must name the assignment and root task, starting
+removed under the registry lock so stale advisories do not accumulate forever.
+The preflight must name the assignment and root task, starting
 revision, path and contract claims, dependencies, generated-output owner,
 validation owner, exact validation commands, Cargo lane, and shared/isolated
 workspace strategy.
 
-Accidental overlap is a preflight failure. Deliberate competing implementations
-use separate isolated worktrees and a versioned integrator handoff.
+Path, contract, and Cargo-lane overlap is returned in the resolved receipt's
+`advisories` array. Use isolated worktrees when separation is useful, but overlap
+does not block shared-worktree execution.
 
 ## Phase 3: Implement
 
@@ -59,8 +60,8 @@ Keep unrelated dirty changes intact. Keep generated output under its owning
 workflow. Do not add logs, screenshots, binaries, or large transcripts to
 reviewable changes unless requested.
 
-Before a claimed write, compare the file with the hash from the supporting read.
-If it changed, reconcile once instead of applying a stale patch.
+Use supporting reads and current file state to reduce accidental overwrites.
+Freshness and ownership mismatches become review risk; they do not reject writes.
 
 ## Phase 4: Check
 
@@ -102,10 +103,10 @@ survive. Release any active preflight receipt after its assignment is terminal.
 ## Optional Multi-Agent Mode
 
 Use `ORCHESTRATOR.md` when multi-agent work is active. Give each agent a bounded
-task, durable identity, claim set, and evidence target. Keep exactly one owner
-for each complete behavioral contract and one owner for final validation.
-Before root completion, linked assignments, validations, gates, and claims must
-be terminal, and no linked workspace mutation lease may remain active. Root
+task, durable identity, claim set, and evidence target. Name one owner for each
+complete behavioral contract and one owner for final validation; overlaps remain
+visible as risk metadata. Before root completion, linked assignments,
+validations, and gates must be terminal. Root
 completion rechecks sealed receipt evidence so later relevant drift remains a
 blocker; unrelated task roots only warn and do not join this barrier.
 
@@ -128,9 +129,10 @@ coordinator treats the architect assignment as incomplete and does not spawn the
 coder. Bind the reviewer and verifier to the coder as their sole evaluation
 target, with both architect and coder assignments as dependencies.
 
-The store and runtime hard-enforce the architect and verifier capability
-boundaries, successful sealed dependencies and cleared gates, and exclusive path
-and named-contract claims. The receipt format, transcription fidelity, exact
+The store and runtime enforce active-assignment lifecycle, root-only task control,
+independent-review read-only boundaries, successful sealed dependencies, and
+cleared gates. Path and named-contract claims are advisory. The receipt format,
+transcription fidelity, exact
 obligation-ID comparison, and refusal to complete with unresolved copied
 obligations are coordinator-policy checks. They are not store validation. The
 coder's copied typed assignment is authoritative for review and verification;

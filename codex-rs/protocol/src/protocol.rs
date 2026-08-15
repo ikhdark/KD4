@@ -1826,7 +1826,6 @@ pub enum NonSteerableTurnKind {
 #[ts(rename_all = "snake_case")]
 pub enum CodexErrorInfo {
     ContextWindowExceeded,
-    SessionBudgetExceeded,
     UsageLimitExceeded,
     ServerOverloaded,
     CyberPolicy,
@@ -1855,6 +1854,7 @@ pub enum CodexErrorInfo {
         turn_kind: NonSteerableTurnKind,
     },
     ThreadRollbackFailed,
+    #[serde(alias = "session_budget_exceeded")]
     Other,
 }
 
@@ -1864,7 +1864,6 @@ impl CodexErrorInfo {
         match self {
             Self::ThreadRollbackFailed | Self::ActiveTurnNotSteerable { .. } => false,
             Self::ContextWindowExceeded
-            | Self::SessionBudgetExceeded
             | Self::UsageLimitExceeded
             | Self::ServerOverloaded
             | Self::CyberPolicy
@@ -2088,11 +2087,6 @@ pub struct TurnTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub pre_first_model_output: Option<TurnTimingPreFirstModelOutput>,
-    /// Pre-edit convergence milestones and bounded aggregate counters. Interval
-    /// durations and count deltas are derived from these snapshots by analysis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub pre_edit_convergence: Option<TurnTimingPreEditConvergence>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2235,11 +2229,6 @@ pub struct TurnTimingModelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub token_usage: Option<TurnTimingProviderTokenUsage>,
-    /// Observational usage for the request immediately following source-result
-    /// cells. Provider fields remain whole-request usage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub post_discovery: Option<TurnTimingPostDiscoveryRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub dispatch_ms: Option<u64>,
@@ -2249,21 +2238,6 @@ pub struct TurnTimingModelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub completed_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct TurnTimingPostDiscoveryRequest {
-    pub total_provider_input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub newly_injected_discovery_result_tokens: u64,
-    pub discovery_result_cells: u32,
-    pub discovery_model_boundary_count: u32,
-    /// `(provider input / injected result tokens) * 1_000_000` when defined.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
-    pub replay_amplification_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2290,13 +2264,6 @@ pub enum TurnTimingGenerationPurpose {
     #[serde(rename = "initial", alias = "initial_reasoning")]
     #[ts(rename = "initial")]
     InitialReasoning,
-    #[serde(
-        rename = "source_interpretation",
-        alias = "source_evidence_interpretation",
-        alias = "source_discovery"
-    )]
-    #[ts(rename = "source_interpretation")]
-    SourceEvidenceInterpretation,
     #[serde(rename = "implementation", alias = "implementation_decision")]
     #[ts(rename = "implementation")]
     ImplementationDecision,
@@ -2310,7 +2277,10 @@ pub enum TurnTimingGenerationPurpose {
     Coordination,
     #[serde(
         rename = "deterministic_tool_continuation",
-        alias = "artifact_continuation"
+        alias = "artifact_continuation",
+        alias = "source_interpretation",
+        alias = "source_evidence_interpretation",
+        alias = "source_discovery"
     )]
     #[ts(rename = "deterministic_tool_continuation")]
     ArtifactContinuation,
@@ -2326,8 +2296,7 @@ pub enum TurnTimingGenerationPurpose {
 pub enum DeterministicContinuationClass {
     #[default]
     UnchangedWait,
-    SourceBundle,
-    SourceCoverage,
+    #[serde(alias = "source_bundle", alias = "source_coverage")]
     ArtifactRange,
     AgentEventWait,
 }
@@ -2338,9 +2307,11 @@ pub enum DeterministicContinuationClass {
 pub enum DeterministicContinuationHostAction {
     #[default]
     AwaitStateChange,
-    BatchSourceBundle,
-    ReuseCoveredSpan,
-    ReadMissingRanges,
+    #[serde(
+        alias = "batch_source_bundle",
+        alias = "reuse_covered_span",
+        alias = "read_missing_ranges"
+    )]
     DrainArtifactRanges,
 }
 
@@ -2424,8 +2395,6 @@ fn derive_continuation_wire_identity(
     fn class_name(class: DeterministicContinuationClass) -> &'static str {
         match class {
             DeterministicContinuationClass::UnchangedWait => "unchanged_wait",
-            DeterministicContinuationClass::SourceBundle => "source_bundle",
-            DeterministicContinuationClass::SourceCoverage => "source_coverage",
             DeterministicContinuationClass::ArtifactRange => "artifact_range",
             DeterministicContinuationClass::AgentEventWait => "agent_event_wait",
         }
@@ -2433,9 +2402,6 @@ fn derive_continuation_wire_identity(
     fn action_name(action: DeterministicContinuationHostAction) -> &'static str {
         match action {
             DeterministicContinuationHostAction::AwaitStateChange => "await_state_change",
-            DeterministicContinuationHostAction::BatchSourceBundle => "batch_source_bundle",
-            DeterministicContinuationHostAction::ReuseCoveredSpan => "reuse_covered_span",
-            DeterministicContinuationHostAction::ReadMissingRanges => "read_missing_ranges",
             DeterministicContinuationHostAction::DrainArtifactRanges => "drain_artifact_ranges",
         }
     }
@@ -2448,6 +2414,42 @@ fn derive_continuation_wire_identity(
         state_revision,
         action_name(host_action),
     )
+}
+
+fn legacy_continuation_wire_identity_matches(
+    serialized: &str,
+    class: DeterministicContinuationClass,
+    resource_identity_hash: &str,
+    state_revision: &str,
+    host_action: DeterministicContinuationHostAction,
+) -> bool {
+    let class_names: &[&str] = match class {
+        DeterministicContinuationClass::ArtifactRange => {
+            &["artifact_range", "source_bundle", "source_coverage"]
+        }
+        _ => return false,
+    };
+    let action_names: &[&str] = match host_action {
+        DeterministicContinuationHostAction::DrainArtifactRanges => &[
+            "drain_artifact_ranges",
+            "batch_source_bundle",
+            "reuse_covered_span",
+            "read_missing_ranges",
+        ],
+        _ => return false,
+    };
+    class_names.iter().any(|class_name| {
+        action_names.iter().any(|action_name| {
+            serialized
+                == format!(
+                    "v1|{class_name}|{}:{}|{}:{}|{action_name}",
+                    resource_identity_hash.len(),
+                    resource_identity_hash,
+                    state_revision.len(),
+                    state_revision,
+                )
+        })
+    })
 }
 
 #[derive(Serialize)]
@@ -2505,6 +2507,13 @@ impl<'de> Deserialize<'de> for TurnTimingDeterministicContinuationReceipt {
         );
         if let Some(serialized) = wire.wire_identity
             && serialized != expected
+            && !legacy_continuation_wire_identity_matches(
+                &serialized,
+                wire.class,
+                &wire.resource_identity_hash,
+                &wire.state_revision,
+                wire.host_action,
+            )
         {
             return Err(serde::de::Error::custom(
                 "deterministic continuation wireIdentity does not match its canonical public fields",
@@ -2550,13 +2559,13 @@ pub struct TurnTimingDiagnosticTokenAggregate {
 #[ts(rename_all = "snake_case", export_to = "v2/")]
 pub enum TurnTimingProgressKind {
     #[serde(
+        alias = "new_named_evidence",
+        alias = "source_closure",
         alias = "new_input",
         alias = "plan_change",
         alias = "completion_state",
         alias = "structured_action_change"
     )]
-    NewNamedEvidence,
-    SourceClosure,
     WorkspaceMutation,
     ValidationResult,
     FailureObservation,
@@ -2617,8 +2626,6 @@ pub struct TurnTimingGenerationDispositionCounts {
 pub struct TurnTimingGenerationPurposeCounts {
     #[serde(default, alias = "initial")]
     pub initial_reasoning: u32,
-    #[serde(default, alias = "sourceInterpretation")]
-    pub source_evidence_interpretation: u32,
     #[serde(default, alias = "implementation")]
     pub implementation_decision: u32,
     pub wait: u32,
@@ -2678,83 +2685,6 @@ pub struct TurnTimingPreFirstModelOutput {
     pub request_transformation_ns: u64,
     pub serialization_ns: u64,
     pub transport_readiness_ns: u64,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct TurnTimingPreEditConvergence {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
-    pub accepted_to_owner_resolved_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
-    pub owner_resolved_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub owner_resolved_generation_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub owner_resolved_tool_call_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
-    pub owner_resolved_to_bundle_ready_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
-    pub implementation_ready_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub implementation_ready_generation_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub implementation_ready_tool_call_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
-    pub first_accepted_mutation_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub first_accepted_mutation_generation_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub first_accepted_mutation_tool_call_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
-    pub bundle_ready_to_first_accepted_mutation_ms: Option<u64>,
-    #[serde(default)]
-    pub mutation_before_ready: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
-    pub first_successful_mutation_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub first_successful_mutation_generation_count: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub first_successful_mutation_tool_call_count: Option<u32>,
-    #[serde(default)]
-    pub material_evidence_operations: u32,
-    #[serde(default)]
-    pub broad_discovery_after_ready: u32,
-    #[serde(default)]
-    pub readiness_reopen_count: u32,
-    #[serde(default)]
-    pub reopen_reason_counts: TurnTimingReadinessReopenReasonCounts,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct TurnTimingReadinessReopenReasonCounts {
-    #[serde(default)]
-    pub source_revision: u32,
-    #[serde(default)]
-    pub contradictory_evidence: u32,
-    #[serde(default)]
-    pub incomplete_evidence: u32,
-    #[serde(default)]
-    pub new_ambiguity: u32,
-    #[serde(default)]
-    pub user_steering: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2826,90 +2756,6 @@ pub struct TurnTimingMilestones {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct TurnTimingSourceDiscoveryCounters {
-    #[serde(default)]
-    pub locator_operation_count: u32,
-    #[serde(default)]
-    pub search_operation_count: u32,
-    #[serde(default)]
-    pub read_operation_count: u32,
-    #[serde(default)]
-    pub bundle_operation_count: u32,
-    #[serde(default)]
-    pub recovery_operation_count: u32,
-    #[serde(default)]
-    pub locator_to_discovery_boundary_count: u32,
-    #[serde(default)]
-    pub discovery_to_discovery_boundary_count: u32,
-    #[serde(default)]
-    pub recovery_to_recovery_boundary_count: u32,
-    #[serde(default)]
-    pub materialized_sections: TurnTimingSourceSectionCategoryCounts,
-    #[serde(default)]
-    pub inline_sections: TurnTimingSourceSectionCategoryCounts,
-    #[serde(default)]
-    pub avoided_singleton_read_count: u32,
-    #[serde(default)]
-    pub bundle_generation_micros: u64,
-    #[serde(default)]
-    pub owner_established_count: u32,
-    #[serde(default)]
-    pub closure_established_count: u32,
-    #[serde(default)]
-    pub searches_before_owner_count: u32,
-    #[serde(default)]
-    pub searches_after_owner_count: u32,
-    #[serde(default)]
-    pub post_closure_search_count: u32,
-    #[serde(default)]
-    pub post_closure_search_with_question_count: u32,
-    #[serde(default)]
-    pub exact_search_reused_count: u32,
-    #[serde(default)]
-    pub duplicate_search_suppressed_count: u32,
-    #[serde(default)]
-    pub direct_read_requested_count: u32,
-    #[serde(default)]
-    pub direct_read_reused_count: u32,
-    #[serde(default)]
-    pub overlap_trimmed_read_count: u32,
-    #[serde(default)]
-    pub new_source_lines_read: u64,
-    #[serde(default)]
-    pub new_source_bytes_read: u64,
-    #[serde(default)]
-    pub git_observations_reused_count: u32,
-    #[serde(default)]
-    pub git_observations_refreshed_count: u32,
-    #[serde(default)]
-    pub capped_zero_result_count: u32,
-    #[serde(default)]
-    pub duplicate_capped_retry_prevented_count: u32,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct TurnTimingSourceSectionCategoryCounts {
-    #[serde(default)]
-    pub primary_implementation: u32,
-    #[serde(default)]
-    pub direct_callers: u32,
-    #[serde(default)]
-    pub focused_tests: u32,
-    #[serde(default)]
-    pub contracts: u32,
-    #[serde(default)]
-    pub generated_relationships: u32,
-    #[serde(default)]
-    pub other_source_context: u32,
-    #[serde(default)]
-    pub core_state: u32,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
 pub struct TurnTimingCounters {
     /// Logical workflow generations. `model_request_count` remains the
     /// authoritative physical provider-attempt aggregate.
@@ -2966,14 +2812,6 @@ pub struct TurnTimingCounters {
     #[serde(default)]
     pub internally_drained_wait_count: u32,
     #[serde(default)]
-    pub suppressed_repeated_dispatch_count: u32,
-    #[serde(default)]
-    pub repeated_discovery_call_count: u32,
-    #[serde(default)]
-    pub discovery_after_owner_resolution_count: u32,
-    #[serde(default)]
-    pub source_discovery: TurnTimingSourceDiscoveryCounters,
-    #[serde(default)]
     pub no_progress_directive_count: u32,
     #[serde(default)]
     pub proven_loop_activation_count: u32,
@@ -3003,12 +2841,6 @@ pub struct TurnTimingCounters {
     pub tool_output_recovery_retruncation_count: u32,
     #[serde(default)]
     pub tool_output_recursive_spill_count: u32,
-    #[serde(default)]
-    pub strict_subset_source_reread_count: u32,
-    #[serde(default)]
-    pub complete_search_index_count: u32,
-    #[serde(default)]
-    pub incomplete_search_index_count: u32,
     #[serde(default)]
     pub attributable_recovery_generation_count: u32,
     #[serde(default)]
@@ -5626,14 +5458,7 @@ mod tests {
     #[test]
     fn turn_timing_generation_accounting_defaults_when_deserializing_legacy_payloads() -> Result<()>
     {
-        let mut value = serde_json::to_value(TurnTiming {
-            pre_edit_convergence: Some(TurnTimingPreEditConvergence::default()),
-            ..Default::default()
-        })?;
-        value
-            .as_object_mut()
-            .expect("turn timing object")
-            .remove("preEditConvergence");
+        let mut value = serde_json::to_value(TurnTiming::default())?;
         value
             .as_object_mut()
             .expect("turn timing object")
@@ -5649,9 +5474,6 @@ mod tests {
         for field in [
             "waitOnlyGenerationCount",
             "internallyDrainedWaitCount",
-            "suppressedRepeatedDispatchCount",
-            "repeatedDiscoveryCallCount",
-            "discoveryAfterOwnerResolutionCount",
             "noProgressDirectiveCount",
             "provenLoopActivationCount",
             "toolOutputTruncationCount",
@@ -5667,9 +5489,6 @@ mod tests {
             "toolOutputRecoveryCallCount",
             "toolOutputRecoveryRetruncationCount",
             "toolOutputRecursiveSpillCount",
-            "strictSubsetSourceRereadCount",
-            "completeSearchIndexCount",
-            "incompleteSearchIndexCount",
             "attributableRecoveryGenerationCount",
             "truncationInducedContinuationCount",
         ] {
@@ -5705,9 +5524,6 @@ mod tests {
         );
         assert_eq!(decoded.counters.wait_only_generation_count, 0);
         assert_eq!(decoded.counters.internally_drained_wait_count, 0);
-        assert_eq!(decoded.counters.suppressed_repeated_dispatch_count, 0);
-        assert_eq!(decoded.counters.repeated_discovery_call_count, 0);
-        assert_eq!(decoded.counters.discovery_after_owner_resolution_count, 0);
         assert_eq!(decoded.counters.no_progress_directive_count, 0);
         assert_eq!(decoded.counters.proven_loop_activation_count, 0);
         assert_eq!(decoded.counters.tool_output_truncation_count, 0);
@@ -5723,12 +5539,8 @@ mod tests {
         assert_eq!(decoded.counters.tool_output_recovery_call_count, 0);
         assert_eq!(decoded.counters.tool_output_recovery_retruncation_count, 0);
         assert_eq!(decoded.counters.tool_output_recursive_spill_count, 0);
-        assert_eq!(decoded.counters.strict_subset_source_reread_count, 0);
-        assert_eq!(decoded.counters.complete_search_index_count, 0);
-        assert_eq!(decoded.counters.incomplete_search_index_count, 0);
         assert_eq!(decoded.counters.attributable_recovery_generation_count, 0);
         assert_eq!(decoded.counters.truncation_induced_continuation_count, 0);
-        assert_eq!(decoded.pre_edit_convergence, None);
         assert_eq!(
             decoded.terminalization,
             TurnTimingTerminalization::default()
@@ -5742,61 +5554,6 @@ mod tests {
             decoded.model_requests[0].attempt_kind,
             TurnTimingAttemptKind::Primary
         );
-        Ok(())
-    }
-
-    #[test]
-    fn source_discovery_protocol_counters_default_when_absent() -> Result<()> {
-        let mut value = serde_json::to_value(TurnTiming::default())?;
-        value["counters"]
-            .as_object_mut()
-            .expect("turn timing counters object")
-            .remove("sourceDiscovery");
-
-        let decoded: TurnTiming = serde_json::from_value(value)?;
-        assert_eq!(
-            decoded.counters.source_discovery,
-            TurnTimingSourceDiscoveryCounters::default()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn pre_edit_convergence_serializes_milestones_durations_and_mutation_ordering() -> Result<()> {
-        let convergence = TurnTimingPreEditConvergence {
-            accepted_to_owner_resolved_ms: Some(10),
-            owner_resolved_ms: Some(10),
-            owner_resolved_generation_count: Some(1),
-            owner_resolved_tool_call_count: Some(2),
-            owner_resolved_to_bundle_ready_ms: Some(10),
-            implementation_ready_ms: Some(20),
-            implementation_ready_generation_count: Some(2),
-            implementation_ready_tool_call_count: Some(4),
-            first_accepted_mutation_ms: Some(25),
-            first_accepted_mutation_generation_count: Some(3),
-            first_accepted_mutation_tool_call_count: Some(5),
-            bundle_ready_to_first_accepted_mutation_ms: Some(5),
-            mutation_before_ready: false,
-            first_successful_mutation_ms: Some(30),
-            first_successful_mutation_generation_count: Some(3),
-            first_successful_mutation_tool_call_count: Some(5),
-            material_evidence_operations: 6,
-            broad_discovery_after_ready: 1,
-            readiness_reopen_count: 2,
-            reopen_reason_counts: TurnTimingReadinessReopenReasonCounts {
-                source_revision: 1,
-                incomplete_evidence: 1,
-                ..Default::default()
-            },
-        };
-        let mut value = serde_json::to_value(&convergence)?;
-        let object = value.as_object_mut().expect("convergence object");
-        assert_eq!(object["acceptedToOwnerResolvedMs"], json!(10));
-        assert_eq!(object["ownerResolvedToBundleReadyMs"], json!(10));
-        assert_eq!(object["bundleReadyToFirstAcceptedMutationMs"], json!(5));
-        assert_eq!(object["mutationBeforeReady"], json!(false));
-        let decoded: TurnTimingPreEditConvergence = serde_json::from_value(value)?;
-        assert_eq!(decoded, convergence);
         Ok(())
     }
 
@@ -7642,7 +7399,6 @@ mod tests {
     fn generation_purpose_wire_contract_is_exact_and_historical_spellings_are_readable() {
         let purposes = [
             TurnTimingGenerationPurpose::InitialReasoning,
-            TurnTimingGenerationPurpose::SourceEvidenceInterpretation,
             TurnTimingGenerationPurpose::Wait,
             TurnTimingGenerationPurpose::ArtifactContinuation,
             TurnTimingGenerationPurpose::ImplementationDecision,
@@ -7661,7 +7417,6 @@ mod tests {
             serialized,
             vec![
                 serde_json::json!("initial"),
-                serde_json::json!("source_interpretation"),
                 serde_json::json!("wait"),
                 serde_json::json!("deterministic_tool_continuation"),
                 serde_json::json!("implementation"),
@@ -7677,10 +7432,6 @@ mod tests {
             (
                 "initial_reasoning",
                 TurnTimingGenerationPurpose::InitialReasoning,
-            ),
-            (
-                "source_evidence_interpretation",
-                TurnTimingGenerationPurpose::SourceEvidenceInterpretation,
             ),
             (
                 "artifact_continuation",
@@ -7704,8 +7455,16 @@ mod tests {
         }
         for (historical, canonical) in [
             (
+                "source_interpretation",
+                TurnTimingGenerationPurpose::ArtifactContinuation,
+            ),
+            (
+                "source_evidence_interpretation",
+                TurnTimingGenerationPurpose::ArtifactContinuation,
+            ),
+            (
                 "source_discovery",
-                TurnTimingGenerationPurpose::SourceEvidenceInterpretation,
+                TurnTimingGenerationPurpose::ArtifactContinuation,
             ),
             (
                 "validation_launch",
@@ -7727,10 +7486,8 @@ mod tests {
     }
 
     #[test]
-    fn progress_kind_wire_contract_is_exact_and_historical_spellings_are_readable() {
+    fn progress_kind_wire_contract_is_exact_and_retired_spellings_remain_readable() {
         let kinds = [
-            TurnTimingProgressKind::NewNamedEvidence,
-            TurnTimingProgressKind::SourceClosure,
             TurnTimingProgressKind::WorkspaceMutation,
             TurnTimingProgressKind::ValidationResult,
             TurnTimingProgressKind::FailureObservation,
@@ -7741,14 +7498,14 @@ mod tests {
                 .map(|kind| serde_json::to_value(kind).expect("progress kind serialization"))
                 .collect::<Vec<_>>(),
             vec![
-                serde_json::json!("new_named_evidence"),
-                serde_json::json!("source_closure"),
                 serde_json::json!("workspace_mutation"),
                 serde_json::json!("validation_result"),
                 serde_json::json!("failure_observation"),
             ]
         );
         for historical in [
+            "new_named_evidence",
+            "source_closure",
             "new_input",
             "plan_change",
             "completion_state",
@@ -7756,8 +7513,8 @@ mod tests {
         ] {
             assert_eq!(
                 serde_json::from_value::<TurnTimingProgressKind>(serde_json::json!(historical))
-                    .expect("historical persisted progress kind"),
-                TurnTimingProgressKind::NewNamedEvidence
+                    .expect("historical progress kind"),
+                TurnTimingProgressKind::WorkspaceMutation,
             );
         }
     }
@@ -7785,11 +7542,7 @@ mod tests {
         let purpose_counts = counters["generationsByPurpose"]
             .as_object()
             .expect("generation purpose counts");
-        for removed in [
-            "sourceDiscovery",
-            "postEditInspection",
-            "validationSelection",
-        ] {
+        for removed in ["postEditInspection", "validationSelection"] {
             assert!(purpose_counts.get(removed).is_none());
         }
     }
@@ -7950,6 +7703,36 @@ mod tests {
         assert!(
             serde_json::from_value::<TurnTimingDeterministicContinuationReceipt>(tampered_fields)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn retired_source_receipts_and_session_budget_errors_remain_history_readable() {
+        let legacy: TurnTimingDeterministicContinuationReceipt =
+            serde_json::from_value(serde_json::json!({
+                "class": "source_coverage",
+                "resourceIdentityHash": "resource",
+                "stateRevision": "revision",
+                "hostAction": "reuse_covered_span",
+                "wireIdentity": "v1|source_coverage|8:resource|8:revision|reuse_covered_span",
+                "suppressedContinuationCount": 1,
+            }))
+            .expect("retired source receipt");
+        assert_eq!(legacy.class, DeterministicContinuationClass::ArtifactRange);
+        assert_eq!(
+            legacy.host_action,
+            DeterministicContinuationHostAction::DrainArtifactRanges,
+        );
+        let reserialized = serde_json::to_value(legacy).expect("canonicalized receipt");
+        assert_eq!(reserialized["class"], serde_json::json!("artifact_range"));
+        assert_eq!(
+            reserialized["hostAction"],
+            serde_json::json!("drain_artifact_ranges"),
+        );
+        assert_eq!(
+            serde_json::from_value::<CodexErrorInfo>(serde_json::json!("session_budget_exceeded"))
+                .expect("retired session budget error"),
+            CodexErrorInfo::Other,
         );
     }
 }

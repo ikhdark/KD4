@@ -215,7 +215,6 @@ pub(crate) fn spawn_exit_watcher(
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     tracker: Option<SharedTurnDiffTracker>,
-    completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
     validation_observation: Option<crate::validation_admission::ValidationObservationToken>,
     validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
     validation_waiter: Option<crate::validation_admission::ValidationLeader>,
@@ -243,7 +242,6 @@ pub(crate) fn spawn_exit_watcher(
     }
 
     tokio::spawn(async move {
-        let _completion_activity = completion_activity;
         let _validation_waiter = validation_waiter;
         exit_token.cancelled().await;
         output_drained.cancelled().await;
@@ -257,25 +255,25 @@ pub(crate) fn spawn_exit_watcher(
                 observation.record_completed(duration_ms).await;
             }
         }
-        let mut failure_message = process.failure_message();
+        let failure_message = process.failure_message();
         let exit_code = if failure_message.is_some() {
             -1
         } else {
             process.exit_code().unwrap_or(-1)
         };
 
-        // Process exit is the mutation-safety boundary. Finalize its repository lease before
-        // event delivery or artifact work so a completed command cannot retain ownership merely
-        // because nobody polls it or its original turn is already idle.
-        let finalized = session_ref
+        // Record the process exit before event delivery. The end event below independently marks
+        // possible workspace mutation, so missing command bookkeeping cannot turn a completed
+        // process into a tool failure.
+        let tracked = session_ref
             .services
             .command_execution
             .mark_running_process_completed(process_id, exit_code)
             .await;
-        if !finalized && failure_message.is_none() {
-            failure_message = Some(
-                "command exited, but Codex could not finalize its mutation-safety state"
-                    .to_string(),
+        if !tracked {
+            tracing::debug!(
+                process_id,
+                "background command bookkeeping was already released"
             );
         }
 

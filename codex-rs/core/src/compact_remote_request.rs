@@ -89,7 +89,6 @@ pub(super) async fn run_remote_compact_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    sess.ensure_rollout_budget_available()?;
     let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
     let new_history_result = sess
         .services

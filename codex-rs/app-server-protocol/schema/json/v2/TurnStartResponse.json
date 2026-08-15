@@ -30,7 +30,6 @@
         {
           "enum": [
             "contextWindowExceeded",
-            "sessionBudgetExceeded",
             "usageLimitExceeded",
             "serverOverloaded",
             "cyberPolicy",
@@ -350,8 +349,6 @@
     "DeterministicContinuationClass": {
       "enum": [
         "unchanged_wait",
-        "source_bundle",
-        "source_coverage",
         "artifact_range",
         "agent_event_wait"
       ],
@@ -360,9 +357,6 @@
     "DeterministicContinuationHostAction": {
       "enum": [
         "await_state_change",
-        "batch_source_bundle",
-        "reuse_covered_span",
-        "read_missing_ranges",
         "drain_artifact_ranges"
       ],
       "type": "string"
@@ -1890,17 +1884,6 @@
           },
           "description": "Provider usage observed on generations where neither relevant structured state nor the next-correct-action changed. This is a diagnostic and is never treated as measured avoidable savings."
         },
-        "preEditConvergence": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/TurnTimingPreEditConvergence"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Pre-edit convergence milestones and bounded aggregate counters. Interval durations and count deltas are derived from these snapshots by analysis."
-        },
         "preFirstModelOutput": {
           "anyOf": [
             {
@@ -2046,18 +2029,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "completeSearchIndexCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "discoveryAfterOwnerResolutionCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "exactRepeatedWaitCount": {
           "default": 0,
           "format": "uint32",
@@ -2102,7 +2073,6 @@
             "implementationDecision": 0,
             "initialReasoning": 0,
             "repair": 0,
-            "sourceEvidenceInterpretation": 0,
             "terminalCompletionReasoning": 0,
             "validationInterpretation": 0,
             "wait": 0
@@ -2123,12 +2093,6 @@
             "subagent": 0,
             "toolContinuation": 0
           }
-        },
-        "incompleteSearchIndexCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
         },
         "internallyDrainedWaitCount": {
           "default": 0,
@@ -2228,12 +2192,6 @@
           },
           "type": "array"
         },
-        "repeatedDiscoveryCallCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "samePurposeContinuationCount": {
           "default": 0,
           "format": "uint32",
@@ -2245,75 +2203,9 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "sourceDiscovery": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/TurnTimingSourceDiscoveryCounters"
-            }
-          ],
-          "default": {
-            "avoidedSingletonReadCount": 0,
-            "bundleGenerationMicros": 0,
-            "bundleOperationCount": 0,
-            "cappedZeroResultCount": 0,
-            "closureEstablishedCount": 0,
-            "directReadRequestedCount": 0,
-            "directReadReusedCount": 0,
-            "discoveryToDiscoveryBoundaryCount": 0,
-            "duplicateCappedRetryPreventedCount": 0,
-            "duplicateSearchSuppressedCount": 0,
-            "exactSearchReusedCount": 0,
-            "gitObservationsRefreshedCount": 0,
-            "gitObservationsReusedCount": 0,
-            "inlineSections": {
-              "contracts": 0,
-              "coreState": 0,
-              "directCallers": 0,
-              "focusedTests": 0,
-              "generatedRelationships": 0,
-              "otherSourceContext": 0,
-              "primaryImplementation": 0
-            },
-            "locatorOperationCount": 0,
-            "locatorToDiscoveryBoundaryCount": 0,
-            "materializedSections": {
-              "contracts": 0,
-              "coreState": 0,
-              "directCallers": 0,
-              "focusedTests": 0,
-              "generatedRelationships": 0,
-              "otherSourceContext": 0,
-              "primaryImplementation": 0
-            },
-            "newSourceBytesRead": 0,
-            "newSourceLinesRead": 0,
-            "overlapTrimmedReadCount": 0,
-            "ownerEstablishedCount": 0,
-            "postClosureSearchCount": 0,
-            "postClosureSearchWithQuestionCount": 0,
-            "readOperationCount": 0,
-            "recoveryOperationCount": 0,
-            "recoveryToRecoveryBoundaryCount": 0,
-            "searchOperationCount": 0,
-            "searchesAfterOwnerCount": 0,
-            "searchesBeforeOwnerCount": 0
-          }
-        },
-        "strictSubsetSourceRereadCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "suppressedDeterministicContinuationCount": {
           "default": 0,
           "description": "Authoritative number of model boundaries suppressed by accepted deterministic-continuation receipts. A receipt whose `suppressed_continuation_count` is N contributes N, not one. Invalid, rejected, and zero-count receipts contribute nothing. This counter is independent of `generations_by_disposition`.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "suppressedRepeatedDispatchCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -2611,7 +2503,6 @@
     "TurnTimingGenerationPurpose": {
       "enum": [
         "initial",
-        "source_interpretation",
         "implementation",
         "wait",
         "failure_diagnosis",
@@ -2726,12 +2617,6 @@
           "type": "integer"
         },
         "repair": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sourceEvidenceInterpretation": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -3013,17 +2898,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "postDiscovery": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/TurnTimingPostDiscoveryRequest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Observational usage for the request immediately following source-result cells. Provider fields remain whole-request usage."
-        },
         "progressKinds": {
           "items": {
             "$ref": "#/definitions/TurnTimingProgressKind"
@@ -3069,213 +2943,6 @@
       "required": [
         "isContinuation"
       ],
-      "type": "object"
-    },
-    "TurnTimingPostDiscoveryRequest": {
-      "properties": {
-        "cachedInputTokens": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "discoveryModelBoundaryCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "discoveryResultCells": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "newlyInjectedDiscoveryResultTokens": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "replayAmplificationMicros": {
-          "description": "`(provider input / injected result tokens) * 1_000_000` when defined.",
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "totalProviderInputTokens": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "cachedInputTokens",
-        "discoveryModelBoundaryCount",
-        "discoveryResultCells",
-        "newlyInjectedDiscoveryResultTokens",
-        "totalProviderInputTokens"
-      ],
-      "type": "object"
-    },
-    "TurnTimingPreEditConvergence": {
-      "properties": {
-        "acceptedToOwnerResolvedMs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "broadDiscoveryAfterReady": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "bundleReadyToFirstAcceptedMutationMs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "firstAcceptedMutationGenerationCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "firstAcceptedMutationMs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "firstAcceptedMutationToolCallCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "firstSuccessfulMutationGenerationCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "firstSuccessfulMutationMs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "firstSuccessfulMutationToolCallCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "implementationReadyGenerationCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "implementationReadyMs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "implementationReadyToolCallCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "materialEvidenceOperations": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "mutationBeforeReady": {
-          "default": false,
-          "type": "boolean"
-        },
-        "ownerResolvedGenerationCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "ownerResolvedMs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "ownerResolvedToBundleReadyMs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "ownerResolvedToolCallCount": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "readinessReopenCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "reopenReasonCounts": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/TurnTimingReadinessReopenReasonCounts"
-            }
-          ],
-          "default": {
-            "contradictoryEvidence": 0,
-            "incompleteEvidence": 0,
-            "newAmbiguity": 0,
-            "sourceRevision": 0,
-            "userSteering": 0
-          }
-        }
-      },
       "type": "object"
     },
     "TurnTimingPreFirstModelOutput": {
@@ -3353,8 +3020,6 @@
     },
     "TurnTimingProgressKind": {
       "enum": [
-        "new_named_evidence",
-        "source_closure",
         "workspace_mutation",
         "validation_result",
         "failure_observation"
@@ -3396,287 +3061,6 @@
         "totalTokens",
         "visibleOutputTokens"
       ],
-      "type": "object"
-    },
-    "TurnTimingReadinessReopenReasonCounts": {
-      "properties": {
-        "contradictoryEvidence": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "incompleteEvidence": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "newAmbiguity": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sourceRevision": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "userSteering": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "TurnTimingSourceDiscoveryCounters": {
-      "properties": {
-        "avoidedSingletonReadCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "bundleGenerationMicros": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "bundleOperationCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "cappedZeroResultCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "closureEstablishedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "directReadRequestedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "directReadReusedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "discoveryToDiscoveryBoundaryCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "duplicateCappedRetryPreventedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "duplicateSearchSuppressedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "exactSearchReusedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "gitObservationsRefreshedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "gitObservationsReusedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "inlineSections": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/TurnTimingSourceSectionCategoryCounts"
-            }
-          ],
-          "default": {
-            "contracts": 0,
-            "coreState": 0,
-            "directCallers": 0,
-            "focusedTests": 0,
-            "generatedRelationships": 0,
-            "otherSourceContext": 0,
-            "primaryImplementation": 0
-          }
-        },
-        "locatorOperationCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "locatorToDiscoveryBoundaryCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "materializedSections": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/TurnTimingSourceSectionCategoryCounts"
-            }
-          ],
-          "default": {
-            "contracts": 0,
-            "coreState": 0,
-            "directCallers": 0,
-            "focusedTests": 0,
-            "generatedRelationships": 0,
-            "otherSourceContext": 0,
-            "primaryImplementation": 0
-          }
-        },
-        "newSourceBytesRead": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "newSourceLinesRead": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "overlapTrimmedReadCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "ownerEstablishedCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "postClosureSearchCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "postClosureSearchWithQuestionCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "readOperationCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "recoveryOperationCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "recoveryToRecoveryBoundaryCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "searchOperationCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "searchesAfterOwnerCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "searchesBeforeOwnerCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "TurnTimingSourceSectionCategoryCounts": {
-      "properties": {
-        "contracts": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "coreState": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "directCallers": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "focusedTests": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "generatedRelationships": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "otherSourceContext": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "primaryImplementation": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
       "type": "object"
     },
     "TurnTimingTerminalization": {

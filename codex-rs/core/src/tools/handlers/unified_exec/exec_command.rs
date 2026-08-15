@@ -8,9 +8,6 @@ use crate::maybe_emit_implicit_skill_invocation;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
-use crate::tools::command_execution::RunningWorkspaceMutation;
-use crate::tools::command_execution::WorkspaceMutationAcquireError;
-use crate::tools::command_execution::acquire_workspace_mutation_lease_cached;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
@@ -47,9 +44,6 @@ use crate::validation_admission::ValidationRegistration;
 use crate::validation_admission::admit_validation;
 use crate::validation_admission::register_if_absent;
 use crate::validation_admission::validation_identity;
-use codex_agent_task_store::REPOSITORY_WIDE_PATH;
-use codex_agent_task_store::WorkspaceActorKind;
-use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_features::Feature;
 use codex_git_utils::get_git_repo_root;
 use codex_otel::SessionTelemetry;
@@ -64,7 +58,6 @@ use codex_tools::ToolSpec;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathConvention;
 use serde::Deserialize;
-use tokio_util::sync::CancellationToken;
 
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_exec_command_tool_with_environment_id;
@@ -232,126 +225,6 @@ pub(super) fn attach_powershell_failure_advisory(
     }
 }
 
-async fn begin_unified_exec_workspace_mutation(
-    session: &crate::session::session::Session,
-    turn: &crate::session::turn_context::TurnContext,
-    command_cwd: &std::path::Path,
-    owner_cancelled: CancellationToken,
-) -> Result<RunningWorkspaceMutation, FunctionCallError> {
-    let coordinator = session.services.agent_control.task_coordinator().clone();
-    if coordinator.store().is_none() {
-        coordinator
-            .initialize_for_workspace_coordination(
-                session.services.state_db.clone(),
-                turn.config.sqlite_home.clone(),
-                turn.config.model_provider_id.clone(),
-                session.services.agent_control.session_id().to_string(),
-            )
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "exec_command workspace coordination could not initialize: {error}"
-                ))
-            })?;
-    }
-    let store = coordinator.store().ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "exec_command workspace coordination store is unavailable".to_string(),
-        )
-    })?;
-    let root_session_id = coordinator.root_session_id().ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "exec_command root task identity is unavailable".to_string(),
-        )
-    })?;
-    let agent_path = turn
-        .session_source
-        .get_agent_path()
-        .map(|path| path.to_string())
-        .unwrap_or_else(|| "/root".to_string());
-    let kind = if turn.session_source.is_non_root_agent() {
-        WorkspaceActorKind::Legacy
-    } else {
-        WorkspaceActorKind::Root
-    };
-    let actor_id = match kind {
-        WorkspaceActorKind::Root => format!("root:{root_session_id}"),
-        WorkspaceActorKind::Legacy => format!("legacy:{root_session_id}:{agent_path}"),
-        WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
-    };
-    let repo_root = get_git_repo_root(command_cwd).unwrap_or_else(|| command_cwd.to_path_buf());
-    let reservation = session
-        .services
-        .command_execution
-        .reserve_workspace_mutation_until_cancelled(&repo_root, &owner_cancelled)
-        .await
-        .map_err(|error| {
-            use crate::tools::command_execution::WorkspaceMutationReservationAcquireError;
-
-            let message = match error {
-                WorkspaceMutationReservationAcquireError::Cancelled => {
-                    "exec_command mutation-reservation wait was cancelled"
-                }
-                WorkspaceMutationReservationAcquireError::TimedOut => {
-                    "exec_command could not reserve repository-wide mutation execution within 10 seconds"
-                }
-            };
-            FunctionCallError::RespondToModel(message.to_string())
-        })?;
-    session
-        .services
-        .agent_control
-        .reconcile_live_typed_actor_heartbeats()
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "exec_command typed-agent liveness could not be reconciled: {error}"
-            ))
-        })?;
-    let request = WorkspaceMutationRequest {
-        root_session_id,
-        actor_id,
-        kind,
-        attempt_id: None,
-        paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-        contracts: Vec::new(),
-        expected_manifest: Vec::new(),
-    };
-    let lease =
-        acquire_workspace_mutation_lease_cached(
-            store.as_ref(),
-            session.services.git_workspace.as_ref(),
-            &repo_root,
-            &request,
-            &owner_cancelled,
-        )
-            .await
-            .map_err(|error| match error {
-                WorkspaceMutationAcquireError::Cancelled => FunctionCallError::RespondToModel(
-                    "exec_command mutation-lease wait was cancelled".to_string(),
-                ),
-                WorkspaceMutationAcquireError::TimedOut { details } => {
-                    FunctionCallError::RespondToModel(format!(
-                        "exec_command could not acquire the repository-wide mutation lease within 10 seconds: {}",
-                        details.join("; ")
-                    ))
-                }
-                WorkspaceMutationAcquireError::Store(error) => {
-                    FunctionCallError::RespondToModel(format!(
-                        "exec_command could not acquire the repository-wide mutation lease: {error}"
-                    ))
-                }
-            })?;
-    Ok(RunningWorkspaceMutation::new_with_cache(
-        store,
-        repo_root,
-        lease,
-        owner_cancelled,
-        reservation,
-        Arc::clone(&session.services.git_workspace),
-    ))
-}
-
 impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("exec_command")
@@ -392,13 +265,6 @@ impl ExecCommandHandler {
             payload,
             ..
         } = invocation;
-        let completion_activity = session
-            .services
-            .agent_control
-            .admit_completion_activity()
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
@@ -583,20 +449,6 @@ impl ExecCommandHandler {
             args.additional_permissions.is_some(),
         )
         .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
-        let inspection_command = is_known_safe_command(&resolved_command.safety_command);
-        if !inspection_command
-            && session
-                .services
-                .agent_control
-                .task_coordinator()
-                .binding_for_source(&turn.session_source)
-                .is_some()
-        {
-            return Err(FunctionCallError::RespondToModel(
-                "typed agents must use shell_command for focused validation; exec_command cannot admit a potentially mutating typed command"
-                    .to_string(),
-            ));
-        }
         let hook_command = command_invocation.display_command();
         // Implicit skill detection requires a native path, so foreign PathUri
         // workdirs are intentionally skipped here.
@@ -611,10 +463,6 @@ impl ExecCommandHandler {
         }
         let command = resolved_command.command;
         let safety_command = resolved_command.safety_command;
-        let intercepted_apply_patch = !matches!(
-            codex_apply_patch::maybe_parse_apply_patch(&command, &cwd),
-            codex_apply_patch::MaybeApplyPatch::NotApplyPatch
-        );
         let shell_type = resolved_command.shell_type;
         let is_powershell_script = command_invocation.is_powershell_script();
         let command_for_display = hook_command.clone();
@@ -727,6 +575,7 @@ impl ExecCommandHandler {
             && validation_launch.is_none()
             && let Some(native_cwd) = native_cwd.as_ref()
             && let CommandInvocation::Argv { program, args } = &command_invocation
+            && known_delta_store::is_immutable_git_show_candidate(program, args)
         {
             let project_namespace = if let Some(source) =
                 turn.turn_metadata_state.git_metadata_source()
@@ -912,41 +761,8 @@ impl ExecCommandHandler {
         )
         .await;
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
-        // Reserve the process identity before acquiring mutation authority so
-        // cancellation can always identify and clean up the startup attempt.
         let process_id_reservation = manager.reserve_process_id().await;
         let process_id = process_id_reservation.process_id();
-
-        let workspace_mutation =
-            if !inspection_command && !intercepted_apply_patch && !environment_is_remote {
-                let mutation_cwd = native_cwd.as_ref().ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
-                    "cannot coordinate a mutating command in non-native working directory `{cwd}`"
-                ))
-            })?;
-                match begin_unified_exec_workspace_mutation(
-                    session.as_ref(),
-                    turn.as_ref(),
-                    mutation_cwd.as_path(),
-                    cancellation_token.clone(),
-                )
-                .await
-                {
-                    Ok(workspace_mutation) => Some(workspace_mutation),
-                    Err(error) => {
-                        if !known_delta_hit {
-                            session
-                                .services
-                                .command_execution
-                                .record_exit(&attempt_key, -1)
-                                .await;
-                        }
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
         let exec_result = manager
             .exec_command(
                 ExecCommandRequest {
@@ -977,8 +793,6 @@ impl ExecCommandHandler {
                         .permissions_preapproved,
                     justification,
                     prefix_rule,
-                    workspace_mutation,
-                    completion_activity: Some(completion_activity),
                     validation_launch,
                     validation_observation,
                     validation_leader,

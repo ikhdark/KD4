@@ -158,11 +158,8 @@ Prefer `rg` for text search and `rg --files` for file discovery when available.
 Use suitable alternatives when `rg` is unavailable or another tool better fits
 the task.
 
-When repository ownership, related source, callers, tests, contracts, or
-validation routes are not already known, start with `locate_task` when it is
-available and reuse its result. Once exact independent files or spans are known,
-request them together instead of alternating a read with a model call for each
-file.
+Once exact independent files or spans are known, request them together instead
+of alternating a read with a model call for each file.
 
 Use `apply_patch` for focused manual edits when it provides a clear and
 reviewable change.

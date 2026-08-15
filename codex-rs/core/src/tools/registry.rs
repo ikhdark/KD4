@@ -20,7 +20,7 @@ use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::attach_canonical_output_artifact;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
-use crate::tools::command_output_artifact::read_tool_output_selectors;
+use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -1041,27 +1041,6 @@ impl ToolRegistry {
                             .await;
                     }
                 }
-                if provider_visible
-                    && matches!(
-                        flat_tool_name(&invocation.tool_name).as_ref(),
-                        "locate_task" | "search_source" | "read_file_span" | "read_tool_output"
-                    )
-                {
-                    let injected_tokens = model_projection.as_ref().map_or_else(
-                        || {
-                            let response = result
-                                .result
-                                .to_response_item(&result.call_id, &result.payload);
-                            serde_json::to_string(&response)
-                                .map_or(0, |text| approx_token_count(&text) as u64)
-                        },
-                        |projection| projection.projected_tokens,
-                    );
-                    invocation
-                        .turn
-                        .turn_timing_state
-                        .record_discovery_result_cell(injected_tokens);
-                }
                 result.model_projection = model_projection;
                 dispatch_trace.record_completed(
                     &invocation,
@@ -1173,7 +1152,12 @@ fn prepare_model_projection(
     force_inline_carrier: bool,
 ) -> Option<ModelProjectionInput> {
     // Exact artifact reads are already bounded and must never recursively spill.
-    if invocation.tool_name.name == "read_tool_output" {
+    // Code mode also performs its own coherent outer projection after merging
+    // native nested results. Re-projecting `functions.exec` here discards the
+    // nested tools' typed packet and creates a generic recovery artifact.
+    let code_mode_exec = crate::tools::code_mode::is_exec_tool_name(&invocation.tool_name);
+    if invocation.tool_name.name == "read_tool_output" || (code_mode_exec && !force_inline_carrier)
+    {
         return None;
     }
 
@@ -1192,12 +1176,7 @@ fn prepare_model_projection(
         ToolOutputDiagnosticClass::Normal => OutputDiagnosticClass::Normal,
         ToolOutputDiagnosticClass::HighSignal => OutputDiagnosticClass::HighSignal,
     };
-    let requested_limit = metadata.requested_limit.or_else(|| {
-        skill_read_projection_limit(
-            flat_tool_name(&invocation.tool_name).as_ref(),
-            &spillable_text,
-        )
-    });
+    let requested_limit = metadata.requested_limit;
     let limits = resolve_projected_output_limits(
         requested_limit,
         outcome,
@@ -1206,22 +1185,31 @@ fn prepare_model_projection(
     );
     let generic_projection = formatted_truncate_text_with_output_limit(&spillable_text, limits);
     let projection_truncated = generic_projection.was_truncated;
+    let has_predetermined_selectors = !metadata.predetermined_ranges.is_empty()
+        || !metadata.predetermined_json_pointers.is_empty();
     let needs_canonical_artifact = result.result.requires_canonical_artifact()
         || generic_projection.was_truncated
-        || requires_canonical_projection_artifact(
-            invocation.tool_name.name.as_ref(),
-            &metadata.fragments,
-        )
-        || !metadata.predetermined_ranges.is_empty()
-        || !metadata.predetermined_json_pointers.is_empty();
+        || has_predetermined_selectors;
     if !needs_canonical_artifact && !force_inline_carrier {
         return None;
     }
-    let materialization = if needs_canonical_artifact {
+    let materialization = if force_inline_carrier {
+        ProjectionMaterialization::InlineCarrier
+    } else if needs_canonical_artifact {
         ProjectionMaterialization::CanonicalArtifact
     } else {
         ProjectionMaterialization::InlineCarrier
     };
+    // An owner result is the last host boundary for deterministic nested
+    // continuations. Give that coherent packet the full model-safe budget so
+    // retained continuation evidence is merged before the model is sampled
+    // again. Ordinary per-result projection limits apply only after this
+    // generation-level packet has been formed.
+    let applied_token_limit = projection_packet_token_limit(
+        force_inline_carrier,
+        limits.applied_limit,
+        limits.hard_limit,
+    );
     let (projected_text, selection_facts) =
         if materialization == ProjectionMaterialization::InlineCarrier {
             (
@@ -1254,7 +1242,7 @@ fn prepare_model_projection(
                 },
             )
         } else {
-            select_typed_projection_fragments(&metadata.fragments, limits.applied_limit)
+            select_typed_projection_fragments(&metadata.fragments, applied_token_limit)
         };
 
     let original_response = result
@@ -1285,16 +1273,6 @@ fn prepare_model_projection(
     });
     let semantic_class = if validation_material {
         "validation"
-    } else if metadata.fragments.iter().any(|fragment| {
-        matches!(
-            fragment.kind,
-            ToolOutputProjectionFragmentKind::SourcePrimaryImplementation
-                | ToolOutputProjectionFragmentKind::SourceCaller
-                | ToolOutputProjectionFragmentKind::SourceTest
-                | ToolOutputProjectionFragmentKind::SourceContractOrGenerated
-        )
-    }) {
-        "source_evidence"
     } else {
         "tool_output"
     };
@@ -1306,7 +1284,7 @@ fn prepare_model_projection(
         essential_inline: metadata.essential_inline,
         origin_call_id: result.call_id.clone(),
         selection_facts,
-        applied_token_limit: limits.applied_limit,
+        applied_token_limit,
         projected_text,
         preserved_content,
         codex_home: invocation.turn.config.codex_home.to_path_buf(),
@@ -1325,12 +1303,16 @@ fn prepare_model_projection(
     })
 }
 
-fn requires_canonical_projection_artifact(
-    tool_name: &str,
-    fragments: &[ToolOutputProjectionFragment],
-) -> bool {
-    matches!(tool_name, "locate_task" | "read_file_span")
-        && fragments.iter().any(|fragment| fragment.id.is_some())
+fn projection_packet_token_limit(
+    has_owner_drained_continuations: bool,
+    ordinary_limit: usize,
+    hard_limit: usize,
+) -> usize {
+    if has_owner_drained_continuations {
+        hard_limit
+    } else {
+        ordinary_limit
+    }
 }
 
 fn canonical_projection_sections(
@@ -1393,17 +1375,10 @@ fn canonical_projection_sections(
         .collect()
 }
 
-const PROJECTION_FRAGMENT_KIND_ORDER: [ToolOutputProjectionFragmentKind; 11] = [
-    ToolOutputProjectionFragmentKind::SourcePrimaryImplementation,
-    ToolOutputProjectionFragmentKind::SourceCaller,
-    ToolOutputProjectionFragmentKind::SourceTest,
-    ToolOutputProjectionFragmentKind::SourceContractOrGenerated,
-    ToolOutputProjectionFragmentKind::CoreInstructionOrTaskState,
-    ToolOutputProjectionFragmentKind::CitationOrExactSpan,
+const PROJECTION_FRAGMENT_KIND_ORDER: [ToolOutputProjectionFragmentKind; 4] = [
     ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
     ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary,
     ToolOutputProjectionFragmentKind::ProcessFinalStatus,
-    ToolOutputProjectionFragmentKind::SearchMatchOrDefinition,
     ToolOutputProjectionFragmentKind::ContextualSpillableText,
 ];
 
@@ -1526,56 +1501,11 @@ fn bounded_fragment_text(text: &str, token_budget: usize) -> String {
 
 fn fragment_section_heading(kind: ToolOutputProjectionFragmentKind) -> &'static str {
     match kind {
-        ToolOutputProjectionFragmentKind::SourcePrimaryImplementation => "[primary]",
-        ToolOutputProjectionFragmentKind::SourceCaller => "[callers]",
-        ToolOutputProjectionFragmentKind::SourceTest => "[tests]",
-        ToolOutputProjectionFragmentKind::SourceContractOrGenerated => "[contracts]",
-        ToolOutputProjectionFragmentKind::CoreInstructionOrTaskState => "[task state]",
-        ToolOutputProjectionFragmentKind::CitationOrExactSpan => "[citations and exact spans]",
-        ToolOutputProjectionFragmentKind::SearchMatchOrDefinition => "[search]",
         ToolOutputProjectionFragmentKind::ErrorOrDiagnostic => "[errors and diagnostics]",
         ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary => "[validation]",
         ToolOutputProjectionFragmentKind::ProcessFinalStatus => "[process final status]",
         ToolOutputProjectionFragmentKind::ContextualSpillableText => "[context]",
     }
-}
-
-const COMPLETE_SKILL_READ_TOKEN_LIMIT: usize = 4_000;
-
-fn skill_read_projection_limit(tool_name: &str, output: &str) -> Option<usize> {
-    if !matches!(
-        tool_name,
-        "read_file_span" | "functions.read_file_span" | "functions.exec"
-    ) {
-        return None;
-    }
-
-    let normalized;
-    let output = if tool_name == "functions.exec" && !output.contains("\nSource file evidence:\n") {
-        normalized = output.replace("\\n", "\n");
-        normalized.as_str()
-    } else {
-        output
-    };
-    let evidence = output.strip_prefix("Source file evidence:\n").or_else(|| {
-        output
-            .split_once("\nSource file evidence:\n")
-            .map(|(_, rest)| rest)
-    })?;
-    let mut lines = evidence.lines();
-    let citation = lines.next()?.strip_prefix("citation: ")?;
-    let file_and_span = citation.rsplit(['/', '\\']).next()?;
-    if !file_and_span.starts_with("SKILL.md:") {
-        return None;
-    }
-    let metadata = lines.next()?;
-    if !metadata.starts_with("total_lines: ") || !metadata.contains(" truncated: false") {
-        return None;
-    }
-    lines
-        .next()?
-        .starts_with("source_route: ")
-        .then_some(COMPLETE_SKILL_READ_TOKEN_LIMIT)
 }
 
 async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolProjection> {
@@ -1750,6 +1680,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             predetermined_json_pointers,
             &canonical.sections,
             &canonical.json_pointers,
+            applied_token_limit,
         )
         .await;
     let base_envelope = envelope.clone();
@@ -2023,6 +1954,7 @@ async fn drain_predetermined_artifact_selectors(
     json_pointers: Vec<ToolOutputProjectionJsonPointer>,
     sections: &[ToolProjectionSection],
     canonical_json_pointers: &BTreeMap<String, CanonicalJsonPointer>,
+    token_ceiling: usize,
 ) -> (
     Vec<Value>,
     Option<TurnTimingDeterministicContinuationReceipt>,
@@ -2044,8 +1976,14 @@ async fn drain_predetermined_artifact_selectors(
                 }),
         )
         .collect::<Vec<_>>();
-    let Ok(result) =
-        read_tool_output_selectors(codex_home, thread_id, artifact_id, selectors.clone()).await
+    let Ok((result, _reused)) = read_tool_output_selectors_with_ceiling_and_reuse(
+        codex_home,
+        thread_id,
+        artifact_id,
+        selectors.clone(),
+        token_ceiling,
+    )
+    .await
     else {
         return (Vec::new(), None);
     };
@@ -2100,9 +2038,6 @@ async fn drain_predetermined_artifact_selectors(
         "predetermined_json_pointers": action_bounds["predetermined_json_pointers"].clone(),
         "results": result.results,
     });
-    if serde_json::to_string(&drained).map_or(true, |value| value.len() > 16 * 1024) {
-        return (Vec::new(), None);
-    }
     (
         vec![drained],
         Some(TurnTimingDeterministicContinuationReceipt {
@@ -2142,6 +2077,7 @@ async fn drain_predetermined_artifact_ranges(
         Vec::new(),
         sections,
         &BTreeMap::new(),
+        codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
     )
     .await
 }

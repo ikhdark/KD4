@@ -231,7 +231,6 @@ pub(super) async fn user_input_or_turn_inner(
                 .update_validation_authorization(&items)
                 .await;
             current_context.update_multi_agent_spawn_authorization(&items);
-            current_context.update_source_owner_candidates(&items).await;
             current_context.session_telemetry.user_prompt(&items);
             sess.refresh_mcp_servers_if_requested(
                 &current_context,
@@ -538,10 +537,6 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .collect::<Vec<_>>();
     sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
         .await;
-    sess.services
-        .agent_control
-        .rollout_budget()
-        .rearm_reminder(sess.thread_id());
     sess.recompute_token_usage(turn_context.as_ref()).await;
 
     sess.persist_rollout_items(&[RolloutItem::EventMsg(rollback_msg.clone())])

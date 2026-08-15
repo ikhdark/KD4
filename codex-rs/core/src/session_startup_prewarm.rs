@@ -28,6 +28,11 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 
+/// Gives an already-running startup prewarm a brief chance to hand its prepared
+/// websocket and response prefix to the first real turn. This is deliberately
+/// bounded so a stalled speculative request cannot stall ordinary dispatch.
+pub(crate) const FIRST_TURN_PREWARM_HANDOFF_TIMEOUT: Duration = Duration::from_millis(500);
+
 pub(crate) struct SessionStartupPrewarmHandle {
     task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
     started_at: Instant,
@@ -76,41 +81,31 @@ impl SessionStartupPrewarmHandle {
     ) -> SessionStartupPrewarmResolution {
         let _startup_wait = startup_timing.begin_phase(StartupPhase::FirstTurnPrewarmWait);
         let resolve_started_at = Instant::now();
-        let Self { task, started_at } = self;
+        let Self {
+            mut task,
+            started_at,
+        } = self;
         let age_at_first_turn = started_at.elapsed();
 
-        let resolution = if cancellation_token.is_cancelled() {
-            task.abort();
-            let _ = task.await;
-            session_telemetry.record_startup_phase(
-                "startup_prewarm_resolve",
-                resolve_started_at.elapsed(),
-                Some("cancelled"),
-            );
-            session_telemetry.record_duration(
-                STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC,
-                age_at_first_turn,
-                &[("status", "cancelled")],
-            );
-            session_telemetry.record_duration(
-                STARTUP_PREWARM_DURATION_METRIC,
-                started_at.elapsed(),
-                &[("status", "cancelled")],
-            );
-            return SessionStartupPrewarmResolution::Cancelled;
-        } else if task.is_finished() {
-            Self::resolution_from_join_result(task.await, started_at)
-        } else {
-            // The regular turn owns the transport once it starts. Revoke the speculative
-            // task without joining it so first-send preparation can continue immediately.
-            // Startup sessions are non-publishing by construction, so dropping the result handle
-            // also prevents the losing transport from entering the shared cache.
-            task.abort();
-            drop(task);
-            info!("startup websocket prewarm was not ready when the first turn started");
-            SessionStartupPrewarmResolution::Unavailable {
-                status: "not_ready",
-                prewarm_duration: Some(started_at.elapsed()),
+        let resolution = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                task.abort();
+                let _ = task.await;
+                SessionStartupPrewarmResolution::Cancelled
+            }
+            result = &mut task => Self::resolution_from_join_result(result, started_at),
+            _ = tokio::time::sleep(FIRST_TURN_PREWARM_HANDOFF_TIMEOUT) => {
+                // The regular turn owns the transport after this bounded handoff window.
+                // Startup sessions are non-publishing by construction, so aborting the loser
+                // also prevents its transport from entering the shared cache.
+                task.abort();
+                drop(task);
+                info!("startup websocket prewarm missed the first-turn handoff window");
+                SessionStartupPrewarmResolution::Unavailable {
+                    status: "handoff_timeout",
+                    prewarm_duration: Some(started_at.elapsed()),
+                }
             }
         };
         let status = match &resolution {
@@ -127,6 +122,16 @@ impl SessionStartupPrewarmHandle {
 
         match resolution {
             SessionStartupPrewarmResolution::Cancelled => {
+                session_telemetry.record_duration(
+                    STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC,
+                    age_at_first_turn,
+                    &[("status", "cancelled")],
+                );
+                session_telemetry.record_duration(
+                    STARTUP_PREWARM_DURATION_METRIC,
+                    started_at.elapsed(),
+                    &[("status", "cancelled")],
+                );
                 SessionStartupPrewarmResolution::Cancelled
             }
             SessionStartupPrewarmResolution::Ready(prewarmed_session) => {

@@ -9,7 +9,6 @@ use codex_features::Feature;
 use codex_features::FeatureToml;
 use codex_features::FeaturesToml;
 use codex_features::MultiAgentV2ConfigToml;
-use codex_features::RolloutBudgetConfigToml;
 use codex_protocol::ThreadId;
 
 use crate::config::Config;
@@ -152,12 +151,6 @@ fn save_config_resolved_fields(
         resolved_config_to_toml(&config.multi_agent_v2, "features.multi_agent_v2")?;
     multi_agent_v2.enabled = Some(config.features.enabled(Feature::MultiAgentV2));
     features.multi_agent_v2 = Some(FeatureToml::Config(multi_agent_v2));
-    if let Some(rollout_budget) = config.rollout_budget.as_ref() {
-        let mut rollout_budget: RolloutBudgetConfigToml =
-            resolved_config_to_toml(rollout_budget, "features.rollout_budget")?;
-        rollout_budget.enabled = Some(config.features.enabled(Feature::RolloutBudget));
-        features.rollout_budget = Some(FeatureToml::Config(rollout_budget));
-    }
     if let Some(current_time_reminder) = config.current_time_reminder.as_ref() {
         let mut current_time_reminder: CurrentTimeReminderConfigToml =
             resolved_config_to_toml(current_time_reminder, "features.current_time_reminder")?;
@@ -238,16 +231,6 @@ mod tests {
     async fn lock_contains_prompts_and_materializes_features() {
         let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
         let mut config = (*sc.original_config_do_not_use).clone();
-        config.rollout_budget = Some(crate::config::RolloutBudgetConfig {
-            limit_tokens: 100_000,
-            reminder_at_remaining_tokens: vec![50_000, 25_000, 10_000],
-            sampling_token_weight: 1.0,
-            prefill_token_weight: 0.25,
-        });
-        config
-            .features
-            .enable(Feature::RolloutBudget)
-            .expect("rollout_budget should be enableable in tests");
         config.current_time_reminder = Some(crate::config::CurrentTimeReminderConfig::default());
         config
             .features
@@ -317,21 +300,6 @@ mod tests {
             })
         ));
 
-        assert_eq!(
-            features.rollout_budget,
-            Some(FeatureToml::Config(RolloutBudgetConfigToml {
-                enabled: Some(true),
-                limit_tokens: Some(100_000),
-                reminder_at_remaining_tokens: Some(vec![50_000, 25_000, 10_000]),
-                sampling_token_weight: Some(1.0),
-                prefill_token_weight: Some(0.25),
-                cached_input_token_weight: None,
-                model_call_token_cost: None,
-                tool_output_byte_weight: None,
-                subagent_token_cost: None,
-                action: None,
-            }))
-        );
         assert_eq!(
             features.current_time_reminder,
             Some(FeatureToml::Config(CurrentTimeReminderConfigToml {

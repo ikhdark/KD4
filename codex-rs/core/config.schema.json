@@ -649,9 +649,6 @@
             "responses_websockets_v2": {
               "type": "boolean"
             },
-            "rollout_budget": {
-              "$ref": "#/definitions/FeatureToml_for_RolloutBudgetConfigToml"
-            },
             "runtime_metrics": {
               "type": "boolean"
             },
@@ -674,9 +671,6 @@
               "type": "boolean"
             },
             "skill_mcp_dependency_install": {
-              "type": "boolean"
-            },
-            "source_tools": {
               "type": "boolean"
             },
             "sqlite": {
@@ -1009,16 +1003,6 @@
         },
         {
           "$ref": "#/definitions/NetworkProxyConfigToml"
-        }
-      ]
-    },
-    "FeatureToml_for_RolloutBudgetConfigToml": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "$ref": "#/definitions/RolloutBudgetConfigToml"
         }
       ]
     },
@@ -2773,78 +2757,6 @@
           "type": "string"
         }
       ]
-    },
-    "RolloutBudgetAction": {
-      "enum": [
-        "remind",
-        "ask",
-        "stop"
-      ],
-      "type": "string"
-    },
-    "RolloutBudgetConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "action": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/RolloutBudgetAction"
-            }
-          ],
-          "description": "Deprecated compatibility field. Its value is ignored."
-        },
-        "cached_input_token_weight": {
-          "description": "Deprecated compatibility field. Its value is ignored.",
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        },
-        "enabled": {
-          "type": "boolean"
-        },
-        "limit_tokens": {
-          "format": "int64",
-          "minimum": 1.0,
-          "type": "integer"
-        },
-        "model_call_token_cost": {
-          "description": "Deprecated compatibility field. Its value is ignored.",
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        },
-        "prefill_token_weight": {
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        },
-        "reminder_at_remaining_tokens": {
-          "description": "Remaining weighted-token values that trigger reminders when crossed.",
-          "items": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "type": "array"
-        },
-        "sampling_token_weight": {
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        },
-        "subagent_token_cost": {
-          "description": "Deprecated compatibility field. Its value is ignored.",
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        },
-        "tool_output_byte_weight": {
-          "description": "Deprecated compatibility field. Its value is ignored.",
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        }
-      },
-      "type": "object"
     },
     "SandboxMode": {
       "enum": [
@@ -5081,9 +4993,6 @@
         "responses_websockets_v2": {
           "type": "boolean"
         },
-        "rollout_budget": {
-          "$ref": "#/definitions/FeatureToml_for_RolloutBudgetConfigToml"
-        },
         "runtime_metrics": {
           "type": "boolean"
         },
@@ -5106,9 +5015,6 @@
           "type": "boolean"
         },
         "skill_mcp_dependency_install": {
-          "type": "boolean"
-        },
-        "source_tools": {
           "type": "boolean"
         },
         "sqlite": {

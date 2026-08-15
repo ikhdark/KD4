@@ -14,13 +14,10 @@ use tracing::info;
 use tracing::instrument;
 use tracing::trace_span;
 
-use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
 use crate::agent::task_capabilities::classify_typed_tool;
 use crate::function_tool::FunctionCallError;
-use crate::session::reasoning_governor::SameGenerationSingleflightRegistration;
 use crate::session::reasoning_governor::SamplingRequestSignalCollector;
-use crate::session::reasoning_governor::is_accepted_mutating_operation;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::AbortedToolOutput;
@@ -186,18 +183,7 @@ impl ToolCallRuntime {
             collaboration_namespace,
         );
         let authoritative_direct_wait = matches!(&tool_class, TypedToolClass::AgentCommunication);
-        let external_mutation_intent = self
-            .step_context
-            .tool_router()
-            .map(|router| router.external_mutation_intent(&call.tool_name))
-            .unwrap_or(ExternalMutationIntent::MayMutate);
-        let accepted_mutating_operation = is_accepted_mutating_operation(
-            tool_class,
-            external_mutation_intent,
-            &call.tool_name,
-            &call.payload,
-        );
-        let mut signal_registration = self.sampling_request_signals.as_ref().map(|collector| {
+        let signal_registration = self.sampling_request_signals.as_ref().map(|collector| {
             collector.register_deterministic_tool_call(
                 &call.tool_name,
                 &call.payload,
@@ -206,174 +192,47 @@ impl ToolCallRuntime {
         });
         let signal_collector = self.sampling_request_signals.clone();
         async move {
-            if let Some(registration) = signal_registration.as_ref() {
-                if let Some(guard) = registration.blocked_wait_guard.as_ref()
-                    && let Some(snapshot) = crate::tools::handlers::multi_agents_v2::wait::inspect_authoritative_wait_snapshot(
+            if let Some(registration) = signal_registration.as_ref()
+                && let Some(guard) = registration.blocked_wait_guard.as_ref()
+                && let Some(snapshot) = crate::tools::handlers::multi_agents_v2::wait::inspect_authoritative_wait_snapshot(
                         self.session.as_ref(),
                         self.step_context.turn.as_ref(),
                         &guard.assignment_ids,
                     )
                     .await
+            {
+                if snapshot.owner == guard.owner
+                    && snapshot.state_revision == guard.state_revision
                 {
-                    if snapshot.owner == guard.owner
-                        && snapshot.state_revision == guard.state_revision
-                    {
-                        let mut output = FunctionCallOutputPayload::from_text(
-                            serde_json::json!({
-                                "kind": "authoritative_wait_suppression",
-                                "disposition": "blocked",
-                                "owner": guard.owner,
-                                "state_revision": guard.state_revision,
-                                "reason": "the exact authoritative wait remains blocked at the same owner revision; act on the blocker or report it",
-                            })
-                            .to_string(),
-                        );
-                        output.success = Some(true);
-                        let response = ResponseInputItem::FunctionCallOutput {
-                            call_id: call.call_id.clone(),
-                            output,
-                        };
-                        if let Some(signal_collector) = signal_collector.as_ref() {
-                            signal_collector
-                                .record_suppressed_result(registration.ordinal, &response);
-                        }
-                        self.step_context
-                            .turn
-                            .turn_timing_state
-                            .record_suppressed_repeated_dispatch();
-                        return Ok(response);
-                    }
-                    if let Some(signal_collector) = signal_collector.as_ref() {
-                        signal_collector.clear_blocked_wait_guard(
-                            &guard.owner,
-                            &guard.state_revision,
-                        );
-                    }
-                }
-                if let Some(suppression) = registration.suppression.as_ref() {
                     let mut output = FunctionCallOutputPayload::from_text(
-                        serde_json::to_string(&suppression.deferred_validation_result())
-                            .unwrap_or_else(|_| {
-                                "{\"kind\":\"validation_suppression\",\"disposition\":\"deferred\",\"outcome\":\"not_executed\",\"reason_code\":\"pending_mutation_obligation\"}"
-                                    .to_string()
-                            }),
+                        serde_json::json!({
+                            "kind": "authoritative_wait_suppression",
+                            "disposition": "blocked",
+                            "owner": guard.owner,
+                            "state_revision": guard.state_revision,
+                            "reason": "the exact authoritative wait remains blocked at the same owner revision; act on the blocker or report it",
+                        })
+                        .to_string(),
                     );
-                    output.success = None;
+                    output.success = Some(true);
                     let response = ResponseInputItem::FunctionCallOutput {
                         call_id: call.call_id.clone(),
                         output,
                     };
                     if let Some(signal_collector) = signal_collector.as_ref() {
                         signal_collector
-                            .record_deferred_validation_result(registration.ordinal, &response);
+                            .record_suppressed_result(registration.ordinal, &response);
                     }
-                    self.step_context
-                        .turn
-                        .turn_timing_state
-                        .record_suppressed_repeated_dispatch();
                     return Ok(response);
                 }
-                if let (Some(response), Some(artifact)) = (
-                    registration.replay_response.clone(),
-                    registration.replay_artifact.as_ref(),
-                ) {
-                    if crate::tools::command_output_artifact::protect_active_tool_history_artifact(
-                        self.step_context.turn.config.codex_home.as_path(),
-                        &self.session.thread_id().to_string(),
-                        &artifact.artifact_id,
-                        artifact.canonical_bytes,
-                        &artifact.canonical_sha256,
-                    )
-                    .await
-                    .is_ok()
-                    {
-                        if registration.repeated_discovery {
-                            self.step_context
-                                .turn
-                                .turn_timing_state
-                                .record_repeated_discovery_call();
-                        }
-                        self.step_context
-                            .turn
-                            .turn_timing_state
-                            .record_suppressed_repeated_dispatch();
-                        return Ok(response);
-                    }
-                    if let (Some(key), Some(signal_collector)) = (
-                        registration.replay_fallback_key.clone(),
-                        signal_collector.as_ref(),
-                    ) {
-                        signal_collector.activate_replay_fallback(
-                            registration.ordinal,
-                            key,
-                            registration.replay_fallback_locator,
-                        );
-                    }
-                }
-            }
-            if let Some(registration) = signal_registration.as_mut()
-                && let Some(SameGenerationSingleflightRegistration::Follower(follower)) =
-                    registration.same_generation_singleflight.as_mut()
-                && let Some(shared) = follower
-                    .wait_for_shareable(&cancellation_token)
-                    .await
-                && shared.authoritative_execution_identity
-                    == follower.authoritative_execution_identity
-                && let Some(response) = shared.project_for_call(&call.call_id)
-            {
                 if let Some(signal_collector) = signal_collector.as_ref() {
-                    signal_collector.record_joined_same_generation_result(
-                        registration.ordinal,
-                        &response,
-                        &shared.authoritative_execution_identity,
-                    );
-                }
-                self.step_context
-                    .turn
-                    .turn_timing_state
-                    .record_suppressed_repeated_dispatch();
-                tracing::info!(
-                    disposition = "joined_reused",
-                    call_id = %call.call_id,
-                    leader_ordinal = follower.leader_ordinal,
-                    authoritative_execution_identity = %shared.authoritative_execution_identity,
-                    "same-generation deterministic read reused its leader result"
-                );
-                return Ok(response);
-            }
-            if let Some(registration) = signal_registration.as_ref() {
-                if registration.repeated_discovery {
-                    self.step_context
-                        .turn
-                        .turn_timing_state
-                        .record_repeated_discovery_call();
-                }
-                if registration.discovery_after_owner_resolution {
-                    self.step_context
-                        .turn
-                        .turn_timing_state
-                        .record_discovery_after_owner_resolution();
-                }
-                if let Some(advisory) = registration.source_advisory.as_ref() {
-                    if let Some(signal_collector) = signal_collector.as_ref() {
-                        signal_collector.record_source_advisory_physical_operation();
-                    }
-                    tracing::info!(
-                        advisory = "source_known_no_advance",
-                        reason = %advisory.reason,
-                        "pre-edit source convergence advisory observed; executing source call"
-                    );
+                    signal_collector
+                        .clear_blocked_wait_guard(&guard.owner, &guard.state_revision);
                 }
             }
             let signal_ordinal = signal_registration
                 .as_ref()
                 .map(|registration| registration.ordinal);
-            if accepted_mutating_operation {
-                self.step_context
-                    .turn
-                    .turn_timing_state
-                    .record_pre_edit_first_accepted_mutation();
-            }
             let mutation_revision_before = if signal_ordinal.is_some() {
                 Some(self.tracker.lock().await.current_mutation_revision())
             } else {
@@ -434,17 +293,6 @@ impl ToolCallRuntime {
                             &response,
                             mutation_advanced,
                         );
-                        if let Some(SameGenerationSingleflightRegistration::Leader(leader)) =
-                            signal_registration.as_ref().and_then(|registration| {
-                                registration.same_generation_singleflight.as_ref()
-                            })
-                        {
-                            collector.complete_same_generation_leader(
-                                leader,
-                                outcome_context,
-                                &response,
-                            );
-                        }
                     }
                     Ok(response)
                 }
@@ -455,13 +303,6 @@ impl ToolCallRuntime {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        if let Some(SameGenerationSingleflightRegistration::Leader(leader)) =
-                            signal_registration.as_ref().and_then(|registration| {
-                                registration.same_generation_singleflight.as_ref()
-                            })
-                        {
-                            collector.fail_same_generation_leader(leader);
-                        }
                         collector.record_failure_with_mutation(ordinal, mutation_advanced);
                     }
                     Err(CodexErr::Fatal(message))
@@ -473,13 +314,6 @@ impl ToolCallRuntime {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        if let Some(SameGenerationSingleflightRegistration::Leader(leader)) =
-                            signal_registration.as_ref().and_then(|registration| {
-                                registration.same_generation_singleflight.as_ref()
-                            })
-                        {
-                            collector.fail_same_generation_leader(leader);
-                        }
                         collector.record_failure_with_mutation(ordinal, mutation_advanced);
                     }
                     Ok(Self::failure_response(error_call, other))
@@ -746,10 +580,8 @@ impl Drop for ToolCallTimingGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use crate::session::reasoning_governor::SamplingReasoningGovernor;
     use crate::session::step_context::StepContext;
     use crate::tools::ToolRouter;
     use crate::tools::context::FunctionToolOutput;
@@ -759,7 +591,6 @@ mod tests {
     use crate::tools::registry::ToolExecutor;
     use crate::tools::registry::ToolRegistry;
     use crate::turn_diff_tracker::TurnDiffTracker;
-    use crate::turn_diff_tracker::ValidationFreshnessStatus;
     use codex_extension_api::ToolCallOutcome;
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
@@ -767,16 +598,6 @@ mod tests {
     use tokio::sync::Notify;
     use tokio::sync::oneshot;
     use tracing_test::internal::MockWriter;
-
-    fn response_call_id(response: &ResponseInputItem) -> Option<String> {
-        match response {
-            ResponseInputItem::FunctionCallOutput { call_id, .. }
-            | ResponseInputItem::CustomToolCallOutput { call_id, .. }
-            | ResponseInputItem::McpToolCallOutput { call_id, .. }
-            | ResponseInputItem::ToolSearchOutput { call_id, .. } => Some(call_id.clone()),
-            ResponseInputItem::Message { .. } => None,
-        }
-    }
 
     #[test]
     fn tool_search_failure_response_is_incomplete() {
@@ -1056,252 +877,6 @@ mod tests {
 
     impl CoreToolRuntime for ImmediateHandler {}
 
-    struct CountingLargeReadHandler {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl ToolExecutor<ToolInvocation> for CountingLargeReadHandler {
-        fn tool_name(&self) -> codex_tools::ToolName {
-            codex_tools::ToolName::plain("read_file_span")
-        }
-
-        fn spec(&self) -> codex_tools::ToolSpec {
-            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
-                name: "read_file_span".to_string(),
-                description: "Large deterministic read test tool.".to_string(),
-                strict: false,
-                defer_loading: None,
-                parameters: codex_tools::JsonSchema::default(),
-                output_schema: None,
-            })
-        }
-
-        fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async {
-                Ok(Box::new(FunctionToolOutput::from_text(
-                    "source-byte".repeat(4_000),
-                    Some(true),
-                ))
-                    as Box<dyn crate::tools::context::ToolOutput>)
-            })
-        }
-    }
-
-    impl CoreToolRuntime for CountingLargeReadHandler {}
-
-    #[tokio::test]
-    async fn identical_successful_reads_singleflight_and_preserve_call_ids() -> anyhow::Result<()> {
-        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let turn_context = Arc::new(turn_context);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(CountingLargeReadHandler {
-            calls: Arc::clone(&calls),
-        }) as Arc<dyn CoreToolRuntime>;
-        let router = Arc::new(ToolRouter::from_parts(
-            ToolRegistry::from_tools([handler]),
-            Vec::new(),
-        ));
-        let step_context =
-            StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
-        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        let runtime = ToolCallRuntime::new(session, step_context, tracker)
-            .with_sampling_request_signals(governor.collector(&baselines));
-        let call = |call_id: &str| ToolCall {
-            tool_name: codex_tools::ToolName::plain("read_file_span"),
-            call_id: call_id.to_string(),
-            payload: ToolPayload::Function {
-                arguments: r#"{"path":"src/lib.rs","start_line":1}"#.to_string(),
-            },
-        };
-
-        let leader = runtime
-            .clone()
-            .handle_tool_call(call("read-leader"), CancellationToken::new());
-        let follower = runtime.handle_tool_call(call("read-follower"), CancellationToken::new());
-        let (leader, follower) = tokio::join!(leader, follower);
-        let leader = leader?;
-        let follower = follower?;
-
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        let ResponseInputItem::FunctionCallOutput {
-            call_id: leader_call_id,
-            output: leader_output,
-        } = leader
-        else {
-            anyhow::bail!("leader should return a function output");
-        };
-        let ResponseInputItem::FunctionCallOutput {
-            call_id: follower_call_id,
-            output: follower_output,
-        } = follower
-        else {
-            anyhow::bail!("follower should return a function output");
-        };
-        assert_eq!(leader_call_id, "read-leader");
-        assert_eq!(follower_call_id, "read-follower");
-        assert_eq!(leader_output, follower_output);
-        Ok(())
-    }
-
-    struct FailFirstLargeReadHandler {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl ToolExecutor<ToolInvocation> for FailFirstLargeReadHandler {
-        fn tool_name(&self) -> codex_tools::ToolName {
-            codex_tools::ToolName::plain("read_file_span")
-        }
-
-        fn spec(&self) -> codex_tools::ToolSpec {
-            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
-                name: "read_file_span".to_string(),
-                description: "Fail-open singleflight read test tool.".to_string(),
-                strict: false,
-                defer_loading: None,
-                parameters: codex_tools::JsonSchema::default(),
-                output_schema: None,
-            })
-        }
-
-        fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-            let call = self.calls.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                if call == 0 {
-                    Err(FunctionCallError::RespondToModel(
-                        "synthetic uncertain read failure".to_string(),
-                    ))
-                } else {
-                    Ok(Box::new(FunctionToolOutput::from_text(
-                        "recovered-source-byte".repeat(4_000),
-                        Some(true),
-                    ))
-                        as Box<dyn crate::tools::context::ToolOutput>)
-                }
-            })
-        }
-    }
-
-    impl CoreToolRuntime for FailFirstLargeReadHandler {}
-
-    #[tokio::test]
-    async fn failed_read_leader_wakes_follower_for_independent_execution() -> anyhow::Result<()> {
-        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let turn_context = Arc::new(turn_context);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(FailFirstLargeReadHandler {
-            calls: Arc::clone(&calls),
-        }) as Arc<dyn CoreToolRuntime>;
-        let router = Arc::new(ToolRouter::from_parts(
-            ToolRegistry::from_tools([handler]),
-            Vec::new(),
-        ));
-        let step_context =
-            StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
-        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        let runtime = ToolCallRuntime::new(session, step_context, tracker)
-            .with_sampling_request_signals(governor.collector(&baselines));
-        let call = |call_id: &str| ToolCall {
-            tool_name: codex_tools::ToolName::plain("read_file_span"),
-            call_id: call_id.to_string(),
-            payload: ToolPayload::Function {
-                arguments: r#"{"path":"src/lib.rs","start_line":1}"#.to_string(),
-            },
-        };
-
-        let leader = runtime
-            .clone()
-            .handle_tool_call(call("read-leader-failure"), CancellationToken::new());
-        let follower =
-            runtime.handle_tool_call(call("read-follower-retry"), CancellationToken::new());
-        let (leader, follower) = tokio::join!(leader, follower);
-        let leader = leader?;
-        let follower = follower?;
-
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            response_call_id(&leader).as_deref(),
-            Some("read-leader-failure")
-        );
-        assert_eq!(
-            response_call_id(&follower).as_deref(),
-            Some("read-follower-retry")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn expired_duplicate_artifact_fails_open_to_normal_execution() -> anyhow::Result<()> {
-        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let turn_context = Arc::new(turn_context);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(CountingLargeReadHandler {
-            calls: Arc::clone(&calls),
-        }) as Arc<dyn CoreToolRuntime>;
-        let router = Arc::new(ToolRouter::from_parts(
-            ToolRegistry::from_tools([handler]),
-            Vec::new(),
-        ));
-        let step_context =
-            StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
-        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker);
-        let governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        let call = |call_id: &str| ToolCall {
-            tool_name: codex_tools::ToolName::plain("read_file_span"),
-            call_id: call_id.to_string(),
-            payload: ToolPayload::Function {
-                arguments: r#"{"path":"src/lib.rs","start_line":1}"#.to_string(),
-            },
-        };
-
-        let first = runtime
-            .clone()
-            .with_sampling_request_signals(governor.collector(&baselines))
-            .handle_tool_call(call("read-1"), CancellationToken::new())
-            .await?;
-        let ResponseInputItem::FunctionCallOutput { output, .. } = first else {
-            anyhow::bail!("projected source read should be a function output");
-        };
-        let FunctionCallOutputBody::Text(text) = output.body else {
-            anyhow::bail!("projected source read should be text JSON");
-        };
-        let envelope: serde_json::Value = serde_json::from_str(&text)?;
-        let artifact_id = envelope["artifact_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("projected source read should have an artifact"))?;
-        let artifact_path = turn_context
-            .config
-            .codex_home
-            .join("tool-output")
-            .join(session.thread_id().to_string())
-            .join(format!("{artifact_id}.log"));
-        std::fs::remove_file(&artifact_path)?;
-
-        let second = runtime
-            .with_sampling_request_signals(governor.collector(&baselines))
-            .handle_tool_call(call("read-2"), CancellationToken::new())
-            .await?;
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        let ResponseInputItem::FunctionCallOutput { output, .. } = second else {
-            anyhow::bail!("fresh source read should be a function output");
-        };
-        let FunctionCallOutputBody::Text(text) = output.body else {
-            anyhow::bail!("fresh source read should be text JSON");
-        };
-        let envelope: serde_json::Value = serde_json::from_str(&text)?;
-        assert_ne!(envelope["status"], "not_modified");
-        Ok(())
-    }
-
     struct ParallelImmediateHandler {
         tool_name: codex_tools::ToolName,
     }
@@ -1343,13 +918,13 @@ mod tests {
         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
         let parallel_read = Arc::new(ParallelImmediateHandler {
-            tool_name: codex_tools::ToolName::plain("search_source"),
+            tool_name: codex_tools::ToolName::plain("read_tool_output"),
         }) as Arc<dyn CoreToolRuntime>;
         let parallel_shell = Arc::new(ParallelImmediateHandler {
             tool_name: codex_tools::ToolName::plain("shell_command"),
         }) as Arc<dyn CoreToolRuntime>;
         let serial_read = Arc::new(ImmediateHandler {
-            tool_name: codex_tools::ToolName::plain("read_file_span"),
+            tool_name: codex_tools::ToolName::plain("view_image"),
         }) as Arc<dyn CoreToolRuntime>;
         let router = Arc::new(ToolRouter::from_parts(
             ToolRegistry::from_tools([parallel_read, parallel_shell, serial_read]),
@@ -1372,7 +947,7 @@ mod tests {
 
         let mut eager_prefix_open = true;
         assert!(
-            runtime.take_eager_read_eligibility(&call("search_source"), &mut eager_prefix_open)
+            runtime.take_eager_read_eligibility(&call("read_tool_output"), &mut eager_prefix_open)
         );
         assert!(eager_prefix_open);
 
@@ -1383,12 +958,12 @@ mod tests {
         assert!(!eager_prefix_open);
         // Once a deferred call appears, a later otherwise-eligible read cannot overtake it.
         assert!(
-            !runtime.take_eager_read_eligibility(&call("search_source"), &mut eager_prefix_open)
+            !runtime.take_eager_read_eligibility(&call("read_tool_output"), &mut eager_prefix_open)
         );
 
         let mut serial_prefix = true;
         // ReadSearch classification alone cannot admit a serial registered handler.
-        assert!(!runtime.take_eager_read_eligibility(&call("read_file_span"), &mut serial_prefix));
+        assert!(!runtime.take_eager_read_eligibility(&call("view_image"), &mut serial_prefix));
         assert!(!serial_prefix);
 
         let mut unknown_prefix = true;

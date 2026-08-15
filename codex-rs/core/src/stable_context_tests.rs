@@ -332,18 +332,14 @@ fn collaboration_reset_removes_plan_and_the_reset_notice() {
 }
 
 #[test]
-fn checkpoint_reconstruction_keeps_only_current_canonical_variants() {
+fn repository_reconstruction_keeps_only_current_canonical_variant() {
     let repository_a = repository("old");
     let repository_b = repository("current");
-    let checkpoint_a = "<rollout_budget>\nA\n</rollout_budget>";
-    let checkpoint_b = "<rollout_budget>\nB\n</rollout_budget>";
     let projection = project_stable_context(
         vec![
             text_message("user", &repository_a),
-            text_message("developer", checkpoint_a),
             text_message("user", "dynamic history survives"),
             text_message("user", &repository_b),
-            text_message("developer", checkpoint_b),
         ]
         .into(),
         StableContextTarget::Sampling,
@@ -351,8 +347,6 @@ fn checkpoint_reconstruction_keeps_only_current_canonical_variants() {
 
     let visible = visible_text(&projection.items);
     assert!(!visible.contains(&repository_a.as_str()));
-    assert!(!visible.contains(&checkpoint_a));
     assert!(visible.contains(&repository_b.as_str()));
-    assert!(visible.contains(&checkpoint_b));
     assert!(visible.contains(&"dynamic history survives"));
 }

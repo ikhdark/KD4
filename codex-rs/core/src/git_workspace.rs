@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::ErrorKind;
@@ -7,21 +6,13 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::time::Instant;
 use std::time::SystemTime;
 
-use codex_agent_task_store::AgentTaskStore;
-use codex_agent_task_store::PreparedWorkspaceManifest;
-use codex_agent_task_store::StoreResult;
-#[cfg(test)]
-use codex_agent_task_store::WorkspaceManifestWork;
 use codex_file_watcher::FileWatcher;
-use codex_file_watcher::FileWatcherEvent;
 use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::WatchPath;
 use codex_file_watcher::WatchRegistration;
@@ -31,7 +22,6 @@ use codex_git_utils::get_git_repo_root_with_fs;
 use codex_git_utils::get_has_changes;
 use codex_git_utils::get_head_commit_hash;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path::normalize_for_path_comparison;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::process::Command;
@@ -43,8 +33,6 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 
 const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
-const REPOSITORY_MANIFEST_CACHE_MAX_ENTRIES: usize = 4;
-const REPOSITORY_MANIFEST_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EnvironmentWorkspaceKey {
@@ -365,235 +353,25 @@ struct ProjectNamespaceCacheEntry {
     _registration: WatchRegistration,
 }
 
-struct RepositoryManifestCacheEntry {
-    prepared: PreparedWorkspaceManifest,
-    identity: WorkspaceManifestReuseIdentity,
-    inserted_at: u64,
-    _registration: WatchRegistration,
-}
-
-struct RepositoryManifestRegistration {
-    dependencies: Vec<DependencyFingerprint>,
-    registration_id: u64,
-    registration: WatchRegistration,
-}
-
-pub(crate) struct RepositoryManifestFinalizationGuard {
-    canonical_root: PathBuf,
-    watcher_generation: u64,
-    watcher_registration_id: u64,
-    host_mutation_generation: u64,
-    dependencies: Vec<DependencyFingerprint>,
-    git_signature: [u8; 32],
-    registration: WatchRegistration,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct WorkspaceManifestReuseIdentity {
-    repository_id: String,
-    workspace_id: String,
-    scope: Vec<String>,
-    workspace_epoch: u64,
-    host_mutation_generation: u64,
-    watcher_registration_id: u64,
-    watcher_generation: u64,
-    dependencies: Vec<DependencyFingerprint>,
-    git_signature: [u8; 32],
-    overlay_paths: Vec<String>,
-    overlay_files: Vec<DependencyFingerprint>,
-}
-
 #[derive(Default)]
 struct GitWorkspaceCacheState {
     root: Option<RootCacheEntry>,
     metadata: HashMap<PathBuf, MetadataCacheEntry>,
     project_namespaces: HashMap<PathBuf, ProjectNamespaceCacheEntry>,
-    repository_manifests: HashMap<PathBuf, RepositoryManifestCacheEntry>,
-    repository_manifest_bytes: usize,
-    repository_manifest_insert_serial: u64,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct SourceFreshnessSnapshot {
-    rescan_generation: u64,
-    paths: Vec<(PathBuf, u64)>,
-}
-
-#[derive(Debug, Default)]
-struct SourceFreshnessState {
-    next_generation: u64,
-    rescan_generation: u64,
-    path_generations: HashMap<PathBuf, u64>,
-}
-
-impl SourceFreshnessState {
-    fn snapshot(&self, paths: impl IntoIterator<Item = PathBuf>) -> SourceFreshnessSnapshot {
-        let mut paths = paths
-            .into_iter()
-            .map(|path| normalize_source_freshness_path(&path))
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths.dedup();
-        SourceFreshnessSnapshot {
-            rescan_generation: self.rescan_generation,
-            paths: paths
-                .into_iter()
-                .map(|path| {
-                    let generation = self.path_generations.get(&path).copied().unwrap_or(0);
-                    (path, generation)
-                })
-                .collect(),
-        }
-    }
-
-    fn record_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
-        self.next_generation = self.next_generation.saturating_add(1);
-        let generation = self.next_generation;
-        for path in paths {
-            self.path_generations
-                .insert(normalize_source_freshness_path(&path), generation);
-        }
-    }
-
-    fn record_rescan(&mut self) {
-        self.next_generation = self.next_generation.saturating_add(1);
-        self.rescan_generation = self.next_generation;
-        self.path_generations.clear();
-    }
 }
 
 pub(crate) struct GitWorkspaceCache {
     state: Mutex<GitWorkspaceCacheState>,
     watcher_generation: AtomicU64,
     host_mutation_generation: AtomicU64,
-    watcher_registration_serial: AtomicU64,
     watcher_reliable: AtomicBool,
     watcher_subscriber: Option<FileWatcherSubscriber>,
-    source_freshness: RwLock<SourceFreshnessState>,
-    #[cfg(test)]
-    manifest_diagnostics: WorkspaceManifestDiagnostics,
 }
 
-#[derive(Clone)]
-pub(crate) struct SourceFreshnessRegistration {
-    pub(crate) watcher_generation: u64,
-    pub(crate) host_mutation_generation: u64,
-    pub(crate) identity: String,
-    freshness: SourceFreshnessSnapshot,
-    registration: Arc<WatchRegistration>,
-}
-
-impl std::fmt::Debug for SourceFreshnessRegistration {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SourceFreshnessRegistration")
-            .field("watcher_generation", &self.watcher_generation)
-            .field("host_mutation_generation", &self.host_mutation_generation)
-            .field("identity", &self.identity)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct WorkspaceManifestDiagnostics {
-    cache_hits: AtomicU64,
-    cache_rejections: AtomicU64,
-    full_manifests_constructed: AtomicU64,
-    incremental_manifests_constructed: AtomicU64,
-    admission_overlay_traversals: AtomicU64,
-    admission_files_examined: AtomicU64,
-    admission_files_hashed: AtomicU64,
-    admission_bytes_hashed: AtomicU64,
-    admission_git_subprocesses: AtomicU64,
-    admission_unique_payloads: AtomicU64,
-    admission_payload_reuses: AtomicU64,
-    admission_manifest_bytes_persisted: AtomicU64,
-    admission_reference_bytes_persisted: AtomicU64,
-    admission_sqlite_statements: AtomicU64,
-    admission_transaction_micros: AtomicU64,
-    admission_duration_micros: AtomicU64,
-    final_overlay_traversals: AtomicU64,
-    final_files_examined: AtomicU64,
-    final_files_hashed: AtomicU64,
-    final_bytes_hashed: AtomicU64,
-    final_git_subprocesses: AtomicU64,
-    final_unique_payloads: AtomicU64,
-    final_payload_reuses: AtomicU64,
-    final_manifest_bytes_persisted: AtomicU64,
-    final_reference_bytes_persisted: AtomicU64,
-    final_sqlite_statements: AtomicU64,
-    final_transaction_micros: AtomicU64,
-    final_duration_micros: AtomicU64,
-}
-
-#[cfg(test)]
-impl WorkspaceManifestDiagnostics {
-    fn record_admission(&self, work: WorkspaceManifestWork) {
-        self.cache_hits
-            .fetch_add(work.reuse_hits, Ordering::Relaxed);
-        self.cache_rejections
-            .fetch_add(work.reuse_rejections, Ordering::Relaxed);
-        self.full_manifests_constructed
-            .fetch_add(work.full_constructions, Ordering::Relaxed);
-        self.incremental_manifests_constructed
-            .fetch_add(work.incremental_constructions, Ordering::Relaxed);
-        self.admission_overlay_traversals
-            .fetch_add(work.overlay_traversals, Ordering::Relaxed);
-        self.admission_files_examined
-            .fetch_add(work.files_examined, Ordering::Relaxed);
-        self.admission_files_hashed
-            .fetch_add(work.files_hashed, Ordering::Relaxed);
-        self.admission_bytes_hashed
-            .fetch_add(work.bytes_hashed, Ordering::Relaxed);
-        self.admission_git_subprocesses
-            .fetch_add(work.git_subprocesses, Ordering::Relaxed);
-        self.admission_unique_payloads
-            .fetch_add(work.unique_payloads, Ordering::Relaxed);
-        self.admission_payload_reuses
-            .fetch_add(work.payload_reuses, Ordering::Relaxed);
-        self.admission_manifest_bytes_persisted
-            .fetch_add(work.manifest_bytes_persisted, Ordering::Relaxed);
-        self.admission_reference_bytes_persisted
-            .fetch_add(work.reference_bytes_persisted, Ordering::Relaxed);
-        self.admission_sqlite_statements
-            .fetch_add(work.sqlite_statements, Ordering::Relaxed);
-        self.admission_transaction_micros
-            .fetch_add(work.transaction_micros, Ordering::Relaxed);
-        self.admission_duration_micros
-            .fetch_add(work.duration_micros, Ordering::Relaxed);
-    }
-
-    fn record_final(&self, work: WorkspaceManifestWork) {
-        self.full_manifests_constructed
-            .fetch_add(work.full_constructions, Ordering::Relaxed);
-        self.incremental_manifests_constructed
-            .fetch_add(work.incremental_constructions, Ordering::Relaxed);
-        self.final_overlay_traversals
-            .fetch_add(work.overlay_traversals, Ordering::Relaxed);
-        self.final_files_examined
-            .fetch_add(work.files_examined, Ordering::Relaxed);
-        self.final_files_hashed
-            .fetch_add(work.files_hashed, Ordering::Relaxed);
-        self.final_bytes_hashed
-            .fetch_add(work.bytes_hashed, Ordering::Relaxed);
-        self.final_git_subprocesses
-            .fetch_add(work.git_subprocesses, Ordering::Relaxed);
-        self.final_unique_payloads
-            .fetch_add(work.unique_payloads, Ordering::Relaxed);
-        self.final_payload_reuses
-            .fetch_add(work.payload_reuses, Ordering::Relaxed);
-        self.final_manifest_bytes_persisted
-            .fetch_add(work.manifest_bytes_persisted, Ordering::Relaxed);
-        self.final_reference_bytes_persisted
-            .fetch_add(work.reference_bytes_persisted, Ordering::Relaxed);
-        self.final_sqlite_statements
-            .fetch_add(work.sqlite_statements, Ordering::Relaxed);
-        self.final_transaction_micros
-            .fetch_add(work.transaction_micros, Ordering::Relaxed);
-        self.final_duration_micros
-            .fetch_add(work.duration_micros, Ordering::Relaxed);
-    }
+pub(crate) struct WorkspaceChangeObservation {
+    watcher_generation: u64,
+    host_mutation_generation: u64,
+    _registration: WatchRegistration,
 }
 
 impl GitWorkspaceCache {
@@ -628,22 +406,17 @@ impl GitWorkspaceCache {
             state: Mutex::new(GitWorkspaceCacheState::default()),
             watcher_generation: AtomicU64::new(0),
             host_mutation_generation: AtomicU64::new(0),
-            watcher_registration_serial: AtomicU64::new(0),
             watcher_reliable: AtomicBool::new(watcher_subscriber.is_some()),
             watcher_subscriber,
-            source_freshness: RwLock::new(SourceFreshnessState::default()),
-            #[cfg(test)]
-            manifest_diagnostics: WorkspaceManifestDiagnostics::default(),
         });
         if let Some(mut receiver) = receiver {
             let weak_cache = Arc::downgrade(&cache);
             tokio::spawn(async move {
-                while let Some(event) = receiver.recv().await {
+                while receiver.recv().await.is_some() {
                     let Some(cache) = weak_cache.upgrade() else {
                         return;
                     };
                     cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
-                    cache.record_source_watcher_event(event);
                 }
                 if let Some(cache) = weak_cache.upgrade() {
                     cache.invalidate_for_watcher_failure().await;
@@ -656,16 +429,10 @@ impl GitWorkspaceCache {
     async fn invalidate_for_watcher_failure(&self) {
         self.watcher_reliable.store(false, Ordering::Release);
         self.watcher_generation.fetch_add(1, Ordering::AcqRel);
-        self.source_freshness
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_rescan();
         let mut state = self.state.lock().await;
         state.root = None;
         state.metadata.clear();
         state.project_namespaces.clear();
-        state.repository_manifests.clear();
-        state.repository_manifest_bytes = 0;
     }
 
     pub(crate) async fn snapshot(
@@ -867,745 +634,60 @@ impl GitWorkspaceCache {
         }
     }
 
-    /// Revalidates every correctness input before reusing cached content hashes.
-    pub(crate) async fn prepare_repository_manifest(
-        &self,
-        store: &dyn AgentTaskStore,
-        repo_root: &Path,
-    ) -> StoreResult<Option<PreparedWorkspaceManifest>> {
-        let started = Instant::now();
-        let Ok(canonical_root) = std::fs::canonicalize(repo_root) else {
-            return Ok(None);
-        };
-        let Some(watcher_generation) = self.reliable_watcher_generation() else {
-            let prepared = store
-                .prepare_workspace_mutation(
-                    repo_root,
-                    vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
-                )
-                .await?;
-            #[cfg(test)]
-            if let Some(prepared) = prepared.as_ref() {
-                self.manifest_diagnostics.record_admission(prepared.work());
-            }
-            return Ok(prepared);
-        };
-        let host_mutation_generation = self.host_mutation_generation.load(Ordering::Acquire);
-        let cached = {
-            let state = self.state.lock().await;
-            state
-                .repository_manifests
-                .get(&canonical_root)
-                .filter(|entry| {
-                    entry.identity.watcher_generation == watcher_generation
-                        && entry.identity.host_mutation_generation == host_mutation_generation
-                        && entry.identity.watcher_registration_id != 0
-                })
-                .map(|entry| (entry.prepared.clone(), entry.identity.clone()))
-        };
-        let had_cached = cached.is_some();
-        if let Some((prepared, identity)) = cached {
-            let epoch_before = store.workspace_mutation_epoch(repo_root).await?;
-            let dependencies_before =
-                refresh_repository_manifest_dependencies(&identity.dependencies);
-            let git_signature_before = repository_manifest_git_signature(repo_root).await;
-            let overlay_paths_before = store.workspace_manifest_overlay_paths(repo_root).await?;
-            let overlay_files = overlay_paths_before
-                .as_deref()
-                .and_then(|paths| repository_overlay_file_identities(&canonical_root, paths));
-            let overlay_paths_after = store.workspace_manifest_overlay_paths(repo_root).await?;
-            let git_signature_after = repository_manifest_git_signature(repo_root).await;
-            let dependencies_after =
-                refresh_repository_manifest_dependencies(&identity.dependencies);
-            let epoch_after = store.workspace_mutation_epoch(repo_root).await?;
-            let stable = dependencies_before.as_ref() == Some(&identity.dependencies)
-                && dependencies_after == dependencies_before
-                && git_signature_before == Some(identity.git_signature)
-                && git_signature_after == git_signature_before
-                && overlay_paths_after == overlay_paths_before
-                && self.reliable_watcher_generation() == Some(identity.watcher_generation)
-                && self.host_mutation_generation.load(Ordering::Acquire)
-                    == identity.host_mutation_generation
-                && epoch_before == Some(identity.workspace_epoch)
-                && epoch_after == epoch_before;
-            if stable
-                && identity.repository_id == prepared.receipt().repository_id()
-                && identity.workspace_id == prepared.receipt().workspace_id()
-                && identity.scope == prepared.receipt().paths()
-                && let (Some(overlay_paths), Some(overlay_files)) =
-                    (overlay_paths_before, overlay_files)
-            {
-                let changed_paths = changed_overlay_paths(
-                    &identity.overlay_paths,
-                    &identity.overlay_files,
-                    &overlay_paths,
-                    &overlay_files,
-                );
-                if changed_paths.is_empty() {
-                    let prepared = prepared.reused_after_validation(
-                        2,
-                        overlay_paths.len().try_into().unwrap_or(u64::MAX),
-                        8,
-                        started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
-                    );
-                    #[cfg(test)]
-                    self.manifest_diagnostics.record_admission(prepared.work());
-                    return Ok(Some(prepared));
-                }
-                if let Some(refreshed) = store
-                    .refresh_workspace_mutation(
-                        repo_root,
-                        prepared,
-                        overlay_paths.clone(),
-                        changed_paths,
-                    )
-                    .await?
-                {
-                    let refreshed = refreshed
-                        .with_dependency_identity(repository_manifest_dependency_identity(
-                            &identity.dependencies,
-                            &identity.git_signature,
-                            &overlay_paths,
-                            &overlay_files,
-                        ))
-                        .with_revalidation_work(
-                            2,
-                            overlay_paths.len().try_into().unwrap_or(u64::MAX),
-                            8,
-                            0,
-                            started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
-                        );
-                    let refreshed_identity = WorkspaceManifestReuseIdentity {
-                        repository_id: refreshed.receipt().repository_id().to_string(),
-                        workspace_id: refreshed.receipt().workspace_id().to_string(),
-                        scope: refreshed.receipt().paths().to_vec(),
-                        workspace_epoch: refreshed.receipt().epoch(),
-                        host_mutation_generation: identity.host_mutation_generation,
-                        watcher_registration_id: identity.watcher_registration_id,
-                        watcher_generation: identity.watcher_generation,
-                        dependencies: identity.dependencies,
-                        git_signature: identity.git_signature,
-                        overlay_paths,
-                        overlay_files,
-                    };
-                    self.replace_repository_manifest_entry(
-                        canonical_root,
-                        refreshed.clone(),
-                        refreshed_identity,
-                        None,
-                    )
-                    .await;
-                    #[cfg(test)]
-                    self.manifest_diagnostics.record_admission(refreshed.work());
-                    return Ok(Some(refreshed));
-                }
-            }
-        }
-        let prepared = self
-            .reconstruct_repository_manifest(store, repo_root, canonical_root)
-            .await?;
-        let prepared = prepared.map(|prepared| {
-            prepared.with_revalidation_work(
-                0,
-                0,
-                0,
-                u64::from(had_cached),
-                started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
-            )
-        });
-        #[cfg(test)]
-        if let Some(prepared) = prepared.as_ref() {
-            self.manifest_diagnostics.record_admission(prepared.work());
-        }
-        Ok(prepared)
-    }
-
-    async fn reconstruct_repository_manifest(
-        &self,
-        store: &dyn AgentTaskStore,
-        repo_root: &Path,
-        canonical_root: PathBuf,
-    ) -> StoreResult<Option<PreparedWorkspaceManifest>> {
-        for _attempt in 0..2 {
-            let Some(watcher_generation) = self.reliable_watcher_generation() else {
-                return store
-                    .prepare_workspace_mutation(
-                        repo_root,
-                        vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
-                    )
-                    .await;
-            };
-            let Some(registration) =
-                self.register_repository_manifest_dependencies(&canonical_root)
-            else {
-                return store
-                    .prepare_workspace_mutation(
-                        repo_root,
-                        vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
-                    )
-                    .await;
-            };
-            if self.reliable_watcher_generation() != Some(watcher_generation) {
-                continue;
-            }
-            let host_mutation_generation = self.host_mutation_generation.load(Ordering::Acquire);
-            let git_signature_before = repository_manifest_git_signature(repo_root).await;
-            let prepared = store
-                .prepare_workspace_mutation(
-                    repo_root,
-                    vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
-                )
-                .await?;
-            let Some(prepared) = prepared else {
-                return Ok(None);
-            };
-            let overlay_paths_before = store.workspace_manifest_overlay_paths(repo_root).await?;
-            let overlay_files = overlay_paths_before
-                .as_deref()
-                .and_then(|paths| repository_overlay_file_identities(&canonical_root, paths));
-            let overlay_paths_after = store.workspace_manifest_overlay_paths(repo_root).await?;
-            let git_signature_after = repository_manifest_git_signature(repo_root).await;
-            let dependencies_after =
-                refresh_repository_manifest_dependencies(&registration.dependencies);
-            let epoch = store.workspace_mutation_epoch(repo_root).await?;
-            if dependencies_after.as_ref() == Some(&registration.dependencies)
-                && git_signature_before.is_some()
-                && git_signature_after == git_signature_before
-                && overlay_paths_after == overlay_paths_before
-                && epoch == Some(prepared.receipt().epoch())
-                && self.reliable_watcher_generation() == Some(watcher_generation)
-                && self.host_mutation_generation.load(Ordering::Acquire) == host_mutation_generation
-                && let (Some(overlay_paths), Some(overlay_files), Some(git_signature)) =
-                    (overlay_paths_before, overlay_files, git_signature_before)
-                && manifest_entry_paths(&prepared) == overlay_paths
-            {
-                let prepared = prepared
-                    .with_dependency_identity(repository_manifest_dependency_identity(
-                        &registration.dependencies,
-                        &git_signature,
-                        &overlay_paths,
-                        &overlay_files,
-                    ))
-                    .with_revalidation_work(
-                        2,
-                        overlay_paths.len().try_into().unwrap_or(u64::MAX),
-                        8,
-                        0,
-                        0,
-                    );
-                let identity = WorkspaceManifestReuseIdentity {
-                    repository_id: prepared.receipt().repository_id().to_string(),
-                    workspace_id: prepared.receipt().workspace_id().to_string(),
-                    scope: prepared.receipt().paths().to_vec(),
-                    workspace_epoch: prepared.receipt().epoch(),
-                    host_mutation_generation,
-                    watcher_registration_id: registration.registration_id,
-                    watcher_generation,
-                    dependencies: registration.dependencies,
-                    git_signature,
-                    overlay_paths,
-                    overlay_files,
-                };
-                self.replace_repository_manifest_entry(
-                    canonical_root,
-                    prepared.clone(),
-                    identity,
-                    Some(registration.registration),
-                )
-                .await;
-                return Ok(Some(prepared));
-            }
-        }
-        // A stable dependency window is only required to admit the reconstructed
-        // manifest to this cache. Repository activity must not prevent callers
-        // from acquiring a fresh workspace mutation lease altogether.
-        store
-            .prepare_workspace_mutation(
-                repo_root,
-                vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
-            )
-            .await
-    }
-
-    async fn replace_repository_manifest_entry(
-        &self,
-        canonical_root: PathBuf,
-        prepared: PreparedWorkspaceManifest,
-        identity: WorkspaceManifestReuseIdentity,
-        registration: Option<WatchRegistration>,
-    ) {
-        let byte_count = prepared.canonical_byte_count();
-        if byte_count > REPOSITORY_MANIFEST_CACHE_MAX_BYTES {
-            return;
-        }
-        let mut state = self.state.lock().await;
-        if registration.is_none()
-            && let Some(previous_bytes) = state
-                .repository_manifests
-                .get(&canonical_root)
-                .map(|entry| entry.prepared.canonical_byte_count())
-        {
-            let updated_total = state
-                .repository_manifest_bytes
-                .saturating_sub(previous_bytes)
-                .saturating_add(byte_count);
-            if updated_total > REPOSITORY_MANIFEST_CACHE_MAX_BYTES {
-                state.repository_manifests.remove(&canonical_root);
-                state.repository_manifest_bytes = state
-                    .repository_manifest_bytes
-                    .saturating_sub(previous_bytes);
-                return;
-            }
-            state.repository_manifest_bytes = state
-                .repository_manifest_bytes
-                .saturating_sub(previous_bytes)
-                .saturating_add(byte_count);
-            state.repository_manifest_insert_serial =
-                state.repository_manifest_insert_serial.saturating_add(1);
-            let inserted_at = state.repository_manifest_insert_serial;
-            if let Some(entry) = state.repository_manifests.get_mut(&canonical_root) {
-                entry.prepared = prepared;
-                entry.identity = identity;
-                entry.inserted_at = inserted_at;
-            }
-            return;
-        }
-        if let Some(previous) = state.repository_manifests.remove(&canonical_root) {
-            state.repository_manifest_bytes = state
-                .repository_manifest_bytes
-                .saturating_sub(previous.prepared.canonical_byte_count());
-        }
-        while state.repository_manifests.len() >= REPOSITORY_MANIFEST_CACHE_MAX_ENTRIES
-            || state.repository_manifest_bytes.saturating_add(byte_count)
-                > REPOSITORY_MANIFEST_CACHE_MAX_BYTES
-        {
-            let Some(eviction_key) = state
-                .repository_manifests
-                .iter()
-                .min_by_key(|(_, entry)| entry.inserted_at)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some(evicted) = state.repository_manifests.remove(&eviction_key) {
-                state.repository_manifest_bytes = state
-                    .repository_manifest_bytes
-                    .saturating_sub(evicted.prepared.canonical_byte_count());
-            }
-        }
-        state.repository_manifest_insert_serial =
-            state.repository_manifest_insert_serial.saturating_add(1);
-        let inserted_at = state.repository_manifest_insert_serial;
-        state.repository_manifest_bytes =
-            state.repository_manifest_bytes.saturating_add(byte_count);
-        state.repository_manifests.insert(
-            canonical_root,
-            RepositoryManifestCacheEntry {
-                prepared,
-                identity,
-                inserted_at,
-                _registration: registration.unwrap_or_default(),
-            },
-        );
-    }
-
     pub(crate) fn reliable_watcher_generation(&self) -> Option<u64> {
         self.watcher_reliable
             .load(Ordering::Acquire)
             .then(|| self.watcher_generation.load(Ordering::Acquire))
     }
 
-    fn source_freshness_snapshot(
-        &self,
-        paths: impl IntoIterator<Item = PathBuf>,
-    ) -> SourceFreshnessSnapshot {
-        self.source_freshness
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot(paths)
-    }
-
-    fn record_source_watcher_event(&self, event: FileWatcherEvent) {
-        let mut freshness = self
-            .source_freshness
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if event.rescan_required {
-            freshness.record_rescan();
-        } else {
-            freshness.record_paths(event.paths);
-        }
-    }
-
-    pub(crate) fn register_source_freshness_paths(
-        &self,
-        paths: impl IntoIterator<Item = PathBuf>,
-    ) -> Option<SourceFreshnessRegistration> {
-        let paths = paths.into_iter().collect::<Vec<_>>();
-        let watcher_generation = self.reliable_watcher_generation()?;
-        let host_mutation_generation = self.host_mutation_generation.load(Ordering::Acquire);
-        let freshness_before = self.source_freshness_snapshot(paths.iter().cloned());
-        let subscriber = self.watcher_subscriber.as_ref()?;
-        let registration = subscriber
-            .register_paths(
-                paths
-                    .iter()
-                    .cloned()
-                    .map(|path| WatchPath {
-                        path,
-                        recursive: false,
-                    })
-                    .collect(),
-            )
-            .ok()?;
-        let freshness = self.source_freshness_snapshot(paths);
-        if !self.watcher_reliable.load(Ordering::Acquire) || freshness != freshness_before {
-            return None;
-        }
-        Some(SourceFreshnessRegistration {
-            watcher_generation,
-            host_mutation_generation,
-            identity: source_freshness_identity(&freshness),
-            freshness,
-            registration: Arc::new(registration),
-        })
-    }
-
-    pub(crate) fn source_registration_is_current(
-        &self,
-        registration: &SourceFreshnessRegistration,
-    ) -> bool {
-        Arc::strong_count(&registration.registration) > 0
-            && self.watcher_reliable.load(Ordering::Acquire)
-            && self.source_freshness_snapshot(
-                registration
-                    .freshness
-                    .paths
-                    .iter()
-                    .map(|(path, _)| path.clone()),
-            ) == registration.freshness
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_final_manifest_work(&self, work: WorkspaceManifestWork) {
-        self.manifest_diagnostics.record_final(work);
-    }
-
-    pub(crate) async fn begin_repository_manifest_finalization(
+    pub(crate) fn begin_workspace_change_observation(
         &self,
         repo_root: &Path,
-    ) -> Option<RepositoryManifestFinalizationGuard> {
+    ) -> Option<WorkspaceChangeObservation> {
         let watcher_generation = self.reliable_watcher_generation()?;
         let host_mutation_generation = self.host_mutation_generation.load(Ordering::Acquire);
-        let canonical_root = std::fs::canonicalize(repo_root).ok()?;
-        let registration = self.register_repository_manifest_dependencies(&canonical_root)?;
-        let git_signature = repository_manifest_git_signature(repo_root).await?;
+        let registration = self
+            .watcher_subscriber
+            .as_ref()?
+            .register_paths(vec![WatchPath {
+                path: repo_root.to_path_buf(),
+                recursive: true,
+            }])
+            .ok()?;
         if self.reliable_watcher_generation() != Some(watcher_generation)
             || self.host_mutation_generation.load(Ordering::Acquire) != host_mutation_generation
-            || !repository_manifest_dependencies_match(&registration.dependencies)
         {
             return None;
         }
-        Some(RepositoryManifestFinalizationGuard {
-            canonical_root,
+        Some(WorkspaceChangeObservation {
             watcher_generation,
-            watcher_registration_id: registration.registration_id,
             host_mutation_generation,
-            dependencies: registration.dependencies,
-            git_signature,
-            registration: registration.registration,
+            _registration: registration,
         })
+    }
+
+    pub(crate) fn workspace_change_observation_is_current(
+        &self,
+        observation: &WorkspaceChangeObservation,
+    ) -> bool {
+        self.reliable_watcher_generation() == Some(observation.watcher_generation)
+            && self.host_mutation_generation.load(Ordering::Acquire)
+                == observation.host_mutation_generation
     }
 
     pub(crate) fn note_host_workspace_mutation(&self) {
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
-        self.source_freshness
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_rescan();
+        self.watcher_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn note_host_workspace_mutation_paths(
         &self,
-        repo_root: &Path,
-        changed_paths: &[String],
+        _repo_root: &Path,
+        _changed_paths: &[String],
     ) {
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
-        self.source_freshness
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_paths(changed_paths.iter().map(|path| repo_root.join(path)));
+        self.watcher_generation.fetch_add(1, Ordering::AcqRel);
     }
-
-    pub(crate) async fn publish_final_repository_manifest(
-        &self,
-        store: &dyn AgentTaskStore,
-        repo_root: &Path,
-        prepared: PreparedWorkspaceManifest,
-        guard: RepositoryManifestFinalizationGuard,
-        host_mutation_recorded: bool,
-    ) -> StoreResult<()> {
-        if prepared.receipt().paths() != [codex_agent_task_store::REPOSITORY_WIDE_PATH] {
-            return Ok(());
-        }
-        let Ok(canonical_root) = std::fs::canonicalize(repo_root) else {
-            return Ok(());
-        };
-        let overlay_paths_before = store.workspace_manifest_overlay_paths(repo_root).await?;
-        let overlay_files = overlay_paths_before
-            .as_deref()
-            .and_then(|paths| repository_overlay_file_identities(&canonical_root, paths));
-        let overlay_paths_after = store.workspace_manifest_overlay_paths(repo_root).await?;
-        let git_signature = repository_manifest_git_signature(repo_root).await;
-        let dependencies = refresh_repository_manifest_dependencies(&guard.dependencies);
-        let epoch = store.workspace_mutation_epoch(repo_root).await?;
-        if canonical_root != guard.canonical_root
-            || epoch != Some(prepared.receipt().epoch())
-            || self.reliable_watcher_generation() != Some(guard.watcher_generation)
-            || self.host_mutation_generation.load(Ordering::Acquire)
-                != guard
-                    .host_mutation_generation
-                    .saturating_add(u64::from(host_mutation_recorded))
-            || dependencies.as_ref() != Some(&guard.dependencies)
-            || git_signature != Some(guard.git_signature)
-            || overlay_paths_after != overlay_paths_before
-        {
-            return Ok(());
-        }
-        let (Some(overlay_paths), Some(overlay_files)) = (overlay_paths_before, overlay_files)
-        else {
-            return Ok(());
-        };
-        if manifest_entry_paths(&prepared) != overlay_paths {
-            return Ok(());
-        }
-        let host_mutation_generation = self.host_mutation_generation.load(Ordering::Acquire);
-        let prepared = prepared.with_dependency_identity(repository_manifest_dependency_identity(
-            &guard.dependencies,
-            &guard.git_signature,
-            &overlay_paths,
-            &overlay_files,
-        ));
-        let identity = WorkspaceManifestReuseIdentity {
-            repository_id: prepared.receipt().repository_id().to_string(),
-            workspace_id: prepared.receipt().workspace_id().to_string(),
-            scope: prepared.receipt().paths().to_vec(),
-            workspace_epoch: prepared.receipt().epoch(),
-            host_mutation_generation,
-            watcher_registration_id: guard.watcher_registration_id,
-            watcher_generation: guard.watcher_generation,
-            dependencies: guard.dependencies,
-            git_signature: guard.git_signature,
-            overlay_paths,
-            overlay_files,
-        };
-        self.replace_repository_manifest_entry(
-            canonical_root,
-            prepared,
-            identity,
-            Some(guard.registration),
-        )
-        .await;
-        Ok(())
-    }
-
-    fn register_repository_manifest_dependencies(
-        &self,
-        repo_root: &Path,
-    ) -> Option<RepositoryManifestRegistration> {
-        let subscriber = self.watcher_subscriber.as_ref()?;
-        let absolute_root = AbsolutePathBuf::from_absolute_path(repo_root).ok()?;
-        let (git_dir, common_dir, head_ref) = resolve_git_dirs(&absolute_root)?;
-        let mut dependency_paths = vec![
-            git_dir.join("index"),
-            git_dir.join("HEAD"),
-            git_dir.join("commondir"),
-            git_dir.join("config.worktree"),
-            git_dir.join("info").join("exclude"),
-            common_dir.join("config"),
-            common_dir.join("packed-refs"),
-            common_dir.join("reftable").join("tables.list"),
-            common_dir.join("shallow"),
-            common_dir.join("info").join("exclude"),
-        ];
-        if let Some(head_ref) = head_ref {
-            dependency_paths.push(common_dir.join(head_ref));
-        }
-        if let Ok(executable) = which::which("git") {
-            let executable = executable.canonicalize().unwrap_or(executable);
-            if let Some(install_root) = executable.parent().and_then(Path::parent) {
-                dependency_paths.push(install_root.join("etc").join("gitconfig"));
-            }
-            dependency_paths.push(executable);
-        }
-        for home_var in ["USERPROFILE", "HOME"] {
-            if let Some(home) = std::env::var_os(home_var) {
-                dependency_paths.push(PathBuf::from(home).join(".gitconfig"));
-            }
-        }
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            dependency_paths.push(PathBuf::from(xdg).join("git").join("config"));
-        }
-        if let Some(program_data) = std::env::var_os("PROGRAMDATA") {
-            dependency_paths.push(PathBuf::from(program_data).join("Git").join("config"));
-        }
-        if cfg!(unix) {
-            dependency_paths.push(PathBuf::from("/etc/gitconfig"));
-        }
-        dependency_paths.sort_unstable();
-        dependency_paths.dedup();
-        let dependencies = dependency_paths
-            .iter()
-            .cloned()
-            .map(|path| dependency_fingerprint(path, false))
-            .collect::<Option<Vec<_>>>()?;
-        if dependencies
-            .iter()
-            .any(|dependency| !dependency.has_stable_file_identity())
-        {
-            return None;
-        }
-        let mut paths = vec![WatchPath {
-            path: repo_root.to_path_buf(),
-            recursive: true,
-        }];
-        paths.extend(dependency_paths.into_iter().map(|path| WatchPath {
-            path,
-            recursive: false,
-        }));
-        match subscriber.register_paths(paths) {
-            Ok(registration) => Some(RepositoryManifestRegistration {
-                dependencies,
-                registration_id: self
-                    .watcher_registration_serial
-                    .fetch_add(1, Ordering::AcqRel)
-                    .saturating_add(1),
-                registration,
-            }),
-            Err(error) => {
-                warn!(%error, "repository manifest reuse disabled after watch registration failed");
-                self.watcher_reliable.store(false, Ordering::Release);
-                self.watcher_generation.fetch_add(1, Ordering::AcqRel);
-                None
-            }
-        }
-    }
-}
-
-fn repository_manifest_dependencies_match(expected: &[DependencyFingerprint]) -> bool {
-    refresh_repository_manifest_dependencies(expected).as_deref() == Some(expected)
-}
-
-fn normalize_source_freshness_path(path: &Path) -> PathBuf {
-    let normalized = normalize_for_path_comparison(path).unwrap_or_else(|_| path.to_path_buf());
-    #[cfg(windows)]
-    {
-        PathBuf::from(normalized.to_string_lossy().to_lowercase())
-    }
-    #[cfg(not(windows))]
-    normalized
-}
-
-fn source_freshness_identity(snapshot: &SourceFreshnessSnapshot) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"kd4-source-freshness-v1\0");
-    digest.update(snapshot.rescan_generation.to_le_bytes());
-    for (path, generation) in &snapshot.paths {
-        let path = path.to_string_lossy();
-        digest.update((path.len() as u64).to_le_bytes());
-        digest.update(path.as_bytes());
-        digest.update(generation.to_le_bytes());
-    }
-    format!("{:x}", digest.finalize())
-}
-
-fn refresh_repository_manifest_dependencies(
-    expected: &[DependencyFingerprint],
-) -> Option<Vec<DependencyFingerprint>> {
-    expected
-        .iter()
-        .map(|dependency| dependency_fingerprint(dependency.path.clone(), false))
-        .collect()
-}
-
-async fn repository_manifest_git_signature(repo_root: &Path) -> Option<[u8; 32]> {
-    let executable = which::which("git").ok()?;
-    let executable = executable.canonicalize().unwrap_or(executable);
-    let (config, head) = tokio::join!(
-        git_config_signature(&executable, repo_root),
-        get_head_commit_hash(repo_root)
-    );
-    let mut digest = Sha256::new();
-    digest.update(b"kd4-repository-manifest-git-identity-v1\0");
-    digest.update(config?);
-    digest.update(head?.0.as_bytes());
-    Some(digest.finalize().into())
-}
-
-fn repository_overlay_file_identities(
-    root: &Path,
-    paths: &[String],
-) -> Option<Vec<DependencyFingerprint>> {
-    paths
-        .iter()
-        .map(|path| dependency_fingerprint(root.join(path), false))
-        .collect::<Option<Vec<_>>>()
-        .filter(|items| {
-            items
-                .iter()
-                .all(DependencyFingerprint::has_stable_file_identity)
-        })
-}
-
-fn changed_overlay_paths(
-    before_paths: &[String],
-    before_files: &[DependencyFingerprint],
-    after_paths: &[String],
-    after_files: &[DependencyFingerprint],
-) -> Vec<String> {
-    let before = before_paths
-        .iter()
-        .cloned()
-        .zip(before_files.iter())
-        .collect::<BTreeMap<_, _>>();
-    let after = after_paths
-        .iter()
-        .cloned()
-        .zip(after_files.iter())
-        .collect::<BTreeMap<_, _>>();
-    before
-        .keys()
-        .chain(after.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|path| before.get(path) != after.get(path))
-        .collect()
-}
-fn manifest_entry_paths(prepared: &PreparedWorkspaceManifest) -> Vec<String> {
-    prepared
-        .receipt()
-        .entries()
-        .iter()
-        .map(|entry| entry.path.clone())
-        .collect()
-}
-fn repository_manifest_dependency_identity(
-    dependencies: &[DependencyFingerprint],
-    git_signature: &[u8; 32],
-    paths: &[String],
-    files: &[DependencyFingerprint],
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"kd4-repository-manifest-reuse-identity-v1\0");
-    digest.update(format!("{dependencies:?}").as_bytes());
-    digest.update(git_signature);
-    for (path, file) in paths.iter().zip(files) {
-        digest.update(path.as_bytes());
-        digest.update([0]);
-        digest.update(format!("{file:?}").as_bytes());
-    }
-    format!("{:x}", digest.finalize())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1795,19 +877,6 @@ fn root_dependencies(
 struct DependencyFingerprint {
     path: PathBuf,
     state: DependencyState,
-}
-
-impl DependencyFingerprint {
-    fn has_stable_file_identity(&self) -> bool {
-        matches!(
-            self.state,
-            DependencyState::Missing
-                | DependencyState::File {
-                    stable_id: Some(_),
-                    ..
-                }
-        )
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

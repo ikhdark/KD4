@@ -3,8 +3,6 @@
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnTiming;
-use codex_protocol::protocol::TurnTimingAttemptKind;
-use codex_protocol::protocol::TurnTimingGenerationReason;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -26,13 +24,6 @@ fn function_call_output_ids(input: &[Value]) -> Vec<&str> {
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
         .filter_map(|item| item.get("call_id").and_then(Value::as_str))
         .collect()
-}
-
-fn estimate_prepared_model_input_tokens(input: &[Value]) -> usize {
-    serde_json::to_vec(input)
-        .expect("serialize prepared model input")
-        .len()
-        .div_ceil(4)
 }
 
 async fn turn_complete(test: &core_test_support::test_codex::TestCodex) -> TurnCompleteEvent {
@@ -87,201 +78,6 @@ fn print_timing_breakdown(workflow: &str, baseline_requests: u32, timing: &TurnT
         timing.counters.tool_call_count,
         timing.unions.model_stream_wait_union_ns,
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn discovery_batches_known_reads_into_three_model_requests() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let baseline_server = start_mock_server().await;
-    let baseline_responses = mount_sse_sequence(
-        &baseline_server,
-        vec![
-            sse(vec![
-                ev_response_created("discover"),
-                ev_function_call("locate", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_completed("discover"),
-            ]),
-            sse(vec![
-                ev_response_created("read-owner"),
-                ev_function_call("read-owner", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_completed("read-owner"),
-            ]),
-            sse(vec![
-                ev_response_created("read-test"),
-                ev_function_call("read-test", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_completed("read-test"),
-            ]),
-            sse(vec![
-                ev_response_created("read-contract"),
-                ev_function_call("read-contract", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_completed("read-contract"),
-            ]),
-            sse(vec![
-                ev_assistant_message("done", "done"),
-                ev_completed("complete"),
-            ]),
-        ],
-    )
-    .await;
-    let baseline_test = test_codex()
-        .with_model("test-gpt-5.1-codex")
-        .build(&baseline_server)
-        .await?;
-
-    baseline_test
-        .submit_turn("discover, then read the exact independent spans")
-        .await?;
-    let baseline_completion = turn_complete(&baseline_test).await;
-
-    let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("discover"),
-                ev_function_call("locate", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_completed("discover"),
-            ]),
-            sse(vec![
-                ev_response_created("read"),
-                ev_function_call("read-owner", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_function_call("read-test", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_function_call("read-contract", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_completed("read"),
-            ]),
-            sse(vec![
-                ev_assistant_message("done", "done"),
-                ev_completed("complete"),
-            ]),
-        ],
-    )
-    .await;
-    let test = test_codex()
-        .with_model("test-gpt-5.1-codex")
-        .build(&server)
-        .await?;
-
-    test.submit_turn("discover, then read the exact independent spans")
-        .await?;
-    let completion = turn_complete(&test).await;
-
-    let bundle_server = start_mock_server().await;
-    let bundle_responses = mount_sse_sequence(
-        &bundle_server,
-        vec![
-            sse(vec![
-                ev_response_created("owner-bundle"),
-                ev_function_call("owner-bundle", "test_sync_tool", EMPTY_TEST_TOOL_ARGS),
-                ev_completed("owner-bundle"),
-            ]),
-            sse(vec![
-                ev_assistant_message("done", "done"),
-                ev_completed("complete"),
-            ]),
-        ],
-    )
-    .await;
-    let bundle_test = test_codex()
-        .with_model("test-gpt-5.1-codex")
-        .build(&bundle_server)
-        .await?;
-    bundle_test
-        .submit_turn("discover with one owner evidence bundle")
-        .await?;
-    let bundle_completion = turn_complete(&bundle_test).await;
-
-    let baseline_requests = baseline_responses.requests();
-    let requests = responses.requests();
-    assert_eq!(
-        baseline_completion.last_agent_message.as_deref(),
-        completion.last_agent_message.as_deref()
-    );
-    assert_eq!(
-        baseline_completion.last_agent_message.as_deref(),
-        bundle_completion.last_agent_message.as_deref()
-    );
-    let baseline_timing = baseline_completion.timing.expect("baseline turn timing");
-    let timing = completion.timing.expect("turn timing");
-    let bundle_timing = bundle_completion.timing.expect("bundle turn timing");
-    assert_timing_reconciles(&baseline_timing);
-    assert_timing_reconciles(&timing);
-    assert_timing_reconciles(&bundle_timing);
-    let counters = &timing.counters;
-    let serial_request_count = baseline_timing.counters.logical_generation_count;
-    assert_eq!(serial_request_count, 5);
-    assert_eq!(baseline_timing.counters.generations_by_reason.initial, 1);
-    assert_eq!(
-        baseline_timing
-            .counters
-            .generations_by_reason
-            .tool_continuation,
-        4
-    );
-    assert_eq!(baseline_timing.counters.tool_call_count, 4);
-    assert_eq!(counters.model_request_count, 3);
-    assert_eq!(counters.logical_generation_count, 3);
-    assert_eq!(counters.generations_by_reason.initial, 1);
-    assert_eq!(counters.generations_by_reason.tool_continuation, 2);
-    assert_eq!(counters.attempts_by_kind.primary, 3);
-    assert!(counters.model_request_count < serial_request_count);
-    assert_eq!(counters.tool_call_count, 4);
-    assert_eq!(bundle_timing.counters.logical_generation_count, 2);
-    assert_eq!(bundle_timing.counters.model_request_count, 2);
-    assert_eq!(bundle_timing.counters.tool_call_count, 1);
-    assert_eq!(
-        timing
-            .model_requests
-            .iter()
-            .map(|request| request.generation_reason)
-            .collect::<Vec<_>>(),
-        [
-            TurnTimingGenerationReason::Initial,
-            TurnTimingGenerationReason::ToolContinuation,
-            TurnTimingGenerationReason::ToolContinuation,
-        ]
-    );
-    assert_eq!(
-        timing
-            .model_requests
-            .iter()
-            .map(|request| request.attempt_kind)
-            .collect::<Vec<_>>(),
-        [TurnTimingAttemptKind::Primary; 3]
-    );
-    assert_eq!(
-        timing
-            .model_requests
-            .iter()
-            .map(|request| request.tool_call_count)
-            .collect::<Vec<_>>(),
-        [1, 3, 0]
-    );
-    assert_eq!(requests.len(), counters.model_request_count as usize);
-    assert_eq!(function_call_output_ids(&requests[1].input()), ["locate"]);
-    assert_eq!(
-        function_call_output_ids(&requests[2].input()),
-        ["locate", "read-owner", "read-test", "read-contract"]
-    );
-    assert_eq!(baseline_requests.len(), 5);
-    assert_eq!(
-        function_call_output_ids(&baseline_requests[4].input()),
-        function_call_output_ids(&requests[2].input())
-    );
-    let bundle_requests = bundle_responses.requests();
-    assert_eq!(bundle_requests.len(), 2);
-    assert_eq!(
-        function_call_output_ids(&bundle_requests[1].input()),
-        ["owner-bundle"]
-    );
-    let serial_final_tokens = estimate_prepared_model_input_tokens(&baseline_requests[4].input());
-    let batched_final_tokens = estimate_prepared_model_input_tokens(&requests[2].input());
-    let bundle_final_tokens = estimate_prepared_model_input_tokens(&bundle_requests[1].input());
-    assert_eq!(serial_final_tokens, batched_final_tokens);
-    assert!(bundle_final_tokens < batched_final_tokens);
-    print_timing_breakdown("independent_reads", serial_request_count, &timing);
-
-    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -480,7 +276,6 @@ fn orchestrator_prompt_preserves_only_substantive_model_boundaries() {
     let prompt = include_str!("../templates/agents/orchestrator.md");
 
     for required_guidance in [
-        "start with `locate_task`",
         "request them together",
         "default to available parallel tool",
         "validation commands and read-only Git inspection",
