@@ -944,6 +944,7 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
                         answers: vec!["Yes (Recommended)".to_string()],
                     },
                 )]),
+                interrupted: false,
             },
         })
         .await?;

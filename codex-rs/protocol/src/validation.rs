@@ -28,12 +28,14 @@ pub struct ValidationProofKey {
 #[ts(rename_all = "snake_case", export_to = "v2/")]
 pub enum ValidationTerminalStatus {
     Succeeded,
+    #[serde(
+        alias = "timed_out",
+        alias = "cancelled",
+        alias = "infrastructure_failure",
+        alias = "admission_rejected"
+    )]
     Failed,
-    TimedOut,
-    Cancelled,
     Superseded,
-    InfrastructureFailure,
-    AdmissionRejected,
 }
 
 impl ValidationTerminalStatus {
@@ -79,4 +81,41 @@ pub struct ValidationResult {
     #[ts(optional)]
     pub raw_artifact_sha256: Option<String>,
     pub freshness: ValidationFreshness,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ValidationTerminalStatus;
+
+    #[test]
+    fn terminal_status_wire_contract_is_exact_and_historical_failures_are_readable() {
+        let statuses = [
+            ValidationTerminalStatus::Succeeded,
+            ValidationTerminalStatus::Failed,
+            ValidationTerminalStatus::Superseded,
+        ];
+        assert_eq!(
+            statuses
+                .into_iter()
+                .map(|status| serde_json::to_value(status).expect("status serialization"))
+                .collect::<Vec<_>>(),
+            vec![
+                serde_json::json!("succeeded"),
+                serde_json::json!("failed"),
+                serde_json::json!("superseded"),
+            ]
+        );
+        for historical in [
+            "timed_out",
+            "cancelled",
+            "infrastructure_failure",
+            "admission_rejected",
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ValidationTerminalStatus>(serde_json::json!(historical))
+                    .expect("historical persisted failure status"),
+                ValidationTerminalStatus::Failed
+            );
+        }
+    }
 }

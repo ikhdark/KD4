@@ -1,5 +1,6 @@
 use crate::context::PromptProvenanceSidecar;
 use crate::stable_context::StableContextManifest;
+use crate::tool_history::ToolHistorySubstitution;
 pub use codex_api::ResponseEvent;
 use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
@@ -25,6 +26,21 @@ pub struct Prompt {
     /// Complete normalized input retained for fail-open dispatch if a
     /// transport cannot establish a fresh non-inheriting provider baseline.
     pub(crate) stable_context_fallback_input: Arc<[ResponseItem]>,
+
+    /// Same stable-context projection as `input`, but with completed-tool
+    /// receipts left as their previously exposed bounded outputs.
+    pub(crate) tool_history_fallback_input: Arc<[ResponseItem]>,
+
+    /// Fully fail-open input: stable context is restored and completed-tool
+    /// receipts remain unreplaced.
+    pub(crate) stable_context_tool_history_fallback_input: Arc<[ResponseItem]>,
+
+    /// Receipt substitutions applied to `input`. This metadata is never sent
+    /// to a provider; it gates provider-prefix invalidation.
+    pub(crate) tool_history_substitutions: Arc<[ToolHistorySubstitution]>,
+
+    /// Receipt substitutions applied to `stable_context_fallback_input`.
+    pub(crate) stable_context_fallback_tool_history_substitutions: Arc<[ToolHistorySubstitution]>,
 
     /// Internal-only context identity and accounting sidecar. This field is
     /// never serialized into a provider request.
@@ -54,6 +70,10 @@ impl Default for Prompt {
         Self {
             input: Arc::from([]),
             stable_context_fallback_input: Arc::from([]),
+            tool_history_fallback_input: Arc::from([]),
+            stable_context_tool_history_fallback_input: Arc::from([]),
+            tool_history_substitutions: Arc::from([]),
+            stable_context_fallback_tool_history_substitutions: Arc::from([]),
             stable_context_manifest: StableContextManifest::default(),
             prompt_provenance: PromptProvenanceSidecar::default(),
             tools: Vec::new(),
@@ -90,6 +110,33 @@ impl Prompt {
             strip_image_details(Arc::make_mut(&mut input));
         }
         input
+    }
+
+    pub(crate) fn get_formatted_tool_history_fallback_input_for_request(
+        &self,
+        use_responses_lite: bool,
+        use_stable_context_fallback: bool,
+    ) -> Arc<[ResponseItem]> {
+        let mut input = if use_stable_context_fallback {
+            Arc::clone(&self.stable_context_tool_history_fallback_input)
+        } else {
+            Arc::clone(&self.tool_history_fallback_input)
+        };
+        if use_responses_lite && has_image_details(&input) {
+            strip_image_details(Arc::make_mut(&mut input));
+        }
+        input
+    }
+
+    pub(crate) fn tool_history_substitutions_for_request(
+        &self,
+        use_stable_context_fallback: bool,
+    ) -> &[ToolHistorySubstitution] {
+        if use_stable_context_fallback {
+            &self.stable_context_fallback_tool_history_substitutions
+        } else {
+            &self.tool_history_substitutions
+        }
     }
 }
 
@@ -164,9 +211,22 @@ fn strip_image_details(items: &mut [ResponseItem]) {
 
 pub struct ResponseStream {
     pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+    pub(crate) attempt_identity: Option<ResponseAttemptIdentity>,
     /// Signals the mapper task that the consumer stopped polling before the
     /// provider stream reached its own terminal event.
     pub(crate) consumer_dropped: CancellationToken,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResponseAttemptIdentity {
+    pub(crate) sampling_request_id: String,
+    pub(crate) physical_attempt_id: String,
+}
+
+impl ResponseStream {
+    pub(crate) fn attempt_identity(&self) -> Option<&ResponseAttemptIdentity> {
+        self.attempt_identity.as_ref()
+    }
 }
 
 impl Stream for ResponseStream {

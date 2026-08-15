@@ -8,13 +8,17 @@ use codex_git_utils::RepositoryContext;
 use codex_git_utils::discover_repository_context;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
+use codex_protocol::persisted_thread_settings::PersistedThreadSettings;
+use codex_protocol::persisted_thread_settings::PersistedThreadSettingsReducer;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::strip_user_message_prefix;
 use codex_protocol::protocol::user_message_preview;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::CreateThreadParams;
 use crate::GitInfoPatch;
@@ -34,6 +38,7 @@ pub(crate) struct ThreadMetadataSync {
     preview_seen: bool,
     first_user_message_seen: bool,
     title_seen: bool,
+    settings_reducer: PersistedThreadSettingsReducer,
     pending_update: Option<ThreadMetadataPatch>,
     pending_update_generation: u64,
     last_touch_persisted_at: Option<Instant>,
@@ -89,6 +94,7 @@ impl ThreadMetadataSync {
             preview_seen: false,
             first_user_message_seen: false,
             title_seen: false,
+            settings_reducer: settings_reducer_from_persistence_metadata(&params.metadata),
             pending_update: Some(update),
             pending_update_generation: 1,
             last_touch_persisted_at: None,
@@ -108,6 +114,7 @@ impl ThreadMetadataSync {
             preview_seen: false,
             first_user_message_seen: false,
             title_seen: false,
+            settings_reducer: settings_reducer_from_persistence_metadata(&params.metadata),
             pending_update: None,
             pending_update_generation: 0,
             last_touch_persisted_at: None,
@@ -214,6 +221,19 @@ impl ThreadMetadataSync {
             return None;
         }
         for item in items {
+            let previous_settings = self.settings_reducer.settings().clone();
+            if !matches!(
+                item,
+                RolloutItem::SessionMeta(meta_line) if meta_line.meta.id != self.thread_id
+            ) {
+                self.settings_reducer.apply_item(item);
+            }
+            apply_persisted_settings_delta(
+                &previous_settings,
+                self.settings_reducer.settings(),
+                &mut update,
+                &mut self.cwd_seen,
+            );
             match item {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());
@@ -222,17 +242,8 @@ impl ThreadMetadataSync {
                     update.agent_nickname = Some(meta_line.meta.agent_nickname.clone());
                     update.agent_role = Some(meta_line.meta.agent_role.clone());
                     update.agent_path = Some(meta_line.meta.agent_path.clone());
-                    if let Some(model_provider) = meta_line.meta.model_provider.clone()
-                        && !model_provider.is_empty()
-                    {
-                        update.model_provider = Some(model_provider);
-                    }
                     if !meta_line.meta.cli_version.is_empty() {
                         update.cli_version = Some(meta_line.meta.cli_version.clone());
-                    }
-                    if !meta_line.meta.cwd.as_os_str().is_empty() {
-                        self.cwd_seen = true;
-                        update.cwd = Some(meta_line.meta.cwd.clone());
                     }
                     if let Some(git_info) = meta_line.git.clone() {
                         update.git_info = Some(git_info_patch_from_observation(git_info));
@@ -243,16 +254,7 @@ impl ThreadMetadataSync {
                         update.memory_mode = Some(memory_mode);
                     }
                 }
-                RolloutItem::TurnContext(turn_ctx) => {
-                    if !self.cwd_seen {
-                        self.cwd_seen = true;
-                        update.cwd = Some(turn_ctx.cwd.clone().into_path_buf());
-                    }
-                    update.model = Some(turn_ctx.model.clone());
-                    update.reasoning_effort = turn_ctx.effort.clone();
-                    update.approval_mode = Some(turn_ctx.approval_policy);
-                    update.permission_profile = Some(turn_ctx.permission_profile());
-                }
+                RolloutItem::TurnContext(_) => {}
                 RolloutItem::EventMsg(EventMsg::UserMessage(user)) => {
                     self.observe_user_message(user, &mut update);
                 }
@@ -280,6 +282,7 @@ impl ThreadMetadataSync {
                 }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ToolManifest(_)
+                | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::EventMsg(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
@@ -320,6 +323,61 @@ impl ThreadMetadataSync {
             None => self.pending_update = Some(update),
         }
         self.pending_update_generation = self.pending_update_generation.wrapping_add(1);
+    }
+}
+
+fn settings_reducer_from_persistence_metadata(
+    metadata: &crate::ThreadPersistenceMetadata,
+) -> PersistedThreadSettingsReducer {
+    let environments = metadata
+        .cwd
+        .as_ref()
+        .and_then(|cwd| AbsolutePathBuf::from_absolute_path(cwd).ok())
+        .map(|cwd| TurnEnvironmentSelections::new(cwd, Vec::new()));
+    PersistedThreadSettingsReducer::new(PersistedThreadSettings {
+        model_provider_id: (!metadata.model_provider.is_empty())
+            .then(|| metadata.model_provider.clone()),
+        environments,
+        ..Default::default()
+    })
+}
+
+fn apply_persisted_settings_delta(
+    previous: &PersistedThreadSettings,
+    current: &PersistedThreadSettings,
+    update: &mut ThreadMetadataPatch,
+    cwd_seen: &mut bool,
+) {
+    if previous.model_provider_id != current.model_provider_id
+        && let Some(model_provider_id) = current.model_provider_id.clone()
+    {
+        update.model_provider = Some(model_provider_id);
+    }
+    if previous.model != current.model
+        && let Some(model) = current.model.clone()
+    {
+        update.model = Some(model);
+    }
+    if previous.reasoning_effort != current.reasoning_effort
+        && let Some(reasoning_effort) = current.reasoning_effort.clone()
+    {
+        update.reasoning_effort = Some(reasoning_effort);
+    }
+    if previous.environments != current.environments
+        && let Some(environments) = current.environments.as_ref()
+    {
+        *cwd_seen = true;
+        update.cwd = Some(environments.legacy_fallback_cwd.to_path_buf());
+    }
+    if previous.approval_policy != current.approval_policy
+        && let Some(approval_policy) = current.approval_policy
+    {
+        update.approval_mode = Some(approval_policy);
+    }
+    if previous.permission_profile != current.permission_profile
+        && let Some(permission_profile) = current.permission_profile.clone()
+    {
+        update.permission_profile = Some(permission_profile);
     }
 }
 
@@ -384,7 +442,16 @@ fn git_info_patch_from_observation(git_info: GitInfo) -> GitInfoPatch {
 mod tests {
     use std::sync::Arc;
 
+    use codex_protocol::config_types::ApprovalsReviewer;
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::Personality;
+    use codex_protocol::config_types::ReasoningSummary;
+    use codex_protocol::config_types::Settings;
     use codex_protocol::items::UserMessageItem;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::SessionMeta;
@@ -393,6 +460,9 @@ mod tests {
     use codex_protocol::protocol::ThreadGoal;
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
+    use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+    use codex_protocol::protocol::ThreadSettingsSnapshot;
+    use codex_protocol::protocol::TurnEnvironmentSelections;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::UserInput;
@@ -435,6 +505,71 @@ mod tests {
 
         sync.mark_pending_update_applied(&update);
         assert!(sync.take_pending_update().is_none());
+    }
+
+    #[test]
+    fn settings_snapshot_updates_live_thread_read_metadata_projection() {
+        let thread_id = ThreadId::new();
+        let cwd = AbsolutePathBuf::from_absolute_path(
+            std::env::current_dir()
+                .expect("current directory")
+                .join("persisted-settings-cwd"),
+        )
+        .expect("absolute settings cwd");
+        let permission_profile = PermissionProfile::read_only();
+        let snapshot = ThreadSettingsSnapshot {
+            model: "persisted-model".to_string(),
+            model_provider_id: "persisted-provider".to_string(),
+            service_tier: Some(Some("flex".to_string())),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            permission_profile: permission_profile.clone(),
+            active_permission_profile: Some(None),
+            environments: Some(TurnEnvironmentSelections::new(cwd.clone(), Vec::new())),
+            workspace_roots: Some(vec![cwd.clone()]),
+            profile_workspace_roots: Some(Vec::new()),
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            cwd: cwd.clone(),
+            reasoning_effort: Some(Some(ReasoningEffort::High)),
+            reasoning_summary: Some(Some(ReasoningSummary::Detailed)),
+            personality: Some(Some(Personality::Pragmatic)),
+            collaboration_mode: CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: "persisted-model".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    developer_instructions: None,
+                },
+            },
+        };
+        let sync = ThreadMetadataSync::for_resume(&resume_params(
+            thread_id,
+            vec![
+                RolloutItem::SessionMeta(session_meta(thread_id)),
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+                    ThreadSettingsAppliedEvent {
+                        thread_settings: snapshot,
+                    },
+                )),
+            ],
+        ));
+
+        let update = sync
+            .take_pending_update()
+            .expect("settings metadata update");
+        assert_eq!(update.patch.model.as_deref(), Some("persisted-model"));
+        assert_eq!(
+            update.patch.model_provider.as_deref(),
+            Some("persisted-provider")
+        );
+        assert_eq!(
+            update.patch.reasoning_effort,
+            Some(Some(ReasoningEffort::High))
+        );
+        assert_eq!(update.patch.cwd, Some(cwd.into_path_buf()));
+        assert_eq!(update.patch.approval_mode, Some(AskForApproval::Never));
+        assert_eq!(update.patch.permission_profile, Some(permission_profile));
     }
 
     #[test]

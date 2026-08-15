@@ -553,6 +553,7 @@ async fn mcp_tool_call_metadata_records_prior_request_user_input_tool() -> Resul
                         answers: vec!["Yes (Recommended)".to_string()],
                     },
                 )]),
+                interrupted: false,
             },
         })
         .await?;

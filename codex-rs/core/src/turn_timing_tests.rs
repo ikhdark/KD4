@@ -20,7 +20,6 @@ use codex_protocol::protocol::TurnTimingGenerationDisposition;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::TurnTimingGenerationReason;
 use codex_protocol::protocol::TurnTimingProgressKind;
-use codex_protocol::protocol::TurnTimingProviderTokenUsage;
 use pretty_assertions::assert_eq;
 
 use super::ClockSample;
@@ -94,6 +93,37 @@ fn legacy_turn_timing_deserializes_with_empty_terminalization_phases() {
 
     let restored: TurnTiming = serde_json::from_value(legacy).expect("legacy timing");
     assert_eq!(restored.terminalization, Default::default());
+}
+
+#[test]
+fn schema_ten_planning_digest_fields_are_ignored_on_deserialization() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(1);
+    state.mark_model_request_dispatched();
+    clock.set_ms(2);
+    let _ =
+        state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("x".to_string()));
+
+    let mut legacy = serde_json::to_value(state.complete_snapshot().protocol_timing())
+        .expect("serialize timing");
+    legacy["schemaVersion"] = serde_json::json!(10);
+    legacy["counters"]["planningRepeatedDigestCount"] = serde_json::json!(2);
+    legacy["preFirstModelOutput"]["planningIdentityNs"] = serde_json::json!(17);
+
+    let restored: TurnTiming = serde_json::from_value(legacy).expect("schema ten timing");
+    assert_eq!(restored.schema_version, 10);
+    let reserialized = serde_json::to_value(restored).expect("reserialize timing");
+    assert!(
+        reserialized["counters"]
+            .get("planningRepeatedDigestCount")
+            .is_none()
+    );
+    assert!(
+        reserialized["preFirstModelOutput"]
+            .get("planningIdentityNs")
+            .is_none()
+    );
 }
 
 #[test]
@@ -405,7 +435,7 @@ fn model_requests_record_dispatch_output_completion_and_continuation() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 9);
+    assert_eq!(timing.schema_version, 11);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(30));
@@ -460,7 +490,7 @@ fn post_discovery_usage_counts_result_cells_and_only_emits_a_ratio_with_usage() 
 }
 
 #[test]
-fn physical_usage_and_diagnostic_accounting_keep_proof_separate_from_nonprogress() {
+fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     let (_clock, state) = timing();
     state.mark_turn_started();
     let mut pending = None;
@@ -468,7 +498,7 @@ fn physical_usage_and_diagnostic_accounting_keep_proof_separate_from_nonprogress
         &mut pending,
         &SessionSource::Cli,
         Some(TurnTimingGenerationPurpose::Wait),
-        true,
+        TurnTimingGenerationDisposition::Deterministic,
         Some("trusted-state".to_string()),
     );
     drop(state.begin_model_request_wait());
@@ -480,11 +510,6 @@ fn physical_usage_and_diagnostic_accounting_keep_proof_separate_from_nonprogress
         total_tokens: 110,
     }));
     state.record_generation_outcome(Vec::new(), false, true);
-    state.record_owner_proved_predetermined_generation(
-        "receipt-identity".to_string(),
-        "trusted-state",
-    );
-
     let timing = state.complete_snapshot().protocol_timing();
     let usage = timing.model_requests[0]
         .token_usage
@@ -495,7 +520,6 @@ fn physical_usage_and_diagnostic_accounting_keep_proof_separate_from_nonprogress
     assert_eq!(usage.visible_output_tokens, 6);
     assert_eq!(usage.reasoning_tokens, 4);
     assert_eq!(usage.total_tokens, 110);
-    assert!(!timing.model_requests[0].decision_bearing);
     assert_eq!(
         timing.model_requests[0].disposition,
         TurnTimingGenerationDisposition::Deterministic
@@ -503,12 +527,12 @@ fn physical_usage_and_diagnostic_accounting_keep_proof_separate_from_nonprogress
     assert!(timing.model_requests[0].unchanged_relevant_state);
     assert!(!timing.model_requests[0].next_structured_action_changed);
 
-    assert_eq!(timing.provably_avoidable_tokens.logical_generations, 1);
-    assert_eq!(timing.provably_avoidable_tokens.input_tokens, 100);
-    assert_eq!(timing.provably_avoidable_tokens.cached_input_tokens, 20);
-    assert_eq!(timing.provably_avoidable_tokens.visible_output_tokens, 0);
-    assert_eq!(timing.provably_avoidable_tokens.reasoning_tokens, 0);
-    assert_eq!(timing.provably_avoidable_tokens.total_tokens, 0);
+    assert_eq!(timing.counters.generations_by_disposition.deterministic, 1);
+    assert_eq!(
+        timing.counters.generations_by_disposition.decision_bearing,
+        0
+    );
+    assert_eq!(timing.counters.generations_by_disposition.unknown, 0);
 
     assert_eq!(
         timing.observational_nonprogress_tokens.logical_generations,
@@ -530,44 +554,126 @@ fn physical_usage_and_diagnostic_accounting_keep_proof_separate_from_nonprogress
 }
 
 #[test]
+fn typed_generation_dispositions_drive_exact_started_counts() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+
+    for disposition in [
+        TurnTimingGenerationDisposition::Unknown,
+        TurnTimingGenerationDisposition::DecisionBearing,
+        TurnTimingGenerationDisposition::Deterministic,
+    ] {
+        let mut pending = None;
+        state.begin_model_generation_with_metadata(
+            &mut pending,
+            &SessionSource::Cli,
+            Some(TurnTimingGenerationPurpose::InitialReasoning),
+            disposition,
+            None,
+        );
+        drop(state.begin_model_request_wait());
+    }
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(
+        timing
+            .model_requests
+            .iter()
+            .map(|request| request.disposition)
+            .collect::<Vec<_>>(),
+        vec![
+            TurnTimingGenerationDisposition::Unknown,
+            TurnTimingGenerationDisposition::DecisionBearing,
+            TurnTimingGenerationDisposition::Deterministic,
+        ]
+    );
+    assert_eq!(timing.counters.generations_by_disposition.unknown, 1);
+    assert_eq!(
+        timing.counters.generations_by_disposition.decision_bearing,
+        1
+    );
+    assert_eq!(timing.counters.generations_by_disposition.deterministic, 1);
+    assert_eq!(
+        timing.counters.suppressed_deterministic_continuation_count,
+        0
+    );
+}
+
+#[test]
+fn accepted_batched_receipt_counts_suppressed_boundaries_without_starting_generations() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let receipt = TurnTimingDeterministicContinuationReceipt {
+        class: DeterministicContinuationClass::UnchangedWait,
+        wire_identity: String::new(),
+        resource_identity_hash: "batched-resource".to_string(),
+        state_revision: "revision".to_string(),
+        host_action: DeterministicContinuationHostAction::AwaitStateChange,
+        action_bounds_hash: "batched-bounds".to_string(),
+        suppressed_continuation_count: 7,
+    };
+    state.record_accepted_deterministic_continuation_receipts(&[receipt]);
+    state.record_accepted_deterministic_continuation_receipts(&[
+        TurnTimingDeterministicContinuationReceipt {
+            suppressed_continuation_count: 0,
+            resource_identity_hash: "zero-resource".to_string(),
+            state_revision: "revision".to_string(),
+            action_bounds_hash: "zero-bounds".to_string(),
+            ..Default::default()
+        },
+        TurnTimingDeterministicContinuationReceipt {
+            suppressed_continuation_count: 3,
+            ..Default::default()
+        },
+    ]);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.suppressed_deterministic_continuation_count, 7);
+    assert_eq!(counters.logical_generation_count, 0);
+    assert_eq!(counters.generations_by_disposition, Default::default());
+}
+
+#[test]
+fn internally_drained_agent_event_pages_do_not_start_model_generations() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+
+    state.record_internally_drained_waits(5);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.internally_drained_wait_count, 5);
+    assert_eq!(counters.logical_generation_count, 0);
+    assert_eq!(counters.generations_by_disposition, Default::default());
+}
+
+#[test]
 fn continuation_receipts_aggregate_saturate_and_bound_distinct_groups() {
     let (_clock, state) = timing();
     state.mark_turn_started();
     let receipt = TurnTimingDeterministicContinuationReceipt {
         class: DeterministicContinuationClass::UnchangedWait,
+        wire_identity: String::new(),
         resource_identity_hash: "hashed-resource".to_string(),
         state_revision: "revision".to_string(),
         host_action: DeterministicContinuationHostAction::AwaitStateChange,
+        action_bounds_hash: "bounds".to_string(),
         suppressed_continuation_count: u32::MAX,
-        avoided_token_usage: Some(TurnTimingProviderTokenUsage {
-            input_tokens: u64::MAX,
-            cached_input_tokens: 2,
-            visible_output_tokens: 3,
-            reasoning_tokens: 4,
-            total_tokens: 5,
-        }),
     };
-    state.record_deterministic_continuation_receipts(std::slice::from_ref(&receipt));
+    state.record_accepted_deterministic_continuation_receipts(std::slice::from_ref(&receipt));
     let mut additional = receipt;
     additional.suppressed_continuation_count = 1;
-    additional.avoided_token_usage = Some(TurnTimingProviderTokenUsage {
-        input_tokens: 1,
-        cached_input_tokens: 3,
-        visible_output_tokens: 4,
-        reasoning_tokens: 5,
-        total_tokens: 6,
-    });
-    state.record_deterministic_continuation_receipts(&[additional]);
+    state.record_accepted_deterministic_continuation_receipts(&[additional]);
 
     for index in 0..64 {
-        state.record_deterministic_continuation_receipts(&[
+        state.record_accepted_deterministic_continuation_receipts(&[
             TurnTimingDeterministicContinuationReceipt {
                 class: DeterministicContinuationClass::SourceCoverage,
+                wire_identity: String::new(),
                 resource_identity_hash: format!("resource-{index}"),
                 state_revision: "revision".to_string(),
                 host_action: DeterministicContinuationHostAction::ReuseCoveredSpan,
+                action_bounds_hash: format!("bounds-{index}"),
                 suppressed_continuation_count: 1,
-                avoided_token_usage: None,
             },
         ]);
     }
@@ -575,107 +681,20 @@ fn continuation_receipts_aggregate_saturate_and_bound_distinct_groups() {
     let timing = state.complete_snapshot().protocol_timing();
     assert_eq!(timing.deterministic_continuation_receipts.len(), 64);
     assert_eq!(timing.deterministic_continuation_receipt_overflow, 1);
+    assert_eq!(
+        timing.counters.suppressed_deterministic_continuation_count,
+        u32::MAX
+    );
+    assert_eq!(
+        timing.counters.generations_by_disposition,
+        Default::default()
+    );
     let aggregated = timing
         .deterministic_continuation_receipts
         .iter()
         .find(|candidate| candidate.resource_identity_hash == "hashed-resource")
         .expect("aggregated receipt");
     assert_eq!(aggregated.suppressed_continuation_count, u32::MAX);
-    assert_eq!(
-        aggregated.avoided_token_usage,
-        Some(TurnTimingProviderTokenUsage {
-            input_tokens: u64::MAX,
-            cached_input_tokens: 5,
-            visible_output_tokens: 7,
-            reasoning_tokens: 9,
-            total_tokens: 11,
-        })
-    );
-}
-
-#[test]
-fn paired_existing_and_host_managed_fixture_reports_exact_elimination() {
-    fn fixture(host_managed: bool) -> TurnTiming {
-        let (_clock, state) = timing();
-        state.mark_turn_started();
-        let mut pending = None;
-        state.begin_model_generation_with_metadata(
-            &mut pending,
-            &SessionSource::Cli,
-            Some(TurnTimingGenerationPurpose::InitialReasoning),
-            true,
-            Some("state-1".to_string()),
-        );
-        drop(state.begin_model_request_wait());
-        state.record_generation_token_usage(Some(&TokenUsage {
-            input_tokens: 80,
-            cached_input_tokens: 10,
-            output_tokens: 8,
-            reasoning_output_tokens: 3,
-            total_tokens: 88,
-        }));
-        state.record_generation_outcome(
-            vec![TurnTimingProgressKind::StructuredActionChange],
-            true,
-            false,
-        );
-
-        if host_managed {
-            state.record_deterministic_continuation_receipts(&[
-                TurnTimingDeterministicContinuationReceipt {
-                    class: DeterministicContinuationClass::UnchangedWait,
-                    resource_identity_hash: "paired-resource".to_string(),
-                    state_revision: "state-1".to_string(),
-                    host_action: DeterministicContinuationHostAction::AwaitStateChange,
-                    suppressed_continuation_count: 1,
-                    avoided_token_usage: Some(TurnTimingProviderTokenUsage {
-                        input_tokens: 120,
-                        cached_input_tokens: 30,
-                        visible_output_tokens: 5,
-                        reasoning_tokens: 5,
-                        total_tokens: 130,
-                    }),
-                },
-            ]);
-        } else {
-            let mut pending = Some(ContinuationCause::ToolResult);
-            state.begin_model_generation_with_metadata(
-                &mut pending,
-                &SessionSource::Cli,
-                Some(TurnTimingGenerationPurpose::Wait),
-                false,
-                Some("state-1".to_string()),
-            );
-            drop(state.begin_model_request_wait());
-            state.record_generation_token_usage(Some(&TokenUsage {
-                input_tokens: 120,
-                cached_input_tokens: 30,
-                output_tokens: 10,
-                reasoning_output_tokens: 5,
-                total_tokens: 130,
-            }));
-            state.record_generation_outcome(Vec::new(), false, true);
-        }
-        state.complete_snapshot().protocol_timing()
-    }
-
-    let existing = fixture(false);
-    let host_managed = fixture(true);
-    assert_eq!(existing.counters.logical_generation_count, 2);
-    assert_eq!(existing.counters.model_request_count, 2);
-    assert_eq!(host_managed.counters.logical_generation_count, 1);
-    assert_eq!(host_managed.counters.model_request_count, 1);
-    assert_eq!(existing.model_requests.len(), 2);
-    assert_eq!(host_managed.model_requests.len(), 1);
-    let avoided = host_managed.deterministic_continuation_receipts[0]
-        .avoided_token_usage
-        .as_ref()
-        .expect("paired counterfactual usage");
-    assert_eq!(avoided.input_tokens, 120);
-    assert_eq!(avoided.cached_input_tokens, 30);
-    assert_eq!(avoided.visible_output_tokens, 5);
-    assert_eq!(avoided.reasoning_tokens, 5);
-    assert_eq!(avoided.total_tokens, 130);
 }
 
 #[test]
@@ -690,23 +709,19 @@ fn controlled_final_proof_fixture_reports_request_and_token_reduction() {
             &mut pending,
             &SessionSource::Cli,
             Some(purpose),
-            true,
+            TurnTimingGenerationDisposition::DecisionBearing,
             Some(format!("final-proof-{purpose:?}")),
         );
         drop(state.begin_model_request_wait());
         state.record_generation_token_usage(Some(&usage));
-        state.record_generation_outcome(
-            vec![TurnTimingProgressKind::StructuredActionChange],
-            true,
-            false,
-        );
+        state.record_generation_outcome(Vec::new(), true, false);
     }
 
     let (_clock, legacy) = timing();
     legacy.mark_turn_started();
     record_request(
         &legacy,
-        TurnTimingGenerationPurpose::ValidationSelection,
+        TurnTimingGenerationPurpose::ImplementationDecision,
         TokenUsage {
             input_tokens: 300,
             cached_input_tokens: 100,
@@ -794,7 +809,7 @@ fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
     let (_clock, state) = timing();
     state.mark_turn_started();
     for (index, purpose) in [
-        TurnTimingGenerationPurpose::ValidationSelection,
+        TurnTimingGenerationPurpose::ImplementationDecision,
         TurnTimingGenerationPurpose::FailureDiagnosis,
         TurnTimingGenerationPurpose::Repair,
         TurnTimingGenerationPurpose::ValidationInterpretation,
@@ -811,7 +826,7 @@ fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
             &mut pending,
             &SessionSource::Cli,
             Some(purpose),
-            true,
+            TurnTimingGenerationDisposition::DecisionBearing,
             Some(format!("decision-state-{index}")),
         );
         drop(state.begin_model_request_wait());
@@ -829,21 +844,9 @@ fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
     let timing = state.complete_snapshot().protocol_timing();
     assert_eq!(timing.counters.logical_generation_count, 4);
     assert_eq!(timing.model_requests.len(), 4);
-    assert!(
-        timing
-            .model_requests
-            .iter()
-            .all(|request| request.decision_bearing)
-    );
     assert!(timing.model_requests.iter().all(|request| {
         request.disposition == TurnTimingGenerationDisposition::DecisionBearing
     }));
-    assert!(
-        timing
-            .model_requests
-            .iter()
-            .all(|request| request.owner_proved_predetermined_continuation.is_none())
-    );
     assert_eq!(
         timing
             .model_requests
@@ -851,7 +854,7 @@ fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
             .map(|request| request.generation_purpose)
             .collect::<Vec<_>>(),
         vec![
-            Some(TurnTimingGenerationPurpose::ValidationSelection),
+            Some(TurnTimingGenerationPurpose::ImplementationDecision),
             Some(TurnTimingGenerationPurpose::FailureDiagnosis),
             Some(TurnTimingGenerationPurpose::Repair),
             Some(TurnTimingGenerationPurpose::ValidationInterpretation),
@@ -912,7 +915,9 @@ fn pre_edit_convergence_records_fake_clock_milestones_and_bounded_counters() {
     clock.set_ms(20);
     state.record_pre_edit_implementation_ready();
     state.record_pre_edit_material_evidence();
-    state.record_pre_edit_broad_discovery_after_ready();
+    state.record_source_discovery(SourceDiscoveryTimingEvent::PostClosureSearch {
+        has_question: false,
+    });
     state.record_pre_edit_reopen(PreEditReopenReason::IncompleteEvidence);
 
     let mut pending = Some(ContinuationCause::ToolResult);
@@ -1042,11 +1047,17 @@ fn logical_generations_are_classified_by_workflow_purpose() {
 }
 
 #[test]
-fn attempts_reconcile_and_stream_wait_is_attributed_without_inflating_generations() {
+fn deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating_generations() {
     let (clock, state) = timing();
     state.mark_turn_started();
     let mut pending = None;
-    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+    state.begin_model_generation_with_metadata(
+        &mut pending,
+        &SessionSource::Cli,
+        Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning),
+        TurnTimingGenerationDisposition::Deterministic,
+        Some("terminal-state".to_string()),
+    );
 
     let primary = state.begin_model_request_wait();
     clock.set_ms(10);
@@ -1067,6 +1078,7 @@ fn attempts_reconcile_and_stream_wait_is_attributed_without_inflating_generation
 
     let timing = state.complete_snapshot().protocol_timing();
     assert_eq!(timing.counters.logical_generation_count, 1);
+    assert_eq!(timing.counters.generations_by_disposition.deterministic, 1);
     assert_eq!(timing.counters.model_request_count, 3);
     assert_eq!(timing.counters.attempts_by_kind.primary, 1);
     assert_eq!(timing.counters.attempts_by_kind.retry, 1);
@@ -1104,10 +1116,15 @@ fn attempts_reconcile_and_stream_wait_is_attributed_without_inflating_generation
     assert_eq!(timing.model_requests[0].tool_call_count, 2);
     assert_eq!(timing.model_requests[1].tool_call_count, 0);
     assert_eq!(timing.model_requests[2].tool_call_count, 0);
+    assert!(
+        timing.model_requests.iter().all(|request| {
+            request.disposition == TurnTimingGenerationDisposition::Deterministic
+        })
+    );
 }
 
 #[test]
-fn repeated_wait_uses_exact_purpose_and_legacy_post_edit_counters_stay_zero() {
+fn repeated_wait_uses_exact_purpose() {
     let (_clock, state) = timing();
     state.mark_turn_started();
 
@@ -1117,7 +1134,7 @@ fn repeated_wait_uses_exact_purpose_and_legacy_post_edit_counters_stay_zero() {
             &mut pending,
             &SessionSource::Cli,
             Some(TurnTimingGenerationPurpose::Wait),
-            true,
+            TurnTimingGenerationDisposition::DecisionBearing,
             Some(fingerprint.to_string()),
         );
         drop(state.begin_model_request_wait());
@@ -1128,7 +1145,7 @@ fn repeated_wait_uses_exact_purpose_and_legacy_post_edit_counters_stay_zero() {
         &mut pending,
         &SessionSource::Cli,
         Some(TurnTimingGenerationPurpose::ImplementationDecision),
-        true,
+        TurnTimingGenerationDisposition::DecisionBearing,
         Some("candidate-a".to_string()),
     );
     drop(state.begin_model_request_wait());
@@ -1138,15 +1155,13 @@ fn repeated_wait_uses_exact_purpose_and_legacy_post_edit_counters_stay_zero() {
         &mut pending,
         &SessionSource::Cli,
         Some(TurnTimingGenerationPurpose::Repair),
-        true,
+        TurnTimingGenerationDisposition::DecisionBearing,
         Some("repair-a".to_string()),
     );
     drop(state.begin_model_request_wait());
 
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.exact_repeated_wait_count, 1);
-    assert_eq!(counters.post_edit_candidate_count, 0);
-    assert_eq!(counters.post_edit_inspection_count, 0);
 }
 
 #[test]
@@ -1194,7 +1209,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 9);
+    assert_eq!(profile.schema_version, 11);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -1266,7 +1281,7 @@ fn parallel_latency_counters_are_additive() {
     let (_clock, state) = timing();
 
     state.record_wait_only_generation();
-    state.record_internally_drained_wait();
+    state.record_internally_drained_waits(7);
     state.record_repeated_discovery_call();
     state.record_discovery_after_owner_resolution();
     state.record_no_progress_directive();
@@ -1276,7 +1291,7 @@ fn parallel_latency_counters_are_additive() {
     state.record_tool_output_projection_facts(1_000, 250, 400, 100, true, true, 3);
     state.record_tool_output_projection_facts(500, 125, 200, 50, false, false, 1);
     state.record_tool_output_artifact_reread();
-    state.record_tool_output_recovery();
+    state.record_tool_output_recovery(2);
     state.record_search_index(true);
     state.record_search_index(false);
     state.record_strict_subset_source_reread();
@@ -1284,7 +1299,8 @@ fn parallel_latency_counters_are_additive() {
 
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.wait_only_generation_count, 1);
-    assert_eq!(counters.internally_drained_wait_count, 1);
+    assert_eq!(counters.internally_drained_wait_count, 7);
+    assert_eq!(counters.suppressed_deterministic_continuation_count, 0);
     assert_eq!(counters.suppressed_repeated_dispatch_count, 0);
     assert_eq!(counters.repeated_discovery_call_count, 1);
     assert_eq!(counters.discovery_after_owner_resolution_count, 1);
@@ -1301,7 +1317,7 @@ fn parallel_latency_counters_are_additive() {
     assert_eq!(counters.tool_output_projection_truncation_count, 1);
     assert_eq!(counters.tool_output_omitted_section_count, 4);
     assert_eq!(counters.tool_output_recovery_call_count, 1);
-    assert_eq!(counters.tool_output_recovery_retruncation_count, 0);
+    assert_eq!(counters.tool_output_recovery_retruncation_count, 2);
     assert_eq!(counters.tool_output_recursive_spill_count, 0);
     assert_eq!(counters.strict_subset_source_reread_count, 1);
     assert_eq!(counters.complete_search_index_count, 1);
@@ -1392,8 +1408,8 @@ fn planning_counters_are_deterministic_and_additive() {
     let (_clock, state) = timing();
     state.record_initial_plan_generation();
     state.record_plan_revision_generation();
-    state.record_planning_fixed_point_iteration(false);
-    state.record_planning_fixed_point_iteration(true);
+    state.record_planning_fixed_point_iteration();
+    state.record_planning_fixed_point_iteration();
     state.record_planning_invalidation();
     state.record_planning_semantic_effect();
     state.record_planning_failure();
@@ -1402,7 +1418,6 @@ fn planning_counters_are_deterministic_and_additive() {
     assert_eq!(counters.planning_generation_count, 1);
     assert_eq!(counters.plan_revision_generation_count, 1);
     assert_eq!(counters.planning_fixed_point_iteration_count, 2);
-    assert_eq!(counters.planning_repeated_digest_count, 1);
     assert_eq!(counters.planning_invalidation_count, 1);
     assert_eq!(counters.planning_semantic_effect_count, 1);
     assert_eq!(counters.planning_failure_count, 1);

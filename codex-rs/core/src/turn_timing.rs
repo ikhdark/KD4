@@ -47,7 +47,7 @@ use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 9;
+const TIMING_SCHEMA_VERSION: u16 = 11;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,10 +294,6 @@ impl TurnTimingSnapshot {
                         &mut saturation_count,
                     ),
                     normalization_ns: public_ns(timing.normalization_ns, &mut saturation_count),
-                    planning_identity_ns: public_ns(
-                        timing.planning_identity_ns,
-                        &mut saturation_count,
-                    ),
                     prompt_construction_ns: public_ns(
                         timing.prompt_construction_ns,
                         &mut saturation_count,
@@ -371,14 +367,10 @@ impl TurnTimingSnapshot {
                 generation_reason: request.generation_reason,
                 generation_purpose: request.generation_purpose,
                 disposition: request.disposition,
-                decision_bearing: request.decision_bearing,
                 relevant_state_fingerprint: request.relevant_state_fingerprint.clone(),
                 progress_kinds: request.progress_kinds.clone(),
                 next_structured_action_changed: request.next_structured_action_changed,
                 unchanged_relevant_state: request.unchanged_relevant_state,
-                owner_proved_predetermined_continuation: request
-                    .owner_proved_predetermined_continuation
-                    .clone(),
                 attempt_kind: request.attempt_kind,
                 is_continuation: request.is_continuation,
                 model_stream_wait_ns: public_ns(
@@ -401,23 +393,12 @@ impl TurnTimingSnapshot {
                     .map(|value| public_ms(value, &mut saturation_count)),
             })
             .collect();
-        let provably_avoidable_tokens = diagnostic_token_aggregate(
-            &profile.model_requests,
-            |request| request.owner_proved_predetermined_continuation.is_some(),
-            /*input_only*/ true,
-        );
         let observational_nonprogress_tokens = diagnostic_token_aggregate(
             &profile.model_requests,
             |request| request.unchanged_relevant_state && !request.next_structured_action_changed,
             /*input_only*/ false,
         );
         let purpose_aggregates = purpose_aggregates(&profile.model_requests, &mut saturation_count);
-        // These legacy counters remain in the wire format for compatibility.
-        // The exact generation-purpose contract no longer exposes a separate
-        // post-edit purpose; new work is classified as implementation,
-        // validation interpretation, failure diagnosis, or repair.
-        let post_edit_inspection_count = 0;
-        let post_edit_candidate_count = 0;
         let exact_repeated_wait_count = exact_repeated_wait_count(&profile.model_requests);
         let failure_diagnosis_count = primary_generation_count(
             &profile.model_requests,
@@ -433,7 +414,10 @@ impl TurnTimingSnapshot {
             logical_generation_count: profile.counters.logical_generation_count,
             generations_by_reason: profile.counters.generations_by_reason.clone(),
             generations_by_purpose: profile.counters.generations_by_purpose.clone(),
-            continuations_by_disposition: profile.counters.continuations_by_disposition.clone(),
+            generations_by_disposition: profile.counters.generations_by_disposition.clone(),
+            suppressed_deterministic_continuation_count: profile
+                .counters
+                .suppressed_deterministic_continuation_count,
             purpose_aggregates,
             same_purpose_continuation_count: profile.counters.same_purpose_continuation_count,
             exact_repeated_wait_count,
@@ -443,11 +427,8 @@ impl TurnTimingSnapshot {
                 .counters
                 .planning_fixed_point_iteration_count,
             planning_invalidation_count: profile.counters.planning_invalidation_count,
-            planning_repeated_digest_count: profile.counters.planning_repeated_digest_count,
             planning_semantic_effect_count: profile.counters.planning_semantic_effect_count,
             planning_failure_count: profile.counters.planning_failure_count,
-            post_edit_candidate_count,
-            post_edit_inspection_count,
             failure_signature_count,
             failure_diagnosis_count,
             attempts_by_kind: profile.counters.attempts_by_kind.clone(),
@@ -517,9 +498,8 @@ impl TurnTimingSnapshot {
             local,
             milestones,
             counters,
-            terminalization: TurnTimingTerminalization::default(),
+            terminalization: profile.terminalization.clone(),
             model_requests,
-            provably_avoidable_tokens,
             observational_nonprogress_tokens,
             deterministic_continuation_receipts: profile
                 .deterministic_continuation_receipts
@@ -552,6 +532,7 @@ pub(crate) struct TurnTimingProfile {
     pub(crate) deterministic_continuation_receipt_overflow: u32,
     pub(crate) pre_first_model_output: Option<PreFirstModelOutputTiming>,
     pub(crate) pre_edit_convergence: Option<PreEditConvergenceTiming>,
+    pub(crate) terminalization: TurnTimingTerminalization,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -560,12 +541,10 @@ pub(crate) struct ModelRequestTiming {
     generation_reason: TurnTimingGenerationReason,
     generation_purpose: Option<TurnTimingGenerationPurpose>,
     disposition: TurnTimingGenerationDisposition,
-    decision_bearing: bool,
     relevant_state_fingerprint: Option<String>,
     progress_kinds: Vec<TurnTimingProgressKind>,
     next_structured_action_changed: bool,
     unchanged_relevant_state: bool,
-    owner_proved_predetermined_continuation: Option<String>,
     attempt_kind: TurnTimingAttemptKind,
     model_stream_wait_ns: u128,
     tool_call_count: u32,
@@ -588,7 +567,6 @@ pub(crate) struct PreFirstModelOutputTiming {
     unattributed_pre_output_ns: u128,
     history_snapshot_ns: u128,
     normalization_ns: u128,
-    planning_identity_ns: u128,
     prompt_construction_ns: u128,
     request_transformation_ns: u128,
     serialization_ns: u128,
@@ -628,7 +606,6 @@ struct PreEditReopenReasonCounts {
 struct ClientCriticalPhaseTiming {
     history_snapshot_ns: u128,
     normalization_ns: u128,
-    planning_identity_ns: u128,
     prompt_construction_ns: u128,
     request_transformation_ns: u128,
     serialization_ns: u128,
@@ -717,14 +694,14 @@ pub(crate) struct TimingCounters {
     pub(crate) logical_generation_count: u32,
     pub(crate) generations_by_reason: TurnTimingGenerationReasonCounts,
     pub(crate) generations_by_purpose: TurnTimingGenerationPurposeCounts,
-    pub(crate) continuations_by_disposition: TurnTimingGenerationDispositionCounts,
+    pub(crate) generations_by_disposition: TurnTimingGenerationDispositionCounts,
+    pub(crate) suppressed_deterministic_continuation_count: u32,
     pub(crate) same_purpose_continuation_count: u32,
     pub(crate) exact_repeated_wait_count: u32,
     pub(crate) planning_generation_count: u32,
     pub(crate) plan_revision_generation_count: u32,
     pub(crate) planning_fixed_point_iteration_count: u32,
     pub(crate) planning_invalidation_count: u32,
-    pub(crate) planning_repeated_digest_count: u32,
     pub(crate) planning_semantic_effect_count: u32,
     pub(crate) planning_failure_count: u32,
     pub(crate) attempts_by_kind: TurnTimingAttemptKindCounts,
@@ -822,7 +799,6 @@ struct TurnTimingStateInner {
     current_generation_reason: TurnTimingGenerationReason,
     current_generation_purpose: Option<TurnTimingGenerationPurpose>,
     current_generation_disposition: TurnTimingGenerationDisposition,
-    current_generation_decision_bearing: bool,
     current_relevant_state_fingerprint: Option<String>,
     next_attempt_kind: TurnTimingAttemptKind,
     legacy: LegacyProfileState,
@@ -832,6 +808,7 @@ struct TurnTimingStateInner {
     dispatch_ready_snapshot: Option<(u128, u128, ClientCriticalPhaseTiming)>,
     pre_first_model_output: Option<PreFirstModelOutputTiming>,
     pre_edit_convergence: Option<PreEditConvergenceTiming>,
+    terminalization: TurnTimingTerminalization,
     tool_output_projection_pending_continuation: bool,
     deterministic_continuation_receipts:
         BTreeMap<String, TurnTimingDeterministicContinuationReceipt>,
@@ -855,7 +832,6 @@ struct ActiveSet {
     planning: u32,
     history_snapshot: u32,
     normalization: u32,
-    planning_identity: u32,
     prompt_construction: u32,
     request_transformation: u32,
     compaction: u32,
@@ -965,7 +941,6 @@ pub(crate) enum TurnLocalPhase {
     Planning,
     HistorySnapshot,
     Normalization,
-    PlanningIdentity,
     PromptConstruction,
     RequestTransformation,
     Compaction,
@@ -1053,7 +1028,7 @@ impl TurnTimingState {
             pending,
             session_source,
             Some(TurnTimingGenerationPurpose::InitialReasoning),
-            true,
+            TurnTimingGenerationDisposition::DecisionBearing,
             None,
         );
     }
@@ -1063,7 +1038,7 @@ impl TurnTimingState {
         pending: &mut Option<ContinuationCause>,
         session_source: &SessionSource,
         purpose: Option<TurnTimingGenerationPurpose>,
-        decision_bearing: bool,
+        disposition: TurnTimingGenerationDisposition,
         relevant_state_fingerprint: Option<String>,
     ) {
         let sample = self.clock.sample();
@@ -1105,12 +1080,7 @@ impl TurnTimingState {
             }
             _ => TurnTimingGenerationReason::Other,
         };
-        state.start_generation(
-            reason,
-            purpose,
-            decision_bearing,
-            relevant_state_fingerprint,
-        );
+        state.start_generation(reason, purpose, disposition, relevant_state_fingerprint);
     }
 
     pub(crate) fn begin_compaction_generation(&self) {
@@ -1120,7 +1090,7 @@ impl TurnTimingState {
         state.start_generation(
             TurnTimingGenerationReason::Compaction,
             Some(TurnTimingGenerationPurpose::CompactionRecovery),
-            true,
+            TurnTimingGenerationDisposition::DecisionBearing,
             None,
         );
     }
@@ -1158,18 +1128,12 @@ impl TurnTimingState {
             .saturating_add(1);
     }
 
-    pub(crate) fn record_planning_fixed_point_iteration(&self, repeated_digest: bool) {
+    pub(crate) fn record_planning_fixed_point_iteration(&self) {
         let mut state = self.state();
         state.counters.planning_fixed_point_iteration_count = state
             .counters
             .planning_fixed_point_iteration_count
             .saturating_add(1);
-        if repeated_digest {
-            state.counters.planning_repeated_digest_count = state
-                .counters
-                .planning_repeated_digest_count
-                .saturating_add(1);
-        }
     }
 
     pub(crate) fn record_planning_invalidation(&self) {
@@ -1268,7 +1232,6 @@ impl TurnTimingState {
         timing.material_evidence_operations = timing.material_evidence_operations.saturating_add(1);
     }
 
-    #[cfg(test)]
     pub(crate) fn record_pre_edit_broad_discovery_after_ready(&self) {
         let mut state = self.state();
         let timing = state.pre_edit_convergence.get_or_insert_default();
@@ -1299,18 +1262,15 @@ impl TurnTimingState {
             state.counters.wait_only_generation_count.saturating_add(1);
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_internally_drained_wait(&self) {
+    pub(crate) fn record_internally_drained_waits(&self, count: u32) {
+        if count == 0 {
+            return;
+        }
         let mut state = self.state();
         state.counters.internally_drained_wait_count = state
             .counters
             .internally_drained_wait_count
-            .saturating_add(1);
-        state.counters.continuations_by_disposition.owner_drained = state
-            .counters
-            .continuations_by_disposition
-            .owner_drained
-            .saturating_add(1);
+            .saturating_add(count);
     }
 
     pub(crate) fn record_generation_outcome(
@@ -1386,46 +1346,30 @@ impl TurnTimingState {
             state.pending_discovery_result_cells.saturating_add(1);
     }
 
-    pub(crate) fn record_deterministic_continuation_receipts(
+    pub(crate) fn record_accepted_deterministic_continuation_receipts(
         &self,
-        receipts: &[TurnTimingDeterministicContinuationReceipt],
+        accepted_receipts: &[TurnTimingDeterministicContinuationReceipt],
     ) {
         let mut state = self.state();
-        for receipt in receipts {
-            if receipt.suppressed_continuation_count == 0 {
+        for receipt in accepted_receipts {
+            if receipt.suppressed_continuation_count == 0
+                || receipt.resource_identity_hash.is_empty()
+                || receipt.state_revision.is_empty()
+                || receipt.action_bounds_hash.is_empty()
+            {
                 continue;
             }
-            let identity = receipt.identity();
+            state.counters.suppressed_deterministic_continuation_count = state
+                .counters
+                .suppressed_deterministic_continuation_count
+                .saturating_add(receipt.suppressed_continuation_count);
+            let Some(identity) = receipt.runtime_identity() else {
+                continue;
+            };
             if let Some(existing) = state.deterministic_continuation_receipts.get_mut(&identity) {
                 existing.suppressed_continuation_count = existing
                     .suppressed_continuation_count
                     .saturating_add(receipt.suppressed_continuation_count);
-                match (
-                    existing.avoided_token_usage.as_mut(),
-                    receipt.avoided_token_usage.as_ref(),
-                ) {
-                    (Some(existing), Some(additional)) => {
-                        existing.input_tokens = existing
-                            .input_tokens
-                            .saturating_add(additional.input_tokens);
-                        existing.cached_input_tokens = existing
-                            .cached_input_tokens
-                            .saturating_add(additional.cached_input_tokens);
-                        existing.visible_output_tokens = existing
-                            .visible_output_tokens
-                            .saturating_add(additional.visible_output_tokens);
-                        existing.reasoning_tokens = existing
-                            .reasoning_tokens
-                            .saturating_add(additional.reasoning_tokens);
-                        existing.total_tokens = existing
-                            .total_tokens
-                            .saturating_add(additional.total_tokens);
-                    }
-                    (None, Some(additional)) => {
-                        existing.avoided_token_usage = Some(additional.clone());
-                    }
-                    _ => {}
-                }
                 continue;
             }
             if state.deterministic_continuation_receipts.len()
@@ -1439,37 +1383,6 @@ impl TurnTimingState {
             state
                 .deterministic_continuation_receipts
                 .insert(identity, receipt.clone());
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_owner_proved_predetermined_generation(
-        &self,
-        receipt_identity: String,
-        trusted_state_revision: &str,
-    ) {
-        let mut state = self.state();
-        let Some(generation_index) = state.current_generation_index else {
-            return;
-        };
-        if let Some(request) = state.model_requests.iter_mut().find(|request| {
-            request.generation_index == generation_index
-                && request.attempt_kind == TurnTimingAttemptKind::Primary
-                && request.relevant_state_fingerprint.as_deref() == Some(trusted_state_revision)
-        }) {
-            request.owner_proved_predetermined_continuation = Some(receipt_identity);
-            request.decision_bearing = false;
-            request.disposition = TurnTimingGenerationDisposition::Deterministic;
-            state.counters.continuations_by_disposition.model_required = state
-                .counters
-                .continuations_by_disposition
-                .model_required
-                .saturating_sub(1);
-            state.counters.continuations_by_disposition.owner_drained = state
-                .counters
-                .continuations_by_disposition
-                .owner_drained
-                .saturating_add(1);
         }
     }
 
@@ -1499,6 +1412,15 @@ impl TurnTimingState {
 
     pub(crate) fn record_source_discovery(&self, event: SourceDiscoveryTimingEvent) {
         let mut state = self.state();
+        if matches!(event, SourceDiscoveryTimingEvent::PostClosureSearch { .. })
+            && state.pre_edit_convergence.as_ref().is_some_and(|timing| {
+                timing.implementation_ready.is_some() && timing.first_accepted_mutation.is_none()
+            })
+        {
+            let timing = state.pre_edit_convergence.get_or_insert_default();
+            timing.broad_discovery_after_ready =
+                timing.broad_discovery_after_ready.saturating_add(1);
+        }
         let operation = match event {
             SourceDiscoveryTimingEvent::Locator => Some(SourceDiscoveryOperationKind::Locator),
             SourceDiscoveryTimingEvent::Bundle { .. }
@@ -1713,12 +1635,82 @@ impl TurnTimingState {
             .saturating_add(omitted_sections);
     }
 
-    pub(crate) fn record_tool_output_recovery(&self) {
+    pub(crate) fn record_tool_output_recovery(&self, retruncation_count: u32) {
         let mut state = self.state();
         state.counters.tool_output_recovery_call_count = state
             .counters
             .tool_output_recovery_call_count
             .saturating_add(1);
+        state.counters.tool_output_recovery_retruncation_count = state
+            .counters
+            .tool_output_recovery_retruncation_count
+            .saturating_add(retruncation_count);
+    }
+
+    pub(crate) fn record_completion_review_preflight(&self, elapsed: Duration) {
+        let mut state = self.state();
+        state.terminalization.review_preflight_ns = state
+            .terminalization
+            .review_preflight_ns
+            .saturating_add(duration_to_u64_ns(elapsed));
+    }
+
+    pub(crate) fn record_completion_review(&self, elapsed: Duration) {
+        let mut state = self.state();
+        state.terminalization.review_ns = state
+            .terminalization
+            .review_ns
+            .saturating_add(duration_to_u64_ns(elapsed));
+    }
+
+    pub(crate) fn record_reviewer_infrastructure_memo_hit(&self) {
+        let mut state = self.state();
+        state.terminalization.reviewer_infrastructure_memo_hit_count = state
+            .terminalization
+            .reviewer_infrastructure_memo_hit_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_review_prevented_by_correctness(&self) {
+        let mut state = self.state();
+        state.terminalization.reviews_prevented_by_correctness_count = state
+            .terminalization
+            .reviews_prevented_by_correctness_count
+            .saturating_add(1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_final_proof_telemetry(
+        &self,
+        checkpoint_tokens: u64,
+        validation_launch_count: u32,
+        validation_process_ns: u64,
+        validation_aggregate_ns: u64,
+        validation_aggregate_count: u32,
+        proof_reuse_count: u32,
+        conservative_rerun_count: u32,
+        diff_reuse_count: u32,
+    ) {
+        let mut state = self.state();
+        let timing = &mut state.terminalization;
+        timing.checkpoint_tokens = timing.checkpoint_tokens.max(checkpoint_tokens);
+        timing.validation_launch_count = timing
+            .validation_launch_count
+            .saturating_add(validation_launch_count);
+        timing.validation_process_ns = timing
+            .validation_process_ns
+            .saturating_add(validation_process_ns);
+        timing.validation_aggregate_ns = timing
+            .validation_aggregate_ns
+            .saturating_add(validation_aggregate_ns);
+        timing.validation_aggregate_count = timing
+            .validation_aggregate_count
+            .saturating_add(validation_aggregate_count);
+        timing.proof_reuse_count = timing.proof_reuse_count.saturating_add(proof_reuse_count);
+        timing.conservative_rerun_count = timing
+            .conservative_rerun_count
+            .saturating_add(conservative_rerun_count);
+        timing.diff_reuse_count = timing.diff_reuse_count.saturating_add(diff_reuse_count);
     }
 
     pub(crate) fn record_search_index(&self, complete: bool) {
@@ -1770,7 +1762,7 @@ impl TurnTimingState {
                 state.start_generation(
                     TurnTimingGenerationReason::Other,
                     Some(TurnTimingGenerationPurpose::InitialReasoning),
-                    true,
+                    TurnTimingGenerationDisposition::DecisionBearing,
                     None,
                 );
             }
@@ -1779,7 +1771,6 @@ impl TurnTimingState {
             let generation_reason = state.current_generation_reason;
             let generation_purpose = state.current_generation_purpose;
             let disposition = state.current_generation_disposition;
-            let decision_bearing = state.current_generation_decision_bearing;
             let relevant_state_fingerprint = state.current_relevant_state_fingerprint.clone();
             let attempt_kind = std::mem::take(&mut state.next_attempt_kind);
             let post_discovery = if attempt_kind == TurnTimingAttemptKind::Primary
@@ -1802,7 +1793,6 @@ impl TurnTimingState {
                 generation_reason,
                 generation_purpose,
                 disposition,
-                decision_bearing,
                 relevant_state_fingerprint,
                 attempt_kind,
                 post_discovery,
@@ -1913,7 +1903,6 @@ impl TurnTimingState {
                         .saturating_sub(attributed_ns.min(dispatch_ready_ns)),
                     history_snapshot_ns: phases.history_snapshot_ns,
                     normalization_ns: phases.normalization_ns,
-                    planning_identity_ns: phases.planning_identity_ns,
                     prompt_construction_ns: phases.prompt_construction_ns,
                     request_transformation_ns: phases.request_transformation_ns,
                     serialization_ns: phases.serialization_ns,
@@ -2005,14 +1994,9 @@ impl TurnTimingStateInner {
         &mut self,
         reason: TurnTimingGenerationReason,
         purpose: Option<TurnTimingGenerationPurpose>,
-        decision_bearing: bool,
+        disposition: TurnTimingGenerationDisposition,
         relevant_state_fingerprint: Option<String>,
     ) {
-        let disposition = if decision_bearing {
-            TurnTimingGenerationDisposition::DecisionBearing
-        } else {
-            TurnTimingGenerationDisposition::Unknown
-        };
         let generation_index = self.counters.logical_generation_count;
         self.counters.logical_generation_count =
             self.counters.logical_generation_count.saturating_add(1);
@@ -2044,9 +2028,6 @@ impl TurnTimingStateInner {
                 TurnTimingGenerationPurpose::InitialReasoning => {
                     &mut self.counters.generations_by_purpose.initial_reasoning
                 }
-                TurnTimingGenerationPurpose::SourceDiscovery => {
-                    &mut self.counters.generations_by_purpose.source_discovery
-                }
                 TurnTimingGenerationPurpose::SourceEvidenceInterpretation => {
                     &mut self
                         .counters
@@ -2059,9 +2040,6 @@ impl TurnTimingStateInner {
                 TurnTimingGenerationPurpose::Wait => &mut self.counters.generations_by_purpose.wait,
                 TurnTimingGenerationPurpose::FailureDiagnosis => {
                     &mut self.counters.generations_by_purpose.failure_diagnosis
-                }
-                TurnTimingGenerationPurpose::ValidationSelection => {
-                    &mut self.counters.generations_by_purpose.validation_selection
                 }
                 TurnTimingGenerationPurpose::ValidationInterpretation => {
                     &mut self
@@ -2091,19 +2069,25 @@ impl TurnTimingStateInner {
             *purpose_count = purpose_count.saturating_add(1);
         }
         match disposition {
-            TurnTimingGenerationDisposition::Unknown
-            | TurnTimingGenerationDisposition::DecisionBearing => {
-                self.counters.continuations_by_disposition.model_required = self
+            TurnTimingGenerationDisposition::Unknown => {
+                self.counters.generations_by_disposition.unknown = self
                     .counters
-                    .continuations_by_disposition
-                    .model_required
+                    .generations_by_disposition
+                    .unknown
+                    .saturating_add(1);
+            }
+            TurnTimingGenerationDisposition::DecisionBearing => {
+                self.counters.generations_by_disposition.decision_bearing = self
+                    .counters
+                    .generations_by_disposition
+                    .decision_bearing
                     .saturating_add(1);
             }
             TurnTimingGenerationDisposition::Deterministic => {
-                self.counters.continuations_by_disposition.owner_drained = self
+                self.counters.generations_by_disposition.deterministic = self
                     .counters
-                    .continuations_by_disposition
-                    .owner_drained
+                    .generations_by_disposition
+                    .deterministic
                     .saturating_add(1);
             }
         }
@@ -2117,7 +2101,6 @@ impl TurnTimingStateInner {
         self.current_generation_reason = reason;
         self.current_generation_purpose = purpose;
         self.current_generation_disposition = disposition;
-        self.current_generation_decision_bearing = decision_bearing;
         self.current_relevant_state_fingerprint = relevant_state_fingerprint;
         self.next_attempt_kind = TurnTimingAttemptKind::Primary;
     }
@@ -2243,7 +2226,6 @@ impl TurnTimingStateInner {
         if self.dispatch_ready_snapshot.is_none()
             && (self.activity.history_snapshot > 0
                 || self.activity.normalization > 0
-                || self.activity.planning_identity > 0
                 || self.activity.prompt_construction > 0
                 || self.activity.request_transformation > 0
                 || self.activity.serialization > 0
@@ -2350,10 +2332,6 @@ impl TurnTimingStateInner {
             (active.history_snapshot > 0, &mut phases.history_snapshot_ns),
             (active.normalization > 0, &mut phases.normalization_ns),
             (
-                active.planning_identity > 0,
-                &mut phases.planning_identity_ns,
-            ),
-            (
                 active.prompt_construction > 0,
                 &mut phases.prompt_construction_ns,
             ),
@@ -2418,6 +2396,7 @@ impl TurnTimingStateInner {
                 .deterministic_continuation_receipt_overflow,
             pre_first_model_output: self.pre_first_model_output.clone(),
             pre_edit_convergence: self.pre_edit_convergence.clone(),
+            terminalization: self.terminalization.clone(),
         };
         let legacy_profile = self
             .legacy
@@ -2460,7 +2439,6 @@ impl TurnTimingStateInner {
             TurnLocalPhase::Planning => &mut self.activity.planning,
             TurnLocalPhase::HistorySnapshot => &mut self.activity.history_snapshot,
             TurnLocalPhase::Normalization => &mut self.activity.normalization,
-            TurnLocalPhase::PlanningIdentity => &mut self.activity.planning_identity,
             TurnLocalPhase::PromptConstruction => &mut self.activity.prompt_construction,
             TurnLocalPhase::RequestTransformation => &mut self.activity.request_transformation,
             TurnLocalPhase::Compaction => &mut self.activity.compaction,
@@ -2480,7 +2458,6 @@ impl TurnTimingStateInner {
             TurnLocalPhase::Planning => &mut self.activity.planning,
             TurnLocalPhase::HistorySnapshot => &mut self.activity.history_snapshot,
             TurnLocalPhase::Normalization => &mut self.activity.normalization,
-            TurnLocalPhase::PlanningIdentity => &mut self.activity.planning_identity,
             TurnLocalPhase::PromptConstruction => &mut self.activity.prompt_construction,
             TurnLocalPhase::RequestTransformation => &mut self.activity.request_transformation,
             TurnLocalPhase::Compaction => &mut self.activity.compaction,
@@ -2795,6 +2772,10 @@ fn duration_from_nanos(nanos: u128) -> Duration {
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
+fn duration_to_u64_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn u128_to_u64_ms(nanos: u128) -> u64 {
     u64::try_from(nanos / NANOS_PER_MILLISECOND).unwrap_or(u64::MAX)
 }
@@ -2864,14 +2845,12 @@ fn purpose_aggregates(
     requests: &[ModelRequestTiming],
     saturation_count: &mut u32,
 ) -> Vec<TurnTimingGenerationPurposeAggregate> {
-    const PURPOSES: [TurnTimingGenerationPurpose; 13] = [
+    const PURPOSES: [TurnTimingGenerationPurpose; 11] = [
         TurnTimingGenerationPurpose::InitialReasoning,
-        TurnTimingGenerationPurpose::SourceDiscovery,
         TurnTimingGenerationPurpose::SourceEvidenceInterpretation,
         TurnTimingGenerationPurpose::ImplementationDecision,
         TurnTimingGenerationPurpose::Wait,
         TurnTimingGenerationPurpose::FailureDiagnosis,
-        TurnTimingGenerationPurpose::ValidationSelection,
         TurnTimingGenerationPurpose::ValidationInterpretation,
         TurnTimingGenerationPurpose::Repair,
         TurnTimingGenerationPurpose::Coordination,

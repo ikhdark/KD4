@@ -25,6 +25,10 @@
     "InitializeCapabilities": {
       "description": "Client-declared capabilities negotiated during initialize.",
       "properties": {
+        "desktopActivationReceipts": {
+          "description": "Opt into the trusted Desktop activation obligation/challenge/receipt API.",
+          "type": "boolean"
+        },
         "experimentalApi": {
           "default": false,
           "description": "Opt into receiving experimental API methods and fields.",

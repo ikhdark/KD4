@@ -1,3 +1,5 @@
+use chrono::DateTime;
+use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
@@ -8,8 +10,10 @@ use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::plan_tool::ValidationRoute;
 use codex_protocol::plan_tool::ValidationRouteOrdering;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
+use codex_protocol::protocol::TurnTimingTerminalization;
 use codex_protocol::user_input::UserInput;
 use codex_protocol::validation::ValidationResult;
 use codex_utils_output_truncation::approx_token_count;
@@ -30,6 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
@@ -37,7 +42,11 @@ use tokio::sync::Semaphore;
 use tracing::debug;
 use tracing::warn;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 9;
+use crate::terminal_event_fingerprint;
+
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 11;
+const FROZEN_TASK_EVIDENCE_V10_SCHEMA_VERSION: u32 = 10;
+const FROZEN_TASK_EVIDENCE_V9_SCHEMA_VERSION: u32 = 9;
 const FROZEN_TASK_EVIDENCE_V8_SCHEMA_VERSION: u32 = 8;
 const FROZEN_TASK_EVIDENCE_V7_SCHEMA_VERSION: u32 = 7;
 const FROZEN_TASK_EVIDENCE_V6_SCHEMA_VERSION: u32 = 6;
@@ -68,6 +77,13 @@ const USER_SOURCE_LEDGER_CANONICAL_FORMAT: &str = "KD4_USER_SOURCE_LEDGER_CANONI
 const REQUIREMENT_MANIFEST_CANONICAL_FORMAT: &str = "KD4_REQUIREMENT_MANIFEST_CANONICAL_V1";
 const IMPLEMENTATION_IDENTITY_CANONICAL_FORMAT: &str = "KD4_IMPLEMENTATION_IDENTITY_CANONICAL_V1";
 const DOSSIER_SNAPSHOT_CANONICAL_FORMAT: &str = "KD4_DOSSIER_SNAPSHOT_CANONICAL_V1";
+const DESKTOP_INSTALL_EVIDENCE_CANONICAL_FORMAT: &str = "KD4_DESKTOP_INSTALL_EVIDENCE_CANONICAL_V1";
+const DESKTOP_ACTIVATION_CHALLENGE_CANONICAL_FORMAT: &str =
+    "KD4_DESKTOP_ACTIVATION_CHALLENGE_CANONICAL_V1";
+const DESKTOP_ACTIVATION_RECEIPT_CANONICAL_FORMAT: &str =
+    "KD4_DESKTOP_ACTIVATION_RECEIPT_CANONICAL_V1";
+const DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+const DESKTOP_ACTIVATION_CHALLENGE_TTL_SECONDS: i64 = 120;
 const REPAIR_INSTRUCTION_CANONICAL_FORMAT: &str = "KD4_REPAIR_INSTRUCTION_CANONICAL_V1";
 const REPAIR_BASELINE_CANONICAL_FORMAT: &str = "KD4_REPAIR_BASELINE_CANONICAL_V1";
 const REPAIR_DELTA_CANONICAL_FORMAT: &str = "KD4_REPAIR_DELTA_CANONICAL_V1";
@@ -206,61 +222,9 @@ impl PlanUpdateEffect {
 pub(crate) struct PlanUpdateOutcome {
     pub(crate) public_update: UpdatePlanArgs,
     pub(crate) effect: PlanUpdateEffect,
-}
-
-/// Read-only, deterministic projection of the durable task ledger used by
-/// token-budget compaction.  This deliberately contains no timestamps and is
-/// not written back to task evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct CanonicalTaskCheckpointSnapshot {
-    pub(crate) schema_version: u32,
-    pub(crate) root_task_id: String,
-    pub(crate) source_thread_id: String,
-    pub(crate) evidence_revision: u64,
-    pub(crate) provenance: BTreeMap<String, String>,
-    pub(crate) requirements: Vec<CheckpointRequirement>,
-    pub(crate) prohibitions: Vec<CheckpointRequirement>,
-    pub(crate) unresolved_conflicts: Vec<CheckpointReference>,
-    pub(crate) decisions: Vec<CheckpointPlanState>,
-    pub(crate) owners: Vec<String>,
-    pub(crate) relevant_files: Vec<String>,
-    pub(crate) relevant_contracts: Vec<String>,
-    pub(crate) implementation_state: CheckpointImplementationState,
-    pub(crate) proof_ids: Vec<String>,
-    pub(crate) blockers: Vec<CheckpointReference>,
-    pub(crate) risks: Vec<CheckpointReference>,
-    pub(crate) immediate_action: Option<String>,
-    pub(crate) durable_artifact_references: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct CheckpointRequirement {
-    pub(crate) id: String,
-    pub(crate) source_id: String,
-    pub(crate) source_content_hash: String,
-    pub(crate) exact_material: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub(crate) struct CheckpointReference {
-    pub(crate) id: String,
-    pub(crate) kind: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct CheckpointPlanState {
-    pub(crate) id: String,
-    pub(crate) status: String,
-    pub(crate) depends_on: Vec<String>,
-    pub(crate) acceptance_criteria: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct CheckpointImplementationState {
-    pub(crate) evidence_epoch: u64,
-    pub(crate) host_mutation_revision: u64,
-    pub(crate) active_step_id: Option<String>,
-    pub(crate) implementation_identities: Vec<String>,
+    /// Authoritative durable-plan proof for pre-edit final-validation admission.
+    /// `None` means the task-evidence mode cannot prove either state.
+    pub(crate) unfinished_mutation_obligation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,6 +409,56 @@ impl CompletionCheckpointV1 {
     }
 }
 
+fn completion_recovery_identity(
+    basis: &CompletionCandidateBasisV1,
+    turn_id: &str,
+    terminal_hooks_completed: bool,
+    mutation_quiescent: bool,
+) -> CompletionRecoveryIdentityV1 {
+    CompletionRecoveryIdentityV1 {
+        implementation_identity: basis.implementation_identity.clone(),
+        evidence_identity: canonical_hash(
+            "KD4_COMPLETION_RECOVERY_EVIDENCE_V1",
+            &serde_json::json!({
+                "source": basis.source_identity,
+                "requirements": basis.requirement_identity,
+                "task_evidence_epoch": basis.task_evidence_epoch,
+                "host_mutation_revision": basis.host_mutation_revision,
+            }),
+        ),
+        workspace_identity: canonical_hash(
+            "KD4_COMPLETION_RECOVERY_WORKSPACE_V1",
+            &serde_json::json!({
+                "epoch": basis.workspace_epoch,
+                "manifest": basis.workspace_manifest_identity,
+            }),
+        ),
+        diff_identity: basis.canonical_diff_identity.clone(),
+        environment_identity: basis.environment_identity.clone(),
+        toolchain_identity: basis.toolchain_identity.clone(),
+        configuration_identity: canonical_hash(
+            "KD4_COMPLETION_RECOVERY_CONFIGURATION_V1",
+            &serde_json::json!({
+                "features": basis.features_identity,
+                "configuration": basis.configuration_identity,
+            }),
+        ),
+        reviewer_identity: basis.reviewer_configuration_identity.clone(),
+        child_gate_identity: canonical_hash(
+            "KD4_COMPLETION_RECOVERY_CHILD_GATE_V1",
+            &serde_json::json!(&basis.child_gate_state),
+        ),
+        terminal_hook_identity: canonical_hash(
+            "KD4_COMPLETION_RECOVERY_TERMINAL_HOOK_V1",
+            &serde_json::json!({
+                "turn_id": turn_id,
+                "terminal_hooks_completed": terminal_hooks_completed,
+                "mutation_quiescent": mutation_quiescent,
+            }),
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CheckpointRequirementV1 {
     pub(crate) requirement_id: String,
@@ -477,6 +491,35 @@ pub(crate) struct CompletionFinalizationMemoV1 {
     pub(crate) identity: String,
     pub(crate) candidate_id: String,
     pub(crate) checkpoint_id: String,
+    #[serde(default)]
+    pub(crate) turn_id: Option<String>,
+    #[serde(default)]
+    pub(crate) terminal_hooks_completed: bool,
+    #[serde(default)]
+    pub(crate) mutation_quiescent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_identity: Option<CompletionRecoveryIdentityV1>,
+    pub(crate) final_message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompletionRecoveryIdentityV1 {
+    pub(crate) implementation_identity: String,
+    pub(crate) evidence_identity: String,
+    pub(crate) workspace_identity: String,
+    pub(crate) diff_identity: String,
+    pub(crate) environment_identity: String,
+    pub(crate) toolchain_identity: String,
+    pub(crate) configuration_identity: String,
+    pub(crate) reviewer_identity: String,
+    pub(crate) child_gate_identity: String,
+    pub(crate) terminal_hook_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionRecoveryIntentV1 {
+    pub(crate) turn_id: String,
+    pub(crate) memo_identity: String,
     pub(crate) final_message: String,
 }
 
@@ -514,10 +557,22 @@ pub(crate) enum FinalProofSealResultV1 {
         candidate: CompletionCandidateV1,
         validation_plan: ValidationPlanV1,
         checkpoint: Box<CompletionCheckpointV1>,
+        telemetry: FinalProofSealTelemetryV1,
         gate: TaskCompletionGate,
     },
-    Memoized(TaskCompletionGate),
+    Memoized {
+        gate: TaskCompletionGate,
+        checkpoint_tokens: u64,
+        telemetry: FinalProofSealTelemetryV1,
+    },
     PreflightFailed(TaskCompletionGate),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FinalProofSealTelemetryV1 {
+    pub(crate) validation_launch_count: u32,
+    pub(crate) validation_process_ns: u64,
+    pub(crate) validation_aggregate_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,6 +596,8 @@ pub(crate) struct TaskEvidenceLedger {
     freshness_state: Arc<std::sync::Mutex<FreshnessState>>,
     last_persisted_revision: Arc<AtomicU64>,
     source_capture_failed: Arc<AtomicBool>,
+    desktop_activation_gate: Arc<Semaphore>,
+    desktop_activation_runtime: Arc<std::sync::Mutex<DesktopActivationRuntimeState>>,
     #[cfg(test)]
     persistence_test_control: Arc<std::sync::Mutex<Option<PersistenceTestControl>>>,
 }
@@ -631,6 +688,7 @@ pub(crate) struct FreshnessDiagnostics {
     pub(crate) files_strongly_hashed: u64,
     pub(crate) bytes_strongly_hashed: u64,
     pub(crate) strong_hashes_reused: u64,
+    pub(crate) conservative_reruns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1052,10 +1110,52 @@ pub(crate) enum TerminalRecoveryState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AuthoritativeTerminalEventV1 {
+    #[serde(default = "authoritative_terminal_event_version")]
+    pub(crate) version: u32,
+    pub(crate) terminal_identity: String,
+    pub(crate) turn_id: String,
+    pub(crate) event: EventMsg,
+    pub(crate) fingerprint: String,
+    pub(crate) semantic_outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) final_proof_identity: Option<String>,
+}
+
+const fn authoritative_terminal_event_version() -> u32 {
+    1
+}
+
+impl AuthoritativeTerminalEventV1 {
+    fn is_self_consistent(&self) -> bool {
+        let event_turn_id = match &self.event {
+            EventMsg::TurnComplete(event) => Some(event.turn_id.as_str()),
+            EventMsg::TurnAborted(event) => event.turn_id.as_deref(),
+            _ => None,
+        };
+        self.version == authoritative_terminal_event_version()
+            && event_turn_id == Some(self.turn_id.as_str())
+            && terminal_event_fingerprint(&self.event).as_deref() == Some(self.fingerprint.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TerminalizationReceipt {
     terminal_identity: String,
     durable_outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authoritative_event: Option<AuthoritativeTerminalEventV1>,
     delivery_state: TerminalDeliveryState,
+    #[serde(default)]
+    app_server_acknowledged: bool,
+    #[serde(default)]
+    runtime_status_converged: bool,
+    #[serde(default)]
+    rollout_mirrored: bool,
+    #[serde(default)]
+    parent_notification_completed: bool,
+    #[serde(default)]
+    post_terminal_cleanup_completed: bool,
     active_turn_detached: bool,
     terminal_interaction_released: bool,
     #[serde(default)]
@@ -1068,14 +1168,17 @@ struct TerminalizationReceipt {
     recovery_state: TerminalRecoveryState,
     #[serde(default)]
     phase_timings_ns: BTreeMap<String, u64>,
+    /// Final schema-v10 terminal timing receipt, populated only by the
+    /// post-cleanup non-blocking persistence pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminalization: Option<TurnTimingTerminalization>,
     recorded_at: String,
     updated_at: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalDecisionClaim {
-    pub(crate) terminal_identity: String,
-    pub(crate) durable_outcome: String,
+    pub(crate) authoritative_event: AuthoritativeTerminalEventV1,
     pub(crate) deadline_exhausted_phase: Option<String>,
     pub(crate) mutation_quiescent: bool,
     pub(crate) durable_success_established: bool,
@@ -1087,17 +1190,34 @@ pub(crate) struct TerminalDecisionClaim {
 pub(crate) struct TerminalInteractionUpdate {
     pub(crate) terminal_identity: String,
     pub(crate) delivery_state: TerminalDeliveryState,
+    pub(crate) app_server_acknowledged: bool,
+    pub(crate) runtime_status_converged: bool,
+    pub(crate) rollout_mirrored: bool,
+    pub(crate) parent_notification_completed: bool,
+    pub(crate) post_terminal_cleanup_completed: bool,
     pub(crate) active_turn_detached: bool,
     pub(crate) terminal_interaction_released: bool,
     pub(crate) recovery_state: TerminalRecoveryState,
     pub(crate) phase_timings_ns: BTreeMap<String, u64>,
+    pub(crate) terminalization: Option<TurnTimingTerminalization>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum TerminalClaimResult {
-    Claimed,
-    AlreadyClaimed,
+    Claimed(AuthoritativeTerminalEventV1),
+    AlreadyClaimed(AuthoritativeTerminalEventV1),
+    Conflict {
+        authoritative: Option<AuthoritativeTerminalEventV1>,
+        candidate_fingerprint: String,
+    },
     Failed,
+}
+
+#[derive(Debug, Clone)]
+enum TerminalClaimMutation {
+    Inserted,
+    Existing(AuthoritativeTerminalEventV1),
+    Conflict(Option<AuthoritativeTerminalEventV1>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2374,9 +2494,17 @@ struct EvidenceRisk {
     epoch: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DesktopActivationReceipt {
+    #[serde(default)]
+    trusted_producer_version: u32,
+    #[serde(default)]
+    publisher_evidence_id: String,
+    #[serde(default)]
+    thread_id: String,
     epoch: u64,
+    #[serde(default)]
+    activation_obligation_identity: String,
     #[serde(default, alias = "recorded_at")]
     activation_timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2396,17 +2524,484 @@ struct DesktopActivationReceipt {
     #[serde(default)]
     observed_running_executable_path: String,
     #[serde(default)]
+    observed_running_executable_sha256: String,
+    #[serde(default)]
     desktop_process_id: u32,
     #[serde(default)]
     desktop_process_identity: String,
     #[serde(default)]
     desktop_executable_path: String,
     #[serde(default)]
+    initialization_observation_identity: String,
+    #[serde(default)]
     post_restart_initialization_observation: String,
     #[serde(default)]
     observation_timestamp: String,
     #[serde(default)]
     implementation_identity_hash: Option<String>,
+    #[serde(default)]
+    publish_identity: String,
+    #[serde(default)]
+    install_generation: u64,
+    #[serde(default)]
+    authoritative_install_evidence_hash: String,
+    #[serde(default)]
+    authenticated_host_channel_identity: String,
+    #[serde(default)]
+    challenge_identity: String,
+    #[serde(default)]
+    challenge_expires_at: String,
+    #[serde(default)]
+    publish_install_timestamp: String,
+    #[serde(default)]
+    bootstrap_consumed_timestamp: String,
+    #[serde(default)]
+    challenge_issued_timestamp: String,
+    #[serde(default)]
+    running_executable_observed_timestamp: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopPublishInstallEvidenceV1 {
+    pub schema_version: u32,
+    pub trusted_producer_version: u32,
+    pub publisher_evidence_id: String,
+    pub thread_id: String,
+    pub evidence_epoch: u64,
+    #[serde(rename = "implementationIdentity")]
+    pub implementation_identity_hash: String,
+    pub activation_obligation_identity: String,
+    #[serde(rename = "publishId")]
+    pub publish_identity: String,
+    #[serde(default)]
+    pub install_generation: u64,
+    pub expected_installed_executable_path: String,
+    #[serde(rename = "installedFileSha256")]
+    pub installed_executable_sha256: String,
+    #[serde(rename = "installationTimestamp")]
+    pub issued_at: String,
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+type AuthoritativeDesktopInstallEvidence = DesktopPublishInstallEvidenceV1;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DesktopInstallEvidenceAvailability {
+    #[default]
+    NoAuthenticatedHostTransport,
+    AuthenticatedHostBootstrap,
+}
+
+/// Sealed source boundary for authoritative install evidence. Production may only create the
+/// authenticated variant from the startup-consumed inherited bootstrap handle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum DesktopInstallEvidenceSource {
+    #[default]
+    NoAuthenticatedHostTransport,
+    AuthenticatedHostBootstrap {
+        channel_identity: String,
+        peer_identity: String,
+        evidence: Box<AuthoritativeDesktopInstallEvidence>,
+    },
+}
+
+impl DesktopInstallEvidenceSource {
+    fn availability(&self) -> DesktopInstallEvidenceAvailability {
+        match self {
+            Self::NoAuthenticatedHostTransport => {
+                DesktopInstallEvidenceAvailability::NoAuthenticatedHostTransport
+            }
+            Self::AuthenticatedHostBootstrap { .. } => {
+                DesktopInstallEvidenceAvailability::AuthenticatedHostBootstrap
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopRunningProcessObservation {
+    process_id: u32,
+    process_identity: String,
+    executable_path: String,
+    executable_sha256: String,
+    observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDesktopActivationChallenge {
+    challenge_identity: String,
+    nonce: String,
+    thread_id: String,
+    evidence_epoch: u64,
+    implementation_identity_hash: String,
+    activation_obligation_identity: String,
+    publisher_evidence_id: String,
+    authoritative_install_evidence_hash: String,
+    publish_identity: String,
+    install_generation: u64,
+    expected_installed_executable_path: String,
+    installed_executable_sha256: String,
+    running_process: DesktopRunningProcessObservation,
+    authenticated_host_channel_identity: String,
+    authenticated_host_peer_identity: String,
+    issued_at: String,
+    expires_at: String,
+    bootstrap_consumed_at: String,
+    monotonic_deadline: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopActivationAcknowledgement {
+    challenge_identity: String,
+    authenticated_host_channel_identity: String,
+    initialized_process_id: u32,
+    initialized_process_identity: String,
+    desktop_process_id: u32,
+    desktop_process_identity: String,
+    desktop_executable_path: String,
+    initialization_observation_identity: String,
+    observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveDesktopActivationProof {
+    receipt_hash: String,
+    evidence_epoch: u64,
+    implementation_identity_hash: String,
+    activation_obligation_identity: String,
+    authoritative_install_evidence_hash: String,
+    publish_identity: String,
+    install_generation: u64,
+    authenticated_host_channel_identity: String,
+    running_process_id: u32,
+    running_process_identity: String,
+    fresh_until: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DesktopActivationRuntimeState {
+    install_evidence_source: DesktopInstallEvidenceSource,
+    pending_challenge: Option<PendingDesktopActivationChallenge>,
+    live_proof: Option<LiveDesktopActivationProof>,
+    recorded_challenges: BTreeMap<String, RecordedDesktopActivationChallenge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedDesktopActivationChallenge {
+    request_hash: String,
+    receipt: DesktopActivationReceipt,
+    recorded_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DesktopActivationRuntimeSnapshot {
+    availability: DesktopInstallEvidenceAvailability,
+    current_install_evidence_hash: Option<String>,
+    live_proof: Option<LiveDesktopActivationProof>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopActivationVerificationError {
+    NoAuthenticatedHostTransport,
+    InvalidAuthoritativeEvidence,
+    AuthoritativeEvidenceStale,
+    ImplementationIdentityMismatch,
+    RunningExecutableMismatch,
+    RunningProcessIdentityMissing,
+    ChallengeMissingOrConsumed,
+    ChallengeExpired,
+    ChallengeIdentityMismatch,
+    AuthenticatedChannelMismatch,
+    InitializedProcessMismatch,
+    InvalidDesktopObservation,
+    ActivationObligationChanged,
+    ChallengeAlreadyRecordedWithDifferentPayload,
+    PersistenceFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopActivationObligation {
+    pub thread_id: String,
+    pub evidence_epoch: u64,
+    pub implementation_identity: String,
+    pub activation_obligation_identity: String,
+    pub requiring_plan_step_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopActivationChallenge {
+    pub challenge_id: String,
+    pub thread_id: String,
+    pub evidence_epoch: u64,
+    pub implementation_identity: String,
+    pub activation_obligation_identity: String,
+    pub publisher_evidence_id: String,
+    pub expected_installed_executable_path: String,
+    pub expected_installed_executable_sha256: String,
+    pub publish_id: String,
+    pub issued_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopActivationRecordObservation {
+    pub challenge_id: String,
+    pub desktop_process_id: u32,
+    pub desktop_executable_path: String,
+    pub observation_timestamp: String,
+    pub initialization_observation_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopActivationRecordResult {
+    pub challenge_id: String,
+    pub recorded_at: String,
+    pub already_recorded: bool,
+}
+
+impl DesktopActivationRuntimeState {
+    fn snapshot(&self) -> DesktopActivationRuntimeSnapshot {
+        let current_install_evidence_hash = match &self.install_evidence_source {
+            DesktopInstallEvidenceSource::NoAuthenticatedHostTransport => None,
+            DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
+                channel_identity,
+                peer_identity,
+                evidence,
+            } => Some(desktop_install_evidence_hash(
+                evidence,
+                channel_identity,
+                peer_identity,
+            )),
+        };
+        DesktopActivationRuntimeSnapshot {
+            availability: self.install_evidence_source.availability(),
+            current_install_evidence_hash,
+            live_proof: self.live_proof.clone(),
+        }
+    }
+
+    fn prepare_challenge(
+        &mut self,
+        obligation: &DesktopActivationObligation,
+        running_process: DesktopRunningProcessObservation,
+        nonce: &str,
+        bootstrap_consumed_at: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PendingDesktopActivationChallenge, DesktopActivationVerificationError> {
+        let DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
+            channel_identity,
+            peer_identity,
+            evidence,
+        } = &self.install_evidence_source
+        else {
+            return Err(DesktopActivationVerificationError::NoAuthenticatedHostTransport);
+        };
+        validate_authoritative_desktop_install_evidence(
+            evidence,
+            channel_identity,
+            peer_identity,
+            obligation,
+            now,
+        )?;
+        let bootstrap_consumed = parse_desktop_timestamp(bootstrap_consumed_at)
+            .filter(|consumed| *consumed <= now)
+            .ok_or(DesktopActivationVerificationError::InvalidAuthoritativeEvidence)?;
+        let installed_at = parse_desktop_timestamp(&evidence.issued_at)
+            .ok_or(DesktopActivationVerificationError::InvalidAuthoritativeEvidence)?;
+        if installed_at > bootstrap_consumed {
+            return Err(DesktopActivationVerificationError::AuthoritativeEvidenceStale);
+        }
+        if let Some(existing) = self.pending_challenge.as_ref()
+            && existing.thread_id == obligation.thread_id
+            && existing.evidence_epoch == obligation.evidence_epoch
+            && existing.implementation_identity_hash == obligation.implementation_identity
+            && existing.activation_obligation_identity == obligation.activation_obligation_identity
+            && existing.publisher_evidence_id == evidence.publisher_evidence_id
+            && Instant::now() <= existing.monotonic_deadline
+        {
+            return Ok(existing.clone());
+        }
+        self.pending_challenge = None;
+        self.live_proof = None;
+        let running_observed_at = parse_desktop_timestamp(&running_process.observed_at);
+        if running_process.process_id == 0
+            || running_process.process_identity.trim().is_empty()
+            || running_observed_at
+                .is_none_or(|observed_at| observed_at < bootstrap_consumed || observed_at > now)
+        {
+            return Err(DesktopActivationVerificationError::RunningProcessIdentityMissing);
+        }
+        if !desktop_paths_match(
+            &evidence.expected_installed_executable_path,
+            &running_process.executable_path,
+        ) || !evidence
+            .installed_executable_sha256
+            .eq_ignore_ascii_case(&running_process.executable_sha256)
+        {
+            return Err(DesktopActivationVerificationError::RunningExecutableMismatch);
+        }
+        if nonce.trim().is_empty() {
+            return Err(DesktopActivationVerificationError::InvalidAuthoritativeEvidence);
+        }
+        let authoritative_install_evidence_hash =
+            desktop_install_evidence_hash(evidence, channel_identity, peer_identity);
+        let expires_at = now + ChronoDuration::seconds(DESKTOP_ACTIVATION_CHALLENGE_TTL_SECONDS);
+        let issued_at = now.to_rfc3339();
+        let expires_at = expires_at.to_rfc3339();
+        let challenge_identity = canonical_hash(
+            DESKTOP_ACTIVATION_CHALLENGE_CANONICAL_FORMAT,
+            &serde_json::json!({
+                "nonce": nonce,
+                "threadId": obligation.thread_id,
+                "evidenceEpoch": obligation.evidence_epoch,
+                "implementationIdentity": obligation.implementation_identity,
+                "activationObligationIdentity": obligation.activation_obligation_identity,
+                "authoritativeInstallEvidence": authoritative_install_evidence_hash,
+                "publisherEvidenceId": evidence.publisher_evidence_id,
+                "publishIdentity": evidence.publish_identity,
+                "runningProcessId": running_process.process_id,
+                "runningProcessIdentity": running_process.process_identity,
+                "authenticatedHostChannel": channel_identity,
+                "authenticatedHostPeer": peer_identity,
+                "issuedAt": issued_at,
+                "expiresAt": expires_at,
+            }),
+        );
+        let challenge = PendingDesktopActivationChallenge {
+            challenge_identity,
+            nonce: nonce.to_string(),
+            thread_id: obligation.thread_id.clone(),
+            evidence_epoch: obligation.evidence_epoch,
+            implementation_identity_hash: obligation.implementation_identity.clone(),
+            activation_obligation_identity: obligation.activation_obligation_identity.clone(),
+            publisher_evidence_id: evidence.publisher_evidence_id.clone(),
+            authoritative_install_evidence_hash,
+            publish_identity: evidence.publish_identity.clone(),
+            install_generation: evidence.install_generation,
+            expected_installed_executable_path: evidence.expected_installed_executable_path.clone(),
+            installed_executable_sha256: evidence.installed_executable_sha256.clone(),
+            running_process,
+            authenticated_host_channel_identity: channel_identity.clone(),
+            authenticated_host_peer_identity: peer_identity.clone(),
+            issued_at,
+            expires_at,
+            bootstrap_consumed_at: bootstrap_consumed_at.to_string(),
+            monotonic_deadline: Instant::now()
+                + std::time::Duration::from_secs(DESKTOP_ACTIVATION_CHALLENGE_TTL_SECONDS as u64),
+        };
+        self.pending_challenge = Some(challenge.clone());
+        Ok(challenge)
+    }
+
+    fn complete_challenge(
+        &mut self,
+        acknowledgement: DesktopActivationAcknowledgement,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopActivationReceipt, DesktopActivationVerificationError> {
+        let challenge = self
+            .pending_challenge
+            .take()
+            .ok_or(DesktopActivationVerificationError::ChallengeMissingOrConsumed)?;
+        if Instant::now() > challenge.monotonic_deadline {
+            return Err(DesktopActivationVerificationError::ChallengeExpired);
+        }
+        if acknowledgement.challenge_identity != challenge.challenge_identity {
+            return Err(DesktopActivationVerificationError::ChallengeIdentityMismatch);
+        }
+        if acknowledgement.authenticated_host_channel_identity
+            != challenge.authenticated_host_channel_identity
+        {
+            return Err(DesktopActivationVerificationError::AuthenticatedChannelMismatch);
+        }
+        if acknowledgement.initialized_process_id != challenge.running_process.process_id
+            || acknowledgement.initialized_process_identity
+                != challenge.running_process.process_identity
+        {
+            return Err(DesktopActivationVerificationError::InitializedProcessMismatch);
+        }
+        let observation_timestamp = parse_desktop_timestamp(&acknowledgement.observed_at)
+            .filter(|observed_at| {
+                parse_desktop_timestamp(&challenge.issued_at)
+                    .is_some_and(|issued_at| *observed_at >= issued_at && *observed_at <= now)
+            })
+            .ok_or(DesktopActivationVerificationError::InvalidDesktopObservation)?;
+        if acknowledgement.desktop_process_id == 0
+            || acknowledgement.desktop_process_identity.trim().is_empty()
+            || !Path::new(&acknowledgement.desktop_executable_path).is_absolute()
+            || acknowledgement
+                .initialization_observation_identity
+                .trim()
+                .is_empty()
+        {
+            return Err(DesktopActivationVerificationError::InvalidDesktopObservation);
+        }
+        let receipt = DesktopActivationReceipt {
+            trusted_producer_version: DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION,
+            publisher_evidence_id: challenge.publisher_evidence_id.clone(),
+            thread_id: challenge.thread_id.clone(),
+            epoch: challenge.evidence_epoch,
+            activation_obligation_identity: challenge.activation_obligation_identity.clone(),
+            activation_timestamp: now.to_rfc3339(),
+            process_path: None,
+            binary_sha1: None,
+            runtime_evidence: Some("authenticated_host_bootstrap_v1".to_string()),
+            expected_installed_executable_path: challenge
+                .expected_installed_executable_path
+                .clone(),
+            installed_executable_sha256: challenge.installed_executable_sha256.clone(),
+            running_process_id: challenge.running_process.process_id,
+            running_process_identity: challenge.running_process.process_identity.clone(),
+            observed_running_executable_path: challenge.running_process.executable_path.clone(),
+            observed_running_executable_sha256: challenge.running_process.executable_sha256.clone(),
+            desktop_process_id: acknowledgement.desktop_process_id,
+            desktop_process_identity: acknowledgement.desktop_process_identity,
+            desktop_executable_path: acknowledgement.desktop_executable_path,
+            initialization_observation_identity: acknowledgement
+                .initialization_observation_identity,
+            post_restart_initialization_observation:
+                "authenticated host initialized the exact app-server process".to_string(),
+            observation_timestamp: observation_timestamp.to_rfc3339(),
+            implementation_identity_hash: Some(challenge.implementation_identity_hash.clone()),
+            publish_identity: challenge.publish_identity.clone(),
+            install_generation: challenge.install_generation,
+            authoritative_install_evidence_hash: challenge
+                .authoritative_install_evidence_hash
+                .clone(),
+            authenticated_host_channel_identity: challenge
+                .authenticated_host_channel_identity
+                .clone(),
+            challenge_identity: challenge.challenge_identity,
+            challenge_expires_at: challenge.expires_at.clone(),
+            publish_install_timestamp: match &self.install_evidence_source {
+                DesktopInstallEvidenceSource::AuthenticatedHostBootstrap { evidence, .. } => {
+                    evidence.issued_at.clone()
+                }
+                DesktopInstallEvidenceSource::NoAuthenticatedHostTransport => String::new(),
+            },
+            bootstrap_consumed_timestamp: challenge.bootstrap_consumed_at,
+            challenge_issued_timestamp: challenge.issued_at.clone(),
+            running_executable_observed_timestamp: challenge.running_process.observed_at.clone(),
+        };
+        self.live_proof = Some(LiveDesktopActivationProof {
+            receipt_hash: desktop_activation_receipt_hash(&receipt),
+            evidence_epoch: receipt.epoch,
+            implementation_identity_hash: challenge.implementation_identity_hash,
+            activation_obligation_identity: challenge.activation_obligation_identity,
+            authoritative_install_evidence_hash: challenge.authoritative_install_evidence_hash,
+            publish_identity: challenge.publish_identity,
+            install_generation: challenge.install_generation,
+            authenticated_host_channel_identity: challenge.authenticated_host_channel_identity,
+            running_process_id: challenge.running_process.process_id,
+            running_process_identity: challenge.running_process.process_identity,
+            fresh_until: challenge.expires_at,
+        });
+        Ok(receipt)
+    }
 }
 
 fn new_completion_review_ledger(root_task_id: &str) -> CompletionReviewLedgerV2 {
@@ -2440,271 +3035,6 @@ fn new_completion_review_ledger(root_task_id: &str) -> CompletionReviewLedgerV2 
 }
 
 impl TaskEvidenceLedger {
-    /// Produce canonical checkpoint state strictly from accepted structured
-    /// records.  In particular, this never classifies or summarizes user prose,
-    /// tool output, or reasoning, and it never mutates the evidence ledger.
-    pub(crate) async fn canonical_checkpoint_snapshot(
-        &self,
-    ) -> Option<CanonicalTaskCheckpointSnapshot> {
-        if !self.allows_kd4_completion() {
-            return None;
-        }
-        let document = self.document.lock().await;
-        let document = document.as_ref()?;
-        let completion = document.completion_review_v2.as_ref();
-
-        let root_task_id = completion
-            .map(|ledger| ledger.root_task_id.clone())
-            .unwrap_or_else(|| document.thread_id.clone());
-        let mut requirements = completion
-            .and_then(active_manifest)
-            .map(|manifest| {
-                manifest
-                    .requirements
-                    .iter()
-                    .filter(|requirement| requirement.status == RequirementStatus::Active)
-                    .map(|requirement| CheckpointRequirement {
-                        id: requirement.requirement_id.clone(),
-                        source_id: requirement.source_id.clone(),
-                        source_content_hash: requirement.source_content_hash.clone(),
-                        exact_material: requirement.exact_material.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        requirements.sort_by(|left, right| left.id.cmp(&right.id));
-
-        // There is no typed prohibition owner in TaskEvidence today.  Do not
-        // infer one by interpreting accepted requirement text.
-        let prohibitions = Vec::new();
-
-        let mut unresolved_conflicts = completion
-            .map(|ledger| {
-                active_source_mappings(ledger)
-                    .into_iter()
-                    .filter_map(|(source_id, mapping)| match mapping {
-                        SourceMapping::PendingClassification => Some(CheckpointReference {
-                            id: source_id,
-                            kind: "pending_source_classification".to_string(),
-                        }),
-                        SourceMapping::UnavailableOrTruncated => Some(CheckpointReference {
-                            id: source_id,
-                            kind: "source_unavailable_or_truncated".to_string(),
-                        }),
-                        SourceMapping::RequirementBearing { .. }
-                        | SourceMapping::NonRequirement { .. }
-                        | SourceMapping::SupersededContext { .. } => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        unresolved_conflicts.sort();
-
-        let mut decisions = document
-            .plan
-            .iter()
-            .map(|step| CheckpointPlanState {
-                id: step.id.clone(),
-                status: checkpoint_step_status(&step.status).to_string(),
-                depends_on: step.depends_on.clone(),
-                acceptance_criteria: step.acceptance_criteria.clone(),
-            })
-            .collect::<Vec<_>>();
-        decisions.sort_by(|left, right| left.id.cmp(&right.id));
-
-        let mut owners = BTreeSet::new();
-        for (thread_id, agent_path) in document
-            .edit_receipts
-            .iter()
-            .map(|receipt| (&receipt.source_thread_id, &receipt.source_agent_path))
-            .chain(
-                document
-                    .command_receipts
-                    .iter()
-                    .map(|receipt| (&receipt.source_thread_id, &receipt.source_agent_path)),
-            )
-            .chain(
-                document
-                    .external_evidence
-                    .iter()
-                    .map(|receipt| (&receipt.source_thread_id, &receipt.source_agent_path)),
-            )
-        {
-            if let Some(thread_id) = thread_id.as_deref() {
-                owners.insert(format!("thread:{thread_id}"));
-            }
-            if let Some(agent_path) = agent_path.as_deref() {
-                owners.insert(format!("agent:{agent_path}"));
-            }
-        }
-
-        let mut relevant_files = BTreeSet::new();
-        relevant_files.extend(document.latest_file_hashes.keys().cloned());
-        relevant_files.extend(document.latest_generated_artifact_hashes.keys().cloned());
-        for step in &document.plan {
-            relevant_files.extend(step.edit_paths.iter().cloned());
-            relevant_files.extend(step.runtime_paths.iter().cloned());
-            relevant_files.extend(step.generated_artifacts.iter().cloned());
-        }
-
-        let mut relevant_contracts = document
-            .plan
-            .iter()
-            .flat_map(|step| step.acceptance_criteria.iter().cloned())
-            .collect::<Vec<_>>();
-        relevant_contracts.sort();
-        relevant_contracts.dedup();
-
-        let mut implementation_identities = document
-            .command_receipts
-            .iter()
-            .filter(|receipt| receipt.epoch == document.evidence_epoch)
-            .filter_map(|receipt| receipt.implementation_identity_hash.clone())
-            .collect::<Vec<_>>();
-        implementation_identities.sort();
-        implementation_identities.dedup();
-
-        let mut proof_ids = document
-            .command_receipts
-            .iter()
-            .filter(|receipt| receipt.epoch == document.evidence_epoch)
-            .map(|receipt| receipt.id.clone())
-            .chain(
-                document
-                    .external_evidence
-                    .iter()
-                    .filter(|receipt| receipt.task_epoch == document.evidence_epoch)
-                    .map(|receipt| receipt.id.clone()),
-            )
-            .collect::<Vec<_>>();
-        proof_ids.sort();
-        proof_ids.dedup();
-
-        let mut blockers = document
-            .risks
-            .iter()
-            .filter(|risk| risk.blocking && !risk.resolved)
-            .map(|risk| CheckpointReference {
-                id: risk.id.clone(),
-                kind: risk.source.clone(),
-            })
-            .collect::<Vec<_>>();
-        blockers.sort();
-        let mut risks = document
-            .risks
-            .iter()
-            .filter(|risk| !risk.resolved)
-            .map(|risk| CheckpointReference {
-                id: risk.id.clone(),
-                kind: risk.source.clone(),
-            })
-            .collect::<Vec<_>>();
-        risks.sort();
-
-        let immediate_action = document.active_step_id.clone().or_else(|| {
-            document
-                .plan
-                .iter()
-                .find(|step| matches!(step.status, StepStatus::InProgress | StepStatus::Pending))
-                .map(|step| step.id.clone())
-        });
-
-        let mut durable_artifact_references = document
-            .external_evidence
-            .iter()
-            .filter_map(|receipt| receipt.payload_artifact_id.clone())
-            .chain(
-                document
-                    .generated_artifact_requirements
-                    .iter()
-                    .map(|requirement| requirement.id.clone()),
-            )
-            .collect::<Vec<_>>();
-        durable_artifact_references.sort();
-        durable_artifact_references.dedup();
-
-        let provenance = BTreeMap::from([
-            (
-                "requirements".to_string(),
-                "accepted_structured_task_contract".to_string(),
-            ),
-            (
-                "prohibitions".to_string(),
-                "accepted_structured_task_contract".to_string(),
-            ),
-            (
-                "unresolved_conflicts".to_string(),
-                "accepted_structured_task_contract".to_string(),
-            ),
-            (
-                "decisions".to_string(),
-                "active_structured_plan_task_state".to_string(),
-            ),
-            (
-                "owners".to_string(),
-                "collaboration_and_task_evidence_records".to_string(),
-            ),
-            (
-                "relevant_files".to_string(),
-                "collaboration_and_task_evidence_records".to_string(),
-            ),
-            (
-                "relevant_contracts".to_string(),
-                "active_structured_plan_task_state".to_string(),
-            ),
-            (
-                "implementation_state".to_string(),
-                "current_implementation_identity_and_receipts".to_string(),
-            ),
-            (
-                "proof_ids".to_string(),
-                "current_implementation_identity_and_receipts".to_string(),
-            ),
-            (
-                "blockers".to_string(),
-                "explicit_structured_records".to_string(),
-            ),
-            (
-                "risks".to_string(),
-                "explicit_structured_records".to_string(),
-            ),
-            (
-                "immediate_action".to_string(),
-                "active_structured_plan_task_state".to_string(),
-            ),
-            (
-                "durable_artifact_references".to_string(),
-                "existing_durable_ids_only".to_string(),
-            ),
-        ]);
-
-        Some(CanonicalTaskCheckpointSnapshot {
-            schema_version: 1,
-            root_task_id,
-            source_thread_id: document.thread_id.clone(),
-            evidence_revision: document.revision,
-            provenance,
-            requirements,
-            prohibitions,
-            unresolved_conflicts,
-            decisions,
-            owners: owners.into_iter().collect(),
-            relevant_files: relevant_files.into_iter().collect(),
-            relevant_contracts,
-            implementation_state: CheckpointImplementationState {
-                evidence_epoch: document.evidence_epoch,
-                host_mutation_revision: document.host_mutation_revision,
-                active_step_id: document.active_step_id.clone(),
-                implementation_identities,
-            },
-            proof_ids,
-            blockers,
-            risks,
-            immediate_action,
-            durable_artifact_references,
-        })
-    }
-
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
         let (mode, repo_root) = if let Some(repo_root) = find_kd4_repo_root(cwd) {
             (TaskEvidenceMode::Kd4Completion, repo_root)
@@ -2765,14 +3095,18 @@ impl TaskEvidenceLedger {
             migrate_document_with_completion_model(&mut document, legacy_completion_model);
             for receipt in &mut document.terminalization_receipts {
                 if receipt.delivery_state.is_authoritative_claim()
-                    && !receipt.terminal_interaction_released
+                    && (!receipt.app_server_acknowledged
+                        || !receipt.runtime_status_converged
+                        || !receipt.rollout_mirrored
+                        || !receipt.parent_notification_completed
+                        || !receipt.post_terminal_cleanup_completed
+                        || !receipt.active_turn_detached
+                        || !receipt.terminal_interaction_released)
                 {
-                    // Restoration never retries live delivery. The durable decision is
-                    // authoritative, while interactive and retained mutation ownership remain
-                    // independent.
-                    receipt.active_turn_detached = true;
-                    receipt.terminal_interaction_released = true;
-                    receipt.recovery_state = TerminalRecoveryState::Recovered;
+                    // A durable terminal decision is immutable, but delivery and post-terminal
+                    // effects remain independently recoverable. Do not manufacture release or
+                    // delivery success merely because the ledger was reloaded.
+                    receipt.recovery_state = TerminalRecoveryState::Pending;
                     receipt.updated_at = now.clone();
                 }
             }
@@ -2860,6 +3194,10 @@ impl TaskEvidenceLedger {
             freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
             last_persisted_revision: Arc::new(AtomicU64::new(0)),
             source_capture_failed: Arc::new(AtomicBool::new(source_capture_failed)),
+            desktop_activation_gate: Arc::new(Semaphore::new(1)),
+            desktop_activation_runtime: Arc::new(std::sync::Mutex::new(
+                DesktopActivationRuntimeState::default(),
+            )),
             #[cfg(test)]
             persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -2945,9 +3283,315 @@ impl TaskEvidenceLedger {
             freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
             last_persisted_revision: Arc::new(AtomicU64::new(0)),
             source_capture_failed: Arc::new(AtomicBool::new(false)),
+            desktop_activation_gate: Arc::new(Semaphore::new(1)),
+            desktop_activation_runtime: Arc::new(std::sync::Mutex::new(
+                DesktopActivationRuntimeState::default(),
+            )),
             #[cfg(test)]
             persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn desktop_activation_runtime_snapshot(&self) -> DesktopActivationRuntimeSnapshot {
+        self.desktop_activation_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
+    }
+
+    pub(crate) async fn desktop_activation_obligation(
+        &self,
+    ) -> Option<DesktopActivationObligation> {
+        let runtime = self.desktop_activation_runtime_snapshot();
+        let document = self.document.lock().await;
+        let document = document.as_ref()?;
+        let obligation = current_desktop_activation_obligation(document)?;
+        if document
+            .desktop_activation_receipt
+            .as_ref()
+            .is_some_and(|receipt| {
+                desktop_activation_receipt_is_complete(receipt, &runtime, document)
+            })
+        {
+            return None;
+        }
+        Some(obligation)
+    }
+
+    pub(crate) async fn issue_desktop_activation_challenge(
+        &self,
+        evidence: AuthoritativeDesktopInstallEvidence,
+        bootstrap_consumed_at: String,
+    ) -> Result<DesktopActivationChallenge, DesktopActivationVerificationError> {
+        let _activation_permit = Arc::clone(&self.desktop_activation_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| DesktopActivationVerificationError::PersistenceFailed)?;
+        let runtime_snapshot = self.desktop_activation_runtime_snapshot();
+        let (obligation, last_mutation_at) = {
+            let document = self.document.lock().await;
+            let document = document
+                .as_ref()
+                .ok_or(DesktopActivationVerificationError::ActivationObligationChanged)?;
+            if document
+                .desktop_activation_receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    desktop_activation_receipt_is_complete(receipt, &runtime_snapshot, document)
+                })
+            {
+                return Err(DesktopActivationVerificationError::ActivationObligationChanged);
+            }
+            (
+                current_desktop_activation_obligation(document)
+                    .ok_or(DesktopActivationVerificationError::ActivationObligationChanged)?,
+                document.last_mutation_at.clone(),
+            )
+        };
+        let now = Utc::now();
+        validate_authoritative_desktop_install_evidence(
+            &evidence,
+            "inherited-bootstrap-handle-v1",
+            &evidence.publisher_evidence_id,
+            &obligation,
+            now,
+        )?;
+        if last_mutation_at
+            .as_deref()
+            .and_then(parse_desktop_timestamp)
+            .is_some_and(|mutated_at| {
+                parse_desktop_timestamp(&evidence.issued_at)
+                    .is_none_or(|installed_at| installed_at < mutated_at)
+            })
+        {
+            return Err(DesktopActivationVerificationError::AuthoritativeEvidenceStale);
+        }
+        let running_process = verified_desktop_running_process(&evidence).await?;
+        {
+            let document = self.document.lock().await;
+            if document
+                .as_ref()
+                .and_then(current_desktop_activation_obligation)
+                .as_ref()
+                != Some(&obligation)
+            {
+                return Err(DesktopActivationVerificationError::ActivationObligationChanged);
+            }
+        }
+        let mut runtime = self
+            .desktop_activation_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.install_evidence_source =
+            DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
+                channel_identity: "inherited-bootstrap-handle-v1".to_string(),
+                peer_identity: evidence.publisher_evidence_id.clone(),
+                evidence: Box::new(evidence),
+            };
+        let pending = runtime.prepare_challenge(
+            &obligation,
+            running_process,
+            &uuid::Uuid::new_v4().to_string(),
+            &bootstrap_consumed_at,
+            Utc::now(),
+        )?;
+        Ok(desktop_activation_challenge_public(&pending))
+    }
+
+    pub(crate) async fn record_desktop_activation(
+        &self,
+        observation: DesktopActivationRecordObservation,
+    ) -> Result<DesktopActivationRecordResult, DesktopActivationVerificationError> {
+        let _activation_permit = Arc::clone(&self.desktop_activation_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| DesktopActivationVerificationError::PersistenceFailed)?;
+        let request_hash = canonical_hash(
+            "KD4_DESKTOP_ACTIVATION_RECORD_REQUEST_V1",
+            &serde_json::to_value(&observation).unwrap_or(Value::Null),
+        );
+        if let Some(result) =
+            self.recorded_desktop_activation_result(&observation.challenge_id, &request_hash)?
+        {
+            return Ok(result);
+        }
+        let pending = {
+            let runtime = self
+                .desktop_activation_runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            runtime
+                .pending_challenge
+                .as_ref()
+                .filter(|pending| pending.challenge_identity == observation.challenge_id)
+                .cloned()
+                .ok_or(DesktopActivationVerificationError::ChallengeMissingOrConsumed)?
+        };
+        if Instant::now() > pending.monotonic_deadline {
+            return Err(DesktopActivationVerificationError::ChallengeExpired);
+        }
+        verify_pending_desktop_running_process(&pending).await?;
+
+        for _ in 0..8 {
+            let expected_revision = {
+                let document_guard = self.document.lock().await;
+                let document = document_guard
+                    .as_ref()
+                    .ok_or(DesktopActivationVerificationError::ActivationObligationChanged)?;
+                let obligation = current_desktop_activation_obligation(document)
+                    .ok_or(DesktopActivationVerificationError::ActivationObligationChanged)?;
+                if obligation.thread_id != pending.thread_id
+                    || obligation.evidence_epoch != pending.evidence_epoch
+                    || obligation.implementation_identity != pending.implementation_identity_hash
+                    || obligation.activation_obligation_identity
+                        != pending.activation_obligation_identity
+                {
+                    return Err(DesktopActivationVerificationError::ActivationObligationChanged);
+                }
+                let runtime_snapshot = self.desktop_activation_runtime_snapshot();
+                if document
+                    .desktop_activation_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| {
+                        desktop_activation_receipt_is_complete(receipt, &runtime_snapshot, document)
+                    })
+                {
+                    return Err(DesktopActivationVerificationError::ActivationObligationChanged);
+                }
+                document.revision
+            };
+            let mut runtime_candidate = self
+                .desktop_activation_runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(recorded) = runtime_candidate
+                .recorded_challenges
+                .get(&observation.challenge_id)
+            {
+                if recorded.request_hash != request_hash {
+                    return Err(
+                        DesktopActivationVerificationError::ChallengeAlreadyRecordedWithDifferentPayload,
+                    );
+                }
+                return Ok(DesktopActivationRecordResult {
+                    challenge_id: observation.challenge_id,
+                    recorded_at: recorded.recorded_at.clone(),
+                    already_recorded: true,
+                });
+            }
+            let acknowledgement = DesktopActivationAcknowledgement {
+                challenge_identity: observation.challenge_id.clone(),
+                authenticated_host_channel_identity: pending
+                    .authenticated_host_channel_identity
+                    .clone(),
+                initialized_process_id: pending.running_process.process_id,
+                initialized_process_identity: pending.running_process.process_identity.clone(),
+                desktop_process_id: observation.desktop_process_id,
+                desktop_process_identity: canonical_hash(
+                    "KD4_DESKTOP_PROCESS_OBSERVATION_V1",
+                    &serde_json::json!({
+                        "processId": observation.desktop_process_id,
+                        "path": observation.desktop_executable_path,
+                    }),
+                ),
+                desktop_executable_path: observation.desktop_executable_path.clone(),
+                initialization_observation_identity: observation
+                    .initialization_observation_identity
+                    .clone(),
+                observed_at: observation.observation_timestamp.clone(),
+            };
+            let receipt = runtime_candidate.complete_challenge(acknowledgement, Utc::now())?;
+            let result = DesktopActivationRecordResult {
+                challenge_id: observation.challenge_id.clone(),
+                recorded_at: receipt.activation_timestamp.clone(),
+                already_recorded: false,
+            };
+            runtime_candidate.recorded_challenges.insert(
+                observation.challenge_id.clone(),
+                RecordedDesktopActivationChallenge {
+                    request_hash: request_hash.clone(),
+                    receipt: receipt.clone(),
+                    recorded_at: result.recorded_at.clone(),
+                },
+            );
+            while runtime_candidate.recorded_challenges.len() > 32 {
+                let Some(first) = runtime_candidate.recorded_challenges.keys().next().cloned()
+                else {
+                    break;
+                };
+                runtime_candidate.recorded_challenges.remove(&first);
+            }
+            let committed_runtime = Arc::clone(&self.desktop_activation_runtime);
+            let receipt_for_document = receipt.clone();
+            let pending_for_document = pending.clone();
+            let transition = self
+                .atomic_review_update_with_commit(
+                    expected_revision,
+                    None,
+                    None,
+                    move |document| {
+                        let Some(obligation) = current_desktop_activation_obligation(document)
+                        else {
+                            return false;
+                        };
+                        if obligation.thread_id != pending_for_document.thread_id
+                            || obligation.evidence_epoch != pending_for_document.evidence_epoch
+                            || obligation.implementation_identity
+                                != pending_for_document.implementation_identity_hash
+                            || obligation.activation_obligation_identity
+                                != pending_for_document.activation_obligation_identity
+                        {
+                            return false;
+                        }
+                        document.desktop_activation_receipt = Some(receipt_for_document);
+                        document.updated_at = timestamp();
+                        document.completion = None;
+                        true
+                    },
+                    move || {
+                        *committed_runtime
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime_candidate;
+                    },
+                )
+                .await;
+            match transition {
+                AtomicReviewTransition::Persisted(true) => return Ok(result),
+                AtomicReviewTransition::Persisted(false) => {
+                    return Err(DesktopActivationVerificationError::ActivationObligationChanged);
+                }
+                AtomicReviewTransition::Superseded => continue,
+                AtomicReviewTransition::Failed => {
+                    return Err(DesktopActivationVerificationError::PersistenceFailed);
+                }
+            }
+        }
+        Err(DesktopActivationVerificationError::PersistenceFailed)
+    }
+
+    fn recorded_desktop_activation_result(
+        &self,
+        challenge_id: &str,
+        request_hash: &str,
+    ) -> Result<Option<DesktopActivationRecordResult>, DesktopActivationVerificationError> {
+        let runtime = self
+            .desktop_activation_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(recorded) = runtime.recorded_challenges.get(challenge_id) else {
+            return Ok(None);
+        };
+        if recorded.request_hash != request_hash {
+            return Err(
+                DesktopActivationVerificationError::ChallengeAlreadyRecordedWithDifferentPayload,
+            );
+        }
+        Ok(Some(DesktopActivationRecordResult {
+            challenge_id: challenge_id.to_string(),
+            recorded_at: recorded.recorded_at.clone(),
+            already_recorded: true,
+        }))
     }
 
     #[cfg(test)]
@@ -2959,36 +3603,61 @@ impl TaskEvidenceLedger {
         self.mode == TaskEvidenceMode::Kd4Completion
     }
 
-    /// Atomically commits the terminal decision and reserves the one live-delivery attempt.
-    /// A recovered or duplicated caller that observes an existing claim must never send again.
+    /// Atomically establishes the immutable terminal event and coordinates at-least-once live
+    /// delivery. An existing identical record is returned for replay; a conflicting record is
+    /// never replaced.
     pub(crate) async fn commit_terminal_decision_and_claim(
         &self,
         claim: TerminalDecisionClaim,
     ) -> TerminalClaimResult {
+        if !claim.authoritative_event.is_self_consistent() {
+            return TerminalClaimResult::Failed;
+        }
         if !self.allows_kd4_completion() {
-            return TerminalClaimResult::Claimed;
+            return TerminalClaimResult::Claimed(claim.authoritative_event);
         }
         for _ in 0..8 {
             let Some(expected_revision) = self.document_revision().await else {
                 return TerminalClaimResult::Failed;
             };
-            let terminal_identity = claim.terminal_identity.clone();
+            let terminal_identity = claim.authoritative_event.terminal_identity.clone();
+            let candidate_fingerprint = claim.authoritative_event.fingerprint.clone();
             let candidate_claim = claim.clone();
             let transition = self
                 .atomic_review_update(expected_revision, None, None, |document| {
-                    if document.terminalization_receipts.iter().any(|receipt| {
-                        receipt.terminal_identity == terminal_identity
-                            && receipt.delivery_state.is_authoritative_claim()
-                    }) {
-                        return false;
+                    if let Some(receipt) =
+                        document.terminalization_receipts.iter().find(|receipt| {
+                            receipt.terminal_identity == terminal_identity
+                                && receipt.delivery_state.is_authoritative_claim()
+                        })
+                    {
+                        return match receipt.authoritative_event.clone() {
+                            Some(authoritative)
+                                if authoritative.is_self_consistent()
+                                    && authoritative.fingerprint == candidate_fingerprint =>
+                            {
+                                TerminalClaimMutation::Existing(authoritative)
+                            }
+                            Some(authoritative) if authoritative.is_self_consistent() => {
+                                TerminalClaimMutation::Conflict(Some(authoritative))
+                            }
+                            _ => TerminalClaimMutation::Conflict(None),
+                        };
                     }
                     let now = timestamp();
+                    let authoritative_event = candidate_claim.authoritative_event;
                     document
                         .terminalization_receipts
                         .push(TerminalizationReceipt {
-                            terminal_identity: candidate_claim.terminal_identity,
-                            durable_outcome: candidate_claim.durable_outcome,
+                            terminal_identity: authoritative_event.terminal_identity.clone(),
+                            durable_outcome: authoritative_event.semantic_outcome.clone(),
+                            authoritative_event: Some(authoritative_event),
                             delivery_state: TerminalDeliveryState::Claimed,
+                            app_server_acknowledged: false,
+                            runtime_status_converged: false,
+                            rollout_mirrored: false,
+                            parent_notification_completed: false,
+                            post_terminal_cleanup_completed: false,
                             active_turn_detached: false,
                             terminal_interaction_released: false,
                             deadline_exhausted_phase: candidate_claim.deadline_exhausted_phase,
@@ -2998,6 +3667,7 @@ impl TaskEvidenceLedger {
                             retained_ownership: candidate_claim.retained_ownership,
                             recovery_state: TerminalRecoveryState::Pending,
                             phase_timings_ns: candidate_claim.phase_timings_ns,
+                            terminalization: None,
                             recorded_at: now.clone(),
                             updated_at: now,
                         });
@@ -3006,25 +3676,83 @@ impl TaskEvidenceLedger {
                         MAX_TERMINALIZATION_RECEIPTS,
                     );
                     document.updated_at = timestamp();
-                    true
+                    TerminalClaimMutation::Inserted
                 })
                 .await;
             match transition {
-                AtomicReviewTransition::Persisted(true) => {
-                    return TerminalClaimResult::Claimed;
+                AtomicReviewTransition::Persisted(TerminalClaimMutation::Inserted) => {
+                    return TerminalClaimResult::Claimed(claim.authoritative_event);
                 }
-                AtomicReviewTransition::Persisted(false) => {
-                    return TerminalClaimResult::AlreadyClaimed;
+                AtomicReviewTransition::Persisted(TerminalClaimMutation::Existing(event)) => {
+                    return TerminalClaimResult::AlreadyClaimed(event);
+                }
+                AtomicReviewTransition::Persisted(TerminalClaimMutation::Conflict(
+                    authoritative,
+                )) => {
+                    return TerminalClaimResult::Conflict {
+                        authoritative,
+                        candidate_fingerprint,
+                    };
                 }
                 AtomicReviewTransition::Superseded => continue,
-                AtomicReviewTransition::Failed => return TerminalClaimResult::Failed,
+                AtomicReviewTransition::Failed => {
+                    return self
+                        .reconcile_terminal_claim_from_disk(&claim.authoritative_event)
+                        .await
+                        .unwrap_or(TerminalClaimResult::Failed);
+                }
             }
         }
-        TerminalClaimResult::Failed
+        self.reconcile_terminal_claim_from_disk(&claim.authoritative_event)
+            .await
+            .unwrap_or(TerminalClaimResult::Failed)
     }
 
-    /// Durably records delivery and interaction release. Failure intentionally leaves the
-    /// durable receipt at `claimed`, which recovery treats as authoritative and never resends.
+    /// A replace/fsync failure can be ambiguous: the bytes may already be the durable file even
+    /// though the writer returned an error. Re-read the authoritative store before permitting a
+    /// caller to establish a different terminal event elsewhere.
+    async fn reconcile_terminal_claim_from_disk(
+        &self,
+        candidate: &AuthoritativeTerminalEventV1,
+    ) -> Option<TerminalClaimResult> {
+        let path = self.evidence_path.as_ref()?;
+        let bytes = tokio::fs::read(path).await.ok()?;
+        let document = serde_json::from_slice::<TaskEvidenceDocument>(&bytes).ok()?;
+        let receipt = document.terminalization_receipts.iter().find(|receipt| {
+            receipt.terminal_identity == candidate.terminal_identity
+                && receipt.delivery_state.is_authoritative_claim()
+        })?;
+        let result = match receipt.authoritative_event.clone() {
+            Some(authoritative)
+                if authoritative.is_self_consistent()
+                    && authoritative.fingerprint == candidate.fingerprint =>
+            {
+                TerminalClaimResult::AlreadyClaimed(authoritative)
+            }
+            Some(authoritative) if authoritative.is_self_consistent() => {
+                TerminalClaimResult::Conflict {
+                    authoritative: Some(authoritative),
+                    candidate_fingerprint: candidate.fingerprint.clone(),
+                }
+            }
+            _ => TerminalClaimResult::Conflict {
+                authoritative: None,
+                candidate_fingerprint: candidate.fingerprint.clone(),
+            },
+        };
+        self.last_persisted_revision
+            .fetch_max(document.revision, Ordering::AcqRel);
+        let mut guard = self.document.lock().await;
+        if guard
+            .as_ref()
+            .is_none_or(|current| current.revision <= document.revision)
+        {
+            *guard = Some(document);
+        }
+        Some(result)
+    }
+
+    /// Durably records independently convergent terminal delivery and post-terminal effects.
     pub(crate) async fn update_terminal_interaction(
         &self,
         update: TerminalInteractionUpdate,
@@ -3050,15 +3778,27 @@ impl TaskEvidenceLedger {
                     if !receipt.delivery_state.is_authoritative_claim() {
                         return false;
                     }
-                    if candidate_update.delivery_state != TerminalDeliveryState::Claimed {
+                    if receipt.delivery_state != TerminalDeliveryState::Delivered
+                        && candidate_update.delivery_state != TerminalDeliveryState::Claimed
+                    {
                         receipt.delivery_state = candidate_update.delivery_state;
                     }
+                    receipt.app_server_acknowledged |= candidate_update.app_server_acknowledged;
+                    receipt.runtime_status_converged |= candidate_update.runtime_status_converged;
+                    receipt.rollout_mirrored |= candidate_update.rollout_mirrored;
+                    receipt.parent_notification_completed |=
+                        candidate_update.parent_notification_completed;
+                    receipt.post_terminal_cleanup_completed |=
+                        candidate_update.post_terminal_cleanup_completed;
                     receipt.active_turn_detached |= candidate_update.active_turn_detached;
                     receipt.terminal_interaction_released |=
                         candidate_update.terminal_interaction_released;
                     receipt.recovery_state = candidate_update.recovery_state;
                     for (phase, duration) in candidate_update.phase_timings_ns {
                         receipt.phase_timings_ns.insert(phase, duration);
+                    }
+                    if let Some(terminalization) = candidate_update.terminalization {
+                        receipt.terminalization = Some(terminalization);
                     }
                     receipt.updated_at = timestamp();
                     document.updated_at = timestamp();
@@ -3067,6 +3807,95 @@ impl TaskEvidenceLedger {
                 .await;
             match transition {
                 AtomicReviewTransition::Persisted(updated) => return updated,
+                AtomicReviewTransition::Superseded => continue,
+                AtomicReviewTransition::Failed => return false,
+            }
+        }
+        false
+    }
+
+    pub(crate) async fn authoritative_terminal_event(
+        &self,
+        terminal_identity: &str,
+    ) -> Option<AuthoritativeTerminalEventV1> {
+        self.document
+            .lock()
+            .await
+            .as_ref()?
+            .terminalization_receipts
+            .iter()
+            .find(|receipt| receipt.terminal_identity == terminal_identity)
+            .and_then(|receipt| receipt.authoritative_event.clone())
+            .filter(AuthoritativeTerminalEventV1::is_self_consistent)
+    }
+
+    pub(crate) async fn pending_authoritative_terminal_events(
+        &self,
+    ) -> Vec<AuthoritativeTerminalEventV1> {
+        self.document
+            .lock()
+            .await
+            .as_ref()
+            .map(|document| {
+                document
+                    .terminalization_receipts
+                    .iter()
+                    .filter(|receipt| {
+                        receipt.delivery_state.is_authoritative_claim()
+                            && (!receipt.app_server_acknowledged
+                                || !receipt.runtime_status_converged
+                                || !receipt.rollout_mirrored
+                                || !receipt.parent_notification_completed
+                                || !receipt.post_terminal_cleanup_completed
+                                || !receipt.active_turn_detached
+                                || !receipt.terminal_interaction_released)
+                    })
+                    .filter_map(|receipt| receipt.authoritative_event.clone())
+                    .filter(AuthoritativeTerminalEventV1::is_self_consistent)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn acknowledge_terminal_event(
+        &self,
+        terminal_identity: &str,
+        fingerprint: &str,
+    ) -> bool {
+        if !self.allows_kd4_completion() {
+            return true;
+        }
+        for _ in 0..8 {
+            let Some(expected_revision) = self.document_revision().await else {
+                return false;
+            };
+            let terminal_identity = terminal_identity.to_string();
+            let fingerprint = fingerprint.to_string();
+            let transition = self
+                .atomic_review_update(expected_revision, None, None, |document| {
+                    let Some(receipt) = document
+                        .terminalization_receipts
+                        .iter_mut()
+                        .find(|receipt| receipt.terminal_identity == terminal_identity)
+                    else {
+                        return false;
+                    };
+                    let Some(authoritative) = receipt.authoritative_event.as_ref() else {
+                        return false;
+                    };
+                    if !authoritative.is_self_consistent()
+                        || authoritative.fingerprint != fingerprint
+                    {
+                        return false;
+                    }
+                    receipt.app_server_acknowledged = true;
+                    receipt.updated_at = timestamp();
+                    document.updated_at = timestamp();
+                    true
+                })
+                .await;
+            match transition {
+                AtomicReviewTransition::Persisted(acknowledged) => return acknowledged,
                 AtomicReviewTransition::Superseded => continue,
                 AtomicReviewTransition::Failed => return false,
             }
@@ -3104,6 +3933,22 @@ impl TaskEvidenceLedger {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn terminal_timing_receipt_for_test(
+        &self,
+        terminal_identity: &str,
+    ) -> Option<TurnTimingTerminalization> {
+        self.document
+            .lock()
+            .await
+            .as_ref()?
+            .terminalization_receipts
+            .iter()
+            .find(|receipt| receipt.terminal_identity == terminal_identity)?
+            .terminalization
+            .clone()
     }
 
     pub(crate) async fn mark_user_source_capture_failed(&self) {
@@ -3968,6 +4813,7 @@ impl TaskEvidenceLedger {
             return PlanUpdateOutcome {
                 public_update: requested_public,
                 effect: PlanUpdateEffect::NoOp,
+                unfinished_mutation_obligation: None,
             };
         }
         // Only a model-authored transition of the currently active, explicitly
@@ -4281,6 +5127,9 @@ impl TaskEvidenceLedger {
                         plan: document.plan.iter().map(plan_item_from_evidence).collect(),
                     },
                     effect,
+                    unfinished_mutation_obligation: Some(has_unfinished_mutation_obligation(
+                        document,
+                    )),
                 }
             })
             .await
@@ -4288,6 +5137,7 @@ impl TaskEvidenceLedger {
             return PlanUpdateOutcome {
                 public_update: requested_public,
                 effect: PlanUpdateEffect::NoOp,
+                unfinished_mutation_obligation: None,
             };
         };
         self.persist_document(&snapshot).await;
@@ -4861,11 +5711,13 @@ impl TaskEvidenceLedger {
         if !self.allows_kd4_completion() {
             return None;
         }
+        let desktop_activation = self.desktop_activation_runtime_snapshot();
         let gate = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
-            task_is_tracked(document)
-                .then(|| derive_completion_gate(document, self.evidence_path.as_deref()))?
+            task_is_tracked(document).then(|| {
+                derive_completion_gate(document, self.evidence_path.as_deref(), &desktop_activation)
+            })?
         };
         if gate.status == TaskCompletionStatus::Passed {
             return None;
@@ -4909,6 +5761,7 @@ impl TaskEvidenceLedger {
         let mut authoritative_input_errors = authoritative_input_errors.to_vec();
         authoritative_input_errors.sort();
         authoritative_input_errors.dedup();
+        let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
         let (
             document_revision,
             root_task_id,
@@ -5177,7 +6030,11 @@ impl TaskEvidenceLedger {
             let mut typed_evidence = typed_evidence.to_vec();
             typed_evidence.sort();
             typed_evidence.dedup();
-            let evidence_gate = derive_completion_gate(document, self.evidence_path.as_deref());
+            let evidence_gate = derive_completion_gate(
+                document,
+                self.evidence_path.as_deref(),
+                &desktop_activation_runtime,
+            );
             let locally_obtainable_proof_routes =
                 completion_review_locally_obtainable_proof_routes(&evidence_gate);
             let desktop_activation =
@@ -5185,9 +6042,11 @@ impl TaskEvidenceLedger {
                     .desktop_activation_receipt
                     .as_ref()
                     .filter(|receipt| {
-                        desktop_activation_receipt_is_complete(receipt)
-                            && receipt.implementation_identity_hash.as_deref()
-                                == Some(implementation_identity_hash.as_str())
+                        desktop_activation_receipt_is_complete(
+                            receipt,
+                            &desktop_activation_runtime,
+                            document,
+                        )
                     });
             let reviewer_visible_evidence = serde_json::json!({
                 "implementationIdentity": implementation_identity_hash,
@@ -6924,82 +7783,6 @@ impl TaskEvidenceLedger {
         })
     }
 
-    pub(crate) async fn pre_review_final_proof_reasons(
-        &self,
-        implementation_identity: &str,
-        source_identity: &str,
-        requirement_identity: &str,
-    ) -> Vec<String> {
-        let guard = self.document.lock().await;
-        let Some(document) = guard.as_ref() else {
-            return vec!["task evidence is unavailable for final-proof preflight".to_string()];
-        };
-        let mut reasons = derive_completion_gate(document, self.evidence_path.as_deref()).reasons;
-        let routes = document.plan.iter().filter(|step| {
-            step.validation_disposition != ValidationDisposition::NotRequired
-                || step.validation_route.is_some()
-        });
-        for step in routes {
-            let Some(route) = step.validation_route.as_ref() else {
-                reasons.push(format!(
-                    "validation obligation `{}` has no structured route",
-                    step.id
-                ));
-                continue;
-            };
-            for leaf in &route.leaves {
-                let has_current_proof = document.command_receipts.iter().rev().any(|receipt| {
-                    receipt.command == leaf.argv
-                        && receipt.user_source_ledger_hash.as_deref() == Some(source_identity)
-                        && receipt.requirement_manifest_hash.as_deref()
-                            == Some(requirement_identity)
-                        && (receipt.implementation_identity_hash.as_deref()
-                            == Some(implementation_identity)
-                            || command_receipt_has_current_proof_identity(document, receipt))
-                });
-                if !has_current_proof {
-                    reasons.push(format!(
-                        "validation proof for obligation `{}` is missing, failed, or stale",
-                        step.id
-                    ));
-                }
-            }
-        }
-        if document.plan.is_empty()
-            && let Some(work_unit) = document.planning.work_unit.as_ref()
-            && (work_unit.validation_disposition != ValidationDisposition::NotRequired
-                || work_unit.validation_route.is_some())
-        {
-            if let Some(route) = work_unit.validation_route.as_ref() {
-                for leaf in &route.leaves {
-                    let has_current_proof = document.command_receipts.iter().rev().any(|receipt| {
-                        receipt.command == leaf.argv
-                            && receipt.user_source_ledger_hash.as_deref() == Some(source_identity)
-                            && receipt.requirement_manifest_hash.as_deref()
-                                == Some(requirement_identity)
-                            && (receipt.implementation_identity_hash.as_deref()
-                                == Some(implementation_identity)
-                                || command_receipt_has_current_proof_identity(document, receipt))
-                    });
-                    if !has_current_proof {
-                        reasons.push(format!(
-                            "validation proof for obligation `{}` is missing, failed, or stale",
-                            work_unit.id
-                        ));
-                    }
-                }
-            } else {
-                reasons.push(format!(
-                    "validation obligation `{}` has no structured route",
-                    work_unit.id
-                ));
-            }
-        }
-        reasons.sort();
-        reasons.dedup();
-        reasons
-    }
-
     /// Seals the correctness-affecting completion basis and its deterministic
     /// validation plan. Callers must establish mutation/hook/child quiescence and
     /// the existing workspace-finalization fence before invoking this boundary.
@@ -7014,6 +7797,7 @@ impl TaskEvidenceLedger {
             .evidence_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
+        let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
         let ((result, changed), snapshot) = self
             .update_document(move |document| {
                 let basis = completion_candidate_basis(document, &input);
@@ -7028,13 +7812,27 @@ impl TaskEvidenceLedger {
                     MAX_COMPLETION_CHECKPOINT_HUNK_BYTES,
                 );
 
-                let proof_observations = current_final_proof_observations(
+                let validation_aggregate_started = Instant::now();
+                let (proof_observations, validation_launch_count, validation_process_ns) =
+                    current_final_proof_observations(
+                        document,
+                        &basis,
+                        &candidate,
+                        &validation_plan,
+                    );
+                let telemetry = FinalProofSealTelemetryV1 {
+                    validation_launch_count,
+                    validation_process_ns,
+                    validation_aggregate_ns: u64::try_from(
+                        validation_aggregate_started.elapsed().as_nanos(),
+                    )
+                    .unwrap_or(u64::MAX),
+                };
+                let mut gate = derive_completion_gate(
                     document,
-                    &basis,
-                    &candidate,
-                    &validation_plan,
+                    self.evidence_path.as_deref(),
+                    &desktop_activation_runtime,
                 );
-                let mut gate = derive_completion_gate(document, self.evidence_path.as_deref());
                 let missing_or_failed = missing_or_failed_obligations(
                     &candidate,
                     &validation_plan,
@@ -7106,7 +7904,19 @@ impl TaskEvidenceLedger {
                         == Some(&failure_fingerprint)
                     && let Some(decision) = document.final_proof.terminal_decision.clone()
                 {
-                    return (FinalProofSealResultV1::Memoized(decision), false);
+                    return (
+                        FinalProofSealResultV1::Memoized {
+                            gate: decision,
+                            checkpoint_tokens: document
+                                .final_proof
+                                .checkpoint
+                                .as_ref()
+                                .map(|checkpoint| checkpoint.estimated_tokens)
+                                .unwrap_or_default(),
+                            telemetry,
+                        },
+                        false,
+                    );
                 }
 
                 let checkpoint = match completion_checkpoint_for(
@@ -7187,6 +7997,7 @@ impl TaskEvidenceLedger {
                         candidate,
                         validation_plan,
                         checkpoint: Box::new(checkpoint),
+                        telemetry,
                         gate,
                     },
                     true,
@@ -7222,38 +8033,108 @@ impl TaskEvidenceLedger {
         ))
     }
 
-    pub(crate) async fn memoized_finalization_result(&self) -> Option<String> {
+    pub(crate) async fn memoized_finalization_result(&self, turn_id: &str) -> Option<String> {
         let guard = self.document.lock().await;
         let document = guard.as_ref()?;
         let candidate = document.final_proof.candidate.as_ref()?;
         let checkpoint = document.final_proof.checkpoint.as_ref()?;
         let memo = document.final_proof.finalization_memo.as_ref()?;
-        (memo.candidate_id == candidate.candidate_id
+        let recovery_identity = completion_recovery_identity(
+            document.final_proof.basis.as_ref()?,
+            turn_id,
+            memo.terminal_hooks_completed,
+            memo.mutation_quiescent,
+        );
+        (memo.turn_id.as_deref() == Some(turn_id)
+            && memo.terminal_hooks_completed
+            && memo.mutation_quiescent
+            && memo.recovery_identity.as_ref() == Some(&recovery_identity)
+            && memo.candidate_id == candidate.candidate_id
             && memo.checkpoint_id == checkpoint.checkpoint_id)
             .then(|| memo.final_message.clone())
     }
 
-    pub(crate) async fn record_finalization_result(&self, final_message: String) -> bool {
+    pub(crate) async fn completion_recovery_intent(
+        &self,
+        open_turn_id: &str,
+    ) -> Option<CompletionRecoveryIntentV1> {
+        let guard = self.document.lock().await;
+        let document = guard.as_ref()?;
+        let candidate = document.final_proof.candidate.as_ref()?;
+        let checkpoint = document.final_proof.checkpoint.as_ref()?;
+        let memo = document.final_proof.finalization_memo.as_ref()?;
+        let recovery_identity = completion_recovery_identity(
+            document.final_proof.basis.as_ref()?,
+            open_turn_id,
+            memo.terminal_hooks_completed,
+            memo.mutation_quiescent,
+        );
+        (memo.turn_id.as_deref() == Some(open_turn_id)
+            && memo.terminal_hooks_completed
+            && memo.mutation_quiescent
+            && memo.recovery_identity.as_ref() == Some(&recovery_identity)
+            && memo.candidate_id == candidate.candidate_id
+            && memo.checkpoint_id == checkpoint.checkpoint_id)
+            .then(|| CompletionRecoveryIntentV1 {
+                turn_id: open_turn_id.to_string(),
+                memo_identity: memo.identity.clone(),
+                final_message: memo.final_message.clone(),
+            })
+    }
+
+    pub(crate) async fn current_finalization_memo_identity(&self) -> Option<String> {
+        self.document
+            .lock()
+            .await
+            .as_ref()?
+            .final_proof
+            .finalization_memo
+            .as_ref()
+            .map(|memo| memo.identity.clone())
+    }
+
+    pub(crate) async fn record_finalization_result(
+        &self,
+        turn_id: String,
+        final_message: String,
+        terminal_hooks_completed: bool,
+        mutation_quiescent: bool,
+    ) -> bool {
         let Some((recorded, snapshot)) = self
             .update_document(|document| {
-                let (Some(candidate), Some(checkpoint)) = (
+                let (Some(basis), Some(candidate), Some(checkpoint)) = (
+                    document.final_proof.basis.as_ref(),
                     document.final_proof.candidate.as_ref(),
                     document.final_proof.checkpoint.as_ref(),
                 ) else {
                     return false;
                 };
+                let recovery_identity = completion_recovery_identity(
+                    basis,
+                    &turn_id,
+                    terminal_hooks_completed,
+                    mutation_quiescent,
+                );
                 let identity = canonical_hash(
                     "KD4_COMPLETION_FINALIZATION_MEMO_V1",
                     &serde_json::json!({
                         "candidate_id": candidate.candidate_id,
                         "checkpoint_id": checkpoint.checkpoint_id,
-                        "final_message": final_message,
+                        "turn_id": &turn_id,
+                        "terminal_hooks_completed": terminal_hooks_completed,
+                        "mutation_quiescent": mutation_quiescent,
+                        "recovery_identity": &recovery_identity,
+                        "final_message": &final_message,
                     }),
                 );
                 document.final_proof.finalization_memo = Some(CompletionFinalizationMemoV1 {
                     identity,
                     candidate_id: candidate.candidate_id.clone(),
                     checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    turn_id: Some(turn_id),
+                    terminal_hooks_completed,
+                    mutation_quiescent,
+                    recovery_identity: Some(recovery_identity),
                     final_message,
                 });
                 document.updated_at = timestamp();
@@ -7273,6 +8154,11 @@ impl TaskEvidenceLedger {
         let source_capture_failed = self.user_source_capture_failed();
         let mut latest_gate = None;
         for persistence_retry in 0..8 {
+            if persistence_retry > 0 {
+                let mut state = self.lock_freshness_state();
+                state.diagnostics.conservative_reruns =
+                    state.diagnostics.conservative_reruns.saturating_add(1);
+            }
             let freshness_ready = self
                 .refresh_external_file_freshness_for(if persistence_retry == 0 {
                     FreshnessPurpose::CompletionFresh
@@ -7284,6 +8170,7 @@ impl TaskEvidenceLedger {
                 continue;
             }
             let completion_proof_manifest = self.completion_proof_manifest();
+            let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
             let mut freshness_state_changed = false;
             let (gate, snapshot) = self
                 .update_document(|document| {
@@ -7301,7 +8188,11 @@ impl TaskEvidenceLedger {
                     if self.evidence_path.is_some() {
                         resolve_risk(document, "task-evidence-storage-failure");
                     }
-                    let mut gate = derive_completion_gate(document, self.evidence_path.as_deref());
+                    let mut gate = derive_completion_gate(
+                        document,
+                        self.evidence_path.as_deref(),
+                        &desktop_activation_runtime,
+                    );
                     overlay_completion_review_gate(document, &mut gate, source_capture_failed);
                     document.completion = Some(gate.clone());
                     document.updated_at = timestamp();
@@ -7354,6 +8245,7 @@ impl TaskEvidenceLedger {
         if gate.status != TaskCompletionStatus::Blocked {
             gate.status = TaskCompletionStatus::Partial;
         }
+        let desktop_activation_runtime = self.desktop_activation_runtime_snapshot();
         let snapshot = {
             let mut guard = self.document.lock().await;
             guard.as_mut().map(|document| {
@@ -7364,8 +8256,11 @@ impl TaskEvidenceLedger {
                     );
                 }
                 if snapshot_revision.is_some() && snapshot_revision != Some(document.revision) {
-                    let current_gate =
-                        derive_completion_gate(document, self.evidence_path.as_deref());
+                    let current_gate = derive_completion_gate(
+                        document,
+                        self.evidence_path.as_deref(),
+                        &desktop_activation_runtime,
+                    );
                     if current_gate.status == TaskCompletionStatus::Blocked {
                         gate.status = TaskCompletionStatus::Blocked;
                     }
@@ -7796,7 +8691,6 @@ impl TaskEvidenceLedger {
         });
     }
 
-    #[cfg(test)]
     pub(crate) fn freshness_diagnostics(&self) -> FreshnessDiagnostics {
         self.lock_freshness_state().diagnostics
     }
@@ -7826,7 +8720,7 @@ impl TaskEvidenceLedger {
         &self,
         events: &[codex_agent_task_store::WorkspaceEvent],
         root_session_id: &str,
-        _same_root_typed_actor_ids: &BTreeSet<String>,
+        same_root_typed_actor_ids: &BTreeSet<String>,
     ) -> bool {
         if self.mode != TaskEvidenceMode::Kd4Completion {
             return true;
@@ -7873,16 +8767,13 @@ impl TaskEvidenceLedger {
         let root_actor_id = format!("root:{root_session_id}");
         let accepted = scanned
             .iter()
-            .filter(|event| match event.actor_kind {
-                codex_agent_task_store::WorkspaceActorKind::Root => {
-                    event.actor_id.as_deref() == Some(root_actor_id.as_str())
-                }
-                codex_agent_task_store::WorkspaceActorKind::Legacy => event
-                    .actor_id
-                    .as_deref()
-                    .is_some_and(|actor_id| actor_id.starts_with(&legacy_actor_prefix)),
-                codex_agent_task_store::WorkspaceActorKind::Typed
-                | codex_agent_task_store::WorkspaceActorKind::External => false,
+            .filter(|event| {
+                workspace_event_actor_is_admitted(
+                    event,
+                    &root_actor_id,
+                    &legacy_actor_prefix,
+                    same_root_typed_actor_ids,
+                )
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -8445,6 +9336,24 @@ impl TaskEvidenceLedger {
         expected_dossier_snapshot: Option<&str>,
         update: impl FnOnce(&mut TaskEvidenceDocument) -> T + Send,
     ) -> AtomicReviewTransition<T> {
+        self.atomic_review_update_with_commit(
+            expected_revision,
+            expected_implementation_identity,
+            expected_dossier_snapshot,
+            update,
+            || {},
+        )
+        .await
+    }
+
+    async fn atomic_review_update_with_commit<T: Send>(
+        &self,
+        expected_revision: u64,
+        expected_implementation_identity: Option<&str>,
+        expected_dossier_snapshot: Option<&str>,
+        update: impl FnOnce(&mut TaskEvidenceDocument) -> T + Send,
+        commit: impl FnOnce() + Send,
+    ) -> AtomicReviewTransition<T> {
         let Some(path) = self.evidence_path.clone() else {
             return AtomicReviewTransition::Failed;
         };
@@ -8511,6 +9420,7 @@ impl TaskEvidenceLedger {
             Ok(Ok(())) => {
                 self.last_persisted_revision
                     .store(candidate.revision, Ordering::Release);
+                commit();
                 *guard = Some(candidate);
                 AtomicReviewTransition::Persisted(result)
             }
@@ -8759,7 +9669,7 @@ fn current_final_proof_observations(
     basis: &CompletionCandidateBasisV1,
     candidate: &CompletionCandidateV1,
     plan: &ValidationPlanV1,
-) -> Vec<FinalProofObservationV1> {
+) -> (Vec<FinalProofObservationV1>, u32, u64) {
     let mut by_step = document
         .final_proof
         .proof_observations
@@ -8769,6 +9679,8 @@ fn current_final_proof_observations(
         })
         .map(|observation| (observation.plan_step_id.clone(), observation.clone()))
         .collect::<BTreeMap<_, _>>();
+    let mut validation_receipt_ids = BTreeSet::new();
+    let mut validation_process_ns = 0_u64;
     for step in &plan.steps {
         let Some(receipt) = document.command_receipts.iter().rev().find(|receipt| {
             receipt.command == step.argv
@@ -8787,6 +9699,10 @@ fn current_final_proof_observations(
         }) else {
             continue;
         };
+        if validation_receipt_ids.insert(receipt.id.clone()) {
+            validation_process_ns =
+                validation_process_ns.saturating_add(receipt.duration_ms.saturating_mul(1_000_000));
+        }
         let invocation_identity = canonical_hash(
             "KD4_VALIDATION_INVOCATION_V1",
             &serde_json::json!({"argv": receipt.command, "cwd": receipt.cwd}),
@@ -8818,7 +9734,11 @@ fn current_final_proof_observations(
             },
         );
     }
-    by_step.into_values().collect()
+    (
+        by_step.into_values().collect(),
+        u32::try_from(validation_receipt_ids.len()).unwrap_or(u32::MAX),
+        validation_process_ns,
+    )
 }
 
 fn missing_or_failed_obligations(
@@ -8992,7 +9912,8 @@ fn completion_checkpoint_for(
             }
         })
         .collect::<Vec<_>>();
-    let evidence_gate = derive_completion_gate(document, None);
+    let evidence_gate =
+        derive_completion_gate(document, None, &DesktopActivationRuntimeSnapshot::default());
     let unresolved_blockers = evidence_gate.reasons;
     let unresolved_risks = document
         .risks
@@ -10473,17 +11394,6 @@ const fn owner_relationship_disposition_name(
     }
 }
 
-fn checkpoint_step_status(status: &StepStatus) -> &'static str {
-    match status {
-        StepStatus::Pending => "pending",
-        StepStatus::InProgress => "in_progress",
-        StepStatus::Implemented => "implemented",
-        StepStatus::Passed | StepStatus::Completed => "passed",
-        StepStatus::Blocked => "blocked",
-        StepStatus::Skipped => "skipped",
-    }
-}
-
 fn review_identity_is_current(
     document: &TaskEvidenceDocument,
     expected_implementation_identity: Option<&str>,
@@ -11169,11 +12079,345 @@ fn canonical_hash(format_name: &str, value: &Value) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn desktop_activation_receipt_is_complete(_receipt: &DesktopActivationReceipt) -> bool {
-    // Desktop activation proof remains planned until a host-owned, publish-ID-bound
-    // initialization handshake exists. Legacy receipts came from command stdout and
-    // must never satisfy the completion gate, even when loaded from persisted state.
-    false
+fn parse_desktop_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn current_desktop_activation_obligation(
+    document: &TaskEvidenceDocument,
+) -> Option<DesktopActivationObligation> {
+    let mut requiring_plan_step_ids = document
+        .plan
+        .iter()
+        .filter(|step| step.status != StepStatus::Skipped && step.requires_desktop_activation)
+        .map(|step| step.id.clone())
+        .collect::<Vec<_>>();
+    requiring_plan_step_ids.sort();
+    requiring_plan_step_ids.dedup();
+    if requiring_plan_step_ids.is_empty() {
+        return None;
+    }
+    let completion = document.completion_review_v2.as_ref();
+    let implementation_identity = canonical_hash(
+        "KD4_DESKTOP_ACTIVATION_IMPLEMENTATION_IDENTITY_V1",
+        &serde_json::json!({
+            "threadId": document.thread_id,
+            "evidenceEpoch": document.evidence_epoch,
+            "hostMutationRevision": document.host_mutation_revision,
+            "completionEpoch": completion.map(|ledger| ledger.completion_epoch),
+            "manifestRevision": completion.map(|ledger| ledger.manifest_revision),
+            "latestFileHashes": document.latest_file_hashes,
+            "latestGeneratedArtifactHashes": document.latest_generated_artifact_hashes,
+        }),
+    );
+    let activation_obligation_identity = canonical_hash(
+        "KD4_DESKTOP_ACTIVATION_OBLIGATION_IDENTITY_V1",
+        &serde_json::json!({
+            "threadId": document.thread_id,
+            "evidenceEpoch": document.evidence_epoch,
+            "implementationIdentity": implementation_identity,
+            "requiringPlanStepIds": requiring_plan_step_ids,
+        }),
+    );
+    Some(DesktopActivationObligation {
+        thread_id: document.thread_id.clone(),
+        evidence_epoch: document.evidence_epoch,
+        implementation_identity,
+        activation_obligation_identity,
+        requiring_plan_step_ids,
+    })
+}
+
+fn desktop_activation_challenge_public(
+    pending: &PendingDesktopActivationChallenge,
+) -> DesktopActivationChallenge {
+    DesktopActivationChallenge {
+        challenge_id: pending.challenge_identity.clone(),
+        thread_id: pending.thread_id.clone(),
+        evidence_epoch: pending.evidence_epoch,
+        implementation_identity: pending.implementation_identity_hash.clone(),
+        activation_obligation_identity: pending.activation_obligation_identity.clone(),
+        publisher_evidence_id: pending.publisher_evidence_id.clone(),
+        expected_installed_executable_path: pending.expected_installed_executable_path.clone(),
+        expected_installed_executable_sha256: pending.installed_executable_sha256.clone(),
+        publish_id: pending.publish_identity.clone(),
+        issued_at: pending.issued_at.clone(),
+        expires_at: pending.expires_at.clone(),
+    }
+}
+
+async fn verified_desktop_running_process(
+    evidence: &AuthoritativeDesktopInstallEvidence,
+) -> Result<DesktopRunningProcessObservation, DesktopActivationVerificationError> {
+    let expected = tokio::fs::canonicalize(&evidence.expected_installed_executable_path)
+        .await
+        .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
+    let running = tokio::fs::canonicalize(
+        std::env::current_exe()
+            .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?,
+    )
+    .await
+    .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
+    let sha256 = sha256_file(&expected)
+        .await
+        .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
+    if !desktop_paths_match(&expected.to_string_lossy(), &running.to_string_lossy())
+        || !sha256.eq_ignore_ascii_case(&evidence.installed_executable_sha256)
+        || !sha256.eq_ignore_ascii_case(&evidence.publish_identity)
+    {
+        return Err(DesktopActivationVerificationError::RunningExecutableMismatch);
+    }
+    let process_id = std::process::id();
+    Ok(DesktopRunningProcessObservation {
+        process_id,
+        process_identity: canonical_hash(
+            "KD4_DESKTOP_RUNNING_PROCESS_IDENTITY_V1",
+            &serde_json::json!({
+                "processId": process_id,
+                "path": normalize_path_for_identity(&running),
+                "sha256": &sha256,
+            }),
+        ),
+        executable_path: running.to_string_lossy().into_owned(),
+        executable_sha256: sha256,
+        observed_at: Utc::now().to_rfc3339(),
+    })
+}
+
+async fn verify_pending_desktop_running_process(
+    pending: &PendingDesktopActivationChallenge,
+) -> Result<(), DesktopActivationVerificationError> {
+    let expected = tokio::fs::canonicalize(&pending.expected_installed_executable_path)
+        .await
+        .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
+    let running = tokio::fs::canonicalize(
+        std::env::current_exe()
+            .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?,
+    )
+    .await
+    .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
+    let sha256 = sha256_file(&expected)
+        .await
+        .map_err(|_| DesktopActivationVerificationError::RunningExecutableMismatch)?;
+    if !desktop_paths_match(&expected.to_string_lossy(), &running.to_string_lossy())
+        || !sha256.eq_ignore_ascii_case(&pending.installed_executable_sha256)
+    {
+        return Err(DesktopActivationVerificationError::RunningExecutableMismatch);
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn desktop_paths_match(expected: &str, observed: &str) -> bool {
+    let expected = normalize_path_for_identity(Path::new(expected));
+    let observed = normalize_path_for_identity(Path::new(observed));
+    #[cfg(windows)]
+    {
+        expected.eq_ignore_ascii_case(&observed)
+    }
+    #[cfg(not(windows))]
+    {
+        expected == observed
+    }
+}
+
+fn desktop_install_evidence_hash(
+    evidence: &AuthoritativeDesktopInstallEvidence,
+    authenticated_channel_identity: &str,
+    authenticated_peer_identity: &str,
+) -> String {
+    canonical_hash(
+        DESKTOP_INSTALL_EVIDENCE_CANONICAL_FORMAT,
+        &serde_json::json!({
+            "schemaVersion": evidence.schema_version,
+            "trustedProducerVersion": evidence.trusted_producer_version,
+            "publisherEvidenceId": evidence.publisher_evidence_id,
+            "threadId": evidence.thread_id,
+            "evidenceEpoch": evidence.evidence_epoch,
+            "implementationIdentity": evidence.implementation_identity_hash,
+            "activationObligationIdentity": evidence.activation_obligation_identity,
+            "publishIdentity": evidence.publish_identity,
+            "installGeneration": evidence.install_generation,
+            "expectedInstalledExecutablePath": normalize_path_for_identity(Path::new(
+                &evidence.expected_installed_executable_path,
+            )),
+            "installedExecutableSha256": evidence.installed_executable_sha256,
+            "issuedAt": evidence.issued_at,
+            "expiresAt": evidence.expires_at,
+            "authenticatedHostChannel": authenticated_channel_identity,
+            "authenticatedHostPeer": authenticated_peer_identity,
+        }),
+    )
+}
+
+fn desktop_activation_receipt_hash(receipt: &DesktopActivationReceipt) -> String {
+    canonical_hash(
+        DESKTOP_ACTIVATION_RECEIPT_CANONICAL_FORMAT,
+        &serde_json::to_value(receipt).unwrap_or(Value::Null),
+    )
+}
+
+fn validate_authoritative_desktop_install_evidence(
+    evidence: &AuthoritativeDesktopInstallEvidence,
+    authenticated_channel_identity: &str,
+    authenticated_peer_identity: &str,
+    current_obligation: &DesktopActivationObligation,
+    now: DateTime<Utc>,
+) -> Result<(), DesktopActivationVerificationError> {
+    if evidence.schema_version != DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION
+        || !is_sha256_hex(&evidence.implementation_identity_hash)
+        || evidence.trusted_producer_version != DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION
+        || evidence.publisher_evidence_id.trim().is_empty()
+        || !is_sha256_hex(&evidence.publish_identity)
+        || !Path::new(&evidence.expected_installed_executable_path).is_absolute()
+        || !is_sha256_hex(&evidence.installed_executable_sha256)
+        || !evidence
+            .publish_identity
+            .eq_ignore_ascii_case(&evidence.installed_executable_sha256)
+        || authenticated_channel_identity.trim().is_empty()
+        || authenticated_peer_identity.trim().is_empty()
+        || authenticated_peer_identity != evidence.publisher_evidence_id
+    {
+        return Err(DesktopActivationVerificationError::InvalidAuthoritativeEvidence);
+    }
+    if evidence.thread_id != current_obligation.thread_id
+        || evidence.evidence_epoch != current_obligation.evidence_epoch
+        || evidence.implementation_identity_hash != current_obligation.implementation_identity
+        || evidence.activation_obligation_identity
+            != current_obligation.activation_obligation_identity
+    {
+        return Err(DesktopActivationVerificationError::ImplementationIdentityMismatch);
+    }
+    let issued_at = parse_desktop_timestamp(&evidence.issued_at)
+        .ok_or(DesktopActivationVerificationError::InvalidAuthoritativeEvidence)?;
+    if issued_at > now {
+        return Err(DesktopActivationVerificationError::AuthoritativeEvidenceStale);
+    }
+    Ok(())
+}
+
+fn desktop_activation_receipt_is_complete(
+    receipt: &DesktopActivationReceipt,
+    runtime: &DesktopActivationRuntimeSnapshot,
+    document: &TaskEvidenceDocument,
+) -> bool {
+    desktop_activation_receipt_is_complete_at(receipt, runtime, document, Utc::now())
+}
+
+fn desktop_activation_receipt_is_complete_at(
+    receipt: &DesktopActivationReceipt,
+    runtime: &DesktopActivationRuntimeSnapshot,
+    document: &TaskEvidenceDocument,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(obligation) = current_desktop_activation_obligation(document) else {
+        return false;
+    };
+    let last_mutation_at = document
+        .last_mutation_at
+        .as_deref()
+        .and_then(parse_desktop_timestamp);
+    desktop_activation_receipt_matches_live_proof_at(
+        receipt,
+        runtime,
+        &obligation,
+        last_mutation_at,
+        now,
+    )
+}
+
+fn desktop_activation_receipt_matches_live_proof_at(
+    receipt: &DesktopActivationReceipt,
+    runtime: &DesktopActivationRuntimeSnapshot,
+    obligation: &DesktopActivationObligation,
+    last_mutation_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(live) = runtime.live_proof.as_ref() else {
+        // Persisted and legacy receipts are audit evidence only. A process
+        // restart deliberately drops this non-serializable live proof.
+        return false;
+    };
+    let timestamps = [
+        &receipt.publish_install_timestamp,
+        &receipt.bootstrap_consumed_timestamp,
+        &receipt.running_executable_observed_timestamp,
+        &receipt.challenge_issued_timestamp,
+        &receipt.observation_timestamp,
+        &receipt.activation_timestamp,
+    ]
+    .map(|timestamp| parse_desktop_timestamp(timestamp));
+    let [
+        Some(installed_at),
+        Some(bootstrap_at),
+        Some(running_at),
+        Some(issued_at),
+        Some(observed_at),
+        Some(recorded_at),
+    ] = timestamps
+    else {
+        return false;
+    };
+    let post_mutation = last_mutation_at.is_none_or(|mutated_at| installed_at >= mutated_at);
+    runtime.availability == DesktopInstallEvidenceAvailability::AuthenticatedHostBootstrap
+        && receipt.trusted_producer_version == DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION
+        && receipt.thread_id == obligation.thread_id
+        && receipt.epoch == live.evidence_epoch
+        && receipt.epoch == obligation.evidence_epoch
+        && receipt.implementation_identity_hash.as_deref()
+            == Some(live.implementation_identity_hash.as_str())
+        && receipt.implementation_identity_hash.as_deref()
+            == Some(obligation.implementation_identity.as_str())
+        && receipt.activation_obligation_identity == live.activation_obligation_identity
+        && receipt.activation_obligation_identity == obligation.activation_obligation_identity
+        && receipt.authoritative_install_evidence_hash == live.authoritative_install_evidence_hash
+        && runtime.current_install_evidence_hash.as_deref()
+            == Some(live.authoritative_install_evidence_hash.as_str())
+        && receipt.publish_identity == live.publish_identity
+        && receipt.install_generation == live.install_generation
+        && receipt.authenticated_host_channel_identity == live.authenticated_host_channel_identity
+        && receipt.running_process_id == live.running_process_id
+        && receipt.running_process_identity == live.running_process_identity
+        && receipt.running_process_id != 0
+        && receipt.desktop_process_id != 0
+        && !receipt.publisher_evidence_id.trim().is_empty()
+        && !receipt.challenge_identity.trim().is_empty()
+        && !receipt
+            .initialization_observation_identity
+            .trim()
+            .is_empty()
+        && Path::new(&receipt.expected_installed_executable_path).is_absolute()
+        && Path::new(&receipt.observed_running_executable_path).is_absolute()
+        && Path::new(&receipt.desktop_executable_path).is_absolute()
+        && desktop_paths_match(
+            &receipt.expected_installed_executable_path,
+            &receipt.observed_running_executable_path,
+        )
+        && is_sha256_hex(&receipt.installed_executable_sha256)
+        && is_sha256_hex(&receipt.observed_running_executable_sha256)
+        && is_sha256_hex(&receipt.publish_identity)
+        && receipt
+            .publish_identity
+            .eq_ignore_ascii_case(&receipt.installed_executable_sha256)
+        && receipt
+            .installed_executable_sha256
+            .eq_ignore_ascii_case(&receipt.observed_running_executable_sha256)
+        && post_mutation
+        && installed_at <= bootstrap_at
+        && bootstrap_at <= running_at
+        && running_at <= issued_at
+        && issued_at <= observed_at
+        && observed_at <= recorded_at
+        && recorded_at <= now
+        && parse_desktop_timestamp(&receipt.challenge_expires_at)
+            .is_some_and(|expires_at| observed_at <= expires_at && now <= expires_at)
+        && parse_desktop_timestamp(&live.fresh_until).is_some_and(|fresh_until| now <= fresh_until)
+        && desktop_activation_receipt_hash(receipt) == live.receipt_hash
 }
 
 pub(crate) async fn sha256_file(path: &Path) -> io::Result<String> {
@@ -12310,6 +13554,8 @@ async fn load_existing_document_with_supported_version(
             | FROZEN_TASK_EVIDENCE_V6_SCHEMA_VERSION
             | FROZEN_TASK_EVIDENCE_V7_SCHEMA_VERSION
             | FROZEN_TASK_EVIDENCE_V8_SCHEMA_VERSION
+            | FROZEN_TASK_EVIDENCE_V9_SCHEMA_VERSION
+            | FROZEN_TASK_EVIDENCE_V10_SCHEMA_VERSION
             | TASK_EVIDENCE_SCHEMA_VERSION
     ) && let Err(reason) = validate_v5_completion_review(&document)
     {
@@ -13970,6 +15216,29 @@ fn implementation_obligations_satisfied(obligations: &[MutationObligationState])
     !obligations.is_empty() && obligations.iter().all(|obligation| obligation.satisfied)
 }
 
+fn has_unfinished_mutation_obligation(document: &TaskEvidenceDocument) -> bool {
+    let active_plan_obligation = document.plan.iter().any(|step| {
+        !matches!(
+            step.status,
+            StepStatus::Passed | StepStatus::Skipped | StepStatus::Blocked | StepStatus::Completed
+        ) && step
+            .mutation_obligations
+            .iter()
+            .any(|obligation| !obligation.satisfied)
+    });
+    active_plan_obligation
+        || document
+            .planning
+            .work_unit
+            .as_ref()
+            .is_some_and(|work_unit| {
+                work_unit
+                    .mutation_obligations
+                    .iter()
+                    .any(|obligation| !obligation.satisfied)
+            })
+}
+
 fn record_obligation_progress(
     obligations: &mut [MutationObligationState],
     changed_paths: &BTreeSet<String>,
@@ -14427,6 +15696,32 @@ fn classify_workspace_event(
     WorkspaceEventRelevance::Unrelated
 }
 
+fn workspace_event_actor_is_admitted(
+    event: &codex_agent_task_store::WorkspaceEvent,
+    root_actor_id: &str,
+    legacy_actor_prefix: &str,
+    same_root_typed_actor_ids: &BTreeSet<String>,
+) -> bool {
+    match event.actor_kind {
+        codex_agent_task_store::WorkspaceActorKind::Root => {
+            event.actor_id.as_deref() == Some(root_actor_id)
+        }
+        codex_agent_task_store::WorkspaceActorKind::Legacy => event
+            .actor_id
+            .as_deref()
+            .is_some_and(|actor_id| actor_id.starts_with(legacy_actor_prefix)),
+        codex_agent_task_store::WorkspaceActorKind::Typed => {
+            event.attribution_confidence
+                == codex_agent_task_store::AttributionConfidence::Definitive
+                && event
+                    .actor_id
+                    .as_ref()
+                    .is_some_and(|actor_id| same_root_typed_actor_ids.contains(actor_id))
+        }
+        codex_agent_task_store::WorkspaceActorKind::External => false,
+    }
+}
+
 const fn workspace_scope_history_is_unknown(scope_changed: bool, history_complete: bool) -> bool {
     scope_changed && !history_complete
 }
@@ -14631,7 +15926,9 @@ fn completion_review_locally_obtainable_proof_routes(gate: &TaskCompletionGate) 
                 Some(format!(
                     "Complete the named durable plan obligation and attach its deterministic focused proof: {reason}"
                 ))
-            } else if reason == "required Desktop activation receipt is missing or stale" {
+            } else if reason
+                .starts_with("required Desktop activation receipt is missing or stale")
+            {
                 Some(
                     "Desktop activation proof is unavailable until the native host implements a publish-ID-bound initialization handshake; command output cannot satisfy this requirement"
                         .to_string(),
@@ -14655,6 +15952,7 @@ fn completion_review_locally_obtainable_proof_routes(gate: &TaskCompletionGate) 
 fn derive_completion_gate(
     document: &TaskEvidenceDocument,
     evidence_path: Option<&Path>,
+    desktop_activation_runtime: &DesktopActivationRuntimeSnapshot,
 ) -> TaskCompletionGate {
     let mut blocked = Vec::new();
     let mut partial = Vec::new();
@@ -14747,10 +16045,22 @@ fn derive_completion_gate(
             .as_ref()
             .is_none_or(|receipt| {
                 receipt.epoch != document.evidence_epoch
-                    || !desktop_activation_receipt_is_complete(receipt)
+                    || !desktop_activation_receipt_is_complete(
+                        receipt,
+                        desktop_activation_runtime,
+                        document,
+                    )
             })
     {
-        partial.push("required Desktop activation receipt is missing or stale".to_string());
+        partial.push(match desktop_activation_runtime.availability {
+            DesktopInstallEvidenceAvailability::NoAuthenticatedHostTransport => {
+                "required Desktop activation receipt is missing or stale: no authenticated host transport"
+                    .to_string()
+            }
+            DesktopInstallEvidenceAvailability::AuthenticatedHostBootstrap => {
+                "required Desktop activation receipt is missing or stale".to_string()
+            }
+        });
     }
     for requirement in &document.generated_artifact_requirements {
         if let Some(path) = requirement.path.as_ref()

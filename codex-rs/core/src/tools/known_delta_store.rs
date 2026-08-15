@@ -118,6 +118,60 @@ impl EvidenceCandidate {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct KnownDeltaHit {
+    rendered_output: String,
+    raw_output_artifact: RawOutputArtifact,
+}
+
+impl KnownDeltaHit {
+    pub(crate) fn rendered_output(&self) -> &str {
+        &self.rendered_output
+    }
+
+    pub(crate) fn raw_output_artifact(&self) -> &RawOutputArtifact {
+        &self.raw_output_artifact
+    }
+}
+
+/// Immutable-read evidence prepared before command approval and execution.
+///
+/// The candidate is retained on a forced-fresh or shadow-validation launch so
+/// the eventual exact result can either promote the evidence or quarantine a
+/// contradiction. A reusable hit also carries a freshly minted task-scoped
+/// artifact; cache blobs themselves never cross the task boundary directly.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedKnownDelta {
+    identity: EvidenceIdentity,
+    candidate: Option<EvidenceCandidate>,
+    hit: Option<KnownDeltaHit>,
+    force_fresh: bool,
+}
+
+impl PreparedKnownDelta {
+    pub(crate) fn hit(&self) -> Option<&KnownDeltaHit> {
+        self.hit.as_ref()
+    }
+
+    pub(crate) fn is_hit(&self) -> bool {
+        self.hit.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_candidate(&self) -> bool {
+        self.candidate.is_some()
+    }
+}
+
+pub(crate) enum KnownDeltaExecutionObservation<'a> {
+    CompleteSuccess {
+        output: &'a [u8],
+        executor_cost: Duration,
+    },
+    CompleteFailure,
+    Incomplete,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Observation {
     Published,
@@ -205,6 +259,48 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
         fingerprint,
         provenance: format!("git-object:{requested}"),
         fingerprint_cost: started.elapsed(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_immutable_git_show(
+    codex_home: &Path,
+    thread_id: &str,
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    known_project_namespace: Option<&str>,
+    force_fresh: bool,
+) -> Option<PreparedKnownDelta> {
+    let identity = immutable_git_show_identity_with_project_namespace(
+        cwd,
+        program,
+        args,
+        known_project_namespace,
+    )
+    .await?;
+    let candidate = lookup(codex_home, &identity).await;
+    let hit = if !force_fresh
+        && let Some(candidate) = candidate.as_ref()
+        && candidate.reusable()
+    {
+        let raw_output_artifact = remint_task_handle(codex_home, thread_id, candidate).await;
+        if raw_output_artifact.model_projection().2.is_none() {
+            Some(KnownDeltaHit {
+                rendered_output: render_hit(candidate, &raw_output_artifact),
+                raw_output_artifact,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some(PreparedKnownDelta {
+        identity,
+        candidate,
+        hit,
+        force_fresh,
     })
 }
 
@@ -308,6 +404,41 @@ pub(crate) async fn record_contradictory_failure(
 ) {
     if had_candidate {
         quarantine(codex_home, identity).await;
+    }
+}
+
+pub(crate) async fn record_execution(
+    codex_home: &Path,
+    prepared: &PreparedKnownDelta,
+    observation: KnownDeltaExecutionObservation<'_>,
+) {
+    if prepared.is_hit() {
+        return;
+    }
+    match observation {
+        KnownDeltaExecutionObservation::CompleteSuccess {
+            output,
+            executor_cost,
+        } => {
+            let _ = record_success(
+                codex_home,
+                &prepared.identity,
+                prepared.candidate.as_ref(),
+                output,
+                executor_cost,
+            )
+            .await;
+        }
+        KnownDeltaExecutionObservation::CompleteFailure if prepared.force_fresh => {
+            record_contradictory_failure(
+                codex_home,
+                &prepared.identity,
+                prepared.candidate.is_some(),
+            )
+            .await;
+        }
+        KnownDeltaExecutionObservation::CompleteFailure
+        | KnownDeltaExecutionObservation::Incomplete => {}
     }
 }
 

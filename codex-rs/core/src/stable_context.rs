@@ -2,8 +2,6 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
-use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
-use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
@@ -283,9 +281,6 @@ enum StableContextSlot {
     Permissions,
     MultiAgent,
     RootCoordinator,
-    ContextWindow,
-    ContextWindowGuidance,
-    TokenBudget,
     RolloutBudget,
 }
 
@@ -302,10 +297,7 @@ impl StableContextSlot {
             Self::Permissions => StableContextKind::EnvironmentPermissions,
             Self::MultiAgent => StableContextKind::MultiAgent,
             Self::RootCoordinator => StableContextKind::RootCoordinator,
-            Self::ContextWindow
-            | Self::ContextWindowGuidance
-            | Self::TokenBudget
-            | Self::RolloutBudget => StableContextKind::CompactionCheckpoint,
+            Self::RolloutBudget => StableContextKind::CompactionCheckpoint,
         }
     }
 
@@ -321,9 +313,6 @@ impl StableContextSlot {
             Self::Permissions => "environment_permissions",
             Self::MultiAgent => "multi_agent",
             Self::RootCoordinator => "root_coordinator",
-            Self::ContextWindow => "context_window",
-            Self::ContextWindowGuidance => "context_window_guidance",
-            Self::TokenBudget => "token_budget",
             Self::RolloutBudget => "rollout_budget",
         }
     }
@@ -656,21 +645,6 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
             StableContextSlot::MultiAgent,
         ),
         (
-            CONTEXT_WINDOW_OPEN_TAG,
-            "</context_window>",
-            StableContextSlot::ContextWindow,
-        ),
-        (
-            CONTEXT_WINDOW_GUIDANCE_OPEN_TAG,
-            "</context_window_guidance>",
-            StableContextSlot::ContextWindowGuidance,
-        ),
-        (
-            "<token_budget>",
-            "</token_budget>",
-            StableContextSlot::TokenBudget,
-        ),
-        (
             "<rollout_budget>",
             "</rollout_budget>",
             StableContextSlot::RolloutBudget,
@@ -691,9 +665,6 @@ fn contains_known_open_marker(text: &str) -> bool {
         PLUGINS_INSTRUCTIONS_OPEN_TAG,
         "<permissions instructions>",
         MULTI_AGENT_MODE_OPEN_TAG,
-        CONTEXT_WINDOW_OPEN_TAG,
-        CONTEXT_WINDOW_GUIDANCE_OPEN_TAG,
-        "<token_budget>",
         "<rollout_budget>",
     ]
     .iter()

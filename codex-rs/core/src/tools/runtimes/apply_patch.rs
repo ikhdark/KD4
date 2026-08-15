@@ -265,6 +265,7 @@ impl ApplyPatchRuntime {
             (WorkspaceActorKind::Root, format!("root:{root_session_id}"))
         };
         let mutation_scope = WorkspaceMutationScope::exact_paths(normalized_repo_paths);
+        #[cfg(test)]
         ctx.session
             .services
             .command_execution
@@ -391,6 +392,7 @@ impl ApplyPatchRuntime {
                 )));
             }
         };
+        #[cfg(test)]
         ctx.session
             .services
             .git_workspace
@@ -398,7 +400,7 @@ impl ApplyPatchRuntime {
         ctx.session
             .services
             .git_workspace
-            .note_host_workspace_mutation();
+            .note_host_workspace_mutation_paths(&repo_root, &outcome.result().changed_paths);
         if let Some((ledger, bindings)) = self.owner_packets.take() {
             let post_paths = collect_post_mutation_paths(
                 req,

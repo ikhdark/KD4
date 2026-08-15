@@ -9,6 +9,7 @@ use super::ModelClient;
 use super::ModelRequestMeasurements;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
+use super::PromptContextBaseline;
 use super::UnauthorizedRecoveryExecution;
 use super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION;
 use super::WebsocketCachePublicationPermit;
@@ -31,6 +32,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::stable_context::StableContextManifest;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
+use crate::tool_history::ToolHistorySubstitution;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseCreateWsRequest;
@@ -60,6 +62,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
@@ -271,6 +274,50 @@ fn lane2_websocket_cache_drops_turn_scoped_state() {
     assert!(!cached.connection_reused());
 }
 
+#[test]
+fn startup_prewarm_rebases_only_an_empty_stable_context_prefix() {
+    let empty_request = history_test_request(Vec::new());
+    let mut empty_baseline = WebsocketHistoryBaseline {
+        request_prefix: CanonicalPrefixHash::from_items(&empty_request.input)
+            .expect("empty prefix hash"),
+        request_properties_fingerprint: super::responses_request_properties_fingerprint(
+            &empty_request,
+        )
+        .expect("request fingerprint"),
+        stable_context_fingerprint: [1; 32],
+        provider_response_id_established: true,
+        generation: 1,
+        normalization_policy_version: WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION,
+    };
+    assert!(super::rebase_empty_startup_prewarm_stable_context(
+        &mut empty_baseline,
+        /*previous_request_input_empty*/ true,
+        [2; 32],
+    ));
+    assert_eq!(empty_baseline.stable_context_fingerprint, [2; 32]);
+
+    let nonempty_request =
+        history_test_request(vec![history_test_item("established", Some("turn-1"))]);
+    let mut nonempty_baseline = WebsocketHistoryBaseline {
+        request_prefix: CanonicalPrefixHash::from_items(&nonempty_request.input)
+            .expect("non-empty prefix hash"),
+        request_properties_fingerprint: super::responses_request_properties_fingerprint(
+            &nonempty_request,
+        )
+        .expect("request fingerprint"),
+        stable_context_fingerprint: [1; 32],
+        provider_response_id_established: true,
+        generation: 1,
+        normalization_policy_version: WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION,
+    };
+    assert!(!super::rebase_empty_startup_prewarm_stable_context(
+        &mut nonempty_baseline,
+        /*previous_request_input_empty*/ false,
+        [2; 32],
+    ));
+    assert_eq!(nonempty_baseline.stable_context_fingerprint, [1; 32]);
+}
+
 fn history_test_item(text: &str, turn_id: Option<&str>) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -307,6 +354,15 @@ fn history_test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
     }
 }
 
+fn history_test_tool_output(call_id: &str, text: &str) -> ResponseItem {
+    ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text(text.to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
 fn history_test_provenance(request: &ResponsesApiRequest) -> PromptProvenanceSidecar {
     PromptProvenanceSidecar::from_assembled_items(&request.input, &StableContextManifest::default())
 }
@@ -338,9 +394,6 @@ fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
     let measurements = ModelRequestMeasurements::for_responses_request(
         &request,
         &history_test_provenance(&request),
-        None,
-        None,
-        None,
     )
     .expect("measure request");
     let mut first = ModelAttemptGuard::new(
@@ -383,17 +436,11 @@ fn model_request_measurements_count_serialized_tools_independently() {
     let baseline = ModelRequestMeasurements::for_responses_request(
         &without_tools,
         &history_test_provenance(&without_tools),
-        None,
-        None,
-        None,
     )
     .expect("measure request without tools");
     let measured = ModelRequestMeasurements::for_responses_request(
         &with_tools,
         &history_test_provenance(&with_tools),
-        None,
-        None,
-        None,
     )
     .expect("measure request with tools");
     let serialized_tools = serde_json::to_string(with_tools.tools.as_ref().unwrap()).unwrap();
@@ -413,9 +460,6 @@ fn model_request_measurements_reconcile_and_match_serialized_wire_payload() {
     let measured = ModelRequestMeasurements::for_responses_request(
         &request,
         &history_test_provenance(&request),
-        None,
-        None,
-        None,
     )
     .expect("measure request");
     let final_payload = serde_json::to_vec(&request).expect("serialize final request");
@@ -450,9 +494,6 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
     let mut first = ModelRequestMeasurements::for_responses_request(
         &first_request,
         &history_test_provenance(&first_request),
-        None,
-        None,
-        None,
     )
     .expect("measure first request");
     let mut baseline = None;
@@ -464,9 +505,6 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
     let mut second = ModelRequestMeasurements::for_responses_request(
         &second_request,
         &history_test_provenance(&second_request),
-        None,
-        None,
-        None,
     )
     .expect("measure second request");
     second.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"));
@@ -486,9 +524,6 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
     let mut third = ModelRequestMeasurements::for_responses_request(
         &changed_tools,
         &history_test_provenance(&changed_tools),
-        None,
-        None,
-        None,
     )
     .expect("measure changed fixed prefix");
     third.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"));
@@ -624,6 +659,7 @@ fn websocket_exact_stable_prefix_inherits_existing_response_id() {
         ResponseCreateWsRequest::from(&current),
         &current,
         [7; 32],
+        &[],
     );
     let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
     assert_eq!(
@@ -654,6 +690,7 @@ fn websocket_stable_replacement_rebases_without_stale_inheritance() {
         ResponseCreateWsRequest::from(&current),
         &current,
         [2; 32],
+        &[],
     );
     let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
     assert!(prepared.previous_response_id.is_none());
@@ -667,10 +704,115 @@ fn websocket_stable_replacement_rebases_without_stale_inheritance() {
         ResponseCreateWsRequest::from(&current),
         &current,
         [2; 32],
+        &[],
     );
     let ResponsesWsRequest::ResponseCreate(retry) = retry;
     assert!(retry.previous_response_id.is_none());
     assert_eq!(retry.input, current.input);
+}
+
+#[test]
+fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let bounded = "bounded provider-visible output";
+    let receipt = r#"{"version":1,"receipt_id":"receipt"}"#;
+    let original = history_test_request(vec![history_test_tool_output("call-1", bounded)]);
+    session.remember_request_history(&original, [7; 32]);
+    session.websocket_session.last_request = Some(original);
+    session.prompt_context_baseline = Some(PromptContextBaseline {
+        prompt_cache_key: Some("stale".to_string()),
+        category_hashes: BTreeMap::new(),
+        ordered_fixed_hashes: Vec::new(),
+    });
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(LastResponse {
+            response_id: "response-stale".to_string(),
+            items_added: Vec::new(),
+        })
+        .expect("response receiver open");
+    session.websocket_session.last_response_rx = Some(receiver);
+    let current = history_test_request(vec![history_test_tool_output("call-1", receipt)]);
+    let substitutions = [ToolHistorySubstitution {
+        item_index: 0,
+        call_id: "call-1".to_string(),
+        bounded_output_sha256: crate::tool_history::sha256(bounded.as_bytes()),
+        receipt_id: "receipt".to_string(),
+        substituted_output_sha256: crate::tool_history::sha256(receipt.as_bytes()),
+    }];
+
+    let (prepared, _) = session.prepare_websocket_request(
+        ResponseCreateWsRequest::from(&current),
+        &current,
+        [7; 32],
+        &substitutions,
+    );
+    let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
+    assert!(prepared.previous_response_id.is_none());
+    assert_eq!(prepared.input, current.input);
+    assert!(session.websocket_session.last_request.is_none());
+    assert!(session.websocket_session.last_request_history.is_none());
+    assert!(session.prompt_context_baseline.is_none());
+    assert!(session.websocket_cache_publication.is_none());
+
+    // A failed receipt-bearing rebase cannot resurrect the stale provider id.
+    let (retry, _) = session.prepare_websocket_request(
+        ResponseCreateWsRequest::from(&current),
+        &current,
+        [7; 32],
+        &substitutions,
+    );
+    let ResponsesWsRequest::ResponseCreate(retry) = retry;
+    assert!(retry.previous_response_id.is_none());
+    assert_eq!(retry.input, current.input);
+}
+
+#[test]
+fn tool_history_receipt_only_in_new_tail_keeps_proven_inheritance() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let original = history_test_request(vec![history_test_item("user", None)]);
+    session.remember_request_history(&original, [7; 32]);
+    session.websocket_session.last_request = Some(original.clone());
+    let assistant = history_test_item("assistant", None);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(LastResponse {
+            response_id: "response-proven".to_string(),
+            items_added: vec![assistant.clone()],
+        })
+        .expect("response receiver open");
+    session.websocket_session.last_response_rx = Some(receiver);
+    let receipt = history_test_tool_output("call-1", "receipt tail");
+    let mut current = original;
+    current.input = current
+        .input
+        .iter()
+        .cloned()
+        .chain([assistant, receipt.clone()])
+        .collect::<Vec<_>>()
+        .into();
+    let substitutions = [ToolHistorySubstitution {
+        item_index: 2,
+        call_id: "call-1".to_string(),
+        bounded_output_sha256: crate::tool_history::sha256(b"bounded tail"),
+        receipt_id: "receipt".to_string(),
+        substituted_output_sha256: crate::tool_history::sha256(b"receipt tail"),
+    }];
+
+    let (prepared, _) = session.prepare_websocket_request(
+        ResponseCreateWsRequest::from(&current),
+        &current,
+        [7; 32],
+        &substitutions,
+    );
+    let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
+    assert_eq!(
+        prepared.previous_response_id.as_deref(),
+        Some("response-proven")
+    );
+    assert_eq!(prepared.input.as_ref(), &[receipt]);
 }
 
 #[tokio::test]
@@ -723,6 +865,47 @@ async fn stable_context_fallback_request_replays_complete_input() {
 
     assert_eq!(normal.input.as_ref(), std::slice::from_ref(&projected));
     assert_eq!(fallback.input.as_ref(), &[stable, projected]);
+}
+
+#[tokio::test]
+async fn tool_history_fail_open_request_uses_unreplaced_input() {
+    let client = test_model_client(SessionSource::Cli);
+    let receipt = history_test_tool_output("call-1", "receipt-substituted");
+    let bounded = history_test_tool_output("call-1", "bounded provider-visible output");
+    let prompt = Prompt {
+        input: vec![receipt].into(),
+        stable_context_fallback_input: Vec::new().into(),
+        tool_history_fallback_input: vec![bounded.clone()].into(),
+        stable_context_tool_history_fallback_input: vec![bounded.clone()].into(),
+        ..Prompt::default()
+    };
+    let model_info = test_model_info();
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /* turn_id */ None,
+        format!("{}:0", client.state.thread_id),
+        /* parent_thread_id */ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let setup = client
+        .current_client_setup()
+        .await
+        .expect("client setup should resolve");
+
+    let request = client
+        .build_responses_request_with_fallbacks(
+            &setup.api_provider,
+            &prompt,
+            &model_info,
+            /* effort */ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /* service_tier */ None,
+            &responses_metadata,
+            /* use_stable_context_fallback */ false,
+            /* use_tool_history_fallback */ true,
+        )
+        .expect("fail-open request should build");
+    assert_eq!(request.input.as_ref(), &[bounded]);
 }
 
 #[test]

@@ -18,16 +18,11 @@ generationIndex: number, generationReason: TurnTimingGenerationReason,
  * Stable workflow purpose for the logical generation. Physical retries
  * inherit this value from their owning generation.
  */
-generationPurpose?: TurnTimingGenerationPurpose, disposition: TurnTimingGenerationDisposition, decisionBearing: boolean,
+generationPurpose?: TurnTimingGenerationPurpose, disposition: TurnTimingGenerationDisposition,
 /**
  * A redacted hash of only the structured state relevant to this request.
  */
-relevantStateFingerprint?: string, progressKinds?: Array<TurnTimingProgressKind>, nextStructuredActionChanged: boolean, unchangedRelevantState: boolean,
-/**
- * Exact hashed identity of the owner receipt proving that this
- * continuation was predetermined at the recorded state revision.
- */
-ownerProvedPredeterminedContinuation?: string, attemptKind: TurnTimingAttemptKind, isContinuation: boolean,
+relevantStateFingerprint?: string, progressKinds?: Array<TurnTimingProgressKind>, nextStructuredActionChanged: boolean, unchangedRelevantState: boolean, attemptKind: TurnTimingAttemptKind, isContinuation: boolean,
 /**
  * Directly observed model-stream wait for this physical attempt.
  */

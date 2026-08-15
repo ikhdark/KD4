@@ -130,8 +130,11 @@
       ]
     },
     "useStateDbOnly": {
-      "description": "If true, return from the state DB without scanning JSONL rollouts to repair thread metadata. Omitted or false preserves scan-and-repair behavior.",
-      "type": "boolean"
+      "description": "Selects local listing storage. Omitted or null prefers SQLite and permits scan-and-repair fallback only before pagination begins; true requires SQLite; false explicitly selects scan-and-repair.",
+      "type": [
+        "boolean",
+        "null"
+      ]
     }
   },
   "title": "ThreadListParams",

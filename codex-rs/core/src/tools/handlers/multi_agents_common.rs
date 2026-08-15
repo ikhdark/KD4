@@ -29,8 +29,8 @@ use serde_json::Value as JsonValue;
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = MIN_WAIT_TIMEOUT_MS;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
-pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-5.6-sol";
-pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
+pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-5.6-luna";
+pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Max;
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {
@@ -258,7 +258,7 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
 /// Provider catalogs may qualify the built-in model slug, so default resolution accepts a
 /// provider prefix while explicit model
 /// overrides continue to require an exact advertised model name. Role-locked values take
-/// precedence; every unlocked reasoning effort defaults independently to `high`.
+/// precedence; every unlocked reasoning effort defaults independently to `max`.
 pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     session: &Session,
     turn: &TurnContext,
@@ -384,6 +384,7 @@ fn models_manager_for_spawn_config(
     }
 
     create_model_provider(config.model_provider.clone(), turn.auth_manager.clone()).models_manager(
+        &config.model_provider_id,
         config.codex_home.to_path_buf(),
         config.model_catalog.clone(),
     )

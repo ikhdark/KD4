@@ -649,6 +649,7 @@ mod tests {
                         },
                     ))
                     .collect(),
+                    interrupted: false,
                 },
             })
             .expect("user input response should serialize")
@@ -665,6 +666,7 @@ mod tests {
                     },
                 ))
                 .collect(),
+                interrupted: false,
             }
         );
     }
@@ -900,6 +902,7 @@ mod tests {
 
         let response = ToolRequestUserInputResponse {
             answers: HashMap::new(),
+            interrupted: false,
         };
         let first_response = pending
             .take_resolution(&Op::UserInputAnswer {

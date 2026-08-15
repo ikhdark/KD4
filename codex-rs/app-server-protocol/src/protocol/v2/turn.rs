@@ -12,8 +12,10 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::plan_tool::PlanItemArg as CorePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
 pub use codex_protocol::protocol::ReasoningPolicySnapshot;
+pub use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::protocol::TaskCompletionGate as CoreTaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus as CoreTaskCompletionStatus;
+pub use codex_protocol::protocol::TurnTerminalizationReceipt;
 pub use codex_protocol::protocol::TurnTiming;
 use codex_protocol::user_input::ByteRange as CoreByteRange;
 use codex_protocol::user_input::TextElement as CoreTextElement;
@@ -156,7 +158,7 @@ pub struct TurnStartParams {
     #[ts(optional = nullable)]
     pub collaboration_mode: Option<CollaborationMode>,
 
-    /// @deprecated Ignored. Use `effort: "ultra"` for proactive multi-agent behavior.
+    /// @deprecated Ignored. Configure delegation independently of reasoning effort.
     #[experimental("turn/start.multiAgentMode")]
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,
@@ -419,6 +421,18 @@ pub struct TurnCompletedNotification {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub timing: Option<TurnTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub surfaced_result: Option<SurfacedToolResult>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTerminalizationCompletedNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub receipt: TurnTerminalizationReceipt,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

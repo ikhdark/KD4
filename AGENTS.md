@@ -26,11 +26,6 @@
   completion requires rebuilding and updating or replacing the local binary,
   then restarting the Desktop app.
 
-## Instruction scope
-
-When the user presents a file path or uploaded file, you are required to read the entire file.
-Do not over-engineer implementations or plans.
-
 ## Delegated and durable workflows
 
 Root sessions do not need inactive role procedures. When delegation, durable
@@ -49,13 +44,19 @@ runtime; do not inject unrelated role bodies. If experiancing agent issues, fall
 * Do not turn a directed fix into a broad fix.
 * Avoid blindly overwriting other agents' work, Compare both verisons and pick the better verison or combine the best compatible behavior.
 * When unsure, ask the user questions to collect intention and guidance.
+* Do not over-engineer implementations or plans.
+* When the user presents a file path or uploaded file, you are required to read the entire file.
+
+# Sessions
+
+- "C:\Users\kuh\Desktop\LOCAL-KD\sessions" contains the rollouts for the fork which are to be used for auditing and diagnosis. Do not use the default "C:\Users\kuh\.codex\sessions" path.
 
 ## Validation
 
 - Validation must stay task-scoped. Do not run full-suite or workspace-wide tests. Run only the narrowest tests that directly cover the changed behavior and its affected contract, unless told otherwise.
 
+
 # Benchmarking
 
 - Do not label unit-test duration, test-binary startup time, analytical action-count projections, stale compiled binaries, or source-level estimates as runtime benchmarks.
 - "C:\Users\kuh\Desktop\LOCAL-KD\backups" contains previous fork binarys that can be used for the A/B comparisons of the previous version to the current verison.
-- "C:\Users\kuh\Desktop\LOCAL-KD\sessions" contains the rollouts for the fork which are to be used for static diagnosis. 

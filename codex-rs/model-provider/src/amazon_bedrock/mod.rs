@@ -164,6 +164,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
 
     fn models_manager(
         &self,
+        _model_provider_id: &str,
         _codex_home: PathBuf,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {

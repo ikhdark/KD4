@@ -94,6 +94,7 @@ mod config_manager_service;
 mod connection_cleanup;
 mod connection_rpc_gate;
 mod current_time;
+mod desktop_activation;
 mod dynamic_tools;
 mod error_code;
 mod extensions;
@@ -475,6 +476,8 @@ pub async fn run_main_with_transport_options(
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<()> {
+    let desktop_activation_bootstrap =
+        Arc::new(desktop_activation::consume_desktop_activation_bootstrap());
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
         test_user_config_file_from_env(),
@@ -922,6 +925,7 @@ pub async fn run_main_with_transport_options(
             rpc_transport: analytics_rpc_transport(&transport),
             remote_control_handle: Some(remote_control_handle.clone()),
             plugin_startup_tasks: runtime_options.plugin_startup_tasks,
+            desktop_activation_bootstrap,
         }));
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();

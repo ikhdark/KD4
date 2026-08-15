@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::sync::TryLockError;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -75,7 +76,18 @@ fn parse_with_powershell_ast_request(
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     };
-    let mut parser = parser.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut parser = match parser.try_lock() {
+        Ok(parser) => parser,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            // Classification is synchronous, so queueing on the cached parser can
+            // hold an async shell admission worker indefinitely behind unrelated
+            // requests. Use a one-shot trusted parser under contention. Failure is
+            // still fail-closed and never admits the target command by itself.
+            let mut uncached_parser = None;
+            return parse_with_cached_process(&mut uncached_parser, executable, script, resolution);
+        }
+    };
     parse_with_cached_process(&mut parser, executable, script, resolution)
 }
 
@@ -773,6 +785,37 @@ mod tests {
                 vec!["Measure-Object".to_string()],
             ],
         );
+    }
+
+    #[test]
+    fn parser_cache_contention_does_not_queue_classification() {
+        let Some(powershell) = try_find_powershell_executable_blocking() else {
+            return;
+        };
+        let powershell = powershell.as_path().to_str().unwrap().to_string();
+        let flavor = PowershellFlavor::from_requested_executable(&powershell).unwrap();
+        let cached_parser = {
+            let mut parser_processes = PARSER_PROCESSES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            parser_processes
+                .entry(flavor)
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
+        let cached_parser_guard = cached_parser.lock().unwrap_or_else(PoisonError::into_inner);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+
+        std::thread::spawn(move || {
+            let result = parse_with_powershell_ast(&powershell, "Get-Content Cargo.toml");
+            let _ = result_tx.send(result);
+        });
+
+        let result = result_rx
+            .recv_timeout(POWERSHELL_PARSER_RESPONSE_TIMEOUT + Duration::from_secs(5))
+            .expect("classification must not wait for the occupied cached parser");
+        drop(cached_parser_guard);
+        assert!(matches!(result, PowershellParseOutcome::Analysis(_)));
     }
 
     #[test]

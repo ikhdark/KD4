@@ -69,6 +69,14 @@ use strum_macros::Display;
 use tracing::error;
 use ts_rs::TS;
 
+fn deserialize_present_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 pub use crate::approvals::ApplyPatchApprovalRequestEvent;
 pub use crate::approvals::ElicitationAction;
 pub use crate::approvals::ExecApprovalRequestEvent;
@@ -115,10 +123,6 @@ pub const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
 pub const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
 pub const REALTIME_CONVERSATION_OPEN_TAG: &str = "<realtime_conversation>";
 pub const REALTIME_CONVERSATION_CLOSE_TAG: &str = "</realtime_conversation>";
-pub const CONTEXT_WINDOW_OPEN_TAG: &str = "<context_window>";
-pub const CONTEXT_WINDOW_CLOSE_TAG: &str = "</context_window>";
-pub const CONTEXT_WINDOW_GUIDANCE_OPEN_TAG: &str = "<context_window_guidance>";
-pub const CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG: &str = "</context_window_guidance>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
 
 /// Removes the model-context prefix from a user message before displaying it.
@@ -131,13 +135,13 @@ pub fn strip_user_message_prefix(text: &str) -> &str {
 
 // TODO(anp): Replace `TurnEnvironmentSelection` with `PathUri` once path URIs carry environment
 // identifiers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct TurnEnvironmentSelection {
     pub environment_id: String,
     pub cwd: PathUri,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct TurnEnvironmentSelections {
     pub legacy_fallback_cwd: AbsolutePathBuf,
     pub environments: Vec<TurnEnvironmentSelection>,
@@ -1342,6 +1346,9 @@ pub struct ReasoningPolicyHistory {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Display, JsonSchema, TS)]
+// This public wire enum has hundreds of construction and match sites. Boxing
+// TurnComplete would be an API-wide migration for a layout-only optimization.
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]
 #[strum(serialize_all = "snake_case")]
@@ -1399,6 +1406,7 @@ pub enum EventMsg {
     /// v1 wire format uses `task_complete`; accept `turn_complete` for v2 interop.
     #[serde(rename = "task_complete", alias = "turn_complete")]
     TurnComplete(TurnCompleteEvent),
+    TurnTerminalizationComplete(TurnTerminalizationCompleteEvent),
 
     /// Transient policy decision emitted immediately before a stream attempt.
     ReasoningPolicyUpdated(ReasoningPolicySnapshot),
@@ -1790,6 +1798,11 @@ pub enum AgentStatus {
     Interrupted,
     /// Agent is done. Contains the final assistant message.
     Completed(Option<String>),
+    /// Agent completed by surfacing an authoritative typed tool result.
+    CompletedWithSurface {
+        last_agent_message: Option<String>,
+        surfaced_result: SurfacedToolResult,
+    },
     /// Agent encountered an error.
     Errored(String),
     /// Agent has been shutdown.
@@ -2061,12 +2074,6 @@ pub struct TurnTiming {
     /// from turn start and are diagnostic only; they are not additive buckets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_requests: Vec<TurnTimingModelRequest>,
-    /// Provider input attributable only to generations carrying a matching
-    /// owner-proved deterministic continuation receipt at the same state
-    /// revision. This is intentionally independent from observational
-    /// nonprogress.
-    #[serde(default)]
-    pub provably_avoidable_tokens: TurnTimingDiagnosticTokenAggregate,
     /// Provider usage observed on generations where neither relevant
     /// structured state nor the next-correct-action changed. This is a
     /// diagnostic and is never treated as measured avoidable savings.
@@ -2094,15 +2101,9 @@ pub struct TurnTiming {
 pub struct TurnTimingTerminalization {
     #[serde(default)]
     pub final_mutation_to_seal_ns: u64,
-    #[serde(default)]
-    pub candidate_to_validation_launch_ns: u64,
-    #[serde(default)]
     pub validation_process_ns: u64,
     #[serde(default)]
     pub validation_aggregate_ns: u64,
-    #[serde(default)]
-    pub validation_aggregate_to_gate_ns: u64,
-    #[serde(default)]
     pub completion_gate_ns: u64,
     #[serde(default)]
     pub review_preflight_ns: u64,
@@ -2150,6 +2151,46 @@ pub struct TurnTimingTerminalization {
     pub unclassified_ns: u64,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum TerminalizationDeliveryState {
+    NotAttempted,
+    Claimed,
+    Delivered,
+    DeliveryFailed,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum TerminalizationRecoveryState {
+    None,
+    Pending,
+    Recovered,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTerminalizationReceipt {
+    pub terminal_identity: String,
+    pub terminalization: TurnTimingTerminalization,
+    pub delivery_state: TerminalizationDeliveryState,
+    pub active_turn_detached: bool,
+    pub terminal_interaction_released: bool,
+    pub recovery_state: TerminalizationRecoveryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub deadline_exhausted_phase: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct TurnTerminalizationCompleteEvent {
+    pub turn_id: String,
+    pub receipt: TurnTerminalizationReceipt,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -2166,8 +2207,6 @@ pub struct TurnTimingModelRequest {
     pub generation_purpose: Option<TurnTimingGenerationPurpose>,
     #[serde(default)]
     pub disposition: TurnTimingGenerationDisposition,
-    #[serde(default)]
-    pub decision_bearing: bool,
     /// A redacted hash of only the structured state relevant to this request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2178,11 +2217,6 @@ pub struct TurnTimingModelRequest {
     pub next_structured_action_changed: bool,
     #[serde(default)]
     pub unchanged_relevant_state: bool,
-    /// Exact hashed identity of the owner receipt proving that this
-    /// continuation was predetermined at the recorded state revision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub owner_proved_predetermined_continuation: Option<String>,
     #[serde(default)]
     pub attempt_kind: TurnTimingAttemptKind,
     pub is_continuation: bool,
@@ -2256,10 +2290,10 @@ pub enum TurnTimingGenerationPurpose {
     #[serde(rename = "initial", alias = "initial_reasoning")]
     #[ts(rename = "initial")]
     InitialReasoning,
-    SourceDiscovery,
     #[serde(
         rename = "source_interpretation",
-        alias = "source_evidence_interpretation"
+        alias = "source_evidence_interpretation",
+        alias = "source_discovery"
     )]
     #[ts(rename = "source_interpretation")]
     SourceEvidenceInterpretation,
@@ -2268,9 +2302,7 @@ pub enum TurnTimingGenerationPurpose {
     ImplementationDecision,
     Wait,
     FailureDiagnosis,
-    #[serde(rename = "validation_launch", alias = "validation_selection")]
-    #[ts(rename = "validation_launch")]
-    ValidationSelection,
+    #[serde(alias = "validation_launch", alias = "validation_selection")]
     ValidationInterpretation,
     Repair,
     #[serde(rename = "agent_coordination", alias = "coordination")]
@@ -2312,28 +2344,181 @@ pub enum DeterministicContinuationHostAction {
     DrainArtifactRanges,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
+#[schemars(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
 pub struct TurnTimingDeterministicContinuationReceipt {
     pub class: DeterministicContinuationClass,
     pub resource_identity_hash: String,
     pub state_revision: String,
     pub host_action: DeterministicContinuationHostAction,
+    pub wire_identity: String,
+    /// Internal proof of the owner-specific action bounds. The owning
+    /// subsystem retains the exact typed bounds; telemetry identity carries
+    /// only this redacted hash. It is intentionally absent from every wire,
+    /// schema, and generated TypeScript representation.
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub action_bounds_hash: String,
     pub suppressed_continuation_count: u32,
-    /// Populated only by an explicit paired counterfactual measurement. Normal
-    /// runtime receipts leave this absent rather than estimating savings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub avoided_token_usage: Option<TurnTimingProviderTokenUsage>,
 }
 
 impl TurnTimingDeterministicContinuationReceipt {
-    pub fn identity(&self) -> String {
-        format!(
-            "{:?}:{}:{}:{:?}",
-            self.class, self.resource_identity_hash, self.state_revision, self.host_action
+    pub fn new(
+        class: DeterministicContinuationClass,
+        resource_identity_hash: String,
+        state_revision: String,
+        host_action: DeterministicContinuationHostAction,
+        action_bounds_hash: String,
+        suppressed_continuation_count: u32,
+    ) -> Self {
+        let wire_identity = derive_continuation_wire_identity(
+            class,
+            &resource_identity_hash,
+            &state_revision,
+            host_action,
+        );
+        Self {
+            class,
+            resource_identity_hash,
+            state_revision,
+            host_action,
+            wire_identity,
+            action_bounds_hash,
+            suppressed_continuation_count,
+        }
+    }
+
+    pub fn wire_identity(&self) -> String {
+        self.expected_wire_identity()
+    }
+
+    pub fn runtime_identity(&self) -> Option<String> {
+        if self.action_bounds_hash.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{}|bounds:{}:{}",
+            self.expected_wire_identity(),
+            self.action_bounds_hash.len(),
+            self.action_bounds_hash,
+        ))
+    }
+
+    fn expected_wire_identity(&self) -> String {
+        derive_continuation_wire_identity(
+            self.class,
+            &self.resource_identity_hash,
+            &self.state_revision,
+            self.host_action,
         )
+    }
+}
+
+fn derive_continuation_wire_identity(
+    class: DeterministicContinuationClass,
+    resource_identity_hash: &str,
+    state_revision: &str,
+    host_action: DeterministicContinuationHostAction,
+) -> String {
+    fn class_name(class: DeterministicContinuationClass) -> &'static str {
+        match class {
+            DeterministicContinuationClass::UnchangedWait => "unchanged_wait",
+            DeterministicContinuationClass::SourceBundle => "source_bundle",
+            DeterministicContinuationClass::SourceCoverage => "source_coverage",
+            DeterministicContinuationClass::ArtifactRange => "artifact_range",
+            DeterministicContinuationClass::AgentEventWait => "agent_event_wait",
+        }
+    }
+    fn action_name(action: DeterministicContinuationHostAction) -> &'static str {
+        match action {
+            DeterministicContinuationHostAction::AwaitStateChange => "await_state_change",
+            DeterministicContinuationHostAction::BatchSourceBundle => "batch_source_bundle",
+            DeterministicContinuationHostAction::ReuseCoveredSpan => "reuse_covered_span",
+            DeterministicContinuationHostAction::ReadMissingRanges => "read_missing_ranges",
+            DeterministicContinuationHostAction::DrainArtifactRanges => "drain_artifact_ranges",
+        }
+    }
+    format!(
+        "v1|{}|{}:{}|{}:{}|{}",
+        class_name(class),
+        resource_identity_hash.len(),
+        resource_identity_hash,
+        state_revision.len(),
+        state_revision,
+        action_name(host_action),
+    )
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeterministicContinuationReceiptRef<'a> {
+    class: DeterministicContinuationClass,
+    resource_identity_hash: &'a str,
+    state_revision: &'a str,
+    host_action: DeterministicContinuationHostAction,
+    wire_identity: String,
+    suppressed_continuation_count: u32,
+}
+
+impl Serialize for TurnTimingDeterministicContinuationReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let expected = self.expected_wire_identity();
+        DeterministicContinuationReceiptRef {
+            class: self.class,
+            resource_identity_hash: &self.resource_identity_hash,
+            state_revision: &self.state_revision,
+            host_action: self.host_action,
+            wire_identity: expected,
+            suppressed_continuation_count: self.suppressed_continuation_count,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeterministicContinuationReceiptOwned {
+    class: DeterministicContinuationClass,
+    resource_identity_hash: String,
+    state_revision: String,
+    host_action: DeterministicContinuationHostAction,
+    #[serde(default)]
+    wire_identity: Option<String>,
+    suppressed_continuation_count: u32,
+}
+
+impl<'de> Deserialize<'de> for TurnTimingDeterministicContinuationReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = DeterministicContinuationReceiptOwned::deserialize(deserializer)?;
+        let expected = derive_continuation_wire_identity(
+            wire.class,
+            &wire.resource_identity_hash,
+            &wire.state_revision,
+            wire.host_action,
+        );
+        if let Some(serialized) = wire.wire_identity
+            && serialized != expected
+        {
+            return Err(serde::de::Error::custom(
+                "deterministic continuation wireIdentity does not match its canonical public fields",
+            ));
+        }
+        Ok(Self {
+            class: wire.class,
+            resource_identity_hash: wire.resource_identity_hash,
+            state_revision: wire.state_revision,
+            host_action: wire.host_action,
+            wire_identity: expected,
+            action_bounds_hash: String::new(),
+            suppressed_continuation_count: wire.suppressed_continuation_count,
+        })
     }
 }
 
@@ -2364,15 +2549,17 @@ pub struct TurnTimingDiagnosticTokenAggregate {
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case", export_to = "v2/")]
 pub enum TurnTimingProgressKind {
-    NewInput,
+    #[serde(
+        alias = "new_input",
+        alias = "plan_change",
+        alias = "completion_state",
+        alias = "structured_action_change"
+    )]
     NewNamedEvidence,
     SourceClosure,
     WorkspaceMutation,
     ValidationResult,
-    PlanChange,
     FailureObservation,
-    CompletionState,
-    StructuredActionChange,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2416,12 +2603,12 @@ pub struct TurnTimingGenerationReasonCounts {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingGenerationDispositionCounts {
-    #[serde(default, alias = "unknown", alias = "decisionBearing")]
-    pub model_required: u32,
-    #[serde(default, alias = "ownerProvedDeterministic")]
-    pub owner_drained: u32,
     #[serde(default)]
-    pub suppressed: u32,
+    pub unknown: u32,
+    #[serde(default)]
+    pub decision_bearing: u32,
+    #[serde(default)]
+    pub deterministic: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2430,17 +2617,12 @@ pub struct TurnTimingGenerationDispositionCounts {
 pub struct TurnTimingGenerationPurposeCounts {
     #[serde(default, alias = "initial")]
     pub initial_reasoning: u32,
-    pub source_discovery: u32,
     #[serde(default, alias = "sourceInterpretation")]
     pub source_evidence_interpretation: u32,
-    #[serde(default)]
-    pub post_edit_inspection: u32,
     #[serde(default, alias = "implementation")]
     pub implementation_decision: u32,
     pub wait: u32,
     pub failure_diagnosis: u32,
-    #[serde(default, alias = "validationLaunch")]
-    pub validation_selection: u32,
     pub validation_interpretation: u32,
     pub repair: u32,
     #[serde(default, alias = "agentCoordination")]
@@ -2492,7 +2674,6 @@ pub struct TurnTimingPreFirstModelOutput {
     pub unattributed_pre_output_ns: u64,
     pub history_snapshot_ns: u64,
     pub normalization_ns: u64,
-    pub planning_identity_ns: u64,
     pub prompt_construction_ns: u64,
     pub request_transformation_ns: u64,
     pub serialization_ns: u64,
@@ -2739,7 +2920,14 @@ pub struct TurnTimingCounters {
     #[serde(default)]
     pub generations_by_purpose: TurnTimingGenerationPurposeCounts,
     #[serde(default)]
-    pub continuations_by_disposition: TurnTimingGenerationDispositionCounts,
+    pub generations_by_disposition: TurnTimingGenerationDispositionCounts,
+    /// Authoritative number of model boundaries suppressed by accepted
+    /// deterministic-continuation receipts. A receipt whose
+    /// `suppressed_continuation_count` is N contributes N, not one. Invalid,
+    /// rejected, and zero-count receipts contribute nothing. This counter is
+    /// independent of `generations_by_disposition`.
+    #[serde(default)]
+    pub suppressed_deterministic_continuation_count: u32,
     /// Bounded to the stable purpose enum's cardinality.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub purpose_aggregates: Vec<TurnTimingGenerationPurposeAggregate>,
@@ -2756,15 +2944,9 @@ pub struct TurnTimingCounters {
     #[serde(default)]
     pub planning_invalidation_count: u32,
     #[serde(default)]
-    pub planning_repeated_digest_count: u32,
-    #[serde(default)]
     pub planning_semantic_effect_count: u32,
     #[serde(default)]
     pub planning_failure_count: u32,
-    #[serde(default)]
-    pub post_edit_candidate_count: u32,
-    #[serde(default)]
-    pub post_edit_inspection_count: u32,
     #[serde(default)]
     pub failure_signature_count: u32,
     #[serde(default)]
@@ -2855,10 +3037,28 @@ pub struct TaskCompletionGate {
     pub evidence_path: Option<String>,
 }
 
+/// Authoritative typed tool result surfaced as the terminal result of a turn.
+/// `canonical_message`, when present, is owner-authored and may be copied
+/// unchanged into legacy last-message consumers. `value` is never rendered into
+/// synthetic assistant prose by the host.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SurfacedToolResult {
+    pub adapter: String,
+    pub value: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub canonical_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnCompleteEvent {
     pub turn_id: String,
     pub last_agent_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub surfaced_result: Option<SurfacedToolResult>,
     /// Terminal error details when the turn completed unsuccessfully.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2911,21 +3111,68 @@ pub struct ThreadSettingsAppliedEvent {
 pub struct ThreadSettingsSnapshot {
     pub model: String,
     pub model_provider_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
+    /// Outer `None` means an older snapshot did not supply this field; an
+    /// inner `None` records an explicit effective clear.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub service_tier: Option<Option<String>>,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub permission_profile: PermissionProfile,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub active_permission_profile: Option<Option<ActivePermissionProfile>>,
+    /// Complete sticky thread environment selection, including the legacy cwd.
+    /// Missing on rollouts written before environment persistence was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub environments: Option<TurnEnvironmentSelections>,
+    /// Runtime workspace roots used to materialize symbolic workspace permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    /// Workspace roots declared by the active permission profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub profile_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    /// Legacy sandbox projection retained alongside the canonical permission profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sandbox_policy: Option<SandboxPolicy>,
+    /// Effective Windows sandbox implementation for future tool execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub windows_sandbox_level: Option<WindowsSandboxLevel>,
     pub cwd: AbsolutePathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffortConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_summary: Option<ReasoningSummaryConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub personality: Option<Personality>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub reasoning_effort: Option<Option<ReasoningEffortConfig>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub reasoning_summary: Option<Option<ReasoningSummaryConfig>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub personality: Option<Option<Personality>>,
     pub collaboration_mode: CollaborationMode,
 }
 
@@ -3557,6 +3804,7 @@ impl InitialHistory {
                 RolloutItem::TurnContext(turn_context) => Some(turn_context),
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ToolManifest(_)
+                | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -3894,6 +4142,7 @@ fn multi_agent_version_from_items(
             RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
             RolloutItem::SessionMeta(_)
             | RolloutItem::ToolManifest(_)
+            | RolloutItem::SamplingBoundary(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -4055,6 +4304,9 @@ impl<'de> Deserialize<'de> for SessionMetaLine {
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
     ToolManifest(ToolManifestItem),
+    /// Model-invisible marker for the exact committed history prefix prepared
+    /// for one physical provider attempt.
+    SamplingBoundary(SamplingBoundaryItem),
     ResponseItem(ResponseItem),
     /// Legacy delivery item reconstructed as a model-visible `agent_message`.
     InterAgentCommunication(InterAgentCommunication),
@@ -4066,6 +4318,40 @@ pub enum RolloutItem {
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
     EventMsg(EventMsg),
+}
+
+/// Persisted before consuming a physical sampling attempt. The marker's
+/// position in the rollout is the history prefix transmitted by that attempt.
+/// An unresolved marker makes reconstructed context provenance conservative.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SamplingBoundaryItem {
+    pub sampling_request_id: String,
+    pub physical_attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub unresolved_context: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct ContextFragmentDigest {
+    pub key: String,
+    pub digest: String,
+}
+
+/// Identifies the exact accepted physical request that established the
+/// authoritative context baseline.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct AcceptedAttemptProvenance {
+    pub sampling_request_id: String,
+    pub physical_attempt_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct TurnContextProvenance {
+    pub accepted_attempt: AcceptedAttemptProvenance,
+    #[serde(default)]
+    pub fragment_digests: Vec<ContextFragmentDigest>,
 }
 
 /// Canonical tool surface used for a model request. The hash is computed from
@@ -4176,6 +4462,11 @@ pub struct TurnContextItem {
     pub realtime_active: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffortConfig>,
+    /// Durable proof that this baseline was transmitted and accepted by the
+    /// exact physical request named here. Legacy items omit this field and are
+    /// reconstructed as an unknown baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_provenance: Option<TurnContextProvenance>,
     // Compatibility-only field written with a default value so older Codex
     // versions can deserialize turn-context rollout items. It is no longer
     // read by context reconstruction and should be removed in a future schema
@@ -5352,6 +5643,8 @@ mod tests {
             .expect("turn timing counters object");
         counters.remove("logicalGenerationCount");
         counters.remove("generationsByReason");
+        counters.remove("generationsByDisposition");
+        counters.remove("suppressedDeterministicContinuationCount");
         counters.remove("attemptsByKind");
         for field in [
             "waitOnlyGenerationCount",
@@ -5397,6 +5690,14 @@ mod tests {
         assert_eq!(
             decoded.counters.generations_by_reason,
             TurnTimingGenerationReasonCounts::default()
+        );
+        assert_eq!(
+            decoded.counters.generations_by_disposition,
+            TurnTimingGenerationDispositionCounts::default()
+        );
+        assert_eq!(
+            decoded.counters.suppressed_deterministic_continuation_count,
+            0
         );
         assert_eq!(
             decoded.counters.attempts_by_kind,
@@ -5502,6 +5803,7 @@ mod tests {
     #[test]
     fn turn_complete_completion_gate_is_typed_and_backward_compatible() -> Result<()> {
         let event = TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
             error: None,
@@ -7126,6 +7428,7 @@ mod tests {
             multi_agent_mode: None,
             realtime_active: None,
             effort: None,
+            context_provenance: None,
             summary: ReasoningSummaryConfig::Auto,
         };
 
@@ -7336,15 +7639,13 @@ mod tests {
     }
 
     #[test]
-    fn generation_purpose_wire_contract_is_exact_and_legacy_aliases_deserialize() {
+    fn generation_purpose_wire_contract_is_exact_and_historical_spellings_are_readable() {
         let purposes = [
             TurnTimingGenerationPurpose::InitialReasoning,
-            TurnTimingGenerationPurpose::SourceDiscovery,
             TurnTimingGenerationPurpose::SourceEvidenceInterpretation,
             TurnTimingGenerationPurpose::Wait,
             TurnTimingGenerationPurpose::ArtifactContinuation,
             TurnTimingGenerationPurpose::ImplementationDecision,
-            TurnTimingGenerationPurpose::ValidationSelection,
             TurnTimingGenerationPurpose::ValidationInterpretation,
             TurnTimingGenerationPurpose::FailureDiagnosis,
             TurnTimingGenerationPurpose::Repair,
@@ -7360,12 +7661,10 @@ mod tests {
             serialized,
             vec![
                 serde_json::json!("initial"),
-                serde_json::json!("source_discovery"),
                 serde_json::json!("source_interpretation"),
                 serde_json::json!("wait"),
                 serde_json::json!("deterministic_tool_continuation"),
                 serde_json::json!("implementation"),
-                serde_json::json!("validation_launch"),
                 serde_json::json!("validation_interpretation"),
                 serde_json::json!("failure_diagnosis"),
                 serde_json::json!("repair"),
@@ -7391,10 +7690,6 @@ mod tests {
                 "implementation_decision",
                 TurnTimingGenerationPurpose::ImplementationDecision,
             ),
-            (
-                "validation_selection",
-                TurnTimingGenerationPurpose::ValidationSelection,
-            ),
             ("coordination", TurnTimingGenerationPurpose::Coordination),
             (
                 "terminal_completion_reasoning",
@@ -7407,6 +7702,154 @@ mod tests {
                 expected
             );
         }
+        for (historical, canonical) in [
+            (
+                "source_discovery",
+                TurnTimingGenerationPurpose::SourceEvidenceInterpretation,
+            ),
+            (
+                "validation_launch",
+                TurnTimingGenerationPurpose::ValidationInterpretation,
+            ),
+            (
+                "validation_selection",
+                TurnTimingGenerationPurpose::ValidationInterpretation,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<TurnTimingGenerationPurpose>(serde_json::json!(
+                    historical
+                ))
+                .expect("historical persisted purpose"),
+                canonical
+            );
+        }
+    }
+
+    #[test]
+    fn progress_kind_wire_contract_is_exact_and_historical_spellings_are_readable() {
+        let kinds = [
+            TurnTimingProgressKind::NewNamedEvidence,
+            TurnTimingProgressKind::SourceClosure,
+            TurnTimingProgressKind::WorkspaceMutation,
+            TurnTimingProgressKind::ValidationResult,
+            TurnTimingProgressKind::FailureObservation,
+        ];
+        assert_eq!(
+            kinds
+                .into_iter()
+                .map(|kind| serde_json::to_value(kind).expect("progress kind serialization"))
+                .collect::<Vec<_>>(),
+            vec![
+                serde_json::json!("new_named_evidence"),
+                serde_json::json!("source_closure"),
+                serde_json::json!("workspace_mutation"),
+                serde_json::json!("validation_result"),
+                serde_json::json!("failure_observation"),
+            ]
+        );
+        for historical in [
+            "new_input",
+            "plan_change",
+            "completion_state",
+            "structured_action_change",
+        ] {
+            assert_eq!(
+                serde_json::from_value::<TurnTimingProgressKind>(serde_json::json!(historical))
+                    .expect("historical persisted progress kind"),
+                TurnTimingProgressKind::NewNamedEvidence
+            );
+        }
+    }
+
+    #[test]
+    fn generation_counter_wire_contract_uses_exact_started_and_suppressed_units() {
+        let counters = serde_json::to_value(TurnTimingCounters::default())
+            .expect("turn timing counters serialization");
+        assert_eq!(
+            counters["generationsByDisposition"],
+            serde_json::json!({
+                "unknown": 0,
+                "decisionBearing": 0,
+                "deterministic": 0,
+            })
+        );
+        assert_eq!(counters["suppressedDeterministicContinuationCount"], 0);
+        for removed in [
+            "continuationsByDisposition",
+            "postEditCandidateCount",
+            "postEditInspectionCount",
+        ] {
+            assert!(counters.get(removed).is_none());
+        }
+        let purpose_counts = counters["generationsByPurpose"]
+            .as_object()
+            .expect("generation purpose counts");
+        for removed in [
+            "sourceDiscovery",
+            "postEditInspection",
+            "validationSelection",
+        ] {
+            assert!(purpose_counts.get(removed).is_none());
+        }
+    }
+
+    #[test]
+    fn removed_turn_timing_fields_are_absent_and_historical_payloads_still_deserialize() {
+        let current =
+            serde_json::to_value(TurnTiming::default()).expect("turn timing serialization");
+        assert!(current.get("provablyAvoidableTokens").is_none());
+        let terminalization = current["terminalization"]
+            .as_object()
+            .expect("terminalization object");
+        assert!(
+            terminalization
+                .get("candidateToValidationLaunchNs")
+                .is_none()
+        );
+        assert!(terminalization.get("validationAggregateToGateNs").is_none());
+
+        let mut historical = current;
+        historical["schemaVersion"] = serde_json::json!(9);
+        historical["provablyAvoidableTokens"] = serde_json::json!({
+            "logicalGenerations": 1,
+            "inputTokens": 2,
+            "cachedInputTokens": 3,
+            "visibleOutputTokens": 4,
+            "reasoningTokens": 5,
+            "totalTokens": 6,
+        });
+        historical["terminalization"]["candidateToValidationLaunchNs"] = serde_json::json!(7);
+        historical["terminalization"]["validationAggregateToGateNs"] = serde_json::json!(8);
+        let mut historical_request = serde_json::to_value(TurnTimingModelRequest::default())
+            .expect("model request serialization");
+        historical_request["decisionBearing"] = serde_json::json!(true);
+        historical_request["ownerProvedPredeterminedContinuation"] =
+            serde_json::json!("legacy-proof");
+        historical["modelRequests"] = serde_json::json!([historical_request]);
+
+        let decoded: TurnTiming =
+            serde_json::from_value(historical).expect("historical timing payload");
+        assert_eq!(decoded.schema_version, 9);
+        let reserialized = serde_json::to_value(decoded).expect("decoded timing serialization");
+        assert!(reserialized.get("provablyAvoidableTokens").is_none());
+        assert!(
+            reserialized["terminalization"]
+                .get("candidateToValidationLaunchNs")
+                .is_none()
+        );
+        assert!(
+            reserialized["terminalization"]
+                .get("validationAggregateToGateNs")
+                .is_none()
+        );
+        let request = &reserialized["modelRequests"][0];
+        assert!(request.get("decisionBearing").is_none());
+        assert!(
+            request
+                .get("ownerProvedPredeterminedContinuation")
+                .is_none()
+        );
     }
 
     #[test]
@@ -7442,22 +7885,71 @@ mod tests {
     }
 
     #[test]
-    fn continuation_receipt_legacy_json_defaults_avoided_usage_to_absent() {
+    fn continuation_receipt_legacy_avoided_usage_is_accepted_but_not_reserialized() {
         let receipt: TurnTimingDeterministicContinuationReceipt =
             serde_json::from_value(serde_json::json!({
                 "class": "unchanged_wait",
                 "resourceIdentityHash": "hash",
                 "stateRevision": "revision",
                 "hostAction": "await_state_change",
+                "avoidedTokenUsage": {
+                    "inputTokens": 123,
+                    "cachedInputTokens": 12,
+                    "outputTokens": 7,
+                    "reasoningOutputTokens": 3,
+                    "totalTokens": 130
+                },
                 "suppressedContinuationCount": 3
             }))
             .expect("legacy receipt");
-        assert_eq!(receipt.avoided_token_usage, None);
+        assert!(receipt.action_bounds_hash.is_empty());
+        assert!(receipt.runtime_identity().is_none());
+        let expected_wire_identity = receipt.wire_identity();
+        let serialized = serde_json::to_value(receipt).expect("receipt serialization");
+        assert!(serialized.get("avoidedTokenUsage").is_none());
+        assert!(serialized.get("actionBoundsHash").is_none());
+        assert_eq!(serialized["wireIdentity"], expected_wire_identity);
+    }
+
+    #[test]
+    fn continuation_receipt_validates_wire_identity_and_keeps_runtime_bounds_private() {
+        let first = TurnTimingDeterministicContinuationReceipt::new(
+            DeterministicContinuationClass::ArtifactRange,
+            "resource".to_string(),
+            "revision".to_string(),
+            DeterministicContinuationHostAction::DrainArtifactRanges,
+            "bounds-a".to_string(),
+            1,
+        );
+        let second = TurnTimingDeterministicContinuationReceipt::new(
+            DeterministicContinuationClass::ArtifactRange,
+            "resource".to_string(),
+            "revision".to_string(),
+            DeterministicContinuationHostAction::DrainArtifactRanges,
+            "bounds-b".to_string(),
+            1,
+        );
+        assert_eq!(first.wire_identity(), second.wire_identity());
+        assert_ne!(first.runtime_identity(), second.runtime_identity());
+
+        let serialized = serde_json::to_value(&first).expect("receipt serialization");
+        let deserialized: TurnTimingDeterministicContinuationReceipt =
+            serde_json::from_value(serialized.clone()).expect("receipt deserialization");
+        assert_eq!(deserialized.wire_identity(), first.wire_identity());
+        assert!(deserialized.runtime_identity().is_none());
+
+        let mut tampered_identity = serialized.clone();
+        tampered_identity["wireIdentity"] = serde_json::json!("v1|forged");
         assert!(
-            serde_json::to_value(receipt)
-                .expect("receipt serialization")
-                .get("avoidedTokenUsage")
-                .is_none()
+            serde_json::from_value::<TurnTimingDeterministicContinuationReceipt>(tampered_identity)
+                .is_err()
+        );
+
+        let mut tampered_fields = serialized;
+        tampered_fields["stateRevision"] = serde_json::json!("different");
+        assert!(
+            serde_json::from_value::<TurnTimingDeterministicContinuationReceipt>(tampered_fields)
+                .is_err()
         );
     }
 }

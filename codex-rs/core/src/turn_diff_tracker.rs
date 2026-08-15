@@ -6,6 +6,7 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 use codex_utils_path::normalize_for_path_comparison;
+use serde::Serialize;
 use sha1::digest::Output;
 #[cfg(test)]
 use sha2::Digest;
@@ -151,9 +152,26 @@ pub(crate) struct SourceCoverageRevision {
     pub(crate) modified_at_ms: i64,
     pub(crate) mutation_revision: u64,
     pub(crate) compaction_epoch: u64,
+    pub(crate) watcher_generation: u64,
+    pub(crate) host_mutation_generation: u64,
+    pub(crate) stable_file_identity: String,
+    pub(crate) freshness_identity: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+impl SourceCoverageRevision {
+    fn permits_reuse(&self, current: &Self) -> bool {
+        self.content_hash == current.content_hash
+            && self.size == current.size
+            && self.created_at_ms == current.created_at_ms
+            && self.modified_at_ms == current.modified_at_ms
+            && self.mutation_revision == current.mutation_revision
+            && self.compaction_epoch == current.compaction_epoch
+            && self.stable_file_identity == current.stable_file_identity
+            && self.freshness_identity == current.freshness_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct SourceLineInterval {
     pub(crate) start_line: usize,
     pub(crate) end_line: usize,
@@ -285,6 +303,8 @@ pub struct TurnDiffTracker {
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     next_revision: u64,
     mutation_revision: u64,
+    source_mutation_revisions: HashMap<TrackedPath, u64>,
+    unknown_source_mutation_revision: u64,
     rendered_diffs: HashMap<DiffCacheKey, Option<String>>,
     unified_diff: Option<String>,
     unvalidated_paths: HashSet<TrackedPath>,
@@ -310,6 +330,8 @@ impl Default for TurnDiffTracker {
             origin_by_current_path: HashMap::new(),
             next_revision: 0,
             mutation_revision: 0,
+            source_mutation_revisions: HashMap::new(),
+            unknown_source_mutation_revision: 0,
             rendered_diffs: HashMap::new(),
             unified_diff: None,
             unvalidated_paths: HashSet::new(),
@@ -451,6 +473,23 @@ impl TurnDiffTracker {
         self.compaction_epoch
     }
 
+    pub(crate) fn current_source_mutation_revision(
+        &self,
+        environment_id: &str,
+        paths: &[PathBuf],
+    ) -> u64 {
+        self.source_mutation_revisions
+            .iter()
+            .filter(|(tracked, _)| {
+                tracked.environment_id == environment_id
+                    && paths
+                        .iter()
+                        .any(|path| self.tracked_path_overlaps(tracked, path))
+            })
+            .map(|(_, revision)| *revision)
+            .fold(self.unknown_source_mutation_revision, u64::max)
+    }
+
     pub(crate) fn record_successful_compaction(&mut self) {
         self.compaction_epoch = self.compaction_epoch.saturating_add(1);
         self.source_coverage.clear();
@@ -470,7 +509,7 @@ impl TurnDiffTracker {
         } else {
             self.source_coverage
                 .get(&key)
-                .filter(|entry| entry.revision == revision)
+                .filter(|entry| entry.revision.permits_reuse(&revision))
                 .map(|entry| entry.intervals.clone())
                 .unwrap_or_default()
         };
@@ -487,6 +526,45 @@ impl TurnDiffTracker {
             },
         );
         SourceCoverageDecision { missing, reused }
+    }
+
+    /// Returns coverage for the current file metadata and turn revision without
+    /// mutating the ledger. This lets source tools suppress a fully covered
+    /// read before opening the file again.
+    // The independent revision dimensions are intentionally explicit here:
+    // callers must supply every freshness fence before a read can be reused.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn current_source_coverage(
+        &self,
+        key: &SourceCoverageKey,
+        size: u64,
+        created_at_ms: i64,
+        modified_at_ms: i64,
+        _watcher_generation: u64,
+        _host_mutation_generation: u64,
+        stable_file_identity: &str,
+        freshness_identity: &str,
+        requested: SourceLineInterval,
+    ) -> Option<(SourceCoverageRevision, SourceCoverageDecision)> {
+        let entry = self.source_coverage.get(key)?;
+        let source_mutation_revision = self
+            .current_source_mutation_revision(&key.environment_id, std::slice::from_ref(&key.path));
+        if entry.revision.size != size
+            || entry.revision.created_at_ms != created_at_ms
+            || entry.revision.modified_at_ms != modified_at_ms
+            || entry.revision.mutation_revision != source_mutation_revision
+            || entry.revision.compaction_epoch != self.compaction_epoch
+            || entry.revision.stable_file_identity != stable_file_identity
+            || entry.revision.freshness_identity != freshness_identity
+        {
+            return None;
+        }
+        let reused = intersect_intervals(&entry.intervals, requested);
+        let missing = subtract_intervals(requested, &reused);
+        Some((
+            entry.revision.clone(),
+            SourceCoverageDecision { missing, reused },
+        ))
     }
 
     pub(crate) fn validation_freshness_status(&self) -> ValidationFreshnessStatus {
@@ -652,7 +730,21 @@ impl TurnDiffTracker {
 
     fn record_mutation(&mut self, paths: HashSet<TrackedPath>) {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
-        self.source_coverage.clear();
+        if paths.is_empty() {
+            self.unknown_source_mutation_revision = self.mutation_revision;
+            self.source_coverage.clear();
+        } else {
+            for path in &paths {
+                self.source_mutation_revisions
+                    .insert(path.clone(), self.mutation_revision);
+            }
+            let display_roots = &self.display_roots_by_environment;
+            self.source_coverage.retain(|key, _| {
+                !paths.iter().any(|tracked| {
+                    source_coverage_key_overlaps_tracked_path(display_roots, key, tracked)
+                })
+            });
+        }
         self.last_post_mutation_validation_status = if self.has_successful_validation {
             ValidationFreshnessStatus::StaleAfterLastMutation
         } else {
@@ -663,6 +755,12 @@ impl TurnDiffTracker {
         } else {
             self.unvalidated_paths.extend(paths);
         }
+    }
+
+    fn tracked_path_overlaps(&self, tracked: &TrackedPath, path: &Path) -> bool {
+        let tracked_path = tracked_path_for_comparison(&self.display_roots_by_environment, tracked);
+        let path = normalize_tracked_path(path);
+        tracked_path == path || tracked_path.starts_with(&path) || path.starts_with(&tracked_path)
     }
 
     fn refresh_unified_diff(&mut self) {
@@ -1033,6 +1131,33 @@ fn normalize_tracked_path(path: &Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     normalized
+}
+
+fn tracked_path_for_comparison(
+    display_roots: &HashMap<String, PathBuf>,
+    tracked: &TrackedPath,
+) -> PathBuf {
+    if tracked.path.is_absolute() {
+        tracked.path.clone()
+    } else {
+        display_roots
+            .get(&tracked.environment_id)
+            .map_or_else(|| tracked.path.clone(), |root| root.join(&tracked.path))
+    }
+}
+
+fn source_coverage_key_overlaps_tracked_path(
+    display_roots: &HashMap<String, PathBuf>,
+    key: &SourceCoverageKey,
+    tracked: &TrackedPath,
+) -> bool {
+    if key.environment_id != tracked.environment_id {
+        return false;
+    }
+    let tracked_path = tracked_path_for_comparison(display_roots, tracked);
+    key.path == tracked_path
+        || key.path.starts_with(&tracked_path)
+        || tracked_path.starts_with(&key.path)
 }
 
 fn normalize_from_existing_ancestor(path: &Path) -> Option<PathBuf> {

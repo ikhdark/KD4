@@ -50,6 +50,7 @@ use crate::state::TerminalDeliveryState as CoordinatorDeliveryState;
 use crate::state::TurnState;
 use crate::state::TurnTerminalCoordinator;
 use crate::state::TurnTerminalPermit;
+use crate::task_evidence::AuthoritativeTerminalEventV1;
 use crate::task_evidence::CandidateDiffSnapshotV1;
 use crate::task_evidence::CompletionCheckpointV1;
 use crate::task_evidence::FinalProofSealInputV1;
@@ -59,6 +60,7 @@ use crate::task_evidence::TerminalDecisionClaim;
 use crate::task_evidence::TerminalDeliveryState as DurableDeliveryState;
 use crate::task_evidence::TerminalInteractionUpdate;
 use crate::task_evidence::TerminalRecoveryState;
+use crate::terminal_event_fingerprint;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
 use codex_login::AuthManager;
@@ -69,18 +71,25 @@ use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
+use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
+use codex_protocol::protocol::TerminalizationDeliveryState;
+use codex_protocol::protocol::TerminalizationRecoveryState;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnTerminalizationCompleteEvent;
+use codex_protocol::protocol::TurnTerminalizationReceipt;
+use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingTerminalization;
 
 use codex_features::Feature;
@@ -101,7 +110,13 @@ const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 const WORKSPACE_FINALIZATION_DISPATCH_SEAL_FAILED_REASON: &str =
     "the workspace finalization fence could not be sealed for terminal dispatch";
 
-pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TurnTaskResult {
+    pub(crate) last_agent_message: Option<String>,
+    pub(crate) surfaced_result: Option<codex_protocol::protocol::SurfacedToolResult>,
+}
+
+pub(crate) type SessionTaskResult = CodexResult<TurnTaskResult>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalWaitError {
@@ -236,33 +251,46 @@ fn apply_terminal_phase_timings(event: &mut EventMsg, phases: &BTreeMap<String, 
     let Some(timing) = timing else {
         return;
     };
-    timing.terminalization = TurnTimingTerminalization {
-        final_mutation_to_seal_ns: phases
-            .get("hooks_quiescence")
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(phases.get("fence").copied().unwrap_or_default())
-            .saturating_add(phases.get("final_proof_gate").copied().unwrap_or_default()),
-        completion_gate_ns: phases.get("final_proof_gate").copied().unwrap_or_default(),
-        review_preflight_ns: phases.get("review_preflight").copied().unwrap_or_default(),
-        review_ns: phases.get("review").copied().unwrap_or_default(),
-        terminal_memo_hit_count: u32::from(phases.contains_key("terminal_memo_hit")),
-        diff_refresh_count: u32::from(phases.contains_key("diff_refresh")),
-        preparation_ns: phases.get("preparation").copied().unwrap_or_default(),
-        hooks_quiescence_ns: phases.get("hooks_quiescence").copied().unwrap_or_default(),
-        fence_ns: phases.get("fence").copied().unwrap_or_default(),
-        freshness_ns: phases.get("freshness").copied().unwrap_or_default(),
-        gate_ns: phases.get("gate").copied().unwrap_or_default(),
-        durable_commit_ns: phases.get("durable_commit").copied().unwrap_or_default(),
-        delivery_attempt_ns: phases.get("delivery_attempt").copied().unwrap_or_default(),
-        interaction_release_ns: phases
-            .get("interaction_release")
-            .copied()
-            .unwrap_or_default(),
-        post_cleanup_ns: phases.get("post_cleanup").copied().unwrap_or_default(),
-        unclassified_ns: phases.get("unclassified").copied().unwrap_or_default(),
-        ..TurnTimingTerminalization::default()
-    };
+    apply_terminal_phase_timings_to_timing(timing, phases);
+}
+
+fn apply_terminal_phase_timings_to_timing(timing: &mut TurnTiming, phases: &BTreeMap<String, u64>) {
+    let terminalization = &mut timing.terminalization;
+    terminalization.final_mutation_to_seal_ns = phases
+        .get("hooks_quiescence")
+        .copied()
+        .unwrap_or_default()
+        .saturating_add(phases.get("fence").copied().unwrap_or_default())
+        .saturating_add(phases.get("final_proof_gate").copied().unwrap_or_default());
+    terminalization.completion_gate_ns =
+        phases.get("final_proof_gate").copied().unwrap_or_default();
+    terminalization.review_preflight_ns = terminalization
+        .review_preflight_ns
+        .max(phases.get("review_preflight").copied().unwrap_or_default());
+    terminalization.review_ns = terminalization
+        .review_ns
+        .max(phases.get("review").copied().unwrap_or_default());
+    terminalization.terminal_memo_hit_count = terminalization
+        .terminal_memo_hit_count
+        .max(u32::from(phases.contains_key("terminal_memo_hit")));
+    terminalization.diff_refresh_count = terminalization
+        .diff_refresh_count
+        .max(u32::from(phases.contains_key("diff_refresh")));
+    terminalization.preparation_ns = phases.get("preparation").copied().unwrap_or_default();
+    terminalization.hooks_quiescence_ns =
+        phases.get("hooks_quiescence").copied().unwrap_or_default();
+    terminalization.fence_ns = phases.get("fence").copied().unwrap_or_default();
+    terminalization.freshness_ns = phases.get("freshness").copied().unwrap_or_default();
+    terminalization.gate_ns = phases.get("gate").copied().unwrap_or_default();
+    terminalization.durable_commit_ns = phases.get("durable_commit").copied().unwrap_or_default();
+    terminalization.delivery_attempt_ns =
+        phases.get("delivery_attempt").copied().unwrap_or_default();
+    terminalization.interaction_release_ns = phases
+        .get("interaction_release")
+        .copied()
+        .unwrap_or_default();
+    terminalization.post_cleanup_ns = phases.get("post_cleanup").copied().unwrap_or_default();
+    terminalization.unclassified_ns = phases.get("unclassified").copied().unwrap_or_default();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,7 +536,7 @@ where
 
 #[derive(Debug)]
 enum TurnTerminalOutcome {
-    Completed { last_agent_message: Option<String> },
+    Completed { result: TurnTaskResult },
     ReturnedError(CodexErr),
     Aborted(TurnAbortReason),
     WorkerJoinFailed(WorkerJoinFailure),
@@ -550,6 +578,7 @@ struct TerminalFinalization {
     workspace_finalization_guard: Option<WorkspaceFinalizationGuard>,
     deadline: TerminalDeadline,
     mutation_quiescent: bool,
+    pending_turn_profile: Option<TurnProfileFact>,
 }
 
 struct TerminalInteractionMilestone {
@@ -1149,7 +1178,7 @@ impl Session {
         result: std::result::Result<SessionTaskResult, tokio::task::JoinError>,
     ) {
         let outcome = match result {
-            Ok(Ok(last_agent_message)) => TurnTerminalOutcome::Completed { last_agent_message },
+            Ok(Ok(result)) => TurnTerminalOutcome::Completed { result },
             Ok(Err(err)) => TurnTerminalOutcome::ReturnedError(err),
             Err(err) if err.is_cancelled() => {
                 TurnTerminalOutcome::WorkerJoinFailed(WorkerJoinFailure::Cancelled)
@@ -1297,6 +1326,7 @@ impl Session {
                     workspace_finalization_guard: None,
                     deadline: terminal_deadline,
                     mutation_quiescent: false,
+                    pending_turn_profile: None,
                 };
                 let result = AssertUnwindSafe(
                     session.finalize_turn_terminal(&mut finalization),
@@ -1383,8 +1413,34 @@ impl Session {
         active_turn_detached
     }
 
-    async fn publish_terminal_interaction_milestone(
+    fn emit_pending_turn_profile(
         &self,
+        finalization: &mut TerminalFinalization,
+    ) -> Option<TurnTimingTerminalization> {
+        let phases = finalization.deadline.phase_timings_ns();
+        let pending = finalization.pending_turn_profile.as_mut()?;
+        if let Some(timing) = pending.timing.as_mut() {
+            apply_terminal_phase_timings_to_timing(timing, &phases);
+        }
+        let terminalization = pending
+            .timing
+            .as_ref()
+            .map(|timing| timing.terminalization.clone());
+        let Some(permit) = finalization.permit.as_ref() else {
+            return terminalization;
+        };
+        if !permit.try_claim_analytics_emission() {
+            return terminalization;
+        }
+        let pending = finalization.pending_turn_profile.take()?;
+        self.services
+            .analytics_events_client
+            .track_turn_profile(pending);
+        terminalization
+    }
+
+    async fn publish_terminal_interaction_milestone(
+        self: &Arc<Self>,
         finalization: &mut TerminalFinalization,
         turn_context: &TurnContext,
         event: &mut EventMsg,
@@ -1393,53 +1449,31 @@ impl Session {
     ) -> TerminalInteractionMilestone {
         let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
         apply_terminal_phase_timings(event, &finalization.deadline.phase_timings_ns());
-        let durable_rollout = finalization
-            .deadline
-            .run(
-                "durable_commit",
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.persist_terminal_event_for_dispatch(
-                    event,
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                ),
-            )
-            .await;
-        let durable_rollout_committed = matches!(durable_rollout, Ok(Ok(())));
-        if !durable_rollout_committed {
-            let reason = match durable_rollout {
-                Ok(Ok(())) => unreachable!("successful rollout handled above"),
-                Ok(Err(error)) => error,
-                Err(TerminalWaitError::OperationTimedOut) => {
-                    "terminal event persistence timed out".to_string()
-                }
-                Err(TerminalWaitError::DeadlineExhausted) => {
-                    "terminalization deadline expired before terminal persistence".to_string()
-                }
-            };
-            warn!(turn_id = %turn_context.sub_id, %reason, "durable terminal decision was not established");
-            if let Some(permit) = finalization.permit.as_ref() {
-                permit.mark_durable_commit(false);
-            }
-            self.try_send_live_event(Event {
-                id: turn_context.sub_id.clone(),
-                msg: EventMsg::Error(ErrorEvent {
-                    message: format!(
-                        "Turn terminal storage failed; successful completion was not established: {reason}"
-                    ),
-                    codex_error_info: Some(CodexErrorInfo::InternalServerError),
-                }),
-            });
+        let Some(candidate_fingerprint) = terminal_event_fingerprint(event) else {
+            warn!(turn_id = %turn_context.sub_id, "refusing to publish a non-terminal event through terminalization");
             let cleared_active_turn = self.detach_terminal_turn(finalization).await;
             return TerminalInteractionMilestone {
                 live_attempted: false,
                 live_delivered: false,
                 cleared_active_turn,
             };
-        }
-
-        let claim = TerminalDecisionClaim {
+        };
+        let final_proof_identity = self
+            .services
+            .task_evidence
+            .current_finalization_memo_identity()
+            .await;
+        let candidate_authority = AuthoritativeTerminalEventV1 {
+            version: 1,
             terminal_identity: terminal_identity.clone(),
-            durable_outcome,
+            turn_id: turn_context.sub_id.clone(),
+            event: event.clone(),
+            fingerprint: candidate_fingerprint.clone(),
+            semantic_outcome: durable_outcome,
+            final_proof_identity,
+        };
+        let claim = TerminalDecisionClaim {
+            authoritative_event: candidate_authority.clone(),
             deadline_exhausted_phase: finalization.deadline.exhausted_phase(),
             mutation_quiescent: finalization.mutation_quiescent,
             durable_success_established,
@@ -1459,37 +1493,102 @@ impl Session {
                     .commit_terminal_decision_and_claim(claim),
             )
             .await;
-        let claim_committed = matches!(claim_result, Ok(TerminalClaimResult::Claimed));
-        if let Some(permit) = finalization.permit.as_ref() {
-            permit.mark_durable_commit(claim_committed);
-        }
-        if !claim_committed {
-            let reason = match claim_result {
-                Ok(TerminalClaimResult::AlreadyClaimed) => {
-                    "terminal live-delivery identity was already durably claimed"
-                }
-                Ok(TerminalClaimResult::Failed) => "terminal decision claim persistence failed",
-                Ok(TerminalClaimResult::Claimed) => unreachable!("handled above"),
-                Err(TerminalWaitError::OperationTimedOut) => {
-                    "terminal decision claim persistence timed out"
-                }
-                Err(TerminalWaitError::DeadlineExhausted) => {
-                    "terminalization deadline expired before the delivery claim"
-                }
-            };
-            warn!(turn_id = %turn_context.sub_id, %reason);
-            // Recovery or a duplicate in-process caller that sees an authoritative claim must
-            // converge interaction ownership without retrying the live terminal event.
-            if !matches!(claim_result, Ok(TerminalClaimResult::AlreadyClaimed)) {
-                self.try_send_live_event(Event {
-                    id: turn_context.sub_id.clone(),
-                    msg: EventMsg::Error(ErrorEvent {
-                        message: format!(
-                            "Turn terminal storage failed; successful completion was not established: {reason}"
+        let mut candidate_rollout_fallback_allowed = true;
+        let mut rollout_mirrored = false;
+        let mut authority = match claim_result {
+            Ok(TerminalClaimResult::Claimed(authority))
+            | Ok(TerminalClaimResult::AlreadyClaimed(authority)) => Some(authority),
+            Ok(TerminalClaimResult::Conflict {
+                authoritative: Some(authority),
+                candidate_fingerprint,
+            }) => {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    authoritative_fingerprint = %authority.fingerprint,
+                    %candidate_fingerprint,
+                    "rejected conflicting terminal outcome; preserving the first authoritative event"
+                );
+                Some(authority)
+            }
+            Ok(TerminalClaimResult::Conflict {
+                authoritative: None,
+                candidate_fingerprint,
+            }) => {
+                warn!(turn_id = %turn_context.sub_id, %candidate_fingerprint, "legacy terminal claim has no exact event; refusing to guess an outcome");
+                candidate_rollout_fallback_allowed = false;
+                None
+            }
+            Ok(TerminalClaimResult::Failed)
+            | Err(TerminalWaitError::OperationTimedOut)
+            | Err(TerminalWaitError::DeadlineExhausted) => None,
+        };
+
+        // Task evidence is the preferred authority store. If it was unavailable, a successful
+        // rollout append establishes the exact same candidate as authority. Never append a
+        // degraded correction after either store accepted the candidate.
+        if authority.is_none() && candidate_rollout_fallback_allowed {
+            if let Some(existing) = self
+                .reconcile_terminal_authority_from_rollout(&candidate_authority)
+                .await
+            {
+                authority = Some(existing);
+                rollout_mirrored = true;
+            } else {
+                let rollout = finalization
+                    .deadline
+                    .run(
+                        "durable_commit",
+                        TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                        self.persist_terminal_event_for_dispatch(
+                            &candidate_authority.event,
+                            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
                         ),
-                        codex_error_info: Some(CodexErrorInfo::InternalServerError),
-                    }),
-                });
+                    )
+                    .await;
+                if matches!(rollout, Ok(Ok(()))) {
+                    authority = Some(candidate_authority.clone());
+                    rollout_mirrored = true;
+                } else {
+                    authority = self
+                        .reconcile_terminal_authority_from_rollout(&candidate_authority)
+                        .await;
+                    rollout_mirrored = authority.is_some();
+                }
+            }
+        } else if let Some(authoritative) = authority.as_ref() {
+            if let Some(existing) = self
+                .reconcile_terminal_authority_from_rollout(authoritative)
+                .await
+            {
+                rollout_mirrored = existing.fingerprint == authoritative.fingerprint;
+                if !rollout_mirrored {
+                    warn!(turn_id = %turn_context.sub_id, "rollout contains a conflicting terminal event; refusing to append another outcome");
+                }
+            } else {
+                let rollout = finalization
+                    .deadline
+                    .run(
+                        "durable_commit",
+                        TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                        self.persist_terminal_event_for_dispatch(
+                            &authoritative.event,
+                            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                        ),
+                    )
+                    .await;
+                if !matches!(rollout, Ok(Ok(()))) {
+                    warn!(turn_id = %turn_context.sub_id, "rollout mirroring failed after the terminal outcome became authoritative");
+                } else {
+                    rollout_mirrored = true;
+                }
+            }
+        }
+
+        let authority = if let Some(authority) = authority {
+            authority
+        } else if !candidate_rollout_fallback_allowed {
+            if let Some(permit) = finalization.permit.as_ref() {
+                permit.mark_durable_commit(true);
             }
             let cleared_active_turn = self.detach_terminal_turn(finalization).await;
             return TerminalInteractionMilestone {
@@ -1497,33 +1596,106 @@ impl Session {
                 live_delivered: false,
                 cleared_active_turn,
             };
-        }
-
-        let coordinator_claimed = finalization
-            .permit
-            .as_ref()
-            .is_some_and(TurnTerminalPermit::mark_delivery_claimed);
-        if !coordinator_claimed {
-            warn!(turn_id = %turn_context.sub_id, "terminal delivery was already claimed in memory; refusing duplicate send");
-            let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-            return TerminalInteractionMilestone {
-                live_attempted: false,
-                live_delivered: false,
-                cleared_active_turn,
+        } else {
+            let reason = "terminalization failed before an authoritative terminal event could be durably established";
+            warn!(turn_id = %turn_context.sub_id, reason);
+            let degraded = EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn_context.sub_id.clone(),
+                last_agent_message: Some(reason.to_string()),
+                surfaced_result: None,
+                error: Some(ErrorEvent {
+                    message: reason.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                }),
+                completion: Some(TaskCompletionGate {
+                    status: TaskCompletionStatus::Partial,
+                    reasons: vec![reason.to_string()],
+                    evidence_path: None,
+                }),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            });
+            let Some(fingerprint) = terminal_event_fingerprint(&degraded) else {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    "failed to fingerprint the degraded terminal event"
+                );
+                if let Some(permit) = finalization.permit.as_ref() {
+                    permit.mark_durable_commit(false);
+                }
+                let cleared_active_turn = self.detach_terminal_turn(finalization).await;
+                return TerminalInteractionMilestone {
+                    live_attempted: false,
+                    live_delivered: false,
+                    cleared_active_turn,
+                };
             };
+            let degraded_authority = AuthoritativeTerminalEventV1 {
+                version: 1,
+                terminal_identity: terminal_identity.clone(),
+                turn_id: turn_context.sub_id.clone(),
+                event: degraded,
+                fingerprint,
+                semantic_outcome: "terminalization_failed".to_string(),
+                final_proof_identity: None,
+            };
+            if let Some(existing) = self
+                .reconcile_terminal_authority_from_rollout(&degraded_authority)
+                .await
+            {
+                rollout_mirrored = true;
+                existing
+            } else {
+                rollout_mirrored = self
+                    .ensure_terminal_authority_mirrored_in_rollout(&degraded_authority)
+                    .await;
+                degraded_authority
+            }
+        };
+
+        *event = authority.event.clone();
+        let mut permit_delivery_claimed = false;
+        if let Some(permit) = finalization.permit.as_ref() {
+            permit.mark_durable_commit(true);
+            permit_delivery_claimed = permit.mark_delivery_claimed();
+        }
+        if !self
+            .register_authoritative_terminal_delivery(
+                terminal_identity.clone(),
+                authority.fingerprint.clone(),
+            )
+            .await
+        {
+            warn!(turn_id = %turn_context.sub_id, "process-local terminal registry rejected a conflicting fingerprint");
         }
 
-        apply_terminal_phase_timings(event, &finalization.deadline.phase_timings_ns());
         let delivery_started = tokio::time::Instant::now();
-        let live_delivered = self.dispatch_terminal_event_live(turn_context, event.clone());
+        let live_delivered = self
+            .dispatch_terminal_event_live(
+                turn_context,
+                authority.event.clone(),
+                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+            )
+            .await;
         finalization.deadline.record_elapsed(
             "delivery_attempt",
             tokio::time::Instant::now().saturating_duration_since(delivery_started),
         );
-        if let Some(permit) = finalization.permit.as_ref() {
+        if permit_delivery_claimed && let Some(permit) = finalization.permit.as_ref() {
             permit.mark_delivery_attempted(live_delivered);
         }
-        let cleared_active_turn = self.detach_terminal_turn(finalization).await;
+        let cleared_active_turn = if live_delivered {
+            self.detach_terminal_turn(finalization).await
+        } else {
+            false
+        };
+
+        let requires_app_server_ack = turn_context.app_server_client_name.is_some();
+        if requires_app_server_ack || !live_delivered {
+            self.schedule_terminal_redelivery(authority.clone(), requires_app_server_ack);
+        }
 
         let delivery_state = if live_delivered {
             DurableDeliveryState::Delivered
@@ -1533,10 +1705,16 @@ impl Session {
         let update = TerminalInteractionUpdate {
             terminal_identity,
             delivery_state,
+            app_server_acknowledged: false,
+            runtime_status_converged: true,
+            rollout_mirrored,
+            parent_notification_completed: false,
+            post_terminal_cleanup_completed: false,
             active_turn_detached: cleared_active_turn,
-            terminal_interaction_released: true,
+            terminal_interaction_released: cleared_active_turn,
             recovery_state: TerminalRecoveryState::None,
             phase_timings_ns: finalization.deadline.phase_timings_ns(),
+            terminalization: None,
         };
         match tokio::time::timeout(
             TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
@@ -1549,7 +1727,7 @@ impl Session {
             Ok(true) => {}
             Ok(false) | Err(_) => warn!(
                 turn_id = %turn_context.sub_id,
-                "terminal interaction receipt remains claimed; recovery will converge without resending"
+                "terminal interaction receipt remains pending; recovery will replay the exact authoritative event"
             ),
         }
 
@@ -1558,6 +1736,683 @@ impl Session {
             live_delivered,
             cleared_active_turn,
         }
+    }
+
+    /// Re-reads rollout storage after an ambiguous append failure. The first exact-turn terminal
+    /// event in durable history wins, even when it conflicts with the in-memory candidate.
+    async fn reconcile_terminal_authority_from_rollout(
+        &self,
+        candidate: &AuthoritativeTerminalEventV1,
+    ) -> Option<AuthoritativeTerminalEventV1> {
+        let history = self
+            .live_thread()?
+            .load_history(/*include_archived*/ true)
+            .await
+            .ok()?;
+        history.items.into_iter().find_map(|item| {
+            let RolloutItem::EventMsg(event) = item else {
+                return None;
+            };
+            let event_turn_id = match &event {
+                EventMsg::TurnComplete(event) => Some(event.turn_id.as_str()),
+                EventMsg::TurnAborted(event) => event.turn_id.as_deref(),
+                _ => return None,
+            };
+            if event_turn_id != Some(candidate.turn_id.as_str()) {
+                return None;
+            }
+            let fingerprint = terminal_event_fingerprint(&event)?;
+            if fingerprint != candidate.fingerprint {
+                warn!(
+                    turn_id = %candidate.turn_id,
+                    authoritative_fingerprint = %fingerprint,
+                    candidate_fingerprint = %candidate.fingerprint,
+                    "rollout reconciliation preserved an earlier conflicting terminal event"
+                );
+            }
+            Some(AuthoritativeTerminalEventV1 {
+                version: 1,
+                terminal_identity: candidate.terminal_identity.clone(),
+                turn_id: candidate.turn_id.clone(),
+                semantic_outcome: semantic_terminal_outcome(&event),
+                event,
+                fingerprint,
+                final_proof_identity: candidate.final_proof_identity.clone(),
+            })
+        })
+    }
+
+    async fn ensure_terminal_authority_mirrored_in_rollout(
+        &self,
+        authority: &AuthoritativeTerminalEventV1,
+    ) -> bool {
+        match self
+            .reconcile_terminal_authority_from_rollout(authority)
+            .await
+        {
+            Some(existing) => existing.fingerprint == authority.fingerprint,
+            None => self
+                .persist_terminal_event_for_dispatch(
+                    &authority.event,
+                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                )
+                .await
+                .is_ok(),
+        }
+    }
+
+    pub(crate) fn schedule_terminal_redelivery(
+        self: &Arc<Self>,
+        authority: AuthoritativeTerminalEventV1,
+        require_app_server_ack: bool,
+    ) {
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            {
+                let mut registry = session.terminal_delivery_registry.lock().await;
+                let Some(entry) = registry.by_identity.get_mut(&authority.terminal_identity) else {
+                    return;
+                };
+                if entry.redelivery_scheduled {
+                    return;
+                }
+                entry.redelivery_scheduled = true;
+            }
+            let retry_interval = Duration::from_millis(500);
+            loop {
+                tokio::time::sleep(retry_interval).await;
+                if session.shutting_down.load(Ordering::Acquire)
+                    || (require_app_server_ack
+                        && session
+                            .terminal_delivery_acknowledged(
+                                &authority.terminal_identity,
+                                &authority.fingerprint,
+                            )
+                            .await)
+                {
+                    break;
+                }
+                let accepted = session.try_send_live_event_accepted(Event {
+                    id: authority.turn_id.clone(),
+                    msg: authority.event.clone(),
+                });
+                if accepted {
+                    let released = session
+                        .release_terminal_turn_after_live_handoff(&authority.turn_id)
+                        .await;
+                    let _ = session
+                        .services
+                        .task_evidence
+                        .update_terminal_interaction(TerminalInteractionUpdate {
+                            terminal_identity: authority.terminal_identity.clone(),
+                            delivery_state: DurableDeliveryState::Delivered,
+                            app_server_acknowledged: false,
+                            runtime_status_converged: true,
+                            rollout_mirrored: false,
+                            parent_notification_completed: false,
+                            post_terminal_cleanup_completed: false,
+                            active_turn_detached: released,
+                            terminal_interaction_released: released,
+                            recovery_state: TerminalRecoveryState::Recovered,
+                            phase_timings_ns: BTreeMap::new(),
+                            terminalization: None,
+                        })
+                        .await;
+                    if !require_app_server_ack {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn schedule_parent_terminal_notification_retry(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        event: EventMsg,
+    ) {
+        let Some(fingerprint) = terminal_event_fingerprint(&event) else {
+            return;
+        };
+        let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            let retry_interval = Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(retry_interval).await;
+                if session.shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+                if !session
+                    .register_authoritative_terminal_delivery(
+                        terminal_identity.clone(),
+                        fingerprint.clone(),
+                    )
+                    .await
+                {
+                    return;
+                }
+                if session
+                    .maybe_notify_parent_of_terminal_turn(turn_context.as_ref(), &event)
+                    .await
+                {
+                    let _ = session
+                        .services
+                        .task_evidence
+                        .update_terminal_interaction(TerminalInteractionUpdate {
+                            terminal_identity,
+                            delivery_state: DurableDeliveryState::Claimed,
+                            app_server_acknowledged: false,
+                            runtime_status_converged: true,
+                            rollout_mirrored: false,
+                            parent_notification_completed: true,
+                            post_terminal_cleanup_completed: false,
+                            active_turn_detached: false,
+                            terminal_interaction_released: false,
+                            recovery_state: TerminalRecoveryState::None,
+                            phase_timings_ns: BTreeMap::new(),
+                            terminalization: None,
+                        })
+                        .await;
+                    return;
+                }
+            }
+        });
+    }
+
+    async fn release_terminal_turn_after_live_handoff(&self, turn_id: &str) -> bool {
+        let mut active = self.active_turn.lock().await;
+        let matches_terminal = active
+            .as_ref()
+            .and_then(|active_turn| active_turn.terminal.as_ref())
+            .is_some_and(|terminal| terminal.turn_id() == turn_id);
+        if matches_terminal {
+            if let Some(terminal) = active
+                .as_ref()
+                .and_then(|active_turn| active_turn.terminal.as_ref())
+            {
+                terminal.mark_interaction_released();
+            }
+            *active = None;
+            self.terminal_interaction_pending
+                .store(false, Ordering::Release);
+            true
+        } else {
+            active.is_none()
+        }
+    }
+
+    pub(crate) async fn resume_pending_terminal_deliveries(self: &Arc<Self>) {
+        for authority in self
+            .services
+            .task_evidence
+            .pending_authoritative_terminal_events()
+            .await
+        {
+            let rollout_mirrored = self
+                .ensure_terminal_authority_mirrored_in_rollout(&authority)
+                .await;
+            if !self
+                .register_authoritative_terminal_delivery(
+                    authority.terminal_identity.clone(),
+                    authority.fingerprint.clone(),
+                )
+                .await
+            {
+                warn!(
+                    turn_id = %authority.turn_id,
+                    "skipping conflicting recovered terminal delivery"
+                );
+                continue;
+            }
+            let live_delivered = self.try_send_live_event_accepted(Event {
+                id: authority.turn_id.clone(),
+                msg: authority.event.clone(),
+            });
+            let turn_context = self
+                .new_default_turn_with_sub_id(authority.turn_id.clone())
+                .await;
+            let parent_notification_completed = self
+                .maybe_notify_parent_of_terminal_turn(turn_context.as_ref(), &authority.event)
+                .await;
+            self.services
+                .guardian_rejection_circuit_breaker
+                .lock()
+                .await
+                .clear_turn(&authority.turn_id);
+            let released = self
+                .release_terminal_turn_after_live_handoff(&authority.turn_id)
+                .await;
+            let _ = self
+                .services
+                .task_evidence
+                .update_terminal_interaction(TerminalInteractionUpdate {
+                    terminal_identity: authority.terminal_identity.clone(),
+                    delivery_state: if live_delivered {
+                        DurableDeliveryState::Delivered
+                    } else {
+                        DurableDeliveryState::DeliveryFailed
+                    },
+                    app_server_acknowledged: false,
+                    runtime_status_converged: true,
+                    rollout_mirrored,
+                    parent_notification_completed,
+                    post_terminal_cleanup_completed: true,
+                    active_turn_detached: released,
+                    terminal_interaction_released: released,
+                    recovery_state: TerminalRecoveryState::Recovered,
+                    phase_timings_ns: BTreeMap::new(),
+                    terminalization: None,
+                })
+                .await;
+            if !parent_notification_completed {
+                self.schedule_parent_terminal_notification_retry(
+                    Arc::clone(&turn_context),
+                    authority.event.clone(),
+                );
+            }
+            self.schedule_terminal_redelivery(authority, /*require_app_server_ack*/ true);
+        }
+    }
+
+    pub(crate) async fn adopt_rollout_terminal_authority(&self, items: &[RolloutItem]) {
+        let Some(authority) = last_terminal_authority_from_rollout(self.thread_id, items) else {
+            return;
+        };
+        if self
+            .services
+            .task_evidence
+            .authoritative_terminal_event(&authority.terminal_identity)
+            .await
+            .is_some()
+        {
+            return;
+        }
+        match self
+            .services
+            .task_evidence
+            .commit_terminal_decision_and_claim(TerminalDecisionClaim {
+                authoritative_event: authority,
+                deadline_exhausted_phase: None,
+                mutation_quiescent: false,
+                durable_success_established: false,
+                retained_ownership: Vec::new(),
+                phase_timings_ns: BTreeMap::new(),
+            })
+            .await
+        {
+            TerminalClaimResult::Claimed(_) | TerminalClaimResult::AlreadyClaimed(_) => {}
+            TerminalClaimResult::Conflict { .. } | TerminalClaimResult::Failed => {
+                warn!("could not bind the exact retained terminal event into recovery evidence");
+            }
+        }
+    }
+
+    pub(crate) async fn recover_bound_terminal_intent(self: &Arc<Self>, turn_id: String) {
+        if self
+            .services
+            .task_evidence
+            .authoritative_terminal_event(&format!("{}:{turn_id}", self.thread_id))
+            .await
+            .is_some()
+        {
+            return;
+        }
+        let Some(intent) = self
+            .services
+            .task_evidence
+            .completion_recovery_intent(&turn_id)
+            .await
+        else {
+            // Legacy or unbound final-proof evidence is deliberately not associated with the
+            // open turn.
+            return;
+        };
+        let turn_context = self.new_default_turn_with_sub_id(turn_id.clone()).await;
+        let mut failure_reasons = Vec::new();
+
+        let mutation_quiescent = self
+            .services
+            .command_execution
+            .cancel_mutations_for_terminal_turn_with_timeout(
+                &turn_id,
+                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+            )
+            .await;
+        if !mutation_quiescent {
+            failure_reasons.push(
+                "restart recovery could not re-establish terminal mutation quiescence".to_string(),
+            );
+        }
+
+        let completion_permit = if failure_reasons.is_empty() {
+            match self
+                .services
+                .agent_control
+                .begin_completion_finalization()
+                .await
+            {
+                Ok(permit) => Some(permit),
+                Err(error) => {
+                    failure_reasons.push(format!(
+                        "restart recovery could not acquire completion finalization: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let authoritative_inputs = if completion_permit.is_some() {
+            let inputs = completion_review::refresh_authoritative_review_inputs(self).await;
+            failure_reasons.extend(inputs.partial_reasons.iter().cloned());
+            if !inputs.typed_quiescent {
+                failure_reasons
+                    .push("typed task ownership was not quiescent during recovery".to_string());
+            }
+            if !inputs.default_children_quiescent {
+                failure_reasons
+                    .push("default child ownership was not quiescent during recovery".to_string());
+            }
+            Some(inputs)
+        } else {
+            None
+        };
+
+        let mut workspace_guard = None;
+        if failure_reasons.is_empty() {
+            let coordinator = self.services.agent_control.task_coordinator();
+            match (
+                coordinator.store(),
+                coordinator.root_session_id(),
+                self.services.task_evidence.repository_root(),
+            ) {
+                (Some(store), Some(root_session_id), Some(repo_root)) => {
+                    match store
+                        .begin_workspace_finalization(repo_root, root_session_id)
+                        .await
+                    {
+                        Ok(fence) => {
+                            workspace_guard = Some(WorkspaceFinalizationGuard::new(
+                                store,
+                                repo_root.to_path_buf(),
+                                fence,
+                            ));
+                        }
+                        Err(error) => failure_reasons.push(format!(
+                            "restart recovery could not acquire the workspace fence: {error}"
+                        )),
+                    }
+                }
+                (None, None, _) => {}
+                _ => failure_reasons.push(
+                    "restart recovery found partially initialized workspace ownership".to_string(),
+                ),
+            }
+        }
+
+        let mut completion_gate = None;
+        if failure_reasons.is_empty() {
+            let child_gate_state = authoritative_inputs
+                .as_ref()
+                .map(|inputs| inputs.typed_evidence.clone())
+                .unwrap_or_default();
+            match seal_terminal_final_proof(
+                self,
+                &turn_context,
+                Some(&intent.final_message),
+                child_gate_state,
+            )
+            .await
+            {
+                Some(FinalProofSealResultV1::Memoized { gate, .. })
+                    if gate.status == TaskCompletionStatus::Passed =>
+                {
+                    completion_gate = Some(gate);
+                }
+                Some(FinalProofSealResultV1::Memoized { gate, .. }) => {
+                    failure_reasons.extend(gate.reasons);
+                }
+                Some(FinalProofSealResultV1::Sealed { .. }) => failure_reasons.push(
+                    "restart recovery identities no longer match the sealed memo".to_string(),
+                ),
+                Some(FinalProofSealResultV1::PreflightFailed(gate)) => {
+                    failure_reasons.extend(gate.reasons);
+                }
+                None => failure_reasons
+                    .push("restart recovery could not rebuild the final proof".to_string()),
+            }
+            if self
+                .services
+                .task_evidence
+                .current_finalization_memo_identity()
+                .await
+                .as_deref()
+                != Some(intent.memo_identity.as_str())
+            {
+                completion_gate = None;
+                failure_reasons.push(
+                    "restart recovery finalization memo identity changed during revalidation"
+                        .to_string(),
+                );
+            }
+        }
+
+        if failure_reasons.is_empty()
+            && let Some(inputs) = authoritative_inputs.as_ref()
+        {
+            let dossier = self
+                .services
+                .task_evidence
+                .completion_review_dossier(
+                    Some(&intent.final_message),
+                    &inputs.typed_mutation_identities,
+                    &inputs.typed_evidence,
+                    &inputs.review_lens_selection_facts,
+                    &inputs.partial_reasons,
+                    inputs.typed_quiescent,
+                    inputs.default_children_quiescent,
+                )
+                .await;
+            let dossier_matches = if let Some(dossier) = dossier.as_ref() {
+                self.services
+                    .task_evidence
+                    .passed_completion_matches_dossier(dossier)
+                    .await
+            } else {
+                false
+            };
+            if !dossier_matches {
+                completion_gate = None;
+                failure_reasons.push(
+                    "restart recovery completion dossier no longer matches the sealed proof"
+                        .to_string(),
+                );
+            }
+        }
+
+        if failure_reasons.is_empty()
+            && let Some(guard) = workspace_guard.as_mut()
+        {
+            let recovery_deadline = TerminalDeadline::start();
+            if let Err(error) = guard.seal_for_terminal_dispatch(&recovery_deadline).await {
+                completion_gate = None;
+                failure_reasons.push(format!(
+                    "restart recovery could not seal the workspace fence: {error}"
+                ));
+            }
+        }
+
+        failure_reasons.sort();
+        failure_reasons.dedup();
+        let (event, outcome) = if failure_reasons.is_empty() {
+            (
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: turn_id.clone(),
+                    last_agent_message: Some(intent.final_message),
+                    surfaced_result: None,
+                    error: None,
+                    completion: completion_gate,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    timing: None,
+                }),
+                "passed_recovered".to_string(),
+            )
+        } else {
+            let message = failure_reasons.join("; ");
+            (
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: turn_id.clone(),
+                    last_agent_message: Some(format!("Task completion is partial: {message}")),
+                    surfaced_result: None,
+                    error: Some(ErrorEvent {
+                        message,
+                        codex_error_info: None,
+                    }),
+                    completion: Some(TaskCompletionGate {
+                        status: TaskCompletionStatus::Partial,
+                        reasons: failure_reasons,
+                        evidence_path: None,
+                    }),
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    timing: None,
+                }),
+                "partial_recovery".to_string(),
+            )
+        };
+        self.establish_recovered_terminal_event(&turn_context, event, outcome, mutation_quiescent)
+            .await;
+        drop(completion_permit);
+        if let Some(mut guard) = workspace_guard
+            && let Err(error) = guard.release().await
+        {
+            warn!(%error, "failed to release restart-recovery workspace fence");
+        }
+    }
+
+    async fn establish_recovered_terminal_event(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        event: EventMsg,
+        semantic_outcome: String,
+        mutation_quiescent: bool,
+    ) {
+        let Some(fingerprint) = terminal_event_fingerprint(&event) else {
+            return;
+        };
+        let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
+        let candidate = AuthoritativeTerminalEventV1 {
+            version: 1,
+            terminal_identity: terminal_identity.clone(),
+            turn_id: turn_context.sub_id.clone(),
+            event,
+            fingerprint,
+            semantic_outcome,
+            final_proof_identity: self
+                .services
+                .task_evidence
+                .current_finalization_memo_identity()
+                .await,
+        };
+        let claim = self
+            .services
+            .task_evidence
+            .commit_terminal_decision_and_claim(TerminalDecisionClaim {
+                authoritative_event: candidate.clone(),
+                deadline_exhausted_phase: None,
+                mutation_quiescent,
+                durable_success_established: candidate.semantic_outcome == "passed_recovered",
+                retained_ownership: Vec::new(),
+                phase_timings_ns: BTreeMap::new(),
+            })
+            .await;
+        let authority = match claim {
+            TerminalClaimResult::Claimed(authority)
+            | TerminalClaimResult::AlreadyClaimed(authority) => authority,
+            TerminalClaimResult::Conflict {
+                authoritative: Some(authority),
+                ..
+            } => authority,
+            TerminalClaimResult::Conflict {
+                authoritative: None,
+                ..
+            } => return,
+            TerminalClaimResult::Failed => {
+                if let Some(existing) = self
+                    .reconcile_terminal_authority_from_rollout(&candidate)
+                    .await
+                {
+                    existing
+                } else if !self
+                    .ensure_terminal_authority_mirrored_in_rollout(&candidate)
+                    .await
+                {
+                    self.try_send_live_event(Event {
+                        id: candidate.turn_id,
+                        msg: candidate.event,
+                    });
+                    return;
+                } else {
+                    candidate
+                }
+            }
+        };
+        let rollout_mirrored = self
+            .ensure_terminal_authority_mirrored_in_rollout(&authority)
+            .await;
+        if !self
+            .register_authoritative_terminal_delivery(
+                authority.terminal_identity.clone(),
+                authority.fingerprint.clone(),
+            )
+            .await
+        {
+            return;
+        }
+        let live_delivered = self.try_send_live_event_accepted(Event {
+            id: authority.turn_id.clone(),
+            msg: authority.event.clone(),
+        });
+        let requires_app_server_ack = turn_context.app_server_client_name.is_some();
+        if requires_app_server_ack || !live_delivered {
+            self.schedule_terminal_redelivery(authority.clone(), requires_app_server_ack);
+        }
+        let parent_notification_completed = self
+            .finish_terminal_event_dispatch(turn_context, &authority.event)
+            .await;
+        if !parent_notification_completed {
+            self.schedule_parent_terminal_notification_retry(
+                Arc::clone(turn_context),
+                authority.event.clone(),
+            );
+        }
+        let _ = self
+            .services
+            .task_evidence
+            .update_terminal_interaction(TerminalInteractionUpdate {
+                terminal_identity,
+                delivery_state: if live_delivered {
+                    DurableDeliveryState::Delivered
+                } else {
+                    DurableDeliveryState::DeliveryFailed
+                },
+                app_server_acknowledged: false,
+                runtime_status_converged: true,
+                rollout_mirrored,
+                parent_notification_completed,
+                post_terminal_cleanup_completed: true,
+                active_turn_detached: true,
+                terminal_interaction_released: true,
+                recovery_state: TerminalRecoveryState::Recovered,
+                phase_timings_ns: BTreeMap::new(),
+                terminalization: None,
+            })
+            .await;
     }
 
     async fn emit_post_terminal_metrics(
@@ -1790,19 +2645,21 @@ impl Session {
             }
         }
 
-        let (mut last_agent_message, abort_reason) = match &finalization.outcome {
-            TurnTerminalOutcome::Completed { last_agent_message } => {
-                (last_agent_message.clone(), None)
-            }
+        let (mut last_agent_message, surfaced_result, abort_reason) = match &finalization.outcome {
+            TurnTerminalOutcome::Completed { result } => (
+                result.last_agent_message.clone(),
+                result.surfaced_result.clone(),
+                None,
+            ),
             TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
-                (None, Some(TurnAbortReason::Interrupted))
+                (None, None, Some(TurnAbortReason::Interrupted))
             }
             TurnTerminalOutcome::ReturnedError(err) => {
                 warn!(%err, "session task returned an unexpected error");
-                (None, None)
+                (None, None, None)
             }
-            TurnTerminalOutcome::Aborted(reason) => (None, Some(reason.clone())),
-            TurnTerminalOutcome::WorkerJoinFailed(_) => (None, None),
+            TurnTerminalOutcome::Aborted(reason) => (None, None, Some(reason.clone())),
+            TurnTerminalOutcome::WorkerJoinFailed(_) => (None, None, None),
         };
 
         let pending_input_result = finalization
@@ -1982,7 +2839,28 @@ impl Session {
                     // The completion permit waits for admitted root/default-child work. Reconcile
                     // authoritative evidence once more before the workspace fence makes the typed
                     // store read-only.
-                    let _ = completion_review::refresh_authoritative_review_inputs(self).await;
+                    let refreshed =
+                        completion_review::refresh_authoritative_review_inputs(self).await;
+                    completion_review_partial_reasons
+                        .extend(refreshed.partial_reasons.iter().cloned());
+                    if !refreshed.typed_quiescent {
+                        completion_review_partial_reasons.push(
+                            "typed task ownership was not quiescent after completion admission"
+                                .to_string(),
+                        );
+                    }
+                    if !refreshed.default_children_quiescent {
+                        completion_review_partial_reasons.push(
+                            "default child ownership was not quiescent after completion admission"
+                                .to_string(),
+                        );
+                    }
+                    completion_review_partial_reasons.sort();
+                    completion_review_partial_reasons.dedup();
+                    terminal_authoritative_inputs = Some(refreshed);
+                }
+
+                if completion_review_partial_reasons.is_empty() {
                     let coordinator = self.services.agent_control.task_coordinator();
                     match (
                         coordinator.store(),
@@ -2019,9 +2897,10 @@ impl Session {
                 }
 
                 if completion_review_partial_reasons.is_empty() {
-                    let authoritative =
-                        completion_review::inspect_authoritative_review_inputs(self).await;
-                    terminal_authoritative_inputs = Some(authoritative.clone());
+                    let authoritative = match terminal_authoritative_inputs.as_ref() {
+                        Some(authoritative) => authoritative.clone(),
+                        None => completion_review::refresh_authoritative_review_inputs(self).await,
+                    };
                     let guarded_dossier = self
                         .services
                         .task_evidence
@@ -2067,19 +2946,47 @@ impl Session {
                                         atomically_persisted_completion = Some(gate);
                                     }
                                     crate::task_evidence::AtomicReviewTransition::Superseded => {
-                                        let retry_dossier = self
-                                            .services
-                                            .task_evidence
-                                            .completion_review_dossier(
-                                                last_agent_message.as_deref(),
-                                                &authoritative.typed_mutation_identities,
-                                                &authoritative.typed_evidence,
-                                                &authoritative.review_lens_selection_facts,
-                                                &authoritative.partial_reasons,
-                                                authoritative.typed_quiescent,
-                                                authoritative.default_children_quiescent,
-                                            )
-                                            .await;
+                                        let retry_authoritative = completion_review::refresh_authoritative_review_inputs(self).await;
+                                        completion_review_partial_reasons.extend(
+                                            retry_authoritative.partial_reasons.iter().cloned(),
+                                        );
+                                        if !retry_authoritative.typed_quiescent {
+                                            completion_review_partial_reasons.push(
+                                                "typed task ownership was not quiescent after completion-review persistence changed"
+                                                    .to_string(),
+                                            );
+                                        }
+                                        if !retry_authoritative.default_children_quiescent {
+                                            completion_review_partial_reasons.push(
+                                                "default child ownership was not quiescent after completion-review persistence changed"
+                                                    .to_string(),
+                                            );
+                                        }
+                                        completion_review_partial_reasons.sort();
+                                        completion_review_partial_reasons.dedup();
+                                        terminal_authoritative_inputs =
+                                            Some(retry_authoritative.clone());
+                                        let retry_dossier = if completion_review_partial_reasons
+                                            .is_empty()
+                                        {
+                                            self.services
+                                                .task_evidence
+                                                .completion_review_dossier(
+                                                    last_agent_message.as_deref(),
+                                                    &retry_authoritative
+                                                        .typed_mutation_identities,
+                                                    &retry_authoritative.typed_evidence,
+                                                    &retry_authoritative
+                                                        .review_lens_selection_facts,
+                                                    &retry_authoritative.partial_reasons,
+                                                    retry_authoritative.typed_quiescent,
+                                                    retry_authoritative
+                                                        .default_children_quiescent,
+                                                )
+                                                .await
+                                        } else {
+                                            None
+                                        };
                                         let retry = match retry_dossier.as_ref() {
                                             Some(retry_dossier)
                                                 if retry_dossier.cycle_phase
@@ -2407,19 +3314,67 @@ impl Session {
                     )
                     .await;
                 match sealed {
-                    Ok(Some(FinalProofSealResultV1::Sealed { gate, .. }))
-                    | Ok(Some(FinalProofSealResultV1::Memoized(gate)))
-                    | Ok(Some(FinalProofSealResultV1::PreflightFailed(gate))) => {
+                    Ok(Some(result)) => {
+                        let freshness_diagnostics =
+                            self.services.task_evidence.freshness_diagnostics();
+                        let proof_reuse_count =
+                            u32::try_from(freshness_diagnostics.strong_hashes_reused)
+                                .unwrap_or(u32::MAX);
+                        let conservative_rerun_count =
+                            u32::try_from(freshness_diagnostics.conservative_reruns)
+                                .unwrap_or(u32::MAX);
+                        let gate = match result {
+                            FinalProofSealResultV1::Sealed {
+                                checkpoint,
+                                telemetry,
+                                gate,
+                                ..
+                            } => {
+                                turn_context.turn_timing_state.record_final_proof_telemetry(
+                                    checkpoint.estimated_tokens,
+                                    telemetry.validation_launch_count,
+                                    telemetry.validation_process_ns,
+                                    telemetry.validation_aggregate_ns,
+                                    1,
+                                    proof_reuse_count,
+                                    conservative_rerun_count,
+                                    0,
+                                );
+                                gate
+                            }
+                            FinalProofSealResultV1::Memoized {
+                                gate,
+                                checkpoint_tokens,
+                                telemetry,
+                            } => {
+                                turn_context.turn_timing_state.record_final_proof_telemetry(
+                                    checkpoint_tokens,
+                                    telemetry.validation_launch_count,
+                                    telemetry.validation_process_ns,
+                                    telemetry.validation_aggregate_ns,
+                                    1,
+                                    proof_reuse_count,
+                                    conservative_rerun_count,
+                                    1,
+                                );
+                                gate
+                            }
+                            FinalProofSealResultV1::PreflightFailed(gate) => gate,
+                        };
                         if gate.status == TaskCompletionStatus::Passed {
                             let memoized = finalization
                                 .deadline
                                 .run(
                                     "completion_finalization",
                                     TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                                    self.services.task_evidence.memoized_finalization_result(),
+                                    self.services
+                                        .task_evidence
+                                        .memoized_finalization_result(&turn_context.sub_id),
                                 )
                                 .await;
-                            if let Ok(Some(memoized)) = memoized {
+                            if let Ok(Some(memoized)) = memoized
+                                && surfaced_result.is_none()
+                            {
                                 finalization
                                     .deadline
                                     .record_elapsed("terminal_memo_hit", Duration::ZERO);
@@ -2463,7 +3418,12 @@ impl Session {
                                             }
                                             self.services
                                                 .task_evidence
-                                                .record_finalization_result(message)
+                                                .record_finalization_result(
+                                                    turn_context.sub_id.clone(),
+                                                    message,
+                                                    finalization.mutation_quiescent,
+                                                    finalization.mutation_quiescent,
+                                                )
                                                 .await
                                         },
                                     )
@@ -2524,9 +3484,9 @@ impl Session {
                 .record_duration(TURN_E2E_DURATION_METRIC, duration, &[]);
         }
         let timing = timing_snapshot.protocol_timing();
-        self.services
-            .analytics_events_client
-            .track_turn_profile(TurnProfileFact {
+        finalization
+            .pending_turn_profile
+            .get_or_insert_with(|| TurnProfileFact {
                 turn_id: turn_context.sub_id.clone(),
                 profile: timing_snapshot.legacy_profile.clone(),
                 timing: Some(timing.clone()),
@@ -2668,6 +3628,7 @@ impl Session {
                 .as_ref()
                 .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed);
         if abort_reason.is_none()
+            && surfaced_result.is_none()
             && let Some(gate) = completion
                 .as_ref()
                 .filter(|gate| gate.status != TaskCompletionStatus::Passed)
@@ -2702,6 +3663,7 @@ impl Session {
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_context.sub_id.clone(),
                 last_agent_message,
+                surfaced_result,
                 error,
                 completion,
                 completed_at,
@@ -2713,20 +3675,7 @@ impl Session {
         let reasoning_summary = finalization
             .reasoning_policy_recorder
             .take_summary(turn_context.sub_id.clone());
-        let durable_outcome = match &event {
-            EventMsg::TurnAborted(_) => "aborted".to_string(),
-            EventMsg::TurnComplete(completed) => completed
-                .completion
-                .as_ref()
-                .map(|gate| match gate.status {
-                    TaskCompletionStatus::Passed => "passed",
-                    TaskCompletionStatus::Partial => "partial",
-                    TaskCompletionStatus::Blocked => "blocked",
-                })
-                .unwrap_or("completed")
-                .to_string(),
-            _ => "terminal".to_string(),
-        };
+        let durable_outcome = semantic_terminal_outcome(&event);
         let terminal_milestone = self
             .publish_terminal_interaction_milestone(
                 finalization,
@@ -2764,15 +3713,27 @@ impl Session {
         {
             warn!(turn_id = %turn_context.sub_id, "timed out recording optional post-terminal metrics");
         }
-        if terminal_milestone.live_attempted
-            && tokio::time::timeout(
+        let parent_notification_completed = if terminal_milestone.live_attempted {
+            match tokio::time::timeout(
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
                 self.finish_terminal_event_dispatch(turn_context.as_ref(), &event),
             )
             .await
-            .is_err()
-        {
-            warn!(turn_id = %turn_context.sub_id, "timed out finishing terminal event side effects");
+            {
+                Ok(completed) => completed,
+                Err(_) => {
+                    warn!(turn_id = %turn_context.sub_id, "timed out finishing terminal event side effects");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if terminal_milestone.live_attempted && !parent_notification_completed {
+            self.schedule_parent_terminal_notification_retry(
+                Arc::clone(&turn_context),
+                event.clone(),
+            );
         }
         if let Some(summary) = reasoning_summary
             && tokio::time::timeout(
@@ -2858,6 +3819,7 @@ impl Session {
             tokio::time::Instant::now().saturating_duration_since(post_cleanup_started),
         );
         finalization.deadline.finish_unclassified();
+        let final_terminalization = self.emit_pending_turn_profile(finalization);
         if finalization.coordinator.durable_terminal_committed() {
             let delivery_state = match finalization.coordinator.delivery_state() {
                 CoordinatorDeliveryState::NotAttempted => DurableDeliveryState::NotAttempted,
@@ -2865,21 +3827,85 @@ impl Session {
                 CoordinatorDeliveryState::Delivered => DurableDeliveryState::Delivered,
                 CoordinatorDeliveryState::DeliveryFailed => DurableDeliveryState::DeliveryFailed,
             };
-            let _ = tokio::time::timeout(
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.services.task_evidence.update_terminal_interaction(
-                    TerminalInteractionUpdate {
-                        terminal_identity: format!("{}:{}", self.thread_id, turn_context.sub_id),
+            let phase_timings_ns = finalization.deadline.phase_timings_ns();
+            let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
+            let deadline_exhausted_phase = finalization.deadline.exhausted_phase();
+            let task_evidence = self.services.task_evidence.clone();
+            let session = Arc::clone(self);
+            let turn_context = Arc::clone(&turn_context);
+            self.spawn_terminal_receipt_task(async move {
+                let persistence = tokio::time::timeout(
+                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                    task_evidence.update_terminal_interaction(TerminalInteractionUpdate {
+                        terminal_identity: terminal_identity.clone(),
                         delivery_state,
-                        active_turn_detached: true,
-                        terminal_interaction_released: true,
+                        app_server_acknowledged: false,
+                        runtime_status_converged: true,
+                        rollout_mirrored: false,
+                        parent_notification_completed,
+                        post_terminal_cleanup_completed: true,
+                        active_turn_detached: cleared_active_turn,
+                        terminal_interaction_released: cleared_active_turn,
                         recovery_state: TerminalRecoveryState::None,
-                        phase_timings_ns: finalization.deadline.phase_timings_ns(),
-                    },
-                ),
-            )
-            .await;
+                        phase_timings_ns,
+                        terminalization: final_terminalization.clone(),
+                    }),
+                )
+                .await;
+                match persistence {
+                    Ok(true) => {
+                        if let Some(terminalization) = final_terminalization {
+                            let receipt = TurnTerminalizationReceipt {
+                                terminal_identity,
+                                terminalization,
+                                delivery_state: match delivery_state {
+                                    DurableDeliveryState::NotAttempted => {
+                                        TerminalizationDeliveryState::NotAttempted
+                                    }
+                                    DurableDeliveryState::Claimed => {
+                                        TerminalizationDeliveryState::Claimed
+                                    }
+                                    DurableDeliveryState::Delivered => {
+                                        TerminalizationDeliveryState::Delivered
+                                    }
+                                    DurableDeliveryState::DeliveryFailed => {
+                                        TerminalizationDeliveryState::DeliveryFailed
+                                    }
+                                },
+                                active_turn_detached: cleared_active_turn,
+                                terminal_interaction_released: cleared_active_turn,
+                                recovery_state: TerminalizationRecoveryState::None,
+                                deadline_exhausted_phase,
+                            };
+                            session
+                                .send_event(
+                                    turn_context.as_ref(),
+                                    EventMsg::TurnTerminalizationComplete(
+                                        TurnTerminalizationCompleteEvent {
+                                            turn_id: turn_context.sub_id.clone(),
+                                            receipt,
+                                        },
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                    Ok(false) => {
+                        warn!(turn_id = %turn_context.sub_id, "failed to persist late terminalization receipt; completed turn remains authoritative");
+                    }
+                    Err(_) => {
+                        warn!(turn_id = %turn_context.sub_id, "timed out persisting late terminalization receipt; completed turn remains authoritative");
+                    }
+                }
+            });
         }
+    }
+
+    pub(crate) fn spawn_terminal_receipt_task<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.terminal_tasks.spawn(task);
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -2943,9 +3969,17 @@ impl Session {
         let prior_delivery_state = finalization.coordinator.delivery_state();
         let had_authoritative_claim =
             prior_delivery_state != CoordinatorDeliveryState::NotAttempted;
+        let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
+        let timing = timing_snapshot.protocol_timing();
+        finalization
+            .pending_turn_profile
+            .get_or_insert_with(|| TurnProfileFact {
+                turn_id: turn_context.sub_id.clone(),
+                profile: timing_snapshot.legacy_profile.clone(),
+                timing: Some(timing.clone()),
+            });
         let mut dispatched_event = None;
-        let cleared_active_turn = if !had_authoritative_claim {
-            let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
+        let cleared_active_turn = {
             if let Some(duration) = timing_snapshot.inclusive_duration() {
                 turn_context.session_telemetry.record_duration(
                     TURN_E2E_DURATION_METRIC,
@@ -2953,14 +3987,6 @@ impl Session {
                     &[],
                 );
             }
-            let timing = timing_snapshot.protocol_timing();
-            self.services
-                .analytics_events_client
-                .track_turn_profile(TurnProfileFact {
-                    turn_id: turn_context.sub_id.clone(),
-                    profile: timing_snapshot.legacy_profile.clone(),
-                    timing: Some(timing.clone()),
-                });
             let abort_reason = match &finalization.outcome {
                 TurnTerminalOutcome::Aborted(reason) => Some(reason.clone()),
                 TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
@@ -2977,11 +4003,20 @@ impl Session {
                     timing: Some(timing),
                 })
             } else {
+                let reason = "turn finalization entered the fail-safe path before an authoritative terminal event was established";
                 EventMsg::TurnComplete(TurnCompleteEvent {
                     turn_id: turn_context.sub_id.clone(),
-                    last_agent_message: None,
-                    error: None,
-                    completion: None,
+                    last_agent_message: Some(reason.to_string()),
+                    surfaced_result: None,
+                    error: Some(ErrorEvent {
+                        message: reason.to_string(),
+                        codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                    }),
+                    completion: Some(TaskCompletionGate {
+                        status: TaskCompletionStatus::Partial,
+                        reasons: vec![reason.to_string()],
+                        evidence_path: None,
+                    }),
                     completed_at: timing_snapshot.completed_at_unix_secs,
                     duration_ms: timing_snapshot.duration_ms,
                     time_to_first_token_ms: timing_snapshot.time_to_first_token_ms,
@@ -3001,32 +4036,6 @@ impl Session {
                 dispatched_event = Some(event);
             }
             milestone.cleared_active_turn
-        } else {
-            // A crash/panic after the durable claim has an intentional at-most-once tradeoff:
-            // never resend, but always converge the interactive milestone.
-            let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-            let durable_delivery_state = match prior_delivery_state {
-                CoordinatorDeliveryState::Claimed => DurableDeliveryState::Claimed,
-                CoordinatorDeliveryState::Delivered => DurableDeliveryState::Delivered,
-                CoordinatorDeliveryState::DeliveryFailed => DurableDeliveryState::DeliveryFailed,
-                CoordinatorDeliveryState::NotAttempted => unreachable!("handled above"),
-            };
-            let update = TerminalInteractionUpdate {
-                terminal_identity: format!("{}:{}", self.thread_id, turn_context.sub_id),
-                delivery_state: durable_delivery_state,
-                active_turn_detached: cleared_active_turn,
-                terminal_interaction_released: true,
-                recovery_state: TerminalRecoveryState::Recovered,
-                phase_timings_ns: finalization.deadline.phase_timings_ns(),
-            };
-            let _ = tokio::time::timeout(
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.services
-                    .task_evidence
-                    .update_terminal_interaction(update),
-            )
-            .await;
-            cleared_active_turn
         };
 
         // Fail-safe cleanup is also post-milestone. Bound every persistence/lifecycle operation
@@ -3038,7 +4047,7 @@ impl Session {
                 .clear_pending_for_turn_state(finalization.turn_state.as_ref()),
         )
         .await;
-        if !had_authoritative_claim && !finalization.coordinator.durable_terminal_committed() {
+        if !finalization.coordinator.durable_terminal_committed() {
             let invalidation = self
                 .services
                 .task_evidence
@@ -3052,15 +4061,27 @@ impl Session {
                 warn!(turn_id = %turn_context.sub_id, "timed out invalidating completion during fail-safe cleanup");
             }
         }
-        if let Some(event) = dispatched_event.as_ref()
-            && tokio::time::timeout(
+        let mut fail_safe_parent_notification_completed = false;
+        if let Some(event) = dispatched_event.as_ref() {
+            let parent_notification_completed = match tokio::time::timeout(
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
                 self.finish_terminal_event_dispatch(turn_context.as_ref(), event),
             )
             .await
-            .is_err()
-        {
-            warn!(turn_id = %turn_context.sub_id, "timed out finishing fail-safe terminal event side effects");
+            {
+                Ok(completed) => completed,
+                Err(_) => {
+                    warn!(turn_id = %turn_context.sub_id, "timed out finishing fail-safe terminal event side effects");
+                    false
+                }
+            };
+            fail_safe_parent_notification_completed = parent_notification_completed;
+            if !parent_notification_completed {
+                self.schedule_parent_terminal_notification_retry(
+                    Arc::clone(&turn_context),
+                    event.clone(),
+                );
+            }
         }
         if let Some(summary) = finalization
             .reasoning_policy_recorder
@@ -3115,6 +4136,7 @@ impl Session {
             tokio::time::Instant::now().saturating_duration_since(post_cleanup_started),
         );
         finalization.deadline.finish_unclassified();
+        let _ = self.emit_pending_turn_profile(finalization);
         if had_authoritative_claim || finalization.coordinator.durable_terminal_committed() {
             let delivery_state = match finalization.coordinator.delivery_state() {
                 CoordinatorDeliveryState::NotAttempted => DurableDeliveryState::NotAttempted,
@@ -3128,10 +4150,16 @@ impl Session {
                     TerminalInteractionUpdate {
                         terminal_identity: format!("{}:{}", self.thread_id, turn_context.sub_id),
                         delivery_state,
+                        app_server_acknowledged: false,
+                        runtime_status_converged: true,
+                        rollout_mirrored: false,
+                        parent_notification_completed: fail_safe_parent_notification_completed,
+                        post_terminal_cleanup_completed: true,
                         active_turn_detached: true,
                         terminal_interaction_released: true,
                         recovery_state: TerminalRecoveryState::Recovered,
                         phase_timings_ns: finalization.deadline.phase_timings_ns(),
+                        terminalization: None,
                     },
                 ),
             )
@@ -3164,6 +4192,74 @@ fn merge_completion_review_partial(
             });
         }
     }
+}
+
+fn semantic_terminal_outcome(event: &EventMsg) -> String {
+    match event {
+        EventMsg::TurnAborted(_) => "aborted".to_string(),
+        EventMsg::TurnComplete(completed) if completed.error.is_some() => "failed".to_string(),
+        EventMsg::TurnComplete(completed) => completed
+            .completion
+            .as_ref()
+            .map(|gate| match gate.status {
+                TaskCompletionStatus::Passed => "passed",
+                TaskCompletionStatus::Partial => "partial",
+                TaskCompletionStatus::Blocked => "blocked",
+            })
+            .unwrap_or("completed")
+            .to_string(),
+        _ => "terminal".to_string(),
+    }
+}
+
+fn last_terminal_authority_from_rollout(
+    thread_id: ThreadId,
+    items: &[RolloutItem],
+) -> Option<AuthoritativeTerminalEventV1> {
+    items.iter().rev().find_map(|item| {
+        let RolloutItem::EventMsg(event) = item else {
+            return None;
+        };
+        let turn_id = match event {
+            EventMsg::TurnComplete(event) => event.turn_id.clone(),
+            EventMsg::TurnAborted(event) => event.turn_id.clone()?,
+            _ => return None,
+        };
+        let fingerprint = terminal_event_fingerprint(event)?;
+        Some(AuthoritativeTerminalEventV1 {
+            version: 1,
+            terminal_identity: format!("{thread_id}:{turn_id}"),
+            turn_id,
+            event: event.clone(),
+            fingerprint,
+            semantic_outcome: semantic_terminal_outcome(event),
+            final_proof_identity: None,
+        })
+    })
+}
+
+pub(crate) fn open_turn_id_for_terminal_recovery(items: &[RolloutItem]) -> Option<String> {
+    let mut open_turn_id = None;
+    for item in items {
+        let RolloutItem::EventMsg(event) = item else {
+            continue;
+        };
+        match event {
+            EventMsg::TurnStarted(started) => open_turn_id = Some(started.turn_id.clone()),
+            EventMsg::TurnComplete(completed)
+                if open_turn_id.as_deref() == Some(completed.turn_id.as_str()) =>
+            {
+                open_turn_id = None;
+            }
+            EventMsg::TurnAborted(aborted)
+                if aborted.turn_id.as_deref() == open_turn_id.as_deref() =>
+            {
+                open_turn_id = None;
+            }
+            _ => {}
+        }
+    }
+    open_turn_id
 }
 
 #[cfg(test)]

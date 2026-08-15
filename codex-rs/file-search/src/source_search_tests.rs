@@ -60,6 +60,46 @@ fn read_preserves_crlf_and_builds_four_deterministic_chunks() {
 }
 
 #[test]
+fn coverage_trim_rebuilds_exact_content_and_chunks_for_disjoint_ranges() {
+    let content = (1..=8)
+        .map(|line| format!("line {line}\r\n"))
+        .collect::<String>();
+    let mut output =
+        read_file_span_from_bytes("src/fixture.rs".to_string(), content.into_bytes(), 1, 8)
+            .expect("read exact source span");
+
+    retain_read_file_span_intervals(&mut output, &[(2, 2), (5, 6)]);
+
+    assert_eq!(output.exact_content, "line 2\r\nline 5\r\nline 6\r\n");
+    assert_eq!(
+        output
+            .lines
+            .iter()
+            .map(|line| line.line_number)
+            .collect::<Vec<_>>(),
+        vec![2, 5, 6]
+    );
+    assert_eq!(
+        output
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.start_line, chunk.end_line))
+            .collect::<Vec<_>>(),
+        vec![(2, 2), (5, 6)]
+    );
+    let reconstructed = output
+        .chunks
+        .iter()
+        .map(|chunk| &output.exact_content[chunk.byte_start..chunk.byte_end])
+        .collect::<String>();
+    assert_eq!(reconstructed, output.exact_content);
+    assert_eq!(
+        output.requested_content_sha256,
+        format!("{:x}", Sha256::digest(output.exact_content.as_bytes()))
+    );
+}
+
+#[test]
 fn one_oversized_source_line_gets_its_own_exact_chunk() {
     let oversized = format!("{}\r\nsmall\r\n", "x".repeat(9 * 1024));
 
@@ -218,6 +258,7 @@ fn unique_complete_search_hydrates_from_the_observed_bytes() {
         hydrated.content_hash,
         format!("{:x}", sha2::Sha256::digest(source.as_bytes()))
     );
+    assert!(output.hydration_packet.is_none());
 }
 
 #[test]
@@ -258,15 +299,269 @@ fn unique_search_prefers_an_existing_authoritative_definition_span() {
 }
 
 #[test]
-fn ambiguous_or_incomplete_search_does_not_hydrate() {
+fn complete_multi_match_search_hydrates_a_bounded_exact_packet() {
     let repo = tempfile::tempdir().expect("tempdir");
-    fs::write(repo.path().join("source.rs"), "needle\nneedle\n").expect("write");
-    let ambiguous = search_source(search_options(repo.path(), "needle")).expect("search");
+    fs::write(repo.path().join("a.rs"), "before a\nneedle a\nafter a\n").expect("write a");
+    fs::write(repo.path().join("b.rs"), "before b\nneedle b\nafter b\n").expect("write b");
+
+    let output = search_source(search_options(repo.path(), "needle")).expect("search");
+
     assert_eq!(
-        ambiguous.hydration_status,
-        SourceSearchHydrationStatus::SkippedNoUniqueMatch
+        output.hydration_status,
+        SourceSearchHydrationStatus::HydratedBoundedPacket
     );
-    assert!(ambiguous.hydrated_span.is_none());
+    assert!(output.hydrated_span.is_none());
+    let packet = output.hydration_packet.expect("multi-match packet");
+    assert_eq!(packet.schema_version, 1);
+    assert_eq!(packet.spans.len(), 2);
+    assert!(packet.issues.is_empty());
+    assert!(packet.exact_content_bytes <= SOURCE_SEARCH_HYDRATION_MAX_BYTES);
+    assert_eq!(packet.spans[0].path, "a.rs");
+    assert_eq!(packet.spans[1].path, "b.rs");
+    assert_eq!(
+        packet.spans[0].span_content_hash,
+        format!(
+            "{:x}",
+            Sha256::digest(packet.spans[0].exact_content.as_bytes())
+        )
+    );
+    assert!(packet.spans.iter().all(|span| {
+        output.matches.iter().any(|matched| {
+            span.match_ids.contains(&matched.id)
+                && span.path == matched.path
+                && span.file_content_hash == matched.source_revision
+                && span.start_line <= matched.line_number
+                && span.end_line >= matched.line_number
+        })
+    }));
+}
+
+#[test]
+fn multi_match_hydration_deduplicates_one_authoritative_span() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        repo.path().join("source.rs"),
+        "fn owner() {\n    let needle = 1;\n    let other_needle = 2;\n}\n",
+    )
+    .expect("write");
+    let mut options = search_options(repo.path(), "needle");
+    options.hydration_candidates = vec![SourceSearchHydrationCandidate {
+        path: "source.rs".to_string(),
+        start_line: 1,
+        end_line: 4,
+        kind: SourceSearchHydrationCandidateKind::AuthoritativeDefinition,
+    }];
+
+    let output = search_source(options).expect("search");
+    let packet = output.hydration_packet.expect("multi-match packet");
+
+    assert_eq!(packet.spans.len(), 1);
+    assert_eq!(packet.spans[0].match_ids.len(), 2);
+    assert_eq!(
+        packet.spans[0].selection,
+        SourceSearchHydrationSelection::AuthoritativeDefinition
+    );
+    assert_eq!(
+        packet.spans[0].exact_content,
+        fs::read_to_string(repo.path().join("source.rs")).expect("read")
+    );
+}
+
+#[test]
+fn ambiguous_multi_match_candidates_are_reported_without_fallback() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join("source.rs"), "needle one\nneedle two\n").expect("write");
+    for (kind, expected_reason) in [
+        (
+            SourceSearchHydrationCandidateKind::AuthoritativeDefinition,
+            SourceSearchHydrationIssueReason::AmbiguousAuthoritativeCandidate,
+        ),
+        (
+            SourceSearchHydrationCandidateKind::StructuredContext,
+            SourceSearchHydrationIssueReason::AmbiguousStructuredCandidate,
+        ),
+    ] {
+        let mut options = search_options(repo.path(), "needle");
+        options.hydration_candidates = vec![
+            SourceSearchHydrationCandidate {
+                path: "source.rs".to_string(),
+                start_line: 1,
+                end_line: 2,
+                kind,
+            },
+            SourceSearchHydrationCandidate {
+                path: "source.rs".to_string(),
+                start_line: 1,
+                end_line: 3,
+                kind,
+            },
+        ];
+
+        let output = search_source(options).expect("search");
+        let packet = output.hydration_packet.expect("partial packet");
+
+        assert_eq!(
+            output.hydration_status,
+            SourceSearchHydrationStatus::PartiallyHydratedBoundedPacket
+        );
+        assert!(packet.spans.is_empty());
+        assert_eq!(packet.issues.len(), 2);
+        assert!(
+            packet
+                .issues
+                .iter()
+                .all(|issue| issue.reason == expected_reason)
+        );
+    }
+}
+
+#[test]
+fn multi_match_packet_caps_content_and_accounts_for_every_match() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    for index in 0..12 {
+        fs::write(
+            repo.path().join(format!("source_{index:02}.rs")),
+            format!("needle {}\n", "x".repeat(700)),
+        )
+        .expect("write");
+    }
+
+    let output = search_source(search_options(repo.path(), "needle")).expect("search");
+    let packet = output.hydration_packet.expect("partial packet");
+    let represented = packet
+        .spans
+        .iter()
+        .flat_map(|span| span.match_ids.iter())
+        .chain(packet.issues.iter().map(|issue| &issue.match_id))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        output.hydration_status,
+        SourceSearchHydrationStatus::PartiallyHydratedBoundedPacket
+    );
+    assert!(packet.exact_content_bytes <= SOURCE_SEARCH_HYDRATION_MAX_BYTES);
+    assert!(packet.spans.len() <= SOURCE_SEARCH_HYDRATION_MAX_SPANS);
+    assert_eq!(represented.len(), output.matches.len());
+    assert!(
+        output
+            .matches
+            .iter()
+            .all(|matched| represented.iter().any(|id| id.as_str() == matched.id))
+    );
+}
+
+#[test]
+fn multi_match_packet_caps_span_count_and_reports_each_omission() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    for index in 0..12 {
+        fs::write(
+            repo.path().join(format!("source_{index:02}.rs")),
+            "needle\n",
+        )
+        .expect("write");
+    }
+
+    let output = search_source(search_options(repo.path(), "needle")).expect("search");
+    let packet = output.hydration_packet.expect("partial packet");
+
+    assert_eq!(packet.spans.len(), SOURCE_SEARCH_HYDRATION_MAX_SPANS);
+    assert_eq!(
+        packet
+            .issues
+            .iter()
+            .filter(|issue| issue.reason == SourceSearchHydrationIssueReason::SpanCap)
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn unavailable_multi_match_observations_are_reported_explicitly() {
+    let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
+    let mut accumulator = SourceSearchAccumulator::new(&options).expect("accumulator");
+    accumulator.add_file_bytes(Path::new("a.rs"), b"needle a\n".to_vec());
+    accumulator.add_file_bytes(Path::new("b.rs"), b"needle b\n".to_vec());
+    accumulator.hydration_observations.clear();
+
+    let output = accumulator.finish(vec![".".to_string()]);
+    let packet = output.hydration_packet.expect("partial packet");
+
+    assert!(packet.spans.is_empty());
+    assert_eq!(packet.issues.len(), 2);
+    assert!(
+        packet.issues.iter().all(|issue| {
+            issue.reason == SourceSearchHydrationIssueReason::ObservationUnavailable
+        })
+    );
+}
+
+#[test]
+fn multi_match_packet_identity_is_independent_of_scan_order() {
+    let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
+    let mut first = SourceSearchAccumulator::new(&options).expect("first accumulator");
+    first.add_file_bytes(Path::new("b.rs"), b"needle b\n".to_vec());
+    first.add_file_bytes(Path::new("a.rs"), b"needle a\n".to_vec());
+    let first = first.finish(vec![".".to_string()]);
+
+    let mut second = SourceSearchAccumulator::new(&options).expect("second accumulator");
+    second.add_file_bytes(Path::new("a.rs"), b"needle a\n".to_vec());
+    second.add_file_bytes(Path::new("b.rs"), b"needle b\n".to_vec());
+    let second = second.finish(vec![".".to_string()]);
+
+    assert_eq!(
+        first
+            .hydration_packet
+            .as_ref()
+            .expect("first packet")
+            .observation_set_id,
+        second
+            .hydration_packet
+            .as_ref()
+            .expect("second packet")
+            .observation_set_id
+    );
+    assert_eq!(first.hydration_packet, second.hydration_packet);
+}
+
+#[test]
+fn incomplete_match_index_rejects_multi_match_hydration() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join("source.rs"), "needle one\nneedle two\n").expect("write");
+    let mut options = search_options(repo.path(), "needle");
+    options.max_matches = 1;
+
+    let output = search_source(options).expect("search");
+
+    assert!(output.coverage_complete);
+    assert!(!output.coverage.index_complete);
+    assert_eq!(
+        output.hydration_status,
+        SourceSearchHydrationStatus::SkippedIndexIncomplete
+    );
+    assert!(output.hydration_packet.is_none());
+}
+
+#[test]
+fn source_search_output_deserializes_without_hydration_packet() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join("source.rs"), "needle\n").expect("write");
+    let output = search_source(search_options(repo.path(), "needle")).expect("search");
+    let mut value = serde_json::to_value(output).expect("serialize output");
+    value
+        .as_object_mut()
+        .expect("object output")
+        .remove("hydration_packet");
+
+    let decoded: SourceSearchOutput =
+        serde_json::from_value(value).expect("deserialize old output");
+
+    assert!(decoded.hydration_packet.is_none());
+    assert!(decoded.hydrated_span.is_some());
+}
+
+#[test]
+fn incomplete_search_does_not_hydrate() {
+    let repo = tempfile::tempdir().expect("tempdir");
 
     let options = search_options(repo.path(), "first");
     let mut accumulator = SourceSearchAccumulator::new(&options).expect("accumulator");
@@ -279,6 +574,7 @@ fn ambiguous_or_incomplete_search_does_not_hydrate() {
         SourceSearchHydrationStatus::SkippedCoverageIncomplete
     );
     assert!(incomplete.hydrated_span.is_none());
+    assert!(incomplete.hydration_packet.is_none());
 }
 
 #[test]
@@ -296,6 +592,7 @@ fn unique_hydration_can_be_disabled_without_changing_search_results() {
         SourceSearchHydrationStatus::Disabled
     );
     assert!(output.hydrated_span.is_none());
+    assert!(output.hydration_packet.is_none());
 }
 
 #[test]

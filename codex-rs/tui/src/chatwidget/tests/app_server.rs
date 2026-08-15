@@ -87,6 +87,9 @@ fn start_safety_buffering_test_turn(
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }),
@@ -460,6 +463,7 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
                     AppServerCollabAgentState {
                         status: AppServerCollabAgentStatus::PendingInit,
                         message: None,
+                        surfaced_result: None,
                     },
                 )]),
             },
@@ -534,6 +538,9 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }),
@@ -569,6 +576,7 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
 
     chat.handle_server_notification(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: AppServerTurn {
@@ -580,6 +588,9 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -597,6 +608,7 @@ async fn live_app_server_turn_completed_renders_completion_gate() {
 
     chat.handle_server_notification(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: Some(codex_app_server_protocol::TaskCompletionGate {
                 status: codex_app_server_protocol::TaskCompletionStatus::Partial,
@@ -612,6 +624,9 @@ async fn live_app_server_turn_completed_renders_completion_gate() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -644,6 +659,9 @@ async fn live_app_server_turn_started_sets_feedback_turn_id() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }),
@@ -901,6 +919,7 @@ async fn live_app_server_collab_wait_items_render_history() {
                         AppServerCollabAgentState {
                             status: AppServerCollabAgentStatus::Completed,
                             message: Some("Done".to_string()),
+                            surfaced_result: None,
                         },
                     ),
                     (
@@ -908,6 +927,7 @@ async fn live_app_server_collab_wait_items_render_history() {
                         AppServerCollabAgentState {
                             status: AppServerCollabAgentStatus::Running,
                             message: None,
+                            surfaced_result: None,
                         },
                     ),
                 ]),
@@ -971,6 +991,7 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                     AppServerCollabAgentState {
                         status: AppServerCollabAgentStatus::PendingInit,
                         message: None,
+                        surfaced_result: None,
                     },
                 )]),
             },
@@ -1005,6 +1026,9 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }),
@@ -1031,6 +1055,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
 
     chat.handle_server_notification(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: AppServerTurn {
@@ -1046,6 +1071,9 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1107,6 +1135,9 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }),
@@ -1166,6 +1197,9 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }),
@@ -1209,6 +1243,9 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }),

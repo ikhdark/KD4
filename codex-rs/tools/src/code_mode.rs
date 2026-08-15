@@ -4,6 +4,28 @@ use crate::ToolSpec;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
 
+const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count.";
+
+pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["completed", "incomplete", "aborted"]
+            },
+            "execution": { "const": "client" },
+            "tools": { "type": "array" },
+            "omitted_result_count": {
+                "type": ["integer", "null"],
+                "minimum": 0
+            }
+        },
+        "required": ["status", "execution", "tools", "omitted_result_count"],
+        "additionalProperties": false
+    })
+}
+
 /// Augment tool descriptions with code-mode-specific exec samples.
 pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
     match spec {
@@ -148,7 +170,22 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 }
             })
             .collect(),
-        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => Vec::new(),
+        ToolSpec::ToolSearch {
+            description,
+            parameters,
+            ..
+        } => vec![CodeModeToolDefinition {
+            tool_name: ToolName::plain("tool_search"),
+            name: "tool_search".to_string(),
+            description: format!(
+                "{}\n\n{CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE}",
+                description.trim()
+            ),
+            kind: CodeModeToolKind::Function,
+            input_schema: serde_json::to_value(parameters).ok(),
+            output_schema: Some(code_mode_tool_search_output_schema()),
+        }],
+        ToolSpec::WebSearch { .. } => Vec::new(),
     }
 }
 

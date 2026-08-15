@@ -494,6 +494,45 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
 }
 
 #[tokio::test]
+async fn dropped_wait_observer_leaves_the_cell_available() {
+    let service = InProcessCodeModeSession::new();
+    let cell = service
+        .execute(execute_request("await new Promise(() => {});"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        cell.initial_response().await.unwrap(),
+        RuntimeResponse::Yielded { .. }
+    ));
+
+    let suspended = service
+        .begin_wait(WaitRequest {
+            cell_id: cell_id("1"),
+            yield_time_ms: 60_000,
+        })
+        .await;
+    drop(suspended);
+
+    assert_eq!(
+        service
+            .wait(WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 0,
+            })
+            .await
+            .unwrap(),
+        WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            cell_id: cell_id("1"),
+            content_items: Vec::new(),
+        })
+    );
+    assert!(matches!(
+        service.terminate(cell_id("1")).await.unwrap(),
+        WaitOutcome::LiveCell(RuntimeResponse::Terminated { .. })
+    ));
+}
+
+#[tokio::test]
 async fn natural_completion_cleans_up_callbacks_before_responding() {
     let (delegate, mut events_rx) = BlockingDelegate::new();
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());

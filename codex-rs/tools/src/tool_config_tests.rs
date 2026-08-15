@@ -63,6 +63,22 @@ fn shell_features() -> Features {
 }
 
 #[test]
+fn default_features_select_unified_exec_when_the_platform_supports_it() {
+    let model = model_with_shell_type(ConfigShellToolType::ShellCommand);
+    let features = Features::with_defaults();
+    let expected = if codex_utils_pty::conpty_supported() {
+        ConfigShellToolType::UnifiedExec
+    } else {
+        ConfigShellToolType::ShellCommand
+    };
+
+    assert_eq!(
+        shell_type_for_model_and_features(&model, &features),
+        expected
+    );
+}
+
+#[test]
 fn shell_type_is_derived_from_model_and_feature_gates() {
     let model = model_with_shell_type(ConfigShellToolType::UnifiedExec);
     let mut features = shell_features();

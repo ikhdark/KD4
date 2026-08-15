@@ -71,6 +71,10 @@ pub(super) async fn run_remote_compact_attempt(
     let prompt = Prompt {
         input: prompt_input.into(),
         stable_context_fallback_input: Arc::from([]),
+        tool_history_fallback_input: Arc::from([]),
+        stable_context_tool_history_fallback_input: Arc::from([]),
+        tool_history_substitutions: Arc::from([]),
+        stable_context_fallback_tool_history_substitutions: Arc::from([]),
         stable_context_manifest: Default::default(),
         prompt_provenance: Default::default(),
         tools: tool_router.model_visible_specs(),

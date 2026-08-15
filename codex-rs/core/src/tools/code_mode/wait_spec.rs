@@ -13,7 +13,8 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
         (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
-                "Wait before yielding more output. Defaults to 10000 ms.".to_string(),
+                "Internal observation/progress cadence for an unchanged cell. Empty observations do not cause a model-visible yield or a new model generation, and this does not set a completion deadline. Defaults to 10000 ms."
+                    .to_string(),
             )),
         ),
         (
@@ -52,6 +53,8 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+    use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -92,7 +95,7 @@ mod tests {
                         (
                             "yield_time_ms".to_string(),
                             JsonSchema::number(Some(
-                                "Wait before yielding more output. Defaults to 10000 ms."
+                                "Internal observation/progress cadence for an unchanged cell. Empty observations do not cause a model-visible yield or a new model generation, and this does not set a completion deadline. Defaults to 10000 ms."
                                     .to_string(),
                             )),
                         ),
@@ -102,6 +105,56 @@ mod tests {
                 ),
                 output_schema: None,
             })
+        );
+    }
+
+    #[test]
+    fn owned_wait_parameter_descriptions_and_schema_shapes_match_runtime_semantics() {
+        let ToolSpec::Function(code_wait) = create_wait_tool() else {
+            panic!("code-mode wait must remain a function tool");
+        };
+        let code_properties = code_wait
+            .parameters
+            .properties
+            .as_ref()
+            .expect("code-mode wait properties");
+        assert_eq!(
+            code_properties.keys().cloned().collect::<Vec<_>>(),
+            vec!["cell_id", "max_tokens", "terminate", "yield_time_ms"]
+        );
+        assert!(
+            code_properties["yield-time_ms"]
+                .description
+                .as_deref()
+                .is_some_and(
+                    |description| description.contains("does not set a completion deadline")
+                )
+        );
+
+        let ToolSpec::Function(agent_wait) = create_wait_agent_tool_v2(WaitAgentTimeoutOptions {
+            default_timeout_ms: 30_000,
+            min_timeout_ms: 10_000,
+            max_timeout_ms: 3_600_000,
+        }) else {
+            panic!("multi-agent wait must remain a function tool");
+        };
+        let agent_properties = agent_wait
+            .parameters
+            .properties
+            .as_ref()
+            .expect("multi-agent wait properties");
+        assert_eq!(
+            agent_properties.keys().cloned().collect::<Vec<_>>(),
+            vec!["cursor", "timeout_ms"]
+        );
+        assert!(
+            agent_properties["timeout_ms"]
+                .description
+                .as_deref()
+                .is_some_and(|description| {
+                    description.contains("Explicit caller deadline")
+                        && description.contains("internal maintenance cadence only")
+                })
         );
     }
 }

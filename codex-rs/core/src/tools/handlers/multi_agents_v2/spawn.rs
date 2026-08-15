@@ -20,6 +20,7 @@ use codex_agent_task_store::AgentTaskBindingDraft;
 use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::ArchitectureContractRef;
 use codex_agent_task_store::Assignment;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AssignmentRelation;
@@ -91,29 +92,18 @@ async fn handle_spawn_agent(
     } = invocation;
     let arguments = function_arguments(payload)?;
     let mut args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    if turn.session_source.is_non_root_agent() {
-        if args.assignment.is_some() {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: durable typed assignments are root-only".to_string(),
-            ));
-        }
-        if session
-            .services
-            .agent_control
-            .task_coordinator()
-            .binding_for_source(&turn.session_source)
-            .is_some()
-        {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: durable typed agents cannot spawn subagents".to_string(),
-            ));
-        }
+    if turn.session_source.is_non_root_agent() && args.assignment.is_some() {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent: durable typed assignments are root-only".to_string(),
+        ));
     }
-    let typed_role = args
-        .assignment
-        .as_ref()
-        .map(|_| parse_typed_role(args.agent_type.as_deref()))
-        .transpose()?;
+    let typed_role = if args.assignment.is_some() {
+        parse_typed_role(args.agent_type.as_deref())?
+    } else {
+        // The legacy message shape remains accepted, but it is admitted as a conservative
+        // repository-scoped worker claim so it cannot bypass durable identity/overlap checks.
+        AgentRole::Worker
+    };
     let fork_mode = args.fork_mode(
         typed_role,
         turn.config.multi_agent_v2.allow_full_history_forks,
@@ -135,9 +125,45 @@ async fn handle_spawn_agent(
                 "spawn_agent: either assignment or message is required".to_string(),
             ));
         }
-        (Some(message), false) => Some(message_content(message)?),
+        (Some(message), false) => {
+            // Preserve the legacy validation contract before converting the task into a durable
+            // assignment. Empty or otherwise invalid message payloads still fail as before.
+            let _ = message_content(message.clone())?;
+            Some(message)
+        }
         (None, true) => None,
     };
+    let legacy_parent_assignment_id = if turn.session_source.is_non_root_agent() {
+        let coordinator = session.services.agent_control.task_coordinator();
+        match coordinator.binding_for_source(&turn.session_source) {
+            Some(binding) => {
+                let parent = coordinator
+                    .get_agent_task(binding.assignment_id, Some(0))
+                    .await
+                    .map_err(typed_task_store_error)?;
+                if !matches!(
+                    parent.assignment.admission_origin,
+                    AssignmentAdmissionOrigin::LegacyMessage { .. }
+                ) {
+                    return Err(FunctionCallError::RespondToModel(
+                        "spawn_agent: explicitly typed agents cannot spawn subagents".to_string(),
+                    ));
+                }
+                Some(binding.assignment_id)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if !crate::session::multi_agents::spawn_is_authorized(turn.as_ref())
+        && legacy_parent_assignment_id.is_none()
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent: this turn is in explicit-request-only mode and the user did not explicitly authorize spawning agents"
+                .to_string(),
+        ));
+    }
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config =
@@ -195,53 +221,45 @@ async fn handle_spawn_agent(
     // Typed spawns reserve execution, registry identity, and V2 residency before any
     // worktree or durable assignment preparation. The token holds only logical RAII
     // reservations; all synchronization guards used to create it have already been released.
-    let typed_role_metric = typed_role.map(agent_role_metric_label);
-    if let Some(role) = typed_role_metric {
-        turn.session_telemetry.counter(
-            "codex.multi_agent.typed_spawn_lifecycle",
-            1,
-            &[("outcome", "attempted"), ("role", role)],
-        );
-    }
-    let mut typed_reservation_metric = None;
-    let mut prepared_typed_spawn = if let Some(role) = typed_role_metric {
-        match session
-            .services
-            .agent_control
-            .prepare_typed_spawn(&config, spawn_source.clone(), Some(session.thread_id))
-            .await
-        {
-            Ok(prepared) => {
-                turn.session_telemetry.counter(
-                    "codex.multi_agent.typed_spawn_lifecycle",
-                    1,
-                    &[("outcome", "reserved"), ("role", role)],
-                );
-                typed_reservation_metric = Some(TypedSpawnReservationMetric::new(
-                    turn.session_telemetry.clone(),
-                    role,
-                ));
-                Some(prepared)
-            }
-            Err(error) => {
-                turn.session_telemetry.counter(
-                    "codex.multi_agent.typed_spawn_lifecycle",
-                    1,
-                    &[("outcome", "reservation_rejected"), ("role", role)],
-                );
-                return Err(collab_spawn_error(error));
-            }
+    let typed_role_metric = agent_role_metric_label(typed_role);
+    turn.session_telemetry.counter(
+        "codex.multi_agent.typed_spawn_lifecycle",
+        1,
+        &[("outcome", "attempted"), ("role", typed_role_metric)],
+    );
+    let mut prepared_typed_spawn = match session
+        .services
+        .agent_control
+        .prepare_typed_spawn(&config, spawn_source.clone(), Some(session.thread_id))
+        .await
+    {
+        Ok(prepared) => {
+            turn.session_telemetry.counter(
+                "codex.multi_agent.typed_spawn_lifecycle",
+                1,
+                &[("outcome", "reserved"), ("role", typed_role_metric)],
+            );
+            Some(prepared)
         }
-    } else {
-        None
+        Err(error) => {
+            turn.session_telemetry.counter(
+                "codex.multi_agent.typed_spawn_lifecycle",
+                1,
+                &[
+                    ("outcome", "reservation_rejected"),
+                    ("role", typed_role_metric),
+                ],
+            );
+            return Err(collab_spawn_error(error));
+        }
     };
+    let mut typed_reservation_metric = Some(TypedSpawnReservationMetric::new(
+        turn.session_telemetry.clone(),
+        typed_role_metric,
+    ));
     let mut consumed_typed_spawn = None;
-    let typed_task = if let Some(assignment_args) = args.assignment.take() {
-        let role = typed_role.ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "spawn_agent: typed assignments require a supported agent_type".to_string(),
-            )
-        })?;
+    let typed_task = if args.assignment.is_some() || legacy_message.is_some() {
+        let role = typed_role;
         let coordinator = session.services.agent_control.task_coordinator();
         if coordinator.store().is_none() {
             coordinator
@@ -280,7 +298,12 @@ async fn handle_spawn_agent(
             None => turn.config.cwd.to_path_buf(),
         };
         let main_repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-        let repo_root = if assignment_args.workspace_strategy == WorkspaceStrategy::Isolated {
+        let workspace_strategy = args
+            .assignment
+            .as_ref()
+            .map(|assignment| assignment.workspace_strategy)
+            .unwrap_or(WorkspaceStrategy::Shared);
+        let repo_root = if workspace_strategy == WorkspaceStrategy::Isolated {
             let workspace = Box::pin(create_isolated_worktree(
                 &main_repo_root,
                 config.codex_home.as_path(),
@@ -309,8 +332,27 @@ async fn handle_spawn_agent(
         } else {
             main_repo_root
         };
-        let relevant_handles = assignment_args.relevant_handles.clone();
-        let draft = assignment_args.into_draft(root_session_id, role);
+        let (draft, relevant_handles) = match args.assignment.take() {
+            Some(assignment_args) => {
+                let relevant_handles = assignment_args.relevant_handles.clone();
+                (
+                    assignment_args.into_draft(root_session_id, role),
+                    relevant_handles,
+                )
+            }
+            None => (
+                legacy_message_draft(
+                    root_session_id,
+                    legacy_message.as_deref().ok_or_else(|| {
+                        FunctionCallError::RespondToModel(
+                            "spawn_agent: either assignment or message is required".to_string(),
+                        )
+                    })?,
+                    legacy_parent_assignment_id,
+                ),
+                Vec::new(),
+            ),
+        };
         let isolated_integrator_available = resolve_role_config(&config, "integrator").is_some();
         let prepared = prepared_typed_spawn.take().ok_or_else(|| {
             FunctionCallError::RespondToModel(
@@ -459,15 +501,7 @@ async fn handle_spawn_agent(
                 new_agent_path.clone(),
                 typed_assignment_message(assignment, attempt),
             ),
-            None => communication_from_tool_message(
-                author,
-                new_agent_path.clone(),
-                legacy_message.ok_or_else(|| {
-                    FunctionCallError::RespondToModel(
-                        "spawn_agent: either assignment or message is required".to_string(),
-                    )
-                })?,
-            ),
+            None => unreachable!("all MultiAgentV2 spawns are durably admitted"),
         };
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
@@ -593,7 +627,12 @@ async fn handle_spawn_agent(
     let task_name = String::from(new_agent_path);
     let assignment_id = typed_task
         .as_ref()
-        .map(|(assignment, _, _)| assignment.assignment_id.to_string());
+        .map(|(assignment, _, _)| assignment.assignment_id.to_string())
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent: durable admission completed without an assignment".to_string(),
+            )
+        })?;
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
@@ -662,21 +701,7 @@ fn emit_admission_overlap_metrics(
     session_telemetry: &SessionTelemetry,
     overlaps: codex_agent_task_store::AdmissionOverlapSummary,
 ) {
-    for (kind, count) in [
-        ("benign_read_read", overlaps.benign_read_overlap_count),
-        (
-            "duplicated_primary_investigation",
-            overlaps.duplicated_primary_investigation_count,
-        ),
-        (
-            "conflicting_write_read",
-            overlaps.conflicting_write_read_count,
-        ),
-        (
-            "conflicting_write_write",
-            overlaps.conflicting_write_write_count,
-        ),
-    ] {
+    for (kind, count) in [("benign_read_read", overlaps.benign_read_overlap_count)] {
         if count > 0 {
             session_telemetry.counter(
                 "codex.multi_agent.admission_overlap",
@@ -1042,7 +1067,7 @@ struct SpawnAgentArgs {
 impl SpawnAgentArgs {
     fn fork_mode(
         &self,
-        typed_role: Option<AgentRole>,
+        role: AgentRole,
         allow_full_history_forks: bool,
     ) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
         if self.fork_context.is_some() {
@@ -1057,7 +1082,7 @@ impl SpawnAgentArgs {
             .map(str::trim)
             .filter(|fork_turns| !fork_turns.is_empty());
 
-        if matches!(typed_role, Some(AgentRole::Reviewer | AgentRole::Verifier)) {
+        if matches!(role, AgentRole::Reviewer | AgentRole::Verifier) {
             if explicit_fork_turns
                 .is_some_and(|fork_turns| !fork_turns.eq_ignore_ascii_case("none"))
             {
@@ -1070,11 +1095,11 @@ impl SpawnAgentArgs {
         }
 
         let Some(fork_turns) = explicit_fork_turns else {
-            return Ok(typed_role.map(|_| SpawnAgentForkMode::TaskCapsule));
+            return Ok(Some(SpawnAgentForkMode::TaskCapsule));
         };
 
         if fork_turns.eq_ignore_ascii_case("none") {
-            return Ok(typed_role.map(|_| SpawnAgentForkMode::TaskCapsule));
+            return Ok(Some(SpawnAgentForkMode::TaskCapsule));
         }
         if fork_turns.eq_ignore_ascii_case("all") {
             if allow_full_history_forks {
@@ -1138,6 +1163,7 @@ impl TypedAssignmentArgs {
     fn into_draft(self, root_session_id: String, role: AgentRole) -> AssignmentDraft {
         AssignmentDraft {
             root_session_id,
+            admission_origin: AssignmentAdmissionOrigin::Typed,
             role,
             capability_profile: role.capability_profile(),
             objective: self.objective,
@@ -1154,6 +1180,42 @@ impl TypedAssignmentArgs {
             relation: self.relation,
             architecture_contract_ref: self.architecture_contract_ref,
         }
+    }
+}
+
+fn legacy_message_draft(
+    root_session_id: String,
+    message: &str,
+    parent_assignment_id: Option<AssignmentId>,
+) -> AssignmentDraft {
+    AssignmentDraft {
+        root_session_id,
+        admission_origin: AssignmentAdmissionOrigin::LegacyMessage {
+            parent_assignment_id,
+        },
+        role: AgentRole::Worker,
+        capability_profile: AgentRole::Worker.capability_profile(),
+        objective: message.to_string(),
+        acceptance_criteria: vec![AcceptanceCriterion {
+            id: "legacy-message-result".to_string(),
+            text: "Return a concrete result for the requested task to the parent agent."
+                .to_string(),
+        }],
+        read_scope: Vec::new(),
+        write_scope: vec![RepoScope {
+            path: ".".to_string(),
+            recursive: true,
+        }],
+        stop_condition: "Stop after reporting the requested result to the parent agent."
+            .to_string(),
+        dependencies: Vec::new(),
+        risk_hints: Vec::new(),
+        required_evidence: vec!["task result reported to the parent agent".to_string()],
+        prohibited_changes: Vec::new(),
+        contract_claims: Vec::new(),
+        workspace_strategy: WorkspaceStrategy::Shared,
+        relation: None,
+        architecture_contract_ref: None,
     }
 }
 
@@ -1355,13 +1417,11 @@ pub(crate) enum SpawnAgentResult {
     WithNickname {
         task_name: String,
         nickname: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        assignment_id: Option<String>,
+        assignment_id: String,
     },
     HiddenMetadata {
         task_name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        assignment_id: Option<String>,
+        assignment_id: String,
     },
 }
 
@@ -1428,23 +1488,47 @@ mod tests {
     }
 
     #[test]
-    fn untyped_spawn_without_overrides_defaults_to_no_history() {
-        let args = spawn_args();
-        assert!(matches!(args.fork_mode(None, false), Ok(None)));
+    fn legacy_message_is_converted_to_a_repository_wide_worker_claim() {
+        let draft = legacy_message_draft("root-session".to_string(), "inspect the repo", None);
+        assert_eq!(draft.role, AgentRole::Worker);
+        assert_eq!(draft.objective, "inspect the repo");
+        assert_eq!(
+            draft.write_scope,
+            vec![RepoScope {
+                path: ".".to_string(),
+                recursive: true,
+            }]
+        );
+        assert_eq!(draft.workspace_strategy, WorkspaceStrategy::Shared);
     }
 
     #[test]
-    fn untyped_spawn_with_model_override_defaults_to_no_history() {
+    fn legacy_message_without_overrides_uses_durable_task_capsule() {
+        let args = spawn_args();
+        assert!(matches!(
+            args.fork_mode(AgentRole::Worker, false),
+            Ok(Some(SpawnAgentForkMode::TaskCapsule))
+        ));
+    }
+
+    #[test]
+    fn legacy_message_with_model_override_uses_durable_task_capsule() {
         let mut args = spawn_args();
         args.model = Some("child-model".to_string());
-        assert!(matches!(args.fork_mode(None, false), Ok(None)));
+        assert!(matches!(
+            args.fork_mode(AgentRole::Worker, false),
+            Ok(Some(SpawnAgentForkMode::TaskCapsule))
+        ));
     }
 
     #[test]
-    fn legacy_explicit_none_is_a_fresh_non_forked_child() {
+    fn legacy_explicit_none_uses_durable_task_capsule() {
         let mut args = spawn_args();
         args.fork_turns = Some("none".to_string());
-        assert!(matches!(args.fork_mode(None, false), Ok(None)));
+        assert!(matches!(
+            args.fork_mode(AgentRole::Worker, false),
+            Ok(Some(SpawnAgentForkMode::TaskCapsule))
+        ));
     }
 
     #[test]
@@ -1452,27 +1536,27 @@ mod tests {
         let mut args = spawn_args();
         args.fork_turns = Some("all".to_string());
         assert!(matches!(
-            args.fork_mode(None, false),
+            args.fork_mode(AgentRole::Worker, false),
             Err(FunctionCallError::RespondToModel(message)) if message.contains("is disabled")
         ));
         assert!(matches!(
-            args.fork_mode(None, true),
+            args.fork_mode(AgentRole::Worker, true),
             Ok(Some(SpawnAgentForkMode::FullHistory))
         ));
 
         args.fork_turns = Some("1".to_string());
         assert!(matches!(
-            args.fork_mode(None, false),
+            args.fork_mode(AgentRole::Worker, false),
             Ok(Some(SpawnAgentForkMode::LastNTurns(1)))
         ));
         args.fork_turns = Some("5".to_string());
         assert!(matches!(
-            args.fork_mode(None, false),
+            args.fork_mode(AgentRole::Worker, false),
             Ok(Some(SpawnAgentForkMode::LastNTurns(5)))
         ));
         args.fork_turns = Some("6".to_string());
         assert!(matches!(
-            args.fork_mode(None, false),
+            args.fork_mode(AgentRole::Worker, false),
             Err(FunctionCallError::RespondToModel(message))
                 if message.contains("requested 6 fork turns")
                     && message.contains("configured limit 5")
@@ -1488,7 +1572,7 @@ mod tests {
         args.assignment = Some(typed_assignment());
         args.agent_type = Some("worker".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Worker), false),
+            args.fork_mode(AgentRole::Worker, false),
             Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }
@@ -1501,7 +1585,7 @@ mod tests {
         args.agent_type = Some("worker".to_string());
         args.fork_turns = Some("none".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Worker), false),
+            args.fork_mode(AgentRole::Worker, false),
             Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }
@@ -1514,7 +1598,7 @@ mod tests {
         args.agent_type = Some("worker".to_string());
         args.fork_turns = Some("3".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Worker), false),
+            args.fork_mode(AgentRole::Worker, false),
             Ok(Some(SpawnAgentForkMode::LastNTurns(3)))
         ));
     }
@@ -1528,7 +1612,7 @@ mod tests {
         args.fork_turns = Some("all".to_string());
         let typed_role = parse_typed_role(args.agent_type.as_deref()).expect("typed role");
         let fork_mode = args
-            .fork_mode(Some(typed_role), true)
+            .fork_mode(typed_role, true)
             .expect("explicit fork mode");
         assert!(matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)));
         assert!(
@@ -1549,7 +1633,7 @@ mod tests {
         args.agent_type = Some("reviewer".to_string());
         args.fork_turns = Some("all".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Reviewer), false),
+            args.fork_mode(AgentRole::Reviewer, false),
             Err(FunctionCallError::RespondToModel(message))
                 if message.contains("require fork_turns=\"none\"")
         ));
@@ -1589,7 +1673,7 @@ mod tests {
         args.agent_type = Some("verifier".to_string());
         args.fork_turns = Some("none".to_string());
         assert!(matches!(
-            args.fork_mode(Some(AgentRole::Verifier), false),
+            args.fork_mode(AgentRole::Verifier, false),
             Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }

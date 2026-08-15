@@ -46,6 +46,34 @@ fn function_payloads_remain_function_outputs() {
 }
 
 #[test]
+fn skipped_function_outputs_remain_typed_and_non_successful() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let neutral = FunctionToolOutput::from_text("not run".to_string(), Some(true))
+        .with_outcome(ToolOutputOutcome::Skipped);
+    assert_eq!(
+        neutral.outcome_context(),
+        ToolOutputOutcomeContext::skipped(None)
+    );
+    assert!(!neutral.success_for_logging());
+    match neutral.to_response_item("skip-neutral", &payload) {
+        ResponseInputItem::FunctionCallOutput { output, .. } => {
+            assert_eq!(output.success, Some(false));
+        }
+        other => panic!("expected FunctionCallOutput, got {other:?}"),
+    }
+
+    let deferred = FunctionToolOutput::from_text("later".to_string(), Some(true))
+        .with_skip_disposition(ToolOutputSkipDisposition::Deferred);
+    assert_eq!(
+        deferred.outcome_context(),
+        ToolOutputOutcomeContext::skipped(Some(ToolOutputSkipDisposition::Deferred))
+    );
+    assert!(!deferred.success_for_logging());
+}
+
+#[test]
 fn mcp_code_mode_result_serializes_full_call_tool_result() {
     let output = CallToolResult {
         content: vec![serde_json::json!({
@@ -83,6 +111,104 @@ fn mcp_code_mode_result_serializes_full_call_tool_result() {
             },
         })
     );
+}
+
+fn assert_mcp_wrapper_preserves_projection_metadata(
+    result: CallToolResult,
+    expected_outcome: ToolOutputOutcome,
+    expected_diagnostic_class: ToolOutputDiagnosticClass,
+) {
+    let native = ToolOutput::projection_metadata(&result).expect("native MCP metadata");
+    let wrapped = McpToolOutput {
+        result,
+        tool_input: json!({}),
+        wall_time: std::time::Duration::from_millis(25),
+        original_image_detail_supported: false,
+        truncation_policy: TruncationPolicy::Bytes(1024),
+    }
+    .projection_metadata()
+    .expect("wrapped MCP metadata");
+
+    assert_eq!(wrapped.outcome, expected_outcome);
+    assert_eq!(wrapped.diagnostic_class, expected_diagnostic_class);
+    assert_eq!(wrapped.outcome, native.outcome);
+    assert_eq!(wrapped.diagnostic_class, native.diagnostic_class);
+    assert_eq!(wrapped.fragments, native.fragments);
+    assert_eq!(wrapped.spillable_text, native.spillable_text);
+    assert_eq!(wrapped.essential_inline, native.essential_inline);
+    assert_eq!(wrapped.requested_limit, native.requested_limit);
+    assert_eq!(wrapped.predetermined_ranges, native.predetermined_ranges);
+    assert_eq!(
+        wrapped.predetermined_json_pointers,
+        native.predetermined_json_pointers
+    );
+
+    let limits_for = |metadata: &ToolOutputProjectionMetadata| {
+        let outcome = match metadata.outcome {
+            ToolOutputOutcome::Success => OutputOutcome::Success,
+            ToolOutputOutcome::Failure => OutputOutcome::Failure,
+            ToolOutputOutcome::TimedOut => OutputOutcome::TimedOut,
+            ToolOutputOutcome::Skipped => OutputOutcome::Skipped,
+        };
+        let diagnostic_class = match metadata.diagnostic_class {
+            ToolOutputDiagnosticClass::Normal => {
+                codex_utils_output_truncation::OutputDiagnosticClass::Normal
+            }
+            ToolOutputDiagnosticClass::HighSignal => {
+                codex_utils_output_truncation::OutputDiagnosticClass::HighSignal
+            }
+        };
+        resolve_projected_output_limits(metadata.requested_limit, outcome, diagnostic_class, 4_000)
+    };
+    assert_eq!(limits_for(&wrapped), limits_for(&native));
+}
+
+#[test]
+fn mcp_wrapper_preserves_native_success_projection_metadata() {
+    assert_mcp_wrapper_preserves_projection_metadata(
+        CallToolResult {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": "provider success",
+            })],
+            structured_content: Some(serde_json::json!({"value": 42})),
+            is_error: Some(false),
+            meta: Some(serde_json::json!({"provider": "fixture"})),
+        },
+        ToolOutputOutcome::Success,
+        ToolOutputDiagnosticClass::Normal,
+    );
+}
+
+#[test]
+fn mcp_wrapper_preserves_native_high_signal_projection_metadata() {
+    let result = CallToolResult {
+        content: vec![serde_json::json!({
+            "type": "text",
+            "text": "provider failure",
+        })],
+        structured_content: Some(serde_json::json!({"code": "provider_failed"})),
+        is_error: Some(true),
+        meta: Some(serde_json::json!({"provider": "fixture"})),
+    };
+    let native = ToolOutput::projection_metadata(&result).expect("native MCP metadata");
+    assert_mcp_wrapper_preserves_projection_metadata(
+        result,
+        ToolOutputOutcome::Failure,
+        ToolOutputDiagnosticClass::HighSignal,
+    );
+    assert!(
+        native.fragments.iter().any(|fragment| {
+            fragment.kind == ToolOutputProjectionFragmentKind::ErrorOrDiagnostic
+        })
+    );
+    let applied = resolve_projected_output_limits(
+        native.requested_limit,
+        OutputOutcome::Failure,
+        codex_utils_output_truncation::OutputDiagnosticClass::HighSignal,
+        4_000,
+    );
+    assert_eq!(applied.applied_limit, 4_000);
 }
 
 #[test]
@@ -326,7 +452,7 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
             limit: None,
         },
     };
-    let response = ToolSearchOutput {
+    let output = ToolSearchOutput {
         tools: vec![LoadableToolSpec::Function(codex_tools::ResponsesApiTool {
             name: "create_event".to_string(),
             description: String::new(),
@@ -340,8 +466,27 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
             output_schema: None,
         })],
         omitted_result_count: 0,
-    }
-    .to_response_item("search-1", &payload);
+    };
+    assert_eq!(
+        output.code_mode_result(&payload),
+        json!({
+            "status": "completed",
+            "execution": "client",
+            "tools": [{
+                "type": "function",
+                "name": "create_event",
+                "description": "",
+                "strict": false,
+                "defer_loading": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }],
+            "omitted_result_count": 0,
+        })
+    );
+    let response = output.to_response_item("search-1", &payload);
 
     match response {
         ResponseInputItem::ToolSearchOutput {
@@ -380,11 +525,20 @@ fn partial_tool_search_outputs_are_model_visible_as_incomplete() {
             limit: None,
         },
     };
-    let response = ToolSearchOutput {
+    let output = ToolSearchOutput {
         tools: Vec::new(),
         omitted_result_count: 1,
-    }
-    .to_response_item("search-partial", &payload);
+    };
+    assert_eq!(
+        output.code_mode_result(&payload),
+        json!({
+            "status": "incomplete",
+            "execution": "client",
+            "tools": [],
+            "omitted_result_count": 1,
+        })
+    );
+    let response = output.to_response_item("search-partial", &payload);
 
     match response {
         ResponseInputItem::ToolSearchOutput { status, tools, .. } => {
@@ -404,11 +558,20 @@ fn aborted_tool_search_payloads_become_incomplete_outputs() {
         },
     };
 
+    let output = AbortedToolOutput {
+        message: "cancelled".to_string(),
+    };
     assert_eq!(
-        AbortedToolOutput {
-            message: "cancelled".to_string(),
-        }
-        .to_response_item("search-aborted", &payload),
+        output.code_mode_result(&payload),
+        json!({
+            "status": "aborted",
+            "execution": "client",
+            "tools": [],
+            "omitted_result_count": null,
+        })
+    );
+    assert_eq!(
+        output.to_response_item("search-aborted", &payload),
         ResponseInputItem::ToolSearchOutput {
             call_id: "search-aborted".to_string(),
             status: "incomplete".to_string(),

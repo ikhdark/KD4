@@ -68,6 +68,9 @@ impl ChatWidget {
             ServerNotification::TurnCompleted(notification) => {
                 self.handle_turn_completed_notification(notification, replay_kind);
             }
+            // `turn/completed` owns visible turn completion. The later receipt is
+            // transport and diagnostic state, so it intentionally has no UI effect.
+            ServerNotification::TurnTerminalizationCompleted(_) => {}
             ServerNotification::ItemStarted(notification) => {
                 self.handle_item_started_notification(notification, replay_kind.is_some());
             }

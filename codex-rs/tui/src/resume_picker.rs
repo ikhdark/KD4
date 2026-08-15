@@ -1824,7 +1824,7 @@ fn thread_list_params(
         parent_thread_id: None,
         ancestor_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
-        use_state_db_only: false,
+        use_state_db_only: None,
         search_term: None,
     }
 }
@@ -5808,6 +5808,9 @@ session_picker_view = "dense"
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             }],
         };
@@ -5866,6 +5869,9 @@ session_picker_view = "dense"
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             }],
         };
@@ -5928,6 +5934,9 @@ session_picker_view = "dense"
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             }],
         };

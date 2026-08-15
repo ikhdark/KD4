@@ -29,6 +29,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::SessionSource;
 use once_cell::sync::Lazy;
 
+use crate::CodexThread;
 use crate::ThreadManager;
 use crate::config::Config;
 use crate::responses_metadata::CodexResponsesMetadata;
@@ -101,6 +102,18 @@ pub fn thread_manager_with_models_provider_and_home(
     )
 }
 
+/// Register a terminal task that keeps thread shutdown pending until the returned sender fires.
+///
+/// This is intended for cross-crate shutdown ownership tests that need a deterministic late
+/// termination without changing production deadlines.
+pub fn block_thread_terminal_tasks(thread: &CodexThread) -> tokio::sync::oneshot::Sender<()> {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    thread.codex.session.terminal_tasks.spawn(async move {
+        let _ = release_rx.await;
+    });
+    release_tx
+}
+
 pub fn thread_manager_with_models_provider_home_and_state(
     auth: CodexAuth,
     provider: ModelProviderInfo,
@@ -157,7 +170,11 @@ pub fn models_manager_with_provider(
     provider: ModelProviderInfo,
 ) -> SharedModelsManager {
     let provider = create_model_provider(provider, Some(auth_manager));
-    provider.models_manager(codex_home, /*config_model_catalog*/ None)
+    provider.models_manager(
+        "test-provider",
+        codex_home,
+        /*config_model_catalog*/ None,
+    )
 }
 
 pub fn default_http_client_factory() -> HttpClientFactory {

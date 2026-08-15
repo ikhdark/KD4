@@ -692,6 +692,7 @@ mod tests {
         drop(tx_event);
         ResponseStream {
             rx_event,
+            attempt_identity: None,
             consumer_dropped: CancellationToken::new(),
         }
     }

@@ -21,6 +21,7 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::ResumedHistory;
+use codex_protocol::protocol::SamplingBoundaryItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -822,14 +823,14 @@ async fn selected_capability_roots_round_trip_through_fork() {
 }
 
 #[test]
-fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
+fn resume_and_fork_restore_thread_environments_from_rollout() {
     run_thread_manager_test_with_stack(
-        "resume_and_fork_do_not_restore_thread_environments_from_rollout",
-        resume_and_fork_do_not_restore_thread_environments_from_rollout_impl,
+        "resume_and_fork_restore_thread_environments_from_rollout",
+        resume_and_fork_restore_thread_environments_from_rollout_impl,
     );
 }
 
-async fn resume_and_fork_do_not_restore_thread_environments_from_rollout_impl() {
+async fn resume_and_fork_restore_thread_environments_from_rollout_impl() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -859,7 +860,6 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout_impl() 
         environment_id: "local".to_string(),
         cwd: PathUri::from_abs_path(&selected_cwd),
     }];
-    let default_cwd = config.cwd.clone();
     let mut source_config = config.clone();
     source_config.cwd = selected_cwd.clone();
     let source = manager
@@ -916,10 +916,6 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout_impl() 
     assert_eq!(resumed_turn.environments.turn_environments.len(), 1);
     assert_eq!(
         resumed_turn.environments.turn_environments[0].cwd(),
-        &PathUri::from_abs_path(&default_cwd)
-    );
-    assert_ne!(
-        resumed_turn.environments.turn_environments[0].cwd(),
         &PathUri::from_abs_path(&selected_cwd)
     );
 
@@ -942,10 +938,6 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout_impl() 
         .expect("build forked turn context");
     assert_eq!(forked_turn.environments.turn_environments.len(), 1);
     assert_eq!(
-        forked_turn.environments.turn_environments[0].cwd(),
-        &PathUri::from_abs_path(&default_cwd)
-    );
-    assert_ne!(
         forked_turn.environments.turn_environments[0].cwd(),
         &PathUri::from_abs_path(&selected_cwd)
     );
@@ -1744,6 +1736,112 @@ fn user_only_legacy_event_history_is_mid_turn_and_forked_safely() {
         ),
         InitialHistory::New
     ));
+}
+
+#[test]
+fn sampling_boundary_fork_excludes_uncommitted_suffix() {
+    let committed_user = RolloutItem::ResponseItem(user_msg("committed"));
+    let boundary = RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+        sampling_request_id: "request-1".to_string(),
+        physical_attempt_id: "attempt-1".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        unresolved_context: true,
+    });
+    let unfinished_output = RolloutItem::ResponseItem(ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "unfinished".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let history = InitialHistory::Forked(vec![
+        committed_user.clone(),
+        boundary.clone(),
+        unfinished_output,
+        RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some("turn-1".to_string()),
+            reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
+            timing: None,
+        })),
+    ]);
+
+    let forked = fork_history_from_snapshot(
+        ForkSnapshot::TruncateToLastSamplingBoundary,
+        history,
+        InterruptedTurnHistoryMarker::ContextualUser,
+    );
+
+    assert_eq!(
+        serde_json::to_value(forked.get_rollout_items()).expect("serialize forked history"),
+        serde_json::to_value([committed_user, boundary]).expect("serialize expected history")
+    );
+}
+
+#[test]
+fn markerless_sampling_boundary_fork_preserves_completed_rounds_and_drops_active_turn() {
+    let completed_user = RolloutItem::ResponseItem(user_msg("completed"));
+    let completed_assistant = RolloutItem::ResponseItem(assistant_msg("answer"));
+    let completed_event = RolloutItem::EventMsg(EventMsg::TurnComplete(
+        codex_protocol::protocol::TurnCompleteEvent {
+            surfaced_result: None,
+            turn_id: "completed-turn".to_string(),
+            last_agent_message: Some("answer".to_string()),
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            completion: None,
+            timing: None,
+        },
+    ));
+    let active_turn = RolloutItem::EventMsg(EventMsg::TurnStarted(
+        codex_protocol::protocol::TurnStartedEvent {
+            turn_id: "active-turn".to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: codex_protocol::config_types::ModeKind::Default,
+        },
+    ));
+    let history = InitialHistory::Forked(vec![
+        completed_user.clone(),
+        completed_assistant.clone(),
+        completed_event.clone(),
+        active_turn,
+        RolloutItem::ResponseItem(user_msg("unfinished")),
+    ]);
+
+    let forked = fork_history_from_snapshot(
+        ForkSnapshot::TruncateToLastSamplingBoundary,
+        history,
+        InterruptedTurnHistoryMarker::ContextualUser,
+    );
+    assert_eq!(
+        serde_json::to_value(forked.get_rollout_items()).expect("serialize forked history"),
+        serde_json::to_value([
+            completed_user.clone(),
+            completed_assistant.clone(),
+            completed_event.clone(),
+        ])
+        .expect("serialize expected history")
+    );
+
+    let between_turns =
+        InitialHistory::Forked(vec![completed_user, completed_assistant, completed_event]);
+    let forked = fork_history_from_snapshot(
+        ForkSnapshot::TruncateToLastSamplingBoundary,
+        between_turns.clone(),
+        InterruptedTurnHistoryMarker::ContextualUser,
+    );
+    assert_eq!(
+        serde_json::to_value(forked.get_rollout_items()).expect("serialize forked history"),
+        serde_json::to_value(between_turns.get_rollout_items())
+            .expect("serialize expected history")
+    );
 }
 
 #[test]

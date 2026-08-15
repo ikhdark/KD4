@@ -25,14 +25,6 @@ PREDICTOR_FIELDS = (
     *COMPONENT_FIELDS,
 )
 RECONCILIATION_TOLERANCE_BYTES = 256.0
-AMPLIFICATION_CATEGORY_FIELDS = (
-    "checkpoint_tokens",
-    "completed_tool_receipt_tokens",
-    "raw_tool_output_tokens",
-    "completed_call_tokens",
-    "schema_tokens",
-    "continuity_tokens",
-)
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -301,144 +293,6 @@ def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
     }
 
 
-def algebraic_attribution(
-    before_count: float,
-    before_mean: float,
-    after_count: float,
-    after_mean: float,
-) -> dict[str, float | str]:
-    """Exact algebraic decomposition; individual terms are not causal claims."""
-    request_count = (before_count - after_count) * after_mean
-    working_set = after_count * (before_mean - after_mean)
-    interaction = (before_count - after_count) * (before_mean - after_mean)
-    observed = before_count * before_mean - after_count * after_mean
-    return {
-        "interpretation": "algebraic attribution, not independent causal proof",
-        "requestCountTerm": request_count,
-        "workingSetTerm": working_set,
-        "interactionTerm": interaction,
-        "observedInputDifference": observed,
-        "termSum": request_count + working_set + interaction,
-    }
-
-
-def _amplification_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    roots: dict[str, list[dict[str, Any]]] = {}
-    ungrouped = 0
-    for record in records:
-        root_task_id = record.get("root_task_id")
-        if isinstance(root_task_id, str) and root_task_id:
-            roots.setdefault(root_task_id, []).append(record)
-        else:
-            ungrouped += 1
-
-    summaries: list[dict[str, Any]] = []
-    for root_task_id, attempts in sorted(roots.items()):
-        windows: dict[str, list[dict[str, Any]]] = {}
-        coverage_reason: str | None = None
-        cumulative_input = 0.0
-        cached_input = 0.0
-        continuation_input = 0.0
-        for attempt in attempts:
-            window_id = attempt.get("measurement_window_id")
-            if not isinstance(window_id, str) or not window_id:
-                coverage_reason = coverage_reason or "missing_measurement_window_id"
-                continue
-            windows.setdefault(window_id, []).append(attempt)
-            provider_input = _number(attempt.get("input_token_count"))
-            cached = _number(attempt.get("cached_input_token_count"))
-            if provider_input is None or cached is None:
-                coverage_reason = coverage_reason or "missing_attempt_provider_usage"
-                continue
-            cumulative_input += provider_input
-            cached_input += cached
-            if attempt.get("request_kind") == "continuation":
-                continuation_input += provider_input
-
-        unique_new = 0.0
-        logical_inputs: list[float] = []
-        category_totals = {field: 0.0 for field in AMPLIFICATION_CATEGORY_FIELDS}
-        local_peaks: list[float] = []
-        effective_peaks: list[float] = []
-        compactions: list[float] = []
-        for window_attempts in windows.values():
-            representative = window_attempts[0]
-            if any(
-                attempt.get("amplification_measurement_complete") is not True
-                for attempt in window_attempts
-            ):
-                reasons = [
-                    attempt.get("amplification_null_reason")
-                    for attempt in window_attempts
-                    if isinstance(attempt.get("amplification_null_reason"), str)
-                ]
-                coverage_reason = coverage_reason or (reasons[0] if reasons else "incomplete_unique_material")
-            window_unique = sum(
-                value
-                for attempt in window_attempts
-                if (value := _number(attempt.get("unique_new_tokens"))) is not None
-            )
-            if any(_number(attempt.get("unique_new_tokens")) is None for attempt in window_attempts):
-                coverage_reason = coverage_reason or "missing_unique_new_tokens"
-            unique_new += window_unique
-            window_inputs = [
-                value
-                for attempt in window_attempts
-                if (value := _number(attempt.get("input_token_count"))) is not None
-            ]
-            if len(window_inputs) == len(window_attempts):
-                logical_inputs.append(sum(window_inputs))
-            for field in AMPLIFICATION_CATEGORY_FIELDS:
-                value = _number(representative.get(field))
-                if value is None:
-                    coverage_reason = coverage_reason or f"missing_{field}"
-                else:
-                    category_totals[field] += value
-            local = _number(representative.get("local_projected_occupancy"))
-            effective = _number(representative.get("effective_provider_occupancy"))
-            if local is not None:
-                local_peaks.append(local)
-            if effective is not None:
-                effective_peaks.append(effective)
-            compaction = _number(representative.get("compactions"))
-            if compaction is not None:
-                compactions.append(compaction)
-
-        if not windows:
-            coverage_reason = coverage_reason or "no_complete_measurement_windows"
-        replay = (
-            cumulative_input / unique_new
-            if coverage_reason is None and unique_new > 0
-            else None
-        )
-        if coverage_reason is None and unique_new == 0:
-            coverage_reason = "zero_unique_new_tokens"
-        summaries.append(
-            {
-                "rootTaskId": root_task_id,
-                "physicalAttemptCount": len(attempts),
-                "requestCount": len(windows),
-                "cumulativeInputTokens": cumulative_input,
-                "cachedInputTokens": cached_input,
-                "inputTokensPerRequest": {
-                    "average": round(sum(logical_inputs) / len(logical_inputs), 3)
-                    if logical_inputs
-                    else None,
-                    **_distribution(logical_inputs),
-                },
-                "peakLocalProjectedOccupancy": max(local_peaks) if local_peaks else None,
-                "peakEffectiveProviderOccupancy": max(effective_peaks) if effective_peaks else None,
-                "categoryTotals": category_totals,
-                "compactions": max(compactions) if compactions else None,
-                "replayAmplification": round(replay, 6) if replay is not None else None,
-                "replayAmplificationNullReason": coverage_reason,
-                "continuationReplayExposureInputTokens": continuation_input,
-                "continuationReplayExposureInterpretation": "observational, not causal waste",
-            }
-        )
-    return {"ungroupedAttemptCount": ungrouped, "roots": summaries}
-
-
 def _quantile_bins(rows: Sequence[dict[str, Any]], predictor: str, count: int = 4) -> list[dict[str, Any]]:
     eligible = [row for row in rows if _number(row.get(predictor)) is not None]
     eligible.sort(key=lambda row: (float(row[predictor]), str(row["attempt_id"])))
@@ -589,7 +443,6 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
             "residualBytes": _distribution(residuals),
         },
         "stableContext": _stable_context_summary(records),
-        "amplification": _amplification_summary(records),
         "rows": rows,
     }
 
@@ -631,14 +484,6 @@ def render(analysis: dict[str, Any]) -> str:
         f"tolerance_bytes={reconciliation['toleranceBytes']} "
         f"residual={json.dumps(reconciliation['residualBytes'], sort_keys=True)}"
     )
-    for root in analysis["amplification"]["roots"]:
-        lines.append(
-            "amplification root "
-            f"{root['rootTaskId']}: requests={root['requestCount']} "
-            f"input={root['cumulativeInputTokens']} cached={root['cachedInputTokens']} "
-            f"replay={root['replayAmplification']} "
-            f"null_reason={root['replayAmplificationNullReason']}"
-        )
     lines.append(
         "Provider queueing, cache lookup, prefill execution, and generation startup are not separately observable."
     )

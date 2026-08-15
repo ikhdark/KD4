@@ -262,6 +262,44 @@ impl ModelsEndpointClient for ControlledModelsEndpoint {
     }
 }
 
+#[derive(Debug, Default)]
+struct NotModifiedModelsEndpoint {
+    observed_etags: Mutex<Vec<Option<String>>>,
+}
+
+impl ModelsEndpointClient for NotModifiedModelsEndpoint {
+    fn has_command_auth(&self) -> bool {
+        false
+    }
+
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { true })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _client_version: &'a str,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+        Box::pin(async { panic!("conditional endpoint should use list_models_conditional") })
+    }
+
+    fn list_models_conditional<'a>(
+        &'a self,
+        _client_version: &'a str,
+        _http_client_factory: HttpClientFactory,
+        etag: Option<&'a str>,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsFetchResult>> {
+        Box::pin(async move {
+            self.observed_etags
+                .lock()
+                .expect("observed ETags lock should not be poisoned")
+                .push(etag.map(ToString::to_string));
+            Ok(ModelsFetchResult::NotModified)
+        })
+    }
+}
+
 #[tokio::test]
 async fn etag_notices_are_non_blocking_coalesced_latest_wins_and_are_waitable() {
     let codex_home = tempdir().expect("temp dir");
@@ -401,6 +439,56 @@ async fn matching_etag_renews_ttl_without_fetching() {
     );
 }
 
+#[tokio::test]
+async fn online_refresh_revalidates_stale_cache_with_its_etag() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = Arc::new(NotModifiedModelsEndpoint::default());
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    let cached = vec![remote_model("revalidated-model", "Revalidated", 1)];
+    manager
+        .cache_manager
+        .persist_cache(
+            &cached,
+            Some("cache-etag".to_string()),
+            crate::client_version_to_whole(),
+        )
+        .await;
+    assert!(manager.try_load_cache().await);
+    manager
+        .cache_manager
+        .manipulate_cache_for_test(|fetched_at| {
+            *fetched_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        })
+        .await
+        .expect("age cache");
+
+    manager
+        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+
+    assert_eq!(
+        *endpoint
+            .observed_etags
+            .lock()
+            .expect("observed ETags lock should not be poisoned"),
+        vec![Some("cache-etag".to_string())]
+    );
+    assert!(
+        manager
+            .cache_manager
+            .load_fresh(&crate::client_version_to_whole())
+            .await
+            .is_some()
+    );
+    assert!(
+        manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "revalidated-model")
+    );
+}
+
 fn openai_manager_for_tests(
     codex_home: std::path::PathBuf,
     endpoint_client: Arc<dyn ModelsEndpointClient>,
@@ -419,7 +507,12 @@ fn openai_manager_for_tests_with_auth(
     endpoint_client: Arc<dyn ModelsEndpointClient>,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> OpenAiModelsManager {
-    OpenAiModelsManager::new(codex_home, endpoint_client, auth_manager)
+    OpenAiModelsManager::new(
+        codex_home,
+        endpoint_client,
+        auth_manager,
+        Arc::new(|| "test-provider-identity".to_string()),
+    )
 }
 
 fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManager {
@@ -915,6 +1008,72 @@ async fn refresh_available_models_uses_cache_when_fresh() {
         1,
         "cache hit should avoid a second model fetch"
     );
+}
+
+#[tokio::test]
+async fn runtime_identity_change_does_not_reuse_disk_or_in_memory_catalog() {
+    let codex_home = tempdir().expect("temp dir");
+    let first_model = remote_model("first-account-model", "First Account", 1);
+    let second_model = remote_model("second-account-model", "Second Account", 1);
+    let endpoint = TestModelsEndpoint::new(vec![vec![first_model], vec![second_model.clone()]]);
+    let identity = Arc::new(Mutex::new("scope-digest-one".to_string()));
+    let identity_for_cache = Arc::clone(&identity);
+    let manager = OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+        Arc::new(move || {
+            identity_for_cache
+                .lock()
+                .expect("identity lock should not be poisoned")
+                .clone()
+        }),
+    );
+
+    manager
+        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("first account refresh should succeed");
+    assert!(
+        manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "first-account-model")
+    );
+
+    *identity
+        .lock()
+        .expect("identity lock should not be poisoned") = "scope-digest-two".to_string();
+    manager
+        .refresh_available_models(RefreshStrategy::Offline, &DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("offline identity transition should fail closed");
+    assert!(
+        !manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "first-account-model")
+    );
+
+    manager
+        .refresh_available_models(
+            RefreshStrategy::OnlineIfUncached,
+            &DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("second account refresh should fetch its own catalog");
+    assert!(
+        manager
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == second_model.slug)
+    );
+    assert_eq!(endpoint.fetch_count(), 2);
 }
 
 #[tokio::test]

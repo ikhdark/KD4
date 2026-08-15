@@ -19,12 +19,6 @@ impl EffectImpact {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct PlanningSnapshotIdentity {
-    pub(crate) generation: u64,
-    pub(crate) state_digest: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompletedEffect {
     pub(crate) impact: EffectImpact,
@@ -34,34 +28,18 @@ pub(crate) struct CompletedEffect {
 #[derive(Debug, Default)]
 pub(crate) struct FixedPointPlanningState {
     iterations: usize,
-    digest_visits: HashMap<String, usize>,
     completed_effects: HashMap<String, CompletedEffect>,
 }
 
 impl FixedPointPlanningState {
-    pub(crate) fn begin_iteration(
-        &mut self,
-        snapshot: &PlanningSnapshotIdentity,
-    ) -> Result<bool, String> {
+    pub(crate) fn begin_iteration(&mut self) -> Result<(), String> {
         self.iterations = self.iterations.saturating_add(1);
         if self.iterations > MAX_FIXED_POINT_ITERATIONS {
             return Err(format!(
                 "pending-turn planning did not reach a fixed point after {MAX_FIXED_POINT_ITERATIONS} iterations"
             ));
         }
-        let visits = self
-            .digest_visits
-            .entry(snapshot.state_digest.clone())
-            .or_default();
-        *visits = visits.saturating_add(1);
-        let repeated_digest = *visits > 1;
-        if *visits > MAX_FIXED_POINT_ITERATIONS {
-            return Err(format!(
-                "pending-turn planning repeatedly invalidated the same model-visible state digest `{}`",
-                snapshot.state_digest
-            ));
-        }
-        Ok(repeated_digest)
+        Ok(())
     }
 
     pub(crate) fn completed(&self, effect_id: &str) -> Option<&CompletedEffect> {
@@ -96,17 +74,16 @@ impl FixedPointPlanningState {
 
     pub(crate) fn require_generation_advance(
         &self,
-        before: &PlanningSnapshotIdentity,
+        before_generation: u64,
         after_generation: u64,
         impact: EffectImpact,
     ) -> Result<(), String> {
         if !impact.invalidates_snapshot() {
             return Ok(());
         }
-        if after_generation <= before.generation {
+        if after_generation <= before_generation {
             return Err(format!(
-                "{:?} effect completed at planning generation {}, but the next observable generation did not advance",
-                impact, before.generation
+                "{impact:?} effect completed at planning generation {before_generation}, but the next observable generation did not advance"
             ));
         }
         Ok(())
@@ -117,25 +94,17 @@ impl FixedPointPlanningState {
 mod tests {
     use super::*;
 
-    fn snapshot(generation: u64, digest: &str) -> PlanningSnapshotIdentity {
-        PlanningSnapshotIdentity {
-            generation,
-            state_digest: digest.to_string(),
-        }
-    }
-
     #[test]
     fn invalidating_effect_requires_a_newer_generation() {
         let state = FixedPointPlanningState::default();
-        let before = snapshot(4, "state-a");
         assert!(
             state
-                .require_generation_advance(&before, 4, EffectImpact::InvalidatesInventory)
+                .require_generation_advance(4, 4, EffectImpact::InvalidatesInventory)
                 .is_err()
         );
         assert!(
             state
-                .require_generation_advance(&before, 5, EffectImpact::InvalidatesInventory)
+                .require_generation_advance(4, 5, EffectImpact::InvalidatesInventory)
                 .is_ok()
         );
     }
@@ -167,11 +136,9 @@ mod tests {
     #[test]
     fn fixed_point_loop_is_bounded() {
         let mut state = FixedPointPlanningState::default();
-        for generation in 0..MAX_FIXED_POINT_ITERATIONS {
-            state
-                .begin_iteration(&snapshot(generation as u64, &format!("state-{generation}")))
-                .expect("within bound");
+        for _ in 0..MAX_FIXED_POINT_ITERATIONS {
+            state.begin_iteration().expect("within bound");
         }
-        assert!(state.begin_iteration(&snapshot(9, "state-9")).is_err());
+        assert!(state.begin_iteration().is_err());
     }
 }

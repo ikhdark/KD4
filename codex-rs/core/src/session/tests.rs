@@ -2952,60 +2952,6 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 }
 
 #[tokio::test]
-async fn start_new_context_window_assigns_and_persists_item_ids() {
-    let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
-        Vec::new(),
-        |config| {
-            let _ = config.features.enable(Feature::ItemIds);
-        },
-    )
-    .await;
-    let rollout_path =
-        attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
-    let world_state =
-        Arc::new(build_world_state_from_turn_context(session.as_ref(), &turn_context).await);
-
-    session
-        .start_new_context_window(turn_context.as_ref(), world_state)
-        .await;
-
-    let live_history = session.clone_history().await;
-    assert!(!live_history.raw_items().is_empty());
-    assert!(
-        live_history
-            .raw_items()
-            .iter()
-            .all(|item| item.id().is_some())
-    );
-
-    session.flush_rollout().await.expect("rollout should flush");
-    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
-        .await
-        .expect("read rollout history")
-    else {
-        panic!("expected resumed rollout history");
-    };
-    let persisted_compaction = resumed.history.iter().rev().find_map(|item| match item {
-        RolloutItem::Compacted(compacted) => Some(compacted),
-        RolloutItem::SessionMeta(_)
-        | RolloutItem::ToolManifest(_)
-        | RolloutItem::ResponseItem(_)
-        | RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::WorldState(_)
-        | RolloutItem::EventMsg(_) => None,
-    });
-    assert!(persisted_compaction.is_some());
-    assert!(
-        persisted_compaction
-            .and_then(|compacted| compacted.replacement_history.as_ref())
-            .is_none()
-    );
-}
-
-#[tokio::test]
 async fn record_initial_history_assigns_and_persists_id_for_forked_response_item() {
     let (mut session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
         CodexAuth::from_api_key("Test API Key"),
@@ -3057,6 +3003,7 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
+        | RolloutItem::SamplingBoundary(_)
         | RolloutItem::EventMsg(_) => None,
     });
     assert_eq!(
@@ -3285,6 +3232,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         multi_agent_mode: None,
         realtime_active: Some(turn_context.realtime_active),
         effort: turn_context.reasoning_effort.clone(),
+        context_provenance: None,
         summary: codex_protocol::config_types::ReasoningSummary::Auto,
     };
     let turn_id = previous_context_item
@@ -3314,6 +3262,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         RolloutItem::TurnContext(previous_context_item.clone()),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id,
                 last_agent_message: None,
                 error: None,
@@ -3517,6 +3466,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         RolloutItem::ResponseItem(turn_one_user.clone()),
         RolloutItem::ResponseItem(turn_one_assistant.clone()),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: first_turn_id,
             last_agent_message: None,
             error: None,
@@ -3549,6 +3499,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         RolloutItem::ResponseItem(turn_two_user),
         RolloutItem::ResponseItem(turn_two_assistant),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: rolled_back_turn_id,
             last_agent_message: None,
             error: None,
@@ -3641,6 +3592,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
         RolloutItem::ResponseItem(user_message("turn 1 user")),
         RolloutItem::ResponseItem(assistant_message("turn 1 assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: first_turn_id,
             last_agent_message: None,
             error: None,
@@ -3668,6 +3620,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             window_id: Some(compacted_window_id.to_string()),
         }),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: compact_turn_id,
             last_agent_message: None,
             error: None,
@@ -3703,6 +3656,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
         RolloutItem::ResponseItem(user_message("turn 2 user")),
         RolloutItem::ResponseItem(assistant_message("turn 2 assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: rolled_back_turn_id,
             last_agent_message: None,
             error: None,
@@ -3779,6 +3733,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         RolloutItem::ResponseItem(user_message("turn 1 user")),
         RolloutItem::ResponseItem(assistant_message("turn 1 assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
             error: None,
@@ -3809,6 +3764,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         RolloutItem::ResponseItem(user_message("turn 2 user")),
         RolloutItem::ResponseItem(assistant_message("turn 2 assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: "turn-2".to_string(),
             last_agent_message: None,
             error: None,
@@ -3839,6 +3795,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         RolloutItem::ResponseItem(user_message("turn 3 user")),
         RolloutItem::ResponseItem(assistant_message("turn 3 assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: "turn-3".to_string(),
             last_agent_message: None,
             error: None,
@@ -5347,6 +5304,7 @@ async fn session_update_settings_does_not_rewrite_sticky_environment_cwds() {
 #[tokio::test]
 async fn relative_cwd_update_without_environments_resolves_under_session_cwd() {
     let (session, _turn_context) = make_session_and_context().await;
+    let planning_generation = session.services.planning_generation();
     let original_cwd = {
         let mut state = session.state.lock().await;
         state.session_configuration.environments.environments = Vec::new();
@@ -5374,6 +5332,7 @@ async fn relative_cwd_update_without_environments_resolves_under_session_cwd() {
             .environment_selections()
             .is_empty()
     );
+    assert!(session.services.planning_generation() > planning_generation);
 }
 
 #[tokio::test]
@@ -5806,6 +5765,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        tool_history_io_gate: Semaphore::new(/*permits*/ 1),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
@@ -5814,6 +5774,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
+        terminal_delivery_registry: Mutex::new(super::session::TerminalDeliveryRegistry::default()),
         terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
@@ -7157,7 +7118,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *trace = current_span_w3c_trace_context();
-            Ok(None)
+            Ok(crate::tasks::TurnTaskResult::default())
         }
     }
 
@@ -7953,6 +7914,7 @@ where
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        tool_history_io_gate: Semaphore::new(/*permits*/ 1),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
@@ -7961,6 +7923,7 @@ where
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
+        terminal_delivery_registry: Mutex::new(super::session::TerminalDeliveryRegistry::default()),
         terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
@@ -8005,6 +7968,7 @@ async fn refresh_mcp_servers_keeps_the_previous_runtime_alive() {
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
     let old_runtime = session.services.latest_mcp_runtime();
+    let old_planning_generation = session.services.planning_generation();
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
         .await;
@@ -8059,11 +8023,42 @@ async fn refresh_mcp_servers_keeps_the_previous_runtime_alive() {
     assert!(!new_token.is_cancelled());
     let new_runtime = session.services.latest_mcp_runtime();
     assert!(!Arc::ptr_eq(&old_runtime, &new_runtime));
+    assert!(session.services.planning_generation() > old_planning_generation);
+    assert_eq!(
+        new_runtime.generation(),
+        session.services.planning_generation()
+    );
     assert!(Arc::ptr_eq(&step_context.mcp, &old_runtime));
     assert_eq!(
         codex_mcp::configured_mcp_servers(new_runtime.config()),
         refreshed_mcp_servers
     );
+}
+
+#[tokio::test]
+async fn compacted_history_replacement_advances_planning_generation() {
+    let (session, turn_context) = make_session_and_context().await;
+    let planning_generation = session.services.planning_generation();
+
+    session
+        .replace_compacted_history(
+            &turn_context,
+            Vec::new(),
+            None,
+            None,
+            CompactedItem {
+                message: "compacted".to_string(),
+                replacement_history: None,
+                window_number: None,
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            },
+        )
+        .await;
+
+    assert!(session.services.planning_generation() > planning_generation);
+    assert!(session.clone_history().await.into_raw_items().is_empty());
 }
 
 #[tokio::test]
@@ -8117,6 +8112,7 @@ async fn plugin_availability_change_reuses_the_mcp_manager() {
         .await;
     let old_runtime = session.services.latest_mcp_runtime();
     let old_manager = old_runtime.manager_arc();
+    let old_planning_generation = session.services.planning_generation();
 
     let selected_root = codex_protocol::capabilities::SelectedCapabilityRoot {
         id: "skill-only".to_string(),
@@ -8149,6 +8145,11 @@ async fn plugin_availability_change_reuses_the_mcp_manager() {
     assert!(new_runtime.plugins_available());
     assert!(!Arc::ptr_eq(&old_runtime, &new_runtime));
     assert!(Arc::ptr_eq(&old_manager, &new_runtime.manager_arc()));
+    assert!(session.services.planning_generation() > old_planning_generation);
+    assert_eq!(
+        new_runtime.generation(),
+        session.services.planning_generation()
+    );
 }
 
 #[tokio::test]
@@ -9725,7 +9726,7 @@ impl SessionTask for CompletingTask {
         _input: Vec<TurnInput>,
         _cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        Ok(None)
+        Ok(crate::tasks::TurnTaskResult::default())
     }
 }
 
@@ -9751,7 +9752,7 @@ impl SessionTask for SignalCompletingTask {
         _cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         self.finish.cancelled().await;
-        Ok(None)
+        Ok(crate::tasks::TurnTaskResult::default())
     }
 }
 
@@ -9864,7 +9865,7 @@ impl SessionTask for NeverEndingTask {
     ) -> SessionTaskResult {
         if self.listen_to_cancellation_token {
             cancellation_token.cancelled().await;
-            return Ok(None);
+            return Ok(crate::tasks::TurnTaskResult::default());
         }
         loop {
             sleep(Duration::from_secs(60)).await;
@@ -9903,7 +9904,7 @@ impl SessionTask for MutationFinalizingOnCancellationTask {
                 .await,
             "the fixture mutation should still be tracked"
         );
-        Ok(None)
+        Ok(crate::tasks::TurnTaskResult::default())
     }
 }
 
@@ -9930,7 +9931,7 @@ impl SessionTask for BlockingAbortTask {
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         cancellation_token.cancelled().await;
-        Ok(None)
+        Ok(crate::tasks::TurnTaskResult::default())
     }
 
     async fn abort(&self, _session: Arc<SessionTaskContext>, _ctx: Arc<TurnContext>) {
@@ -9964,7 +9965,7 @@ impl SessionTask for GuardianDeniedApprovalTask {
         }
 
         cancellation_token.cancelled().await;
-        Ok(None)
+        Ok(crate::tasks::TurnTaskResult::default())
     }
 }
 
@@ -10522,6 +10523,71 @@ async fn terminal_task_tracker_shutdown_waits_for_running_finalizer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_task_tracker_waits_for_receipt_persistence_and_delivery() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let persistence_started = Arc::new(tokio::sync::Notify::new());
+    let delivery_started = Arc::new(tokio::sync::Notify::new());
+    let delivery_completed = Arc::new(tokio::sync::Notify::new());
+    let (release_persistence_tx, release_persistence_rx) = tokio::sync::oneshot::channel();
+    let (release_delivery_tx, release_delivery_rx) = tokio::sync::oneshot::channel();
+
+    sess.spawn_terminal_receipt_task({
+        let persistence_started = Arc::clone(&persistence_started);
+        let delivery_started = Arc::clone(&delivery_started);
+        let delivery_completed = Arc::clone(&delivery_completed);
+        async move {
+            persistence_started.notify_one();
+            let _ = release_persistence_rx.await;
+            delivery_started.notify_one();
+            let _ = release_delivery_rx.await;
+            delivery_completed.notify_one();
+        }
+    });
+    timeout(Duration::from_secs(2), persistence_started.notified())
+        .await
+        .expect("receipt persistence should start");
+
+    sess.terminal_tasks.close();
+    let mut tracker_wait = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        async move {
+            sess.terminal_tasks.wait().await;
+        }
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut tracker_wait)
+            .await
+            .is_err(),
+        "tracker wait must retain receipt persistence"
+    );
+
+    release_persistence_tx
+        .send(())
+        .expect("receipt persistence task should still be waiting");
+    timeout(Duration::from_secs(2), delivery_started.notified())
+        .await
+        .expect("receipt delivery should start after persistence");
+    assert!(
+        timeout(Duration::from_millis(50), &mut tracker_wait)
+            .await
+            .is_err(),
+        "tracker wait must retain receipt delivery"
+    );
+
+    let delivery_completed_wait = delivery_completed.notified();
+    release_delivery_tx
+        .send(())
+        .expect("receipt delivery task should still be waiting");
+    timeout(Duration::from_secs(2), delivery_completed_wait)
+        .await
+        .expect("receipt delivery should complete");
+    timeout(Duration::from_secs(2), &mut tracker_wait)
+        .await
+        .expect("tracker should drain after receipt delivery")
+        .expect("tracker waiter should not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let finish = CancellationToken::new();
@@ -10642,6 +10708,7 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     assert!(matches!(
         fifth.msg,
         EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
             turn_id,
             last_agent_message: None,
             error: None,
@@ -11447,13 +11514,14 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         .expect("tool call present");
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let err = router
-        .dispatch_tool_call_with_code_mode_result(
+        .dispatch_tool_call_with_terminal_outcome(
             Arc::clone(&session),
             step_context,
             CancellationToken::new(),
             tracker,
             call,
             ToolCallSource::Direct,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .err()

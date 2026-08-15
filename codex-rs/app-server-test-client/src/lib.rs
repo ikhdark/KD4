@@ -258,17 +258,28 @@ enum CliCommand {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
-    /// Increment the out-of-band elicitation pause counter for a thread.
+    /// Acquire an out-of-band elicitation lease for a thread until this command disconnects.
     #[command(name = "thread-increment-elicitation")]
     ThreadIncrementElicitation {
         /// Existing thread id to update.
         thread_id: String,
     },
-    /// Decrement the out-of-band elicitation pause counter for a thread.
+    /// Attempt an idempotent lease release from a new connection.
     #[command(name = "thread-decrement-elicitation")]
     ThreadDecrementElicitation {
         /// Existing thread id to update.
         thread_id: String,
+        /// Lease token to probe; a different connection cannot release it.
+        lease_id: String,
+    },
+    /// Hold one out-of-band elicitation lease on a single connection.
+    #[command(name = "thread-hold-elicitation")]
+    ThreadHoldElicitation {
+        /// Existing thread id to pause.
+        thread_id: String,
+        /// Number of seconds to retain the lease before releasing it.
+        #[arg(long)]
+        hold_seconds: u64,
     },
     /// Run the live websocket harness that proves elicitation pause prevents a
     /// 10s unified exec timeout from killing a 15s helper script.
@@ -450,10 +461,21 @@ pub async fn run() -> Result<()> {
             let url = resolve_shared_websocket_url(codex_bin, url, "thread-increment-elicitation")?;
             thread_increment_elicitation(&url, thread_id)
         }
-        CliCommand::ThreadDecrementElicitation { thread_id } => {
+        CliCommand::ThreadDecrementElicitation {
+            thread_id,
+            lease_id,
+        } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-decrement-elicitation")?;
             let url = resolve_shared_websocket_url(codex_bin, url, "thread-decrement-elicitation")?;
-            thread_decrement_elicitation(&url, thread_id)
+            thread_decrement_elicitation(&url, thread_id, lease_id)
+        }
+        CliCommand::ThreadHoldElicitation {
+            thread_id,
+            hold_seconds,
+        } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-hold-elicitation")?;
+            let url = resolve_shared_websocket_url(codex_bin, url, "thread-hold-elicitation")?;
+            thread_hold_elicitation(&url, thread_id, hold_seconds)
         }
         CliCommand::LiveElicitationTimeoutPause {
             model,
@@ -1193,7 +1215,7 @@ async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u3
             parent_thread_id: None,
             ancestor_thread_id: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
         })?;
         println!("< thread/list response: {response:?}");
@@ -1239,17 +1261,38 @@ fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()> {
     Ok(())
 }
 
-fn thread_decrement_elicitation(url: &str, thread_id: String) -> Result<()> {
+fn thread_decrement_elicitation(url: &str, thread_id: String, lease_id: String) -> Result<()> {
     let endpoint = Endpoint::ConnectWs(url.to_string());
     let mut client = CodexClient::connect(&endpoint, &[])?;
 
     let initialize = client.initialize()?;
     println!("< initialize response: {initialize:?}");
 
-    let response =
-        client.thread_decrement_elicitation(ThreadDecrementElicitationParams { thread_id })?;
+    let response = client.thread_decrement_elicitation(ThreadDecrementElicitationParams {
+        thread_id,
+        lease_id,
+    })?;
     println!("< thread/decrement_elicitation response: {response:?}");
 
+    Ok(())
+}
+
+fn thread_hold_elicitation(url: &str, thread_id: String, hold_seconds: u64) -> Result<()> {
+    let endpoint = Endpoint::ConnectWs(url.to_string());
+    let mut client = CodexClient::connect(&endpoint, &[])?;
+
+    let initialize = client.initialize()?;
+    println!("< initialize response: {initialize:?}");
+    let response = client.thread_increment_elicitation(ThreadIncrementElicitationParams {
+        thread_id: thread_id.clone(),
+    })?;
+    println!("< thread/increment_elicitation response: {response:?}");
+    std::thread::sleep(Duration::from_secs(hold_seconds));
+    let response = client.thread_decrement_elicitation(ThreadDecrementElicitationParams {
+        thread_id,
+        lease_id: response.lease_id,
+    })?;
+    println!("< thread/decrement_elicitation response: {response:?}");
     Ok(())
 }
 
@@ -1388,17 +1431,6 @@ fn live_elicitation_timeout_pause(
 
         Ok(())
     })();
-
-    match client.thread_decrement_elicitation(ThreadDecrementElicitationParams {
-        thread_id: thread_id.clone(),
-    }) {
-        Ok(response) => {
-            println!("[cleanup] thread/decrement_elicitation response after harness: {response:?}");
-        }
-        Err(err) => {
-            eprintln!("[cleanup] thread/decrement_elicitation ignored: {err:#}");
-        }
-    }
 
     validation_result?;
 
@@ -1626,6 +1658,7 @@ impl CodexClient {
                 capabilities: Some(InitializeCapabilities {
                     experimental_api,
                     request_attestation: false,
+                    desktop_activation_receipts: false,
                     opt_out_notification_methods: Some(
                         NOTIFICATIONS_TO_OPT_OUT
                             .iter()

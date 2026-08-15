@@ -387,7 +387,10 @@ mod agent {
             let final_status =
                 loop_agent(db.clone(), claim.token.clone(), thread_id, &thread).await;
 
-            if matches!(final_status, AgentStatus::Completed(_)) {
+            if matches!(
+                final_status,
+                AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }
+            ) {
                 if let Some(token_usage) = thread
                     .token_usage_info()
                     .await

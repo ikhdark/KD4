@@ -7,6 +7,7 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -17,8 +18,10 @@ use std::time::SystemTime;
 use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::PreparedWorkspaceManifest;
 use codex_agent_task_store::StoreResult;
+#[cfg(test)]
 use codex_agent_task_store::WorkspaceManifestWork;
 use codex_file_watcher::FileWatcher;
+use codex_file_watcher::FileWatcherEvent;
 use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::WatchPath;
 use codex_file_watcher::WatchRegistration;
@@ -28,6 +31,7 @@ use codex_git_utils::get_git_repo_root_with_fs;
 use codex_git_utils::get_has_changes;
 use codex_git_utils::get_head_commit_hash;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path::normalize_for_path_comparison;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::process::Command;
@@ -409,6 +413,55 @@ struct GitWorkspaceCacheState {
     repository_manifest_insert_serial: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SourceFreshnessSnapshot {
+    rescan_generation: u64,
+    paths: Vec<(PathBuf, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct SourceFreshnessState {
+    next_generation: u64,
+    rescan_generation: u64,
+    path_generations: HashMap<PathBuf, u64>,
+}
+
+impl SourceFreshnessState {
+    fn snapshot(&self, paths: impl IntoIterator<Item = PathBuf>) -> SourceFreshnessSnapshot {
+        let mut paths = paths
+            .into_iter()
+            .map(|path| normalize_source_freshness_path(&path))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        SourceFreshnessSnapshot {
+            rescan_generation: self.rescan_generation,
+            paths: paths
+                .into_iter()
+                .map(|path| {
+                    let generation = self.path_generations.get(&path).copied().unwrap_or(0);
+                    (path, generation)
+                })
+                .collect(),
+        }
+    }
+
+    fn record_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        for path in paths {
+            self.path_generations
+                .insert(normalize_source_freshness_path(&path), generation);
+        }
+    }
+
+    fn record_rescan(&mut self) {
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.rescan_generation = self.next_generation;
+        self.path_generations.clear();
+    }
+}
+
 pub(crate) struct GitWorkspaceCache {
     state: Mutex<GitWorkspaceCacheState>,
     watcher_generation: AtomicU64,
@@ -416,6 +469,8 @@ pub(crate) struct GitWorkspaceCache {
     watcher_registration_serial: AtomicU64,
     watcher_reliable: AtomicBool,
     watcher_subscriber: Option<FileWatcherSubscriber>,
+    source_freshness: RwLock<SourceFreshnessState>,
+    #[cfg(test)]
     manifest_diagnostics: WorkspaceManifestDiagnostics,
 }
 
@@ -423,6 +478,8 @@ pub(crate) struct GitWorkspaceCache {
 pub(crate) struct SourceFreshnessRegistration {
     pub(crate) watcher_generation: u64,
     pub(crate) host_mutation_generation: u64,
+    pub(crate) identity: String,
+    freshness: SourceFreshnessSnapshot,
     registration: Arc<WatchRegistration>,
 }
 
@@ -432,10 +489,12 @@ impl std::fmt::Debug for SourceFreshnessRegistration {
             .debug_struct("SourceFreshnessRegistration")
             .field("watcher_generation", &self.watcher_generation)
             .field("host_mutation_generation", &self.host_mutation_generation)
+            .field("identity", &self.identity)
             .finish_non_exhaustive()
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct WorkspaceManifestDiagnostics {
     cache_hits: AtomicU64,
@@ -468,6 +527,7 @@ struct WorkspaceManifestDiagnostics {
     final_duration_micros: AtomicU64,
 }
 
+#[cfg(test)]
 impl WorkspaceManifestDiagnostics {
     fn record_admission(&self, work: WorkspaceManifestWork) {
         self.cache_hits
@@ -551,6 +611,11 @@ impl GitWorkspaceCache {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_noop_watcher_for_tests() -> Arc<Self> {
+        Self::with_watcher(Some(Arc::new(FileWatcher::noop())))
+    }
+
     fn with_watcher(watcher: Option<Arc<FileWatcher>>) -> Arc<Self> {
         let (watcher_subscriber, receiver) = match watcher {
             Some(watcher) => {
@@ -566,16 +631,19 @@ impl GitWorkspaceCache {
             watcher_registration_serial: AtomicU64::new(0),
             watcher_reliable: AtomicBool::new(watcher_subscriber.is_some()),
             watcher_subscriber,
+            source_freshness: RwLock::new(SourceFreshnessState::default()),
+            #[cfg(test)]
             manifest_diagnostics: WorkspaceManifestDiagnostics::default(),
         });
         if let Some(mut receiver) = receiver {
             let weak_cache = Arc::downgrade(&cache);
             tokio::spawn(async move {
-                while receiver.recv().await.is_some() {
+                while let Some(event) = receiver.recv().await {
                     let Some(cache) = weak_cache.upgrade() else {
                         return;
                     };
                     cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
+                    cache.record_source_watcher_event(event);
                 }
                 if let Some(cache) = weak_cache.upgrade() {
                     cache.invalidate_for_watcher_failure().await;
@@ -588,6 +656,10 @@ impl GitWorkspaceCache {
     async fn invalidate_for_watcher_failure(&self) {
         self.watcher_reliable.store(false, Ordering::Release);
         self.watcher_generation.fetch_add(1, Ordering::AcqRel);
+        self.source_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_rescan();
         let mut state = self.state.lock().await;
         state.root = None;
         state.metadata.clear();
@@ -812,6 +884,7 @@ impl GitWorkspaceCache {
                     vec![codex_agent_task_store::REPOSITORY_WIDE_PATH.to_string()],
                 )
                 .await?;
+            #[cfg(test)]
             if let Some(prepared) = prepared.as_ref() {
                 self.manifest_diagnostics.record_admission(prepared.work());
             }
@@ -875,6 +948,7 @@ impl GitWorkspaceCache {
                         8,
                         started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
                     );
+                    #[cfg(test)]
                     self.manifest_diagnostics.record_admission(prepared.work());
                     return Ok(Some(prepared));
                 }
@@ -921,6 +995,7 @@ impl GitWorkspaceCache {
                         None,
                     )
                     .await;
+                    #[cfg(test)]
                     self.manifest_diagnostics.record_admission(refreshed.work());
                     return Ok(Some(refreshed));
                 }
@@ -938,6 +1013,7 @@ impl GitWorkspaceCache {
                 started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
             )
         });
+        #[cfg(test)]
         if let Some(prepared) = prepared.as_ref() {
             self.manifest_diagnostics.record_admission(prepared.work());
         }
@@ -1139,17 +1215,42 @@ impl GitWorkspaceCache {
             .then(|| self.watcher_generation.load(Ordering::Acquire))
     }
 
+    fn source_freshness_snapshot(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> SourceFreshnessSnapshot {
+        self.source_freshness
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(paths)
+    }
+
+    fn record_source_watcher_event(&self, event: FileWatcherEvent) {
+        let mut freshness = self
+            .source_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if event.rescan_required {
+            freshness.record_rescan();
+        } else {
+            freshness.record_paths(event.paths);
+        }
+    }
+
     pub(crate) fn register_source_freshness_paths(
         &self,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Option<SourceFreshnessRegistration> {
+        let paths = paths.into_iter().collect::<Vec<_>>();
         let watcher_generation = self.reliable_watcher_generation()?;
         let host_mutation_generation = self.host_mutation_generation.load(Ordering::Acquire);
+        let freshness_before = self.source_freshness_snapshot(paths.iter().cloned());
         let subscriber = self.watcher_subscriber.as_ref()?;
         let registration = subscriber
             .register_paths(
                 paths
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(|path| WatchPath {
                         path,
                         recursive: false,
@@ -1157,14 +1258,15 @@ impl GitWorkspaceCache {
                     .collect(),
             )
             .ok()?;
-        if self.reliable_watcher_generation() != Some(watcher_generation)
-            || self.host_mutation_generation.load(Ordering::Acquire) != host_mutation_generation
-        {
+        let freshness = self.source_freshness_snapshot(paths);
+        if !self.watcher_reliable.load(Ordering::Acquire) || freshness != freshness_before {
             return None;
         }
         Some(SourceFreshnessRegistration {
             watcher_generation,
             host_mutation_generation,
+            identity: source_freshness_identity(&freshness),
+            freshness,
             registration: Arc::new(registration),
         })
     }
@@ -1174,11 +1276,17 @@ impl GitWorkspaceCache {
         registration: &SourceFreshnessRegistration,
     ) -> bool {
         Arc::strong_count(&registration.registration) > 0
-            && self.reliable_watcher_generation() == Some(registration.watcher_generation)
-            && self.host_mutation_generation.load(Ordering::Acquire)
-                == registration.host_mutation_generation
+            && self.watcher_reliable.load(Ordering::Acquire)
+            && self.source_freshness_snapshot(
+                registration
+                    .freshness
+                    .paths
+                    .iter()
+                    .map(|(path, _)| path.clone()),
+            ) == registration.freshness
     }
 
+    #[cfg(test)]
     pub(crate) fn record_final_manifest_work(&self, work: WorkspaceManifestWork) {
         self.manifest_diagnostics.record_final(work);
     }
@@ -1211,6 +1319,22 @@ impl GitWorkspaceCache {
 
     pub(crate) fn note_host_workspace_mutation(&self) {
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
+        self.source_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_rescan();
+    }
+
+    pub(crate) fn note_host_workspace_mutation_paths(
+        &self,
+        repo_root: &Path,
+        changed_paths: &[String],
+    ) {
+        self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
+        self.source_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_paths(changed_paths.iter().map(|path| repo_root.join(path)));
     }
 
     pub(crate) async fn publish_final_repository_manifest(
@@ -1219,6 +1343,7 @@ impl GitWorkspaceCache {
         repo_root: &Path,
         prepared: PreparedWorkspaceManifest,
         guard: RepositoryManifestFinalizationGuard,
+        host_mutation_recorded: bool,
     ) -> StoreResult<()> {
         if prepared.receipt().paths() != [codex_agent_task_store::REPOSITORY_WIDE_PATH] {
             return Ok(());
@@ -1238,7 +1363,9 @@ impl GitWorkspaceCache {
             || epoch != Some(prepared.receipt().epoch())
             || self.reliable_watcher_generation() != Some(guard.watcher_generation)
             || self.host_mutation_generation.load(Ordering::Acquire)
-                != guard.host_mutation_generation.saturating_add(1)
+                != guard
+                    .host_mutation_generation
+                    .saturating_add(u64::from(host_mutation_recorded))
             || dependencies.as_ref() != Some(&guard.dependencies)
             || git_signature != Some(guard.git_signature)
             || overlay_paths_after != overlay_paths_before
@@ -1367,6 +1494,29 @@ impl GitWorkspaceCache {
 
 fn repository_manifest_dependencies_match(expected: &[DependencyFingerprint]) -> bool {
     refresh_repository_manifest_dependencies(expected).as_deref() == Some(expected)
+}
+
+fn normalize_source_freshness_path(path: &Path) -> PathBuf {
+    let normalized = normalize_for_path_comparison(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        PathBuf::from(normalized.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(windows))]
+    normalized
+}
+
+fn source_freshness_identity(snapshot: &SourceFreshnessSnapshot) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"kd4-source-freshness-v1\0");
+    digest.update(snapshot.rescan_generation.to_le_bytes());
+    for (path, generation) in &snapshot.paths {
+        let path = path.to_string_lossy();
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update(generation.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn refresh_repository_manifest_dependencies(

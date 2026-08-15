@@ -86,6 +86,8 @@ fn search_source_guides_callers_to_ownership_scoped_paths() {
         assert!(paths_description.contains(guidance), "{guidance}");
     }
     assert!(description.contains("deliberate repository-wide"));
+    assert!(description.contains("capped packet for multiple matches"));
+    assert!(description.contains("omissions and ambiguities reported explicitly"));
     assert!(paths_description.contains("Empty remains valid"));
 }
 

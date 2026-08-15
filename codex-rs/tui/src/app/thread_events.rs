@@ -394,6 +394,9 @@ mod tests {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             reasoning_policy_history: None,
         }
     }
@@ -414,11 +417,15 @@ mod tests {
         status: TurnStatus,
     ) -> ServerNotification {
         ServerNotification::TurnCompleted(TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: thread_id.to_string(),
             completion: None,
             turn: Turn {
                 completed_at: Some(0),
                 duration_ms: Some(1),
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 ..test_turn(turn_id, status, Vec::new())
             },
             timing: None,

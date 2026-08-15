@@ -77,7 +77,7 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
         (
             "hydrate_selected_span".to_string(),
             JsonSchema::boolean(Some(
-                "When complete coverage has exactly one match, include a bounded span selected from the same observed file bytes. Defaults to true."
+                "When coverage and result indexing are complete, include exact bounded hydration from the same observed file bytes: the existing selected span for one match or a capped multi-match packet. Defaults to true."
                     .to_string(),
             )),
         ),
@@ -94,7 +94,7 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
 
     ToolSpec::Function(ResponsesApiTool {
         name: SEARCH_SOURCE_TOOL_NAME.to_string(),
-        description: "Search repository source with fixed-string matching and hard scan/result limits. Prefer ownership-scoped paths: when the owner is unknown, call locate_task once and reuse its owner or closure paths. Complete unique results hydrate one bounded span from the same observed bytes by default. Use empty paths only for deliberate repository-wide work. This tool supports local environments only. Results include repo-relative 1-based line-span evidence citations."
+        description: "Search repository source with fixed-string matching and hard scan/result limits. Prefer ownership-scoped paths: when the owner is unknown, call locate_task once and reuse its owner or closure paths. Complete results hydrate exact bounded source from the same observed bytes by default: one selected span for a unique match or a capped packet for multiple matches, with omissions and ambiguities reported explicitly. Use empty paths only for deliberate repository-wide work. This tool supports local environments only. Results include repo-relative 1-based line-span evidence citations."
             .to_string(),
         strict: false,
         defer_loading: None,

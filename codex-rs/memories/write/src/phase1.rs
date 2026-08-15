@@ -414,6 +414,7 @@ mod job {
                 }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ToolManifest(_)
+                | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)

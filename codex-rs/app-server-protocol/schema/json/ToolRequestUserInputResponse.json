@@ -24,6 +24,10 @@
         "$ref": "#/definitions/ToolRequestUserInputAnswer"
       },
       "type": "object"
+    },
+    "interrupted": {
+      "default": false,
+      "type": "boolean"
     }
   },
   "required": [

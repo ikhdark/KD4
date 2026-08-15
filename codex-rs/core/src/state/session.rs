@@ -11,6 +11,7 @@ use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
+use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::ContextManager;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
@@ -20,10 +21,22 @@ use crate::session_startup_prewarm::SessionStartupTransportHandle;
 use crate::tool_history::ModelGenerationId;
 use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryState;
+use codex_protocol::protocol::ContextFragmentDigest;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
+use codex_protocol::protocol::WorldStateItem;
+
+#[derive(Clone)]
+pub(crate) struct ContextBaselineCandidate {
+    pub(crate) turn_context_item: TurnContextItem,
+    pub(crate) world_state_snapshot: WorldStateSnapshot,
+    pub(crate) world_state_item: Option<WorldStateItem>,
+    pub(crate) fragment_digests: Vec<ContextFragmentDigest>,
+    pub(crate) bound_sampling_request_id: Option<String>,
+    pub(crate) bound_physical_attempt_id: Option<String>,
+}
 use codex_utils_output_truncation::TruncationPolicy;
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
@@ -50,6 +63,7 @@ pub(crate) struct SessionState {
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     last_passed_root_completion_turn_id: Option<String>,
     next_turn_is_first: bool,
+    pending_context_baseline: Option<ContextBaselineCandidate>,
 }
 
 impl SessionState {
@@ -84,6 +98,7 @@ impl SessionState {
             granted_permissions_by_environment_id: HashMap::new(),
             last_passed_root_completion_turn_id: None,
             next_turn_is_first: true,
+            pending_context_baseline: None,
         }
     }
 
@@ -172,6 +187,18 @@ impl SessionState {
         self.history.reference_context_item()
     }
 
+    pub(crate) fn stage_context_baseline(&mut self, candidate: ContextBaselineCandidate) {
+        self.pending_context_baseline = Some(candidate);
+    }
+
+    pub(crate) fn pending_context_baseline(&self) -> Option<ContextBaselineCandidate> {
+        self.pending_context_baseline.clone()
+    }
+
+    pub(crate) fn clear_pending_context_baseline(&mut self) {
+        self.pending_context_baseline = None;
+    }
+
     // Token/rate limit helpers
     pub(crate) fn update_token_info_from_usage(
         &mut self,
@@ -197,10 +224,6 @@ impl SessionState {
         self.auto_compact_window.snapshot()
     }
 
-    pub(crate) fn claim_token_budget_reminder(&mut self) -> bool {
-        self.auto_compact_window.claim_token_budget_reminder()
-    }
-
     pub(crate) fn auto_compact_window_number(&self) -> u64 {
         self.auto_compact_window.window_number()
     }
@@ -218,18 +241,6 @@ impl SessionState {
     }
 
     pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.auto_compact_window.advance()
-    }
-
-    pub(crate) fn request_new_context_window(&mut self) {
-        self.auto_compact_window.request_new_context_window();
-    }
-
-    pub(crate) fn take_new_context_window_request(&mut self) -> bool {
-        self.auto_compact_window.take_new_context_window_request()
-    }
-
-    pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
         self.auto_compact_window.advance()
     }
 
@@ -352,29 +363,6 @@ impl SessionState {
         self.granted_permissions_by_environment_id
             .get(environment_id)
             .cloned()
-    }
-
-    pub(crate) fn soft_floor_receipt_matches(&self, identity: &str) -> bool {
-        self.auto_compact_window
-            .soft_floor_receipt_matches(identity)
-    }
-
-    pub(crate) fn record_soft_floor_receipt(&mut self, identity: String) {
-        self.auto_compact_window.record_soft_floor_receipt(identity);
-    }
-
-    pub(crate) fn budget_compaction_blocked_for_turn(&self, turn_id: &str) -> bool {
-        self.auto_compact_window
-            .budget_compaction_blocked_for_turn(turn_id)
-    }
-
-    pub(crate) fn record_budget_compaction_outcome(
-        &mut self,
-        turn_id: String,
-        meaningful_headroom: bool,
-    ) {
-        self.auto_compact_window
-            .record_budget_compaction_outcome(turn_id, meaningful_headroom);
     }
 }
 

@@ -1,6 +1,11 @@
 use crate::function_tool::FunctionCallError;
 use crate::tools::command_output_artifact::ToolOutputSelector;
-use crate::tools::command_output_artifact::read_tool_output_selectors;
+#[cfg(test)]
+use crate::tools::command_output_artifact::ToolOutputSelectorResult;
+use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
+use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
+use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -18,6 +23,11 @@ const DEFAULT_MAX_BYTES: usize = 16_384;
 const DEFAULT_LINE_COUNT: usize = 200;
 const MAX_LEGACY_RANGES: usize = 16;
 const MAX_AGGREGATE_LINES: usize = 2_000;
+// A nested result is serialized into a code-mode cell and then into the outer
+// exec result. Keep exact recovery below the smallest supported outer budget;
+// oversized selectors return their deterministic byte subdivision instead of
+// being recursively truncated into another artifact.
+const CODE_MODE_RECOVERY_TOKEN_CEILING: usize = 512;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,22 +91,38 @@ async fn handle_read_tool_output(
     // clip a selected value. The selector engine owns its exact response fit.
     let _legacy_max_bytes = resolved_max_bytes(args.max_bytes)?;
     let selectors = resolved_selectors(&args)?;
-    let output = read_tool_output_selectors(
-        invocation.turn.config.codex_home.as_path(),
-        &invocation.session.thread_id.to_string(),
-        &args.artifact_id,
-        selectors,
-    )
-    .await
+    let (output, reused) = match &invocation.source {
+        ToolCallSource::Direct => {
+            read_tool_output_selectors_with_reuse(
+                invocation.turn.config.codex_home.as_path(),
+                &invocation.session.thread_id.to_string(),
+                &args.artifact_id,
+                selectors,
+            )
+            .await
+        }
+        ToolCallSource::CodeMode { .. } => {
+            read_tool_output_selectors_with_ceiling_and_reuse(
+                invocation.turn.config.codex_home.as_path(),
+                &invocation.session.thread_id.to_string(),
+                &args.artifact_id,
+                selectors,
+                CODE_MODE_RECOVERY_TOKEN_CEILING,
+            )
+            .await
+        }
+    }
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+    if !reused {
+        invocation
+            .turn
+            .turn_timing_state
+            .record_tool_output_artifact_reread();
+    }
     invocation
         .turn
         .turn_timing_state
-        .record_tool_output_artifact_reread();
-    invocation
-        .turn
-        .turn_timing_state
-        .record_tool_output_recovery();
+        .record_tool_output_recovery(recovery_retruncation_count(&output));
     invocation
         .turn
         .turn_timing_state
@@ -106,6 +132,25 @@ async fn handle_read_tool_output(
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
     Ok(boxed_tool_output(JsonToolOutput::new(output)))
+}
+
+fn recovery_retruncation_count(
+    output: &crate::tools::command_output_artifact::ReadToolOutputResult,
+) -> u32 {
+    u32::try_from(
+        output
+            .results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.status,
+                    ToolOutputSelectorStatus::SelectorTooLarge
+                        | ToolOutputSelectorStatus::AggregateOmitted
+                )
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 fn resolved_selectors(
@@ -220,6 +265,43 @@ fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selector_result(status: ToolOutputSelectorStatus) -> ToolOutputSelectorResult {
+        ToolOutputSelectorResult {
+            selector: ToolOutputSelector::Lines { start: 1, end: 1 },
+            status,
+            complete: status == ToolOutputSelectorStatus::Ok,
+            exact_bytes: None,
+            canonical_range: None,
+            text: None,
+            value: None,
+            data_base64: None,
+            subdivision_plan: None,
+            child_selectors: Vec::new(),
+            continuation: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn retruncation_count_tracks_incomplete_recovery_results() {
+        let output = crate::tools::command_output_artifact::ReadToolOutputResult {
+            artifact_id: "artifact".to_string(),
+            canonical_sha256: "digest".to_string(),
+            canonical_bytes: 1,
+            retained_bytes: 1,
+            complete: false,
+            unavailable_ranges: Vec::new(),
+            results: vec![
+                selector_result(ToolOutputSelectorStatus::Ok),
+                selector_result(ToolOutputSelectorStatus::SelectorTooLarge),
+                selector_result(ToolOutputSelectorStatus::AggregateOmitted),
+                selector_result(ToolOutputSelectorStatus::NotFound),
+            ],
+        };
+
+        assert_eq!(recovery_retruncation_count(&output), 2);
+    }
 
     #[test]
     fn default_range_is_exactly_two_hundred_lines() {

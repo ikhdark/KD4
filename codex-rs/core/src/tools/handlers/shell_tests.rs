@@ -42,6 +42,51 @@ use tokio::sync::Mutex;
 use super::parse_shell_command_hook_invocation;
 
 #[test]
+fn validation_diagnostic_ranges_are_exact_and_bounded() {
+    let range = super::validation_diagnostic_range("validation:diagnostics", b"first\nsecond\n")
+        .expect("bounded diagnostics");
+    assert_eq!(range.id, "validation:diagnostics");
+    assert_eq!((range.start_line, range.end_line), (1, 2));
+
+    assert!(super::validation_diagnostic_range("", b"failure\n").is_none());
+    assert!(
+        super::validation_diagnostic_range("validation:diagnostics", &vec![b'x'; 12 * 1024 + 1],)
+            .is_none()
+    );
+    let too_many_lines = std::iter::repeat_n("line", 201)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        super::validation_diagnostic_range("validation:diagnostics", too_many_lines.as_bytes(),)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn stall_shell_operation_timeout_cancels_pre_spawn_work() {
+    let timeout = super::ShellOperationTimeout::new(Some(1));
+    timeout.token().cancelled().await;
+    assert!(timeout.timed_out());
+}
+
+#[test]
+fn transient_finalization_fence_is_not_memoized_as_structural_admission_failure() {
+    let finalization = codex_agent_task_store::StoreError::WorkspaceFinalizationActive {
+        root_session_id: "root-session".to_string(),
+    };
+    let initialization = codex_agent_task_store::StoreError::WorkspaceStateInitialization(
+        "invalid workspace state".to_string(),
+    );
+
+    assert!(!super::is_structural_workspace_admission_block(
+        &finalization
+    ));
+    assert!(super::is_structural_workspace_admission_block(
+        &initialization
+    ));
+}
+
+#[test]
 fn direct_normalization_requires_the_same_authorization_envelope() {
     use crate::tools::sandboxing::ExecApprovalRequirement;
 
@@ -123,22 +168,42 @@ fn retry_guard_counts_operational_rejections_but_not_user_declines() {
 }
 
 #[test]
-fn successful_validation_skip_remains_successful_for_reuse() {
+fn validation_execution_outcome_distinguishes_success_from_not_executed() {
     let skipped = super::RunExecLikeResult {
         output: FunctionToolOutput::from_text("validation skipped".to_string(), Some(true)),
         exit_code: None,
-        validation_reuse_success: Some(true),
+        validation_execution_outcome: super::ValidationExecutionOutcome::ExecutedSuccess,
         canonical_output: None,
     };
-    assert!(skipped.validation_reuse_succeeded());
+    assert_eq!(
+        skipped.validation_execution_outcome(),
+        super::ValidationExecutionOutcome::ExecutedSuccess
+    );
 
     let unknown_exit = super::RunExecLikeResult {
         output: FunctionToolOutput::from_text("no exit".to_string(), Some(true)),
         exit_code: None,
-        validation_reuse_success: None,
+        validation_execution_outcome: super::ValidationExecutionOutcome::NotExecuted,
         canonical_output: None,
     };
-    assert!(!unknown_exit.validation_reuse_succeeded());
+    assert_eq!(
+        unknown_exit.validation_execution_outcome(),
+        super::ValidationExecutionOutcome::NotExecuted
+    );
+
+    let projected = super::shell_command::validation_structured_output(serde_json::json!({
+        "text": "validation skipped",
+        "execution_outcome": "not_executed",
+        "command_was_executed": false,
+        "skip_disposition": "deferred",
+    }));
+    assert_eq!(
+        projected.outcome_context(),
+        codex_tools::ToolOutputOutcomeContext::skipped(Some(
+            codex_tools::ToolOutputSkipDisposition::Deferred,
+        ))
+    );
+    assert!(!projected.success_for_logging());
 }
 
 #[test]
@@ -149,6 +214,7 @@ fn legacy_shell_keeps_exact_canonical_bytes_and_one_typed_projection() {
         canonical_output: Some(raw.clone()),
         exit_code: Some(7),
         call_id: "shell-call".to_string(),
+        validation_failure: false,
     };
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -1528,9 +1594,12 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
     let output = FunctionToolOutput {
         body: vec![],
         success: Some(true),
+        outcome: None,
         post_tool_use_response: Some(json!("shell output")),
         deterministic_continuation_receipts: Vec::new(),
         sampling_request_signal: None,
+        deterministic_continuation_owner_key: None,
+        skip_disposition: None,
     };
     let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
     let (session, turn) = make_session_and_context().await;

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use codex_features::Feature;
 use codex_protocol::config_types::WebSearchMode;
@@ -507,13 +508,51 @@ pub(crate) struct CompletionReviewState {
     phase: TurnReviewPhase,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CompletionReviewTurnBaseline {
-    implementation_identity_hash: String,
-    dossier_snapshot_id: String,
-    /// Supplied only by a completion-review owner that binds the complete
-    /// reviewer/model/configuration/prompt and workspace freshness identity.
-    complete_reuse_identity: Option<String>,
+#[derive(Clone, Copy)]
+enum ReviewTelemetryPhase {
+    Preflight,
+    Review,
+}
+
+struct ReviewTelemetryTimer {
+    timing: Arc<crate::turn_timing::TurnTimingState>,
+    phase: ReviewTelemetryPhase,
+    started: Instant,
+    active: bool,
+}
+
+impl ReviewTelemetryTimer {
+    fn start(
+        timing: Arc<crate::turn_timing::TurnTimingState>,
+        phase: ReviewTelemetryPhase,
+    ) -> Self {
+        Self {
+            timing,
+            phase,
+            started: Instant::now(),
+            active: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let elapsed = self.started.elapsed();
+        match self.phase {
+            ReviewTelemetryPhase::Preflight => {
+                self.timing.record_completion_review_preflight(elapsed);
+            }
+            ReviewTelemetryPhase::Review => self.timing.record_completion_review(elapsed),
+        }
+    }
+}
+
+impl Drop for ReviewTelemetryTimer {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -3193,7 +3232,28 @@ fn review_admission_decision_for_source(
         .exact_diff
         .as_deref()
         .is_some_and(|diff| !diff.trim().is_empty());
-    if !dossier.has_task_attributed_mutations && !has_turn_diff {
+    let has_mutations = dossier.has_task_attributed_mutations || has_turn_diff;
+    let fresh_validation = turn_evidence.validation_freshness
+        == ValidationFreshnessStatus::PassedAfterLastMutation
+        && turn_evidence.last_successful_validation_revision
+            == Some(turn_evidence.mutation_revision);
+    let deterministic_completion_evidence_sufficient = dossier.mappings_classified
+        && dossier.source_classification_current
+        && dossier.relationship_resolution_current
+        && !dossier.source_capture_failed
+        && dossier
+            .sources
+            .iter()
+            .all(|source| source.availability == UserSourceAvailability::Available)
+        && dossier.evidence_gate.status == TaskCompletionStatus::Passed
+        && dossier.authoritative_input_errors.is_empty()
+        && dossier.typed_quiescent
+        && dossier.default_children_quiescent
+        && (!has_mutations || fresh_validation);
+    if !deterministic_completion_evidence_sufficient {
+        return ReviewAdmissionDecision::Admit;
+    }
+    if !has_mutations {
         return ReviewAdmissionDecision::SkipNonMutating;
     }
     let Some(selection_input) = build_review_lens_selection_input(dossier) else {
@@ -3223,33 +3283,27 @@ fn review_admission_decision_for_source(
     {
         return ReviewAdmissionDecision::SkipDocumentationOnly;
     }
-    let fresh_validation = turn_evidence.validation_freshness
-        == ValidationFreshnessStatus::PassedAfterLastMutation
-        && turn_evidence.last_successful_validation_revision
-            == Some(turn_evidence.mutation_revision);
-    if fresh_validation
-        && dossier.evidence_gate.status == TaskCompletionStatus::Passed
-        && dossier.authoritative_input_errors.is_empty()
-        && dossier.typed_quiescent
-        && dossier.default_children_quiescent
-        && !specialized_risk
-        && !paths.is_empty()
-    {
+    if fresh_validation && !specialized_risk && !paths.is_empty() {
         return ReviewAdmissionDecision::SkipFreshLowRisk;
     }
     ReviewAdmissionDecision::Admit
 }
 
-fn correctness_review_gate_reasons(
-    dossier: &CompletionReviewDossier,
-    turn_evidence: &CompletionReviewTurnEvidence,
-) -> Vec<String> {
+fn review_stability_blocker_reasons(dossier: &CompletionReviewDossier) -> Vec<String> {
     let mut reasons = dossier.authoritative_input_errors.clone();
     if dossier.source_capture_failed {
         reasons.push("a user source could not be durably captured".to_string());
     }
-    if dossier.evidence_gate.status != TaskCompletionStatus::Passed {
-        reasons.extend(dossier.evidence_gate.reasons.iter().cloned());
+    if dossier
+        .sources
+        .iter()
+        .any(|source| source.availability != UserSourceAvailability::Available)
+        || dossier
+            .source_mappings
+            .values()
+            .any(|mapping| matches!(mapping, SourceMapping::UnavailableOrTruncated))
+    {
+        reasons.push("user source evidence is unavailable or truncated".to_string());
     }
     if !dossier.typed_quiescent {
         reasons.push("typed task mutations are not quiescent".to_string());
@@ -3257,21 +3311,21 @@ fn correctness_review_gate_reasons(
     if !dossier.default_children_quiescent {
         reasons.push("default child task mutations are not quiescent".to_string());
     }
-    let has_turn_diff = turn_evidence
-        .exact_diff
-        .as_deref()
-        .is_some_and(|diff| !diff.trim().is_empty());
-    if (dossier.has_task_attributed_mutations || has_turn_diff)
-        && (turn_evidence.validation_freshness
-            != ValidationFreshnessStatus::PassedAfterLastMutation
-            || turn_evidence.last_successful_validation_revision
-                != Some(turn_evidence.mutation_revision))
-    {
-        reasons.push("validation proof is missing, failed, or stale for this mutation".to_string());
-    }
     reasons.sort();
     reasons.dedup();
     reasons
+}
+
+fn has_pending_review_lineage(dossier: &CompletionReviewDossier) -> bool {
+    matches!(
+        dossier.cycle_phase,
+        Some(
+            CompletionReviewCyclePhase::CorrectionPending
+                | CompletionReviewCyclePhase::RereviewPending
+                | CompletionReviewCyclePhase::InitialReviewPending
+                | CompletionReviewCyclePhase::ClassificationPending
+        )
+    )
 }
 
 fn reviewer_execution_contract(config: &Config) -> ReviewerExecutionContract {
@@ -3349,7 +3403,6 @@ pub(crate) async fn coordinate_completion_review(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     cancellation_token: &CancellationToken,
-    _turn_baseline: Option<&CompletionReviewTurnBaseline>,
     turn_evidence: &CompletionReviewTurnEvidence,
     candidate_completion: Option<&str>,
     state: &mut CompletionReviewState,
@@ -3439,20 +3492,13 @@ pub(crate) async fn coordinate_completion_review(
                 ..Default::default()
             });
         }
-        let mut correctness_reasons = correctness_review_gate_reasons(&dossier, turn_evidence);
-        correctness_reasons.extend(
-            sess.services
-                .task_evidence
-                .pre_review_final_proof_reasons(
-                    &dossier.implementation_identity_hash,
-                    &dossier.user_source_ledger_hash,
-                    &dossier.requirement_manifest_hash,
-                )
-                .await,
-        );
-        correctness_reasons.sort();
-        correctness_reasons.dedup();
-        if !correctness_reasons.is_empty() {
+        let pending_lineage = has_pending_review_lineage(&dossier);
+        let stability_reasons = if pending_lineage {
+            Vec::new()
+        } else {
+            review_stability_blocker_reasons(&dossier)
+        };
+        if !stability_reasons.is_empty() {
             let obligation = if dossier.mappings_classified {
                 match resolve_review_obligation(&dossier) {
                     ReviewObligationResolution::Resolved(obligation) => obligation,
@@ -3467,16 +3513,16 @@ pub(crate) async fn coordinate_completion_review(
                 sess,
                 turn_context,
                 &obligation,
-                &correctness_reasons,
+                &stability_reasons,
             )
             .await;
             state.phase = TurnReviewPhase::Terminal;
             return Ok(CompletionReviewCoordinatorOutcome {
-                partial_reasons: correctness_reasons,
+                partial_reasons: stability_reasons,
                 ..Default::default()
             });
         }
-        if !user_sources_still_current(&dossier).await {
+        if !pending_lineage && !user_sources_still_current(&dossier).await {
             let reasons = vec!["user source evidence changed before review admission".to_string()];
             record_review_not_admitted_correctness(
                 sess,
@@ -3533,7 +3579,7 @@ pub(crate) async fn coordinate_completion_review(
                         continue;
                     }
                     state.phase = TurnReviewPhase::Terminal;
-                    return Ok(CompletionReviewCoordinatorOutcome::default());
+                    return Ok(superseded_persistence_outcome());
                 }
                 AtomicReviewTransition::Failed => {
                     record_review_infrastructure(
@@ -3548,7 +3594,7 @@ pub(crate) async fn coordinate_completion_review(
                     )
                     .await;
                     state.phase = TurnReviewPhase::Terminal;
-                    return Ok(CompletionReviewCoordinatorOutcome::default());
+                    return Ok(partial_outcome(ReviewFailureCategory::Persistence));
                 }
             }
         }
@@ -3577,15 +3623,25 @@ pub(crate) async fn coordinate_completion_review(
             obligation_hash: obligation.hash(),
             required_attempt_identity: None,
         };
-        if !matches!(
-            sess.services
-                .task_evidence
-                .synchronize_completion_review_obligation(obligation_input)
-                .await,
-            AtomicReviewTransition::Persisted(())
-        ) {
-            state.phase = TurnReviewPhase::Terminal;
-            return Ok(CompletionReviewCoordinatorOutcome::default());
+        match sess
+            .services
+            .task_evidence
+            .synchronize_completion_review_obligation(obligation_input)
+            .await
+        {
+            AtomicReviewTransition::Persisted(()) => {}
+            AtomicReviewTransition::Superseded => {
+                if candidate_restart_count == 0 {
+                    candidate_restart_count = 1;
+                    continue;
+                }
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(superseded_persistence_outcome());
+            }
+            AtomicReviewTransition::Failed => {
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(partial_outcome(ReviewFailureCategory::Persistence));
+            }
         }
         let Some(fresh) = review_dossier(sess, candidate_completion).await else {
             state.phase = TurnReviewPhase::Terminal;
@@ -3593,15 +3649,7 @@ pub(crate) async fn coordinate_completion_review(
         };
         dossier = fresh;
 
-        let pending_lineage = matches!(
-            dossier.cycle_phase,
-            Some(
-                CompletionReviewCyclePhase::CorrectionPending
-                    | CompletionReviewCyclePhase::RereviewPending
-                    | CompletionReviewCyclePhase::InitialReviewPending
-                    | CompletionReviewCyclePhase::ClassificationPending
-            )
-        );
+        let pending_lineage = has_pending_review_lineage(&dossier);
         let admission = if pending_lineage {
             if matches!(
                 &turn_context.session_source,
@@ -3718,23 +3766,6 @@ pub(crate) async fn coordinate_completion_review(
         attach_lens_observation_advisories(&mut outcome, lens_observation_advisories);
         return Ok(outcome);
     }
-}
-
-pub(crate) async fn capture_completion_review_turn_baseline(
-    sess: &Session,
-) -> Option<CompletionReviewTurnBaseline> {
-    if !sess.services.task_evidence.allows_kd4_completion() {
-        return None;
-    }
-    let dossier = review_dossier(sess, None).await?;
-    Some(CompletionReviewTurnBaseline {
-        implementation_identity_hash: dossier.implementation_identity_hash,
-        dossier_snapshot_id: dossier.dossier_snapshot_id,
-        // The current owner does not yet expose reviewer model/provider,
-        // effective reviewer configuration, mandatory-review disposition, and
-        // prompt/schema contract identity. Fail open to model evaluation.
-        complete_reuse_identity: None,
-    })
 }
 
 async fn review_dossier(
@@ -4027,6 +4058,17 @@ fn partial_outcome(failure: ReviewFailureCategory) -> CompletionReviewCoordinato
     }
 }
 
+fn superseded_persistence_outcome() -> CompletionReviewCoordinatorOutcome {
+    CompletionReviewCoordinatorOutcome {
+        candidate_changed: true,
+        partial_reasons: vec![
+            "completion review persistence was superseded by a concurrent authoritative update"
+                .to_string(),
+        ],
+        ..Default::default()
+    }
+}
+
 async fn record_review_skip(
     sess: &Session,
     turn_context: &TurnContext,
@@ -4064,6 +4106,9 @@ async fn record_review_not_admitted_correctness(
     obligation: &ReviewObligationMode,
     reasons: &[String],
 ) {
+    turn_context
+        .turn_timing_state
+        .record_review_prevented_by_correctness();
     let _ = sess
         .services
         .task_evidence
@@ -4224,6 +4269,10 @@ async fn run_contract_review(
     obligation: &ReviewObligationMode,
     turn_evidence: &CompletionReviewTurnEvidence,
 ) -> CodexResult<CompletionReviewCoordinatorOutcome> {
+    let mut preflight_timer = ReviewTelemetryTimer::start(
+        Arc::clone(&turn_context.turn_timing_state),
+        ReviewTelemetryPhase::Preflight,
+    );
     let attempt_kind = match kind {
         ReviewerRequestKind::InitialReview => CompletionReviewAttemptKind::InitialReview,
         ReviewerRequestKind::Rereview => CompletionReviewAttemptKind::Rereview,
@@ -4349,22 +4398,28 @@ async fn run_contract_review(
     let preflight_implementation_identity = dossier.implementation_identity_hash.clone();
     let preflight_dossier_snapshot = dossier.dossier_snapshot_id.clone();
     let preflight_manifest_hash = dossier.requirement_manifest_hash.clone();
-    if !matches!(
-        sess.services
-            .task_evidence
-            .synchronize_completion_review_obligation(CompletionReviewObligationInput {
-                mode: obligation.name().to_string(),
-                requirement_ids: obligation.requirement_ids(),
-                obligation_hash: obligation.hash(),
-                required_attempt_identity: obligation
-                    .is_mandatory()
-                    .then(|| attempt_identity.value.clone()),
-            })
-            .await,
-        AtomicReviewTransition::Persisted(())
-    ) {
-        state.phase = TurnReviewPhase::Terminal;
-        return Ok(CompletionReviewCoordinatorOutcome::default());
+    match sess
+        .services
+        .task_evidence
+        .synchronize_completion_review_obligation(CompletionReviewObligationInput {
+            mode: obligation.name().to_string(),
+            requirement_ids: obligation.requirement_ids(),
+            obligation_hash: obligation.hash(),
+            required_attempt_identity: obligation
+                .is_mandatory()
+                .then(|| attempt_identity.value.clone()),
+        })
+        .await
+    {
+        AtomicReviewTransition::Persisted(()) => {}
+        AtomicReviewTransition::Superseded => {
+            state.phase = TurnReviewPhase::Terminal;
+            return Ok(superseded_persistence_outcome());
+        }
+        AtomicReviewTransition::Failed => {
+            state.phase = TurnReviewPhase::Terminal;
+            return Ok(partial_outcome(ReviewFailureCategory::Persistence));
+        }
     }
     let Some(mut dossier) = review_dossier(sess, candidate_completion).await else {
         state.phase = TurnReviewPhase::Terminal;
@@ -4417,6 +4472,9 @@ async fn run_contract_review(
             )
             .await
         {
+            turn_context
+                .turn_timing_state
+                .record_reviewer_infrastructure_memo_hit();
             state.phase = TurnReviewPhase::Terminal;
             return Ok(CompletionReviewCoordinatorOutcome::default());
         }
@@ -4458,6 +4516,9 @@ async fn run_contract_review(
             )
             .await
         {
+            turn_context
+                .turn_timing_state
+                .record_reviewer_infrastructure_memo_hit();
             state.phase = TurnReviewPhase::Terminal;
             return Ok(CompletionReviewCoordinatorOutcome::default());
         }
@@ -4556,16 +4617,23 @@ async fn run_contract_review(
                 };
                 dossier = fresh;
             }
-            AtomicReviewTransition::Superseded | AtomicReviewTransition::Failed => {
+            AtomicReviewTransition::Superseded => {
                 prepared.shutdown().await;
                 state.phase = TurnReviewPhase::Terminal;
-                return Ok(CompletionReviewCoordinatorOutcome {
-                    candidate_changed: true,
-                    ..Default::default()
-                });
+                return Ok(superseded_persistence_outcome());
+            }
+            AtomicReviewTransition::Failed => {
+                prepared.shutdown().await;
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(partial_outcome(ReviewFailureCategory::Persistence));
             }
         }
     }
+    preflight_timer.finish();
+    let mut review_timer = ReviewTelemetryTimer::start(
+        Arc::clone(&turn_context.turn_timing_state),
+        ReviewTelemetryPhase::Review,
+    );
     let execution = run_prepared_reviewer_with_deadline(
         prepared,
         inputs,
@@ -4575,6 +4643,7 @@ async fn run_contract_review(
         cancellation_token,
     )
     .await?;
+    review_timer.finish();
     drop(review_permit);
     if execution.payload.is_none() {
         let failure = execution
@@ -4735,10 +4804,14 @@ async fn run_contract_review(
         )
         .await
         {
-            Some(_) => {}
-            None => {
+            AtomicReviewTransition::Persisted(_) => {}
+            AtomicReviewTransition::Superseded => {
                 state.phase = TurnReviewPhase::Terminal;
-                return Ok(CompletionReviewCoordinatorOutcome::default());
+                return Ok(superseded_persistence_outcome());
+            }
+            AtomicReviewTransition::Failed => {
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(partial_outcome(ReviewFailureCategory::Persistence));
             }
         }
         let Some(rebuilt) = review_dossier(sess, candidate_completion).await else {
@@ -4761,7 +4834,7 @@ async fn run_contract_review(
         .await;
     }
     if validated.review_clean {
-        if persist_validated_attempt(
+        match persist_validated_attempt(
             sess,
             &dossier,
             attempt_kind,
@@ -4775,10 +4848,16 @@ async fn run_contract_review(
             &attempt_identity,
         )
         .await
-        .is_none()
         {
-            state.phase = TurnReviewPhase::Terminal;
-            return Ok(CompletionReviewCoordinatorOutcome::default());
+            AtomicReviewTransition::Persisted(_) => {}
+            AtomicReviewTransition::Superseded => {
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(superseded_persistence_outcome());
+            }
+            AtomicReviewTransition::Failed => {
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(partial_outcome(ReviewFailureCategory::Persistence));
+            }
         }
         state.phase = TurnReviewPhase::Terminal;
         return Ok(CompletionReviewCoordinatorOutcome {
@@ -4787,7 +4866,7 @@ async fn run_contract_review(
         });
     }
     if matches!(kind, ReviewerRequestKind::Rereview) || dossier.correction_consumed {
-        let _ = persist_validated_attempt(
+        let transition = persist_validated_attempt(
             sess,
             &dossier,
             attempt_kind,
@@ -4802,7 +4881,11 @@ async fn run_contract_review(
         )
         .await;
         state.phase = TurnReviewPhase::Terminal;
-        return Ok(CompletionReviewCoordinatorOutcome::default());
+        return Ok(match transition {
+            AtomicReviewTransition::Persisted(_) => CompletionReviewCoordinatorOutcome::default(),
+            AtomicReviewTransition::Superseded => superseded_persistence_outcome(),
+            AtomicReviewTransition::Failed => partial_outcome(ReviewFailureCategory::Persistence),
+        });
     }
 
     let Some(preview_review_id) = sess
@@ -4817,7 +4900,7 @@ async fn run_contract_review(
     let preview_findings = preview_finding_receipts(&preview_review_id, &validated.findings);
     let repair = build_repair_item(&dossier, &preview_findings);
     let Some((repair_item, repair_payload)) = repair else {
-        let _ = persist_validated_attempt(
+        let transition = persist_validated_attempt(
             sess,
             &dossier,
             attempt_kind,
@@ -4832,7 +4915,11 @@ async fn run_contract_review(
         )
         .await;
         state.phase = TurnReviewPhase::Terminal;
-        return Ok(CompletionReviewCoordinatorOutcome::default());
+        return Ok(match transition {
+            AtomicReviewTransition::Persisted(_) => CompletionReviewCoordinatorOutcome::default(),
+            AtomicReviewTransition::Superseded => superseded_persistence_outcome(),
+            AtomicReviewTransition::Failed => partial_outcome(ReviewFailureCategory::Persistence),
+        });
     };
     let recorded = match persist_validated_attempt(
         sess,
@@ -4849,10 +4936,14 @@ async fn run_contract_review(
     )
     .await
     {
-        Some(recorded) => recorded,
-        None => {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        AtomicReviewTransition::Superseded => {
             state.phase = TurnReviewPhase::Terminal;
-            return Ok(CompletionReviewCoordinatorOutcome::default());
+            return Ok(superseded_persistence_outcome());
+        }
+        AtomicReviewTransition::Failed => {
+            state.phase = TurnReviewPhase::Terminal;
+            return Ok(partial_outcome(ReviewFailureCategory::Persistence));
         }
     };
     if recorded.review_id != preview_review_id || recorded.findings != preview_findings {
@@ -4895,9 +4986,16 @@ async fn resume_correction(
         state.phase = TurnReviewPhase::Terminal;
         return Ok(partial_outcome(ReviewFailureCategory::Persistence));
     };
-    if !persist_correction_evidence(sess, &dossier, &initial_review_id).await {
-        state.phase = TurnReviewPhase::Terminal;
-        return Ok(partial_outcome(ReviewFailureCategory::Persistence));
+    match persist_correction_evidence(sess, &dossier, &initial_review_id).await {
+        AtomicReviewTransition::Persisted(_) => {}
+        AtomicReviewTransition::Superseded => {
+            state.phase = TurnReviewPhase::Terminal;
+            return Ok(superseded_persistence_outcome());
+        }
+        AtomicReviewTransition::Failed => {
+            state.phase = TurnReviewPhase::Terminal;
+            return Ok(partial_outcome(ReviewFailureCategory::Persistence));
+        }
     }
     let Some(after_correction) = review_dossier(sess, candidate_completion).await else {
         state.phase = TurnReviewPhase::Terminal;
@@ -4940,7 +5038,7 @@ async fn persist_validated_attempt(
     gap_reconstructed: bool,
     lens_observation_advisories: &mut Vec<String>,
     attempt_identity: &ReviewAttemptIdentity,
-) -> Option<RecordedReviewAttempt> {
+) -> AtomicReviewTransition<RecordedReviewAttempt> {
     let advisory_parent_review_id = parent_review_id.clone();
     let superseded_review_id = (attempt_kind == CompletionReviewAttemptKind::InitialReview)
         .then(|| dossier.cycle_superseded_review_id.clone())
@@ -4971,7 +5069,7 @@ async fn persist_validated_attempt(
     };
     let transition = if input.manifest_gaps.is_empty() {
         if source_materialization.is_some() {
-            return None;
+            return AtomicReviewTransition::Failed;
         }
         sess.services
             .task_evidence
@@ -4983,7 +5081,10 @@ async fn persist_validated_attempt(
             .record_completion_review_attempt_v2_with_materialization(
                 dossier,
                 input,
-                source_materialization?,
+                match source_materialization {
+                    Some(source_materialization) => source_materialization,
+                    None => return AtomicReviewTransition::Failed,
+                },
             )
             .await
     };
@@ -4998,9 +5099,10 @@ async fn persist_validated_attempt(
                 superseded_review_id.as_deref(),
                 &lens_observations,
             );
-            Some(recorded)
+            AtomicReviewTransition::Persisted(recorded)
         }
-        AtomicReviewTransition::Superseded | AtomicReviewTransition::Failed => None,
+        AtomicReviewTransition::Superseded => AtomicReviewTransition::Superseded,
+        AtomicReviewTransition::Failed => AtomicReviewTransition::Failed,
     }
 }
 
@@ -5008,31 +5110,28 @@ async fn persist_correction_evidence(
     sess: &Session,
     dossier: &CompletionReviewDossier,
     initial_review_id: &str,
-) -> bool {
-    matches!(
-        sess.services
-            .task_evidence
-            .record_completion_review_attempt_v2(
-                dossier,
-                CompletionReviewAttemptInput {
-                    attempt_kind: CompletionReviewAttemptKind::CorrectionEvidence,
-                    parent_review_id: Some(initial_review_id.to_string()),
-                    superseded_review_id: None,
-                    findings: Vec::new(),
-                    dispositions: Vec::new(),
-                    manifest_gaps: Vec::new(),
-                    repair_instruction: None,
-                    repair_instruction_hash: dossier.initial_repair_instruction_hash.clone(),
-                    infrastructure_outcome: "ok".to_string(),
-                    review_clean: false,
-                    terminal_outcome: None,
-                    attempt_identity: String::new(),
-                    reviewer_contract_hash: String::new(),
-                },
-            )
-            .await,
-        AtomicReviewTransition::Persisted(_)
-    )
+) -> AtomicReviewTransition<RecordedReviewAttempt> {
+    sess.services
+        .task_evidence
+        .record_completion_review_attempt_v2(
+            dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::CorrectionEvidence,
+                parent_review_id: Some(initial_review_id.to_string()),
+                superseded_review_id: None,
+                findings: Vec::new(),
+                dispositions: Vec::new(),
+                manifest_gaps: Vec::new(),
+                repair_instruction: None,
+                repair_instruction_hash: dossier.initial_repair_instruction_hash.clone(),
+                infrastructure_outcome: "ok".to_string(),
+                review_clean: false,
+                terminal_outcome: None,
+                attempt_identity: String::new(),
+                reviewer_contract_hash: String::new(),
+            },
+        )
+        .await
 }
 
 fn preview_finding_receipts(
@@ -5234,21 +5333,27 @@ mod tests {
     }
 
     #[test]
-    fn correctness_gate_prevents_reviewer_construction_until_proof_is_current() {
+    fn stability_gate_only_blocks_unstable_or_unavailable_evidence() {
         let current = CompletionReviewTurnEvidence {
             exact_diff: Some("diff-a".to_string()),
             mutation_revision: 3,
             validation_freshness: ValidationFreshnessStatus::PassedAfterLastMutation,
             last_successful_validation_revision: Some(3),
         };
-        assert!(correctness_review_gate_reasons(&dossier(), &current).is_empty());
+        assert!(review_stability_blocker_reasons(&dossier()).is_empty());
 
-        let mut stale = current.clone();
+        let mut stale = current;
         stale.last_successful_validation_revision = Some(2);
-        assert!(
-            correctness_review_gate_reasons(&dossier(), &stale)
-                .iter()
-                .any(|reason| reason.contains("validation proof"))
+        assert!(review_stability_blocker_reasons(&dossier()).is_empty());
+        assert_eq!(
+            review_admission_decision_for_source(
+                &SessionSource::Cli,
+                &dossier(),
+                &ReviewObligationMode::Supplemental,
+                &stale,
+            ),
+            ReviewAdmissionDecision::Admit,
+            "stale deterministic proof must admit supplemental review"
         );
 
         let mut blocked = dossier();
@@ -5262,9 +5367,9 @@ mod tests {
         blocked
             .authoritative_input_errors
             .push("typed evidence unavailable".to_string());
-        let reasons = correctness_review_gate_reasons(&blocked, &current);
+        let reasons = review_stability_blocker_reasons(&blocked);
         assert!(
-            reasons
+            !reasons
                 .iter()
                 .any(|reason| reason.contains("plan dependency"))
         );
@@ -5282,16 +5387,17 @@ mod tests {
 
         let mut non_mutating = dossier();
         non_mutating.has_task_attributed_mutations = false;
-        let no_validation = CompletionReviewTurnEvidence {
-            exact_diff: None,
-            mutation_revision: 0,
-            validation_freshness: ValidationFreshnessStatus::None,
-            last_successful_validation_revision: None,
-        };
         assert!(
-            correctness_review_gate_reasons(&non_mutating, &no_validation).is_empty(),
+            review_stability_blocker_reasons(&non_mutating).is_empty(),
             "a zero-command candidate must not invent a validation requirement"
         );
+
+        let mut unavailable = dossier();
+        unavailable.source_capture_failed = true;
+        unavailable.sources[0].availability = UserSourceAvailability::Unavailable;
+        let reasons = review_stability_blocker_reasons(&unavailable);
+        assert!(reasons.iter().any(|reason| reason.contains("captured")));
+        assert!(reasons.iter().any(|reason| reason.contains("unavailable")));
     }
 
     #[test]

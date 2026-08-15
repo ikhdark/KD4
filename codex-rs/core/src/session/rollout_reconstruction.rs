@@ -310,7 +310,26 @@ impl Session {
                             TurnReferenceContextItem::NeverSet
                         ) {
                             active_segment.reference_context_item =
-                                TurnReferenceContextItem::Latest(Box::new(ctx.clone()));
+                                if ctx.context_provenance.is_some() {
+                                    TurnReferenceContextItem::Latest(Box::new(ctx.clone()))
+                                } else {
+                                    // Legacy context state can describe host settings without proving
+                                    // the complete model-visible baseline was transmitted.
+                                    TurnReferenceContextItem::Cleared
+                                };
+                        }
+                    }
+                }
+                RolloutItem::SamplingBoundary(boundary) => {
+                    if boundary.unresolved_context {
+                        let active_segment =
+                            active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        if matches!(
+                            active_segment.reference_context_item,
+                            TurnReferenceContextItem::NeverSet
+                        ) {
+                            active_segment.reference_context_item =
+                                TurnReferenceContextItem::Cleared;
                         }
                     }
                 }
@@ -465,6 +484,7 @@ impl Session {
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::ToolManifest(_)
                 | RolloutItem::SessionMeta(_) => {}
             }
@@ -510,6 +530,7 @@ impl Session {
                 }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ToolManifest(_)
+                | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }

@@ -1,4 +1,5 @@
 use crate::function_tool::FunctionCallError;
+use crate::session::reasoning_governor::InstructionSnapshotIdentity;
 use crate::session::reasoning_governor::OwnerEvidenceReceiptV2;
 use crate::session::reasoning_governor::SourceClosureReceiptState as OwnerEvidenceClosureState;
 use crate::session::reasoning_governor::SourceOwnerReceiptState as OwnerEvidenceOwnerState;
@@ -12,7 +13,10 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::resolve_tool_environment;
+use crate::tools::handlers::source_closure::AdmittedSourceEvidenceBasis;
+use crate::tools::handlers::source_closure::AuthoritativeSourceBasis;
 use crate::tools::handlers::source_closure::GitObservationReceipt;
+use crate::tools::handlers::source_closure::ObligationIdentity;
 use crate::tools::handlers::source_closure::ReadReceipt;
 use crate::tools::handlers::source_closure::SearchReceipt;
 use crate::tools::handlers::source_closure::SharedSourceClosureState;
@@ -46,9 +50,11 @@ use codex_file_search::source_search::SOURCE_SEARCH_MAX_WALK_DIRECTORIES;
 use codex_file_search::source_search::SOURCE_SEARCH_MAX_WALK_ENTRIES;
 use codex_file_search::source_search::SourceIgnoreMatcher;
 use codex_file_search::source_search::SourceSearchAccumulator;
+use codex_file_search::source_search::SourceSearchHydrationStatus;
 use codex_file_search::source_search::SourceSearchOptions;
 use codex_file_search::source_search::SourceSearchOutput;
 use codex_file_search::source_search::read_file_span_from_bytes;
+use codex_file_search::source_search::retain_read_file_span_intervals;
 use codex_file_search::source_search::should_descend_source_path;
 use codex_file_search::source_search::should_scan_source_file;
 use codex_file_search::source_search::validate_read_file_span_bounds;
@@ -75,7 +81,9 @@ use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolOutputProjectionFragment;
 use codex_tools::ToolOutputProjectionFragmentKind;
+use codex_tools::ToolOutputProjectionJsonPointer;
 use codex_tools::ToolOutputProjectionMetadata;
+use codex_tools::ToolOutputProjectionRange;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -108,12 +116,14 @@ pub(crate) mod test_observation {
 
     #[derive(Clone, Default)]
     struct Counters {
+        read_reservation_waits: Arc<AtomicUsize>,
         successful_content_reads: Arc<AtomicUsize>,
         runtime_entries: Arc<AtomicUsize>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) struct Snapshot {
+        pub read_reservation_waits: usize,
         pub successful_content_reads: usize,
         pub runtime_entries: usize,
     }
@@ -126,6 +136,7 @@ pub(crate) mod test_observation {
         let counters = Counters::default();
         let output = COUNTERS.scope(counters.clone(), future).await;
         let snapshot = Snapshot {
+            read_reservation_waits: counters.read_reservation_waits.load(Ordering::Relaxed),
             successful_content_reads: counters.successful_content_reads.load(Ordering::Relaxed),
             runtime_entries: counters.runtime_entries.load(Ordering::Relaxed),
         };
@@ -143,6 +154,14 @@ pub(crate) mod test_observation {
     pub(super) fn record_runtime_entry() {
         let _ = COUNTERS.try_with(|counters| {
             counters.runtime_entries.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    pub(super) fn record_read_reservation_wait() {
+        let _ = COUNTERS.try_with(|counters| {
+            counters
+                .read_reservation_waits
+                .fetch_add(1, Ordering::Relaxed);
         });
     }
 }
@@ -217,6 +236,15 @@ struct ReadFileSpanArgs {
 struct ReadReplayArtifact {
     content_hash: String,
     output: ReadFileSpanOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    full_file_bytes: Option<Vec<u8>>,
+}
+
+struct ReplayedSourceFile {
+    bytes: Vec<u8>,
+    content_hash: String,
+    artifact_id: String,
+    metadata: SourceMetadataToken,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -352,6 +380,23 @@ struct OwnerEvidenceBundleV2 {
     next_action: &'static str,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct OwnerEvidenceNativeSectionV2 {
+    section_id: String,
+    category: String,
+    path: Option<String>,
+    span: Option<codex_file_search::task_locator::ExactSpan>,
+    content_hash: String,
+    source_snapshot_identity: Option<String>,
+    exact_text: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OwnerEvidenceNativeResultV2 {
+    bundle: OwnerEvidenceBundleV2,
+    materialized_sections: Vec<OwnerEvidenceNativeSectionV2>,
+}
+
 #[derive(Clone, Debug)]
 struct MaterializedBundleSection {
     section_id: String,
@@ -367,6 +412,7 @@ struct MaterializedBundleSection {
 struct OwnerEvidenceToolOutput {
     inner: FunctionToolOutput,
     projection: ToolOutputProjectionMetadata,
+    native_result: serde_json::Value,
     signal: serde_json::Value,
     materialized_section_counts: [u32; 7],
     inline_section_counts: [u32; 7],
@@ -384,6 +430,15 @@ struct SourceSearchToolOutput {
     inner: FunctionToolOutput,
     canonical: CanonicalToolResult,
     projection: ToolOutputProjectionMetadata,
+}
+
+#[derive(Clone, Debug)]
+struct ExactSourceEvidenceSpan {
+    path: String,
+    start_line: usize,
+    end_line: usize,
+    file_content_hash: String,
+    span_content_hash: String,
 }
 
 impl ToolOutput for SourceReadToolOutput {
@@ -456,7 +511,10 @@ impl ToolOutput for SourceSearchToolOutput {
     }
 
     fn code_mode_result(&self, payload: &ToolPayload) -> serde_json::Value {
-        self.inner.code_mode_result(payload)
+        self.canonical
+            .value
+            .clone()
+            .unwrap_or_else(|| self.inner.code_mode_result(payload))
     }
 }
 
@@ -474,22 +532,29 @@ fn source_read_tool_output(
     {
         timing.record_strict_subset_source_reread();
     }
-    let fragments = output
-        .chunks
-        .iter()
-        .filter_map(|chunk| {
-            output
-                .exact_content
-                .get(chunk.byte_start..chunk.byte_end)
-                .map(|text| {
-                    ToolOutputProjectionFragment::new(
-                        ToolOutputProjectionFragmentKind::CitationOrExactSpan,
-                        text,
-                    )
-                    .with_id(chunk.id.clone())
-                })
-        })
-        .collect::<Vec<_>>();
+    let mut fragments = Vec::new();
+    let mut predetermined_ranges = Vec::new();
+    let mut artifact_start_line = 1_usize;
+    for chunk in &output.chunks {
+        let Some(text) = output.exact_content.get(chunk.byte_start..chunk.byte_end) else {
+            continue;
+        };
+        let start_line = artifact_start_line;
+        let end_line = start_line.saturating_add(chunk.end_line.saturating_sub(chunk.start_line));
+        artifact_start_line = end_line.saturating_add(1);
+        fragments.push(
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::CitationOrExactSpan,
+                text,
+            )
+            .with_id(chunk.id.clone()),
+        );
+        predetermined_ranges.push(ToolOutputProjectionRange {
+            id: chunk.id.clone(),
+            start_line,
+            end_line,
+        });
+    }
     let projection = ToolOutputProjectionMetadata {
         outcome: ToolOutputOutcome::Success,
         diagnostic_class: ToolOutputDiagnosticClass::Normal,
@@ -508,7 +573,8 @@ fn source_read_tool_output(
             "complete": !output.truncated,
         }),
         requested_limit: None,
-        predetermined_ranges: Vec::new(),
+        predetermined_ranges,
+        predetermined_json_pointers: Vec::new(),
     };
     let canonical = CanonicalToolResult::text(output.exact_content)
         .with_retention_policy(CanonicalRetentionPolicy::ArtifactRequired);
@@ -559,11 +625,15 @@ impl ToolOutput for OwnerEvidenceToolOutput {
             .unwrap_or_default();
         vec![TurnTimingDeterministicContinuationReceipt {
             class: DeterministicContinuationClass::SourceBundle,
+            wire_identity: String::new(),
             resource_identity_hash: sha256_text(resource),
             state_revision: state_revision.to_string(),
             host_action: DeterministicContinuationHostAction::BatchSourceBundle,
+            action_bounds_hash: sha256_text(&format!(
+                "singleton_reads={}",
+                self.avoided_singleton_reads
+            )),
             suppressed_continuation_count: self.avoided_singleton_reads,
-            avoided_token_usage: None,
         }]
     }
 
@@ -574,6 +644,10 @@ impl ToolOutput for OwnerEvidenceToolOutput {
     ) -> codex_protocol::models::ResponseInputItem {
         self.inner.to_response_item(call_id, payload)
     }
+
+    fn code_mode_result(&self, _payload: &ToolPayload) -> serde_json::Value {
+        self.native_result.clone()
+    }
 }
 
 fn assemble_owner_evidence_bundle_v2(
@@ -581,6 +655,7 @@ fn assemble_owner_evidence_bundle_v2(
     task_contract_epoch: &str,
     owner_packet: Option<&OwnerPacketPreview>,
     source_dependency_identity: Option<String>,
+    instruction_snapshot_identity: InstructionSnapshotIdentity,
     validated_instruction_hashes: &BTreeMap<String, String>,
 ) -> OwnerEvidenceToolOutput {
     let mut source_closure = output.decision_facts.clone();
@@ -769,6 +844,7 @@ fn assemble_owner_evidence_bundle_v2(
         task_contract_epoch,
         authoritative_owner_id.as_deref(),
         &source_closure.source_snapshot_identity,
+        &instruction_snapshot_identity,
         &source_closure.closure_contract_revision,
     );
     let receipt = OwnerEvidenceReceiptV2 {
@@ -776,6 +852,7 @@ fn assemble_owner_evidence_bundle_v2(
         task_contract_epoch: task_contract_epoch.to_string(),
         owner_id: authoritative_owner_id,
         source_snapshot_identity: source_closure.source_snapshot_identity.clone(),
+        instruction_snapshot_identity,
         closure_contract_revision: source_closure.closure_contract_revision.clone(),
         owner_state,
         closure_state,
@@ -852,6 +929,32 @@ fn assemble_owner_evidence_bundle_v2(
     section_manifest.sort_by(|left, right| left.section_id.cmp(&right.section_id));
     bundle.section_manifest = section_manifest;
 
+    let native_result = serde_json::to_value(OwnerEvidenceNativeResultV2 {
+        bundle: bundle.clone(),
+        materialized_sections: materialized_sections
+            .iter()
+            .map(|section| OwnerEvidenceNativeSectionV2 {
+                section_id: section.section_id.clone(),
+                category: section.category.clone(),
+                path: section.path.clone(),
+                span: section.span.clone(),
+                content_hash: section.content_hash.clone(),
+                source_snapshot_identity: section.source_snapshot_identity.clone(),
+                exact_text: section.text.clone(),
+            })
+            .collect(),
+    })
+    .unwrap_or_else(|error| {
+        json!({
+            "bundle": {
+                "schema_version": OWNER_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                "receipt_id": receipt_id.clone(),
+                "serialization_error": error.to_string(),
+            },
+            "materialized_sections": [],
+        })
+    });
+
     let metadata_line = serde_json::to_string(&bundle).unwrap_or_else(|error| {
         json!({
             "schema_version": OWNER_EVIDENCE_BUNDLE_SCHEMA_VERSION,
@@ -862,26 +965,19 @@ fn assemble_owner_evidence_bundle_v2(
     });
     let mut artifact_lines = vec!["OWNER_EVIDENCE_BUNDLE_V2".to_string(), metadata_line];
     let mut fragments = Vec::new();
-    for section in &materialized_sections {
-        artifact_lines.push(
-            json!({
-                "section_id": section.section_id,
-                "category": section.category,
-                "path": section.path,
-                "span": section.span,
-                "content_hash": section.content_hash,
-                "source_snapshot_identity": section.source_snapshot_identity,
-                "exact_text": section.text,
-            })
-            .to_string(),
-        );
+    let mut predetermined_ranges = Vec::new();
+    for (index, section) in materialized_sections.iter().enumerate() {
+        let record = canonical_bundle_section_record(section);
+        artifact_lines.push(record.clone());
         fragments.push(
-            ToolOutputProjectionFragment::new(
-                section.projection_kind,
-                render_bundle_projection_fragment(section),
-            )
-            .with_id(section.section_id.clone()),
+            ToolOutputProjectionFragment::new(section.projection_kind, record)
+                .with_id(section.section_id.clone()),
         );
+        predetermined_ranges.push(ToolOutputProjectionRange {
+            id: section.section_id.clone(),
+            start_line: index + 3,
+            end_line: index + 3,
+        });
     }
     let rendered = artifact_lines.join("\n");
     let essential_inline = serde_json::to_value(&bundle).unwrap_or_else(|_| {
@@ -909,7 +1005,23 @@ fn assemble_owner_evidence_bundle_v2(
         "owner_id": bundle.receipt.owner_id,
         "primary_path": bundle.source_closure.primary_path,
         "materialized_paths": materialized_sections.iter().filter_map(|section| section.path.as_deref()).collect::<Vec<_>>(),
+        "required_source_sections": bundle.source_closure.captured_source_sections.iter()
+            .filter(|section| section.state == LocateTaskSourceSectionState::NotMaterialized)
+            .map(|section| json!({
+                "path": section.path,
+                "obligation_kind": match section.kind {
+                    LocateTaskSourceSectionKind::PrimaryImplementation => "primary",
+                    LocateTaskSourceSectionKind::Caller => "caller",
+                    LocateTaskSourceSectionKind::Test => "test",
+                    LocateTaskSourceSectionKind::Contract => "contract",
+                    LocateTaskSourceSectionKind::Generated => "generated",
+                    LocateTaskSourceSectionKind::OtherSourceContext => "other_source_context",
+                },
+                "span": section.span,
+            }))
+            .collect::<Vec<_>>(),
         "unresolved_ids": bundle.unresolved_questions.iter().map(|question| question.id.as_str()).collect::<Vec<_>>(),
+        "unresolved_questions": &bundle.unresolved_questions,
         "validation_route": bundle.validation_routes.first().map(|route| route.id.as_str()),
         "relationship": {
             "kind": "known_advances",
@@ -928,7 +1040,6 @@ fn assemble_owner_evidence_bundle_v2(
         } else {
             Vec::new()
         },
-        "introduces_uncertainty": closure_state == OwnerEvidenceClosureState::BundleIncomplete,
     });
     OwnerEvidenceToolOutput {
         inner: FunctionToolOutput::from_text(rendered.clone(), Some(true)),
@@ -939,8 +1050,10 @@ fn assemble_owner_evidence_bundle_v2(
             spillable_text: vec![rendered],
             essential_inline,
             requested_limit: Some(OWNER_EVIDENCE_INLINE_TOKEN_TARGET),
-            predetermined_ranges: Vec::new(),
+            predetermined_ranges,
+            predetermined_json_pointers: Vec::new(),
         },
+        native_result,
         signal,
         materialized_section_counts,
         inline_section_counts,
@@ -1203,32 +1316,32 @@ fn stable_bundle_receipt_id(
     task_contract_epoch: &str,
     owner_id: Option<&str>,
     snapshot_id: &str,
+    instruction_snapshot_identity: &InstructionSnapshotIdentity,
     closure_contract_revision: &str,
 ) -> String {
+    let instruction_snapshot_identity = serde_json::to_string(instruction_snapshot_identity)
+        .unwrap_or_else(|error| format!("serialization-error:{error}"));
     sha256_fields(&[
         task_contract_epoch,
         owner_id.unwrap_or("owner_unresolved"),
         snapshot_id,
+        &instruction_snapshot_identity,
         closure_contract_revision,
         &OWNER_EVIDENCE_BUNDLE_SCHEMA_VERSION.to_string(),
     ])
 }
 
-fn render_bundle_projection_fragment(section: &MaterializedBundleSection) -> String {
-    let citation = section
-        .path
-        .as_deref()
-        .map(|path| {
-            section.span.as_ref().map_or_else(
-                || path.to_string(),
-                |span| format!("{path}:{}-{}", span.start_line, span.end_line),
-            )
-        })
-        .unwrap_or_else(|| section.category.clone());
-    format!(
-        "section_id: {}\ncitation: {}\ncontent_hash: {}\n{}",
-        section.section_id, citation, section.content_hash, section.text
-    )
+fn canonical_bundle_section_record(section: &MaterializedBundleSection) -> String {
+    json!({
+        "section_id": section.section_id,
+        "category": section.category,
+        "path": section.path,
+        "span": section.span,
+        "content_hash": section.content_hash,
+        "source_snapshot_identity": section.source_snapshot_identity,
+        "exact_text": section.text,
+    })
+    .to_string()
 }
 
 fn sha256_text(text: &str) -> String {
@@ -1461,9 +1574,9 @@ async fn handle_locate_task(
             .validate()
             .map_err(FunctionCallError::RespondToModel)?;
     }
-    if args.source_question.is_none() {
+    if args.source_question.is_none() && !args.force_fresh {
         let closure = invocation.step_context.turn.source_closure.lock().await;
-        if closure.locator_attempted {
+        if closure.locator_evidence_is_current() {
             return Ok(boxed_tool_output(render_closure_preflight(
                 LOCATE_TASK_TOOL_NAME,
                 &closure,
@@ -1558,6 +1671,13 @@ async fn handle_locate_task(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let instruction_snapshot_identity = invocation
+        .step_context
+        .loaded_agents_md
+        .as_deref()
+        .map_or(InstructionSnapshotIdentity::Empty, |instructions| {
+            InstructionSnapshotIdentity::loaded(instructions.semantic_digest())
+        });
 
     let locator_artifact_id = if let Ok(serialized) = serde_json::to_vec(&json!({
         "request_identity": &output.request_identity,
@@ -1654,6 +1774,22 @@ async fn handle_locate_task(
         || format!("turn_epoch:{}", invocation.turn.sub_id),
         |packet| format!("contract_epoch:{}", packet.contract_epoch),
     );
+    invocation
+        .step_context
+        .turn
+        .source_closure
+        .lock()
+        .await
+        .bind_authoritative_source_basis(
+            output.request_identity.clone(),
+            task_contract_epoch.clone(),
+        );
+    record_exact_source_evidence(
+        &invocation,
+        &source_context,
+        locator_exact_evidence(&output),
+    )
+    .await;
 
     let bundle_started = Instant::now();
     let bundle = assemble_owner_evidence_bundle_v2(
@@ -1661,6 +1797,7 @@ async fn handle_locate_task(
         &task_contract_epoch,
         owner_packet.as_ref(),
         source_dependency_identity,
+        instruction_snapshot_identity,
         &validated_instruction_hashes,
     );
     invocation
@@ -1857,12 +1994,10 @@ async fn handle_search_source(
             closure.reopen_for_source_change(format!("search scope `{search_key}`"));
         }
     }
-    // Exact turn coverage below stable-reads and hashes before reuse. The
-    // older artifact replay path remains a compatibility reader, but no
-    // longer decides whether source can be omitted from this context.
-    let legacy_replay_enabled = false;
-    if legacy_replay_enabled
-        && !args.force_fresh
+    // The complete scope revision includes topology, metadata, ignore inputs,
+    // and content hashes. A matching receipt is therefore an exact replay key,
+    // not merely a diagnostic that the same search happened before.
+    if !args.force_fresh
         && let Some(scope_revision) = scope_revision.as_deref()
     {
         let receipt = invocation
@@ -1878,6 +2013,12 @@ async fn handle_search_source(
                 read_source_replay_artifact(&invocation, &receipt.artifact_id).await
                 && let Ok(output) = serde_json::from_slice::<SourceSearchOutput>(&bytes)
             {
+                record_exact_source_evidence(
+                    &invocation,
+                    &source_context,
+                    search_exact_evidence(&output),
+                )
+                .await;
                 {
                     let mut closure = invocation.step_context.turn.source_closure.lock().await;
                     apply_search_observations(&mut closure, &output, args.source_question.as_ref());
@@ -1893,6 +2034,7 @@ async fn handle_search_source(
                     &output,
                     omitted_global_ignore,
                     true,
+                    args.source_question.as_ref(),
                     &invocation.step_context.turn.turn_timing_state,
                 )));
             }
@@ -1945,6 +2087,12 @@ async fn handle_search_source(
                                 && let Ok(output) =
                                     serde_json::from_slice::<SourceSearchOutput>(&bytes)
                             {
+                                record_exact_source_evidence(
+                                    &invocation,
+                                    &source_context,
+                                    search_exact_evidence(&output),
+                                )
+                                .await;
                                 {
                                     let mut closure =
                                         invocation.step_context.turn.source_closure.lock().await;
@@ -1965,6 +2113,7 @@ async fn handle_search_source(
                                     &output,
                                     omitted_global_ignore,
                                     true,
+                                    args.source_question.as_ref(),
                                     &invocation.step_context.turn.turn_timing_state,
                                 )));
                             }
@@ -2018,6 +2167,8 @@ async fn handle_search_source(
             })
             .collect::<Result<Vec<_>, _>>()?;
         record_supporting_source_reads(&invocation, &source_context, supporting_entries).await?;
+        record_exact_source_evidence(&invocation, &source_context, search_exact_evidence(&output))
+            .await;
         if let Some(scope_revision) = scope_revision.as_ref()
             && let Ok(serialized) = serde_json::to_vec(&output)
             && let Some(artifact_id) = store_source_replay_artifact(&invocation, &serialized).await
@@ -2050,6 +2201,7 @@ async fn handle_search_source(
         &output,
         omitted_global_ignore,
         false,
+        args.source_question.as_ref(),
         &invocation.step_context.turn.turn_timing_state,
     )))
 }
@@ -2094,7 +2246,7 @@ async fn handle_read_file_span(
         }
         let output = read_file_span_from_bytes(skill_path, bytes, start_line, line_count)
             .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
-        let signal = read_file_span_signal(&output);
+        let signal = read_file_span_signal(&invocation, &output, None).await;
         let rendered = render_read_output(&output);
         return Ok(boxed_tool_output(source_read_tool_output(
             output,
@@ -2140,93 +2292,119 @@ async fn handle_read_file_span(
             closure.reopen_for_source_change(&relative_path);
         }
     }
+    let admitted_source_basis = invocation
+        .step_context
+        .turn
+        .source_closure
+        .lock()
+        .await
+        .admitted_source_evidence_basis(&relative_path);
     if !args.force_fresh
         && let Some(metadata_token) = metadata_token.as_ref()
-        && let Some(output) = replay_covered_read(
-            &invocation,
-            &source_context,
-            &path,
-            &relative_path,
-            start_line,
-            line_count,
-            metadata_token,
-        )
-        .await
+        && let Ok(coverage_path) = path.to_abs_path()
     {
-        invocation
-            .step_context
-            .turn
-            .source_closure
-            .lock()
-            .await
-            .mark_observed(&relative_path);
-        invocation
-            .step_context
-            .turn
-            .turn_timing_state
-            .record_source_discovery(SourceDiscoveryTimingEvent::DirectReadReused);
-        let signal = read_file_span_signal(&output);
-        let rendered = render_read_output(&output);
-        return Ok(boxed_tool_output(source_read_tool_output(
-            output,
-            rendered,
-            signal,
-            None,
-            &invocation.step_context.turn.turn_timing_state,
-        )));
+        let requested = SourceLineInterval {
+            start_line,
+            end_line: start_line.saturating_add(line_count.saturating_sub(1)),
+        };
+        let covered = {
+            let tracker = invocation.tracker.lock().await;
+            let repo_root = source_context.repo_root_abs.as_path().to_string_lossy();
+            let key = SourceCoverageKey::new(
+                &source_context.environment_id,
+                repo_root.as_ref(),
+                coverage_path.as_ref(),
+            );
+            tracker.current_source_coverage(
+                &key,
+                metadata.size,
+                metadata.created_at_ms,
+                metadata.modified_at_ms,
+                metadata_token.watcher_generation,
+                metadata_token.host_mutation_generation,
+                &metadata_token.stable_file_identity,
+                &metadata_token.freshness_identity,
+                requested,
+            )
+        };
+        if let Some((revision, decision)) = covered
+            && decision.missing.is_empty()
+        {
+            invocation
+                .step_context
+                .turn
+                .source_closure
+                .lock()
+                .await
+                .mark_observed(&relative_path);
+            invocation
+                .step_context
+                .turn
+                .turn_timing_state
+                .record_source_discovery(SourceDiscoveryTimingEvent::DirectReadReused);
+            let accepted_basis = validated_read_basis(
+                &invocation,
+                &relative_path,
+                &revision.content_hash,
+                admitted_source_basis.as_ref(),
+            )
+            .await;
+            let (authoritative_source_basis, obligation_identity) =
+                split_read_basis(accepted_basis);
+            let rendered = format!(
+                "Source file evidence already present in current context.\npath: {relative_path}\nreused_intervals: {}",
+                render_source_intervals(&decision.reused),
+            );
+            let signal = json!({
+                "kind": "source_evidence",
+                "operation": "read_file_span",
+                "path": relative_path,
+                "start_line": start_line,
+                "end_line": requested.end_line,
+                "truncated": false,
+                "full_file_sha256": revision.content_hash.clone(),
+                "authoritative_source_basis": authoritative_source_basis,
+                "obligation_identity": obligation_identity,
+                "source_disposition": "covered_exact_evidence",
+            });
+            let mut output = FunctionToolOutput::from_text(rendered, Some(true))
+                .with_sampling_request_signal(signal);
+            if let Some(receipt) = source_coverage_receipt(
+                &source_context,
+                &relative_path,
+                &revision,
+                &decision,
+                start_line,
+                line_count,
+            ) {
+                output = output.with_deterministic_continuation_receipt(receipt);
+            }
+            return Ok(boxed_tool_output(output));
+        }
     }
-
-    // Exact turn coverage above is the authoritative reuse path. Keep the
-    // older artifact replay reader disabled for ordinary reads.
-    let legacy_replay_enabled = false;
-    let (fragmented_replay, overlap_reused_lines) = if legacy_replay_enabled && !args.force_fresh {
+    let mut cached_source = if !args.force_fresh {
         if let Some(metadata_token) = metadata_token.as_ref() {
-            replay_fragmented_read(
+            replay_cached_source_file(
                 &invocation,
                 &source_context,
                 &path,
                 &relative_path,
-                start_line,
-                line_count,
                 metadata_token,
             )
             .await
         } else {
-            (None, BTreeSet::new())
+            None
         }
     } else {
-        (None, BTreeSet::new())
+        None
     };
-    if let Some(output) = fragmented_replay {
-        invocation
-            .step_context
-            .turn
-            .source_closure
-            .lock()
-            .await
-            .mark_observed(&relative_path);
-        invocation
-            .step_context
-            .turn
-            .turn_timing_state
-            .record_source_discovery(SourceDiscoveryTimingEvent::DirectReadReused);
-        let signal = read_file_span_signal(&output);
-        let rendered = render_read_output(&output);
-        return Ok(boxed_tool_output(source_read_tool_output(
-            output,
-            rendered,
-            signal,
-            None,
-            &invocation.step_context.turn.turn_timing_state,
-        )));
-    }
 
     let reservation_key = crate::tools::handlers::source_closure::read_reservation_key(
         &relative_path,
         start_line,
         start_line.saturating_add(line_count.saturating_sub(1)),
     );
-    let reservation_guard = if args.force_fresh {
+    let reservation_guard = if args.force_fresh || cached_source.is_some() {
         None
     } else {
         loop {
@@ -2246,6 +2424,8 @@ async fn handle_read_file_span(
                     ));
                 }
                 Err(mut waiter) => {
+                    #[cfg(test)]
+                    test_observation::record_read_reservation_wait();
                     tokio::select! {
                         _ = waiter.changed() => {}
                         _ = invocation.cancellation_token.cancelled() => {
@@ -2266,33 +2446,18 @@ async fn handle_read_file_span(
                         &current_metadata,
                     )
                     .await;
-                    if legacy_replay_enabled
-                        && let Some(current_token) = current_token.as_ref()
-                        && let Some(output) = replay_covered_read(
+                    if let Some(current_token) = current_token.as_ref()
+                        && let Some(replayed) = replay_cached_source_file(
                             &invocation,
                             &source_context,
                             &path,
                             &relative_path,
-                            start_line,
-                            line_count,
                             current_token,
                         )
                         .await
                     {
-                        invocation
-                            .step_context
-                            .turn
-                            .turn_timing_state
-                            .record_source_discovery(SourceDiscoveryTimingEvent::DirectReadReused);
-                        let signal = read_file_span_signal(&output);
-                        let rendered = render_read_output(&output);
-                        return Ok(boxed_tool_output(source_read_tool_output(
-                            output,
-                            rendered,
-                            signal,
-                            None,
-                            &invocation.step_context.turn.turn_timing_state,
-                        )));
+                        cached_source = Some(replayed);
+                        break None;
                     }
                 }
             }
@@ -2300,19 +2465,64 @@ async fn handle_read_file_span(
     };
 
     let fresh_result = async {
-        let Some(bytes) = read_source_file_stably(&source_context, &path, &metadata).await? else {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "source file `{}` changed while it was being read; retry the read",
-                args.path
-            )));
+        let (bytes, content_hash, replay_artifact_id, replay_metadata) =
+            if let Some(replayed) = cached_source {
+                (
+                    replayed.bytes,
+                    replayed.content_hash,
+                    Some(replayed.artifact_id),
+                    Some(replayed.metadata),
+                )
+            } else {
+                let Some(bytes) = read_source_file_stably(&source_context, &path, &metadata).await?
+                else {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "source file `{}` changed while it was being read; retry the read",
+                        args.path
+                    )));
+                };
+                let content_hash = format!("{:x}", Sha256::digest(&bytes));
+                (bytes, content_hash, None, None)
+            };
+        let reused_cached_file = replay_metadata.is_some();
+        if reused_cached_file {
+            invocation
+                .step_context
+                .turn
+                .turn_timing_state
+                .record_source_discovery(SourceDiscoveryTimingEvent::DirectReadReused);
         };
-        let content_hash = format!("{:x}", Sha256::digest(&bytes));
         let supporting_entry = manifest_entry_from_bytes(relative_path.clone(), &bytes);
         let mut output =
             read_file_span_from_bytes(relative_path.clone(), bytes.clone(), start_line, line_count)
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
-        record_supporting_source_reads(&invocation, &source_context, vec![supporting_entry])
-            .await?;
+        let metadata_after = source_context
+            .fs
+            .get_metadata(&path, Some(&source_context.sandbox))
+            .await
+            .map_err(|err| source_fs_error("re-inspect", &path, err))?;
+        if source_metadata_changed(&metadata, &metadata_after) {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "source file `{}` changed before its read could be committed; retry the read",
+                args.path
+            )));
+        }
+        let committed_metadata_token =
+            source_metadata_token(&invocation, &source_context, &path, &metadata_after).await;
+        if replay_metadata.as_ref().is_some_and(|replayed| {
+            committed_metadata_token
+                .as_ref()
+                .is_none_or(|current| !replayed.permits_reuse(current))
+        }) {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "source file `{}` changed before its cached read could be committed; retry the read",
+                args.path
+            )));
+        }
+        if !reused_cached_file {
+            record_supporting_source_reads(&invocation, &source_context, vec![supporting_entry])
+                .await?;
+        }
         if let (Some(observed_start), Some(observed_end), Some(span_sha256)) = (
             output.start_line,
             output.end_line,
@@ -2331,19 +2541,21 @@ async fn handle_read_file_span(
                 )
                 .await;
         }
-        let metadata_after = source_context
-            .fs
-            .get_metadata(&path, Some(&source_context.sandbox))
-            .await
-            .map_err(|err| source_fs_error("re-inspect", &path, err))?;
         let coverage_path = path.to_abs_path().map_err(|err| {
             FunctionCallError::RespondToModel(format!(
                 "source file `{}` cannot be represented as a local coverage path: {err}",
                 args.path
             ))
         })?;
-        let coverage_decision = if let (Some(observed_start), Some(observed_end)) =
-            (output.start_line, output.end_line)
+        let coverage_decision = if let (
+            Some(observed_start),
+            Some(observed_end),
+            Some(metadata_token),
+        ) = (
+            output.start_line,
+            output.end_line,
+            committed_metadata_token.as_ref(),
+        )
         {
             let mut tracker = invocation.tracker.lock().await;
             let revision = SourceCoverageRevision {
@@ -2351,8 +2563,12 @@ async fn handle_read_file_span(
                 size: metadata_after.size,
                 created_at_ms: metadata_after.created_at_ms,
                 modified_at_ms: metadata_after.modified_at_ms,
-                mutation_revision: tracker.current_mutation_revision(),
+                mutation_revision: metadata_token.mutation_revision,
                 compaction_epoch: tracker.current_compaction_epoch(),
+                watcher_generation: metadata_token.watcher_generation,
+                host_mutation_generation: metadata_token.host_mutation_generation,
+                stable_file_identity: metadata_token.stable_file_identity.clone(),
+                freshness_identity: metadata_token.freshness_identity.clone(),
             };
             let repo_root = source_context.repo_root_abs.as_path().to_string_lossy();
             let key = SourceCoverageKey::new(
@@ -2375,14 +2591,19 @@ async fn handle_read_file_span(
         } else {
             None
         };
-        let metadata_token =
-            source_metadata_token(&invocation, &source_context, &path, &metadata_after).await;
-        if let Some(metadata_token) = metadata_token
-            && let Ok(serialized) = serde_json::to_vec(&ReadReplayArtifact {
-                content_hash: content_hash.clone(),
-                output: output.clone(),
-            })
-            && let Some(artifact_id) = store_source_replay_artifact(&invocation, &serialized).await
+        let replay_artifact_id = if let Some(artifact_id) = replay_artifact_id {
+            Some(artifact_id)
+        } else if let Ok(serialized) = serde_json::to_vec(&ReadReplayArtifact {
+            content_hash: content_hash.clone(),
+            output: output.clone(),
+            full_file_bytes: Some(bytes.clone()),
+        }) {
+            store_source_replay_artifact(&invocation, &serialized).await
+        } else {
+            None
+        };
+        if let (Some(metadata_token), Some(artifact_id)) =
+            (committed_metadata_token, replay_artifact_id)
         {
             invocation
                 .step_context
@@ -2418,10 +2639,14 @@ async fn handle_read_file_span(
                         "modified_at_ms": revision.modified_at_ms,
                         "mutation_revision": revision.mutation_revision,
                         "compaction_epoch": revision.compaction_epoch,
+                        "watcher_generation": revision.watcher_generation,
+                        "host_mutation_generation": revision.host_mutation_generation,
+                        "stable_file_identity": revision.stable_file_identity,
                     })
                     .to_string();
                     TurnTimingDeterministicContinuationReceipt {
                         class: DeterministicContinuationClass::SourceCoverage,
+                        wire_identity: String::new(),
                         resource_identity_hash: sha256_text(&format!(
                             "{}\0{}\0{}",
                             source_context.environment_id,
@@ -2434,32 +2659,37 @@ async fn handle_read_file_span(
                         } else {
                             DeterministicContinuationHostAction::ReadMissingRanges
                         },
+                        action_bounds_hash: sha256_text(
+                            &json!({
+                                "requested": {
+                                    "start_line": start_line,
+                                    "line_count": line_count,
+                                },
+                                "reused": reused.iter().map(|interval| json!({
+                                    "start_line": interval.start_line,
+                                    "end_line": interval.end_line,
+                                })).collect::<Vec<_>>(),
+                                "missing": decision.missing.iter().map(|interval| json!({
+                                    "start_line": interval.start_line,
+                                    "end_line": interval.end_line,
+                                })).collect::<Vec<_>>(),
+                            })
+                            .to_string(),
+                        ),
                         suppressed_continuation_count: 1,
-                        avoided_token_usage: None,
                     }
                 });
-                if decision.missing.is_empty() {
-                    output.lines.clear();
-                } else {
-                    output.lines.retain(|line| {
-                        decision.missing.iter().any(|interval| {
-                            line.line_number >= interval.start_line
-                                && line.line_number <= interval.end_line
-                        })
-                    });
-                }
-                output.start_line = output.lines.first().map(|line| line.line_number);
-                output.end_line = output.lines.last().map(|line| line.line_number);
-                output.bytes_returned = output
-                    .lines
+                let missing = decision
+                    .missing
                     .iter()
-                    .map(|line| line.text.len().saturating_add(1))
-                    .sum();
+                    .map(|interval| (interval.start_line, interval.end_line))
+                    .collect::<Vec<_>>();
+                retain_read_file_span_intervals(&mut output, &missing);
                 (receipt, reused)
             },
         );
         let new_lines = output.lines.iter().collect::<Vec<_>>();
-        if !reused_intervals.is_empty() || !overlap_reused_lines.is_empty() {
+        if !reused_intervals.is_empty() {
             invocation
                 .step_context
                 .turn
@@ -2494,7 +2724,12 @@ async fn handle_read_file_span(
                 render_source_intervals(&reused_intervals),
             ));
         }
-        let signal = read_file_span_signal(&output);
+        let signal = read_file_span_signal(
+            &invocation,
+            &output,
+            admitted_source_basis.as_ref(),
+        )
+        .await;
         Ok::<_, FunctionCallError>((output, rendered, signal, coverage_receipt))
     }
     .await;
@@ -2519,17 +2754,169 @@ fn render_source_intervals(intervals: &[SourceLineInterval]) -> String {
         .join(",")
 }
 
-fn read_file_span_signal(output: &ReadFileSpanOutput) -> serde_json::Value {
+fn source_coverage_receipt(
+    source_context: &LocalSourceContext,
+    relative_path: &str,
+    revision: &SourceCoverageRevision,
+    decision: &crate::turn_diff_tracker::SourceCoverageDecision,
+    requested_start_line: usize,
+    requested_line_count: usize,
+) -> Option<TurnTimingDeterministicContinuationReceipt> {
+    (!decision.reused.is_empty()).then(|| {
+        let revision_text = json!({
+            "content_hash": revision.content_hash,
+            "size": revision.size,
+            "created_at_ms": revision.created_at_ms,
+            "modified_at_ms": revision.modified_at_ms,
+            "mutation_revision": revision.mutation_revision,
+            "compaction_epoch": revision.compaction_epoch,
+            "watcher_generation": revision.watcher_generation,
+            "host_mutation_generation": revision.host_mutation_generation,
+            "stable_file_identity": revision.stable_file_identity,
+        })
+        .to_string();
+        TurnTimingDeterministicContinuationReceipt {
+            class: DeterministicContinuationClass::SourceCoverage,
+            wire_identity: String::new(),
+            resource_identity_hash: sha256_text(&format!(
+                "{}\0{}\0{}",
+                source_context.environment_id,
+                source_context.repo_root_abs.as_path().display(),
+                relative_path,
+            )),
+            state_revision: sha256_text(&revision_text),
+            host_action: if decision.missing.is_empty() {
+                DeterministicContinuationHostAction::ReuseCoveredSpan
+            } else {
+                DeterministicContinuationHostAction::ReadMissingRanges
+            },
+            action_bounds_hash: sha256_text(
+                &json!({
+                    "requested": {
+                        "start_line": requested_start_line,
+                        "line_count": requested_line_count,
+                    },
+                    "reused": decision.reused.iter().map(|interval| json!({
+                        "start_line": interval.start_line,
+                        "end_line": interval.end_line,
+                    })).collect::<Vec<_>>(),
+                    "missing": decision.missing.iter().map(|interval| json!({
+                        "start_line": interval.start_line,
+                        "end_line": interval.end_line,
+                    })).collect::<Vec<_>>(),
+                })
+                .to_string(),
+            ),
+            suppressed_continuation_count: 1,
+        }
+    })
+}
+
+async fn read_file_span_signal(
+    invocation: &ToolInvocation,
+    output: &ReadFileSpanOutput,
+    admitted_basis: Option<&AdmittedSourceEvidenceBasis>,
+) -> serde_json::Value {
+    let accepted_basis = validated_read_basis(
+        invocation,
+        &output.path,
+        &output.full_file_sha256,
+        admitted_basis,
+    )
+    .await;
+    let (authoritative_source_basis, obligation_identity) = split_read_basis(accepted_basis);
     json!({
         "kind": "source_evidence",
         "operation": "read_file_span",
         "path": output.path,
-        "source_map_route": output.source_map_route,
         "start_line": output.start_line,
         "end_line": output.end_line,
         "total_lines": output.total_lines,
         "truncated": output.truncated,
+        "full_file_sha256": output.full_file_sha256,
+        "authoritative_source_basis": authoritative_source_basis,
+        "obligation_identity": obligation_identity,
     })
+}
+
+fn split_read_basis(
+    accepted_basis: Option<AdmittedSourceEvidenceBasis>,
+) -> (Option<AuthoritativeSourceBasis>, Option<ObligationIdentity>) {
+    accepted_basis.map_or((None, None), |basis| {
+        (Some(basis.source_basis), Some(basis.obligation_identity))
+    })
+}
+
+async fn validated_read_basis(
+    invocation: &ToolInvocation,
+    path: &str,
+    full_file_sha256: &str,
+    admitted_basis: Option<&AdmittedSourceEvidenceBasis>,
+) -> Option<AdmittedSourceEvidenceBasis> {
+    if let Some(admitted_basis) = admitted_basis {
+        let mut closure = invocation.step_context.turn.source_closure.lock().await;
+        let current_basis = closure.admitted_source_evidence_basis(path);
+        if current_basis.as_ref() != Some(admitted_basis) {
+            return None;
+        }
+        if full_file_sha256.is_empty()
+            || full_file_sha256 != admitted_basis.source_basis.file_content_hash
+        {
+            closure.reopen_for_source_change(path);
+            return None;
+        }
+        current_basis
+    } else {
+        None
+    }
+}
+
+fn locator_exact_evidence(output: &LocateTaskOutput) -> Vec<ExactSourceEvidenceSpan> {
+    output
+        .decision_facts
+        .captured_source_sections
+        .iter()
+        .filter(|section| section.state == LocateTaskSourceSectionState::Materialized)
+        .filter_map(|section| {
+            let span = section.span.as_ref()?;
+            Some(ExactSourceEvidenceSpan {
+                path: section.path.clone(),
+                start_line: span.start_line,
+                end_line: span.end_line,
+                file_content_hash: section.file_content_hash.clone()?,
+                span_content_hash: section.content_hash.clone()?,
+            })
+        })
+        .collect()
+}
+
+fn search_exact_evidence(output: &SourceSearchOutput) -> Vec<ExactSourceEvidenceSpan> {
+    if let Some(packet) = output.hydration_packet.as_ref() {
+        return packet
+            .spans
+            .iter()
+            .map(|span| ExactSourceEvidenceSpan {
+                path: span.path.clone(),
+                start_line: span.start_line,
+                end_line: span.end_line,
+                file_content_hash: span.file_content_hash.clone(),
+                span_content_hash: span.span_content_hash.clone(),
+            })
+            .collect();
+    }
+    output
+        .hydrated_span
+        .iter()
+        .filter_map(|hydrated| {
+            Some(ExactSourceEvidenceSpan {
+                path: hydrated.observation.path.clone(),
+                start_line: hydrated.observation.start_line?,
+                end_line: hydrated.observation.end_line?,
+                file_content_hash: hydrated.content_hash.clone(),
+                span_content_hash: hydrated.observation.requested_content_sha256.clone(),
+            })
+        })
+        .collect()
 }
 
 fn apply_search_observations(
@@ -2552,6 +2939,38 @@ fn apply_search_observations(
             closure.mark_observed(&matched.path);
         }
     }
+    if let Some(question) = question
+        && search_resolves_focused_question(output)
+    {
+        closure.resolve_question(question);
+    }
+}
+
+fn search_resolves_focused_question(output: &SourceSearchOutput) -> bool {
+    if output.truncated || !output.coverage_complete || !output.coverage.index_complete {
+        return false;
+    }
+    if output.matches.is_empty() {
+        return output.hydration_status == SourceSearchHydrationStatus::SkippedNoUniqueMatch;
+    }
+    if let Some(packet) = output.hydration_packet.as_ref() {
+        let hydrated_match_ids = packet
+            .spans
+            .iter()
+            .filter(|span| !span.truncated)
+            .flat_map(|span| span.match_ids.iter().map(String::as_str))
+            .collect::<BTreeSet<_>>();
+        return packet.issues.is_empty()
+            && output
+                .matches
+                .iter()
+                .all(|matched| hydrated_match_ids.contains(matched.id.as_str()));
+    }
+    output.matches.len() == 1
+        && output
+            .hydrated_span
+            .as_ref()
+            .is_some_and(|hydrated| !hydrated.observation.truncated)
 }
 
 fn render_closure_preflight(
@@ -2591,6 +3010,7 @@ fn render_closure_preflight(
         "outcome": disposition,
         "source_disposition": disposition,
         "evidence_revision": state.source_revision,
+        "progress_only": true,
         "snapshot_id": state.source_snapshot_identity.as_deref(),
         "receipt_id": format!("source-closure-preflight:{}", state.source_revision),
         "owner_state": if owner_resolved { "owner_resolved" } else { "owner_unresolved" },
@@ -2606,21 +3026,57 @@ fn render_closure_preflight(
 fn search_function_output(
     output: &SourceSearchOutput,
     omitted_global_ignore: bool,
-    replayed: bool,
+    _replayed: bool,
+    source_question: Option<&SourceQuestion>,
     timing: &crate::turn_timing::TurnTimingState,
 ) -> SourceSearchToolOutput {
     timing.record_search_index(output.coverage.index_complete);
+    let hydration_packet = output.hydration_packet.as_ref();
+    let hydrated_paths = hydration_packet
+        .into_iter()
+        .flat_map(|packet| packet.spans.iter())
+        .filter(|span| !span.truncated)
+        .map(|span| span.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut hydrated_match_ids = hydration_packet
+        .into_iter()
+        .flat_map(|packet| packet.spans.iter())
+        .filter(|span| !span.truncated)
+        .flat_map(|span| span.match_ids.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    if output
+        .hydrated_span
+        .as_ref()
+        .is_some_and(|hydrated| !hydrated.observation.truncated)
+        && let Some(matched) = output.matches.first()
+    {
+        hydrated_match_ids.insert(matched.id.as_str());
+    }
+    let hydration_truncated = output
+        .hydrated_span
+        .as_ref()
+        .is_some_and(|hydrated| hydrated.observation.truncated)
+        || hydration_packet.is_some_and(|packet| packet.spans.iter().any(|span| span.truncated));
     let signal = json!({
         "kind": "source_evidence",
         "operation": "search_source",
-        "query": output.query.clone(),
-        "roots": output.roots.clone(),
-        "paths": output.matches.iter().map(|matched| matched.path.as_str()).collect::<Vec<_>>(),
+        "match_count": output.matches.len(),
+        "match_paths": output.matches.iter().map(|matched| matched.path.as_str()).collect::<Vec<_>>(),
         "truncated": output.truncated,
         "coverage_complete": output.coverage_complete,
+        "index_complete": output.coverage.index_complete,
         "hydration_status": output.hydration_status,
-        "hydrated_path": output.hydrated_span.as_ref().map(|hydrated| hydrated.observation.path.as_str()),
-        "source_disposition": if replayed { "exact_replay" } else { "fresh" },
+        "hydrated_path": output
+            .hydrated_span
+            .as_ref()
+            .filter(|hydrated| !hydrated.observation.truncated)
+            .map(|hydrated| hydrated.observation.path.as_str()),
+        "hydrated_paths": &hydrated_paths,
+        "hydration_omission_count": hydration_packet.map_or(0, |packet| packet.issues.len()),
+        "hydration_truncated": hydration_truncated,
+        "resolved_question_detail": source_question
+            .filter(|_| search_resolves_focused_question(output))
+            .map(|question| question.detail.trim()),
     });
     let mut rendered = render_search_output(output);
     if !output.coverage_complete && output.matches.is_empty() {
@@ -2633,7 +3089,7 @@ fn search_function_output(
             "\ndiagnostic: global Git ignore rules were omitted because the selected environment does not expose Git config resolution\n",
         );
     }
-    let fragments = output
+    let mut fragments = output
         .matches
         .iter()
         .filter_map(|matched| {
@@ -2649,6 +3105,80 @@ fn search_function_output(
             )
         })
         .collect::<Vec<_>>();
+    let mut predetermined_json_pointers = Vec::new();
+    if let Some(packet) = hydration_packet {
+        for (index, span) in packet.spans.iter().enumerate() {
+            fragments.push(
+                ToolOutputProjectionFragment::new(
+                    ToolOutputProjectionFragmentKind::CitationOrExactSpan,
+                    span.exact_content.clone(),
+                )
+                .with_id(span.id.clone()),
+            );
+            predetermined_json_pointers.push(ToolOutputProjectionJsonPointer {
+                id: span.id.clone(),
+                pointer: format!("/hydration_packet/spans/{index}"),
+            });
+        }
+        let selected_match_ids = packet
+            .spans
+            .iter()
+            .flat_map(|span| span.match_ids.iter().map(String::as_str))
+            .collect::<BTreeSet<_>>();
+        for (index, issue) in packet.issues.iter().enumerate() {
+            if !selected_match_ids.contains(issue.match_id.as_str()) {
+                continue;
+            }
+            let issue_id = format!("source-hydration-issue:{}", issue.match_id);
+            if let Ok(value) = serde_json::to_value(issue) {
+                let exact_issue = CanonicalToolResult::json(value);
+                if let Ok(text) = String::from_utf8(exact_issue.bytes) {
+                    fragments.push(
+                        ToolOutputProjectionFragment::new(
+                            ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+                            text,
+                        )
+                        .with_id(issue_id.clone()),
+                    );
+                }
+            }
+            predetermined_json_pointers.push(ToolOutputProjectionJsonPointer {
+                id: issue_id,
+                pointer: format!("/hydration_packet/issues/{index}"),
+            });
+        }
+    } else if let Some(hydrated) = output.hydrated_span.as_ref()
+        && !hydrated.observation.exact_content.is_empty()
+    {
+        let fragment_id = output.matches.first().map_or_else(
+            || {
+                format!(
+                    "source-hydration:{}:{}-{}",
+                    hydrated.observation.path,
+                    hydrated
+                        .observation
+                        .start_line
+                        .unwrap_or(hydrated.observation.requested_start_line),
+                    hydrated
+                        .observation
+                        .end_line
+                        .unwrap_or(hydrated.observation.requested_start_line),
+                )
+            },
+            |matched| format!("{}:hydrated-span", matched.id),
+        );
+        fragments.push(
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::CitationOrExactSpan,
+                hydrated.observation.exact_content.clone(),
+            )
+            .with_id(fragment_id.clone()),
+        );
+        predetermined_json_pointers.push(ToolOutputProjectionJsonPointer {
+            id: fragment_id,
+            pointer: "/hydrated_span".to_string(),
+        });
+    }
     let projection = ToolOutputProjectionMetadata {
         outcome: ToolOutputOutcome::Success,
         diagnostic_class: ToolOutputDiagnosticClass::Normal,
@@ -2664,12 +3194,16 @@ fn search_function_output(
             "omitted_contexts": output.coverage.omitted_contexts,
             "result_cap_reached": output.coverage.result_cap_reached,
             "match_ids": output.matches.iter().map(|matched| matched.id.as_str()).collect::<Vec<_>>(),
+            "hydration_observation_set_id": hydration_packet.map(|packet| packet.observation_set_id.as_str()),
+            "hydrated_match_ids": &hydrated_match_ids,
+            "hydration_issue_match_ids": hydration_packet.into_iter().flat_map(|packet| packet.issues.iter().map(|issue| issue.match_id.as_str())).collect::<Vec<_>>(),
         }),
         requested_limit: None,
         predetermined_ranges: Vec::new(),
+        predetermined_json_pointers,
     };
     let canonical =
-        CanonicalToolResult::json(serde_json::to_value(output).unwrap_or_else(|_| json!(null)));
+        CanonicalToolResult::json(serde_json::to_value(output).unwrap_or(serde_json::Value::Null));
     let inner =
         FunctionToolOutput::from_text(rendered, Some(true)).with_sampling_request_signal(signal);
     SourceSearchToolOutput {
@@ -2751,36 +3285,6 @@ async fn record_source_git_observation(
         return;
     }
 
-    let Some(registration) = invocation
-        .session
-        .services
-        .git_workspace
-        .register_source_freshness_paths(
-            paths
-                .iter()
-                .map(|path| source_context.repo_root_abs.join(path).to_path_buf()),
-        )
-    else {
-        return;
-    };
-    let watcher_generation = registration.watcher_generation;
-    let host_mutation_generation = registration.host_mutation_generation;
-    invocation
-        .step_context
-        .turn
-        .source_closure
-        .lock()
-        .await
-        .retain_source_watch("git-observation".to_string(), registration);
-    let mutation_revision = invocation.tracker.lock().await.current_mutation_revision();
-    let paths_freshness = source_paths_freshness_identity(invocation, source_context, &paths).await;
-    let freshness_key = format!(
-        "repo={};env={};paths={};watcher={watcher_generation};host={host_mutation_generation};mutation={mutation_revision};files={}",
-        source_context.repo_root_abs.display(),
-        source_context.environment_id,
-        paths.join("\u{1f}"),
-        paths_freshness.as_deref().unwrap_or("unreusable"),
-    );
     let existing = invocation
         .step_context
         .turn
@@ -2789,6 +3293,49 @@ async fn record_source_git_observation(
         .await
         .git_observation
         .clone();
+    let freshness_paths = if let Some(existing) = existing
+        .as_ref()
+        .filter(|existing| existing.observed_paths == paths)
+    {
+        existing.freshness_paths.clone()
+    } else {
+        let Some(freshness_paths) = git_observation_freshness_paths(source_context, &paths).await
+        else {
+            return;
+        };
+        freshness_paths
+    };
+    let Some(registration) = invocation
+        .session
+        .services
+        .git_workspace
+        .register_source_freshness_paths(freshness_paths.iter().cloned())
+    else {
+        return;
+    };
+    let watcher_generation = registration.watcher_generation;
+    let host_mutation_generation = registration.host_mutation_generation;
+    let source_freshness_identity = registration.identity.clone();
+    invocation
+        .step_context
+        .turn
+        .source_closure
+        .lock()
+        .await
+        .retain_source_watch("git-observation".to_string(), registration.clone());
+    let mutation_revision = invocation
+        .tracker
+        .lock()
+        .await
+        .current_source_mutation_revision(&source_context.environment_id, &freshness_paths);
+    let paths_freshness = source_paths_freshness_identity(invocation, source_context, &paths).await;
+    let freshness_key = format!(
+        "repo={};env={};paths={};source_freshness={source_freshness_identity};mutation={mutation_revision};files={}",
+        source_context.repo_root_abs.display(),
+        source_context.environment_id,
+        paths.join("\u{1f}"),
+        paths_freshness.as_deref().unwrap_or("unreusable"),
+    );
     if existing
         .as_ref()
         .is_some_and(|existing| existing.freshness_key != freshness_key)
@@ -2835,20 +3382,33 @@ async fn record_source_git_observation(
     let bounded_status = bounded_utf8(String::from_utf8_lossy(&status).trim(), 64 * 1024);
     let diff_head_sha256 = format!("{:x}", Sha256::digest(&diff));
     let revision_identity = format!(
-        "repo={};env={};watcher={watcher_generation};host={host_mutation_generation};mutation={mutation_revision}",
+        "repo={};env={};source_freshness={source_freshness_identity};mutation={mutation_revision};watcher={watcher_generation};host={host_mutation_generation}",
         source_context.repo_root_abs.display(),
         source_context.environment_id,
     );
     let paths_freshness_after =
         source_paths_freshness_identity(invocation, source_context, &paths).await;
-    let stable_freshness_key = if paths_freshness_after == paths_freshness {
+    let mutation_revision_after = invocation
+        .tracker
+        .lock()
+        .await
+        .current_source_mutation_revision(&source_context.environment_id, &freshness_paths);
+    let registration_current = invocation
+        .session
+        .services
+        .git_workspace
+        .source_registration_is_current(&registration);
+    let stable_freshness_key = if paths_freshness_after == paths_freshness
+        && mutation_revision_after == mutation_revision
+        && registration_current
+    {
         freshness_key
     } else {
         format!("unreusable:{mutation_revision}")
     };
     let artifact = GitObservationArtifact {
         head,
-        paths,
+        paths: paths.clone(),
         bounded_status,
         diff_head_sha256,
         revision_identity,
@@ -2870,6 +3430,8 @@ async fn record_source_git_observation(
         freshness_key: stable_freshness_key,
         identity,
         artifact_id,
+        observed_paths: paths,
+        freshness_paths,
     });
     invocation
         .step_context
@@ -2899,11 +3461,70 @@ async fn source_paths_freshness_identity(
         hasher.update(token.created_at_ms.to_le_bytes());
         hasher.update(token.modified_at_ms.to_le_bytes());
         hasher.update(token.mutation_revision.to_le_bytes());
-        hasher.update(token.watcher_generation.to_le_bytes());
-        hasher.update(token.host_mutation_generation.to_le_bytes());
         hasher.update(token.stable_file_identity.as_bytes());
+        hasher.update(token.freshness_identity.as_bytes());
     }
     Some(format!("{:x}", hasher.finalize()))
+}
+
+async fn git_observation_freshness_paths(
+    source_context: &LocalSourceContext,
+    paths: &[String],
+) -> Option<Vec<PathBuf>> {
+    let output = run_bounded_git(
+        source_context,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--absolute-git-dir",
+            "--git-common-dir",
+            "--symbolic-full-name",
+            "HEAD",
+        ],
+        &[],
+    )
+    .await?;
+    let output = String::from_utf8(output).ok()?;
+    let mut lines = output.lines().map(str::to_string);
+    let git_dir = PathBuf::from(lines.next()?);
+    let common_dir = PathBuf::from(lines.next()?);
+    let head_ref = lines.next()?;
+
+    let mut freshness_paths = paths
+        .iter()
+        .map(|path| source_context.repo_root_abs.join(path).to_path_buf())
+        .collect::<Vec<_>>();
+    freshness_paths.extend([
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        git_dir.join("config.worktree"),
+        common_dir.join("config"),
+        common_dir.join("packed-refs"),
+        common_dir.join("info/exclude"),
+    ]);
+    if head_ref.starts_with("refs/") {
+        freshness_paths.push(common_dir.join(head_ref));
+    }
+    for path in paths {
+        let mut directory = Path::new(path).parent();
+        loop {
+            let relative = directory.unwrap_or_else(|| Path::new(""));
+            freshness_paths.push(
+                source_context
+                    .repo_root_abs
+                    .join(relative)
+                    .join(".gitignore")
+                    .to_path_buf(),
+            );
+            let Some(parent) = directory.and_then(Path::parent) else {
+                break;
+            };
+            directory = Some(parent);
+        }
+    }
+    freshness_paths.sort();
+    freshness_paths.dedup();
+    Some(freshness_paths)
 }
 
 fn bounded_utf8(value: &str, max_bytes: usize) -> String {
@@ -2937,23 +3558,20 @@ async fn run_bounded_git(
     output.status.success().then_some(output.stdout)
 }
 
-async fn replay_covered_read(
+async fn replay_cached_source_file(
     invocation: &ToolInvocation,
     source_context: &LocalSourceContext,
     source_path: &PathUri,
     path: &str,
-    start_line: usize,
-    line_count: usize,
     metadata: &SourceMetadataToken,
-) -> Option<ReadFileSpanOutput> {
-    let end_line = start_line.saturating_add(line_count.saturating_sub(1));
+) -> Option<ReplayedSourceFile> {
     let receipt = invocation
         .step_context
         .turn
         .source_closure
         .lock()
         .await
-        .find_covering_read(path, start_line, end_line, metadata)?;
+        .find_cached_read(path, metadata)?;
     let bytes = read_source_replay_artifact(invocation, &receipt.artifact_id).await?;
     let artifact = serde_json::from_slice::<ReadReplayArtifact>(&bytes).ok()?;
     if artifact.content_hash != receipt.content_hash {
@@ -2974,112 +3592,12 @@ async fn replay_covered_read(
     if !receipt.metadata.permits_reuse(&revalidated) {
         return None;
     }
-    Some(slice_replayed_read(artifact.output, start_line, line_count))
-}
-
-async fn replay_fragmented_read(
-    invocation: &ToolInvocation,
-    source_context: &LocalSourceContext,
-    source_path: &PathUri,
-    path: &str,
-    start_line: usize,
-    line_count: usize,
-    metadata: &SourceMetadataToken,
-) -> (Option<ReadFileSpanOutput>, BTreeSet<usize>) {
-    let end_line = start_line.saturating_add(line_count.saturating_sub(1));
-    let receipts = invocation
-        .step_context
-        .turn
-        .source_closure
-        .lock()
-        .await
-        .find_overlapping_reads(path, start_line, end_line, metadata);
-    if receipts.is_empty() {
-        return (None, BTreeSet::new());
-    }
-
-    let mut outputs = Vec::new();
-    let mut content_hash = None;
-    for receipt in receipts {
-        let Some(bytes) = read_source_replay_artifact(invocation, &receipt.artifact_id).await
-        else {
-            continue;
-        };
-        let Ok(artifact) = serde_json::from_slice::<ReadReplayArtifact>(&bytes) else {
-            continue;
-        };
-        if artifact.content_hash != receipt.content_hash
-            || content_hash
-                .as_ref()
-                .is_some_and(|expected| expected != &artifact.content_hash)
-        {
-            continue;
-        }
-        content_hash.get_or_insert_with(|| artifact.content_hash.clone());
-        outputs.push(artifact.output);
-    }
-    if outputs.is_empty() {
-        return (None, BTreeSet::new());
-    }
-
-    let Ok(revalidated_metadata) = source_context
-        .fs
-        .get_metadata(source_path, Some(&source_context.sandbox))
-        .await
-    else {
-        return (None, BTreeSet::new());
-    };
-    let Some(revalidated) = source_metadata_token(
-        invocation,
-        source_context,
-        source_path,
-        &revalidated_metadata,
-    )
-    .await
-    else {
-        return (None, BTreeSet::new());
-    };
-    if !metadata.permits_reuse(&revalidated) {
-        return (None, BTreeSet::new());
-    }
-
-    let total_lines = outputs[0].total_lines;
-    if outputs
-        .iter()
-        .any(|output| output.total_lines != total_lines)
-    {
-        return (None, BTreeSet::new());
-    }
-    let effective_end = end_line.min(total_lines);
-    let mut all_lines = outputs
-        .iter()
-        .flat_map(|output| output.lines.iter().cloned())
-        .filter(|line| line.line_number >= start_line && line.line_number <= effective_end)
-        .collect::<Vec<_>>();
-    all_lines.sort_by_key(|line| line.line_number);
-    all_lines.dedup_by_key(|line| line.line_number);
-    let reused_lines = all_lines
-        .iter()
-        .map(|line| line.line_number)
-        .collect::<BTreeSet<_>>();
-    let expected_line_count = effective_end.saturating_sub(start_line).saturating_add(1);
-    if reused_lines.len() != expected_line_count {
-        return (None, reused_lines);
-    }
-
-    let mut output = outputs.remove(0);
-    output.lines = all_lines;
-    output.requested_start_line = start_line;
-    output.requested_line_count = line_count;
-    output.start_line = output.lines.first().map(|line| line.line_number);
-    output.end_line = output.lines.last().map(|line| line.line_number);
-    output.bytes_returned = output
-        .lines
-        .iter()
-        .map(|line| line.text.len().saturating_add(1))
-        .sum();
-    output.truncated = end_line < total_lines && output.end_line != Some(end_line);
-    (Some(output), reused_lines)
+    Some(ReplayedSourceFile {
+        bytes: artifact.full_file_bytes?,
+        content_hash: artifact.content_hash,
+        artifact_id: receipt.artifact_id,
+        metadata: receipt.metadata,
+    })
 }
 
 async fn source_metadata_token(
@@ -3099,7 +3617,15 @@ async fn source_metadata_token(
         .register_source_freshness_paths([source_path.to_path_buf()])?;
     let watcher_generation = registration.watcher_generation;
     let host_mutation_generation = registration.host_mutation_generation;
-    let mutation_revision = invocation.tracker.lock().await.current_mutation_revision();
+    let mutation_revision = invocation
+        .tracker
+        .lock()
+        .await
+        .current_source_mutation_revision(
+            &source_context.environment_id,
+            &[source_path.to_path_buf()],
+        );
+    let freshness_identity = registration.identity.clone();
     let stable_file_identity = stable_file_identity(source_path.as_path())?;
     if !invocation
         .session
@@ -3127,6 +3653,7 @@ async fn source_metadata_token(
         watcher_generation,
         host_mutation_generation,
         stable_file_identity,
+        freshness_identity,
     })
 }
 
@@ -3167,62 +3694,6 @@ fn stable_file_identity(path: &Path) -> Option<String> {
 #[cfg(not(any(unix, windows)))]
 fn stable_file_identity(_path: &Path) -> Option<String> {
     None
-}
-
-fn slice_replayed_read(
-    mut output: ReadFileSpanOutput,
-    start_line: usize,
-    line_count: usize,
-) -> ReadFileSpanOutput {
-    if !output.exact_content.is_empty() && start_line >= output.requested_start_line {
-        let local_start = start_line - output.requested_start_line + 1;
-        if let Ok(mut sliced) = read_file_span_from_bytes(
-            output.path.clone(),
-            output.exact_content.as_bytes().to_vec(),
-            local_start,
-            line_count,
-        ) {
-            let line_offset = output.requested_start_line.saturating_sub(1);
-            for line in &mut sliced.lines {
-                line.line_number = line.line_number.saturating_add(line_offset);
-            }
-            for chunk in &mut sliced.chunks {
-                chunk.start_line = chunk.start_line.saturating_add(line_offset);
-                chunk.end_line = chunk.end_line.saturating_add(line_offset);
-                chunk.id = format!(
-                    "src:{}:L{}-L{}",
-                    &sliced.requested_content_sha256
-                        [..sliced.requested_content_sha256.len().min(16)],
-                    chunk.start_line,
-                    chunk.end_line,
-                );
-            }
-            sliced.source_map_route = output.source_map_route;
-            sliced.requested_start_line = start_line;
-            sliced.start_line = sliced.lines.first().map(|line| line.line_number);
-            sliced.end_line = sliced.lines.last().map(|line| line.line_number);
-            sliced.total_lines = output.total_lines;
-            sliced.full_file_sha256 = output.full_file_sha256;
-            return sliced;
-        }
-    }
-    let requested_end = start_line.saturating_add(line_count.saturating_sub(1));
-    output
-        .lines
-        .retain(|line| line.line_number >= start_line && line.line_number <= requested_end);
-    output.requested_start_line = start_line;
-    output.requested_line_count = line_count;
-    output.start_line = output.lines.first().map(|line| line.line_number);
-    output.end_line = output.lines.last().map(|line| line.line_number);
-    output.bytes_returned = output
-        .lines
-        .iter()
-        .map(|line| line.text.len().saturating_add(1))
-        .sum();
-    output.truncated = output
-        .end_line
-        .is_some_and(|end| end < requested_end.min(output.total_lines));
-    output
 }
 
 async fn resolve_candidate_owner(
@@ -3311,6 +3782,80 @@ async fn record_supporting_source_reads(
         record_supporting_source_reads_inner(invocation, source_context, entries),
     )
     .await
+}
+
+async fn record_exact_source_evidence(
+    invocation: &ToolInvocation,
+    source_context: &LocalSourceContext,
+    spans: Vec<ExactSourceEvidenceSpan>,
+) {
+    for span in spans {
+        if span.start_line == 0 || span.start_line > span.end_line {
+            continue;
+        }
+        let Ok(path) = resolve_confined_path(source_context, &span.path, "source evidence").await
+        else {
+            continue;
+        };
+        let Ok(metadata) = source_context
+            .fs
+            .get_metadata(&path, Some(&source_context.sandbox))
+            .await
+        else {
+            continue;
+        };
+        if !metadata.is_file {
+            continue;
+        }
+        let Ok(coverage_path) = path.to_abs_path() else {
+            continue;
+        };
+        invocation
+            .session
+            .services
+            .task_evidence
+            .record_owner_source_span(
+                &span.path,
+                span.start_line,
+                span.end_line,
+                &span.file_content_hash,
+                &span.span_content_hash,
+            )
+            .await;
+        let Some(metadata_token) =
+            source_metadata_token(invocation, source_context, &path, &metadata).await
+        else {
+            continue;
+        };
+        let mut tracker = invocation.tracker.lock().await;
+        let revision = SourceCoverageRevision {
+            content_hash: span.file_content_hash,
+            size: metadata.size,
+            created_at_ms: metadata.created_at_ms,
+            modified_at_ms: metadata.modified_at_ms,
+            mutation_revision: metadata_token.mutation_revision,
+            compaction_epoch: tracker.current_compaction_epoch(),
+            watcher_generation: metadata_token.watcher_generation,
+            host_mutation_generation: metadata_token.host_mutation_generation,
+            stable_file_identity: metadata_token.stable_file_identity,
+            freshness_identity: metadata_token.freshness_identity,
+        };
+        let repo_root = source_context.repo_root_abs.as_path().to_string_lossy();
+        let key = SourceCoverageKey::new(
+            &source_context.environment_id,
+            repo_root.as_ref(),
+            coverage_path.as_ref(),
+        );
+        let _ = tracker.record_source_coverage(
+            key,
+            revision,
+            SourceLineInterval {
+                start_line: span.start_line,
+                end_line: span.end_line,
+            },
+            false,
+        );
+    }
 }
 
 async fn await_supporting_read_coordination<F>(
@@ -3812,7 +4357,7 @@ fn source_path_is_ignored(
     Ok(ignore_matcher.is_ignored(path.as_path(), is_directory))
 }
 
-const SOURCE_SEARCH_REPLAY_CONTRACT_VERSION: &str = "source_search_replay_v1";
+const SOURCE_SEARCH_REPLAY_CONTRACT_VERSION: &str = "source_search_replay_v2";
 
 fn update_scope_metadata(hasher: &mut Sha256, path: &str, metadata: &FileMetadata) -> bool {
     if metadata.created_at_ms <= 0 || metadata.modified_at_ms <= 0 {
@@ -4394,7 +4939,47 @@ fn render_search_output(output: &SourceSearchOutput) -> String {
     ));
     let render_reason_index = rendered.line_count();
 
-    'matches: for source_match in &output.matches {
+    if let Some(packet) = &output.hydration_packet {
+        let _ = rendered.push_line(format!("hydration_status: {:?}", output.hydration_status));
+        render_search_hydration_packet(&mut rendered, output, packet);
+    } else {
+        render_search_matches(&mut rendered, &output.matches, &BTreeSet::new());
+        let _ = rendered.push_line(format!("hydration_status: {:?}", output.hydration_status));
+        if let Some(hydrated) = &output.hydrated_span {
+            let observation = &hydrated.observation;
+            let _ = rendered.push_line(String::new());
+            let _ = rendered.push_line(format!(
+                "hydrated_citation: {}:{}-{}",
+                observation.path,
+                observation
+                    .start_line
+                    .unwrap_or(observation.requested_start_line),
+                observation
+                    .end_line
+                    .unwrap_or(observation.requested_start_line)
+            ));
+            let _ = rendered.push_line(format!("observed_content_hash: {}", hydrated.content_hash));
+            for line in &observation.lines {
+                if !rendered.push_source_line(line.line_number, &line.text, line.text_truncated) {
+                    break;
+                }
+            }
+        }
+    }
+
+    rendered.finish(
+        coverage_line_index,
+        render_search_coverage(output, true),
+        render_reason_index,
+    )
+}
+
+fn render_search_matches(
+    rendered: &mut BoundedSourceOutput,
+    matches: &[codex_file_search::source_search::SourceSearchMatch],
+    omitted_context_match_ids: &BTreeSet<&str>,
+) {
+    'matches: for source_match in matches {
         let mut metadata = vec![
             String::new(),
             format!("match_id: {}", source_match.id),
@@ -4416,40 +5001,110 @@ fn render_search_output(output: &SourceSearchOutput) -> String {
         if !rendered.push_lines(metadata) {
             break;
         }
+        if omitted_context_match_ids.contains(source_match.id.as_str()) {
+            continue;
+        }
         for line in &source_match.lines {
             if !rendered.push_source_line(line.line_number, &line.text, line.text_truncated) {
                 break 'matches;
             }
         }
     }
+}
 
-    let _ = rendered.push_line(format!("hydration_status: {:?}", output.hydration_status));
-    if let Some(hydrated) = &output.hydrated_span {
-        let observation = &hydrated.observation;
-        let _ = rendered.push_line(String::new());
-        let _ = rendered.push_line(format!(
-            "hydrated_citation: {}:{}-{}",
-            observation.path,
-            observation
-                .start_line
-                .unwrap_or(observation.requested_start_line),
-            observation
-                .end_line
-                .unwrap_or(observation.requested_start_line)
-        ));
-        let _ = rendered.push_line(format!("observed_content_hash: {}", hydrated.content_hash));
-        for line in &observation.lines {
-            if !rendered.push_source_line(line.line_number, &line.text, line.text_truncated) {
-                break;
+fn render_search_hydration_packet(
+    rendered: &mut BoundedSourceOutput,
+    output: &SourceSearchOutput,
+    packet: &codex_file_search::source_search::SourceSearchHydrationPacket,
+) {
+    let hydrated_match_ids = packet
+        .spans
+        .iter()
+        .flat_map(|span| span.match_ids.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+
+    for matched in &output.matches {
+        if !rendered.push_line(format!(
+            "match_identity: id={} file_id={} citation={}:{}-{} match_line={} source_revision={} hydrated={}",
+            matched.id,
+            matched.file_id,
+            matched.path,
+            matched.start_line,
+            matched.end_line,
+            matched.line_number,
+            matched.source_revision,
+            hydrated_match_ids.contains(matched.id.as_str()),
+        )) {
+            return;
+        }
+    }
+    if !rendered.push_lines(vec![
+        String::new(),
+        format!(
+            "hydration_packet: schema={} observation_set_id={} exact_bytes={}/{} spans={} issues={}",
+            packet.schema_version,
+            packet.observation_set_id,
+            packet.exact_content_bytes,
+            packet.exact_content_byte_limit,
+            packet.spans.len(),
+            packet.issues.len(),
+        ),
+    ]) {
+        return;
+    }
+    for span in &packet.spans {
+        if !rendered.push_lines(vec![
+            String::new(),
+            format!("hydrated_span_id: {}", span.id),
+            format!("hydrated_match_ids: {}", span.match_ids.join(",")),
+            format!(
+                "hydrated_citation: {}:{}-{} requested={}-{}",
+                span.path,
+                span.start_line,
+                span.end_line,
+                span.requested_start_line,
+                span.requested_end_line,
+            ),
+            format!(
+                "hydrated_selection: {:?} truncated={}",
+                span.selection, span.truncated
+            ),
+            format!("observed_content_hash: {}", span.file_content_hash),
+            format!("span_content_hash: {}", span.span_content_hash),
+        ]) {
+            return;
+        }
+        for (offset, line) in span.exact_content.lines().enumerate() {
+            if !rendered.push_source_line(span.start_line + offset, line, false) {
+                return;
             }
         }
     }
-
-    rendered.finish(
-        coverage_line_index,
-        render_search_coverage(output, true),
-        render_reason_index,
-    )
+    for issue in &packet.issues {
+        if !rendered.push_line(format!(
+            "hydration_issue: match_id={} reason={:?}",
+            issue.match_id, issue.reason
+        )) {
+            return;
+        }
+    }
+    for matched in output
+        .matches
+        .iter()
+        .filter(|matched| !hydrated_match_ids.contains(matched.id.as_str()))
+    {
+        if !rendered.push_lines(vec![
+            String::new(),
+            format!("non_hydrated_match_context: {}", matched.id),
+        ]) {
+            return;
+        }
+        for line in &matched.lines {
+            if !rendered.push_source_line(line.line_number, &line.text, line.text_truncated) {
+                return;
+            }
+        }
+    }
 }
 
 fn render_search_coverage(output: &SourceSearchOutput, truncated: bool) -> String {

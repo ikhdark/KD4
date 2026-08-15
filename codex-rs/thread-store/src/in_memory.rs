@@ -156,7 +156,7 @@ mod tests {
                 archived: false,
                 search_term: None,
                 relation_filter: Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id)),
-                use_state_db_only: false,
+                storage_mode: crate::ThreadListStorageMode::PreferStateDb,
             },
         )
         .await
@@ -183,7 +183,7 @@ mod tests {
                 archived: false,
                 search_term: None,
                 relation_filter: Some(ThreadRelationFilter::DescendantsOf(parent_thread_id)),
-                use_state_db_only: false,
+                storage_mode: crate::ThreadListStorageMode::PreferStateDb,
             },
         )
         .await
@@ -567,6 +567,7 @@ impl InMemoryThreadStore {
         Ok(ThreadPage {
             items,
             next_cursor: None,
+            backwards_cursor: None,
         })
     }
 
@@ -773,7 +774,7 @@ fn stored_thread_from_state(
             .and_then(|metadata| metadata.model_provider.clone())
             .unwrap_or_else(|| "test".to_string()),
         model: metadata.and_then(|metadata| metadata.model.clone()),
-        reasoning_effort: metadata.and_then(|metadata| metadata.reasoning_effort.clone()),
+        reasoning_effort: metadata.and_then(|metadata| metadata.reasoning_effort.clone().flatten()),
         created_at: metadata
             .and_then(|metadata| metadata.created_at)
             .unwrap_or_else(Utc::now),

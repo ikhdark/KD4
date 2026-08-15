@@ -1205,6 +1205,7 @@ async fn collab_receiver_notification_does_not_cache_not_found_thread() {
                     codex_app_server_protocol::CollabAgentState {
                         status: codex_app_server_protocol::CollabAgentStatus::NotFound,
                         message: None,
+                        surfaced_result: None,
                     },
                 )]),
             },
@@ -4615,6 +4616,9 @@ fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItem>) -> Turn 
         started_at: None,
         completed_at: None,
         duration_ms: None,
+        completion: None,
+        timing: None,
+        surfaced_result: None,
         reasoning_policy_history: None,
     }
 }
@@ -4635,11 +4639,15 @@ fn turn_completed_notification(
     status: TurnStatus,
 ) -> ServerNotification {
     ServerNotification::TurnCompleted(TurnCompletedNotification {
+        surfaced_result: None,
         thread_id: thread_id.to_string(),
         completion: None,
         turn: Turn {
             completed_at: Some(0),
             duration_ms: Some(1),
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             ..test_turn(turn_id, status, Vec::new())
         },
         timing: None,
@@ -5319,6 +5327,9 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 },
                 Turn {
@@ -5345,6 +5356,9 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 },
             ],

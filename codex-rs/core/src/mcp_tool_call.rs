@@ -2131,6 +2131,7 @@ fn request_user_input_response_from_elicitation_content(
     let Some(content) = content else {
         return Some(RequestUserInputResponse {
             answers: std::collections::HashMap::new(),
+            interrupted: false,
         });
     };
     let content = content.as_object()?;
@@ -2149,7 +2150,10 @@ fn request_user_input_response_from_elicitation_content(
         })
         .collect();
 
-    Some(RequestUserInputResponse { answers })
+    Some(RequestUserInputResponse {
+        answers,
+        interrupted: false,
+    })
 }
 
 fn parse_mcp_tool_approval_response(

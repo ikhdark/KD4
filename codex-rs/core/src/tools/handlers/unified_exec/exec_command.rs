@@ -8,7 +8,6 @@ use crate::maybe_emit_implicit_skill_invocation;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
-use crate::tools::command_execution::DeterministicFailureRecord;
 use crate::tools::command_execution::RunningWorkspaceMutation;
 use crate::tools::command_execution::WorkspaceMutationAcquireError;
 use crate::tools::command_execution::acquire_workspace_mutation_lease_cached;
@@ -31,6 +30,7 @@ use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
+use crate::tools::known_delta_store;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
@@ -80,11 +80,23 @@ fn validation_structured_output(value: serde_json::Value) -> FunctionToolOutput 
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| value.to_string());
-    let success = value
-        .get("success")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let mut output = FunctionToolOutput::from_text(text, Some(success));
+    let execution_outcome =
+        super::super::shell::ValidationExecutionOutcome::from_value_or_legacy_success(&value);
+    let skip_disposition = value
+        .get("skip_disposition")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let mut output = FunctionToolOutput::from_text(text, execution_outcome.success())
+        .with_outcome(execution_outcome.tool_outcome());
+    if let Some(skip_disposition) = skip_disposition {
+        output = output.with_skip_disposition(skip_disposition);
+    } else if value
+        .get("execution_outcome")
+        .and_then(serde_json::Value::as_str)
+        == Some("not_executed")
+    {
+        output = output.with_outcome(codex_tools::ToolOutputOutcome::Skipped);
+    }
     output.post_tool_use_response = Some(value);
     output
 }
@@ -561,10 +573,8 @@ impl ExecCommandHandler {
                 validation_call_id: None,
             }),
         };
-        // Validation admission is the positive structural proof that this command class has a
-        // closed deterministic-input contract. A nonzero exit from any other command remains
-        // intentionally retryable.
-        let has_deterministic_validation_contract = validation_launch.is_some();
+        // Admission authorizes the validation; it does not prove that a nonzero outcome is
+        // deterministic. All outcomes remain ordinary retryable command records here.
         let validation_observation = Arc::new(StdMutex::new(None));
         validate_independent_review_shell(
             &turn.session_source,
@@ -617,6 +627,7 @@ impl ExecCommandHandler {
             additional_permissions,
             justification,
             prefix_rule,
+            force_fresh,
             ..
         } = args;
 
@@ -710,12 +721,45 @@ impl ExecCommandHandler {
         .with_input_context(&input_context)
         .with_runtime_context(&runtime_context)
         .with_repository_epoch(repository_epoch);
-        session
-            .services
-            .command_execution
-            .begin_attempt(&attempt_key, repair_notice.is_some())
+        let known_delta = if session.features().enabled(Feature::KnownDeltaStore)
+            && !environment_is_remote
+            && !tty
+            && validation_launch.is_none()
+            && let Some(native_cwd) = native_cwd.as_ref()
+            && let CommandInvocation::Argv { program, args } = &command_invocation
+        {
+            let project_namespace = if let Some(source) =
+                turn.turn_metadata_state.git_metadata_source()
+                && native_cwd.starts_with(source.repo_root().as_path())
+            {
+                source.project_namespace().await
+            } else {
+                None
+            };
+            known_delta_store::prepare_immutable_git_show(
+                turn.config.codex_home.as_path(),
+                &session.thread_id.to_string(),
+                native_cwd,
+                program,
+                args,
+                project_namespace.as_deref(),
+                force_fresh,
+            )
             .await
-            .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
+        } else {
+            None
+        };
+        let known_delta_hit = known_delta
+            .as_ref()
+            .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
+        if !known_delta_hit {
+            session
+                .services
+                .command_execution
+                .begin_attempt_with_freshness(&attempt_key, repair_notice.is_some(), force_fresh)
+                .await
+                .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
+        }
         let (validation_leader, validation_waiter) = if validation_launch.is_some() {
             let environment =
                 crate::tools::handlers::shell::validation_environment_hash(&effective_environment);
@@ -761,25 +805,28 @@ impl ExecCommandHandler {
                             }
                         };
                         if let Some(result) = joined {
-                            let exit_code = result
-                                .value
-                                .get("exit_code")
-                                .and_then(serde_json::Value::as_i64)
-                                .and_then(|code| i32::try_from(code).ok())
-                                .unwrap_or_else(|| {
-                                    if result.value.get("success")
-                                        == Some(&serde_json::Value::Bool(false))
-                                    {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                });
-                            session
-                                .services
-                                .command_execution
-                                .record_exit(&attempt_key, exit_code)
-                                .await;
+                            let execution_outcome = super::super::shell::ValidationExecutionOutcome::from_value_or_legacy_success(&result.value);
+                            if execution_outcome
+                                != super::super::shell::ValidationExecutionOutcome::NotExecuted
+                            {
+                                let exit_code = result
+                                    .value
+                                    .get("exit_code")
+                                    .and_then(serde_json::Value::as_i64)
+                                    .and_then(|code| i32::try_from(code).ok())
+                                    .unwrap_or_else(|| match execution_outcome {
+                                        super::super::shell::ValidationExecutionOutcome::ExecutedSuccess => 0,
+                                        super::super::shell::ValidationExecutionOutcome::ExecutedFailure => 1,
+                                        super::super::shell::ValidationExecutionOutcome::NotExecuted => unreachable!(
+                                            "not-executed validation was filtered before exit bookkeeping"
+                                        ),
+                                    });
+                                session
+                                    .services
+                                    .command_execution
+                                    .record_exit(&attempt_key, exit_code)
+                                    .await;
+                            }
                             return Ok(boxed_tool_output(joined_validation_structured_output(
                                 result.value,
                                 &call_id,
@@ -823,11 +870,13 @@ impl ExecCommandHandler {
                     &raw_output,
                 )
                 .await;
-                session
-                    .services
-                    .command_execution
-                    .record_exit(&attempt_key, 0)
-                    .await;
+                if !known_delta_hit {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, 0)
+                        .await;
+                }
                 return Ok(boxed_tool_output(ExecCommandToolOutput {
                     event_call_id: String::new(),
                     chunk_id: String::new(),
@@ -845,11 +894,13 @@ impl ExecCommandHandler {
             }
             Ok(None) => {}
             Err(err) => {
-                session
-                    .services
-                    .command_execution
-                    .record_exit(&attempt_key, -1)
-                    .await;
+                if !known_delta_hit {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, -1)
+                        .await;
+                }
                 return Err(err);
             }
         }
@@ -883,11 +934,13 @@ impl ExecCommandHandler {
                 {
                     Ok(workspace_mutation) => Some(workspace_mutation),
                     Err(error) => {
-                        session
-                            .services
-                            .command_execution
-                            .record_exit(&attempt_key, -1)
-                            .await;
+                        if !known_delta_hit {
+                            session
+                                .services
+                                .command_execution
+                                .record_exit(&attempt_key, -1)
+                                .await;
+                        }
                         return Err(error);
                     }
                 }
@@ -930,6 +983,7 @@ impl ExecCommandHandler {
                     validation_observation,
                     validation_leader,
                     validation_waiter,
+                    known_delta,
                 },
                 process_id_reservation,
                 &context,
@@ -948,36 +1002,20 @@ impl ExecCommandHandler {
                     .clone()
                     .unwrap_or_else(|| raw_output_artifact.clone());
                 response.repair_notice = repair_notice;
-                if let Some(process_id) = response.process_id {
-                    session
-                        .services
-                        .command_execution
-                        .update_running_artifact(process_id, finalized_artifact)
-                        .await;
-                } else if let Some(exit_code) = response.exit_code {
-                    let tracked = session
-                        .services
-                        .command_execution
-                        .finish_running_process(process_id, Some(exit_code))
-                        .await;
-                    if !tracked {
-                        if exit_code != 0 && has_deterministic_validation_contract {
-                            session
-                                .services
-                                .command_execution
-                                .record_deterministic_failure(
-                                    &attempt_key,
-                                    DeterministicFailureRecord::from_trusted_classification(
-                                        "focused-validation",
-                                        finalized_artifact.clone(),
-                                        exit_code,
-                                        std::time::SystemTime::now(),
-                                        response.wall_time,
-                                        None,
-                                    ),
-                                )
-                                .await;
-                        } else {
+                if !known_delta_hit {
+                    if let Some(process_id) = response.process_id {
+                        session
+                            .services
+                            .command_execution
+                            .update_running_artifact(process_id, finalized_artifact)
+                            .await;
+                    } else if let Some(exit_code) = response.exit_code {
+                        let tracked = session
+                            .services
+                            .command_execution
+                            .finish_running_process(process_id, Some(exit_code))
+                            .await;
+                        if !tracked {
                             session
                                 .services
                                 .command_execution
@@ -993,17 +1031,19 @@ impl ExecCommandHandler {
                 let output_text = output.aggregated_output.text;
                 let finalized_artifact =
                     replace_raw_output_artifact(&raw_output_artifact, output_text.as_bytes()).await;
-                let tracked = session
-                    .services
-                    .command_execution
-                    .finish_running_process(process_id, Some(output.exit_code))
-                    .await;
-                if !tracked {
-                    session
+                if !known_delta_hit {
+                    let tracked = session
                         .services
                         .command_execution
-                        .record_exit(&attempt_key, output.exit_code)
+                        .finish_running_process(process_id, Some(output.exit_code))
                         .await;
+                    if !tracked {
+                        session
+                            .services
+                            .command_execution
+                            .record_exit(&attempt_key, output.exit_code)
+                            .await;
+                    }
                 }
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
@@ -1025,15 +1065,19 @@ impl ExecCommandHandler {
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 Ok(boxed_tool_output(response))
             }
-            Err(UnifiedExecError::ValidationSkipped(skipped)) => Ok(boxed_tool_output(
-                validation_structured_output(serde_json::to_value(skipped).unwrap_or_default()),
-            )),
+            Err(UnifiedExecError::ValidationSkipped(skipped)) => {
+                let skip_disposition = skipped.skip_disposition;
+                Ok(boxed_tool_output(
+                    validation_structured_output(serde_json::to_value(skipped).unwrap_or_default())
+                        .with_skip_disposition(skip_disposition),
+                ))
+            }
             Err(err) => {
                 let retry_failure = matches!(
                     &err,
                     UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }
                 );
-                if retry_failure {
+                if retry_failure && !known_delta_hit {
                     let finalized_running_process =
                         if matches!(&err, UnifiedExecError::ProcessFailed { .. }) {
                             session

@@ -212,63 +212,6 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         )
         self.assertIsNone(kd4_model_attempt_analysis.spearman([1.0, 1.0], [2.0, 3.0]))
 
-    def test_amplification_coverage_retries_and_algebraic_attribution(self) -> None:
-        def attempt(attempt_id: str, retry: int, input_tokens: int, unique: int) -> dict[str, object]:
-            return {
-                "event.name": "codex.model_attempt",
-                "root_task_id": "root",
-                "measurement_window_id": "window",
-                "sampling_request_id": "window",
-                "attempt_id": attempt_id,
-                "retry_index": retry,
-                "outcome": "success",
-                "request_kind": "continuation",
-                "input_token_count": input_tokens,
-                "cached_input_token_count": input_tokens - 1,
-                "amplification_measurement_complete": True,
-                "unique_new_tokens": unique,
-                "local_projected_occupancy": 60,
-                "effective_provider_occupancy": 70,
-                "compactions": 3,
-                **{field: 1 for field in kd4_model_attempt_analysis.AMPLIFICATION_CATEGORY_FIELDS},
-            }
-
-        analysis = kd4_model_attempt_analysis.analyze(
-            [attempt("one", 0, 100, 20), attempt("two", 1, 100, 0)]
-        )
-        root = analysis["amplification"]["roots"][0]
-        self.assertEqual(root["physicalAttemptCount"], 2)
-        self.assertEqual(root["requestCount"], 1)
-        self.assertEqual(root["replayAmplification"], 10.0)
-        self.assertEqual(root["categoryTotals"]["checkpoint_tokens"], 1.0)
-        self.assertEqual(root["compactions"], 3.0)
-
-        attribution = kd4_model_attempt_analysis.algebraic_attribution(10, 40, 8, 30)
-        self.assertEqual(attribution["termSum"], attribution["observedInputDifference"])
-        self.assertIn("not independent causal proof", attribution["interpretation"])
-
-    def test_amplification_is_null_when_attempt_usage_is_missing(self) -> None:
-        record = {
-            "event.name": "codex.model_attempt",
-            "root_task_id": "root",
-            "measurement_window_id": "window",
-            "sampling_request_id": "window",
-            "attempt_id": "attempt",
-            "retry_index": 0,
-            "outcome": "failed",
-            "request_kind": "initial",
-            "input_token_count": None,
-            "cached_input_token_count": None,
-            "amplification_measurement_complete": True,
-            "unique_new_tokens": 10,
-            **{field: 0 for field in kd4_model_attempt_analysis.AMPLIFICATION_CATEGORY_FIELDS},
-        }
-        root = kd4_model_attempt_analysis.analyze([record])["amplification"]["roots"][0]
-        self.assertIsNone(root["replayAmplification"])
-        self.assertEqual(
-            root["replayAmplificationNullReason"], "missing_attempt_provider_usage"
-        )
-
     def test_model_attempt_jsonl_loader_and_parser_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "attempts.jsonl"

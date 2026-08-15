@@ -100,7 +100,7 @@ pub struct ThreadStartParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
-    /// @deprecated Ignored. Use Ultra reasoning effort for proactive multi-agent behavior.
+    /// @deprecated Ignored. Configure delegation independently of reasoning effort.
     #[experimental("thread/start.multiAgentMode")]
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,
@@ -207,6 +207,101 @@ impl ThreadStartResponse {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadDesktopActivationObligationParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct DesktopActivationObligation {
+    pub thread_id: String,
+    pub evidence_epoch: u64,
+    pub implementation_identity: String,
+    pub activation_obligation_identity: String,
+    pub requiring_plan_step_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadDesktopActivationObligationResponse {
+    pub obligation: Option<DesktopActivationObligation>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadDesktopActivationChallengeParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct DesktopActivationChallenge {
+    pub challenge_id: String,
+    pub thread_id: String,
+    pub evidence_epoch: u64,
+    pub implementation_identity: String,
+    pub activation_obligation_identity: String,
+    pub publisher_evidence_id: String,
+    pub expected_installed_executable_path: String,
+    pub expected_installed_executable_sha256: String,
+    pub publish_id: String,
+    pub issued_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum DesktopActivationUnavailableReason {
+    NoCurrentActivationObligation,
+    NoAuthoritativeBootstrapEvidence,
+    BootstrapEvidenceMalformed,
+    BootstrapEvidenceMismatch,
+    BootstrapEvidenceStale,
+    RunningExecutableMismatch,
+    ChallengeExpired,
+    ChallengeMissingOrConsumed,
+    ActivationObligationChanged,
+    InvalidDesktopObservation,
+    ReplayPayloadMismatch,
+    PersistenceFailed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadDesktopActivationChallengeResponse {
+    pub challenge: Option<DesktopActivationChallenge>,
+    pub unavailable_reason: Option<DesktopActivationUnavailableReason>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ThreadDesktopActivationRecordParams {
+    pub challenge_id: String,
+    pub desktop_process_id: u32,
+    pub desktop_executable_path: String,
+    pub observation_timestamp: String,
+    pub initialization_observation_identity: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadDesktopActivationRecordResponse {
+    pub challenge_id: String,
+    pub recorded_at: String,
+    pub already_recorded: bool,
+}
+
 #[derive(
     Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
 )]
@@ -258,7 +353,7 @@ pub struct ThreadSettingsUpdateParams {
     #[experimental("thread/settings/update.collaborationMode")]
     #[ts(optional = nullable)]
     pub collaboration_mode: Option<CollaborationMode>,
-    /// @deprecated Ignored. Use `effort: "ultra"` for proactive multi-agent behavior.
+    /// @deprecated Ignored. Configure delegation independently of reasoning effort.
     #[experimental("thread/settings/update.multiAgentMode")]
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,
@@ -675,7 +770,7 @@ pub enum ThreadUnsubscribeStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadIncrementElicitationParams {
-    /// Thread whose out-of-band elicitation counter should be incremented.
+    /// Thread on which a connection-owned out-of-band elicitation lease should be acquired.
     pub thread_id: String,
 }
 
@@ -684,9 +779,11 @@ pub struct ThreadIncrementElicitationParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadIncrementElicitationResponse {
-    /// Current out-of-band elicitation count after the increment.
+    /// Server-issued token that uniquely identifies this lease within the connection.
+    pub lease_id: String,
+    /// Current active out-of-band elicitation lease count after the acquisition.
     pub count: i64,
-    /// Whether timeout accounting is paused after applying the increment.
+    /// Whether timeout accounting is paused after acquiring the lease.
     pub paused: bool,
 }
 
@@ -695,8 +792,10 @@ pub struct ThreadIncrementElicitationResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadDecrementElicitationParams {
-    /// Thread whose out-of-band elicitation counter should be decremented.
+    /// Thread on which the lease was acquired.
     pub thread_id: String,
+    /// `leaseId` returned by the successful increment on this same connection.
+    pub lease_id: String,
 }
 
 /// Response for `thread/decrement_elicitation`.
@@ -704,9 +803,9 @@ pub struct ThreadDecrementElicitationParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadDecrementElicitationResponse {
-    /// Current out-of-band elicitation count after the decrement.
+    /// Current active out-of-band elicitation lease count after the idempotent release.
     pub count: i64,
-    /// Whether timeout accounting remains paused after applying the decrement.
+    /// Whether timeout accounting remains paused after releasing the lease.
     pub paused: bool,
 }
 
@@ -1096,11 +1195,12 @@ pub struct ThreadListParams {
     /// exactly matches one of these paths are returned.
     #[ts(optional = nullable, type = "string | Array<string> | null")]
     pub cwd: Option<ThreadListCwdFilter>,
-    /// If true, return from the state DB without scanning JSONL rollouts to
-    /// repair thread metadata. Omitted or false preserves scan-and-repair
-    /// behavior.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub use_state_db_only: bool,
+    /// Selects local listing storage. Omitted or null prefers SQLite and permits
+    /// scan-and-repair fallback only before pagination begins; true requires
+    /// SQLite; false explicitly selects scan-and-repair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub use_state_db_only: Option<bool>,
     /// Optional substring filter for the extracted thread title.
     #[ts(optional = nullable)]
     pub search_term: Option<String>,

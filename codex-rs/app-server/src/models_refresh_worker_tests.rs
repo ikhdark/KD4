@@ -81,6 +81,7 @@ async fn refreshes_immediately_periodically_and_stops_when_dropped() {
         codex_home.path().to_path_buf(),
         endpoint.clone(),
         /*auth_manager*/ None,
+        Arc::new(|| "test-provider-identity".to_string()),
     ));
     let worker = spawn_with_interval(
         &models_manager,

@@ -220,6 +220,9 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             }],
         }

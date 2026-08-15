@@ -22,6 +22,9 @@ impl ChatWidget {
                 started_at,
                 completed_at,
                 duration_ms,
+                completion,
+                timing,
+                surfaced_result,
                 reasoning_policy_history,
             } = turn;
             if matches!(status, TurnStatus::InProgress) {
@@ -36,22 +39,27 @@ impl ChatWidget {
                 status,
                 TurnStatus::Completed | TurnStatus::Interrupted | TurnStatus::Failed
             ) {
+                let turn = Turn {
+                    id: turn_id,
+                    items_view: codex_app_server_protocol::TurnItemsView::NotLoaded,
+                    items: Vec::new(),
+                    status,
+                    error,
+                    started_at,
+                    completed_at,
+                    duration_ms,
+                    completion,
+                    timing,
+                    surfaced_result,
+                    reasoning_policy_history,
+                };
                 self.handle_turn_completed_notification(
                     TurnCompletedNotification {
                         thread_id: self.thread_id.map(|id| id.to_string()).unwrap_or_default(),
-                        completion: None,
-                        turn: Turn {
-                            id: turn_id,
-                            items_view: codex_app_server_protocol::TurnItemsView::NotLoaded,
-                            items: Vec::new(),
-                            status,
-                            error,
-                            started_at,
-                            completed_at,
-                            duration_ms,
-                            reasoning_policy_history,
-                        },
-                        timing: None,
+                        completion: turn.completion.clone(),
+                        timing: turn.timing.clone(),
+                        surfaced_result: turn.surfaced_result.clone(),
+                        turn,
                     },
                     Some(replay_kind),
                 );

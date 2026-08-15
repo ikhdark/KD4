@@ -1,6 +1,7 @@
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::outgoing_message::ClientRequestResult;
+use crate::outgoing_message::TerminalNotificationDispatch;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::request_processors::populate_thread_turns_from_history;
 use crate::request_processors::thread_from_stored_thread;
@@ -81,6 +82,7 @@ use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::TurnTerminalizationCompletedNotification;
 use codex_app_server_protocol::TurnTiming;
 use codex_app_server_protocol::WarningNotification;
 use codex_app_server_protocol::build_item_from_guardian_event;
@@ -150,6 +152,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         id: event_turn_id,
         msg,
     } = event;
+    let terminal_fingerprint = codex_core::terminal_event_fingerprint(&msg);
     match msg {
         EventMsg::TurnStarted(payload) => {
             // While not technically necessary as it was already done on TurnComplete, be extra cautios and abort any pending server requests.
@@ -168,6 +171,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                     started_at: payload.started_at,
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 });
                 turn.items.clear();
@@ -186,18 +192,30 @@ pub(crate) async fn apply_bespoke_event_handling(
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
             respond_to_pending_interrupts(&thread_state, &outgoing).await;
-            let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
+            let turn_failed = turn_complete_event.error.is_some()
+                || thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
                 .await;
-            handle_turn_complete(
+            let attempt = handle_turn_complete(
                 conversation_id,
-                event_turn_id,
+                event_turn_id.clone(),
                 turn_complete_event,
                 &outgoing,
                 &thread_state,
+                terminal_fingerprint.as_deref(),
             )
             .await;
+            if let Some(fingerprint) = terminal_fingerprint.as_deref() {
+                finish_terminal_notification_attempt(
+                    &conversation,
+                    &thread_state,
+                    &event_turn_id,
+                    fingerprint,
+                    attempt,
+                )
+                .await;
+            }
         }
         EventMsg::McpStartupUpdate(update) => {
             let (status, error, failure_reason) = match update.status {
@@ -1055,14 +1073,36 @@ pub(crate) async fn apply_bespoke_event_handling(
             thread_watch_manager
                 .note_turn_interrupted(&conversation_id.to_string())
                 .await;
-            handle_turn_interrupted(
+            let attempt = handle_turn_interrupted(
                 conversation_id,
-                event_turn_id,
+                event_turn_id.clone(),
                 turn_aborted_event,
                 &outgoing,
                 &thread_state,
+                terminal_fingerprint.as_deref(),
             )
             .await;
+            if let Some(fingerprint) = terminal_fingerprint.as_deref() {
+                finish_terminal_notification_attempt(
+                    &conversation,
+                    &thread_state,
+                    &event_turn_id,
+                    fingerprint,
+                    attempt,
+                )
+                .await;
+            }
+        }
+        EventMsg::TurnTerminalizationComplete(payload) => {
+            outgoing
+                .send_server_notification(ServerNotification::TurnTerminalizationCompleted(
+                    TurnTerminalizationCompletedNotification {
+                        thread_id: conversation_id.to_string(),
+                        turn_id: payload.turn_id,
+                        receipt: payload.receipt,
+                    },
+                ))
+                .await;
         }
         EventMsg::ThreadRolledBack(_rollback_event) => {
             let pending = {
@@ -1179,6 +1219,59 @@ pub(crate) async fn apply_bespoke_event_handling(
     }
 }
 
+/// Rebuilds and dispatches only the cached terminal client projection for a terminal event whose
+/// app-server state was already reduced. This deliberately skips request cancellation, thread
+/// history reduction, watch-state transitions, and every other terminal side effect.
+pub(crate) async fn project_terminal_notification_only(
+    event: Event,
+    conversation_id: ThreadId,
+    conversation: Arc<CodexThread>,
+    outgoing: ThreadScopedOutgoingMessageSender,
+    thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
+    expected_fingerprint: &str,
+) {
+    if codex_core::terminal_event_fingerprint(&event.msg).as_deref() != Some(expected_fingerprint) {
+        tracing::error!(
+            turn_id = %event.id,
+            "refusing to project a terminal notification with a mismatched fingerprint"
+        );
+        return;
+    }
+    let attempt = match event.msg {
+        EventMsg::TurnComplete(payload) => {
+            handle_turn_complete(
+                conversation_id,
+                event.id.clone(),
+                payload,
+                &outgoing,
+                &thread_state,
+                Some(expected_fingerprint),
+            )
+            .await
+        }
+        EventMsg::TurnAborted(payload) => {
+            handle_turn_interrupted(
+                conversation_id,
+                event.id.clone(),
+                payload,
+                &outgoing,
+                &thread_state,
+                Some(expected_fingerprint),
+            )
+            .await
+        }
+        _ => return,
+    };
+    finish_terminal_notification_attempt(
+        &conversation,
+        &thread_state,
+        &event.id,
+        expected_fingerprint,
+        attempt,
+    )
+    .await;
+}
+
 async fn handle_turn_diff(
     conversation_id: ThreadId,
     event_turn_id: &str,
@@ -1225,7 +1318,14 @@ struct TurnCompletionMetadata {
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
     timing: Option<TurnTiming>,
+    surfaced_result: Option<codex_protocol::protocol::SurfacedToolResult>,
     origin_connection_id: Option<crate::outgoing_message::ConnectionId>,
+}
+
+struct TerminalNotificationAttempt {
+    notification: ServerNotification,
+    origin_connection_id: Option<crate::outgoing_message::ConnectionId>,
+    dispatch: TerminalNotificationDispatch,
 }
 
 async fn emit_turn_completed_with_status(
@@ -1233,29 +1333,78 @@ async fn emit_turn_completed_with_status(
     event_turn_id: String,
     turn_completion_metadata: TurnCompletionMetadata,
     outgoing: &ThreadScopedOutgoingMessageSender,
-) {
-    let notification = TurnCompletedNotification {
-        thread_id: conversation_id.to_string(),
-        turn: Turn {
-            id: event_turn_id,
-            items: vec![],
-            items_view: TurnItemsView::NotLoaded,
-            error: turn_completion_metadata.error,
-            status: turn_completion_metadata.status,
-            started_at: turn_completion_metadata.started_at,
-            completed_at: turn_completion_metadata.completed_at,
-            duration_ms: turn_completion_metadata.duration_ms,
-            reasoning_policy_history: None,
-        },
+    thread_state: &Arc<Mutex<ThreadState>>,
+    terminal_fingerprint: Option<&str>,
+) -> TerminalNotificationAttempt {
+    let origin_connection_id = turn_completion_metadata.origin_connection_id;
+    let turn = Turn {
+        id: event_turn_id.clone(),
+        items: vec![],
+        items_view: TurnItemsView::NotLoaded,
+        error: turn_completion_metadata.error,
+        status: turn_completion_metadata.status,
+        started_at: turn_completion_metadata.started_at,
+        completed_at: turn_completion_metadata.completed_at,
+        duration_ms: turn_completion_metadata.duration_ms,
         completion: turn_completion_metadata.completion,
         timing: turn_completion_metadata.timing,
+        surfaced_result: turn_completion_metadata.surfaced_result,
+        reasoning_policy_history: None,
     };
-    outgoing
-        .send_server_notification_with_receipts(
-            ServerNotification::TurnCompleted(notification),
-            turn_completion_metadata.origin_connection_id,
-        )
+    let notification = TurnCompletedNotification {
+        thread_id: conversation_id.to_string(),
+        completion: turn.completion.clone(),
+        timing: turn.timing.clone(),
+        surfaced_result: turn.surfaced_result.clone(),
+        turn,
+    };
+    let notification = ServerNotification::TurnCompleted(notification);
+    if let Some(fingerprint) = terminal_fingerprint {
+        let _ = thread_state.lock().await.cache_terminal_notification(
+            &event_turn_id,
+            fingerprint,
+            notification.clone(),
+            origin_connection_id,
+        );
+    }
+    let dispatch = outgoing
+        .send_server_notification_with_receipts(notification.clone(), origin_connection_id)
         .await;
+    TerminalNotificationAttempt {
+        notification,
+        origin_connection_id,
+        dispatch,
+    }
+}
+
+async fn finish_terminal_notification_attempt(
+    conversation: &Arc<CodexThread>,
+    thread_state: &Arc<Mutex<ThreadState>>,
+    turn_id: &str,
+    fingerprint: &str,
+    attempt: TerminalNotificationAttempt,
+) {
+    let notification_accepted = thread_state
+        .lock()
+        .await
+        .record_terminal_notification_attempt(
+            turn_id,
+            fingerprint,
+            attempt.notification,
+            attempt.origin_connection_id,
+            &attempt.dispatch.targeted_connection_ids,
+            &attempt.dispatch.accepted_connection_ids,
+        );
+    if notification_accepted
+        && conversation
+            .acknowledge_terminal_event(turn_id, fingerprint)
+            .await
+    {
+        thread_state
+            .lock()
+            .await
+            .mark_terminal_acknowledged(turn_id, fingerprint);
+    }
 }
 
 async fn apply_canonical_item_completed_side_effects(
@@ -1425,10 +1574,17 @@ async fn handle_turn_complete(
     turn_complete_event: TurnCompleteEvent,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
-) {
+    terminal_fingerprint: Option<&str>,
+) -> TerminalNotificationAttempt {
     let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
 
-    let (status, error) = match turn_summary.last_error {
+    let embedded_error = turn_complete_event.error.as_ref().map(|error| TurnError {
+        message: error.message.clone(),
+        codex_error_info: error.codex_error_info.clone().map(V2CodexErrorInfo::from),
+        additional_details: None,
+    });
+
+    let (status, error) = match embedded_error.or(turn_summary.last_error) {
         Some(error) => (TurnStatus::Failed, Some(error)),
         None => (TurnStatus::Completed, None),
     };
@@ -1444,11 +1600,14 @@ async fn handle_turn_complete(
             completed_at: turn_complete_event.completed_at,
             duration_ms: turn_complete_event.duration_ms,
             timing: turn_complete_event.timing,
+            surfaced_result: turn_complete_event.surfaced_result,
             origin_connection_id: turn_summary.origin_connection_id,
         },
         outgoing,
+        thread_state,
+        terminal_fingerprint,
     )
-    .await;
+    .await
 }
 
 async fn handle_turn_interrupted(
@@ -1457,7 +1616,8 @@ async fn handle_turn_interrupted(
     turn_aborted_event: TurnAbortedEvent,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
-) {
+    terminal_fingerprint: Option<&str>,
+) -> TerminalNotificationAttempt {
     let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
 
     emit_turn_completed_with_status(
@@ -1471,11 +1631,14 @@ async fn handle_turn_interrupted(
             completed_at: turn_aborted_event.completed_at,
             duration_ms: turn_aborted_event.duration_ms,
             timing: turn_aborted_event.timing,
+            surfaced_result: None,
             origin_connection_id: turn_summary.origin_connection_id,
         },
         outgoing,
+        thread_state,
+        terminal_fingerprint,
     )
-    .await;
+    .await
 }
 
 async fn handle_thread_rollback_failed(
@@ -1603,6 +1766,7 @@ async fn on_request_user_input_response(
             error!("request failed with client error: {err:?}");
             let empty = CoreRequestUserInputResponse {
                 answers: HashMap::new(),
+                interrupted: false,
             };
             if let Err(err) = conversation
                 .submit(Op::UserInputAnswer {
@@ -1619,6 +1783,7 @@ async fn on_request_user_input_response(
             error!("request failed: {err:?}");
             let empty = CoreRequestUserInputResponse {
                 answers: HashMap::new(),
+                interrupted: false,
             };
             if let Err(err) = conversation
                 .submit(Op::UserInputAnswer {
@@ -1638,9 +1803,11 @@ async fn on_request_user_input_response(
             error!("failed to deserialize ToolRequestUserInputResponse: {err}");
             ToolRequestUserInputResponse {
                 answers: HashMap::new(),
+                interrupted: false,
             }
         });
     let response = CoreRequestUserInputResponse {
+        interrupted: response.interrupted,
         answers: response
             .answers
             .into_iter()
@@ -2211,6 +2378,7 @@ mod tests {
 
     fn turn_complete_event(turn_id: &str) -> TurnCompleteEvent {
         TurnCompleteEvent {
+            surfaced_result: None,
             turn_id: turn_id.to_string(),
             last_agent_message: None,
             error: None,
@@ -3504,6 +3672,12 @@ mod tests {
             reasons: vec!["focused validation is stale".to_string()],
             evidence_path: Some("task-evidence/thread.json".to_string()),
         });
+        let surfaced_result = codex_protocol::protocol::SurfacedToolResult {
+            adapter: "code_mode_cell".to_string(),
+            value: json!({"answer": 42}),
+            canonical_message: None,
+        };
+        completion_event.surfaced_result = Some(surfaced_result.clone());
         {
             let mut state = thread_state.lock().await;
             state.track_current_turn_event(
@@ -3528,6 +3702,7 @@ mod tests {
             completion_event,
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3542,6 +3717,10 @@ mod tests {
                 assert_eq!(n.turn.started_at, Some(42));
                 assert_eq!(n.turn.completed_at, Some(TEST_TURN_COMPLETED_AT));
                 assert_eq!(n.turn.duration_ms, Some(TEST_TURN_DURATION_MS));
+                assert_eq!(n.turn.completion.as_ref(), n.completion.as_ref());
+                assert_eq!(n.turn.timing.as_ref(), n.timing.as_ref());
+                assert_eq!(n.turn.surfaced_result.as_ref(), n.surfaced_result.as_ref());
+                assert_eq!(n.turn.surfaced_result, Some(surfaced_result));
                 let completion = n.completion.expect("completion gate");
                 assert_eq!(
                     completion.status,
@@ -3588,6 +3767,7 @@ mod tests {
             turn_aborted_event(&event_turn_id),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3638,6 +3818,7 @@ mod tests {
             turn_complete_event(&event_turn_id),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3893,6 +4074,7 @@ mod tests {
             turn_complete_event(&a_turn1),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3914,6 +4096,7 @@ mod tests {
             turn_complete_event(&b_turn1),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3925,6 +4108,7 @@ mod tests {
             turn_complete_event(&a_turn2),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 

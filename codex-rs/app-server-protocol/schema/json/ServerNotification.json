@@ -740,6 +740,16 @@
         },
         "status": {
           "$ref": "#/definitions/CollabAgentStatus"
+        },
+        "surfacedResult": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SurfacedToolResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -3729,6 +3739,26 @@
         }
       ]
     },
+    "SurfacedToolResult": {
+      "description": "Authoritative typed tool result surfaced as the terminal result of a turn. `canonical_message`, when present, is owner-authored and may be copied unchanged into legacy last-message consumers. `value` is never rendered into synthetic assistant prose by the host.",
+      "properties": {
+        "adapter": {
+          "type": "string"
+        },
+        "canonicalMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": true
+      },
+      "required": [
+        "adapter",
+        "value"
+      ],
+      "type": "object"
+    },
     "TaskCompletionGate": {
       "properties": {
         "evidencePath": {
@@ -3786,6 +3816,23 @@
         "turnId"
       ],
       "type": "object"
+    },
+    "TerminalizationDeliveryState": {
+      "enum": [
+        "not_attempted",
+        "claimed",
+        "delivered",
+        "delivery_failed"
+      ],
+      "type": "string"
+    },
+    "TerminalizationRecoveryState": {
+      "enum": [
+        "none",
+        "pending",
+        "recovered"
+      ],
+      "type": "string"
     },
     "TextElement": {
       "properties": {
@@ -5385,6 +5432,17 @@
             "null"
           ]
         },
+        "completion": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskCompletionGate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Machine-derived completion proof persisted at the terminal turn boundary."
+        },
         "durationMs": {
           "description": "Duration between turn start and completion in milliseconds, if known.",
           "format": "int64",
@@ -5434,6 +5492,28 @@
         },
         "status": {
           "$ref": "#/definitions/TurnStatus"
+        },
+        "surfacedResult": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SurfacedToolResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Authoritative typed tool result surfaced when the turn terminalized."
+        },
+        "timing": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnTiming"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Immutable wall-clock profile persisted at the terminal turn boundary."
         }
       },
       "required": [
@@ -5449,6 +5529,16 @@
           "anyOf": [
             {
               "$ref": "#/definitions/TaskCompletionGate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "surfacedResult": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SurfacedToolResult"
             },
             {
               "type": "null"
@@ -5706,6 +5796,62 @@
       ],
       "type": "string"
     },
+    "TurnTerminalizationCompletedNotification": {
+      "properties": {
+        "receipt": {
+          "$ref": "#/definitions/TurnTerminalizationReceipt"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "receipt",
+        "threadId",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "TurnTerminalizationReceipt": {
+      "properties": {
+        "activeTurnDetached": {
+          "type": "boolean"
+        },
+        "deadlineExhaustedPhase": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deliveryState": {
+          "$ref": "#/definitions/TerminalizationDeliveryState"
+        },
+        "recoveryState": {
+          "$ref": "#/definitions/TerminalizationRecoveryState"
+        },
+        "terminalIdentity": {
+          "type": "string"
+        },
+        "terminalInteractionReleased": {
+          "type": "boolean"
+        },
+        "terminalization": {
+          "$ref": "#/definitions/TurnTimingTerminalization"
+        }
+      },
+      "required": [
+        "activeTurnDetached",
+        "deliveryState",
+        "recoveryState",
+        "terminalIdentity",
+        "terminalInteractionReleased",
+        "terminalization"
+      ],
+      "type": "object"
+    },
     "TurnTiming": {
       "description": "Immutable wall-clock profile captured at the core terminal boundary.\n\n`exclusive` is the canonical elapsed-time partition. Values in `unions` and `local` may overlap and must not be added to that partition.",
       "properties": {
@@ -5813,22 +5959,6 @@
         "profileValid": {
           "type": "boolean"
         },
-        "provablyAvoidableTokens": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/TurnTimingDiagnosticTokenAggregate"
-            }
-          ],
-          "default": {
-            "cachedInputTokens": 0,
-            "inputTokens": 0,
-            "logicalGenerations": 0,
-            "reasoningTokens": 0,
-            "totalTokens": 0,
-            "visibleOutputTokens": 0
-          },
-          "description": "Provider input attributable only to generations carrying a matching owner-proved deterministic continuation receipt at the same state revision. This is intentionally independent from observational nonprogress."
-        },
         "schemaVersion": {
           "format": "uint16",
           "minimum": 0.0,
@@ -5849,7 +5979,6 @@
             }
           ],
           "default": {
-            "candidateToValidationLaunchNs": 0,
             "checkpointTokens": 0,
             "completionGateNs": 0,
             "conservativeRerunCount": 0,
@@ -5874,7 +6003,6 @@
             "unclassifiedNs": 0,
             "validationAggregateCount": 0,
             "validationAggregateNs": 0,
-            "validationAggregateToGateNs": 0,
             "validationLaunchCount": 0,
             "validationProcessNs": 0
           },
@@ -5969,18 +6097,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "continuationsByDisposition": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/TurnTimingGenerationDispositionCounts"
-            }
-          ],
-          "default": {
-            "modelRequired": 0,
-            "ownerDrained": 0,
-            "suppressed": 0
-          }
-        },
         "discoveryAfterOwnerResolutionCount": {
           "default": 0,
           "format": "uint32",
@@ -6005,6 +6121,18 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "generationsByDisposition": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingGenerationDispositionCounts"
+            }
+          ],
+          "default": {
+            "decisionBearing": 0,
+            "deterministic": 0,
+            "unknown": 0
+          }
+        },
         "generationsByPurpose": {
           "allOf": [
             {
@@ -6018,13 +6146,10 @@
             "failureDiagnosis": 0,
             "implementationDecision": 0,
             "initialReasoning": 0,
-            "postEditInspection": 0,
             "repair": 0,
-            "sourceDiscovery": 0,
             "sourceEvidenceInterpretation": 0,
             "terminalCompletionReasoning": 0,
             "validationInterpretation": 0,
-            "validationSelection": 0,
             "wait": 0
           }
         },
@@ -6129,25 +6254,7 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "planningRepeatedDigestCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "planningSemanticEffectCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "postEditCandidateCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "postEditInspectionCount": {
           "default": 0,
           "format": "uint32",
           "minimum": 0.0,
@@ -6239,6 +6346,13 @@
         },
         "strictSubsetSourceRereadCount": {
           "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "suppressedDeterministicContinuationCount": {
+          "default": 0,
+          "description": "Authoritative number of model boundaries suppressed by accepted deterministic-continuation receipts. A receipt whose `suppressed_continuation_count` is N contributes N, not one. Invalid, rejected, and zero-count receipts contribute nothing. This counter is independent of `generations_by_disposition`.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -6367,17 +6481,6 @@
     },
     "TurnTimingDeterministicContinuationReceipt": {
       "properties": {
-        "avoidedTokenUsage": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/TurnTimingProviderTokenUsage"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Populated only by an explicit paired counterfactual measurement. Normal runtime receipts leave this absent rather than estimating savings."
-        },
         "class": {
           "$ref": "#/definitions/DeterministicContinuationClass"
         },
@@ -6394,6 +6497,9 @@
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "wireIdentity": {
+          "type": "string"
         }
       },
       "required": [
@@ -6401,7 +6507,8 @@
         "hostAction",
         "resourceIdentityHash",
         "stateRevision",
-        "suppressedContinuationCount"
+        "suppressedContinuationCount",
+        "wireIdentity"
       ],
       "type": "object"
     },
@@ -6525,19 +6632,19 @@
     },
     "TurnTimingGenerationDispositionCounts": {
       "properties": {
-        "modelRequired": {
+        "decisionBearing": {
           "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
-        "ownerDrained": {
+        "deterministic": {
           "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
-        "suppressed": {
+        "unknown": {
           "default": 0,
           "format": "uint32",
           "minimum": 0.0,
@@ -6549,12 +6656,10 @@
     "TurnTimingGenerationPurpose": {
       "enum": [
         "initial",
-        "source_discovery",
         "source_interpretation",
         "implementation",
         "wait",
         "failure_diagnosis",
-        "validation_launch",
         "validation_interpretation",
         "repair",
         "agent_coordination",
@@ -6665,18 +6770,7 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "postEditInspection": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "repair": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sourceDiscovery": {
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -6698,12 +6792,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "validationSelection": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "wait": {
           "format": "uint32",
           "minimum": 0.0,
@@ -6714,7 +6802,6 @@
         "compactionRecovery",
         "failureDiagnosis",
         "repair",
-        "sourceDiscovery",
         "validationInterpretation",
         "wait"
       ],
@@ -6901,10 +6988,6 @@
             "null"
           ]
         },
-        "decisionBearing": {
-          "default": false,
-          "type": "boolean"
-        },
         "dispatchMs": {
           "format": "uint64",
           "minimum": 0.0,
@@ -6974,13 +7057,6 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
-        },
-        "ownerProvedPredeterminedContinuation": {
-          "description": "Exact hashed identity of the owner receipt proving that this continuation was predetermined at the recorded state revision.",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "postDiscovery": {
           "anyOf": [
@@ -7279,11 +7355,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "planningIdentityNs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "promptConstructionNs": {
           "format": "uint64",
           "minimum": 0.0,
@@ -7317,7 +7388,6 @@
         "firstRequestDispatchReadyNs",
         "historySnapshotNs",
         "normalizationNs",
-        "planningIdentityNs",
         "promptConstructionNs",
         "requestTransformationNs",
         "serializationNs",
@@ -7328,15 +7398,11 @@
     },
     "TurnTimingProgressKind": {
       "enum": [
-        "new_input",
         "new_named_evidence",
         "source_closure",
         "workspace_mutation",
         "validation_result",
-        "plan_change",
-        "failure_observation",
-        "completion_state",
-        "structured_action_change"
+        "failure_observation"
       ],
       "type": "string"
     },
@@ -7660,12 +7726,6 @@
     },
     "TurnTimingTerminalization": {
       "properties": {
-        "candidateToValidationLaunchNs": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "checkpointTokens": {
           "default": 0,
           "format": "uint64",
@@ -7673,7 +7733,6 @@
           "type": "integer"
         },
         "completionGateNs": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -7810,12 +7869,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "validationAggregateToGateNs": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "validationLaunchCount": {
           "default": 0,
           "format": "uint32",
@@ -7823,12 +7876,15 @@
           "type": "integer"
         },
         "validationProcessNs": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         }
       },
+      "required": [
+        "completionGateNs",
+        "validationProcessNs"
+      ],
       "type": "object"
     },
     "TurnTimingUnions": {
@@ -8566,6 +8622,26 @@
         "params"
       ],
       "title": "Turn/completedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "turn/terminalizationCompleted"
+          ],
+          "title": "Turn/terminalizationCompletedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/TurnTerminalizationCompletedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Turn/terminalizationCompletedNotification",
       "type": "object"
     },
     {

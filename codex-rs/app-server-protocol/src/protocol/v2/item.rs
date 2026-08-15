@@ -41,6 +41,7 @@ use codex_protocol::protocol::GuardianUserAuthorization as CoreGuardianUserAutho
 use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::ReviewDecision as CoreReviewDecision;
 use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
+use codex_protocol::protocol::SurfacedToolResult;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use schemars::JsonSchema;
@@ -1196,6 +1197,9 @@ pub enum CollabAgentStatus {
 pub struct CollabAgentState {
     pub status: CollabAgentStatus,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub surfaced_result: Option<SurfacedToolResult>,
 }
 
 impl From<CoreAgentStatus> for CollabAgentState {
@@ -1204,30 +1208,45 @@ impl From<CoreAgentStatus> for CollabAgentState {
             CoreAgentStatus::PendingInit => Self {
                 status: CollabAgentStatus::PendingInit,
                 message: None,
+                surfaced_result: None,
             },
             CoreAgentStatus::Running => Self {
                 status: CollabAgentStatus::Running,
                 message: None,
+                surfaced_result: None,
             },
             CoreAgentStatus::Interrupted => Self {
                 status: CollabAgentStatus::Interrupted,
                 message: None,
+                surfaced_result: None,
             },
             CoreAgentStatus::Completed(message) => Self {
                 status: CollabAgentStatus::Completed,
                 message,
+                surfaced_result: None,
+            },
+            CoreAgentStatus::CompletedWithSurface {
+                last_agent_message,
+                surfaced_result,
+            } => Self {
+                status: CollabAgentStatus::Completed,
+                message: last_agent_message,
+                surfaced_result: Some(surfaced_result),
             },
             CoreAgentStatus::Errored(message) => Self {
                 status: CollabAgentStatus::Errored,
                 message: Some(message),
+                surfaced_result: None,
             },
             CoreAgentStatus::Shutdown => Self {
                 status: CollabAgentStatus::Shutdown,
                 message: None,
+                surfaced_result: None,
             },
             CoreAgentStatus::NotFound => Self {
                 status: CollabAgentStatus::NotFound,
                 message: None,
+                surfaced_result: None,
             },
         }
     }
@@ -1645,4 +1664,6 @@ pub struct ToolRequestUserInputAnswer {
 /// EXPERIMENTAL. Response payload mapping question ids to answers.
 pub struct ToolRequestUserInputResponse {
     pub answers: HashMap<String, ToolRequestUserInputAnswer>,
+    #[serde(default)]
+    pub interrupted: bool,
 }

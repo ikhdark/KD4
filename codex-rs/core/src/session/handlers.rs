@@ -42,9 +42,7 @@ use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
-use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -100,7 +98,7 @@ pub async fn update_thread_settings(
         Ok(()) => {
             sess.send_event_raw_without_materializing_rollout(Event {
                 id: sub_id,
-                msg: thread_settings_applied_event(sess).await,
+                msg: sess.thread_settings_applied_event().await,
             })
             .await;
         }
@@ -168,30 +166,6 @@ async fn thread_settings_update(
     }
 }
 
-async fn thread_settings_applied_event(sess: &Session) -> EventMsg {
-    let snapshot = {
-        let state = sess.state.lock().await;
-        state.session_configuration.thread_config_snapshot()
-    };
-    let cwd = snapshot.cwd().clone();
-    EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
-        thread_settings: ThreadSettingsSnapshot {
-            model: snapshot.model,
-            model_provider_id: snapshot.model_provider_id,
-            service_tier: snapshot.service_tier,
-            approval_policy: snapshot.approval_policy,
-            approvals_reviewer: snapshot.approvals_reviewer,
-            permission_profile: snapshot.permission_profile,
-            active_permission_profile: snapshot.active_permission_profile,
-            cwd,
-            reasoning_effort: snapshot.reasoning_effort,
-            reasoning_summary: snapshot.reasoning_summary,
-            personality: snapshot.personality,
-            collaboration_mode: snapshot.collaboration_mode,
-        },
-    })
-}
-
 pub(super) async fn user_input_or_turn_inner(
     sess: &Arc<Session>,
     sub_id: String,
@@ -223,7 +197,7 @@ pub(super) async fn user_input_or_turn_inner(
     if emit_thread_settings_applied {
         sess.send_event_raw_without_materializing_rollout(Event {
             id: sub_id.clone(),
-            msg: thread_settings_applied_event(sess).await,
+            msg: sess.thread_settings_applied_event().await,
         })
         .await;
     }
@@ -256,6 +230,7 @@ pub(super) async fn user_input_or_turn_inner(
             current_context
                 .update_validation_authorization(&items)
                 .await;
+            current_context.update_multi_agent_spawn_authorization(&items);
             current_context.update_source_owner_candidates(&items).await;
             current_context.session_telemetry.user_prompt(&items);
             sess.refresh_mcp_servers_if_requested(
@@ -303,9 +278,13 @@ pub async fn inter_agent_communication(
     communication: InterAgentCommunication,
 ) {
     let trigger_turn = communication.trigger_turn;
-    sess.input_queue
+    let accepted = sess
+        .input_queue
         .enqueue_mailbox_communication(communication)
         .await;
+    if !accepted {
+        return;
+    }
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
@@ -438,6 +417,18 @@ pub async fn request_user_input_response(
     id: String,
     response: RequestUserInputResponse,
 ) {
+    let terminal = if response.interrupted {
+        sess.active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|active| active.terminal.clone())
+    } else {
+        None
+    };
+    if let Some(terminal) = terminal {
+        terminal.mark_interrupt_pending().await;
+    }
     sess.notify_user_input_response(&id, response).await;
 }
 

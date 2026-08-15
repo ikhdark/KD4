@@ -666,6 +666,7 @@ mod tests {
 
     fn turn_completed(turn_id: &str) -> ServerNotification {
         ServerNotification::TurnCompleted(TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -677,6 +678,9 @@ mod tests {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: Some(1),
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -721,6 +725,7 @@ mod tests {
             id: "turn-1".to_string(),
             response: ToolRequestUserInputResponse {
                 answers: HashMap::new(),
+                interrupted: false,
             },
         });
 
@@ -806,6 +811,7 @@ mod tests {
             id: "turn-1".to_string(),
             response: ToolRequestUserInputResponse {
                 answers: HashMap::new(),
+                interrupted: false,
             },
         });
 
@@ -830,6 +836,7 @@ mod tests {
             id: "turn-1".to_string(),
             response: ToolRequestUserInputResponse {
                 answers: HashMap::new(),
+                interrupted: false,
             },
         });
 

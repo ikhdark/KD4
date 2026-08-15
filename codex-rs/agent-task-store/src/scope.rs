@@ -175,6 +175,7 @@ fn normalize_lexically(path: &str) -> StoreResult<String> {
                     "scope traversal is not allowed: {path}"
                 )));
             }
+            Component::CurDir if path.trim() == "." => {}
             Component::CurDir => {
                 return Err(StoreError::InvalidScope(format!(
                     "scope dot components are not allowed: {path}"
@@ -186,6 +187,9 @@ fn normalize_lexically(path: &str) -> StoreResult<String> {
                 )));
             }
         }
+    }
+    if components.is_empty() && path.trim() == "." {
+        return Ok(".".to_string());
     }
     if components.is_empty() {
         return Err(StoreError::InvalidScope(
@@ -232,6 +236,9 @@ fn canonical_relative_identity(canonical_root: &Path, relative: &str) -> StoreRe
             ))),
         })
         .collect::<StoreResult<Vec<_>>>()?;
+    if components.is_empty() && relative == "." {
+        return Ok(".".to_string());
+    }
     if components.is_empty() {
         return Err(StoreError::InvalidScope(
             "scope path cannot resolve to the repository root".to_string(),
@@ -243,6 +250,9 @@ fn canonical_relative_identity(canonical_root: &Path, relative: &str) -> StoreRe
 fn is_descendant(parent: &str, child: &str) -> bool {
     let parent = comparison_key(parent);
     let child = comparison_key(child);
+    if parent == "." {
+        return child != ".";
+    }
     child
         .strip_prefix(&parent)
         .is_some_and(|suffix| suffix.starts_with('/'))

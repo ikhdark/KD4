@@ -100,6 +100,7 @@ fn completed_task_with_validation(
         assignment: Assignment {
             assignment_id,
             root_session_id: "root-session".to_string(),
+            admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
             repository_id: "repository".to_string(),
             workspace_id: "workspace".to_string(),
             role: AgentRole::Worker,

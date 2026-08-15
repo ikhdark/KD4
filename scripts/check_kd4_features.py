@@ -7,19 +7,22 @@ import argparse
 import json
 import re
 import subprocess
-import tomllib
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
+import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_FILE_NAME = "kd4_features.toml"
 DEFAULT_MANIFEST = REPO_ROOT / MANIFEST_FILE_NAME
 SELF_FEATURE_ID = "kd4-feature-manifest"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+STATUS_SEMANTICS = "implementation_lifecycle"
 ALLOWED_STATUSES = frozenset({"enabled", "disabled", "orphaned", "planned", "replaced"})
+ALLOWED_RUNTIME_STATUSES = frozenset({"enabled", "disabled"})
 ALLOWED_CAPABILITY_KINDS = frozenset({"runtime", "workflow", "library", "guidance"})
 ALLOWED_EVIDENCE_KINDS = frozenset(
     {"entrypoint", "module", "registration", "config", "protocol", "test", "workflow"}
@@ -40,6 +43,7 @@ class CheckResult:
     schema_version: int | None
     feature_count: int
     status_counts: dict[str, int]
+    runtime_status_counts: dict[str, int]
     findings: tuple[Finding, ...]
 
     @property
@@ -52,6 +56,7 @@ class CheckResult:
             "schemaVersion": self.schema_version,
             "featureCount": self.feature_count,
             "statusCounts": self.status_counts,
+            "runtimeStatusCounts": self.runtime_status_counts,
             "findings": [asdict(finding) for finding in self.findings],
         }
 
@@ -80,6 +85,153 @@ def _required_text(
     return Finding(
         "error", "missing-field", f"{key} must be a non-empty string", feature_id
     )
+
+
+def _project_feature_override(repo_root: Path, feature_key: str) -> bool | None:
+    config_path = repo_root / ".codex" / "config.toml"
+    if not config_path.is_file():
+        return None
+    try:
+        with config_path.open("rb") as config_file:
+            value: object = tomllib.load(config_file)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    for part in feature_key.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("enabled"), bool):
+        return value["enabled"]
+    return None
+
+
+def _feature_default(repo_root: Path, feature_key: str) -> bool | None:
+    key = feature_key.removeprefix("features.")
+    registry_path = repo_root / "codex-rs" / "features" / "src" / "lib.rs"
+    try:
+        registry = registry_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    pattern = re.compile(
+        rf'FeatureSpec\s*\{{(?:(?!FeatureSpec\s*\{{).)*?key:\s*"{re.escape(key)}"'
+        rf"(?:(?!FeatureSpec\s*\{{).)*?default_enabled:\s*(true|false)",
+        flags=re.DOTALL,
+    )
+    match = pattern.search(registry)
+    if match is None:
+        return None
+    return match.group(1) == "true"
+
+
+def _validate_runtime_status(
+    *,
+    feature: dict[str, Any],
+    feature_id: str,
+    repo_root: Path,
+    findings: list[Finding],
+) -> str | None:
+    config_keys = feature.get("config_keys")
+    feature_config_keys = (
+        [key for key in config_keys if key.startswith("features.")]
+        if isinstance(config_keys, list)
+        else []
+    )
+    runtime_feature_key = feature.get("runtime_feature_key")
+    runtime_status = feature.get("runtime_status")
+    runtime_status_source = feature.get("runtime_status_source")
+
+    if not feature_config_keys:
+        if any(
+            field in feature
+            for field in (
+                "runtime_feature_key",
+                "runtime_status",
+                "runtime_status_source",
+            )
+        ):
+            findings.append(
+                Finding(
+                    "error",
+                    "unexpected-runtime-status",
+                    "runtime status fields require a features.* config key",
+                    feature_id,
+                )
+            )
+        return None
+
+    if runtime_feature_key not in feature_config_keys:
+        findings.append(
+            Finding(
+                "error",
+                "invalid-runtime-feature-key",
+                "runtime_feature_key must select one declared features.* config key",
+                feature_id,
+            )
+        )
+    if runtime_status not in ALLOWED_RUNTIME_STATUSES:
+        findings.append(
+            Finding(
+                "error",
+                "invalid-runtime-status",
+                f"unsupported runtime_status {runtime_status!r}",
+                feature_id,
+            )
+        )
+        return None
+    if not isinstance(runtime_status_source, str) or not runtime_status_source:
+        findings.append(
+            Finding(
+                "error",
+                "invalid-runtime-status-source",
+                "runtime_status_source must be a non-empty string",
+                feature_id,
+            )
+        )
+        return runtime_status
+    if not isinstance(runtime_feature_key, str):
+        return runtime_status
+
+    project_override = _project_feature_override(repo_root, runtime_feature_key)
+    if project_override is not None:
+        expected_enabled = project_override
+        expected_source = ".codex/config.toml"
+    else:
+        feature_default = _feature_default(repo_root, runtime_feature_key)
+        if feature_default is None:
+            findings.append(
+                Finding(
+                    "error",
+                    "unresolved-runtime-status",
+                    f"could not resolve effective state for {runtime_feature_key}",
+                    feature_id,
+                )
+            )
+            return runtime_status
+        expected_enabled = feature_default
+        expected_source = "codex-rs/features/src/lib.rs"
+
+    expected_status = "enabled" if expected_enabled else "disabled"
+    if runtime_status != expected_status:
+        findings.append(
+            Finding(
+                "error",
+                "stale-runtime-status",
+                f"runtime_status is {runtime_status!r}, but {runtime_feature_key} resolves to {expected_status!r}",
+                feature_id,
+            )
+        )
+    if runtime_status_source != expected_source:
+        findings.append(
+            Finding(
+                "error",
+                "stale-runtime-status-source",
+                f"runtime_status_source must be {expected_source!r}",
+                feature_id,
+            )
+        )
+    return runtime_status
 
 
 def _validate_declared_paths(
@@ -298,6 +450,7 @@ def validate_manifest(
             schema_version=None,
             feature_count=0,
             status_counts={},
+            runtime_status_counts={},
             findings=(Finding("error", "manifest-load", str(exc)),),
         )
 
@@ -308,6 +461,15 @@ def validate_manifest(
                 "error",
                 "schema-version",
                 f"expected schema_version {SCHEMA_VERSION}, found {schema_version!r}",
+            )
+        )
+
+    if manifest.get("status_semantics") != STATUS_SEMANTICS:
+        findings.append(
+            Finding(
+                "error",
+                "status-semantics",
+                f"status_semantics must be {STATUS_SEMANTICS!r}",
             )
         )
 
@@ -351,6 +513,7 @@ def validate_manifest(
 
     seen_ids: set[str] = set()
     status_counts: Counter[str] = Counter()
+    runtime_status_counts: Counter[str] = Counter()
     text_cache: dict[Path, str] = {}
     for index, feature in enumerate(features):
         if not isinstance(feature, dict):
@@ -456,6 +619,15 @@ def validate_manifest(
                 )
             )
 
+        runtime_status = _validate_runtime_status(
+            feature=feature,
+            feature_id=feature_id,
+            repo_root=repo_root,
+            findings=findings,
+        )
+        if runtime_status is not None:
+            runtime_status_counts[runtime_status] += 1
+
         _validate_declared_paths(
             feature_id=feature_id,
             field="generated_artifacts",
@@ -551,6 +723,7 @@ def validate_manifest(
         schema_version=schema_version if isinstance(schema_version, int) else None,
         feature_count=len(features),
         status_counts=dict(sorted(status_counts.items())),
+        runtime_status_counts=dict(sorted(runtime_status_counts.items())),
         findings=tuple(findings),
     )
 
@@ -587,7 +760,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{status}={count}" for status, count in result.status_counts.items()
         )
         print(
-            f"KD4 FEATURE CHECK {verdict}: {result.feature_count} feature(s); {counts}"
+            f"KD4 FEATURE CHECK {verdict}: {result.feature_count} feature(s); {counts}; "
+            f"runtime={result.runtime_status_counts}"
         )
         for finding in result.findings:
             feature = f" [{finding.feature_id}]" if finding.feature_id else ""

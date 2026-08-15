@@ -15,6 +15,7 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::flat_tool_name;
+use crate::tools::known_delta_store::KnownDeltaHit;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::RuntimePathPrepends;
@@ -65,6 +66,45 @@ use tokio::sync::OwnedRwLockReadGuard;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
+#[cfg(test)]
+pub(crate) mod test_observation {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Clone, Default)]
+    struct Counters {
+        process_launches: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Snapshot {
+        pub process_launches: usize,
+    }
+
+    tokio::task_local! {
+        static COUNTERS: Counters;
+    }
+
+    pub(crate) async fn observe<F: Future>(future: F) -> (F::Output, Snapshot) {
+        let counters = Counters::default();
+        let output = COUNTERS.scope(counters.clone(), future).await;
+        (
+            output,
+            Snapshot {
+                process_launches: counters.process_launches.load(Ordering::Relaxed),
+            },
+        )
+    }
+
+    pub(super) fn record_process_launch() {
+        let _ = COUNTERS.try_with(|counters| {
+            counters.process_launches.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+}
+
 /// Request payload used by the unified-exec runtime after approvals and
 /// sandbox preferences have been resolved for the current turn.
 #[derive(Clone, Debug)]
@@ -98,6 +138,13 @@ pub struct UnifiedExecRequest {
     pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
     pub validation_observation:
         Arc<std::sync::Mutex<Option<crate::validation_admission::ValidationObservationToken>>>,
+    pub(crate) known_delta_hit: Option<KnownDeltaHit>,
+}
+
+#[derive(Debug)]
+pub(crate) enum UnifiedExecLaunch {
+    Process(Arc<UnifiedExecProcess>),
+    KnownDelta(KnownDeltaHit),
 }
 
 #[derive(Debug)]
@@ -348,7 +395,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     }
 }
 
-impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExecRuntime<'a> {
+impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRuntime<'a> {
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
         Some(&req.sandbox_cwd)
     }
@@ -358,6 +405,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         req: &UnifiedExecRequest,
         ctx: &ToolCtx,
     ) -> Option<NetworkApprovalSpec> {
+        if req.known_delta_hit.is_some() {
+            return None;
+        }
         let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
@@ -388,7 +438,12 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         req: &UnifiedExecRequest,
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
-    ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
+    ) -> Result<UnifiedExecLaunch, ToolError> {
+        if let Some(hit) = req.known_delta_hit.as_ref() {
+            return Ok(UnifiedExecLaunch::KnownDelta(hit.clone()));
+        }
+        #[cfg(test)]
+        test_observation::record_process_launch();
         let base_command = &req.command;
         let session_shell = ctx.session.user_shell();
         let shell = req
@@ -555,6 +610,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                             &self.pending_spawns,
                         )
                         .await
+                        .map(UnifiedExecLaunch::Process)
                         .map_err(|err| match err {
                             UnifiedExecError::SandboxDenied { output, .. } => {
                                 ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
@@ -606,6 +662,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 &self.pending_spawns,
             )
             .await
+            .map(UnifiedExecLaunch::Process)
     }
 }
 
@@ -752,6 +809,7 @@ mod tests {
             },
             validation_launch: None,
             validation_observation: Arc::new(std::sync::Mutex::new(None)),
+            known_delta_hit: None,
         };
 
         assert_eq!(
@@ -864,6 +922,7 @@ mod tests {
             exec_approval_requirement,
             validation_launch: None,
             validation_observation: Arc::new(std::sync::Mutex::new(None)),
+            known_delta_hit: None,
         }
     }
 

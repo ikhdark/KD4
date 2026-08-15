@@ -233,7 +233,13 @@ impl LocalAgentTaskStore {
             coordination_root: Arc::new(coordination_root),
             missing_evidence_rejections: Arc::new(Mutex::new(HashMap::new())),
         };
-        store.drain_snapshot_gc_queue().await?;
+        store
+            .drain_snapshot_gc_queue_best_effort("store initialization")
+            .await;
+        store.queue_eligible_retained_snapshot_candidates().await?;
+        store
+            .drain_snapshot_gc_queue_best_effort("store initialization")
+            .await;
         store.reconcile_snapshot_files().await?;
         store.rebuild_wake_streams().await?;
         Ok(store)
@@ -279,35 +285,6 @@ impl LocalAgentTaskStore {
         Ok(sqlx::query_scalar("PRAGMA busy_timeout")
             .fetch_one(&self.pool)
             .await?)
-    }
-
-    pub async fn validate_dependencies(
-        &self,
-        candidate_id: AssignmentId,
-        dependencies: &[AssignmentId],
-    ) -> StoreResult<()> {
-        self.validate_dependencies_impl(candidate_id, None, dependencies, None)
-            .await
-    }
-
-    async fn validate_dependencies_impl(
-        &self,
-        candidate_id: AssignmentId,
-        repository_id: Option<&str>,
-        dependencies: &[AssignmentId],
-        allowed_pending_gate: Option<(AssignmentId, GateKind)>,
-    ) -> StoreResult<()> {
-        let mut transaction = self.pool.begin().await?;
-        validate_dependencies_tx(
-            &mut transaction,
-            candidate_id,
-            repository_id,
-            dependencies,
-            allowed_pending_gate,
-        )
-        .await?;
-        transaction.commit().await?;
-        Ok(())
     }
 
     async fn create_assignment_impl(
@@ -1858,7 +1835,10 @@ impl LocalAgentTaskStore {
             None,
         )
         .await?;
+        queue_collectible_snapshots_tx(&mut transaction, attempt.assignment_id).await?;
         transaction.commit().await?;
+        self.drain_snapshot_gc_queue_best_effort("receipt submission")
+            .await;
         self.clear_missing_evidence_rejection(attempt_id);
         Ok(receipt)
     }
@@ -2203,7 +2183,10 @@ impl LocalAgentTaskStore {
             None,
         )
         .await?;
+        queue_collectible_snapshots_tx(&mut transaction, assignment_id).await?;
         transaction.commit().await?;
+        self.drain_snapshot_gc_queue_best_effort("assignment abandonment")
+            .await;
         self.clear_missing_evidence_rejection(attempt.attempt_id);
         Ok(receipt)
     }
@@ -2323,7 +2306,10 @@ impl LocalAgentTaskStore {
             )
             .await?;
         }
+        queue_collectible_snapshots_tx(&mut transaction, assignment_id).await?;
         transaction.commit().await?;
+        self.drain_snapshot_gc_queue_best_effort("gate verdict submission")
+            .await;
         Ok(gate)
     }
 
@@ -2419,7 +2405,10 @@ impl LocalAgentTaskStore {
             None,
         )
         .await?;
+        queue_collectible_snapshots_tx(&mut transaction, assignment_id).await?;
         transaction.commit().await?;
+        self.drain_snapshot_gc_queue_best_effort("gate waiver")
+            .await;
         Ok(gate)
     }
 
@@ -2443,6 +2432,8 @@ impl LocalAgentTaskStore {
                 reason: None,
                 updated_agents: Vec::new(),
                 latest_event_id: None,
+                lost_to_retention_count: 0,
+                remaining_count: 0,
                 truncated_count: 0,
                 timed_out: true,
             });
@@ -2491,6 +2482,8 @@ impl LocalAgentTaskStore {
             timed_out: updated_agents.is_empty(),
             updated_agents,
             latest_event_id,
+            lost_to_retention_count: lost_to_retention,
+            remaining_count: not_returned,
             truncated_count: lost_to_retention + not_returned,
         })
     }
@@ -2793,7 +2786,10 @@ impl LocalAgentTaskStore {
             None,
         )
         .await?;
+        queue_collectible_snapshots_tx(&mut transaction, assignment_id).await?;
         transaction.commit().await?;
+        self.drain_snapshot_gc_queue_best_effort("nonproductive recovery")
+            .await;
         Ok(NonproductiveRecovery::Recovered {
             receipt: Box::new(receipt),
             productivity: ProductivitySummary {
@@ -3209,71 +3205,21 @@ impl LocalAgentTaskStore {
         })
     }
 
-    pub async fn garbage_collect_snapshots(
-        &self,
-        assignment_id: AssignmentId,
-        retention_allows: bool,
-    ) -> StoreResult<usize> {
-        if !retention_allows {
-            return Err(StoreError::SnapshotRetentionRequired);
-        }
-        let mut transaction = self.pool.begin().await?;
-        lock_assignment_tx(&mut transaction, assignment_id).await?;
-        let attempts =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attempts WHERE assignment_id = ?")
-                .bind(assignment_id.to_string())
-                .fetch_one(&mut *transaction)
-                .await?;
-        let sealed_attempts = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM attempts WHERE assignment_id = ? AND sealed_at IS NOT NULL",
+    async fn queue_eligible_retained_snapshot_candidates(&self) -> StoreResult<()> {
+        let assignment_ids = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT assignment_id FROM mutation_files
+             WHERE snapshot_retained = 1 ORDER BY assignment_id",
         )
-        .bind(assignment_id.to_string())
-        .fetch_one(&mut *transaction)
+        .fetch_all(&self.pool)
         .await?;
-        let receipts =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM receipts WHERE assignment_id = ?")
-                .bind(assignment_id.to_string())
-                .fetch_one(&mut *transaction)
-                .await?;
-        let pending_gates = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM gates WHERE assignment_id = ? AND sealed_at IS NULL",
-        )
-        .bind(assignment_id.to_string())
-        .fetch_one(&mut *transaction)
-        .await?;
-        if attempts == 0
-            || attempts != sealed_attempts
-            || attempts != receipts
-            || pending_gates != 0
-        {
-            return Err(StoreError::SnapshotRetentionRequired);
+        for assignment_id in assignment_ids {
+            let assignment_id = AssignmentId::parse(&assignment_id)?;
+            let mut transaction = self.pool.begin().await?;
+            lock_assignment_tx(&mut transaction, assignment_id).await?;
+            queue_collectible_snapshots_tx(&mut transaction, assignment_id).await?;
+            transaction.commit().await?;
         }
-        let rows = sqlx::query("SELECT attempt_id, path, snapshot_name, final_snapshot_name FROM mutation_files WHERE assignment_id = ? AND snapshot_retained = 1")
-            .bind(assignment_id.to_string())
-            .fetch_all(&mut *transaction)
-            .await?;
-        for row in &rows {
-            let snapshot_names = [
-                Some(row.get::<String, _>("snapshot_name")),
-                row.get::<Option<String>, _>("final_snapshot_name"),
-            ];
-            for snapshot_name in snapshot_names.into_iter().flatten() {
-                sqlx::query("INSERT OR IGNORE INTO snapshot_gc_queue (snapshot_name, queued_at) VALUES (?, ?)")
-                    .bind(snapshot_name)
-                    .bind(encode(&Utc::now())?)
-                    .execute(&mut *transaction)
-                    .await?;
-            }
-        }
-        sqlx::query(
-            "UPDATE mutation_files SET snapshot_retained = 0 WHERE assignment_id = ? AND snapshot_retained = 1",
-        )
-        .bind(assignment_id.to_string())
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        self.drain_snapshot_gc_queue().await?;
-        Ok(rows.len())
+        Ok(())
     }
 
     async fn drain_snapshot_gc_queue(&self) -> StoreResult<()> {
@@ -3295,6 +3241,17 @@ impl LocalAgentTaskStore {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn drain_snapshot_gc_queue_best_effort(&self, operation: &'static str) {
+        if let Err(error) = self.drain_snapshot_gc_queue().await {
+            tracing::warn!(
+                target: "codex_agent_task_store::snapshot_gc",
+                operation,
+                %error,
+                "private snapshot deletion failed; queued deletion will be retried"
+            );
+        }
     }
 
     async fn reconcile_snapshot_files(&self) -> StoreResult<()> {
@@ -3349,7 +3306,8 @@ impl LocalAgentTaskStore {
             }
         }
         transaction.commit().await?;
-        self.drain_snapshot_gc_queue().await?;
+        self.drain_snapshot_gc_queue_best_effort("snapshot reconciliation")
+            .await;
 
         let snapshot_root = self.coordination_root.join("snapshots");
         let mut pending_directories = vec![snapshot_root];
@@ -4012,6 +3970,105 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
                 .await
         })
     }
+}
+
+async fn queue_collectible_snapshots_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment_id: AssignmentId,
+) -> StoreResult<usize> {
+    // This is the sole snapshot-retention eligibility gate. Startup discovers
+    // candidates only; it uses this same helper instead of inferring eligibility
+    // from the assignment or current-attempt status.
+    let assignment_key = assignment_id.to_string();
+    let attempt_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attempts WHERE assignment_id = ?")
+            .bind(&assignment_key)
+            .fetch_one(&mut **transaction)
+            .await?;
+    if attempt_count == 0 {
+        return Ok(0);
+    }
+    let ineligible_attempt_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM attempts
+         WHERE assignment_id = ?
+           AND (
+               sealed_at IS NULL
+               OR (SELECT COUNT(*) FROM receipts
+                   WHERE receipts.attempt_id = attempts.attempt_id) <> 1
+           )",
+    )
+    .bind(&assignment_key)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if ineligible_attempt_count != 0 {
+        return Ok(0);
+    }
+
+    let current_attempt = load_current_attempt_tx(transaction, assignment_id).await?;
+    if !current_attempt.state.is_terminal() || current_attempt.sealed_at.is_none() {
+        return Ok(0);
+    }
+
+    let unsealed_gate_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM gates
+         WHERE assignment_id = ? AND (sealed_at IS NULL OR status = ?)",
+    )
+    .bind(&assignment_key)
+    .bind(encode(&GateStatus::Pending)?)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if unsealed_gate_count != 0 {
+        return Ok(0);
+    }
+
+    let assignment = load_assignment_tx(transaction, assignment_id).await?;
+    let correction_can_reopen = assignment.role == AgentRole::Worker
+        && current_attempt.ordinal == 0
+        && sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM gates
+             WHERE assignment_id = ? AND kind = ? AND status = ?",
+        )
+        .bind(&assignment_key)
+        .bind(encode(&GateKind::Review)?)
+        .bind(encode(&GateStatus::ChangesRequested)?)
+        .fetch_one(&mut **transaction)
+        .await?
+            != 0;
+    if correction_can_reopen {
+        return Ok(0);
+    }
+
+    let rows = sqlx::query(
+        "SELECT snapshot_name, final_snapshot_name FROM mutation_files
+         WHERE assignment_id = ? AND snapshot_retained = 1",
+    )
+    .bind(&assignment_key)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let queued_at = encode(&Utc::now())?;
+    for row in &rows {
+        let snapshot_names = [
+            Some(row.get::<String, _>("snapshot_name")),
+            row.get::<Option<String>, _>("final_snapshot_name"),
+        ];
+        for snapshot_name in snapshot_names.into_iter().flatten() {
+            sqlx::query(
+                "INSERT OR IGNORE INTO snapshot_gc_queue (snapshot_name, queued_at) VALUES (?, ?)",
+            )
+            .bind(snapshot_name)
+            .bind(&queued_at)
+            .execute(&mut **transaction)
+            .await?;
+        }
+    }
+    sqlx::query(
+        "UPDATE mutation_files SET snapshot_retained = 0
+         WHERE assignment_id = ? AND snapshot_retained = 1",
+    )
+    .bind(&assignment_key)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(rows.len())
 }
 
 async fn prepare_validation_call(
@@ -6182,6 +6239,8 @@ async fn selective_admission_tx(
                             .target_assignment_ids
                             .contains(&existing.assignment_id)
                 });
+            let intentional_legacy_delegation_overlap =
+                is_intentional_legacy_delegation_overlap(assignment, &existing);
             let write_conflicts = existing
                 .write_scope
                 .iter()
@@ -6197,7 +6256,10 @@ async fn selective_admission_tx(
                         })
                 })
                 .collect::<Vec<_>>();
-            if !intentional_integration_overlap && !write_conflicts.is_empty() {
+            if !intentional_integration_overlap
+                && !intentional_legacy_delegation_overlap
+                && !write_conflicts.is_empty()
+            {
                 return Err(StoreError::WriteClaimConflict {
                     conflicts: write_conflicts,
                 });
@@ -6540,13 +6602,13 @@ async fn plan_write_claim_tx(
         HashSet::new()
     };
     let rows = if let Some(excluded) = exclude_assignment_id {
-        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root FROM write_claims wc LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL) AND wc.assignment_id <> ?")
+        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root, a.body_json FROM write_claims wc JOIN assignments a ON a.assignment_id = wc.assignment_id LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL) AND wc.assignment_id <> ?")
             .bind(&bound_workspace_id)
             .bind(excluded.to_string())
             .fetch_all(&mut **transaction)
             .await?
     } else {
-        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root FROM write_claims wc LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL)")
+        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root, a.body_json FROM write_claims wc JOIN assignments a ON a.assignment_id = wc.assignment_id LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL)")
             .bind(&bound_workspace_id)
             .fetch_all(&mut **transaction)
             .await?
@@ -6555,6 +6617,7 @@ async fn plan_write_claim_tx(
     let mut conflicts = Vec::new();
     for row in rows {
         let existing_id = AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?;
+        let existing: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
         let existing_repository_id = row.get::<Option<String>, _>("repository_id");
         let mut scopes: Vec<RepoScope> = decode(row.get::<String, _>("scopes_json").as_str())?;
         if let Some(canonical_root) = row.get::<Option<String>, _>("canonical_root") {
@@ -6577,6 +6640,9 @@ async fn plan_write_claim_tx(
             })
             .collect::<Vec<_>>();
         if overlaps.is_empty() {
+            continue;
+        }
+        if is_intentional_legacy_delegation_overlap(assignment, &existing) {
             continue;
         }
         let fully_covered = scopes.iter().all(|existing_scope| {
@@ -6609,6 +6675,21 @@ async fn plan_write_claim_tx(
             .then_with(|| left.requested_scope.path.cmp(&right.requested_scope.path))
     });
     Ok((supersedes, conflicts))
+}
+
+fn is_intentional_legacy_delegation_overlap(
+    assignment: &Assignment,
+    existing: &Assignment,
+) -> bool {
+    matches!(
+        assignment.admission_origin,
+        crate::AssignmentAdmissionOrigin::LegacyMessage {
+            parent_assignment_id: Some(parent_assignment_id),
+        } if parent_assignment_id == existing.assignment_id
+    ) && matches!(
+        existing.admission_origin,
+        crate::AssignmentAdmissionOrigin::LegacyMessage { .. }
+    )
 }
 
 async fn require_repository_identity_tx(

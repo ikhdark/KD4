@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ModelsClient;
+use codex_api::ModelsListResult;
 use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
 use codex_api::TransportError;
@@ -23,6 +24,7 @@ use codex_login::default_client::create_client_for_route_async;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
+use codex_models_manager::manager::ModelsFetchResult;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CoreResult;
@@ -30,6 +32,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_response_debug_context::extract_response_debug_context;
 use codex_response_debug_context::telemetry_transport_error_message;
 use http::HeaderMap;
+use http::header::IF_NONE_MATCH;
 use tokio::time::timeout;
 
 use crate::auth::agent_identity_telemetry;
@@ -77,6 +80,23 @@ impl OpenAiModelsEndpoint {
         client_version: &str,
         http_client_factory: HttpClientFactory,
     ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+        match self
+            .list_models_conditional(client_version, http_client_factory, None)
+            .await?
+        {
+            ModelsFetchResult::Modified { models, etag } => Ok((models, etag)),
+            ModelsFetchResult::NotModified => Err(CodexErr::InvalidRequest(
+                "models endpoint returned 304 without an ETag validator".to_string(),
+            )),
+        }
+    }
+
+    async fn list_models_conditional(
+        &self,
+        client_version: &str,
+        http_client_factory: HttpClientFactory,
+        etag: Option<&str>,
+    ) -> CoreResult<ModelsFetchResult> {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let auth = self.auth().await;
@@ -105,10 +125,23 @@ impl OpenAiModelsEndpoint {
                 .await?;
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
+            let mut headers = HeaderMap::new();
+            if let Some(etag) = etag {
+                let etag = etag.parse().map_err(|err| {
+                    CodexErr::InvalidRequest(format!("invalid models ETag validator: {err}"))
+                })?;
+                headers.insert(IF_NONE_MATCH, etag);
+            }
             client
-                .list_models(request_url, HeaderMap::new())
+                .list_models_conditional(request_url, headers)
                 .await
                 .map_err(map_api_error)
+                .map(|result| match result {
+                    ModelsListResult::Modified { models, etag } => {
+                        ModelsFetchResult::Modified { models, etag }
+                    }
+                    ModelsListResult::NotModified => ModelsFetchResult::NotModified,
+                })
         })
         .await
         .map_err(|_| CodexErr::Timeout)?
@@ -141,6 +174,20 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
             self,
             client_version,
             http_client_factory,
+        ))
+    }
+
+    fn list_models_conditional<'a>(
+        &'a self,
+        client_version: &'a str,
+        http_client_factory: HttpClientFactory,
+        etag: Option<&'a str>,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsFetchResult>> {
+        Box::pin(OpenAiModelsEndpoint::list_models_conditional(
+            self,
+            client_version,
+            http_client_factory,
+            etag,
         ))
     }
 }
@@ -193,7 +240,9 @@ impl RequestTelemetry for ModelsRequestTelemetry {
         error: Option<&TransportError>,
         duration: Duration,
     ) {
-        let success = status.is_some_and(|code| code.is_success()) && error.is_none();
+        let success = status
+            .is_some_and(|code| code.is_success() || code == http::StatusCode::NOT_MODIFIED)
+            && error.is_none();
         let error_message = error.map(telemetry_transport_error_message);
         let response_debug = error
             .map(extract_response_debug_context)
@@ -287,6 +336,7 @@ mod tests {
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
     use wiremock::matchers::query_param;
@@ -389,5 +439,35 @@ mod tests {
                 format!("{}/models?client_version=0.0.0", server.uri()),
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn conditional_model_request_sends_etag_and_accepts_not_modified() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("client_version", "0.0.0"))
+            .and(header("if-none-match", "\"models-etag\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
+            auth_manager: None,
+            transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
+        };
+
+        let result = endpoint
+            .list_models_conditional(
+                "0.0.0",
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                Some("\"models-etag\""),
+            )
+            .await
+            .expect("conditional models request should succeed");
+
+        assert!(matches!(result, ModelsFetchResult::NotModified));
     }
 }

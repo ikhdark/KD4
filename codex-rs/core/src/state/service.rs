@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use super::SessionState;
 use crate::SkillsService;
 use crate::agent::AgentControl;
 use crate::agents_md_manager::AgentsMdManager;
@@ -123,7 +124,9 @@ impl SessionServices {
         available_environment_ids: Vec<String>,
         manager: McpConnectionManager,
     ) -> Result<()> {
-        let runtime = self.publish_mcp_runtime(
+        // Session construction has not published a `Session` yet, so no pending
+        // turn can race this initial runtime installation.
+        let runtime = self.publish_mcp_runtime_unowned(
             config,
             plugins_available,
             runtime_context,
@@ -135,14 +138,93 @@ impl SessionServices {
 
     pub(crate) fn publish_mcp_runtime(
         &self,
+        state_owner: &mut SessionState,
         config: Arc<McpConfig>,
         plugins_available: bool,
         runtime_context: McpRuntimeContext,
         available_environment_ids: Vec<String>,
         manager: McpConnectionManager,
     ) -> Arc<McpRuntimeSnapshot> {
-        let manager = Arc::new(manager);
-        let generation = self.bump_planning_generation();
+        self.publish_mcp_runtime_update(
+            state_owner,
+            config,
+            plugins_available,
+            runtime_context,
+            available_environment_ids,
+            Arc::new(manager),
+        )
+    }
+
+    pub(crate) fn publish_mcp_runtime_reusing_manager(
+        &self,
+        state_owner: &mut SessionState,
+        config: Arc<McpConfig>,
+        plugins_available: bool,
+        runtime_context: McpRuntimeContext,
+        available_environment_ids: Vec<String>,
+        manager: Arc<McpConnectionManager>,
+    ) -> Arc<McpRuntimeSnapshot> {
+        self.publish_mcp_runtime_update(
+            state_owner,
+            config,
+            plugins_available,
+            runtime_context,
+            available_environment_ids,
+            manager,
+        )
+    }
+
+    fn publish_mcp_runtime_update(
+        &self,
+        state_owner: &mut SessionState,
+        config: Arc<McpConfig>,
+        plugins_available: bool,
+        runtime_context: McpRuntimeContext,
+        available_environment_ids: Vec<String>,
+        manager: Arc<McpConnectionManager>,
+    ) -> Arc<McpRuntimeSnapshot> {
+        let next_generation = self.planning_generation().saturating_add(1);
+        let runtime = self.publish_mcp_runtime_with_generation(
+            next_generation,
+            config,
+            plugins_available,
+            runtime_context,
+            available_environment_ids,
+            manager,
+        );
+        let published_generation = self.advance_planning_generation(state_owner);
+        debug_assert_eq!(published_generation, next_generation);
+        runtime
+    }
+
+    fn publish_mcp_runtime_unowned(
+        &self,
+        config: Arc<McpConfig>,
+        plugins_available: bool,
+        runtime_context: McpRuntimeContext,
+        available_environment_ids: Vec<String>,
+        manager: McpConnectionManager,
+    ) -> Arc<McpRuntimeSnapshot> {
+        let generation = self.bump_planning_generation_unowned();
+        self.publish_mcp_runtime_with_generation(
+            generation,
+            config,
+            plugins_available,
+            runtime_context,
+            available_environment_ids,
+            Arc::new(manager),
+        )
+    }
+
+    fn publish_mcp_runtime_with_generation(
+        &self,
+        generation: u64,
+        config: Arc<McpConfig>,
+        plugins_available: bool,
+        runtime_context: McpRuntimeContext,
+        available_environment_ids: Vec<String>,
+        manager: Arc<McpConnectionManager>,
+    ) -> Arc<McpRuntimeSnapshot> {
         let runtime = Arc::new(McpRuntimeSnapshot::new(
             generation,
             config,
@@ -159,7 +241,14 @@ impl SessionServices {
         self.planning_generation.load(Ordering::Acquire)
     }
 
-    pub(crate) fn bump_planning_generation(&self) -> u64 {
+    /// Advances planning state while the caller owns the session persistence
+    /// mutex. Requiring the mutable state owner makes invalidation mutually
+    /// exclusive with pending-plan compare-and-commit.
+    pub(crate) fn advance_planning_generation(&self, _state_owner: &mut SessionState) -> u64 {
+        self.bump_planning_generation_unowned()
+    }
+
+    fn bump_planning_generation_unowned(&self) -> u64 {
         self.planning_generation
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1)

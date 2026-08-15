@@ -4,6 +4,7 @@ use crate::agent::control::AgentExecutionGuard;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
+use crate::config::PermissionProfileSnapshot;
 use crate::config::ThreadStoreConfig;
 use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -15,6 +16,7 @@ use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::resolve_multi_agent_version;
+use crate::session::session::SessionSettingsUpdate;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use codex_agent_graph_store::AgentGraphStore;
@@ -25,6 +27,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::InProcessCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
+use codex_config::types::WindowsSandboxModeToml;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::ExtensionDataInit;
@@ -44,9 +47,13 @@ use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::persisted_thread_settings::PersistedThreadSettings;
+use codex_protocol::persisted_thread_settings::PersistedThreadSettingsOverrideMask;
+use codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
@@ -128,17 +135,26 @@ pub struct NewThread {
     pub session_configured: SessionConfiguredEvent,
 }
 
-// TODO(ccunningham): Add an explicit non-interrupting live-turn snapshot once
-// core can represent sampling boundaries directly instead of relying on
-// whichever items happened to be persisted mid-turn.
-//
-// Two likely future variants:
-// - `TruncateToLastSamplingBoundary` for callers that want a coherent fork from
-//   the last stable model boundary without synthesizing an interrupt.
-// - `WaitUntilNextSamplingBoundary` (or similar) for callers that prefer to
-//   fork after the next sampling boundary rather than interrupting immediately.
+/// Inputs outside rollout history used while reconstructing persistent settings.
+///
+/// `fallback` may contain SQLite/store metadata and only fills fields for which
+/// the exact rollout prefix has no evidence. `explicit_overrides` removes
+/// reconstructed fields already supplied by the caller's loaded `Config`.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadSettingsReconstruction {
+    pub fallback: PersistedThreadSettings,
+    pub explicit_overrides: PersistedThreadSettingsOverrideMask,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkSnapshot {
+    /// Fork the committed prefix prepared for the most recent physical model
+    /// attempt. Metadata after the marker is deliberately excluded.
+    ///
+    /// Legacy marker-less histories fall back to the active turn's opening
+    /// boundary, while histories already between turns remain unchanged.
+    TruncateToLastSamplingBoundary,
+
     /// Fork a committed prefix ending strictly before the nth user message.
     ///
     /// When `n` is within range, this cuts before that 0-based user-message
@@ -268,6 +284,7 @@ pub fn build_models_manager(
 ) -> SharedModelsManager {
     let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
     provider.models_manager(
+        &config.model_provider_id,
         config.codex_home.to_path_buf(),
         config.model_catalog.clone(),
     )
@@ -320,6 +337,176 @@ pub(crate) async fn rollback_created_thread_persistence(
     };
     if let Err(err) = state_db.delete_thread(thread_id).await {
         warn!("failed to remove state DB rows for rolled-back thread {thread_id}: {err}");
+    }
+}
+
+fn invalid_reconstructed_setting(error: impl std::fmt::Display) -> CodexErr {
+    CodexErr::InvalidRequest(format!(
+        "persisted thread settings are no longer allowed by the active configuration: {error}"
+    ))
+}
+
+fn apply_reconstructed_settings_to_config(
+    config: &mut Config,
+    settings: &PersistedThreadSettings,
+) -> CodexResult<()> {
+    if let Some(model_provider_id) = settings.model_provider_id.as_ref() {
+        let model_provider = config
+            .model_providers
+            .get(model_provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(format!(
+                    "persisted model provider `{model_provider_id}` is not configured"
+                ))
+            })?;
+        config.model_provider_id = model_provider_id.clone();
+        config.model_provider = model_provider;
+    }
+    if let Some(model) = settings.model.as_ref() {
+        config.model = Some(model.clone());
+    }
+    if let Some(service_tier) = settings.service_tier.as_ref() {
+        config.service_tier = service_tier.clone();
+    }
+    if let Some(reasoning_effort) = settings.reasoning_effort.as_ref() {
+        config.model_reasoning_effort = reasoning_effort.clone();
+    }
+    if let Some(reasoning_summary) = settings.reasoning_summary {
+        config.model_reasoning_summary = reasoning_summary;
+    }
+    if let Some(personality) = settings.personality {
+        config.personality = personality;
+    }
+
+    let previous_cwd = config.cwd.clone();
+    if let Some(environments) = settings.environments.as_ref() {
+        config.cwd = environments.legacy_fallback_cwd.clone();
+    }
+
+    let workspace_roots = if let Some(workspace_roots) = settings.workspace_roots.as_ref() {
+        config.workspace_roots_explicit = true;
+        Some(workspace_roots.clone())
+    } else if config.cwd != previous_cwd && config.workspace_roots.contains(&previous_cwd) {
+        let mut retargeted = Vec::with_capacity(config.workspace_roots.len());
+        for root in &config.workspace_roots {
+            let root = if root == &previous_cwd {
+                config.cwd.clone()
+            } else {
+                root.clone()
+            };
+            if !retargeted.contains(&root) {
+                retargeted.push(root);
+            }
+        }
+        Some(retargeted)
+    } else {
+        None
+    };
+    if let Some(workspace_roots) = workspace_roots {
+        config.workspace_roots = workspace_roots.clone();
+        config.permissions.set_workspace_roots(workspace_roots);
+    }
+
+    if let Some(approval_policy) = settings.approval_policy {
+        config
+            .permissions
+            .approval_policy
+            .set(approval_policy)
+            .map_err(invalid_reconstructed_setting)?;
+    }
+    if let Some(approvals_reviewer) = settings.approvals_reviewer {
+        config
+            .config_layer_stack
+            .requirements()
+            .approvals_reviewer
+            .can_set(&approvals_reviewer)
+            .map_err(invalid_reconstructed_setting)?;
+        config.approvals_reviewer = approvals_reviewer;
+    }
+
+    if let Some(permission_profile) = settings.permission_profile.as_ref() {
+        // Missing provenance in an older snapshot is not evidence that the
+        // current process's active profile or profile roots belonged to the
+        // historical thread. Apply such records as legacy permission state.
+        let active_permission_profile = settings.active_permission_profile.clone().flatten();
+        let profile_workspace_roots = settings.profile_workspace_roots.clone().unwrap_or_default();
+        let snapshot = match active_permission_profile.as_ref() {
+            Some(active_permission_profile) => {
+                PermissionProfileSnapshot::active_with_profile_workspace_roots(
+                    permission_profile.clone(),
+                    active_permission_profile.clone(),
+                    profile_workspace_roots,
+                )
+            }
+            None => PermissionProfileSnapshot::legacy(permission_profile.clone()),
+        };
+        let network = if let Some(active_permission_profile) = active_permission_profile.as_ref() {
+            Some(
+                config
+                    .network_proxy_spec_for_active_permission_profile(
+                        active_permission_profile,
+                        permission_profile,
+                    )
+                    .map_err(invalid_reconstructed_setting)?,
+            )
+        } else {
+            None
+        };
+        config
+            .permissions
+            .set_permission_profile_from_session_snapshot(snapshot)
+            .map_err(invalid_reconstructed_setting)?;
+        if let Some(network) = network {
+            config.permissions.network = network;
+        }
+        config.explicit_permission_profile_mode = true;
+    } else if let Some(sandbox_policy) = settings.sandbox_policy.as_ref() {
+        config
+            .set_legacy_sandbox_policy(sandbox_policy.clone())
+            .map_err(invalid_reconstructed_setting)?;
+    }
+
+    if let Some(windows_sandbox_level) = settings.windows_sandbox_level {
+        let windows_sandbox_mode = match windows_sandbox_level {
+            WindowsSandboxLevel::Disabled => None,
+            WindowsSandboxLevel::RestrictedToken => Some(WindowsSandboxModeToml::Unelevated),
+            WindowsSandboxLevel::Elevated => Some(WindowsSandboxModeToml::Elevated),
+        };
+        config
+            .config_layer_stack
+            .requirements()
+            .windows_sandbox_mode
+            .can_set(&windows_sandbox_mode)
+            .map_err(invalid_reconstructed_setting)?;
+        config.permissions.windows_sandbox_mode = windows_sandbox_mode;
+    }
+
+    Ok(())
+}
+
+fn remove_explicit_overrides_and_retarget_roots(
+    settings: &mut PersistedThreadSettings,
+    mask: &PersistedThreadSettingsOverrideMask,
+    explicit_cwd: &AbsolutePathBuf,
+) {
+    let persisted_cwd = settings
+        .environments
+        .as_ref()
+        .map(|environments| environments.legacy_fallback_cwd.clone());
+    settings.remove_explicit_overrides(mask);
+    if mask.environments
+        && !mask.workspace_roots
+        && let Some(persisted_cwd) = persisted_cwd
+        && let Some(workspace_roots) = settings.workspace_roots.as_mut()
+    {
+        for root in workspace_roots.iter_mut() {
+            if root == &persisted_cwd {
+                *root = explicit_cwd.clone();
+            }
+        }
+        let mut seen = HashSet::new();
+        workspace_roots.retain(|root| seen.insert(root.clone()));
     }
 }
 
@@ -489,7 +676,11 @@ impl ThreadManager {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
-                    .models_manager(codex_home, /*config_model_catalog*/ None),
+                    .models_manager(
+                        OPENAI_PROVIDER_ID,
+                        codex_home,
+                        /*config_model_catalog*/ None,
+                    ),
                 environment_manager,
                 skills_service,
                 plugins_manager,
@@ -826,7 +1017,7 @@ impl ThreadManager {
             .multi_agent_version()
             .unwrap_or(MultiAgentVersion::V1);
         options.initial_history = fork_history_from_snapshot(
-            ForkSnapshot::Interrupted,
+            ForkSnapshot::TruncateToLastSamplingBoundary,
             history,
             InterruptedTurnHistoryMarker::from_config_and_version(
                 &options.config,
@@ -856,6 +1047,47 @@ impl ThreadManager {
         .await
     }
 
+    async fn restore_reconstructed_runtime_settings(
+        &self,
+        new_thread: &NewThread,
+        settings: &PersistedThreadSettings,
+        explicit_overrides: PersistedThreadSettingsOverrideMask,
+        persist_snapshot: bool,
+    ) -> CodexResult<()> {
+        let current = new_thread.thread.config_snapshot().await;
+        let collaboration_mode = settings.collaboration_mode.as_ref().map(|mode| {
+            mode.with_updates(
+                explicit_overrides.model.then(|| current.model.clone()),
+                explicit_overrides
+                    .reasoning_effort
+                    .then(|| current.reasoning_effort.clone()),
+                /*developer_instructions*/ None,
+            )
+        });
+        if collaboration_mode.is_some() || settings.windows_sandbox_level.is_some() {
+            new_thread
+                .thread
+                .codex
+                .session
+                .update_settings(SessionSettingsUpdate {
+                    collaboration_mode,
+                    windows_sandbox_level: settings.windows_sandbox_level,
+                    ..Default::default()
+                })
+                .await
+                .map_err(invalid_reconstructed_setting)?;
+        }
+        if persist_snapshot {
+            new_thread
+                .thread
+                .codex
+                .session
+                .persist_thread_settings_snapshot()
+                .await?;
+        }
+        Ok(())
+    }
+
     #[instrument(level = "trace", skip_all)]
     pub async fn resume_thread_with_history(
         &self,
@@ -865,15 +1097,53 @@ impl ThreadManager {
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
     ) -> CodexResult<NewThread> {
-        let agent_control = self.agent_control_for_config(&config);
-        let environments = default_thread_environment_selections(
-            self.state.environment_manager.as_ref(),
+        self.resume_thread_with_history_and_settings(
+            config,
+            initial_history,
+            auth_manager,
+            parent_trace,
+            supports_openai_form_elicitation,
+            ThreadSettingsReconstruction::default(),
+        )
+        .await
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    pub async fn resume_thread_with_history_and_settings(
+        &self,
+        mut config: Config,
+        initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        supports_openai_form_elicitation: bool,
+        reconstruction: ThreadSettingsReconstruction,
+    ) -> CodexResult<NewThread> {
+        let mut persisted_settings = reduce_persisted_thread_settings(
+            initial_history.get_rollout_items(),
+            reconstruction.fallback,
+        );
+        remove_explicit_overrides_and_retarget_roots(
+            &mut persisted_settings,
+            &reconstruction.explicit_overrides,
             &config.cwd,
         );
+        apply_reconstructed_settings_to_config(&mut config, &persisted_settings)?;
+        let environments = persisted_settings
+            .environments
+            .as_ref()
+            .map(|environments| environments.environments.clone())
+            .unwrap_or_else(|| {
+                default_thread_environment_selections(
+                    self.state.environment_manager.as_ref(),
+                    &config.cwd,
+                )
+            });
+        self.validate_environment_selections(&environments)?;
+        let agent_control = self.agent_control_for_config(&config);
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
-        Box::pin(self.state.spawn_thread_with_source(
+        let new_thread = Box::pin(self.state.spawn_thread_with_source(
             config,
             initial_history,
             /*history_mode*/ None,
@@ -894,7 +1164,27 @@ impl ThreadManager {
             supports_openai_form_elicitation,
             /*user_shell_override*/ None,
         ))
-        .await
+        .await?;
+        if let Err(err) = self
+            .restore_reconstructed_runtime_settings(
+                &new_thread,
+                &persisted_settings,
+                reconstruction.explicit_overrides,
+                reconstruction.explicit_overrides.any(),
+            )
+            .await
+        {
+            self.remove_thread_if_same(&new_thread.thread_id, &new_thread.thread)
+                .await;
+            if let Err(shutdown_err) = new_thread.thread.shutdown_and_wait().await {
+                warn!(
+                    "failed to shut down thread {} after settings reconstruction failed: {shutdown_err}",
+                    new_thread.thread_id
+                );
+            }
+            return Err(err);
+        }
+        Ok(new_thread)
     }
 
     pub(crate) async fn start_thread_with_user_shell_override_for_tests(
@@ -973,6 +1263,18 @@ impl ThreadManager {
     /// Returns the thread if the thread was found and removed.
     pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
         self.state.threads.write().await.remove(thread_id)
+    }
+
+    /// Remove a thread only when the currently loaded instance is the expected one.
+    #[doc(hidden)]
+    pub async fn remove_thread_if_same(
+        &self,
+        thread_id: &ThreadId,
+        expected_thread: &Arc<CodexThread>,
+    ) -> bool {
+        self.state
+            .remove_thread_if_same(thread_id, expected_thread)
+            .await
     }
 
     /// Roll back a newly spawned thread that failed before its creator could
@@ -1107,6 +1409,34 @@ impl ThreadManager {
     where
         S: Into<ForkSnapshot>,
     {
+        self.fork_thread_from_history_with_settings(
+            snapshot,
+            config,
+            history,
+            thread_source,
+            parent_trace,
+            supports_openai_form_elicitation,
+            ThreadSettingsReconstruction::default(),
+        )
+        .await
+    }
+
+    /// Fork an already-loaded rollout after reconstructing settings from the
+    /// exact truncated history prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fork_thread_from_history_with_settings<S>(
+        &self,
+        snapshot: S,
+        config: Config,
+        history: InitialHistory,
+        thread_source: Option<ThreadSource>,
+        parent_trace: Option<W3cTraceContext>,
+        supports_openai_form_elicitation: bool,
+        reconstruction: ThreadSettingsReconstruction,
+    ) -> CodexResult<NewThread>
+    where
+        S: Into<ForkSnapshot>,
+    {
         self.fork_thread_with_initial_history(
             snapshot.into(),
             config,
@@ -1114,10 +1444,14 @@ impl ThreadManager {
             thread_source,
             parent_trace,
             supports_openai_form_elicitation,
+            reconstruction,
         )
         .await
     }
 
+    // Keeping the lineage, transport, and reconstruction inputs explicit makes
+    // this private fork boundary auditable at its two construction sites.
+    #[allow(clippy::too_many_arguments)]
     async fn fork_thread_with_initial_history(
         &self,
         snapshot: ForkSnapshot,
@@ -1126,6 +1460,7 @@ impl ThreadManager {
         thread_source: Option<ThreadSource>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
+        reconstruction: ThreadSettingsReconstruction,
     ) -> CodexResult<NewThread> {
         // `forked_from_id()` describes this history's existing lineage. When
         // forking a resumed thread, the child copies the resumed thread itself.
@@ -1147,12 +1482,28 @@ impl ThreadManager {
         let interrupted_marker =
             InterruptedTurnHistoryMarker::from_config_and_version(&config, multi_agent_version);
         let history = fork_history_from_snapshot(snapshot, history, interrupted_marker);
-        let environments = default_thread_environment_selections(
-            self.state.environment_manager.as_ref(),
+        let mut config = config;
+        let mut persisted_settings =
+            reduce_persisted_thread_settings(history.get_rollout_items(), reconstruction.fallback);
+        remove_explicit_overrides_and_retarget_roots(
+            &mut persisted_settings,
+            &reconstruction.explicit_overrides,
             &config.cwd,
         );
+        apply_reconstructed_settings_to_config(&mut config, &persisted_settings)?;
+        let environments = persisted_settings
+            .environments
+            .as_ref()
+            .map(|environments| environments.environments.clone())
+            .unwrap_or_else(|| {
+                default_thread_environment_selections(
+                    self.state.environment_manager.as_ref(),
+                    &config.cwd,
+                )
+            });
+        self.validate_environment_selections(&environments)?;
         let agent_control = self.agent_control_for_config(&config);
-        Box::pin(self.state.spawn_thread(
+        let new_thread = Box::pin(self.state.spawn_thread(
             config,
             history,
             Arc::clone(&self.state.auth_manager),
@@ -1168,7 +1519,21 @@ impl ThreadManager {
             supports_openai_form_elicitation,
             /*user_shell_override*/ None,
         ))
-        .await
+        .await?;
+        if let Err(err) = self
+            .restore_reconstructed_runtime_settings(
+                &new_thread,
+                &persisted_settings,
+                reconstruction.explicit_overrides,
+                /*persist_snapshot*/ true,
+            )
+            .await
+        {
+            self.rollback_thread_spawn(new_thread.thread_id, &new_thread.thread)
+                .await;
+            return Err(err);
+        }
+        Ok(new_thread)
     }
 
     pub(crate) fn agent_control(&self) -> AgentControl {
@@ -2045,6 +2410,9 @@ fn fork_history_from_snapshot(
 ) -> InitialHistory {
     let snapshot_state = snapshot_turn_state(&history);
     match snapshot {
+        ForkSnapshot::TruncateToLastSamplingBoundary => {
+            truncate_to_last_sampling_boundary(history, &snapshot_state)
+        }
         ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
             truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
         }
@@ -2067,6 +2435,36 @@ fn fork_history_from_snapshot(
                 history
             }
         }
+    }
+}
+
+fn truncate_to_last_sampling_boundary(
+    history: InitialHistory,
+    snapshot_state: &SnapshotTurnState,
+) -> InitialHistory {
+    let items = history.get_rollout_items();
+    let retained = if let Some(boundary_index) = items
+        .iter()
+        .rposition(|item| matches!(item, RolloutItem::SamplingBoundary(_)))
+    {
+        items[..=boundary_index].to_vec()
+    } else if snapshot_state.ends_mid_turn {
+        let cut_index = snapshot_state.active_turn_start_index.or_else(|| {
+            truncation::user_message_positions_in_rollout(items)
+                .last()
+                .copied()
+        });
+        cut_index
+            .map(|index| items[..index].to_vec())
+            .unwrap_or_default()
+    } else {
+        items.to_vec()
+    };
+
+    if retained.is_empty() {
+        InitialHistory::New
+    } else {
+        InitialHistory::Forked(retained)
     }
 }
 

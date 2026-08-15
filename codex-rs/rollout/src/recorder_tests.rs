@@ -1479,6 +1479,7 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
             multi_agent_mode: None,
             realtime_active: None,
             effort: None,
+            context_provenance: None,
             summary: codex_protocol::config_types::ReasoningSummary::Auto,
         }),
     };
@@ -1536,6 +1537,7 @@ async fn find_latest_thread_path_filters_on_latest_turn_context_cwd() -> std::io
             multi_agent_mode: None,
             realtime_active: None,
             effort: None,
+            context_provenance: None,
             summary: codex_protocol::config_types::ReasoningSummary::Auto,
         }),
     };

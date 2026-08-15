@@ -12,6 +12,8 @@ use rmcp::model::PaginatedRequestParams;
 
 use super::ListResourceTemplatesArgs;
 use super::ListResourceTemplatesPayload;
+use super::canonical_all_list_resource_templates;
+use super::canonical_single_list_resource_templates;
 use super::ensure_model_can_access_mcp_server;
 use super::execute_resource_call;
 use super::model_can_access_mcp_server;
@@ -83,7 +85,7 @@ impl ListMcpResourceTemplatesHandler {
             invocation,
             cancellation_token,
             async {
-                let payload = if let Some(server_name) = server.clone() {
+                let (payload, canonical) = if let Some(server_name) = server.clone() {
                     ensure_model_can_access_mcp_server(turn.as_ref(), &server_name)?;
                     let params = cursor
                         .clone()
@@ -96,11 +98,14 @@ impl ListMcpResourceTemplatesHandler {
                                 "resources/templates/list failed: {err:#}"
                             ))
                         })?;
-                    ListResourceTemplatesPayload::from_single_server(
+                    let canonical =
+                        canonical_single_list_resource_templates(&server_name, &result)?;
+                    let payload = ListResourceTemplatesPayload::from_single_server(
                         server_name,
                         result,
                         truncation_policy,
-                    )?
+                    )?;
+                    (payload, canonical)
                 } else {
                     if cursor.is_some() {
                         return Err(FunctionCallError::RespondToModel(
@@ -113,9 +118,12 @@ impl ListMcpResourceTemplatesHandler {
                             model_can_access_mcp_server(turn.as_ref(), server_name)
                         })
                         .await;
-                    ListResourceTemplatesPayload::from_all_servers(pages, truncation_policy)?
+                    let canonical = canonical_all_list_resource_templates(&pages)?;
+                    let payload =
+                        ListResourceTemplatesPayload::from_all_servers(pages, truncation_policy)?;
+                    (payload, canonical)
                 };
-                serialize_function_output(payload, truncation_policy)
+                serialize_function_output(payload, canonical, truncation_policy)
             },
         )
         .await

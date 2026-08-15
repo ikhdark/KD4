@@ -36,6 +36,40 @@ mod thread_list_cwd_filter_tests {
     }
 }
 
+mod desktop_activation_owner_tests {
+    use super::super::remove_desktop_activation_challenge_owners_for_connection;
+    use crate::outgoing_message::ConnectionId;
+    use std::collections::HashMap;
+
+    #[test]
+    fn connection_close_removes_only_its_desktop_activation_challenges() {
+        let mut owners = HashMap::from([
+            (
+                "challenge-a".to_string(),
+                ("thread-a".to_string(), ConnectionId(1)),
+            ),
+            (
+                "challenge-b".to_string(),
+                ("thread-b".to_string(), ConnectionId(2)),
+            ),
+            (
+                "challenge-c".to_string(),
+                ("thread-c".to_string(), ConnectionId(1)),
+            ),
+        ]);
+
+        remove_desktop_activation_challenge_owners_for_connection(&mut owners, ConnectionId(1));
+
+        assert_eq!(
+            owners,
+            HashMap::from([(
+                "challenge-b".to_string(),
+                ("thread-b".to_string(), ConnectionId(2)),
+            )])
+        );
+    }
+}
+
 mod background_terminal_pagination_tests {
     use super::super::paginate_background_terminals;
     use codex_app_server_protocol::ThreadBackgroundTerminal;
@@ -402,6 +436,9 @@ mod thread_processor_behavior_tests {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             reasoning_policy_history: None,
         };
 
@@ -854,6 +891,7 @@ mod thread_processor_behavior_tests {
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             permission_profile: codex_protocol::models::PermissionProfile::Disabled,
             active_permission_profile: None,
+            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
             environments: TurnEnvironmentSelections::new(cwd, Vec::new()),
             workspace_roots: Vec::new(),
             profile_workspace_roots: Vec::new(),
@@ -918,169 +956,55 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn merge_persisted_resume_metadata_prefers_persisted_model_and_reasoning_effort() -> Result<()>
-    {
-        let mut request_overrides = None;
-        let mut typesafe_overrides = ConfigOverrides::default();
-        let persisted_metadata =
-            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
-
-        merge_persisted_resume_metadata(
-            &mut request_overrides,
-            &mut typesafe_overrides,
-            &persisted_metadata,
-        );
-
-        assert_eq!(
-            typesafe_overrides.model,
-            Some("gpt-5.1-codex-max".to_string())
-        );
-        assert_eq!(
-            typesafe_overrides.model_provider,
-            Some("mock_provider".to_string())
-        );
-        assert_eq!(
-            request_overrides,
-            Some(HashMap::from([(
-                "model_reasoning_effort".to_string(),
-                serde_json::Value::String("high".to_string()),
-            )]))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn merge_persisted_resume_metadata_preserves_explicit_overrides() -> Result<()> {
-        let mut request_overrides = Some(HashMap::from([(
+    fn persisted_settings_override_mask_is_fieldwise() {
+        let request_overrides = HashMap::from([(
             "model_reasoning_effort".to_string(),
             serde_json::Value::String("low".to_string()),
-        )]));
-        let mut typesafe_overrides = ConfigOverrides {
+        )]);
+        let typesafe_overrides = ConfigOverrides {
             model: Some("gpt-5.2-codex".to_string()),
-            ..Default::default()
-        };
-        let persisted_metadata =
-            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
-
-        merge_persisted_resume_metadata(
-            &mut request_overrides,
-            &mut typesafe_overrides,
-            &persisted_metadata,
-        );
-
-        assert_eq!(typesafe_overrides.model, Some("gpt-5.2-codex".to_string()));
-        assert_eq!(typesafe_overrides.model_provider, None);
-        assert_eq!(
-            request_overrides,
-            Some(HashMap::from([(
-                "model_reasoning_effort".to_string(),
-                serde_json::Value::String("low".to_string()),
-            )]))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn merge_persisted_resume_metadata_skips_persisted_values_when_model_overridden() -> Result<()>
-    {
-        let mut request_overrides = Some(HashMap::from([(
-            "model".to_string(),
-            serde_json::Value::String("gpt-5.2-codex".to_string()),
-        )]));
-        let mut typesafe_overrides = ConfigOverrides::default();
-        let persisted_metadata =
-            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
-
-        merge_persisted_resume_metadata(
-            &mut request_overrides,
-            &mut typesafe_overrides,
-            &persisted_metadata,
-        );
-
-        assert_eq!(typesafe_overrides.model, None);
-        assert_eq!(typesafe_overrides.model_provider, None);
-        assert_eq!(
-            request_overrides,
-            Some(HashMap::from([(
-                "model".to_string(),
-                serde_json::Value::String("gpt-5.2-codex".to_string()),
-            )]))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn merge_persisted_resume_metadata_skips_persisted_values_when_provider_overridden()
-    -> Result<()> {
-        let mut request_overrides = None;
-        let mut typesafe_overrides = ConfigOverrides {
             model_provider: Some("oss".to_string()),
+            service_tier: Some(None),
             ..Default::default()
         };
-        let persisted_metadata =
-            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
 
-        merge_persisted_resume_metadata(
-            &mut request_overrides,
-            &mut typesafe_overrides,
-            &persisted_metadata,
-        );
+        let mask = persisted_settings_override_mask(Some(&request_overrides), &typesafe_overrides);
 
-        assert_eq!(typesafe_overrides.model, None);
-        assert_eq!(typesafe_overrides.model_provider, Some("oss".to_string()));
-        assert_eq!(request_overrides, None);
-        Ok(())
+        assert!(mask.model);
+        assert!(mask.model_provider_id);
+        assert!(mask.reasoning_effort);
+        assert!(mask.service_tier);
+        assert!(!mask.reasoning_summary);
+        assert!(!mask.approval_policy);
+        assert!(!mask.environments);
     }
 
     #[test]
-    fn merge_persisted_resume_metadata_skips_persisted_values_when_reasoning_effort_overridden()
-    -> Result<()> {
-        let mut request_overrides = Some(HashMap::from([(
-            "model_reasoning_effort".to_string(),
-            serde_json::Value::String("low".to_string()),
-        )]));
-        let mut typesafe_overrides = ConfigOverrides::default();
-        let persisted_metadata =
-            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
+    fn permission_override_masks_every_permission_projection() {
+        let typesafe_overrides = ConfigOverrides {
+            default_permissions: Some("workspace".to_string()),
+            ..Default::default()
+        };
 
-        merge_persisted_resume_metadata(
-            &mut request_overrides,
-            &mut typesafe_overrides,
-            &persisted_metadata,
-        );
+        let mask = persisted_settings_override_mask(None, &typesafe_overrides);
 
-        assert_eq!(typesafe_overrides.model, None);
-        assert_eq!(typesafe_overrides.model_provider, None);
-        assert_eq!(
-            request_overrides,
-            Some(HashMap::from([(
-                "model_reasoning_effort".to_string(),
-                serde_json::Value::String("low".to_string()),
-            )]))
-        );
-        Ok(())
+        assert!(mask.permission_profile);
+        assert!(mask.active_permission_profile);
+        assert!(mask.profile_workspace_roots);
+        assert!(mask.sandbox_policy);
     }
 
     #[test]
-    fn merge_persisted_resume_metadata_skips_missing_values() -> Result<()> {
-        let mut request_overrides = None;
-        let mut typesafe_overrides = ConfigOverrides::default();
-        let persisted_metadata =
-            test_thread_metadata(/*model*/ None, /*reasoning_effort*/ None)?;
+    fn nested_windows_override_masks_persisted_windows_sandbox() {
+        let request_overrides = HashMap::from([(
+            "windows".to_string(),
+            serde_json::json!({"sandbox": "elevated"}),
+        )]);
 
-        merge_persisted_resume_metadata(
-            &mut request_overrides,
-            &mut typesafe_overrides,
-            &persisted_metadata,
-        );
+        let mask =
+            persisted_settings_override_mask(Some(&request_overrides), &ConfigOverrides::default());
 
-        assert_eq!(typesafe_overrides.model, None);
-        assert_eq!(
-            typesafe_overrides.model_provider,
-            Some("mock_provider".to_string())
-        );
-        assert_eq!(request_overrides, None);
-        Ok(())
+        assert!(mask.windows_sandbox_level);
     }
 
     #[tokio::test]
@@ -1607,5 +1531,308 @@ mod thread_processor_behavior_tests {
             Some(unrelated_supported_connection)
         );
         Ok(())
+    }
+}
+
+mod elicitation_lease_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use codex_core::CodexThread;
+    use codex_login::CodexAuth;
+    use codex_protocol::ThreadId;
+    use core_test_support::load_default_config_for_test;
+    use tempfile::TempDir;
+
+    use crate::outgoing_message::ConnectionId;
+    use crate::thread_state::ConnectionCapabilities;
+    use crate::thread_state::OutOfBandElicitationLeaseKey;
+    use crate::thread_state::ThreadStateManager;
+
+    struct ElicitationLeaseFixture {
+        _codex_home: TempDir,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        state: ThreadStateManager,
+    }
+
+    impl ElicitationLeaseFixture {
+        async fn new() -> Result<Self> {
+            let codex_home = TempDir::new()?;
+            let config = load_default_config_for_test(&codex_home).await;
+            let thread_manager =
+                codex_core::test_support::thread_manager_with_models_provider_and_home(
+                    CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                    config.model_provider.clone(),
+                    config.codex_home.to_path_buf(),
+                    Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+                );
+            let codex_core::NewThread {
+                thread_id, thread, ..
+            } = thread_manager.start_thread(config).await?;
+            Ok(Self {
+                _codex_home: codex_home,
+                thread_id,
+                thread,
+                state: ThreadStateManager::new(),
+            })
+        }
+
+        async fn initialize(&self, connection_id: ConnectionId) {
+            self.state
+                .connection_initialized(connection_id, ConnectionCapabilities::default())
+                .await;
+        }
+
+        async fn acquire(&self, lease: OutOfBandElicitationLeaseKey) -> Result<i64> {
+            Ok(self
+                .state
+                .acquire_out_of_band_elicitation_lease(self.thread_id, lease, &self.thread)
+                .await?)
+        }
+
+        async fn shutdown(&self) -> Result<()> {
+            tokio::time::timeout(Duration::from_secs(5), self.thread.shutdown_and_wait()).await??;
+            Ok(())
+        }
+    }
+
+    fn lease(connection_id: ConnectionId, lease_id: i64) -> OutOfBandElicitationLeaseKey {
+        OutOfBandElicitationLeaseKey::new(connection_id, format!("lease-{lease_id}"))
+    }
+
+    #[tokio::test]
+    async fn leases_are_independent_release_is_idempotent_and_ownership_is_enforced() -> Result<()>
+    {
+        let fixture = ElicitationLeaseFixture::new().await?;
+        let first_connection = ConnectionId(1);
+        let second_connection = ConnectionId(2);
+        fixture.initialize(first_connection).await;
+        fixture.initialize(second_connection).await;
+        let first = lease(first_connection, 10);
+        let second = lease(second_connection, 20);
+
+        assert_eq!(fixture.acquire(first.clone()).await?, 1);
+        assert!(
+            fixture.acquire(first.clone()).await.is_err(),
+            "one server-issued token must not create two leases"
+        );
+        assert_eq!(fixture.acquire(second.clone()).await?, 2);
+
+        let cross_owner_release = lease(second_connection, 10);
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(fixture.thread_id, &cross_owner_release,)
+                .await,
+            None
+        );
+        assert_eq!(
+            fixture.thread.active_out_of_band_elicitation_lease_count(),
+            2
+        );
+
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(fixture.thread_id, &first)
+                .await,
+            Some(1)
+        );
+        let later = lease(first_connection, 30);
+        assert_eq!(fixture.acquire(later.clone()).await?, 2);
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(fixture.thread_id, &first)
+                .await,
+            None
+        );
+        assert_eq!(
+            fixture.thread.active_out_of_band_elicitation_lease_count(),
+            2,
+            "retrying an old release must not affect a later lease"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(fixture.thread_id, &later)
+                .await,
+            Some(1)
+        );
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(fixture.thread_id, &second)
+                .await,
+            Some(0)
+        );
+        fixture.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn disconnect_releases_only_that_connections_leases() -> Result<()> {
+        let fixture = ElicitationLeaseFixture::new().await?;
+        let disconnected = ConnectionId(1);
+        let remaining = ConnectionId(2);
+        fixture.initialize(disconnected).await;
+        fixture.initialize(remaining).await;
+        fixture.acquire(lease(disconnected, 10)).await?;
+        fixture.acquire(lease(disconnected, 11)).await?;
+        let remaining_lease = lease(remaining, 20);
+        fixture.acquire(remaining_lease.clone()).await?;
+
+        fixture.state.remove_connection(disconnected).await;
+        assert_eq!(
+            fixture.thread.active_out_of_band_elicitation_lease_count(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .state
+                .out_of_band_elicitation_lease_count(fixture.thread_id)
+                .await,
+            1
+        );
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(fixture.thread_id, &remaining_lease)
+                .await,
+            Some(0)
+        );
+        fixture.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_releases_only_that_threads_connection_leases() -> Result<()> {
+        let fixture = ElicitationLeaseFixture::new().await?;
+        let unsubscribed = ConnectionId(1);
+        let remaining = ConnectionId(2);
+        fixture.initialize(unsubscribed).await;
+        fixture.initialize(remaining).await;
+        assert!(
+            fixture
+                .state
+                .try_add_connection_to_thread(fixture.thread_id, unsubscribed)
+                .await
+        );
+        assert!(
+            fixture
+                .state
+                .try_add_connection_to_thread(fixture.thread_id, remaining)
+                .await
+        );
+        fixture.acquire(lease(unsubscribed, 10)).await?;
+        fixture.acquire(lease(unsubscribed, 11)).await?;
+        let remaining_lease = lease(remaining, 20);
+        fixture.acquire(remaining_lease.clone()).await?;
+
+        assert!(
+            fixture
+                .state
+                .unsubscribe_connection_from_thread(fixture.thread_id, unsubscribed)
+                .await
+        );
+        assert_eq!(
+            fixture.thread.active_out_of_band_elicitation_lease_count(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(fixture.thread_id, &remaining_lease)
+                .await,
+            Some(0)
+        );
+        fixture.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn explicit_release_racing_disconnect_is_safe() -> Result<()> {
+        let fixture = ElicitationLeaseFixture::new().await?;
+        let connection_id = ConnectionId(1);
+        fixture.initialize(connection_id).await;
+        let lease = lease(connection_id, 10);
+        fixture.acquire(lease.clone()).await?;
+
+        let release_state = fixture.state.clone();
+        let disconnect_state = fixture.state.clone();
+        let thread_id = fixture.thread_id;
+        let (released, _) = tokio::join!(
+            async move {
+                release_state
+                    .release_out_of_band_elicitation_lease(thread_id, &lease)
+                    .await
+            },
+            async move { disconnect_state.remove_connection(connection_id).await }
+        );
+        assert!(matches!(released, Some(0) | None));
+        assert_eq!(
+            fixture.thread.active_out_of_band_elicitation_lease_count(),
+            0
+        );
+        assert_eq!(
+            fixture
+                .state
+                .out_of_band_elicitation_lease_count(fixture.thread_id)
+                .await,
+            0
+        );
+        fixture.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn thread_shutdown_and_teardown_clear_every_outstanding_lease() -> Result<()> {
+        let fixture = ElicitationLeaseFixture::new().await?;
+        let first_connection = ConnectionId(1);
+        let second_connection = ConnectionId(2);
+        fixture.initialize(first_connection).await;
+        fixture.initialize(second_connection).await;
+        fixture.acquire(lease(first_connection, 10)).await?;
+        fixture.acquire(lease(second_connection, 20)).await?;
+
+        fixture.shutdown().await?;
+        assert_eq!(
+            fixture.thread.active_out_of_band_elicitation_lease_count(),
+            0
+        );
+        fixture.state.remove_thread_state(fixture.thread_id).await;
+        assert_eq!(
+            fixture
+                .state
+                .out_of_band_elicitation_lease_count(fixture.thread_id)
+                .await,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnected_helper_cannot_leave_a_pause_for_later_work() -> Result<()> {
+        let fixture = ElicitationLeaseFixture::new().await?;
+        let crashed_helper = ConnectionId(1);
+        fixture.initialize(crashed_helper).await;
+        fixture.acquire(lease(crashed_helper, 10)).await?;
+
+        fixture.state.remove_connection(crashed_helper).await;
+        assert_eq!(
+            fixture.thread.active_out_of_band_elicitation_lease_count(),
+            0
+        );
+
+        let later_helper = ConnectionId(2);
+        fixture.initialize(later_helper).await;
+        let later_lease = lease(later_helper, 20);
+        assert_eq!(fixture.acquire(later_lease.clone()).await?, 1);
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(fixture.thread_id, &later_lease)
+                .await,
+            Some(0)
+        );
+        fixture.shutdown().await
     }
 }

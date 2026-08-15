@@ -3,7 +3,9 @@ use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -35,6 +37,7 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<InterAgentCommunication>>,
+    seen_mailbox_communication_ids: Mutex<HashSet<codex_protocol::ResponseItemId>>,
 }
 
 impl InputQueue {
@@ -43,6 +46,7 @@ impl InputQueue {
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
+            seen_mailbox_communication_ids: Mutex::new(HashSet::new()),
         }
     }
 
@@ -72,12 +76,36 @@ impl InputQueue {
     pub(crate) async fn enqueue_mailbox_communication(
         &self,
         communication: InterAgentCommunication,
-    ) {
+    ) -> bool {
+        if let Some(id) = communication.id.as_ref()
+            && !self
+                .seen_mailbox_communication_ids
+                .lock()
+                .await
+                .insert(id.clone())
+        {
+            return false;
+        }
         self.mailbox_pending_mails
             .lock()
             .await
             .push_back(communication);
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        true
+    }
+
+    pub(crate) async fn seed_seen_mailbox_communication_ids(&self, items: &[RolloutItem]) {
+        let mut seen = self.seen_mailbox_communication_ids.lock().await;
+        for item in items {
+            let id = match item {
+                RolloutItem::InterAgentCommunication(communication) => communication.id.as_ref(),
+                RolloutItem::ResponseItem(ResponseItem::AgentMessage { id, .. }) => id.as_ref(),
+                _ => None,
+            };
+            if let Some(id) = id {
+                seen.insert(id.clone());
+            }
+        }
     }
 
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
@@ -415,5 +443,37 @@ mod tests {
             ))
             .await;
         assert!(input_queue.has_trigger_turn_mailbox_items().await);
+    }
+
+    #[tokio::test]
+    async fn deterministic_mailbox_ids_are_deduplicated_and_seeded_from_history() {
+        let id = codex_protocol::ResponseItemId::from_server("terminal-parent-effect".to_string());
+        let mut communication = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "done",
+            /*trigger_turn*/ false,
+        );
+        communication.id = Some(id);
+
+        let input_queue = InputQueue::new();
+        assert!(
+            input_queue
+                .enqueue_mailbox_communication(communication.clone())
+                .await
+        );
+        assert!(
+            !input_queue
+                .enqueue_mailbox_communication(communication.clone())
+                .await
+        );
+
+        let restored = InputQueue::new();
+        restored
+            .seed_seen_mailbox_communication_ids(&[RolloutItem::InterAgentCommunication(
+                communication.clone(),
+            )])
+            .await;
+        assert!(!restored.enqueue_mailbox_communication(communication).await);
     }
 }

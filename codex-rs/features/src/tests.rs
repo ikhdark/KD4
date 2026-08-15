@@ -953,6 +953,13 @@ fn source_tools_are_enabled_by_default() {
 }
 
 #[test]
+fn unified_exec_is_stable_and_enabled_by_default() {
+    assert_eq!(Feature::UnifiedExec.stage(), Stage::Stable);
+    assert_eq!(Feature::UnifiedExec.default_enabled(), true);
+    assert_eq!(feature_for_key("unified_exec"), Some(Feature::UnifiedExec));
+}
+
+#[test]
 fn known_delta_store_is_enabled_by_default() {
     assert_eq!(Feature::KnownDeltaStore.stage(), Stage::Stable);
     assert_eq!(Feature::KnownDeltaStore.default_enabled(), true);

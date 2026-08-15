@@ -182,6 +182,19 @@ struct PendingTurnDeliveryReceipt {
     immediate_outcome: Option<TurnDeliveryOutcomeKind>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TerminalNotificationDispatch {
+    pub(crate) targeted_connection_ids: Vec<ConnectionId>,
+    pub(crate) accepted_connection_ids: Vec<ConnectionId>,
+}
+
+impl TerminalNotificationDispatch {
+    #[cfg(test)]
+    pub(crate) fn all_targets_accepted(&self) -> bool {
+        self.targeted_connection_ids.len() == self.accepted_connection_ids.len()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TurnDeliveryOutcomeKind {
     Success,
@@ -205,7 +218,7 @@ impl ThreadScopedOutgoingMessageSender {
         &self,
         notification: ServerNotification,
         origin_connection_id: Option<ConnectionId>,
-    ) {
+    ) -> TerminalNotificationDispatch {
         self.outgoing
             .analytics_events_client
             .track_notification(notification.clone());
@@ -219,7 +232,7 @@ impl ThreadScopedOutgoingMessageSender {
                     )
                     .await;
             }
-            return;
+            return TerminalNotificationDispatch::default();
         };
         let turn_id = completed.turn.id.clone();
         let core_completed_at_ms = completed
@@ -246,7 +259,45 @@ impl ThreadScopedOutgoingMessageSender {
                 core_completed_at_ms,
                 notification,
             )
-            .await;
+            .await
+    }
+
+    pub(crate) async fn retry_terminal_notification_with_receipts(
+        &self,
+        notification: ServerNotification,
+        origin_connection_id: Option<ConnectionId>,
+        connection_ids: Vec<ConnectionId>,
+    ) -> TerminalNotificationDispatch {
+        self.outgoing
+            .analytics_events_client
+            .track_notification(notification.clone());
+        let ServerNotification::TurnCompleted(completed) = &notification else {
+            return TerminalNotificationDispatch::default();
+        };
+        let core_completed_at_ms = completed
+            .timing
+            .as_ref()
+            .and_then(|timing| timing.completed_at_unix_ms)
+            .or_else(|| {
+                completed
+                    .turn
+                    .completed_at
+                    .and_then(|seconds| seconds.checked_mul(1_000))
+            })
+            .and_then(|milliseconds| u64::try_from(milliseconds).ok());
+        let mut connection_ids = connection_ids;
+        connection_ids.sort_unstable_by_key(|connection_id| connection_id.0);
+        connection_ids.dedup();
+        self.outgoing
+            .dispatch_turn_completed_with_receipts(
+                self.thread_id,
+                completed.turn.id.clone(),
+                connection_ids,
+                origin_connection_id,
+                core_completed_at_ms,
+                notification,
+            )
+            .await
     }
 
     pub(crate) fn new(
@@ -962,7 +1013,7 @@ impl OutgoingMessageSender {
         origin_connection_id: Option<ConnectionId>,
         core_completed_at_ms: Option<u64>,
         notification: ServerNotification,
-    ) {
+    ) -> TerminalNotificationDispatch {
         tracing::trace!(
             targeted_connections = target_connection_ids.len(),
             "app-server terminal event: {notification}"
@@ -972,22 +1023,22 @@ impl OutgoingMessageSender {
         let post_core_dispatch_latency_ms = core_completed_at_ms
             .map(|completed_at_ms| now_unix_timestamp_ms().saturating_sub(completed_at_ms));
         let outgoing_message = OutgoingMessage::AppServerNotification(notification);
+        let targeted_connection_ids_for_result = target_connection_ids.clone();
+        let mut accepted_connection_ids = Vec::with_capacity(target_connection_ids.len());
         let mut receipts = Vec::with_capacity(target_connection_ids.len());
 
         for connection_id in target_connection_ids {
             let (write_complete_tx, write_complete_rx) = oneshot::channel();
-            let send_result = self
-                .sender
-                .send(OutgoingEnvelope::ToConnection {
-                    connection_id,
-                    message: outgoing_message.clone(),
-                    write_complete_tx: Some(write_complete_tx),
-                })
-                .await;
+            let send_result = self.sender.try_send(OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: outgoing_message.clone(),
+                write_complete_tx: Some(write_complete_tx),
+            });
             let immediate_outcome = if let Err(err) = send_result {
                 warn!("failed to dispatch terminal notification to {connection_id:?}: {err:?}");
                 Some(TurnDeliveryOutcomeKind::Failure)
             } else {
+                accepted_connection_ids.push(connection_id);
                 None
             };
             receipts.push(PendingTurnDeliveryReceipt {
@@ -1005,7 +1056,10 @@ impl OutgoingMessageSender {
                     origin_connection_id,
                     Vec::new(),
                 ));
-            return;
+            return TerminalNotificationDispatch {
+                targeted_connection_ids: targeted_connection_ids_for_result,
+                accepted_connection_ids,
+            };
         }
 
         let accepting = self.delivery_accepting.lock().await;
@@ -1028,7 +1082,10 @@ impl OutgoingMessageSender {
                     outcomes,
                 ));
             });
-            return;
+            return TerminalNotificationDispatch {
+                targeted_connection_ids: targeted_connection_ids_for_result,
+                accepted_connection_ids,
+            };
         }
         drop(accepting);
 
@@ -1050,6 +1107,10 @@ impl OutgoingMessageSender {
                 origin_connection_id,
                 outcomes,
             ));
+        TerminalNotificationDispatch {
+            targeted_connection_ids: targeted_connection_ids_for_result,
+            accepted_connection_ids,
+        }
     }
 
     pub(crate) async fn shutdown_delivery_tasks(&self) {
@@ -1366,6 +1427,7 @@ mod tests {
 
     fn turn_completed_notification(thread_id: ThreadId, turn_id: &str) -> ServerNotification {
         ServerNotification::TurnCompleted(TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: thread_id.to_string(),
             turn: Turn {
                 id: turn_id.to_string(),
@@ -1376,6 +1438,9 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             completion: None,
@@ -1835,12 +1900,20 @@ mod tests {
             thread_id,
         );
 
-        scoped
+        let dispatch = scoped
             .send_server_notification_with_receipts(
                 turn_completed_notification(thread_id, "turn-1"),
                 Some(ConnectionId(3)),
             )
             .await;
+        assert_eq!(
+            dispatch.targeted_connection_ids,
+            vec![ConnectionId(1), ConnectionId(3)]
+        );
+        assert_eq!(
+            dispatch.accepted_connection_ids,
+            vec![ConnectionId(1), ConnectionId(3)]
+        );
 
         for expected_connection_id in [ConnectionId(1), ConnectionId(3)] {
             let envelope = timeout(Duration::from_secs(1), rx.recv())
@@ -1866,6 +1939,39 @@ mod tests {
                 .expect("receipt collector should still be waiting");
         }
         assert!(rx.try_recv().is_err(), "no duplicate dispatch is allowed");
+        outgoing.shutdown_delivery_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_dispatch_reports_backpressured_target_as_unaccepted() {
+        let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let thread_id = ThreadId::new();
+        tx.try_send(OutgoingEnvelope::Broadcast {
+            message: OutgoingMessage::AppServerNotification(turn_completed_notification(
+                thread_id, "filler",
+            )),
+        })
+        .expect("fill outbound queue");
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let scoped = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
+            vec![ConnectionId(7)],
+            thread_id,
+        );
+
+        let dispatch = scoped
+            .send_server_notification_with_receipts(
+                turn_completed_notification(thread_id, "turn-1"),
+                None,
+            )
+            .await;
+
+        assert_eq!(dispatch.targeted_connection_ids, vec![ConnectionId(7)]);
+        assert!(dispatch.accepted_connection_ids.is_empty());
+        assert!(!dispatch.all_targets_accepted());
         outgoing.shutdown_delivery_tasks().await;
     }
 

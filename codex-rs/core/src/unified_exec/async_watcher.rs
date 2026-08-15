@@ -23,6 +23,9 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventFailure;
 use crate::tools::events::ToolEventStage;
+use crate::tools::known_delta_store;
+use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
+use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
@@ -216,6 +219,8 @@ pub(crate) fn spawn_exit_watcher(
     validation_observation: Option<crate::validation_admission::ValidationObservationToken>,
     validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
     validation_waiter: Option<crate::validation_admission::ValidationLeader>,
+    known_delta: Option<PreparedKnownDelta>,
+    known_delta_executor_started_at: Option<Instant>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
@@ -272,6 +277,19 @@ pub(crate) fn spawn_exit_watcher(
                 "command exited, but Codex could not finalize its mutation-safety state"
                     .to_string(),
             );
+        }
+
+        if let Some(known_delta) = known_delta.as_ref() {
+            record_known_delta_from_transcript(
+                turn_ref.config.codex_home.as_path(),
+                known_delta,
+                &transcript,
+                failure_message.is_none() && exit_code == 0 && !process.termination_was_requested(),
+                known_delta_executor_started_at
+                    .map(|started_at| Instant::now().saturating_duration_since(started_at))
+                    .unwrap_or(duration),
+            )
+            .await;
         }
 
         if let Some(mut finalized_artifact) = process.raw_output_artifact().await {
@@ -354,6 +372,29 @@ pub(crate) fn spawn_exit_watcher(
                 .await;
         }
     });
+}
+
+pub(crate) async fn record_known_delta_from_transcript(
+    codex_home: &std::path::Path,
+    prepared: &PreparedKnownDelta,
+    transcript: &Arc<Mutex<HeadTailBuffer>>,
+    success: bool,
+    executor_cost: Duration,
+) {
+    let exact_output = {
+        let transcript = transcript.lock().await;
+        (transcript.omitted_bytes() == 0 && transcript.lagged_chunks() == 0)
+            .then(|| transcript.to_bytes())
+    };
+    let observation = match (exact_output.as_deref(), success) {
+        (Some(output), true) => KnownDeltaExecutionObservation::CompleteSuccess {
+            output,
+            executor_cost,
+        },
+        (Some(_), false) => KnownDeltaExecutionObservation::CompleteFailure,
+        (None, _) => KnownDeltaExecutionObservation::Incomplete,
+    };
+    known_delta_store::record_execution(codex_home, prepared, observation).await;
 }
 
 #[allow(clippy::too_many_arguments)]

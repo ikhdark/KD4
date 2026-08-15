@@ -488,6 +488,21 @@ client_request_definitions! {
         serialization: thread_or_path(params.thread_id, params.path),
         response: v2::ThreadResumeResponse,
     },
+    ThreadDesktopActivationObligation => "thread/desktopActivation/obligation" {
+        params: v2::ThreadDesktopActivationObligationParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadDesktopActivationObligationResponse,
+    },
+    ThreadDesktopActivationChallenge => "thread/desktopActivation/challenge" {
+        params: v2::ThreadDesktopActivationChallengeParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadDesktopActivationChallengeResponse,
+    },
+    ThreadDesktopActivationRecord => "thread/desktopActivation/record" {
+        params: v2::ThreadDesktopActivationRecordParams,
+        serialization: global("desktop_activation_record"),
+        response: v2::ThreadDesktopActivationRecordResponse,
+    },
     ThreadFork => "thread/fork" {
         params: v2::ThreadForkParams,
         inspect_params: true,
@@ -510,19 +525,21 @@ client_request_definitions! {
         response: v2::ThreadUnsubscribeResponse,
     },
     #[experimental("thread/increment_elicitation")]
-    /// Increment the thread-local out-of-band elicitation counter.
+    /// Acquire a connection-owned out-of-band elicitation lease for the thread.
     ///
     /// This is used by external helpers to pause timeout accounting while a user
-    /// approval or other elicitation is pending outside the app-server request flow.
+    /// approval or other elicitation is pending outside the app-server request flow. The
+    /// response token can only be released by this connection.
     ThreadIncrementElicitation => "thread/increment_elicitation" {
         params: v2::ThreadIncrementElicitationParams,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadIncrementElicitationResponse,
     },
     #[experimental("thread/decrement_elicitation")]
-    /// Decrement the thread-local out-of-band elicitation counter.
+    /// Idempotently release a connection-owned out-of-band elicitation lease.
     ///
-    /// When the count reaches zero, timeout accounting resumes for the thread.
+    /// The caller must provide the server-issued lease token. When the count reaches zero,
+    /// timeout accounting resumes for the thread.
     ThreadDecrementElicitation => "thread/decrement_elicitation" {
         params: v2::ThreadDecrementElicitationParams,
         serialization: thread_id(params.thread_id),
@@ -1638,6 +1655,7 @@ server_notification_definitions! {
     TurnReasoningPolicyUpdated => "turn/reasoningPolicy/updated" (v2::TurnReasoningPolicyUpdatedNotification),
     HookStarted => "hook/started" (v2::HookStartedNotification),
     TurnCompleted => "turn/completed" (v2::TurnCompletedNotification),
+    TurnTerminalizationCompleted => "turn/terminalizationCompleted" (v2::TurnTerminalizationCompletedNotification),
     HookCompleted => "hook/completed" (v2::HookCompletedNotification),
     TurnDiffUpdated => "turn/diff/updated" (v2::TurnDiffUpdatedNotification),
     TurnPlanUpdated => "turn/plan/updated" (v2::TurnPlanUpdatedNotification),
@@ -1726,8 +1744,13 @@ pub fn server_notification_requires_delivery(notification: &ServerNotification) 
     matches!(
         notification,
         ServerNotification::TurnCompleted(_)
+            | ServerNotification::TurnTerminalizationCompleted(_)
+            | ServerNotification::ThreadClosed(_)
             | ServerNotification::ThreadSettingsUpdated(_)
+            | ServerNotification::HookCompleted(_)
             | ServerNotification::ItemCompleted(_)
+            | ServerNotification::ServerRequestResolved(_)
+            | ServerNotification::AccountLoginCompleted(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
             | ServerNotification::AgentMessageDelta(_)
             | ServerNotification::PlanDelta(_)
@@ -1773,6 +1796,69 @@ mod tests {
     fn request_id() -> RequestId {
         const REQUEST_ID: i64 = 1;
         RequestId::Integer(REQUEST_ID)
+    }
+
+    #[test]
+    fn terminalization_completed_notification_requires_delivery() {
+        let notification = ServerNotification::TurnTerminalizationCompleted(
+            v2::TurnTerminalizationCompletedNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                receipt: codex_protocol::protocol::TurnTerminalizationReceipt {
+                    terminal_identity: "thread:turn".to_string(),
+                    terminalization: Default::default(),
+                    delivery_state:
+                        codex_protocol::protocol::TerminalizationDeliveryState::Delivered,
+                    active_turn_detached: true,
+                    terminal_interaction_released: true,
+                    recovery_state: codex_protocol::protocol::TerminalizationRecoveryState::None,
+                    deadline_exhausted_phase: None,
+                },
+            },
+        );
+        assert!(server_notification_requires_delivery(&notification));
+    }
+
+    #[test]
+    fn authoritative_lifecycle_notifications_require_delivery() {
+        let notifications = [
+            ServerNotification::HookCompleted(v2::HookCompletedNotification {
+                thread_id: "thread".to_string(),
+                turn_id: None,
+                run: v2::HookRunSummary {
+                    id: "hook".to_string(),
+                    event_name: v2::HookEventName::Stop,
+                    handler_type: v2::HookHandlerType::Command,
+                    execution_mode: v2::HookExecutionMode::Sync,
+                    scope: v2::HookScope::Thread,
+                    source_path: absolute_path("hook"),
+                    source: v2::HookSource::Unknown,
+                    display_order: 0,
+                    status: v2::HookRunStatus::Completed,
+                    status_message: None,
+                    started_at: 0,
+                    completed_at: Some(1),
+                    duration_ms: Some(1),
+                    entries: Vec::new(),
+                },
+            }),
+            ServerNotification::ServerRequestResolved(v2::ServerRequestResolvedNotification {
+                thread_id: "thread".to_string(),
+                request_id: request_id(),
+            }),
+            ServerNotification::AccountLoginCompleted(v2::AccountLoginCompletedNotification {
+                login_id: Some("login".to_string()),
+                success: true,
+                error: None,
+            }),
+            ServerNotification::ThreadClosed(v2::ThreadClosedNotification {
+                thread_id: "thread".to_string(),
+            }),
+        ];
+
+        for notification in notifications {
+            assert!(server_notification_requires_delivery(&notification));
+        }
     }
 
     #[test]
@@ -2235,6 +2321,7 @@ mod tests {
                 capabilities: Some(v1::InitializeCapabilities {
                     experimental_api: true,
                     request_attestation: true,
+                    desktop_activation_receipts: false,
                     mcp_server_openai_form_elicitation: true,
                     opt_out_notification_methods: Some(vec![
                         "thread/started".to_string(),
@@ -2306,6 +2393,7 @@ mod tests {
                     capabilities: Some(v1::InitializeCapabilities {
                         experimental_api: true,
                         request_attestation: true,
+                        desktop_activation_receipts: false,
                         mcp_server_openai_form_elicitation: true,
                         opt_out_notification_methods: Some(vec![
                             "thread/started".to_string(),

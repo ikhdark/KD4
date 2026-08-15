@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
@@ -103,6 +104,7 @@ pub(crate) struct SourceMetadataToken {
     pub(crate) watcher_generation: u64,
     pub(crate) host_mutation_generation: u64,
     pub(crate) stable_file_identity: String,
+    pub(crate) freshness_identity: String,
 }
 
 impl SourceMetadataToken {
@@ -118,9 +120,8 @@ impl SourceMetadataToken {
             && self.repository_identity == current.repository_identity
             && self.environment_identity == current.environment_identity
             && self.mutation_revision == current.mutation_revision
-            && self.watcher_generation == current.watcher_generation
-            && self.host_mutation_generation == current.host_mutation_generation
             && self.stable_file_identity == current.stable_file_identity
+            && self.freshness_identity == current.freshness_identity
     }
 }
 
@@ -147,6 +148,53 @@ pub(crate) struct GitObservationReceipt {
     pub(crate) freshness_key: String,
     pub(crate) identity: String,
     pub(crate) artifact_id: String,
+    pub(crate) observed_paths: Vec<String>,
+    pub(crate) freshness_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub(crate) struct SourceEvidenceRange {
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AuthoritativeSourceBasis {
+    pub(crate) path: String,
+    pub(crate) file_content_hash: String,
+    pub(crate) source_snapshot_identity: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ObligationIdentity {
+    pub(crate) locator_request_identity: String,
+    pub(crate) owner_id: String,
+    pub(crate) task_contract_epoch: String,
+    pub(crate) obligation_kind: String,
+    pub(crate) required_ranges: Vec<SourceEvidenceRange>,
+    pub(crate) reset_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedSourceEvidenceBasis {
+    pub(crate) source_basis: AuthoritativeSourceBasis,
+    pub(crate) obligation_identity: ObligationIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthoritativeSourceIdentity {
+    file_content_hash: String,
+    obligation_kind: String,
+    required_ranges: Vec<SourceEvidenceRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundSourceBasisSignature {
+    source_snapshot_identity: String,
+    locator_request_identity: String,
+    owner_id: String,
+    task_contract_epoch: String,
+    source_identities: BTreeMap<String, AuthoritativeSourceIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,18 +221,26 @@ pub(crate) struct SourceClosureState {
     read_receipts: VecDeque<ReadReceipt>,
     search_receipts: VecDeque<SearchReceipt>,
     unresolved: Vec<String>,
+    locator_unresolved: BTreeSet<String>,
     capacity_loss: bool,
     validation_known: bool,
     validation_explicitly_unresolved: bool,
     disposition: SourceClosureDisposition,
     reopen_reason: Option<String>,
     pub(crate) locator_attempted: bool,
+    locator_source_revision: u64,
     pub(crate) source_revision: u64,
     pub(crate) repository_identity: Option<String>,
     pub(crate) source_snapshot_identity: Option<String>,
     pub(crate) manifest_revision: Option<String>,
     pub(crate) locator_artifact_id: Option<String>,
     pub(crate) git_observation: Option<GitObservationReceipt>,
+    authoritative_source_identities: BTreeMap<String, AuthoritativeSourceIdentity>,
+    locator_request_identity: Option<String>,
+    task_contract_epoch: Option<String>,
+    evidence_basis_generation: u64,
+    bound_source_basis: Option<BoundSourceBasisSignature>,
+    source_basis_bound: bool,
     read_reservations: BTreeMap<String, watch::Sender<bool>>,
     search_reservations: BTreeMap<String, watch::Sender<bool>>,
     hydration_candidates: Vec<SourceSearchHydrationCandidate>,
@@ -236,6 +292,10 @@ impl SourceClosureState {
         owner: Option<ManifestOwnerProjection>,
     ) {
         self.locator_attempted = true;
+        self.source_basis_bound = false;
+        self.unresolved
+            .retain(|item| !self.locator_unresolved.contains(item));
+        self.locator_unresolved.clear();
         self.repository_identity = Some(facts.repository_identity.clone());
         self.source_snapshot_identity = Some(facts.source_snapshot_identity.clone());
         self.manifest_revision = Some(facts.owner_manifest_revision.clone());
@@ -253,6 +313,7 @@ impl SourceClosureState {
         if let Some(owner) = owner {
             self.set_owner(owner);
         }
+        self.authoritative_source_identities = authoritative_source_identities(facts);
         for instruction in &facts.captured_instruction_sources {
             let path = normalize_path(&instruction.path);
             if let Some(observed) = self.instructions.get_mut(&path) {
@@ -304,9 +365,76 @@ impl SourceClosureState {
                 .source_gaps
                 .iter()
                 .any(|gap| gap.to_ascii_lowercase().contains("validation"));
-        self.extend_unresolved(facts.source_gaps.clone());
-        self.extend_unresolved(facts.unresolved_source_ambiguity.clone());
+        self.locator_unresolved
+            .extend(facts.source_gaps.iter().cloned());
+        self.locator_unresolved
+            .extend(facts.unresolved_source_ambiguity.iter().cloned());
+        self.extend_unresolved(self.locator_unresolved.clone());
+        self.locator_source_revision = self.source_revision;
         self.recompute_disposition();
+    }
+
+    pub(crate) fn bind_authoritative_source_basis(
+        &mut self,
+        locator_request_identity: String,
+        task_contract_epoch: String,
+    ) {
+        let Some(source_snapshot_identity) = self.source_snapshot_identity.clone() else {
+            self.source_basis_bound = false;
+            return;
+        };
+        let Some(owner_id) = self.owner.as_ref().map(|owner| owner.id.clone()) else {
+            self.source_basis_bound = false;
+            return;
+        };
+        if source_snapshot_identity.trim().is_empty()
+            || locator_request_identity.trim().is_empty()
+            || owner_id.trim().is_empty()
+            || task_contract_epoch.trim().is_empty()
+        {
+            self.source_basis_bound = false;
+            return;
+        }
+        let signature = BoundSourceBasisSignature {
+            source_snapshot_identity,
+            locator_request_identity: locator_request_identity.clone(),
+            owner_id,
+            task_contract_epoch: task_contract_epoch.clone(),
+            source_identities: self.authoritative_source_identities.clone(),
+        };
+        if self.bound_source_basis.as_ref() != Some(&signature) {
+            self.evidence_basis_generation = self.evidence_basis_generation.saturating_add(1);
+        }
+        self.locator_request_identity = Some(locator_request_identity);
+        self.task_contract_epoch = Some(task_contract_epoch);
+        self.bound_source_basis = Some(signature);
+        self.source_basis_bound = true;
+    }
+
+    pub(crate) fn admitted_source_evidence_basis(
+        &self,
+        path: &str,
+    ) -> Option<AdmittedSourceEvidenceBasis> {
+        if !self.source_basis_bound {
+            return None;
+        }
+        let path = normalize_path(path);
+        let identity = self.authoritative_source_identities.get(&path)?;
+        Some(AdmittedSourceEvidenceBasis {
+            source_basis: AuthoritativeSourceBasis {
+                path,
+                file_content_hash: identity.file_content_hash.clone(),
+                source_snapshot_identity: self.source_snapshot_identity.clone()?,
+            },
+            obligation_identity: ObligationIdentity {
+                locator_request_identity: self.locator_request_identity.clone()?,
+                owner_id: self.owner.as_ref()?.id.clone(),
+                task_contract_epoch: self.task_contract_epoch.clone()?,
+                obligation_kind: identity.obligation_kind.clone(),
+                required_ranges: identity.required_ranges.clone(),
+                reset_generation: self.evidence_basis_generation,
+            },
+        })
     }
 
     pub(crate) fn hydration_candidates(&self) -> Vec<SourceSearchHydrationCandidate> {
@@ -319,6 +447,9 @@ impl SourceClosureState {
             .as_ref()
             .is_some_and(|prior| prior.id != owner.id);
         if replacing {
+            self.source_basis_bound = false;
+            self.authoritative_source_identities.clear();
+            self.evidence_basis_generation = self.evidence_basis_generation.saturating_add(1);
             self.reopen("authoritative owner changed");
         }
         let prior_instructions = std::mem::take(&mut self.instructions);
@@ -432,6 +563,9 @@ impl SourceClosureState {
     }
 
     pub(crate) fn reopen_for_source_change(&mut self, detail: impl Into<String>) {
+        self.source_basis_bound = false;
+        self.authoritative_source_identities.clear();
+        self.evidence_basis_generation = self.evidence_basis_generation.saturating_add(1);
         self.reopen(format!("source changed: {}", detail.into()));
     }
 
@@ -456,8 +590,23 @@ impl SourceClosureState {
     }
 
     pub(crate) fn reopen_for_question(&mut self, question: &SourceQuestion) {
+        self.source_basis_bound = false;
+        self.evidence_basis_generation = self.evidence_basis_generation.saturating_add(1);
         self.extend_unresolved([question.summary()]);
         self.reopen("new source question");
+    }
+
+    pub(crate) fn resolve_question(&mut self, question: &SourceQuestion) {
+        let summary = question.summary();
+        let detail = question.detail.trim();
+        self.unresolved
+            .retain(|item| item != &summary && item.trim() != detail);
+        self.locator_unresolved.retain(|item| item.trim() != detail);
+        self.recompute_disposition();
+    }
+
+    pub(crate) fn locator_evidence_is_current(&self) -> bool {
+        self.locator_attempted && self.locator_source_revision == self.source_revision
     }
 
     pub(crate) fn reopen(&mut self, reason: impl Into<String>) {
@@ -534,45 +683,17 @@ impl SourceClosureState {
         ))
     }
 
-    pub(crate) fn find_covering_read(
+    pub(crate) fn find_cached_read(
         &self,
         path: &str,
-        start_line: usize,
-        end_line: usize,
         metadata: &SourceMetadataToken,
     ) -> Option<ReadReceipt> {
         let path = normalize_path(path);
         self.read_receipts
             .iter()
             .rev()
-            .find(|receipt| {
-                receipt.path == path
-                    && receipt.start_line <= start_line
-                    && receipt.end_line >= end_line
-                    && receipt.metadata.permits_reuse(metadata)
-            })
+            .find(|receipt| receipt.path == path && receipt.metadata.permits_reuse(metadata))
             .cloned()
-    }
-
-    pub(crate) fn find_overlapping_reads(
-        &self,
-        path: &str,
-        start_line: usize,
-        end_line: usize,
-        metadata: &SourceMetadataToken,
-    ) -> Vec<ReadReceipt> {
-        let path = normalize_path(path);
-        self.read_receipts
-            .iter()
-            .rev()
-            .filter(|receipt| {
-                receipt.path == path
-                    && receipt.start_line <= end_line
-                    && receipt.end_line >= start_line
-                    && receipt.metadata.permits_reuse(metadata)
-            })
-            .cloned()
-            .collect()
     }
 
     pub(crate) fn record_read(&mut self, receipt: ReadReceipt) {
@@ -737,6 +858,87 @@ fn normalize_path(path: &str) -> String {
         .to_string()
 }
 
+fn authoritative_source_identities(
+    facts: &LocateTaskDecisionFacts,
+) -> BTreeMap<String, AuthoritativeSourceIdentity> {
+    let mut identities = BTreeMap::<String, AuthoritativeSourceIdentity>::new();
+    let mut conflicting_paths = BTreeSet::new();
+    for section in &facts.captured_source_sections {
+        if section.source_snapshot_identity != facts.source_snapshot_identity {
+            continue;
+        }
+        let (Some(file_content_hash), Some(span)) =
+            (section.file_content_hash.as_ref(), section.span.as_ref())
+        else {
+            continue;
+        };
+        if file_content_hash.is_empty() || span.start_line == 0 || span.end_line < span.start_line {
+            continue;
+        }
+        let path = normalize_path(&section.path);
+        if path.is_empty() || conflicting_paths.contains(&path) {
+            continue;
+        }
+        let range = SourceEvidenceRange {
+            start_line: span.start_line,
+            end_line: span.end_line,
+        };
+        let obligation_kind = match section.kind {
+            codex_file_search::task_locator::LocateTaskSourceSectionKind::PrimaryImplementation => {
+                "primary"
+            }
+            codex_file_search::task_locator::LocateTaskSourceSectionKind::Caller => "caller",
+            codex_file_search::task_locator::LocateTaskSourceSectionKind::Test => "test",
+            codex_file_search::task_locator::LocateTaskSourceSectionKind::Contract => "contract",
+            codex_file_search::task_locator::LocateTaskSourceSectionKind::Generated => "generated",
+            codex_file_search::task_locator::LocateTaskSourceSectionKind::OtherSourceContext => {
+                "other_source_context"
+            }
+        };
+        match identities.get_mut(&path) {
+            Some(identity)
+                if identity.file_content_hash.as_str() == file_content_hash.as_str()
+                    && identity.obligation_kind == obligation_kind =>
+            {
+                identity.required_ranges.push(range);
+            }
+            Some(_) => {
+                identities.remove(&path);
+                conflicting_paths.insert(path);
+            }
+            None => {
+                identities.insert(
+                    path,
+                    AuthoritativeSourceIdentity {
+                        file_content_hash: file_content_hash.clone(),
+                        obligation_kind: obligation_kind.to_string(),
+                        required_ranges: vec![range],
+                    },
+                );
+            }
+        }
+    }
+    for identity in identities.values_mut() {
+        canonicalize_evidence_ranges(&mut identity.required_ranges);
+    }
+    identities
+}
+
+fn canonicalize_evidence_ranges(ranges: &mut Vec<SourceEvidenceRange>) {
+    ranges.sort();
+    let mut merged: Vec<SourceEvidenceRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && range.start_line <= previous.end_line.saturating_add(1)
+        {
+            previous.end_line = previous.end_line.max(range.end_line);
+        } else {
+            merged.push(range);
+        }
+    }
+    *ranges = merged;
+}
+
 fn path_within(path: &str, root: &str) -> bool {
     path == root
         || path
@@ -806,7 +1008,10 @@ fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_file_search::task_locator::ExactSpan;
     use codex_file_search::task_locator::LocateTaskLocatedPath;
+    use codex_file_search::task_locator::LocateTaskSourceSection;
+    use codex_file_search::task_locator::LocateTaskSourceSectionKind;
     use codex_file_search::task_locator::LocateTaskValidationRoute;
 
     fn owner(instructions: Vec<String>) -> ManifestOwnerProjection {
@@ -877,6 +1082,7 @@ mod tests {
                 watcher_generation: 0,
                 host_mutation_generation: 0,
                 stable_file_identity: "file".to_string(),
+                freshness_identity: "freshness".to_string(),
             },
             content_hash: "secret-hash".to_string(),
             artifact_id: "secret-artifact".to_string(),
@@ -996,7 +1202,139 @@ mod tests {
     }
 
     #[test]
-    fn source_tools_metadata_revision_rejects_watcher_mutation_and_replacement() {
+    fn locator_refresh_is_admitted_after_source_revision_changes() {
+        let authoritative = owner(Vec::new());
+        let facts = locator_facts(authoritative.clone(), Vec::new());
+        let mut state = SourceClosureState::default();
+        state.apply_locator(&facts, Some(authoritative));
+        assert!(state.locator_evidence_is_current());
+
+        state.reopen_for_source_change("src/lib.rs");
+
+        assert!(!state.locator_evidence_is_current());
+    }
+
+    #[test]
+    fn authoritative_basis_uses_existing_owner_identity_and_ignores_progress_revision() {
+        let authoritative = owner(Vec::new());
+        let mut facts = locator_facts(authoritative.clone(), Vec::new());
+        facts
+            .captured_source_sections
+            .push(LocateTaskSourceSection {
+                section_id: "caller-section".to_string(),
+                kind: LocateTaskSourceSectionKind::Caller,
+                state: LocateTaskSourceSectionState::NotMaterialized,
+                path: "src/caller.rs".to_string(),
+                span: Some(ExactSpan {
+                    start_line: 1,
+                    end_line: 100,
+                    start_byte: 0,
+                    end_byte: 1000,
+                }),
+                content_hash: None,
+                file_content_hash: Some("hash-a".to_string()),
+                source_snapshot_identity: "snapshot".to_string(),
+                text: None,
+                provenance: "locator".to_string(),
+            });
+        let mut state = SourceClosureState::default();
+        state.apply_locator(&facts, Some(authoritative));
+        state.bind_authoritative_source_basis("locator-v1".to_string(), "contract-1".to_string());
+        let admitted = state
+            .admitted_source_evidence_basis("./src\\caller.rs")
+            .expect("owner-provided identity");
+        assert_eq!(admitted.source_basis.file_content_hash, "hash-a");
+        assert_eq!(admitted.source_basis.source_snapshot_identity, "snapshot");
+        assert_eq!(admitted.obligation_identity.obligation_kind, "caller");
+        assert_eq!(
+            admitted.obligation_identity.required_ranges,
+            vec![SourceEvidenceRange {
+                start_line: 1,
+                end_line: 100,
+            }]
+        );
+
+        state.mark_observed("src/lib.rs");
+        state.bind_authoritative_source_basis("locator-v1".to_string(), "contract-1".to_string());
+        assert_eq!(
+            state.admitted_source_evidence_basis("src/caller.rs"),
+            Some(admitted),
+            "progress-only source revisions must not split the stable evidence basis"
+        );
+    }
+
+    #[test]
+    fn authoritative_basis_is_unavailable_or_invalidated_fail_closed() {
+        let authoritative = owner(Vec::new());
+        let mut facts = locator_facts(authoritative.clone(), Vec::new());
+        facts
+            .captured_source_sections
+            .push(LocateTaskSourceSection {
+                section_id: "caller-section".to_string(),
+                kind: LocateTaskSourceSectionKind::Caller,
+                state: LocateTaskSourceSectionState::NotMaterialized,
+                path: "src/caller.rs".to_string(),
+                span: Some(ExactSpan {
+                    start_line: 1,
+                    end_line: 100,
+                    start_byte: 0,
+                    end_byte: 1000,
+                }),
+                content_hash: None,
+                file_content_hash: None,
+                source_snapshot_identity: "snapshot".to_string(),
+                text: None,
+                provenance: "locator".to_string(),
+            });
+        let mut state = SourceClosureState::default();
+        state.apply_locator(&facts, Some(authoritative));
+        state.bind_authoritative_source_basis("locator-v1".to_string(), "contract-1".to_string());
+        assert!(
+            state
+                .admitted_source_evidence_basis("src/caller.rs")
+                .is_none()
+        );
+
+        facts.captured_source_sections[0].file_content_hash = Some("hash-a".to_string());
+        state.apply_locator(&facts, facts.authoritative_owner.clone());
+        state.bind_authoritative_source_basis("locator-v1".to_string(), "contract-1".to_string());
+        assert!(
+            state
+                .admitted_source_evidence_basis("src/caller.rs")
+                .is_some()
+        );
+
+        state.reopen_for_question(&SourceQuestion {
+            kind: SourceQuestionKind::IncompletePriorResult,
+            detail: "explicitly rebind the source obligation".to_string(),
+        });
+        assert!(
+            state
+                .admitted_source_evidence_basis("src/caller.rs")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn focused_question_resolution_retires_locator_and_question_obligations() {
+        let detail = "find the unknown caller";
+        let authoritative = owner(Vec::new());
+        let facts = locator_facts(authoritative.clone(), vec![detail.to_string()]);
+        let mut state = SourceClosureState::default();
+        state.apply_locator(&facts, Some(authoritative));
+        let question = SourceQuestion {
+            kind: SourceQuestionKind::UnknownCaller,
+            detail: detail.to_string(),
+        };
+        state.reopen_for_question(&question);
+
+        state.resolve_question(&question);
+
+        assert!(state.summary().unresolved_questions.is_empty());
+    }
+
+    #[test]
+    fn source_tools_metadata_revision_uses_scoped_freshness_and_replacement() {
         let base = SourceMetadataToken {
             size: 10,
             created_at_ms: 1,
@@ -1008,10 +1346,13 @@ mod tests {
             watcher_generation: 3,
             host_mutation_generation: 4,
             stable_file_identity: "file-a".to_string(),
+            freshness_identity: "freshness-a".to_string(),
         };
         assert!(base.permits_reuse(&base));
         let mut changed = base.clone();
         changed.watcher_generation += 1;
+        assert!(base.permits_reuse(&changed));
+        changed.freshness_identity = "freshness-b".to_string();
         assert!(!base.permits_reuse(&changed));
         changed = base.clone();
         changed.mutation_revision += 1;

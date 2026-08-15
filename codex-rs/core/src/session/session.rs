@@ -35,6 +35,9 @@ pub(crate) struct Session {
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
+    /// Serializes completed-tool ledger snapshots with artifact protection changes so
+    /// compaction cannot remove a marker while a concurrent candidate is being persisted.
+    pub(super) tool_history_io_gate: Semaphore,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
     pub(super) managed_network_proxy_refresh_lock: Semaphore,
@@ -49,6 +52,9 @@ pub(crate) struct Session {
     pub(crate) startup_timing: Arc<StartupTimingState>,
     /// Owns terminal coordinators so request cancellation cannot strand a claimed turn.
     pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
+    /// Process-local acknowledgement registry for at-least-once terminal delivery. The durable
+    /// task-evidence receipt mirrors acknowledgement when available.
+    pub(crate) terminal_delivery_registry: Mutex<TerminalDeliveryRegistry>,
     /// Admission stays closed while the prior turn is between terminal claim and the
     /// interaction-released milestone, even if its raw active-turn slot is being detached.
     pub(crate) terminal_interaction_pending: std::sync::atomic::AtomicBool,
@@ -60,6 +66,17 @@ pub(crate) struct Session {
     pub(super) completion_review_slot: Semaphore,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
+}
+
+#[derive(Default)]
+pub(crate) struct TerminalDeliveryRegistry {
+    pub(crate) by_identity: HashMap<String, TerminalDeliveryRegistryEntry>,
+}
+
+pub(crate) struct TerminalDeliveryRegistryEntry {
+    pub(crate) fingerprint: String,
+    pub(crate) acknowledged: bool,
+    pub(crate) redelivery_scheduled: bool,
 }
 
 #[derive(Clone)]
@@ -200,6 +217,7 @@ impl SessionConfiguration {
             approvals_reviewer: self.approvals_reviewer,
             permission_profile: self.permission_profile(),
             active_permission_profile: self.active_permission_profile(),
+            windows_sandbox_level: self.windows_sandbox_level,
             environments: self.environments.clone(),
             workspace_roots: self.workspace_roots.clone(),
             profile_workspace_roots: self.profile_workspace_roots().to_vec(),
@@ -537,6 +555,13 @@ impl Session {
             .forked_from_thread_id
             .or_else(|| initial_history.forked_from_id());
         session_configuration.forked_from_thread_id = forked_from_id;
+        let tool_history_fork_source = matches!(&initial_history, InitialHistory::Forked(_))
+            .then_some(forked_from_id)
+            .flatten();
+        let restores_initial_tool_history = matches!(
+            &initial_history,
+            InitialHistory::Resumed(_) | InitialHistory::Forked(_)
+        );
         let parent_thread_id = session_configuration
             .parent_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id());
@@ -986,12 +1011,20 @@ impl Session {
                 session_configuration.clone(),
                 initial_auto_compact_window_ids,
             );
-            if config.completed_tool_history_projection {
-                let tool_history = crate::tool_history::load_tool_history_state(
-                    config.codex_home.as_path(),
-                    &thread_id.to_string(),
-                )
-                .await;
+            if config.completed_tool_history_projection && restores_initial_tool_history {
+                let tool_history = if let Some(source_thread_id) = tool_history_fork_source {
+                    crate::tool_history::load_tool_history_state_for_fork(
+                        config.codex_home.as_path(),
+                        &source_thread_id.to_string(),
+                    )
+                    .await
+                } else {
+                    crate::tool_history::load_tool_history_state(
+                        config.codex_home.as_path(),
+                        &thread_id.to_string(),
+                    )
+                    .await
+                };
                 state.set_tool_history_state(tool_history);
             }
             let managed_network_requirements_configured = config
@@ -1219,6 +1252,7 @@ impl Session {
                 tx_event: tx_event.clone(),
                 agent_status,
                 state: Mutex::new(state),
+                tool_history_io_gate: Semaphore::new(/*permits*/ 1),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),
                 multi_agent_version,
@@ -1227,6 +1261,7 @@ impl Session {
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
+                terminal_delivery_registry: Mutex::new(TerminalDeliveryRegistry::default()),
                 terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 input_queue: InputQueue::new(),
@@ -1242,6 +1277,14 @@ impl Session {
             sess.schedule_startup_transport_preconnect().await;
             // Dispatch the SessionConfiguredEvent first and then report any errors.
             // If resuming, include converted initial messages in the payload so UIs can render them immediately.
+            let terminal_recovery_turn_id = crate::tasks::open_turn_id_for_terminal_recovery(
+                initial_history.get_rollout_items(),
+            );
+            sess.adopt_rollout_terminal_authority(initial_history.get_rollout_items())
+                .await;
+            sess.input_queue
+                .seed_seen_mailbox_communication_ids(initial_history.get_rollout_items())
+                .await;
             let initial_messages = initial_history.get_event_msgs();
             let events = std::iter::once(Event {
                 id: INITIAL_SUBMIT_ID.to_owned(),
@@ -1342,6 +1385,16 @@ impl Session {
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(sess.record_initial_history(initial_history)).await;
+            if config.completed_tool_history_projection && restores_initial_tool_history {
+                sess.finalize_initial_tool_history_state(
+                    config.codex_home.as_path(),
+                    tool_history_fork_source,
+                )
+                .await;
+            }
+            if let Some(turn_id) = terminal_recovery_turn_id {
+                sess.recover_bound_terminal_intent(turn_id).await;
+            }
             {
                 let mut state = sess.state.lock().await;
                 state.queue_pending_session_start_source(session_start_source);

@@ -549,6 +549,7 @@ mod tests {
                     },
                 )),
                 RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    surfaced_result: None,
                     turn_id: "turn-1".to_string(),
                     last_agent_message: None,
                     error: None,

@@ -2443,6 +2443,7 @@ fn accepted_elicitation_content_converts_to_request_user_input_response() {
                     answers: vec![MCP_TOOL_APPROVAL_ACCEPT_AND_REMEMBER.to_string()],
                 },
             )]),
+            interrupted: false,
         })
     );
 }
@@ -2779,6 +2780,7 @@ fn synthetic_decline_request_user_input_response_stays_decline() {
                     answers: vec![MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC.to_string()],
                 },
             )]),
+            interrupted: false,
         }),
         "approval",
     );

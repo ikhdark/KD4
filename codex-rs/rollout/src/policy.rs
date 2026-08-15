@@ -16,6 +16,7 @@ pub fn is_persisted_rollout_item(item: &RolloutItem, history_mode: ThreadHistory
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::SamplingBoundary(_)
         | RolloutItem::SessionMeta(_) => true,
     }
 }
@@ -139,6 +140,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::ModelReroute(_)
         | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
+        | EventMsg::TurnTerminalizationComplete(_)
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)

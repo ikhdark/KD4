@@ -18,6 +18,8 @@ use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadSettingsUpdateParams;
+use codex_app_server_protocol::ThreadSettingsUpdateResponse;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -69,7 +71,7 @@ async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
             source_kinds: None,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -81,6 +83,58 @@ async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
     )
     .await??;
     to_response::<ThreadListResponse>(list_resp)
+}
+
+async fn complete_text_turn(
+    mcp: &mut TestAppServer,
+    thread_id: &str,
+    text: &str,
+) -> Result<String> {
+    let request_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread_id.to_string(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(response)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    Ok(turn.id)
+}
+
+async fn update_thread_model(mcp: &mut TestAppServer, thread_id: &str, model: &str) -> Result<()> {
+    let request_id = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: thread_id.to_string(),
+            model: Some(model.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let _: ThreadSettingsUpdateResponse = to_response(response)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -366,6 +420,61 @@ async fn thread_fork_at_last_turn_id_keeps_only_terminal_prefix() -> Result<()> 
         }
     };
     assert!(started.thread.turns.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_reduces_settings_at_head_and_selected_turn_boundary() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model-1".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let first_turn_id = complete_text_turn(&mut mcp, &thread.id, "first").await?;
+    update_thread_model(&mut mcp, &thread.id, "mock-model-2").await?;
+    let second_turn_id = complete_text_turn(&mut mcp, &thread.id, "second").await?;
+    update_thread_model(&mut mcp, &thread.id, "mock-model-3").await?;
+
+    let fork_cases = [
+        (Some(first_turn_id), "mock-model-1"),
+        (Some(second_turn_id), "mock-model-2"),
+        (None, "mock-model-3"),
+    ];
+    for (last_turn_id, expected_model) in fork_cases {
+        let fork_id = mcp
+            .send_thread_fork_request(ThreadForkParams {
+                thread_id: thread.id.clone(),
+                last_turn_id,
+                ..Default::default()
+            })
+            .await?;
+        let fork_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+        )
+        .await??;
+        let ThreadForkResponse { model, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+        assert_eq!(model, expected_model);
+    }
 
     Ok(())
 }

@@ -44,6 +44,7 @@ pub use bugs::BugStore;
 ///
 /// Most consumers should prefer [`StateRuntime`].
 pub use extract::apply_rollout_item;
+pub use extract::apply_rollout_items;
 pub use extract::rollout_item_affects_thread_metadata;
 pub use model::AgentJob;
 pub use model::AgentJobCreateParams;

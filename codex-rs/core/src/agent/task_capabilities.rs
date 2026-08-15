@@ -262,7 +262,6 @@ pub(crate) fn classify_typed_tool(
             "list_mcp_resources",
             "list_mcp_resource_templates",
             "read_mcp_resource",
-            "get_context_remaining",
             "current_time",
         ],
     ) {

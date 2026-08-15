@@ -22,7 +22,7 @@ use codex_state::DB_METRIC_BACKFILL;
 use codex_state::DB_METRIC_BACKFILL_DURATION_MS;
 use codex_state::ExtractionOutcome;
 use codex_state::ThreadMetadataBuilder;
-use codex_state::apply_rollout_item;
+use codex_state::apply_rollout_items;
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::info;
@@ -70,6 +70,7 @@ pub fn builder_from_items(
         RolloutItem::SessionMeta(meta_line) => Some(meta_line),
         RolloutItem::ResponseItem(_)
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::SamplingBoundary(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
@@ -114,9 +115,7 @@ pub async fn extract_metadata_from_rollout(
         )
     })?;
     let mut metadata = builder.build(default_provider);
-    for item in &items {
-        apply_rollout_item(&mut metadata, item, default_provider);
-    }
+    apply_rollout_items(&mut metadata, &items, default_provider);
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;
         metadata.recency_at = updated_at;
@@ -127,6 +126,7 @@ pub async fn extract_metadata_from_rollout(
             RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
             RolloutItem::ResponseItem(_)
             | RolloutItem::ToolManifest(_)
+            | RolloutItem::SamplingBoundary(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)

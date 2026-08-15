@@ -76,8 +76,10 @@ is the current source map for the checked-in script tooling.
 - `invoke-rust-perf-env.ps1` and `sccache-perf.ps1`: local Rust performance and
   cache diagnostics. Do not change cache topology without measured need.
 - `check_kd4_features.py`: validates `kd4_features.toml` ownership, registration,
-  test, and static evidence markers. Use `--strict` when orphaned features must
-  fail the gate.
+  test, and static evidence markers. Manifest `status` records implementation
+  lifecycle, while feature-gated entries separately declare their effective
+  repository `runtime_status`; project overrides and Rust feature defaults are
+  checked for drift. Use `--strict` when orphaned features must fail the gate.
 - `kd4_sync_audit.py`: reports branch divergence, dirty-worktree risk, and a
   non-mutating `git merge-tree` conflict forecast before upstream integration.
 - `kd4_perf_snapshot.py`: records cold-first and warm-repeat timing snapshots for

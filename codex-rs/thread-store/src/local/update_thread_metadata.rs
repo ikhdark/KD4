@@ -266,7 +266,7 @@ async fn apply_metadata_update(
                 metadata.model = Some(model);
             }
             if let Some(reasoning_effort) = patch.reasoning_effort {
-                metadata.reasoning_effort = Some(reasoning_effort);
+                metadata.reasoning_effort = reasoning_effort;
             }
             if let Some(created_at) = patch.created_at {
                 metadata.created_at = created_at;
@@ -1783,7 +1783,7 @@ mod tests {
                 archived: false,
                 search_term: None,
                 relation_filter: None,
-                use_state_db_only: true,
+                storage_mode: crate::ThreadListStorageMode::StateDbOnly,
             })
             .await
             .expect("list threads by cwd");

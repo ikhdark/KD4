@@ -348,6 +348,9 @@ fn sample_turn_start_response(turn_id: &str) -> ClientResponsePayload {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             reasoning_policy_history: None,
         },
     })
@@ -365,6 +368,9 @@ fn sample_turn_started_notification(thread_id: &str, turn_id: &str) -> ServerNot
             started_at: Some(455),
             completed_at: None,
             duration_ms: None,
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             reasoning_policy_history: None,
         },
     })
@@ -391,6 +397,7 @@ fn sample_turn_completed_notification(
     codex_error_info: Option<codex_app_server_protocol::CodexErrorInfo>,
 ) -> ServerNotification {
     ServerNotification::TurnCompleted(TurnCompletedNotification {
+        surfaced_result: None,
         thread_id: thread_id.to_string(),
         completion: None,
         turn: Turn {
@@ -406,6 +413,9 @@ fn sample_turn_completed_notification(
             started_at: None,
             completed_at: Some(456),
             duration_ms: Some(1234),
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             reasoning_policy_history: None,
         },
         timing: None,
@@ -814,6 +824,7 @@ fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
             capabilities: Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -1696,6 +1707,7 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
                     capabilities: Some(InitializeCapabilities {
                         experimental_api: false,
                         request_attestation: false,
+                        desktop_activation_receipts: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                     }),
@@ -2000,6 +2012,7 @@ async fn compaction_event_ingests_custom_fact() {
                     capabilities: Some(InitializeCapabilities {
                         experimental_api: false,
                         request_attestation: false,
+                        desktop_activation_receipts: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                     }),
@@ -2130,6 +2143,7 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
                     capabilities: Some(InitializeCapabilities {
                         experimental_api: false,
                         request_attestation: false,
+                        desktop_activation_receipts: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                     }),

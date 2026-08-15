@@ -232,6 +232,7 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::EventMsg(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::SamplingBoundary(_)
             | RolloutItem::TurnContext(_) => None,
         })
         .expect("session metadata should be persisted")
@@ -403,6 +404,7 @@ async fn on_event_updates_status_from_task_started() {
 #[tokio::test]
 async fn on_event_updates_status_from_task_complete() {
     let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+        surfaced_result: None,
         turn_id: "turn-1".to_string(),
         last_agent_message: Some("done".to_string()),
         error: None,
@@ -414,6 +416,33 @@ async fn on_event_updates_status_from_task_complete() {
     }));
     let expected = AgentStatus::Completed(Some("done".to_string()));
     assert_eq!(status, Some(expected));
+}
+
+#[tokio::test]
+async fn on_event_preserves_typed_surface_in_agent_status() {
+    let surfaced_result = codex_protocol::protocol::SurfacedToolResult {
+        adapter: "owner".to_string(),
+        value: serde_json::json!({"answer": 42}),
+        canonical_message: None,
+    };
+    let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+        surfaced_result: Some(surfaced_result.clone()),
+        turn_id: "turn-surface".to_string(),
+        last_agent_message: None,
+        error: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+        completion: None,
+        timing: None,
+    }));
+    assert_eq!(
+        status,
+        Some(AgentStatus::CompletedWithSurface {
+            last_agent_message: None,
+            surfaced_result,
+        })
+    );
 }
 
 #[tokio::test]
@@ -2782,6 +2811,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
         .send_event(
             tester_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: tester_turn.sub_id.clone(),
                 last_agent_message: Some("done".to_string()),
                 error: None,
@@ -2872,6 +2902,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         .send_event(
             tester_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: tester_turn.sub_id.clone(),
                 last_agent_message: Some("done".to_string()),
                 error: None,
@@ -2965,6 +2996,7 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
             repository.path(),
             AssignmentDraft {
                 root_session_id,
+                admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
                 role: AgentRole::Worker,
                 capability_profile: CapabilityProfile::ScopedSourceWrite,
                 objective: "complete the typed task".to_string(),
@@ -3022,6 +3054,7 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
         .send_event(
             child_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: child_turn.sub_id.clone(),
                 last_agent_message: Some("done".to_string()),
                 error: None,

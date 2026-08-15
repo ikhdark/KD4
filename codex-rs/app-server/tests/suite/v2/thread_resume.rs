@@ -626,6 +626,102 @@ async fn thread_resume_preserves_acknowledged_approvals_reviewer_update() -> Res
 }
 
 #[tokio::test]
+async fn settings_only_model_update_survives_cold_resume_and_explicit_override_wins() -> Result<()>
+{
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let thread_id = {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .build()
+            .await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+        let start_id = mcp
+            .send_thread_start_request(ThreadStartParams {
+                model: Some("mock-model-1".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+        )
+        .await??;
+        let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+        let update_id = mcp
+            .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+                thread_id: thread.id.clone(),
+                model: Some("mock-model-2".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let update_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(update_id)),
+        )
+        .await??;
+        let _: ThreadSettingsUpdateResponse = to_response(update_resp)?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/settings/updated"),
+        )
+        .await??;
+
+        thread.id
+    };
+
+    {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .build()
+            .await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+        let resume_id = mcp
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            })
+            .await?;
+        let resume_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+        )
+        .await??;
+        let ThreadResumeResponse { model, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+        assert_eq!(model, "mock-model-2");
+    }
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            model: Some("mock-model-3".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { model, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(model, "mock-model-3");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

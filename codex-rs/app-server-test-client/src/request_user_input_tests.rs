@@ -67,6 +67,7 @@ fn collects_option_and_free_form_answers() {
                     },
                 ),
             ]),
+            interrupted: false,
         }
     );
     assert_eq!(
@@ -118,6 +119,7 @@ fn retries_invalid_selection_and_collects_other_answer() {
                     answers: vec!["user_note: SDK wrapper".to_string()],
                 },
             )]),
+            interrupted: false,
         }
     );
     let output = String::from_utf8(output).unwrap();

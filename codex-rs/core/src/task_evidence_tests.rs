@@ -1,4 +1,5 @@
 use super::*;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 
@@ -1345,6 +1346,7 @@ async fn focused_planning_uses_stable_work_unit_without_plan_dependencies() {
     let first = ledger.record_planning_update(update.clone()).await;
     assert_eq!(first.effect, PlanUpdateEffect::Initial);
     assert!(first.public_update.plan.is_empty());
+    assert_eq!(first.unfinished_mutation_obligation, Some(true));
     let work_unit_id = {
         let guard = ledger.document.lock().await;
         let document = guard.as_ref().expect("document");
@@ -2864,7 +2866,11 @@ async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage()
             activation.runtime_evidence.as_deref(),
             Some("legacy desktop restarted")
         );
-        assert!(!desktop_activation_receipt_is_complete(activation));
+        assert!(!desktop_activation_receipt_is_complete(
+            activation,
+            &DesktopActivationRuntimeSnapshot::default(),
+            document,
+        ));
         assert_eq!(
             document.completion.as_ref().map(|gate| gate.status),
             Some(TaskCompletionStatus::Passed)
@@ -3134,6 +3140,7 @@ async fn ordinary_freshness_refresh_reuses_unchanged_strong_hashes() {
             files_strongly_hashed: 1,
             bytes_strongly_hashed: bytes.len() as u64,
             strong_hashes_reused: 2,
+            conservative_reruns: 0,
         }
     );
 }
@@ -3184,6 +3191,7 @@ async fn unavailable_trusted_tokens_remain_strong_hash_only() {
             files_strongly_hashed: 3,
             bytes_strongly_hashed: 3 * bytes.len() as u64,
             strong_hashes_reused: 0,
+            conservative_reruns: 0,
         }
     );
 }
@@ -3206,6 +3214,7 @@ async fn ambiguous_trusted_tokens_remain_strong_hash_only() {
             files_strongly_hashed: 3,
             bytes_strongly_hashed: 3 * bytes.len() as u64,
             strong_hashes_reused: 0,
+            conservative_reruns: 0,
         }
     );
 }
@@ -3445,9 +3454,32 @@ fn set_persistence_test_failure(ledger: &TaskEvidenceLedger, fail_writes: bool) 
 }
 
 fn terminal_decision_claim(terminal_identity: &str) -> TerminalDecisionClaim {
+    let turn_id = terminal_identity
+        .rsplit_once(':')
+        .map(|(_, turn_id)| turn_id)
+        .unwrap_or(terminal_identity)
+        .to_string();
+    let event = EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: turn_id.clone(),
+        last_agent_message: Some("done".to_string()),
+        surfaced_result: None,
+        error: None,
+        completion: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+        timing: None,
+    });
     TerminalDecisionClaim {
-        terminal_identity: terminal_identity.to_string(),
-        durable_outcome: "passed".to_string(),
+        authoritative_event: AuthoritativeTerminalEventV1 {
+            version: 1,
+            terminal_identity: terminal_identity.to_string(),
+            turn_id,
+            fingerprint: crate::terminal_event_fingerprint(&event).expect("terminal event"),
+            event,
+            semantic_outcome: "passed".to_string(),
+            final_proof_identity: None,
+        },
         deadline_exhausted_phase: None,
         mutation_quiescent: true,
         durable_success_established: true,
@@ -3592,19 +3624,23 @@ async fn missing_mandatory_completion_review_proof_overlays_but_supplemental_rev
 async fn terminal_decision_and_delivery_claim_are_atomic_and_one_shot() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     let identity = "thread:turn";
+    let terminalization = codex_protocol::protocol::TurnTimingTerminalization {
+        post_cleanup_ns: 17,
+        ..Default::default()
+    };
 
-    assert_eq!(
+    assert!(matches!(
         ledger
             .commit_terminal_decision_and_claim(terminal_decision_claim(identity))
             .await,
-        TerminalClaimResult::Claimed
-    );
-    assert_eq!(
+        TerminalClaimResult::Claimed(_)
+    ));
+    assert!(matches!(
         ledger
             .commit_terminal_decision_and_claim(terminal_decision_claim(identity))
             .await,
-        TerminalClaimResult::AlreadyClaimed
-    );
+        TerminalClaimResult::AlreadyClaimed(_)
+    ));
     assert_eq!(
         ledger.terminalization_receipts_for_test().await,
         vec![(
@@ -3621,10 +3657,16 @@ async fn terminal_decision_and_delivery_claim_are_atomic_and_one_shot() {
             .update_terminal_interaction(TerminalInteractionUpdate {
                 terminal_identity: identity.to_string(),
                 delivery_state: TerminalDeliveryState::Delivered,
+                app_server_acknowledged: true,
+                runtime_status_converged: true,
+                rollout_mirrored: true,
+                parent_notification_completed: true,
+                post_terminal_cleanup_completed: true,
                 active_turn_detached: true,
                 terminal_interaction_released: true,
                 recovery_state: TerminalRecoveryState::None,
                 phase_timings_ns: BTreeMap::from([("delivery_attempt".to_string(), 3)]),
+                terminalization: Some(terminalization.clone()),
             })
             .await
     );
@@ -3638,6 +3680,48 @@ async fn terminal_decision_and_delivery_claim_are_atomic_and_one_shot() {
             TerminalRecoveryState::None,
         )]
     );
+    assert_eq!(
+        ledger.terminal_timing_receipt_for_test(identity).await,
+        Some(terminalization)
+    );
+}
+
+#[tokio::test]
+async fn conflicting_terminal_candidate_cannot_replace_authoritative_event() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let identity = "thread:turn";
+    let first = terminal_decision_claim(identity);
+    let first_fingerprint = first.authoritative_event.fingerprint.clone();
+    assert!(matches!(
+        ledger.commit_terminal_decision_and_claim(first).await,
+        TerminalClaimResult::Claimed(_)
+    ));
+
+    let mut conflicting = terminal_decision_claim(identity);
+    let EventMsg::TurnComplete(event) = &mut conflicting.authoritative_event.event else {
+        unreachable!("test claim is terminal completion");
+    };
+    event.last_agent_message = Some("conflicting outcome".to_string());
+    conflicting.authoritative_event.fingerprint =
+        crate::terminal_event_fingerprint(&conflicting.authoritative_event.event)
+            .expect("terminal fingerprint");
+    let result = ledger.commit_terminal_decision_and_claim(conflicting).await;
+    let TerminalClaimResult::Conflict {
+        authoritative: Some(authoritative),
+        ..
+    } = result
+    else {
+        panic!("conflicting terminal event must be rejected");
+    };
+    assert_eq!(authoritative.fingerprint, first_fingerprint);
+    assert_eq!(
+        ledger
+            .authoritative_terminal_event(identity)
+            .await
+            .expect("authoritative event")
+            .fingerprint,
+        first_fingerprint
+    );
 }
 
 #[tokio::test]
@@ -3646,17 +3730,63 @@ async fn terminal_claim_persistence_failure_establishes_no_durable_success() {
     install_persistence_supersede_control(&ledger, 0);
     set_persistence_test_failure(&ledger, true);
 
-    assert_eq!(
+    assert!(matches!(
         ledger
             .commit_terminal_decision_and_claim(terminal_decision_claim("failed:turn"))
             .await,
         TerminalClaimResult::Failed
-    );
+    ));
     assert!(ledger.terminalization_receipts_for_test().await.is_empty());
 }
 
 #[tokio::test]
-async fn claimed_terminal_receipt_recovers_interaction_without_resend_state() {
+async fn late_terminalization_persistence_failure_does_not_change_committed_claim() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let identity = "committed:turn";
+    assert!(matches!(
+        ledger
+            .commit_terminal_decision_and_claim(terminal_decision_claim(identity))
+            .await,
+        TerminalClaimResult::Claimed(_)
+    ));
+
+    set_persistence_test_failure(&ledger, true);
+    assert!(
+        !ledger
+            .update_terminal_interaction(TerminalInteractionUpdate {
+                terminal_identity: identity.to_string(),
+                delivery_state: TerminalDeliveryState::Delivered,
+                app_server_acknowledged: false,
+                runtime_status_converged: true,
+                rollout_mirrored: false,
+                parent_notification_completed: false,
+                post_terminal_cleanup_completed: false,
+                active_turn_detached: true,
+                terminal_interaction_released: true,
+                recovery_state: TerminalRecoveryState::None,
+                phase_timings_ns: BTreeMap::new(),
+                terminalization: Some(Default::default()),
+            })
+            .await
+    );
+    assert_eq!(
+        ledger.terminalization_receipts_for_test().await,
+        vec![(
+            identity.to_string(),
+            TerminalDeliveryState::Claimed,
+            false,
+            false,
+            TerminalRecoveryState::Pending,
+        )]
+    );
+    assert_eq!(
+        ledger.terminal_timing_receipt_for_test(identity).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn claimed_terminal_receipt_remains_pending_for_exact_replay() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     let codex_home = temp.path().join("home");
@@ -3669,12 +3799,12 @@ async fn claimed_terminal_receipt_recovers_interaction_without_resend_state() {
     let thread_id = ThreadId::new();
     let identity = format!("{thread_id}:turn");
     let ledger = TaskEvidenceLedger::load_or_new(codex_home.clone(), thread_id, &repo).await;
-    assert_eq!(
+    assert!(matches!(
         ledger
             .commit_terminal_decision_and_claim(terminal_decision_claim(&identity))
             .await,
-        TerminalClaimResult::Claimed
-    );
+        TerminalClaimResult::Claimed(_)
+    ));
     drop(ledger);
 
     let recovered = TaskEvidenceLedger::load_or_new(codex_home, thread_id, &repo).await;
@@ -3683,9 +3813,9 @@ async fn claimed_terminal_receipt_recovers_interaction_without_resend_state() {
         vec![(
             identity,
             TerminalDeliveryState::Claimed,
-            true,
-            true,
-            TerminalRecoveryState::Recovered,
+            false,
+            false,
+            TerminalRecoveryState::Pending,
         )]
     );
 }
@@ -3782,6 +3912,76 @@ fn workspace_scope_change_with_incomplete_history_invalidates_conservatively() {
         WorkspaceEventRelevance::Unknown,
         "repository-wide facts stay unknown without proof of the actor's complete disjoint scope"
     );
+}
+
+#[test]
+fn typed_workspace_actor_requires_exact_same_root_definitive_identity() {
+    use codex_agent_task_store::AttributionConfidence;
+    use codex_agent_task_store::WorkspaceActorKind;
+
+    let proven_attempt_id = "attempt:same-root".to_string();
+    let admitted = BTreeSet::from([proven_attempt_id.clone()]);
+    let event = codex_agent_task_store::WorkspaceEvent {
+        workspace_id: "workspace".to_string(),
+        epoch: 8,
+        actor_id: Some(proven_attempt_id),
+        actor_kind: WorkspaceActorKind::Typed,
+        attribution_confidence: AttributionConfidence::Definitive,
+        paths: vec!["src/lib.rs".to_string()],
+        contracts: Vec::new(),
+        created_at: chrono::Utc::now(),
+    };
+
+    assert!(workspace_event_actor_is_admitted(
+        &event,
+        "root:session",
+        "legacy:session:",
+        &admitted,
+    ));
+
+    let unmatched = codex_agent_task_store::WorkspaceEvent {
+        actor_id: Some("attempt:other-root".to_string()),
+        ..event.clone()
+    };
+    assert!(!workspace_event_actor_is_admitted(
+        &unmatched,
+        "root:session",
+        "legacy:session:",
+        &admitted,
+    ));
+
+    let detection_only = codex_agent_task_store::WorkspaceEvent {
+        attribution_confidence: AttributionConfidence::DetectionOnly,
+        ..event.clone()
+    };
+    assert!(!workspace_event_actor_is_admitted(
+        &detection_only,
+        "root:session",
+        "legacy:session:",
+        &admitted,
+    ));
+
+    let missing_identity = codex_agent_task_store::WorkspaceEvent {
+        actor_id: None,
+        ..event.clone()
+    };
+    assert!(!workspace_event_actor_is_admitted(
+        &missing_identity,
+        "root:session",
+        "legacy:session:",
+        &admitted,
+    ));
+
+    let external = codex_agent_task_store::WorkspaceEvent {
+        actor_kind: WorkspaceActorKind::External,
+        ..event
+    };
+    assert!(!workspace_event_actor_is_admitted(
+        &external,
+        "root:session",
+        "legacy:session:",
+        &admitted,
+    ));
 }
 
 async fn wait_persistence_barrier(barrier: Arc<std::sync::Barrier>) {
@@ -3946,6 +4146,68 @@ async fn completion_persistence_failure_is_partial_then_recovers_when_storage_re
     assert_eq!(
         persisted.completion.expect("persisted completion").status,
         TaskCompletionStatus::Passed
+    );
+}
+
+#[tokio::test]
+async fn atomic_review_commit_publishes_runtime_state_only_after_durable_write() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let revision = ledger.document_revision().await.expect("document revision");
+    set_persistence_test_failure(&ledger, true);
+
+    let commit_flag = Arc::clone(&committed);
+    let failed = ledger
+        .atomic_review_update_with_commit(
+            revision,
+            None,
+            None,
+            |document| {
+                document.active_step_id = Some("durable-before-runtime".to_string());
+            },
+            move || commit_flag.store(true, std::sync::atomic::Ordering::Release),
+        )
+        .await;
+
+    assert_eq!(failed, AtomicReviewTransition::Failed);
+    assert!(!committed.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .active_step_id,
+        None
+    );
+
+    set_persistence_test_failure(&ledger, false);
+    let commit_flag = Arc::clone(&committed);
+    let persisted = ledger
+        .atomic_review_update_with_commit(
+            revision,
+            None,
+            None,
+            |document| {
+                document.active_step_id = Some("durable-before-runtime".to_string());
+            },
+            move || commit_flag.store(true, std::sync::atomic::Ordering::Release),
+        )
+        .await;
+
+    assert_eq!(persisted, AtomicReviewTransition::Persisted(()));
+    assert!(committed.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .active_step_id
+            .as_deref(),
+        Some("durable-before-runtime")
     );
 }
 
@@ -4120,7 +4382,11 @@ fn unreadable_risk_ids_are_stable() {
 #[test]
 fn legacy_self_asserted_desktop_activation_receipts_never_satisfy_completion() {
     let receipt = DesktopActivationReceipt {
+        trusted_producer_version: 0,
+        publisher_evidence_id: String::new(),
+        thread_id: String::new(),
         epoch: 7,
+        activation_obligation_identity: String::new(),
         activation_timestamp: "2026-08-02T12:00:01Z".to_string(),
         process_path: None,
         binary_sha1: None,
@@ -4130,15 +4396,279 @@ fn legacy_self_asserted_desktop_activation_receipts_never_satisfy_completion() {
         running_process_id: 4101,
         running_process_identity: "self-asserted running process".to_string(),
         observed_running_executable_path: "C:/local/codex.exe".to_string(),
+        observed_running_executable_sha256: "b".repeat(64),
         desktop_process_id: 4100,
         desktop_process_identity: "self-asserted Desktop process".to_string(),
         desktop_executable_path: "C:/local/Codex.exe".to_string(),
+        initialization_observation_identity: String::new(),
         post_restart_initialization_observation: "self-asserted initialization".to_string(),
         observation_timestamp: "2026-08-02T12:00:01Z".to_string(),
         implementation_identity_hash: Some("a".repeat(64)),
+        publish_identity: String::new(),
+        install_generation: 0,
+        authoritative_install_evidence_hash: String::new(),
+        authenticated_host_channel_identity: String::new(),
+        challenge_identity: String::new(),
+        challenge_expires_at: String::new(),
+        publish_install_timestamp: String::new(),
+        bootstrap_consumed_timestamp: String::new(),
+        challenge_issued_timestamp: String::new(),
+        running_executable_observed_timestamp: String::new(),
     };
 
-    assert!(!desktop_activation_receipt_is_complete(&receipt));
+    assert!(!desktop_activation_receipt_matches_live_proof_at(
+        &receipt,
+        &DesktopActivationRuntimeSnapshot::default(),
+        &desktop_test_obligation(&"a".repeat(64)),
+        None,
+        desktop_test_timestamp("2026-08-02T12:00:01Z"),
+    ));
+}
+
+fn desktop_test_timestamp(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .expect("valid desktop test timestamp")
+        .with_timezone(&Utc)
+}
+
+fn desktop_test_executable_path() -> &'static str {
+    if cfg!(windows) {
+        "C:/Program Files/Codex/codex.exe"
+    } else {
+        "/opt/codex/codex"
+    }
+}
+
+fn desktop_test_obligation(implementation_identity: &str) -> DesktopActivationObligation {
+    DesktopActivationObligation {
+        thread_id: "thread-1".to_string(),
+        evidence_epoch: 3,
+        implementation_identity: implementation_identity.to_string(),
+        activation_obligation_identity: format!("obligation-{implementation_identity}"),
+        requiring_plan_step_ids: vec!["desktop-step".to_string()],
+    }
+}
+
+fn authenticated_desktop_install_source(
+    obligation: &DesktopActivationObligation,
+) -> DesktopInstallEvidenceSource {
+    DesktopInstallEvidenceSource::AuthenticatedHostBootstrap {
+        channel_identity: "native-host-channel-1".to_string(),
+        peer_identity: "publisher-record-1".to_string(),
+        evidence: Box::new(AuthoritativeDesktopInstallEvidence {
+            schema_version: DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION,
+            trusted_producer_version: DESKTOP_INSTALL_EVIDENCE_SCHEMA_VERSION,
+            publisher_evidence_id: "publisher-record-1".to_string(),
+            thread_id: obligation.thread_id.clone(),
+            evidence_epoch: obligation.evidence_epoch,
+            implementation_identity_hash: obligation.implementation_identity.clone(),
+            activation_obligation_identity: obligation.activation_obligation_identity.clone(),
+            publish_identity: "a".repeat(64),
+            install_generation: 7,
+            expected_installed_executable_path: desktop_test_executable_path().to_string(),
+            installed_executable_sha256: "a".repeat(64),
+            issued_at: "2026-08-14T12:00:00Z".to_string(),
+            expires_at: "2026-08-14T12:10:00Z".to_string(),
+        }),
+    }
+}
+
+fn desktop_running_process() -> DesktopRunningProcessObservation {
+    DesktopRunningProcessObservation {
+        process_id: 4242,
+        process_identity: "pid-4242-start-100".to_string(),
+        executable_path: desktop_test_executable_path().to_string(),
+        executable_sha256: "a".repeat(64),
+        observed_at: "2026-08-14T12:00:02Z".to_string(),
+    }
+}
+
+#[test]
+fn desktop_activation_cannot_issue_a_challenge_without_authenticated_host_transport() {
+    let now = desktop_test_timestamp("2026-08-14T12:00:03Z");
+    let obligation = desktop_test_obligation(&"b".repeat(64));
+    let mut runtime = DesktopActivationRuntimeState::default();
+
+    assert_eq!(
+        runtime.prepare_challenge(
+            &obligation,
+            desktop_running_process(),
+            "nonce-1",
+            "2026-08-14T12:00:01Z",
+            now,
+        ),
+        Err(DesktopActivationVerificationError::NoAuthenticatedHostTransport)
+    );
+    assert_eq!(
+        runtime.snapshot(),
+        DesktopActivationRuntimeSnapshot::default()
+    );
+}
+
+#[test]
+fn authenticated_desktop_activation_is_exact_live_and_single_use() {
+    let now = desktop_test_timestamp("2026-08-14T12:00:04Z");
+    let implementation_identity = "b".repeat(64);
+    let obligation = desktop_test_obligation(&implementation_identity);
+    let mut runtime = DesktopActivationRuntimeState {
+        install_evidence_source: authenticated_desktop_install_source(&obligation),
+        ..DesktopActivationRuntimeState::default()
+    };
+    let challenge = runtime
+        .prepare_challenge(
+            &obligation,
+            desktop_running_process(),
+            "nonce-1",
+            "2026-08-14T12:00:01Z",
+            now,
+        )
+        .expect("authenticated evidence issues a challenge");
+    let acknowledgement = DesktopActivationAcknowledgement {
+        challenge_identity: challenge.challenge_identity.clone(),
+        authenticated_host_channel_identity: challenge.authenticated_host_channel_identity.clone(),
+        initialized_process_id: challenge.running_process.process_id,
+        initialized_process_identity: challenge.running_process.process_identity,
+        desktop_process_id: 8080,
+        desktop_process_identity: "desktop-pid-8080-start-50".to_string(),
+        desktop_executable_path: "C:/Program Files/Codex Desktop/Codex.exe".to_string(),
+        initialization_observation_identity: "desktop-initialized-pid-4242".to_string(),
+        observed_at: "2026-08-14T12:00:04Z".to_string(),
+    };
+    let receipt = runtime
+        .complete_challenge(acknowledgement.clone(), now)
+        .expect("exact acknowledgement completes activation");
+    let snapshot = runtime.snapshot();
+
+    assert!(desktop_activation_receipt_matches_live_proof_at(
+        &receipt,
+        &snapshot,
+        &obligation,
+        None,
+        now,
+    ));
+    let mut tampered = receipt.clone();
+    tampered.publish_identity.push_str("-tampered");
+    assert!(!desktop_activation_receipt_matches_live_proof_at(
+        &tampered,
+        &snapshot,
+        &obligation,
+        None,
+        now,
+    ));
+    assert_eq!(
+        runtime.complete_challenge(acknowledgement, now),
+        Err(DesktopActivationVerificationError::ChallengeMissingOrConsumed)
+    );
+    assert!(!desktop_activation_receipt_matches_live_proof_at(
+        &receipt,
+        &DesktopActivationRuntimeSnapshot::default(),
+        &obligation,
+        None,
+        now,
+    ));
+    let DesktopInstallEvidenceSource::AuthenticatedHostBootstrap { evidence, .. } =
+        &mut runtime.install_evidence_source
+    else {
+        unreachable!("test helper always returns authenticated evidence");
+    };
+    evidence.publish_identity.push_str("-mutated");
+    assert!(!desktop_activation_receipt_matches_live_proof_at(
+        &receipt,
+        &runtime.snapshot(),
+        &obligation,
+        None,
+        now,
+    ));
+    assert!(!desktop_activation_receipt_matches_live_proof_at(
+        &receipt,
+        &snapshot,
+        &obligation,
+        None,
+        now + ChronoDuration::seconds(DESKTOP_ACTIVATION_CHALLENGE_TTL_SECONDS + 1),
+    ));
+}
+
+#[test]
+fn desktop_activation_rejects_circular_and_mismatched_expected_identity() {
+    let now = desktop_test_timestamp("2026-08-14T12:00:03Z");
+    let implementation_identity = "b".repeat(64);
+    let obligation = desktop_test_obligation(&implementation_identity);
+    let mut runtime = DesktopActivationRuntimeState {
+        install_evidence_source: authenticated_desktop_install_source(&obligation),
+        ..DesktopActivationRuntimeState::default()
+    };
+    let mut wrong_running_binary = desktop_running_process();
+    wrong_running_binary.executable_path = "C:/tmp/running-codex.exe".to_string();
+
+    assert_eq!(
+        runtime.prepare_challenge(
+            &obligation,
+            wrong_running_binary,
+            "nonce-1",
+            "2026-08-14T12:00:01Z",
+            now,
+        ),
+        Err(DesktopActivationVerificationError::RunningExecutableMismatch)
+    );
+    let mismatched_obligation = desktop_test_obligation(&"c".repeat(64));
+    assert_eq!(
+        runtime.prepare_challenge(
+            &mismatched_obligation,
+            desktop_running_process(),
+            "nonce-2",
+            "2026-08-14T12:00:01Z",
+            now,
+        ),
+        Err(DesktopActivationVerificationError::ImplementationIdentityMismatch)
+    );
+
+    let mut stale_source = authenticated_desktop_install_source(&obligation);
+    let DesktopInstallEvidenceSource::AuthenticatedHostBootstrap { evidence, .. } =
+        &mut stale_source
+    else {
+        unreachable!("test helper always returns authenticated evidence");
+    };
+    evidence.issued_at = "2026-08-14T12:00:04Z".to_string();
+    runtime.install_evidence_source = stale_source;
+    assert_eq!(
+        runtime.prepare_challenge(
+            &obligation,
+            desktop_running_process(),
+            "nonce-stale",
+            "2026-08-14T12:00:01Z",
+            now,
+        ),
+        Err(DesktopActivationVerificationError::AuthoritativeEvidenceStale)
+    );
+    runtime.install_evidence_source = authenticated_desktop_install_source(&obligation);
+
+    let challenge = runtime
+        .prepare_challenge(
+            &obligation,
+            desktop_running_process(),
+            "nonce-3",
+            "2026-08-14T12:00:01Z",
+            now,
+        )
+        .expect("valid challenge");
+    assert_eq!(
+        runtime.complete_challenge(
+            DesktopActivationAcknowledgement {
+                challenge_identity: challenge.challenge_identity,
+                authenticated_host_channel_identity: "different-channel".to_string(),
+                initialized_process_id: challenge.running_process.process_id,
+                initialized_process_identity: challenge.running_process.process_identity,
+                desktop_process_id: 8080,
+                desktop_process_identity: "desktop-pid-8080-start-50".to_string(),
+                desktop_executable_path: "C:/Program Files/Codex Desktop/Codex.exe".to_string(),
+                initialization_observation_identity: "desktop-initialized-pid-4242".to_string(),
+                observed_at: "2026-08-14T12:00:03Z".to_string(),
+            },
+            now,
+        ),
+        Err(DesktopActivationVerificationError::AuthenticatedChannelMismatch)
+    );
+    assert!(runtime.snapshot().live_proof.is_none());
 }
 
 #[tokio::test]
@@ -6422,16 +6952,42 @@ async fn sealed_checkpoint_is_complete_and_finalization_is_exactly_memoized() {
     assert!(!checkpoint.validation_plan_id.is_empty());
     assert!(!checkpoint.diff_identity.is_empty());
     assert!(checkpoint.estimated_tokens <= 10_000);
-    assert!(ledger.memoized_finalization_result().await.is_none());
     assert!(
         ledger
-            .record_finalization_result("final answer".to_string())
+            .memoized_finalization_result("turn-1")
+            .await
+            .is_none()
+    );
+    assert!(
+        ledger
+            .record_finalization_result(
+                "turn-1".to_string(),
+                "final answer".to_string(),
+                true,
+                true,
+            )
             .await
     );
     assert_eq!(
-        ledger.memoized_finalization_result().await.as_deref(),
+        ledger
+            .memoized_finalization_result("turn-1")
+            .await
+            .as_deref(),
         Some("final answer")
     );
+    assert!(ledger.completion_recovery_intent("turn-2").await.is_none());
+    {
+        let mut document = ledger.document.lock().await;
+        document
+            .as_mut()
+            .expect("document")
+            .final_proof
+            .basis
+            .as_mut()
+            .expect("basis")
+            .implementation_identity = "stale-implementation".to_string();
+    }
+    assert!(ledger.completion_recovery_intent("turn-1").await.is_none());
 }
 
 #[tokio::test]

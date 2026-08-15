@@ -12,7 +12,7 @@ To find one, filter `ALL_TOOLS` by `name` and `description`."#;
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate tool calls in a fresh async V8 isolate.
 - Input is JavaScript source, not JSON, quotes, or a Markdown fence. Node, filesystem, network, and console APIs are unavailable.
 - Nested tools are normalized methods on `tools` (for example `await tools.exec_command(...)`); methods accept the documented string or object and return the documented object or string.
-- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`. `yield_time_ms` defaults to 10000; `max_output_tokens` limits direct output.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`. `yield_time_ms` controls the internal observation/progress cadence for an unchanged cell and defaults to 10000; empty observations do not cause a model-visible yield or a new model generation. `max_output_tokens` limits direct output.
 - When evaluation ends, unawaited work is discarded.
 
 Global helpers:
@@ -27,11 +27,11 @@ Global helpers:
 - `ALL_TOOLS` lists `{ name, description }`; `yield_control()` emits accumulated output while execution continues."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
-- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
+- `yield_time_ms` controls the internal observation/progress cadence for an unchanged cell. Empty observations remain host-internal and do not cause a model-visible yield or a new model generation. Defaults to 10000 ms.
 - `max_tokens` limits how much new output this wait call returns. Model projections are capped at 1000 tokens for success, 2000 for failure/timeout, and 4000 for high-signal diagnostics; a lower requested value is honored.
 - `terminate: true` stops the running cell; false or omitted waits for output.
-- `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
-- If the cell is still running, `wait` may yield again with the same `cell_id`.
+- `wait` returns only meaningful new output or state changes since the last model-visible result, or the final completion or termination result for that cell.
+- New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.
 - If the cell has already finished, `wait` returns the completed result and closes the cell."#;
 // Based off of https://modelcontextprotocol.io/specification/draft/schema#calltoolresult
 const MCP_TYPESCRIPT_PREAMBLE: &str = r#"type Role = "user" | "assistant";
@@ -405,6 +405,21 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
             .map(render_json_schema_to_typescript)
             .unwrap_or_else(|| "unknown".to_string())
     };
+    if definition.name == "tool_search" {
+        let declaration = format!(
+            "type CodeModeToolSearchResult = {output_type};\ndeclare const tools: {{ {} }};",
+            render_code_mode_tool_declaration(
+                &definition.name,
+                input_name,
+                input_type,
+                "CodeModeToolSearchResult".to_string(),
+            )
+        );
+        return format!(
+            "{}\n\nexec tool declaration:\n```ts\n{declaration}\n```",
+            definition.description
+        );
+    }
     render_code_mode_sample(
         &definition.description,
         &definition.name,
@@ -706,6 +721,7 @@ mod tests {
     use super::ToolNamespaceDescription;
     use super::augment_tool_definition;
     use super::build_exec_tool_description;
+    use super::build_wait_tool_description;
     use super::normalize_code_mode_identifier;
     use super::parse_exec_source;
     use codex_protocol::ToolName;
@@ -1145,5 +1161,18 @@ bar"
         assert!(description.contains("Some deferred nested tools may be omitted"));
         assert!(description.contains("filter `ALL_TOOLS` by `name` and `description`"));
         assert!(!description.contains("do not print the full `ALL_TOOLS` array"));
+    }
+
+    #[test]
+    fn yield_time_descriptions_define_internal_cadence_without_changing_fields() {
+        let exec = build_exec_tool_description(&[], &[], &BTreeMap::new(), false);
+        let wait = build_wait_tool_description();
+
+        for description in [&exec, wait] {
+            assert!(description.contains("`yield_time_ms`"));
+            assert!(description.contains("internal observation/progress cadence"));
+            assert!(description.contains("do not cause a model-visible yield"));
+            assert!(description.contains("new model generation"));
+        }
     }
 }

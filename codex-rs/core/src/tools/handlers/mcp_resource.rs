@@ -12,8 +12,13 @@ use codex_protocol::items::McpToolCallItem;
 use codex_protocol::items::McpToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_tools::CanonicalToolResult;
+use codex_tools::ToolOutput;
+use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputProjectionMetadata;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use rmcp::model::ListResourceTemplatesResult;
@@ -32,10 +37,58 @@ use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use codex_protocol::protocol::McpInvocation;
 
 const MCP_RESOURCE_CALL_CANCELLED_MESSAGE: &str = "MCP resource call cancelled";
+
+struct McpResourceToolOutput {
+    visible: FunctionToolOutput,
+    canonical: Value,
+}
+
+impl ToolOutput for McpResourceToolOutput {
+    fn log_preview(&self) -> String {
+        self.visible.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.visible.success_for_logging()
+    }
+
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        self.visible.outcome_for_logging()
+    }
+
+    fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
+        self.visible.outcome_context()
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        self.visible.projection_metadata()
+    }
+
+    fn requires_canonical_artifact(&self) -> bool {
+        true
+    }
+
+    fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        Some(CanonicalToolResult::json(self.canonical.clone()))
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        self.visible.to_response_item(call_id, payload)
+    }
+
+    fn post_tool_use_response(&self, call_id: &str, payload: &ToolPayload) -> Option<Value> {
+        self.visible.post_tool_use_response(call_id, payload)
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> Value {
+        self.visible.code_mode_result(payload)
+    }
+}
 
 mod list_mcp_resource_templates;
 mod list_mcp_resources;
@@ -160,28 +213,34 @@ impl ListResourcesPayload {
         result: ListResourcesResult,
         truncation_policy: TruncationPolicy,
     ) -> Result<Self, FunctionCallError> {
-        let resources: Vec<ResourceWithServer> = result
-            .resources
-            .into_iter()
-            .map(|resource| ResourceWithServer::new(server.clone(), resource))
-            .collect();
-        let payload = Self {
-            server: Some(server),
-            resources,
+        let total_resources = result.resources.len();
+        let mut payload = Self {
+            server: Some(server.clone()),
+            resources: Vec::new(),
             next_cursor: result.next_cursor,
             next_cursors: BTreeMap::new(),
             remaining_servers: Vec::new(),
-            truncated: false,
-            omitted_count: 0,
+            truncated: total_resources > 0,
+            omitted_count: total_resources,
             errors: Vec::new(),
             omitted_error_count: 0,
         };
-        if !serialized_payload_fits(&payload, truncation_policy)? {
-            return Err(FunctionCallError::RespondToModel(
-                "The MCP server returned a resource page that exceeds the output budget; the page cannot be shortened without skipping entries before its next cursor"
-                    .to_string(),
-            ));
+
+        ensure_payload_metadata_fits(&payload, truncation_policy)?;
+        for resource in result.resources {
+            payload
+                .resources
+                .push(ResourceWithServer::new(server.clone(), resource));
+            payload.omitted_count -= 1;
+            payload.truncated = payload.omitted_count > 0;
+            if !serialized_payload_fits(&payload, truncation_policy)? {
+                payload.resources.pop();
+                payload.omitted_count += 1;
+                payload.truncated = true;
+                break;
+            }
         }
+
         Ok(payload)
     }
 
@@ -313,27 +372,31 @@ impl ListResourceTemplatesPayload {
         result: ListResourceTemplatesResult,
         truncation_policy: TruncationPolicy,
     ) -> Result<Self, FunctionCallError> {
-        let resource_templates: Vec<ResourceTemplateWithServer> = result
-            .resource_templates
-            .into_iter()
-            .map(|template| ResourceTemplateWithServer::new(server.clone(), template))
-            .collect();
-        let payload = Self {
-            server: Some(server),
-            resource_templates,
+        let total_templates = result.resource_templates.len();
+        let mut payload = Self {
+            server: Some(server.clone()),
+            resource_templates: Vec::new(),
             next_cursor: result.next_cursor,
             next_cursors: BTreeMap::new(),
             remaining_servers: Vec::new(),
-            truncated: false,
-            omitted_count: 0,
+            truncated: total_templates > 0,
+            omitted_count: total_templates,
             errors: Vec::new(),
             omitted_error_count: 0,
         };
-        if !serialized_payload_fits(&payload, truncation_policy)? {
-            return Err(FunctionCallError::RespondToModel(
-                "The MCP server returned a resource-template page that exceeds the output budget; the page cannot be shortened without skipping entries before its next cursor"
-                    .to_string(),
-            ));
+        ensure_payload_metadata_fits(&payload, truncation_policy)?;
+        for template in result.resource_templates {
+            payload
+                .resource_templates
+                .push(ResourceTemplateWithServer::new(server.clone(), template));
+            payload.omitted_count -= 1;
+            payload.truncated = payload.omitted_count > 0;
+            if !serialized_payload_fits(&payload, truncation_policy)? {
+                payload.resource_templates.pop();
+                payload.omitted_count += 1;
+                payload.truncated = true;
+                break;
+            }
         }
         Ok(payload)
     }
@@ -760,7 +823,7 @@ async fn execute_resource_call<F>(
     operation: F,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>
 where
-    F: Future<Output = Result<FunctionToolOutput, FunctionCallError>>,
+    F: Future<Output = Result<McpResourceToolOutput, FunctionCallError>>,
 {
     emit_tool_call_begin(session, turn, call_id, invocation.clone()).await;
     let start = Instant::now();
@@ -775,9 +838,12 @@ where
 
     let terminal_result = match result.as_ref() {
         Ok(output) => {
-            let content =
-                function_call_output_content_items_to_text(&output.body).unwrap_or_default();
-            Ok(call_tool_result_from_content(&content, output.success))
+            let content = function_call_output_content_items_to_text(&output.visible.body)
+                .unwrap_or_default();
+            Ok(call_tool_result_from_content(
+                &content,
+                output.visible.success,
+            ))
         }
         Err(err) => Err(err.to_string()),
     };
@@ -848,8 +914,9 @@ fn validate_optional_opaque_selector(
 
 fn serialize_function_output<T>(
     payload: T,
+    canonical: Value,
     truncation_policy: TruncationPolicy,
-) -> Result<FunctionToolOutput, FunctionCallError>
+) -> Result<McpResourceToolOutput, FunctionCallError>
 where
     T: Serialize,
 {
@@ -860,7 +927,135 @@ where
         ));
     }
 
-    Ok(FunctionToolOutput::from_text(content, Some(true)))
+    Ok(McpResourceToolOutput {
+        visible: FunctionToolOutput::from_text(content, Some(true)),
+        canonical,
+    })
+}
+
+fn canonical_single_list_resources(
+    server: &str,
+    result: &ListResourcesResult,
+) -> Result<Value, FunctionCallError> {
+    let resources = result
+        .resources
+        .iter()
+        .map(|resource| serialize_value_with_server(server, resource))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(serde_json::json!({
+        "server": server,
+        "resources": resources,
+        "nextCursor": result.next_cursor,
+    }))
+}
+
+fn canonical_all_list_resources(
+    collection: &McpServerCollection<ListResourcesResult>,
+) -> Result<Value, FunctionCallError> {
+    let mut entries = collection.results.iter().collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut resources = Vec::new();
+    let mut next_cursors = BTreeMap::new();
+    for (server, page) in entries {
+        for resource in &page.resources {
+            resources.push(serialize_value_with_server(server, resource)?);
+        }
+        if let Some(cursor) = &page.next_cursor {
+            next_cursors.insert(server.clone(), cursor.clone());
+        }
+    }
+    let mut errors = collection
+        .errors
+        .iter()
+        .map(|error| McpResourceServerError {
+            server: error.server.clone(),
+            message: error.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    errors.sort_by(|a, b| a.server.cmp(&b.server));
+    Ok(serde_json::json!({
+        "resources": resources,
+        "nextCursors": next_cursors,
+        "errors": errors,
+    }))
+}
+
+fn canonical_single_list_resource_templates(
+    server: &str,
+    result: &ListResourceTemplatesResult,
+) -> Result<Value, FunctionCallError> {
+    let resource_templates = result
+        .resource_templates
+        .iter()
+        .map(|template| serialize_value_with_server(server, template))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(serde_json::json!({
+        "server": server,
+        "resourceTemplates": resource_templates,
+        "nextCursor": result.next_cursor,
+    }))
+}
+
+fn canonical_all_list_resource_templates(
+    collection: &McpServerCollection<ListResourceTemplatesResult>,
+) -> Result<Value, FunctionCallError> {
+    let mut entries = collection.results.iter().collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut resource_templates = Vec::new();
+    let mut next_cursors = BTreeMap::new();
+    for (server, page) in entries {
+        for template in &page.resource_templates {
+            resource_templates.push(serialize_value_with_server(server, template)?);
+        }
+        if let Some(cursor) = &page.next_cursor {
+            next_cursors.insert(server.clone(), cursor.clone());
+        }
+    }
+    let mut errors = collection
+        .errors
+        .iter()
+        .map(|error| McpResourceServerError {
+            server: error.server.clone(),
+            message: error.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    errors.sort_by(|a, b| a.server.cmp(&b.server));
+    Ok(serde_json::json!({
+        "resourceTemplates": resource_templates,
+        "nextCursors": next_cursors,
+        "errors": errors,
+    }))
+}
+
+fn canonical_read_resource(
+    server: &str,
+    uri: &str,
+    result: &ReadResourceResult,
+) -> Result<Value, FunctionCallError> {
+    let contents = serde_json::to_value(&result.contents).map_err(resource_serialization_error)?;
+    Ok(serde_json::json!({
+        "server": server,
+        "uri": uri,
+        "contents": contents,
+    }))
+}
+
+fn serialize_value_with_server<T: Serialize>(
+    server: &str,
+    value: &T,
+) -> Result<Value, FunctionCallError> {
+    let mut value = serde_json::to_value(value).map_err(resource_serialization_error)?;
+    let Value::Object(object) = &mut value else {
+        return Err(FunctionCallError::RespondToModel(
+            "failed to serialize MCP resource response: expected an object".to_string(),
+        ));
+    };
+    object.insert("server".to_string(), Value::String(server.to_string()));
+    Ok(value)
+}
+
+fn resource_serialization_error(err: serde_json::Error) -> FunctionCallError {
+    FunctionCallError::RespondToModel(format!("failed to serialize MCP resource response: {err}"))
 }
 
 fn serialized_payload_fits<T>(

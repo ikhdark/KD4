@@ -34,11 +34,11 @@ archived?: boolean | null, /**
  * exactly matches one of these paths are returned.
  */
 cwd?: string | Array<string> | null, /**
- * If true, return from the state DB without scanning JSONL rollouts to
- * repair thread metadata. Omitted or false preserves scan-and-repair
- * behavior.
+ * Selects local listing storage. Omitted or null prefers SQLite and permits
+ * scan-and-repair fallback only before pagination begins; true requires
+ * SQLite; false explicitly selects scan-and-repair.
  */
-useStateDbOnly?: boolean, /**
+useStateDbOnly?: boolean | null, /**
  * Optional substring filter for the extracted thread title.
  */
 searchTerm?: string | null};

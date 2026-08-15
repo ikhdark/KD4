@@ -916,6 +916,7 @@ mod tests {
         CollabAgentState {
             status,
             message: message.map(str::to_string),
+            surfaced_result: None,
         }
     }
 

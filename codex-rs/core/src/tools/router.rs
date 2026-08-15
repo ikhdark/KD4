@@ -301,29 +301,6 @@ impl ToolRouter {
         }
     }
 
-    #[allow(dead_code)]
-    #[instrument(level = "trace", skip_all, err)]
-    pub async fn dispatch_tool_call_with_code_mode_result(
-        &self,
-        session: Arc<Session>,
-        step_context: Arc<StepContext>,
-        cancellation_token: CancellationToken,
-        tracker: SharedTurnDiffTracker,
-        call: ToolCall,
-        source: ToolCallSource,
-    ) -> Result<AnyToolResult, FunctionCallError> {
-        self.dispatch_tool_call_with_code_mode_result_inner(
-            session,
-            step_context,
-            cancellation_token,
-            tracker,
-            call,
-            source,
-            /*terminal_outcome_reached*/ None,
-        )
-        .await
-    }
-
     #[instrument(level = "trace", skip_all, err)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_tool_call_with_terminal_outcome(
@@ -335,29 +312,6 @@ impl ToolRouter {
         call: ToolCall,
         source: ToolCallSource,
         terminal_outcome_reached: Arc<AtomicBool>,
-    ) -> Result<AnyToolResult, FunctionCallError> {
-        self.dispatch_tool_call_with_code_mode_result_inner(
-            session,
-            step_context,
-            cancellation_token,
-            tracker,
-            call,
-            source,
-            Some(terminal_outcome_reached),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn dispatch_tool_call_with_code_mode_result_inner(
-        &self,
-        session: Arc<Session>,
-        step_context: Arc<StepContext>,
-        cancellation_token: CancellationToken,
-        tracker: SharedTurnDiffTracker,
-        call: ToolCall,
-        source: ToolCallSource,
-        terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         if self.registry.tool_exposure(&call.tool_name)
             == Some(crate::tools::registry::ToolExposure::Deferred)

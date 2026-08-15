@@ -12,6 +12,7 @@ use rmcp::model::ReadResourceRequestParams;
 
 use super::ReadResourceArgs;
 use super::ReadResourcePayload;
+use super::canonical_read_resource;
 use super::ensure_model_can_access_mcp_server;
 use super::execute_resource_call;
 use super::normalize_required_string;
@@ -91,8 +92,9 @@ impl ReadMcpResourceHandler {
                     .map_err(|err| {
                         FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
                     })?;
+                let canonical = canonical_read_resource(&server, &uri, &result)?;
                 let payload = ReadResourcePayload::new(server, uri, result, truncation_policy)?;
-                serialize_function_output(payload, truncation_policy)
+                serialize_function_output(payload, canonical, truncation_policy)
             },
         )
         .await

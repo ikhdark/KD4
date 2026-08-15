@@ -17,8 +17,8 @@ use crate::sandboxing::execute_exec_request_with_after_spawn;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::flat_tool_name;
-use crate::tools::known_delta_store::EvidenceCandidate;
-use crate::tools::known_delta_store::EvidenceIdentity;
+use crate::tools::known_delta_store::KnownDeltaHit;
+use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::RuntimePathPrepends;
@@ -78,16 +78,8 @@ pub struct ShellRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
-    pub(crate) known_delta: Option<KnownDeltaShellRequest>,
+    pub(crate) known_delta: Option<PreparedKnownDelta>,
     pub(crate) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct KnownDeltaShellRequest {
-    pub(crate) identity: EvidenceIdentity,
-    pub(crate) candidate: Option<EvidenceCandidate>,
-    pub(crate) hit_output: Option<String>,
-    pub(crate) force_fresh: bool,
 }
 
 /// Selects `ShellRuntime` behavior for different callers.
@@ -267,12 +259,13 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         if let Some(hit_output) = req
             .known_delta
             .as_ref()
-            .and_then(|known_delta| known_delta.hit_output.as_ref())
+            .and_then(PreparedKnownDelta::hit)
+            .map(KnownDeltaHit::rendered_output)
         {
             return Ok(ExecToolCallOutput {
-                stdout: codex_protocol::exec_output::StreamOutput::new(hit_output.clone()),
+                stdout: codex_protocol::exec_output::StreamOutput::new(hit_output.to_string()),
                 aggregated_output: codex_protocol::exec_output::StreamOutput::new(
-                    hit_output.clone(),
+                    hit_output.to_string(),
                 ),
                 ..Default::default()
             });

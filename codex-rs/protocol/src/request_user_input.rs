@@ -136,6 +136,8 @@ pub struct RequestUserInputAnswer {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RequestUserInputResponse {
     pub answers: HashMap<String, RequestUserInputAnswer>,
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]

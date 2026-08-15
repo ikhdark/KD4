@@ -31,7 +31,6 @@ pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_MUTATION_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_WORKSPACE_LEASE_SECONDS: i64 = 120;
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -51,6 +50,16 @@ pub enum CapabilityProfile {
     ReadSearchShell,
     ScopedSourceWrite,
     IntegratorSourceWrite,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum AssignmentAdmissionOrigin {
+    #[default]
+    Typed,
+    LegacyMessage {
+        parent_assignment_id: Option<AssignmentId>,
+    },
 }
 
 impl AgentRole {
@@ -136,6 +145,8 @@ pub enum WorkspaceStrategy {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AssignmentDraft {
     pub root_session_id: String,
+    #[serde(default)]
+    pub admission_origin: AssignmentAdmissionOrigin,
     pub role: AgentRole,
     pub capability_profile: CapabilityProfile,
     pub objective: String,
@@ -178,9 +189,6 @@ impl PrimaryInvestigationIdentity {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AdmissionOverlapSummary {
     pub benign_read_overlap_count: u32,
-    pub duplicated_primary_investigation_count: u32,
-    pub conflicting_write_read_count: u32,
-    pub conflicting_write_write_count: u32,
 }
 
 #[doc(hidden)]
@@ -308,6 +316,7 @@ impl AssignmentDraft {
         Ok(Assignment {
             assignment_id: AssignmentId::new(),
             root_session_id: self.root_session_id,
+            admission_origin: self.admission_origin,
             repository_id: repository_identity(repo_root)?.id,
             role: self.role,
             capability_profile: self.capability_profile,
@@ -336,6 +345,8 @@ impl AssignmentDraft {
 pub struct Assignment {
     pub assignment_id: AssignmentId,
     pub root_session_id: String,
+    #[serde(default)]
+    pub admission_origin: AssignmentAdmissionOrigin,
     /// Stable hash of the Git repository lineage (or canonical root outside Git). The private
     /// absolute worktree root is stored separately and never included in task-facing JSON.
     #[serde(default)]
@@ -972,6 +983,7 @@ pub enum ValidationCallStatus {
     Running,
     Succeeded,
     Failed,
+    NotExecuted,
     Cancelled,
     Superseded,
 }
@@ -1481,6 +1493,12 @@ pub struct WakeRead {
     pub reason: Option<ObservationKind>,
     pub updated_agents: Vec<WakeEvent>,
     pub latest_event_id: Option<WakeEventId>,
+    /// Events that fell out of the retained wake stream before this read.
+    #[serde(default)]
+    pub lost_to_retention_count: u64,
+    /// Retained events after `latest_event_id` that did not fit in this page.
+    #[serde(default)]
+    pub remaining_count: u64,
     pub truncated_count: u64,
     pub timed_out: bool,
 }

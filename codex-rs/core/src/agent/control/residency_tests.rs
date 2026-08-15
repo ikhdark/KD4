@@ -1,3 +1,5 @@
+use super::CompletedUnloadResult;
+use super::UnloadOneResult;
 use super::V2Residency;
 use crate::ThreadManager;
 use crate::agent::AgentControl;
@@ -19,6 +21,7 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::test]
 async fn eviction_claim_stays_charged_and_touch_waits_for_completion() {
@@ -108,6 +111,109 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
 
     assert!(manager.get_thread(root.thread_id).await.is_ok());
     assert!(manager.get_thread(second.thread_id).await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_residency_shutdown_keeps_claim_charged_until_slot_handoff() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    let temp_home = tempfile::tempdir().expect("create temp home");
+    config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
+    config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let control = manager.agent_control();
+    let manager_state = control.upgrade().expect("thread manager should be live");
+    let residency = Arc::clone(&control.v2_residency);
+
+    let first_slot = control
+        .reserve_v2_residency_slot(&manager_state, &config, /*protected_thread_id*/ None)
+        .await
+        .expect("first resident slot");
+    let first = spawn_v2_subagent(
+        &control,
+        &manager_state,
+        config,
+        root.thread_id,
+        "late-worker",
+    )
+    .await;
+    first_slot.commit(first.thread_id);
+    mark_thread_completed(first.thread.as_ref()).await;
+    let release_shutdown = crate::test_support::block_thread_terminal_tasks(first.thread.as_ref());
+
+    let completion = match residency
+        .try_unload_one_resident_with_shutdown_timeout(
+            &manager_state,
+            /*protected_thread_id*/ None,
+            Duration::ZERO,
+        )
+        .await
+    {
+        UnloadOneResult::WaitingForLateShutdown(completion) => completion,
+        _ => panic!("short deadline should hand ownership to late shutdown cleanup"),
+    };
+
+    {
+        let state = residency
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.residents.contains(&first.thread_id));
+        assert!(state.evicting.contains_key(&first.thread_id));
+        assert_eq!(state.pending_slots, 0);
+    }
+    assert!(
+        !residency.try_reserve_pending_slot(/*capacity*/ 1),
+        "the late eviction claim must stay charged"
+    );
+    let mut touch = Box::pin(residency.wait_for_eviction_or_touch(first.thread_id));
+    assert!(
+        futures::poll!(touch.as_mut()).is_pending(),
+        "touch must remain blocked while late cleanup owns the claim"
+    );
+    assert!(
+        manager.get_thread(first.thread_id).await.is_ok(),
+        "the manager entry must remain until termination"
+    );
+
+    release_shutdown
+        .send(())
+        .expect("blocked terminal task should still be waiting");
+    let reserved_slot = match tokio::time::timeout(Duration::from_secs(5), completion)
+        .await
+        .expect("late cleanup should finish after terminal work")
+        .expect("late cleanup owner should return its slot")
+    {
+        CompletedUnloadResult::Reserved(slot) => slot,
+        CompletedUnloadResult::Retry => panic!("late cleanup should remove the expected thread"),
+    };
+    assert!(!touch.await, "completed eviction must make touch reload");
+    match manager.get_thread(first.thread_id).await {
+        Err(CodexErr::ThreadNotFound(thread_id)) => assert_eq!(thread_id, first.thread_id),
+        Err(err) => panic!("expected evicted thread to be missing, got {err:?}"),
+        Ok(_) => panic!("expected evicted thread to be missing"),
+    }
+    {
+        let state = residency
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.evicting.contains_key(&first.thread_id));
+        assert_eq!(state.pending_slots, 1);
+    }
+
+    drop(reserved_slot);
+    assert!(residency.try_reserve_pending_slot(/*capacity*/ 1));
 }
 
 #[tokio::test]
@@ -294,6 +400,7 @@ async fn mark_thread_completed(thread: &CodexThread) {
         .send_event(
             turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: turn.sub_id.clone(),
                 last_agent_message: Some("done".to_string()),
                 error: None,

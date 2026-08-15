@@ -42,6 +42,7 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
             Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -78,6 +79,7 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
             Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -129,6 +131,7 @@ async fn thread_memory_mode_set_requires_experimental_api_capability() -> Result
             Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -168,6 +171,7 @@ async fn thread_settings_update_requires_experimental_api_capability() -> Result
             Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -207,6 +211,7 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
             Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -261,6 +266,7 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
             Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -303,6 +309,7 @@ async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capa
             Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),
@@ -344,6 +351,7 @@ async fn thread_start_granular_approval_policy_requires_experimental_api_capabil
             Some(InitializeCapabilities {
                 experimental_api: false,
                 request_attestation: false,
+                desktop_activation_receipts: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
             }),

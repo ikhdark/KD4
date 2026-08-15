@@ -16,8 +16,6 @@ use codex_protocol::models::is_local_image_close_tag_text;
 use codex_protocol::models::is_local_image_open_tag_text;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
-use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
-use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::REALTIME_CONVERSATION_OPEN_TAG;
@@ -42,10 +40,6 @@ const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
     SKILLS_INSTRUCTIONS_OPEN_TAG,
     SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG,
     "<personality_spec>",
-    // Keep recognizing token-budget wrappers persisted by older versions.
-    "<token_budget>",
-    CONTEXT_WINDOW_OPEN_TAG,
-    CONTEXT_WINDOW_GUIDANCE_OPEN_TAG,
     "<rollout_budget>",
 ];
 

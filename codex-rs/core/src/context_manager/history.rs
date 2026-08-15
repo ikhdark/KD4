@@ -15,7 +15,7 @@ use crate::stable_context::project_stable_context;
 use crate::tool_history::ModelGenerationId;
 use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryState;
-use crate::tool_history::ToolHistoryTokenAccounting;
+use crate::tool_history::ToolHistorySubstitution;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::BaseInstructions;
@@ -64,11 +64,14 @@ pub(crate) struct PreparedHistoryPolicy {
 pub(crate) struct PreparedPromptInput {
     items: Arc<[ResponseItem]>,
     fallback_items: Arc<[ResponseItem]>,
+    unreplaced_items: Arc<[ResponseItem]>,
+    unreplaced_fallback_items: Arc<[ResponseItem]>,
+    tool_history_substitutions: Arc<[ToolHistorySubstitution]>,
+    fallback_tool_history_substitutions: Arc<[ToolHistorySubstitution]>,
     stable_context_manifest: StableContextManifest,
     prompt_provenance: PromptProvenanceSidecar,
     fingerprint: Option<[u8; 32]>,
     policy: PreparedHistoryPolicy,
-    tool_history_accounting: ToolHistoryTokenAccounting,
 }
 
 impl PreparedPromptInput {
@@ -84,6 +87,22 @@ impl PreparedPromptInput {
         Arc::clone(&self.fallback_items)
     }
 
+    pub(crate) fn shared_unreplaced_items(&self) -> Arc<[ResponseItem]> {
+        Arc::clone(&self.unreplaced_items)
+    }
+
+    pub(crate) fn shared_unreplaced_fallback_items(&self) -> Arc<[ResponseItem]> {
+        Arc::clone(&self.unreplaced_fallback_items)
+    }
+
+    pub(crate) fn tool_history_substitutions(&self) -> Arc<[ToolHistorySubstitution]> {
+        Arc::clone(&self.tool_history_substitutions)
+    }
+
+    pub(crate) fn fallback_tool_history_substitutions(&self) -> Arc<[ToolHistorySubstitution]> {
+        Arc::clone(&self.fallback_tool_history_substitutions)
+    }
+
     pub(crate) fn stable_context_manifest(&self) -> &StableContextManifest {
         &self.stable_context_manifest
     }
@@ -92,6 +111,7 @@ impl PreparedPromptInput {
         &self.prompt_provenance
     }
 
+    #[cfg(test)]
     pub(crate) fn fingerprint(&self) -> Option<[u8; 32]> {
         self.fingerprint
     }
@@ -102,6 +122,13 @@ struct PreparedHistoryCacheEntry {
     source_items: Arc<Vec<ResponseItem>>,
     projection_revision: u64,
     prepared: PreparedPromptInput,
+}
+
+#[derive(Debug, Clone, Default)]
+enum RealizedContextBaseline {
+    Known(Box<TurnContextItem>),
+    #[default]
+    Unknown,
 }
 
 /// Transcript of thread history
@@ -127,7 +154,7 @@ pub(crate) struct ContextManager {
     /// baseline and emits a full reinjection of context state. Rollback may
     /// also clear this when it trims a mixed initial-context developer bundle
     /// whose non-diff fragments no longer exist in the surviving history.
-    reference_context_item: Option<TurnContextItem>,
+    realized_context_baseline: RealizedContextBaseline,
     /// World state most recently appended to model-visible history.
     world_state_baseline: Option<WorldStateSnapshot>,
 }
@@ -143,7 +170,7 @@ impl ContextManager {
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
-            reference_context_item: None,
+            realized_context_baseline: RealizedContextBaseline::Unknown,
             world_state_baseline: None,
         }
     }
@@ -152,20 +179,21 @@ impl ContextManager {
         self.token_info.clone()
     }
 
-    pub(crate) fn contains_model_generated_item(&self) -> bool {
-        self.items.iter().any(is_model_generated_item)
-    }
-
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.token_info = info;
     }
 
     pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
-        self.reference_context_item = item;
+        self.realized_context_baseline = item.map_or(RealizedContextBaseline::Unknown, |item| {
+            RealizedContextBaseline::Known(Box::new(item))
+        });
     }
 
     pub(crate) fn reference_context_item(&self) -> Option<TurnContextItem> {
-        self.reference_context_item.clone()
+        match &self.realized_context_baseline {
+            RealizedContextBaseline::Known(item) => Some(item.as_ref().clone()),
+            RealizedContextBaseline::Unknown => None,
+        }
     }
 
     pub(crate) fn update_world_state(
@@ -188,6 +216,15 @@ impl ContextManager {
 
     pub(crate) fn set_world_state_baseline(&mut self, snapshot: WorldStateSnapshot) {
         self.world_state_baseline = Some(snapshot);
+    }
+
+    pub(crate) fn world_state_baseline(&self) -> Option<WorldStateSnapshot> {
+        self.world_state_baseline.clone()
+    }
+
+    pub(crate) fn mark_realized_context_unknown(&mut self) {
+        self.realized_context_baseline = RealizedContextBaseline::Unknown;
+        self.world_state_baseline = None;
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
@@ -293,13 +330,16 @@ impl ContextManager {
             .then(|| prepared_history_fingerprint(&items, &projection.manifest, policy).ok())
             .flatten();
         let prepared = PreparedPromptInput {
+            unreplaced_items: Arc::clone(&items),
+            unreplaced_fallback_items: Arc::clone(&projection.fallback_items),
             items,
             fallback_items: projection.fallback_items,
+            tool_history_substitutions: Arc::from([]),
+            fallback_tool_history_substitutions: Arc::from([]),
             stable_context_manifest: projection.manifest,
             prompt_provenance,
             fingerprint,
             policy,
-            tool_history_accounting: ToolHistoryTokenAccounting::default(),
         };
         if crate::latency_switches::history_identity_enabled() && prepared.fingerprint.is_some() {
             *self
@@ -331,10 +371,14 @@ impl ContextManager {
     ) -> PreparedPromptInput {
         let tool_history = Arc::clone(&self.tool_history);
         let mut prepared = self.prepare_for_prompt_target(input_modalities, target);
-        let (items, accounting) = tool_history.project(Arc::clone(&prepared.items));
-        let (fallback_items, _) = tool_history.project(Arc::clone(&prepared.fallback_items));
-        prepared.items = items;
-        prepared.fallback_items = fallback_items;
+        let projection = tool_history.project(Arc::clone(&prepared.items));
+        let fallback_projection = tool_history.project(Arc::clone(&prepared.fallback_items));
+        prepared.items = projection.items;
+        prepared.unreplaced_items = projection.unreplaced_items;
+        prepared.tool_history_substitutions = projection.substitutions;
+        prepared.fallback_items = fallback_projection.items;
+        prepared.unreplaced_fallback_items = fallback_projection.unreplaced_items;
+        prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
         prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
             &prepared.items,
             &prepared.stable_context_manifest,
@@ -349,7 +393,6 @@ impl ContextManager {
                 .ok()
             })
             .flatten();
-        prepared.tool_history_accounting = accounting;
         prepared
     }
 
@@ -747,7 +790,7 @@ impl ContextManager {
                         // Mixed `build_initial_context` bundles are not reconstructible from
                         // steady-state diffs once trimmed, so the next real turn must fully
                         // reinject context instead of diffing against a stale baseline.
-                        self.reference_context_item = None;
+                        self.realized_context_baseline = RealizedContextBaseline::Unknown;
                     }
                     cut_idx -= 1;
                 }
@@ -792,6 +835,12 @@ impl ContextManager {
         let mut fallback_items = entry.prepared.fallback_items.to_vec();
         fallback_items.extend_from_slice(appended);
         let fallback_items: Arc<[ResponseItem]> = fallback_items.into();
+        let mut unreplaced_items = entry.prepared.unreplaced_items.to_vec();
+        unreplaced_items.extend_from_slice(appended);
+        let unreplaced_items: Arc<[ResponseItem]> = unreplaced_items.into();
+        let mut unreplaced_fallback_items = entry.prepared.unreplaced_fallback_items.to_vec();
+        unreplaced_fallback_items.extend_from_slice(appended);
+        let unreplaced_fallback_items: Arc<[ResponseItem]> = unreplaced_fallback_items.into();
         let Ok(fingerprint) = prepared_history_fingerprint(
             &items,
             &entry.prepared.stable_context_manifest,
@@ -809,11 +858,16 @@ impl ContextManager {
             prepared: PreparedPromptInput {
                 items,
                 fallback_items,
+                unreplaced_items,
+                unreplaced_fallback_items,
+                tool_history_substitutions: entry.prepared.tool_history_substitutions,
+                fallback_tool_history_substitutions: entry
+                    .prepared
+                    .fallback_tool_history_substitutions,
                 stable_context_manifest: entry.prepared.stable_context_manifest,
                 prompt_provenance,
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
-                tool_history_accounting: entry.prepared.tool_history_accounting,
             },
         });
     }

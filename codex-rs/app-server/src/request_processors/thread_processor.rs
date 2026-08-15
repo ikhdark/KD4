@@ -1,11 +1,16 @@
 use super::*;
 use crate::error_code::method_not_found;
+use crate::thread_state::OutOfBandElicitationLeaseKey;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use codex_protocol::persisted_thread_settings::PersistedThreadSettings;
+use codex_protocol::persisted_thread_settings::PersistedThreadSettingsOverrideMask;
+use codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TurnEnvironmentSelections;
 
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -13,13 +18,52 @@ const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
 
+fn desktop_activation_unavailable_reason(
+    error: codex_core::DesktopActivationVerificationError,
+) -> DesktopActivationUnavailableReason {
+    use codex_core::DesktopActivationVerificationError as Error;
+    match error {
+        Error::NoAuthenticatedHostTransport => {
+            DesktopActivationUnavailableReason::NoAuthoritativeBootstrapEvidence
+        }
+        Error::InvalidAuthoritativeEvidence
+        | Error::RunningProcessIdentityMissing
+        | Error::ImplementationIdentityMismatch
+        | Error::ChallengeIdentityMismatch
+        | Error::AuthenticatedChannelMismatch
+        | Error::InitializedProcessMismatch => {
+            DesktopActivationUnavailableReason::BootstrapEvidenceMismatch
+        }
+        Error::AuthoritativeEvidenceStale => {
+            DesktopActivationUnavailableReason::BootstrapEvidenceStale
+        }
+        Error::RunningExecutableMismatch => {
+            DesktopActivationUnavailableReason::RunningExecutableMismatch
+        }
+        Error::ChallengeMissingOrConsumed => {
+            DesktopActivationUnavailableReason::ChallengeMissingOrConsumed
+        }
+        Error::ChallengeExpired => DesktopActivationUnavailableReason::ChallengeExpired,
+        Error::InvalidDesktopObservation => {
+            DesktopActivationUnavailableReason::InvalidDesktopObservation
+        }
+        Error::ActivationObligationChanged => {
+            DesktopActivationUnavailableReason::ActivationObligationChanged
+        }
+        Error::ChallengeAlreadyRecordedWithDifferentPayload => {
+            DesktopActivationUnavailableReason::ReplayPayloadMismatch
+        }
+        Error::PersistenceFailed => DesktopActivationUnavailableReason::PersistenceFailed,
+    }
+}
+
 struct ThreadListFilters {
     model_providers: Option<Vec<String>>,
     source_kinds: Option<Vec<ThreadSourceKind>>,
     archived: bool,
     cwd_filters: Option<Vec<PathBuf>>,
     search_term: Option<String>,
-    use_state_db_only: bool,
+    use_state_db_only: Option<bool>,
     relation_filter: Option<StoreThreadRelationFilter>,
 }
 
@@ -144,52 +188,74 @@ fn collect_resume_override_mismatches(
     mismatch_details
 }
 
-fn merge_persisted_resume_metadata(
-    request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &mut ConfigOverrides,
-    persisted_metadata: &ThreadMetadata,
-) {
-    if has_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
-        return;
-    }
-
-    typesafe_overrides.model = persisted_metadata.model.clone();
-    typesafe_overrides.model_provider = Some(persisted_metadata.model_provider.clone());
-
-    if let Some(reasoning_effort) = persisted_metadata.reasoning_effort.as_ref() {
-        request_overrides.get_or_insert_with(HashMap::new).insert(
-            "model_reasoning_effort".to_string(),
-            serde_json::Value::String(reasoning_effort.to_string()),
-        );
+fn persisted_settings_fallback(stored_thread: &StoredThread) -> PersistedThreadSettings {
+    let environments = AbsolutePathBuf::from_absolute_path(&stored_thread.cwd)
+        .ok()
+        .map(|cwd| TurnEnvironmentSelections::new(cwd, Vec::new()));
+    PersistedThreadSettings {
+        model: stored_thread.model.clone(),
+        model_provider_id: (!stored_thread.model_provider.is_empty())
+            .then(|| stored_thread.model_provider.clone()),
+        approval_policy: Some(stored_thread.approval_mode),
+        permission_profile: Some(stored_thread.permission_profile.clone()),
+        environments,
+        reasoning_effort: stored_thread.reasoning_effort.clone().map(Some),
+        ..Default::default()
     }
 }
 
-fn merge_persisted_approvals_reviewer(
-    thread_history: &InitialHistory,
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &mut ConfigOverrides,
-) {
-    if typesafe_overrides.approvals_reviewer.is_some()
-        || request_overrides.is_some_and(|overrides| overrides.contains_key("approvals_reviewer"))
-    {
-        return;
-    }
+fn raw_override_contains(
+    overrides: Option<&HashMap<String, serde_json::Value>>,
+    key: &str,
+) -> bool {
+    overrides.is_some_and(|overrides| {
+        overrides.contains_key(key)
+            || overrides.keys().any(|candidate| {
+                candidate
+                    .strip_prefix(key)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+    })
+}
 
-    let InitialHistory::Resumed(resumed_history) = thread_history else {
-        return;
-    };
-    typesafe_overrides.approvals_reviewer =
-        resumed_history
-            .history
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                RolloutItem::TurnContext(turn_context) => turn_context.approvals_reviewer,
-                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
-                    Some(event.thread_settings.approvals_reviewer)
-                }
-                _ => None,
-            });
+fn persisted_settings_override_mask(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &ConfigOverrides,
+) -> PersistedThreadSettingsOverrideMask {
+    let permission_override = typesafe_overrides.permission_profile.is_some()
+        || typesafe_overrides.default_permissions.is_some()
+        || typesafe_overrides.sandbox_mode.is_some()
+        || raw_override_contains(request_overrides, "permission_profile")
+        || raw_override_contains(request_overrides, "default_permissions")
+        || raw_override_contains(request_overrides, "permissions")
+        || raw_override_contains(request_overrides, "sandbox_mode");
+    PersistedThreadSettingsOverrideMask {
+        model: typesafe_overrides.model.is_some()
+            || raw_override_contains(request_overrides, "model"),
+        model_provider_id: typesafe_overrides.model_provider.is_some()
+            || raw_override_contains(request_overrides, "model_provider"),
+        service_tier: typesafe_overrides.service_tier.is_some()
+            || raw_override_contains(request_overrides, "service_tier"),
+        approval_policy: typesafe_overrides.approval_policy.is_some()
+            || raw_override_contains(request_overrides, "approval_policy"),
+        approvals_reviewer: typesafe_overrides.approvals_reviewer.is_some()
+            || raw_override_contains(request_overrides, "approvals_reviewer"),
+        permission_profile: permission_override,
+        active_permission_profile: permission_override,
+        environments: typesafe_overrides.cwd.is_some()
+            || raw_override_contains(request_overrides, "cwd"),
+        workspace_roots: typesafe_overrides.workspace_roots.is_some()
+            || raw_override_contains(request_overrides, "workspace_roots"),
+        profile_workspace_roots: permission_override,
+        sandbox_policy: permission_override,
+        windows_sandbox_level: raw_override_contains(request_overrides, "windows.sandbox")
+            || raw_override_contains(request_overrides, "windows"),
+        reasoning_effort: raw_override_contains(request_overrides, "model_reasoning_effort"),
+        reasoning_summary: raw_override_contains(request_overrides, "model_reasoning_summary"),
+        personality: typesafe_overrides.personality.is_some()
+            || raw_override_contains(request_overrides, "personality"),
+        collaboration_mode: raw_override_contains(request_overrides, "collaboration_mode"),
+    }
 }
 
 fn normalize_thread_list_cwd_filters(
@@ -214,17 +280,6 @@ fn normalize_thread_list_cwd_filters(
     }
 
     Ok(Some(normalized_cwds))
-}
-
-fn has_model_resume_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.model.is_some()
-        || typesafe_overrides.model_provider.is_some()
-        || request_overrides.is_some_and(|overrides| overrides.contains_key("model"))
-        || request_overrides
-            .is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
 }
 
 fn should_finalize_failed_fork(rollback_succeeded: bool, thread_id_still_loaded: bool) -> bool {
@@ -398,6 +453,10 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+    pub(super) desktop_activation_bootstrap:
+        Arc<crate::desktop_activation::DesktopActivationBootstrap>,
+    pub(super) desktop_activation_challenge_owners:
+        Arc<Mutex<HashMap<String, (String, ConnectionId)>>>,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -430,6 +489,7 @@ impl ThreadRequestProcessor {
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
+        desktop_activation_bootstrap: Arc<crate::desktop_activation::DesktopActivationBootstrap>,
     ) -> Self {
         Self {
             auth_manager,
@@ -449,6 +509,8 @@ impl ThreadRequestProcessor {
             background_tasks: TaskTracker::new(),
             skills_watcher,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            desktop_activation_bootstrap,
+            desktop_activation_challenge_owners: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -546,18 +608,20 @@ impl ThreadRequestProcessor {
 
     pub(crate) async fn thread_increment_elicitation(
         &self,
+        request_id: &ConnectionRequestId,
         params: ThreadIncrementElicitationParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_increment_elicitation_inner(params)
+        self.thread_increment_elicitation_inner(request_id, params)
             .await
             .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn thread_decrement_elicitation(
         &self,
+        request_id: &ConnectionRequestId,
         params: ThreadDecrementElicitationParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_decrement_elicitation_inner(params)
+        self.thread_decrement_elicitation_inner(request_id, params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -794,6 +858,162 @@ impl ThreadRequestProcessor {
 
         Ok((thread_id, thread))
     }
+
+    pub(crate) async fn desktop_activation_obligation(
+        &self,
+        params: ThreadDesktopActivationObligationParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (_, thread) = self.load_thread(&params.thread_id).await?;
+        let obligation = thread.desktop_activation_obligation().await.map(|value| {
+            ApiDesktopActivationObligation {
+                thread_id: value.thread_id,
+                evidence_epoch: value.evidence_epoch,
+                implementation_identity: value.implementation_identity,
+                activation_obligation_identity: value.activation_obligation_identity,
+                requiring_plan_step_ids: value.requiring_plan_step_ids,
+            }
+        });
+        Ok(Some(
+            ThreadDesktopActivationObligationResponse { obligation }.into(),
+        ))
+    }
+
+    pub(crate) async fn desktop_activation_challenge(
+        &self,
+        connection_id: ConnectionId,
+        params: ThreadDesktopActivationChallengeParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (_, thread) = self.load_thread(&params.thread_id).await?;
+        if thread.desktop_activation_obligation().await.is_none() {
+            return Ok(Some(
+                ThreadDesktopActivationChallengeResponse {
+                    challenge: None,
+                    unavailable_reason: Some(
+                        DesktopActivationUnavailableReason::NoCurrentActivationObligation,
+                    ),
+                }
+                .into(),
+            ));
+        }
+        let (evidence, consumed_at) =
+            match self.desktop_activation_bootstrap.as_ref() {
+                crate::desktop_activation::DesktopActivationBootstrap::Absent => return Ok(Some(
+                    ThreadDesktopActivationChallengeResponse {
+                        challenge: None,
+                        unavailable_reason: Some(
+                            DesktopActivationUnavailableReason::NoAuthoritativeBootstrapEvidence,
+                        ),
+                    }
+                    .into(),
+                )),
+                crate::desktop_activation::DesktopActivationBootstrap::Malformed => {
+                    return Ok(Some(
+                        ThreadDesktopActivationChallengeResponse {
+                            challenge: None,
+                            unavailable_reason: Some(
+                                DesktopActivationUnavailableReason::BootstrapEvidenceMalformed,
+                            ),
+                        }
+                        .into(),
+                    ));
+                }
+                crate::desktop_activation::DesktopActivationBootstrap::Available {
+                    evidence,
+                    consumed_at,
+                } => (evidence.as_ref().clone(), consumed_at.clone()),
+            };
+        match thread
+            .issue_desktop_activation_challenge(evidence, consumed_at)
+            .await
+        {
+            Ok(value) => {
+                let mut owners = self.desktop_activation_challenge_owners.lock().await;
+                match owners.get(&value.challenge_id) {
+                    Some((_, owner)) if *owner != connection_id => {
+                        return Err(invalid_request(
+                            "Desktop activation challenge belongs to another connection",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        owners.insert(
+                            value.challenge_id.clone(),
+                            (params.thread_id, connection_id),
+                        );
+                    }
+                }
+                drop(owners);
+                Ok(Some(
+                    ThreadDesktopActivationChallengeResponse {
+                        challenge: Some(ApiDesktopActivationChallenge {
+                            challenge_id: value.challenge_id,
+                            thread_id: value.thread_id,
+                            evidence_epoch: value.evidence_epoch,
+                            implementation_identity: value.implementation_identity,
+                            activation_obligation_identity: value.activation_obligation_identity,
+                            publisher_evidence_id: value.publisher_evidence_id,
+                            expected_installed_executable_path: value
+                                .expected_installed_executable_path,
+                            expected_installed_executable_sha256: value
+                                .expected_installed_executable_sha256,
+                            publish_id: value.publish_id,
+                            issued_at: value.issued_at,
+                            expires_at: value.expires_at,
+                        }),
+                        unavailable_reason: None,
+                    }
+                    .into(),
+                ))
+            }
+            Err(error) => Ok(Some(
+                ThreadDesktopActivationChallengeResponse {
+                    challenge: None,
+                    unavailable_reason: Some(desktop_activation_unavailable_reason(error)),
+                }
+                .into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn desktop_activation_record(
+        &self,
+        connection_id: ConnectionId,
+        params: ThreadDesktopActivationRecordParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let thread_id = self
+            .desktop_activation_challenge_owners
+            .lock()
+            .await
+            .get(&params.challenge_id)
+            .filter(|(_, owner)| *owner == connection_id)
+            .map(|(thread_id, _)| thread_id.clone())
+            .ok_or_else(|| invalid_request("unknown Desktop activation challenge"))?;
+        let (_, thread) = self.load_thread(&thread_id).await?;
+        let result = thread
+            .record_desktop_activation(codex_core::DesktopActivationRecordObservation {
+                challenge_id: params.challenge_id,
+                desktop_process_id: params.desktop_process_id,
+                desktop_executable_path: params.desktop_executable_path,
+                observation_timestamp: params.observation_timestamp,
+                initialization_observation_identity: params.initialization_observation_identity,
+            })
+            .await
+            .map_err(|error| {
+                invalid_request(format!(
+                    "Desktop activation record rejected: {:?}",
+                    desktop_activation_unavailable_reason(error)
+                ))
+            })?;
+        Ok(Some(
+            ThreadDesktopActivationRecordResponse {
+                challenge_id: result.challenge_id,
+                recorded_at: result.recorded_at,
+                already_recorded: result.already_recorded,
+            }
+            .into(),
+        ))
+    }
+
     pub(super) async fn acquire_thread_list_state_permit(
         &self,
     ) -> Result<SemaphorePermit<'_>, JSONRPCErrorError> {
@@ -1057,6 +1277,9 @@ impl ThreadRequestProcessor {
         let report = self
             .thread_manager
             .shutdown_all_threads_bounded(Duration::from_secs(10))
+            .await;
+        self.thread_state_manager
+            .clear_all_out_of_band_elicitation_leases()
             .await;
         for thread_id in report.submit_failed {
             warn!("failed to submit Shutdown to thread {thread_id}");
@@ -1524,18 +1747,24 @@ impl ThreadRequestProcessor {
 
     async fn thread_increment_elicitation_inner(
         &self,
+        request_id: &ConnectionRequestId,
         params: ThreadIncrementElicitationParams,
     ) -> Result<ThreadIncrementElicitationResponse, JSONRPCErrorError> {
-        let (_, thread) = self.load_thread(&params.thread_id).await?;
-        let count = thread
-            .increment_out_of_band_elicitation_count()
+        let (thread_id, thread) = self.load_thread(&params.thread_id).await?;
+        let lease_id = Uuid::now_v7().to_string();
+        let lease = OutOfBandElicitationLeaseKey::new(request_id.connection_id, lease_id.clone());
+        let count = self
+            .thread_state_manager
+            .acquire_out_of_band_elicitation_lease(thread_id, lease, &thread)
             .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to increment out-of-band elicitation counter: {err}"
-                ))
+            .map_err(|err| match err {
+                CodexErr::InvalidRequest(message) => invalid_request(message),
+                err => internal_error(format!(
+                    "failed to acquire out-of-band elicitation lease: {err}"
+                )),
             })?;
         Ok(ThreadIncrementElicitationResponse {
+            lease_id,
             count,
             paused: count > 0,
         })
@@ -1543,18 +1772,30 @@ impl ThreadRequestProcessor {
 
     async fn thread_decrement_elicitation_inner(
         &self,
+        request_id: &ConnectionRequestId,
         params: ThreadDecrementElicitationParams,
     ) -> Result<ThreadDecrementElicitationResponse, JSONRPCErrorError> {
-        let (_, thread) = self.load_thread(&params.thread_id).await?;
-        let count = thread
-            .decrement_out_of_band_elicitation_count()
-            .await
-            .map_err(|err| match err {
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                err => internal_error(format!(
-                    "failed to decrement out-of-band elicitation counter: {err}"
-                )),
-            })?;
+        let ThreadDecrementElicitationParams {
+            thread_id,
+            lease_id,
+        } = params;
+        let thread_id = ThreadId::from_string(&thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        let lease = OutOfBandElicitationLeaseKey::new(request_id.connection_id, lease_id);
+        let released_count = self
+            .thread_state_manager
+            .release_out_of_band_elicitation_lease(thread_id, &lease)
+            .await;
+        let count = match released_count {
+            Some(count) => count,
+            None => self
+                .thread_manager
+                .get_thread(thread_id)
+                .await
+                .map_or(0, |thread| {
+                    thread.active_out_of_band_elicitation_lease_count()
+                }),
+        };
         Ok(ThreadDecrementElicitationResponse {
             count,
             paused: count > 0,
@@ -1993,6 +2234,11 @@ impl ThreadRequestProcessor {
             )),
             (None, None) => None,
         };
+        if relation_filter.is_some() && use_state_db_only == Some(false) {
+            return Err(invalid_request(
+                "relationship-filtered thread listing does not support scan-and-repair storage",
+            ));
+        }
 
         let requested_page_size = limit
             .map(|value| value as usize)
@@ -2004,7 +2250,7 @@ impl ThreadRequestProcessor {
             ThreadSortKey::RecencyAt => StoreThreadSortKey::RecencyAt,
         };
         let sort_direction = sort_direction.unwrap_or(SortDirection::Desc);
-        let (stored_threads, next_cursor) = self
+        let (stored_threads, next_cursor, backwards_cursor) = self
             .list_threads_common(
                 requested_page_size,
                 cursor,
@@ -2021,9 +2267,6 @@ impl ThreadRequestProcessor {
                 },
             )
             .await?;
-        let backwards_cursor = stored_threads.first().and_then(|thread| {
-            thread_backwards_cursor_for_sort_key(thread, store_sort_key, sort_direction)
-        });
         let mut threads = Vec::with_capacity(stored_threads.len());
         let mut status_ids = Vec::with_capacity(stored_threads.len());
         let fallback_provider = self.config.model_provider_id.clone();
@@ -2633,6 +2876,10 @@ impl ThreadRequestProcessor {
     }
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+        {
+            let mut owners = self.desktop_activation_challenge_owners.lock().await;
+            remove_desktop_activation_challenge_owners_for_connection(&mut owners, connection_id);
+        }
         let thread_ids = self
             .thread_state_manager
             .remove_connection(connection_id)
@@ -2752,7 +2999,7 @@ impl ThreadRequestProcessor {
             approvals_reviewer,
             sandbox,
             permissions,
-            config: mut request_overrides,
+            config: request_overrides,
             base_instructions,
             developer_instructions,
             personality,
@@ -2782,9 +3029,21 @@ impl ThreadRequestProcessor {
             }
         };
 
-        let history_cwd = thread_history.session_cwd();
+        let persisted_fallback = resume_source_thread
+            .as_ref()
+            .map(persisted_settings_fallback)
+            .unwrap_or_default();
+        let reduced_settings = reduce_persisted_thread_settings(
+            thread_history.get_rollout_items(),
+            persisted_fallback.clone(),
+        );
+        let history_cwd = reduced_settings
+            .environments
+            .as_ref()
+            .map(|environments| environments.legacy_fallback_cwd.to_path_buf())
+            .or_else(|| thread_history.session_cwd());
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
-        let mut typesafe_overrides = self.build_thread_config_overrides(
+        let typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
             service_tier,
@@ -2798,12 +3057,8 @@ impl ThreadRequestProcessor {
             developer_instructions,
             personality,
         );
-        self.load_and_apply_persisted_resume_metadata(
-            &thread_history,
-            &mut request_overrides,
-            &mut typesafe_overrides,
-        )
-        .await;
+        let explicit_overrides =
+            persisted_settings_override_mask(request_overrides.as_ref(), &typesafe_overrides);
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let config = match self
@@ -2823,12 +3078,16 @@ impl ThreadRequestProcessor {
 
         match self
             .thread_manager
-            .resume_thread_with_history(
+            .resume_thread_with_history_and_settings(
                 config,
                 thread_history,
                 self.auth_manager.clone(),
                 self.request_trace_context(&request_id).await,
                 supports_openai_form_elicitation,
+                codex_core::ThreadSettingsReconstruction {
+                    fallback: persisted_fallback,
+                    explicit_overrides,
+                },
             )
             .await
         {
@@ -2989,30 +3248,6 @@ impl ThreadRequestProcessor {
         Ok(())
     }
 
-    async fn load_and_apply_persisted_resume_metadata(
-        &self,
-        thread_history: &InitialHistory,
-        request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
-        typesafe_overrides: &mut ConfigOverrides,
-    ) -> Option<ThreadMetadata> {
-        merge_persisted_approvals_reviewer(
-            thread_history,
-            request_overrides.as_ref(),
-            typesafe_overrides,
-        );
-        let InitialHistory::Resumed(resumed_history) = thread_history else {
-            return None;
-        };
-        let state_db_ctx = self.state_db.clone()?;
-        let persisted_metadata = state_db_ctx
-            .get_thread(resumed_history.conversation_id)
-            .await
-            .ok()
-            .flatten()?;
-        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
-        Some(persisted_metadata)
-    }
-
     #[tracing::instrument(level = "trace", skip_all)]
     async fn resume_running_thread(
         &self,
@@ -3097,20 +3332,28 @@ impl ThreadRequestProcessor {
                     // A loaded idle thread is only a cache entry. Shut it down
                     // before removing it so cold resume cannot duplicate a
                     // thread that timed out during shutdown.
-                    match wait_for_thread_shutdown(&existing_thread).await {
-                        ThreadShutdownResult::Complete => {
-                            self.thread_manager.remove_thread(&existing_thread_id).await;
-                            self.finalize_thread_teardown(existing_thread_id).await;
+                    match shutdown_idle_thread_for_resume(
+                        &self.thread_manager,
+                        &self.outgoing,
+                        &self.pending_thread_unloads,
+                        &self.thread_state_manager,
+                        &self.thread_watch_manager,
+                        existing_thread_id,
+                        Arc::clone(&existing_thread),
+                    )
+                    .await
+                    {
+                        IdleThreadShutdownResult::ReadyForColdResume => {
                             // Shutdown can flush newer rollout items, so reload the
                             // stored thread before starting the replacement session.
                             return Ok(RunningThreadResumeResult::NotRunning(None));
                         }
-                        ThreadShutdownResult::SubmitFailed => {
-                            warn!("failed to submit Shutdown to thread {existing_thread_id}");
+                        IdleThreadShutdownResult::Closing => {
+                            return Err(invalid_request(format!(
+                                "thread {existing_thread_id} is closing; retry after the thread is closed"
+                            )));
                         }
-                        ThreadShutdownResult::TimedOut => {
-                            warn!("thread {existing_thread_id} shutdown timed out");
-                        }
+                        IdleThreadShutdownResult::RejoinLoaded => {}
                     }
                 }
 
@@ -3501,6 +3744,7 @@ impl ThreadRequestProcessor {
             .read_stored_thread_for_resume(&thread_id, path.as_ref(), /*include_history*/ true)
             .await?;
         let source_thread_id = source_thread.thread_id;
+        let use_head_metadata_fallback = last_turn_id.is_none();
         let source_thread_name = source_thread
             .name
             .as_deref()
@@ -3522,30 +3766,20 @@ impl ThreadRequestProcessor {
         } else {
             Arc::new(history_items)
         };
-        let history_cwd = Some(source_thread.cwd.clone());
-
-        // Persist Windows sandbox mode.
-        let mut cli_overrides = cli_overrides.unwrap_or_default();
-        if cfg!(windows) {
-            match WindowsSandboxLevel::from_config(&self.config) {
-                WindowsSandboxLevel::Elevated => {
-                    cli_overrides
-                        .insert("windows.sandbox".to_string(), serde_json::json!("elevated"));
-                }
-                WindowsSandboxLevel::RestrictedToken => {
-                    cli_overrides.insert(
-                        "windows.sandbox".to_string(),
-                        serde_json::json!("unelevated"),
-                    );
-                }
-                WindowsSandboxLevel::Disabled => {}
-            }
-        }
-        let request_overrides = if cli_overrides.is_empty() {
-            None
+        let persisted_fallback = if use_head_metadata_fallback {
+            persisted_settings_fallback(&source_thread)
         } else {
-            Some(cli_overrides)
+            Default::default()
         };
+        let reduced_settings =
+            reduce_persisted_thread_settings(&history_items, persisted_fallback.clone());
+        let history_cwd = reduced_settings
+            .environments
+            .as_ref()
+            .map(|environments| environments.legacy_fallback_cwd.to_path_buf())
+            .or_else(|| use_head_metadata_fallback.then(|| source_thread.cwd.clone()));
+
+        let request_overrides = cli_overrides;
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
@@ -3562,6 +3796,8 @@ impl ThreadRequestProcessor {
             /*personality*/ None,
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
+        let explicit_overrides =
+            persisted_settings_override_mask(request_overrides.as_ref(), &typesafe_overrides);
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let config = self
             .config_manager
@@ -3578,7 +3814,7 @@ impl ThreadRequestProcessor {
             ..
         } = self
             .thread_manager
-            .fork_thread_from_history(
+            .fork_thread_from_history_with_settings(
                 ForkSnapshot::Interrupted,
                 config,
                 InitialHistory::Resumed(ResumedHistory {
@@ -3589,6 +3825,10 @@ impl ThreadRequestProcessor {
                 thread_source.map(Into::into),
                 self.request_trace_context(&request_id).await,
                 supports_openai_form_elicitation,
+                codex_core::ThreadSettingsReconstruction {
+                    fallback: persisted_fallback,
+                    explicit_overrides,
+                },
             )
             .await
             .map_err(|err| match err {
@@ -3819,7 +4059,7 @@ impl ThreadRequestProcessor {
         sort_key: StoreThreadSortKey,
         sort_direction: SortDirection,
         filters: ThreadListFilters,
-    ) -> Result<(Vec<StoredThread>, Option<String>), JSONRPCErrorError> {
+    ) -> Result<(Vec<StoredThread>, Option<String>, Option<String>), JSONRPCErrorError> {
         let ThreadListFilters {
             model_providers,
             source_kinds,
@@ -3834,6 +4074,7 @@ impl ThreadRequestProcessor {
         let mut remaining = requested_page_size;
         let mut items = Vec::with_capacity(requested_page_size);
         let mut next_cursor: Option<String> = None;
+        let mut backwards_cursor: Option<String> = None;
 
         let model_provider_filter = match model_providers {
             Some(providers) => {
@@ -3872,7 +4113,11 @@ impl ThreadRequestProcessor {
                     cwd_filters: cwd_filters.clone(),
                     archived,
                     search_term: search_term.clone(),
-                    use_state_db_only,
+                    storage_mode: match use_state_db_only {
+                        None => StoreThreadListStorageMode::PreferStateDb,
+                        Some(true) => StoreThreadListStorageMode::StateDbOnly,
+                        Some(false) => StoreThreadListStorageMode::ScanAndRepair,
+                    },
                     relation_filter,
                 })
                 .await
@@ -3901,6 +4146,9 @@ impl ThreadRequestProcessor {
                 }
             }
             items.extend(filtered);
+            if backwards_cursor.is_none() && !items.is_empty() {
+                backwards_cursor = page.backwards_cursor;
+            }
             remaining = requested_page_size.saturating_sub(items.len());
 
             next_cursor = page.next_cursor;
@@ -3921,7 +4169,7 @@ impl ThreadRequestProcessor {
             cursor_obj = Some(cursor_val);
         }
 
-        Ok((items, next_cursor))
+        Ok((items, next_cursor, backwards_cursor))
     }
 }
 
@@ -4086,8 +4334,8 @@ fn thread_backwards_cursor_for_sort_key(
     // The state DB stores unique millisecond timestamps. Offset the reverse cursor by one
     // millisecond so the opposite-direction query includes the page anchor.
     let timestamp = match sort_direction {
-        SortDirection::Asc => timestamp.checked_add_signed(ChronoDuration::milliseconds(1))?,
-        SortDirection::Desc => timestamp.checked_sub_signed(ChronoDuration::milliseconds(1))?,
+        SortDirection::Asc => timestamp.checked_add_signed(chrono::Duration::milliseconds(1))?,
+        SortDirection::Desc => timestamp.checked_sub_signed(chrono::Duration::milliseconds(1))?,
     };
     Some(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
@@ -4775,6 +5023,13 @@ fn paginate_background_terminals(
     let end = start.saturating_add(effective_limit).min(terminals.len());
     let next_cursor = (end < terminals.len()).then(|| terminals[end - 1].process_id.clone());
     Ok((terminals[start..end].to_vec(), next_cursor))
+}
+
+fn remove_desktop_activation_challenge_owners_for_connection(
+    owners: &mut HashMap<String, (String, ConnectionId)>,
+    connection_id: ConnectionId,
+) {
+    owners.retain(|_, (_, owner)| *owner != connection_id);
 }
 
 fn build_thread_from_loaded_snapshot(

@@ -422,10 +422,10 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
                 },
                 "assignment_id": {
                     "type": "string",
-                    "description": "Durable UUIDv7 assignment id, present only for typed assignments."
+                    "description": "Durable UUIDv7 assignment id for the admitted task."
                 }
             },
-            "required": ["task_name"],
+            "required": ["task_name", "assignment_id"],
             "additionalProperties": false
         });
     }
@@ -443,10 +443,10 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
             },
             "assignment_id": {
                 "type": "string",
-                "description": "Durable UUIDv7 assignment id, present only for typed assignments."
+                "description": "Durable UUIDv7 assignment id for the admitted task."
             }
         },
-        "required": ["task_name", "nickname"],
+        "required": ["task_name", "nickname", "assignment_id"],
         "additionalProperties": false
     })
 }
@@ -678,7 +678,8 @@ fn spawn_agent_common_properties_v2(
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Initial plain-text task for the new agent.".to_string(),
+                "Plain-text task admitted as a durable repository-wide worker claim. Use a typed assignment with narrower scopes when safe parallel overlap is required."
+                    .to_string(),
             ))
             .with_encrypted(),
         ),
@@ -689,7 +690,7 @@ fn spawn_agent_common_properties_v2(
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(format!(
-                "Optional fork mode. For typed assignments, omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; for legacy messages, omitted or `none` creates a fresh non-forked child. Use an integer string from 1 through 5 for a history-bearing fork. Full history (`all`) is disabled by default.{full_history_override_guidance}"
+                "Optional fork mode. Omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation. Use an integer string from 1 through 5 for a history-bearing fork. Full history (`all`) is disabled by default.{full_history_override_guidance}"
             ))),
         ),
         (
@@ -1039,15 +1040,15 @@ fn spawn_agent_tool_description_v2(
         {agent_role_guidance}
         Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
 You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
-The spawned agent will have the same tools as you and the ability to spawn its own subagents.
+The spawned agent receives a durable task binding. Explicitly typed agents cannot spawn additional subagents; compatibility `message` agents may delegate another compatibility task, which remains bound to and overlap-checked against its parent.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
-Use `assignment` for durable typed coordination or `message` for a legacy plain-text task; exactly one is required. Typed assignments require an explicit typed-capable `agent_type` (a built-in role or its configured `kd4_` alias) and return an `assignment_id`.
+Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted as a repository-wide worker claim; exactly one is required. Both forms are durably admitted, checked for overlap, and return an `assignment_id`. Typed assignments require an explicit typed-capable `agent_type` (a built-in role or its configured `kd4_` alias).
 
     {full_history_override_guidance}
-For typed assignments, omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. For legacy `message` spawning, omitted or `none` creates a fresh non-forked child. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#
+Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#
     );
 
     if let Some(usage_hint_text) = usage_hint_text {
@@ -1138,8 +1139,8 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema::number(Some(format!(
-                "Timeout in milliseconds. Omit for the normal wait; completed targets return immediately. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
-                options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
+                "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Explicit values must be between {} and {}. Completed targets return immediately.",
+                options.min_timeout_ms, options.max_timeout_ms,
             ))),
         ),
         (
@@ -1166,7 +1167,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema::number(Some(format!(
-                "Timeout in milliseconds. Omit for the normal wait. Use list_agents or get_agent_task for an immediate status snapshot. Defaults to {}, min {}, max {}.",
+                "Explicit caller deadline in milliseconds. Omit to keep waiting; the default {} ms interval is internal maintenance cadence only and does not return an unchanged result. Explicit values must be between {} and {}. Use list_agents or get_agent_task for an immediate status snapshot.",
                 options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
             ))),
         ),

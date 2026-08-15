@@ -118,7 +118,7 @@ mod tests {
                 archived: true,
                 search_term: None,
                 relation_filter: None,
-                use_state_db_only: false,
+                storage_mode: crate::ThreadListStorageMode::PreferStateDb,
             })
             .await
             .expect("archived listing");

@@ -212,6 +212,26 @@ pub enum ThreadRelationFilter {
     DescendantsOf(ThreadId),
 }
 
+/// Storage selection policy for local thread listings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreadListStorageMode {
+    /// Prefer SQLite for a new listing, falling back to JSONL scan-and-repair only when the
+    /// initial SQLite query is unavailable or fails.
+    #[default]
+    PreferStateDb,
+    /// Require SQLite and surface storage failures to the caller.
+    StateDbOnly,
+    /// Use the legacy JSONL scan-and-repair listing path.
+    ScanAndRepair,
+}
+
+/// Storage path that owns a local thread-list pagination cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ThreadListStoragePath {
+    StateDb,
+    ScanAndRepair,
+}
+
 /// Parameters for listing threads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListThreadsParams {
@@ -237,8 +257,8 @@ pub struct ListThreadsParams {
     pub search_term: Option<String>,
     /// Optional spawn-graph relationship filter.
     pub relation_filter: Option<ThreadRelationFilter>,
-    /// Return directly from the state DB without scanning JSONL rollouts to repair metadata.
-    pub use_state_db_only: bool,
+    /// Storage selection policy for this listing request.
+    pub storage_mode: ThreadListStorageMode,
 }
 
 /// Parameters for searching thread content.
@@ -267,6 +287,8 @@ pub struct ThreadPage {
     pub items: Vec<StoredThread>,
     /// Opaque cursor to continue listing.
     pub next_cursor: Option<String>,
+    /// Opaque cursor for fetching in the opposite direction.
+    pub backwards_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -543,7 +565,12 @@ pub struct ThreadMetadataPatch {
     /// Latest observed model.
     pub model: Option<String>,
     /// Latest observed reasoning effort.
-    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_option"
+    )]
+    pub reasoning_effort: ClearableField<ReasoningEffort>,
     /// Creation timestamp when known.
     pub created_at: Option<DateTime<Utc>>,
     /// Last update timestamp for this metadata observation.
@@ -741,6 +768,7 @@ mod tests {
     fn thread_metadata_patch_round_trips_optional_clears() {
         let patch = ThreadMetadataPatch {
             name: Some(None),
+            reasoning_effort: Some(None),
             thread_source: Some(None),
             agent_nickname: Some(None),
             agent_role: Some(None),
@@ -750,6 +778,7 @@ mod tests {
 
         let value = serde_json::to_value(&patch).expect("serialize patch");
         assert_eq!(value["name"], json!(null));
+        assert_eq!(value["reasoning_effort"], json!(null));
         assert_eq!(value["thread_source"], json!(null));
         assert_eq!(value["agent_nickname"], json!(null));
         assert_eq!(value["agent_role"], json!(null));
@@ -758,6 +787,7 @@ mod tests {
         let decoded: ThreadMetadataPatch =
             serde_json::from_value(value).expect("deserialize patch");
         assert_eq!(decoded.name, Some(None));
+        assert_eq!(decoded.reasoning_effort, Some(None));
         assert_eq!(decoded.thread_source, Some(None));
         assert_eq!(decoded.agent_nickname, Some(None));
         assert_eq!(decoded.agent_role, Some(None));

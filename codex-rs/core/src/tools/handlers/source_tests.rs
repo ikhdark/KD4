@@ -1,10 +1,13 @@
 use super::*;
+use crate::git_workspace::GitWorkspaceCache;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnEnvironment;
+use crate::tools::command_execution::record_finalized_workspace_mutation;
 use crate::tools::context::ToolCallSource;
 use crate::tools::known_delta_store;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_agent_task_store::WorkspaceMutationResult;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_core_skills::SkillLoadOutcome;
 use codex_core_skills::SkillMetadata;
@@ -18,6 +21,12 @@ use codex_file_search::source_search::SOURCE_SEARCH_MAX_MATCHES;
 use codex_file_search::source_search::SourceLine;
 use codex_file_search::source_search::SourceSearchCoverage;
 use codex_file_search::source_search::SourceSearchDiagnostics;
+use codex_file_search::source_search::SourceSearchHydratedSpan;
+use codex_file_search::source_search::SourceSearchHydrationIssue;
+use codex_file_search::source_search::SourceSearchHydrationIssueReason;
+use codex_file_search::source_search::SourceSearchHydrationPacket;
+use codex_file_search::source_search::SourceSearchHydrationPacketSpan;
+use codex_file_search::source_search::SourceSearchHydrationSelection;
 use codex_file_search::source_search::SourceSearchHydrationStatus;
 use codex_file_search::source_search::SourceSearchMatch;
 use codex_file_search::source_search::SourceTruncatedReason;
@@ -36,6 +45,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::TempDirExt;
 use serde_json::json;
+use std::fs::FileTimes;
 use std::io;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -263,8 +273,86 @@ fn sample_search_output(text: String) -> SourceSearchOutput {
         }],
         hydration_status: SourceSearchHydrationStatus::SkippedObservationUnavailable,
         hydrated_span: None,
+        hydration_packet: None,
         diagnostics: SourceSearchDiagnostics::default(),
     }
+}
+
+fn sample_packet_search_output() -> SourceSearchOutput {
+    let mut output = sample_search_output("ordinary hydrated context".to_string());
+    let mut second = output.matches[0].clone();
+    second.id = "match:omitted".to_string();
+    second.file_id = "file:omitted".to_string();
+    second.path = "src/other.rs".to_string();
+    second.source_revision = "other-revision".to_string();
+    second.line_number = 4;
+    second.start_line = 3;
+    second.end_line = 5;
+    second.matched_content = "needle omitted".to_string();
+    second.lines = vec![SourceLine {
+        line_number: 4,
+        text: "unhydrated exact context".to_string(),
+        text_truncated: false,
+    }];
+    output.matches.push(second);
+    output.coverage.total_matches = 2;
+    output.coverage.matches_returned = 2;
+    output.coverage.indexed_matches = 2;
+    output.hydration_status = SourceSearchHydrationStatus::PartiallyHydratedBoundedPacket;
+    let exact_content = "fn owner() {\n    let needle = true;\n}\n".to_string();
+    let span_content_hash = format!("{:x}", Sha256::digest(exact_content.as_bytes()));
+    output.hydration_packet = Some(SourceSearchHydrationPacket {
+        schema_version: 1,
+        observation_set_id: "observation-set".to_string(),
+        exact_content_byte_limit: 5 * 1024,
+        exact_content_bytes: exact_content.len(),
+        spans: vec![SourceSearchHydrationPacketSpan {
+            id: "source-hydration:fixture".to_string(),
+            match_ids: vec!["match:fixture".to_string()],
+            path: "src/lib.rs".to_string(),
+            requested_start_line: 7,
+            requested_end_line: 9,
+            start_line: 7,
+            end_line: 9,
+            file_content_hash: "revision".to_string(),
+            span_content_hash,
+            selection: SourceSearchHydrationSelection::AuthoritativeDefinition,
+            truncated: false,
+            exact_content,
+        }],
+        issues: vec![SourceSearchHydrationIssue {
+            match_id: "match:omitted".to_string(),
+            reason: SourceSearchHydrationIssueReason::ByteCap,
+        }],
+    });
+    output
+}
+
+fn sample_unique_hydrated_search_output() -> SourceSearchOutput {
+    let mut output = sample_search_output("ordinary match context".to_string());
+    let exact_content = [
+        "fn helper() {}",
+        "",
+        "fn owner() {",
+        "    let before = true;",
+        "    let needle = true;",
+        "    let after = true;",
+        "}",
+    ]
+    .join("\n");
+    let observation = read_file_span_from_bytes(
+        "src/lib.rs".to_string(),
+        exact_content.as_bytes().to_vec(),
+        3,
+        5,
+    )
+    .expect("unique hydration span");
+    output.hydration_status = SourceSearchHydrationStatus::HydratedAuthoritativeDefinition;
+    output.hydrated_span = Some(SourceSearchHydratedSpan {
+        content_hash: format!("{:x}", Sha256::digest(exact_content.as_bytes())),
+        observation,
+    });
+    output
 }
 
 #[test]
@@ -274,6 +362,186 @@ fn search_render_includes_explicit_line_span_evidence() {
     let rendered = render_search_output(&output);
     assert!(rendered.contains("citation: src/lib.rs:7-9 (match line 8)"));
     assert!(rendered.contains("     8 | needle"));
+}
+
+#[test]
+fn packet_search_render_includes_exact_spans_and_omissions_without_duplicate_context() {
+    let output = sample_packet_search_output();
+
+    let rendered = render_search_output(&output);
+
+    assert!(rendered.len() <= SOURCE_TOOL_MAX_RENDERED_BYTES);
+    assert!(rendered.contains("hydration_packet: schema=1 observation_set_id=observation-set"));
+    assert!(rendered.contains("hydrated_citation: src/lib.rs:7-9 requested=7-9"));
+    assert!(rendered.contains("span_content_hash:"));
+    assert!(rendered.contains("     8 |     let needle = true;"));
+    assert!(rendered.contains("hydration_issue: match_id=match:omitted reason=ByteCap"));
+    assert!(rendered.contains("unhydrated exact context"));
+    assert!(!rendered.contains("ordinary hydrated context"));
+    let last_identity = rendered
+        .rfind("match_identity:")
+        .expect("packet match identities");
+    let first_span = rendered
+        .find("hydrated_span_id:")
+        .expect("hydrated packet span");
+    assert!(last_identity < first_span);
+}
+
+#[tokio::test]
+async fn packet_search_projection_and_signal_preserve_exact_hydration() {
+    let output = sample_packet_search_output();
+    let expected_packet = output.hydration_packet.clone().expect("packet");
+    let (_session, turn) = make_session_and_context().await;
+
+    let tool_output = search_function_output(&output, false, false, None, &turn.turn_timing_state);
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let projection = tool_output
+        .projection_metadata()
+        .expect("search projection");
+    let hydration_fragment = projection
+        .fragments
+        .iter()
+        .find(|fragment| fragment.id.as_deref() == Some("source-hydration:fixture"))
+        .expect("hydration fragment");
+    assert_eq!(
+        hydration_fragment.text,
+        expected_packet.spans[0].exact_content
+    );
+    assert_eq!(
+        projection.predetermined_json_pointers,
+        vec![ToolOutputProjectionJsonPointer {
+            id: "source-hydration:fixture".to_string(),
+            pointer: "/hydration_packet/spans/0".to_string(),
+        }]
+    );
+    assert!(
+        projection
+            .predetermined_json_pointers
+            .iter()
+            .all(|selector| !selector.pointer.starts_with("/matches/"))
+    );
+
+    let canonical = tool_output
+        .canonical_result(&payload)
+        .expect("canonical search result");
+    let canonical: SourceSearchOutput =
+        serde_json::from_slice(&canonical.bytes).expect("decode canonical search output");
+    assert_eq!(canonical.hydration_packet, Some(expected_packet));
+
+    let code_mode: SourceSearchOutput =
+        serde_json::from_value(tool_output.code_mode_result(&payload))
+            .expect("decode native code-mode search output");
+    assert_eq!(code_mode.hydration_packet, canonical.hydration_packet);
+
+    let signal = tool_output
+        .sampling_request_signal()
+        .expect("sampling signal");
+    assert_eq!(
+        signal
+            .get("match_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        signal.get("match_paths"),
+        Some(&serde_json::json!(["src/lib.rs", "src/other.rs"]))
+    );
+    assert_eq!(
+        signal
+            .get("hydration_omission_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    for unused in [
+        "query",
+        "roots",
+        "match_ids",
+        "hydrated_match_ids",
+        "hydration_observation_set_id",
+        "hydration_span_count",
+        "hydration_exact_content_bytes",
+        "hydration_issues",
+        "source_disposition",
+    ] {
+        assert!(
+            signal.get(unused).is_none(),
+            "unexpected private field {unused}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unique_search_projection_preserves_exact_hydration() {
+    let output = sample_unique_hydrated_search_output();
+    let expected = output
+        .hydrated_span
+        .as_ref()
+        .expect("unique hydration")
+        .observation
+        .exact_content
+        .clone();
+    let (_session, turn) = make_session_and_context().await;
+
+    let tool_output = search_function_output(&output, false, false, None, &turn.turn_timing_state);
+    let projection = tool_output
+        .projection_metadata()
+        .expect("search projection");
+    let hydration_fragment = projection
+        .fragments
+        .iter()
+        .find(|fragment| fragment.id.as_deref() == Some("match:fixture:hydrated-span"))
+        .expect("unique hydration fragment");
+
+    assert_eq!(hydration_fragment.text, expected);
+    assert_eq!(
+        hydration_fragment.kind,
+        ToolOutputProjectionFragmentKind::CitationOrExactSpan
+    );
+    assert_eq!(
+        projection.predetermined_json_pointers,
+        vec![ToolOutputProjectionJsonPointer {
+            id: "match:fixture:hydrated-span".to_string(),
+            pointer: "/hydrated_span".to_string(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn search_projection_owner_recovery_only_adds_issue_for_policy_selected_span() {
+    let mut output = sample_packet_search_output();
+    output
+        .hydration_packet
+        .as_mut()
+        .expect("hydration packet")
+        .issues[0]
+        .match_id = "match:fixture".to_string();
+    let (_session, turn) = make_session_and_context().await;
+
+    let projection = search_function_output(&output, false, false, None, &turn.turn_timing_state)
+        .projection_metadata()
+        .expect("search projection");
+
+    assert_eq!(
+        projection.predetermined_json_pointers,
+        vec![
+            ToolOutputProjectionJsonPointer {
+                id: "source-hydration:fixture".to_string(),
+                pointer: "/hydration_packet/spans/0".to_string(),
+            },
+            ToolOutputProjectionJsonPointer {
+                id: "source-hydration-issue:match:fixture".to_string(),
+                pointer: "/hydration_packet/issues/0".to_string(),
+            },
+        ]
+    );
+    assert!(
+        projection
+            .predetermined_json_pointers
+            .iter()
+            .all(|selector| !selector.pointer.starts_with("/matches/"))
+    );
 }
 
 #[tokio::test]
@@ -318,6 +586,91 @@ async fn source_read_canonicalizes_exact_content_before_bounded_rendering() {
             .as_deref()
             .is_some_and(|id| id.starts_with("src:"))
     }));
+    assert_eq!(projection.predetermined_ranges.len(), 4);
+    assert_eq!(
+        projection
+            .predetermined_ranges
+            .iter()
+            .map(|range| (range.start_line, range.end_line))
+            .collect::<Vec<_>>(),
+        vec![(1, 40), (41, 80), (81, 120), (121, 126)]
+    );
+    assert!(
+        projection
+            .predetermined_ranges
+            .iter()
+            .zip(&projection.fragments)
+            .all(|(range, fragment)| fragment.id.as_deref() == Some(range.id.as_str()))
+    );
+}
+
+#[tokio::test]
+async fn source_predetermined_ranges_are_relative_to_the_requested_artifact() {
+    let content = (1..=126)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let output =
+        read_file_span_from_bytes("src/fixture.rs".to_string(), content.into_bytes(), 41, 86)
+            .expect("source fixture");
+    let (_session, turn) = make_session_and_context().await;
+    let tool_output = source_read_tool_output(
+        output,
+        "bounded renderer output".to_string(),
+        serde_json::json!({ "kind": "source_evidence" }),
+        None,
+        &turn.turn_timing_state,
+    );
+    let projection = tool_output
+        .projection_metadata()
+        .expect("typed source projection");
+
+    assert_eq!(
+        projection
+            .predetermined_ranges
+            .iter()
+            .map(|range| (range.start_line, range.end_line))
+            .collect::<Vec<_>>(),
+        vec![(1, 40), (41, 80), (81, 86)]
+    );
+    assert!(projection.predetermined_ranges[0].id.ends_with(":L41-L80"));
+}
+
+#[tokio::test]
+async fn source_coverage_trim_keeps_canonical_and_projection_on_missing_ranges() {
+    let content = (1..=8)
+        .map(|line| format!("line {line}\r\n"))
+        .collect::<String>();
+    let mut output =
+        read_file_span_from_bytes("src/fixture.rs".to_string(), content.into_bytes(), 1, 8)
+            .expect("source fixture");
+    retain_read_file_span_intervals(&mut output, &[(2, 2), (5, 6)]);
+    let (_session, turn) = make_session_and_context().await;
+    let tool_output = source_read_tool_output(
+        output,
+        "bounded renderer output".to_string(),
+        serde_json::json!({ "kind": "source_evidence" }),
+        None,
+        &turn.turn_timing_state,
+    );
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+
+    let canonical = tool_output
+        .canonical_result(&payload)
+        .expect("canonical source result");
+    assert_eq!(canonical.bytes, b"line 2\r\nline 5\r\nline 6\r\n");
+    let projection = tool_output
+        .projection_metadata()
+        .expect("typed source projection");
+    assert_eq!(
+        projection
+            .predetermined_ranges
+            .iter()
+            .map(|range| (range.start_line, range.end_line))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, 3)]
+    );
 }
 
 #[test]
@@ -645,7 +998,7 @@ async fn search_handler_passes_sandbox_context_to_filesystem_operations() {
 }
 
 #[tokio::test]
-async fn search_handler_reads_through_selected_local_filesystem() {
+async fn receipt_reuse_search_handler_reads_through_selected_local_filesystem() {
     let (session, mut turn) = make_session_and_context().await;
     assert!(
         session.services.state_db.is_none(),
@@ -668,20 +1021,20 @@ async fn search_handler_reads_through_selected_local_filesystem() {
     };
     let session = Arc::new(session);
 
-    let output = SearchSourceHandler::new(false)
-        .handle(ToolInvocation {
+    let (output, first_reads) =
+        test_observation::observe(SearchSourceHandler::new(false).handle(ToolInvocation {
             session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
+            turn: Arc::clone(&turn),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-search-source-success".to_string(),
             tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
             source: ToolCallSource::Direct,
             payload: payload.clone(),
-        })
-        .await
-        .expect("source search should succeed");
+        }))
+        .await;
+    let output = output.expect("source search should succeed");
 
     let ResponseInputItem::FunctionCallOutput { output, .. } =
         output.to_response_item("call-search-source-success", &payload)
@@ -704,10 +1057,36 @@ async fn search_handler_reads_through_selected_local_filesystem() {
     assert_eq!(manifest[0].path, "src/lib.rs");
     assert!(manifest[0].existed);
     assert!(manifest[0].content_hash.is_some());
+
+    let (replayed, replay_reads) =
+        test_observation::observe(SearchSourceHandler::new(false).handle(ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-search-source-replay".to_string(),
+            tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload,
+        }))
+        .await;
+    let replayed = replayed.expect("identical source search should replay");
+    assert_eq!(
+        replayed
+            .sampling_request_signal()
+            .and_then(|signal| signal.get("source_disposition").cloned()),
+        Some(json!("exact_replay")),
+    );
+    assert_eq!(
+        replay_reads.successful_content_reads.saturating_add(1),
+        first_reads.successful_content_reads,
+        "the replay may recompute the exact scope identity but must not rescan matched files",
+    );
 }
 
 #[tokio::test]
-async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_lines() {
+async fn receipt_reuse_bounded_source_reads_emit_only_partial_missing_lines() {
     let (session, mut turn) = make_session_and_context().await;
     let source_dir = tempfile::tempdir().expect("create source temp dir");
     let source_cwd = source_dir.abs();
@@ -732,8 +1111,8 @@ async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_l
         })
         .to_string(),
     };
-    let first = ReadFileSpanHandler::new(false)
-        .handle(ToolInvocation {
+    let (first, first_reads) =
+        test_observation::observe(ReadFileSpanHandler::new(false).handle(ToolInvocation {
             session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
             turn: Arc::clone(&turn),
@@ -743,9 +1122,10 @@ async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_l
             tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
             source: ToolCallSource::Direct,
             payload: first_payload,
-        })
-        .await
-        .expect("first read");
+        }))
+        .await;
+    let first = first.expect("first read");
+    assert_eq!(first_reads.successful_content_reads, 1);
     assert!(first.deterministic_continuation_receipts().is_empty());
 
     let partial_payload = ToolPayload::Function {
@@ -756,8 +1136,8 @@ async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_l
         })
         .to_string(),
     };
-    let partial = ReadFileSpanHandler::new(false)
-        .handle(ToolInvocation {
+    let (partial, partial_reads) =
+        test_observation::observe(ReadFileSpanHandler::new(false).handle(ToolInvocation {
             session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
             turn: Arc::clone(&turn),
@@ -767,9 +1147,13 @@ async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_l
             tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
             source: ToolCallSource::Direct,
             payload: partial_payload.clone(),
-        })
-        .await
-        .expect("partial read");
+        }))
+        .await;
+    let partial = partial.expect("partial read");
+    assert_eq!(
+        partial_reads.successful_content_reads, 0,
+        "partial overlap must be served from the freshness-verified replay artifact",
+    );
     let ResponseInputItem::FunctionCallOutput { output, .. } =
         partial.to_response_item("source-coverage-partial", &partial_payload)
     else {
@@ -803,8 +1187,8 @@ async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_l
         })
         .to_string(),
     };
-    let full = ReadFileSpanHandler::new(false)
-        .handle(ToolInvocation {
+    let (full, full_reads) =
+        test_observation::observe(ReadFileSpanHandler::new(false).handle(ToolInvocation {
             session,
             step_context: StepContext::for_test(Arc::clone(&turn)),
             turn,
@@ -814,9 +1198,13 @@ async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_l
             tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
             source: ToolCallSource::Direct,
             payload: full_payload.clone(),
-        })
-        .await
-        .expect("full overlap read");
+        }))
+        .await;
+    let full = full.expect("full overlap read");
+    assert_eq!(
+        full_reads.successful_content_reads, 0,
+        "full overlap must not reread the source file",
+    );
     let ResponseInputItem::FunctionCallOutput { output, .. } =
         full.to_response_item("source-coverage-full", &full_payload)
     else {
@@ -832,6 +1220,162 @@ async fn bounded_source_reads_reuse_full_overlap_and_emit_only_partial_missing_l
     assert_eq!(
         full_receipts[0].host_action,
         DeterministicContinuationHostAction::ReuseCoveredSpan
+    );
+}
+
+#[tokio::test]
+async fn completion_hook_invalidation_forces_immediate_source_reread_without_watcher_event() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    session.services.git_workspace = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let source_cwd = source_dir.abs();
+    std::fs::create_dir(source_cwd.join(".git").as_path()).expect("create git marker");
+    std::fs::create_dir(source_cwd.join("src").as_path()).expect("create src");
+    let source_path = source_cwd.join("src/lib.rs");
+    std::fs::write(source_path.as_path(), "old\n").expect("write initial source");
+    replace_primary_environment_cwd(&mut turn, source_cwd.clone());
+    turn.permission_profile = PermissionProfile::Disabled;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "line_count": 1
+        })
+        .to_string(),
+    };
+
+    let (first, first_reads) =
+        test_observation::observe(ReadFileSpanHandler::new(false).handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::clone(&tracker),
+            call_id: "completion-hook-source-before".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        }))
+        .await;
+    first.expect("initial source read");
+    assert_eq!(first_reads.successful_content_reads, 1);
+
+    let modified = std::fs::metadata(source_path.as_path())
+        .and_then(|metadata| metadata.modified())
+        .expect("initial source modified time");
+    std::fs::write(source_path.as_path(), "new\n").expect("hook source mutation");
+    std::fs::File::options()
+        .write(true)
+        .open(source_path.as_path())
+        .and_then(|file| file.set_times(FileTimes::new().set_modified(modified)))
+        .expect("restore source modified time");
+    let result = WorkspaceMutationResult {
+        lease_id: "completion-hook-source-mutation".to_string(),
+        start_epoch: 0,
+        end_epoch: 1,
+        changed_paths: vec!["src/lib.rs".to_string()],
+        drift_paths: Vec::new(),
+    };
+    assert!(record_finalized_workspace_mutation(
+        session.services.git_workspace.as_ref(),
+        source_cwd.as_path(),
+        &result,
+    ));
+
+    let (second, second_reads) =
+        test_observation::observe(ReadFileSpanHandler::new(false).handle(ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker,
+            call_id: "completion-hook-source-after".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        }))
+        .await;
+    let second = second.expect("source read after completion hook mutation");
+    assert_eq!(
+        second_reads.successful_content_reads, 1,
+        "the pre-hook replay artifact must be rejected synchronously"
+    );
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        second.to_response_item("completion-hook-source-after", &payload)
+    else {
+        panic!("expected source function output");
+    };
+    let rendered = output.body.to_text().expect("source output text");
+    assert!(rendered.contains("     1 | new"), "{rendered}");
+}
+
+#[tokio::test]
+async fn concurrent_identical_reads_replay_after_reservation_wait() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let source_cwd = source_dir.abs();
+    std::fs::create_dir(source_cwd.join("src").as_path()).expect("create src");
+    let contents = std::iter::repeat_n("line of source evidence\n", 60_000).collect::<String>();
+    std::fs::write(source_cwd.join("src/lib.rs").as_path(), contents).expect("write source");
+    replace_primary_environment_cwd(&mut turn, source_cwd);
+    turn.permission_profile = PermissionProfile::Disabled;
+    let turn = Arc::new(turn);
+    let session = Arc::new(session);
+    let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "line_count": 5
+        })
+        .to_string(),
+    };
+    let first_handler = ReadFileSpanHandler::new(false);
+    let second_handler = ReadFileSpanHandler::new(false);
+    let first_invocation = ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn: Arc::clone(&turn),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::clone(&tracker),
+        call_id: "source-concurrent-first".to_string(),
+        tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+        source: ToolCallSource::Direct,
+        payload: payload.clone(),
+    };
+    let second_invocation = ToolInvocation {
+        session,
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker,
+        call_id: "source-concurrent-second".to_string(),
+        tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+        source: ToolCallSource::Direct,
+        payload,
+    };
+
+    let ((first, second), observation) = test_observation::observe(async {
+        tokio::join!(
+            first_handler.handle(first_invocation),
+            second_handler.handle(second_invocation)
+        )
+    })
+    .await;
+
+    first.expect("first concurrent read");
+    second.expect("second concurrent read");
+    assert_eq!(observation.runtime_entries, 2);
+    assert!(
+        observation.read_reservation_waits >= 1,
+        "the regression must exercise the post-reservation replay path"
+    );
+    assert_eq!(
+        observation.successful_content_reads, 1,
+        "the waiter should replay the authoritative coverage produced by the owner"
     );
 }
 
@@ -1782,16 +2326,51 @@ fn instruction_freshness_joins_validated_core_and_locator_snapshot_identities() 
 
 #[test]
 fn bundle_receipt_identity_uses_only_stable_contract_inputs() {
-    let first = stable_bundle_receipt_id("epoch-7", Some("owner"), "snapshot", "closure-v2");
-    let second = stable_bundle_receipt_id("epoch-7", Some("owner"), "snapshot", "closure-v2");
+    let instruction_snapshot = InstructionSnapshotIdentity::loaded([7; 32]);
+    let first = stable_bundle_receipt_id(
+        "epoch-7",
+        Some("owner"),
+        "snapshot",
+        &instruction_snapshot,
+        "closure-v2",
+    );
+    let second = stable_bundle_receipt_id(
+        "epoch-7",
+        Some("owner"),
+        "snapshot",
+        &instruction_snapshot,
+        "closure-v2",
+    );
     assert_eq!(first, second);
     assert_ne!(
         first,
-        stable_bundle_receipt_id("epoch-8", Some("owner"), "snapshot", "closure-v2")
+        stable_bundle_receipt_id(
+            "epoch-8",
+            Some("owner"),
+            "snapshot",
+            &instruction_snapshot,
+            "closure-v2",
+        )
     );
     assert_ne!(
         first,
-        stable_bundle_receipt_id("epoch-7", Some("owner"), "snapshot-2", "closure-v2")
+        stable_bundle_receipt_id(
+            "epoch-7",
+            Some("owner"),
+            "snapshot-2",
+            &instruction_snapshot,
+            "closure-v2",
+        )
+    );
+    assert_ne!(
+        first,
+        stable_bundle_receipt_id(
+            "epoch-7",
+            Some("owner"),
+            "snapshot",
+            &InstructionSnapshotIdentity::loaded([8; 32]),
+            "closure-v2",
+        )
     );
 }
 
@@ -1853,7 +2432,12 @@ fn canonical_bundle_artifact_contains_every_materialized_section_and_no_false_ra
                     kind: LocateTaskSourceSectionKind::Test,
                     state: LocateTaskSourceSectionState::NotMaterialized,
                     path: "tests/main.rs".to_string(),
-                    span: None,
+                    span: Some(codex_file_search::task_locator::ExactSpan {
+                        start_line: 10,
+                        end_line: 20,
+                        start_byte: 90,
+                        end_byte: 200,
+                    }),
                     content_hash: None,
                     file_content_hash: Some(missing_file_hash),
                     source_snapshot_identity: snapshot.to_string(),
@@ -1872,7 +2456,14 @@ fn canonical_bundle_artifact_contains_every_materialized_section_and_no_false_ra
         rendered_bytes: 0,
     };
 
-    let bundle = assemble_owner_evidence_bundle_v2(output, "epoch", None, None, &BTreeMap::new());
+    let bundle = assemble_owner_evidence_bundle_v2(
+        output,
+        "epoch",
+        None,
+        None,
+        InstructionSnapshotIdentity::Empty,
+        &BTreeMap::new(),
+    );
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
     };
@@ -1901,10 +2492,62 @@ fn canonical_bundle_artifact_contains_every_materialized_section_and_no_false_ra
     assert_eq!(primary_record["exact_text"], primary_text);
     assert_eq!(primary_record["content_hash"], primary_hash);
 
+    let code_mode = bundle.code_mode_result(&payload);
+    assert_eq!(code_mode["bundle"], metadata);
+    let materialized_sections = code_mode["materialized_sections"]
+        .as_array()
+        .expect("native materialized sections");
+    let native_primary = materialized_sections
+        .iter()
+        .find(|section| section["section_id"] == "primary-section")
+        .expect("native primary section");
+    assert_eq!(native_primary["exact_text"], primary_text);
+    assert_eq!(native_primary["content_hash"], primary_hash);
+
+    let canonical = bundle
+        .canonical_result(&payload)
+        .expect("owner evidence canonical text");
+    assert_eq!(canonical.kind, codex_tools::CanonicalToolResultKind::Text);
+    assert_eq!(canonical.bytes, artifact.as_bytes());
+    let projection = bundle
+        .projection_metadata()
+        .expect("owner evidence projection");
+    assert_eq!(projection.predetermined_ranges.len(), 1);
+    assert_eq!(projection.predetermined_ranges[0].id, "primary-section");
+    assert_eq!(
+        (
+            projection.predetermined_ranges[0].start_line,
+            projection.predetermined_ranges[0].end_line,
+        ),
+        (primary_line, primary_line)
+    );
+    let primary_fragment = projection
+        .fragments
+        .iter()
+        .find(|fragment| fragment.id.as_deref() == Some("primary-section"))
+        .expect("primary exact fragment");
+    assert_eq!(primary_fragment.text, lines[primary_line - 1]);
+
     let missing = manifest
         .iter()
         .find(|entry| entry["section_id"] == "missing-test-section")
         .expect("missing manifest entry");
     assert_eq!(missing["state"], "not_materialized");
     assert!(missing["artifact_line_range"].is_null());
+    let signal = bundle
+        .sampling_request_signal()
+        .expect("owner bundle signal");
+    assert_eq!(
+        signal["required_source_sections"],
+        serde_json::json!([{
+            "path": "tests/main.rs",
+            "obligation_kind": "test",
+            "span": {
+                "start_line": 10,
+                "end_line": 20,
+                "start_byte": 90,
+                "end_byte": 200,
+            },
+        }])
+    );
 }

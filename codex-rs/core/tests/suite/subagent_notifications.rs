@@ -56,11 +56,12 @@ const TURN_0_FORK_PROMPT: &str = "seed fork context";
 const TURN_1_PROMPT: &str = "spawn a child and continue";
 const TURN_2_NO_WAIT_PROMPT: &str = "follow up without wait";
 const CHILD_PROMPT: &str = "child: do work";
-const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-sol";
-const DEFAULT_SUBAGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
+const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-luna";
+const DEFAULT_SUBAGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Max;
 const INHERITED_MODEL: &str = "gpt-5.2";
 const INHERITED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 const REQUESTED_MODEL: &str = "gpt-5.4";
+const REQUESTED_MODEL_WITH_DEFAULT_REASONING: &str = "gpt-5.6-sol";
 const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
@@ -1058,13 +1059,13 @@ async fn spawn_agent_model_override_keeps_built_in_reasoning_default() -> Result
         &server,
         json!({
             "message": CHILD_PROMPT,
-            "model": REQUESTED_MODEL,
+            "model": REQUESTED_MODEL_WITH_DEFAULT_REASONING,
         }),
         |builder| builder,
     )
     .await?;
 
-    assert_eq!(child_snapshot.model, REQUESTED_MODEL);
+    assert_eq!(child_snapshot.model, REQUESTED_MODEL_WITH_DEFAULT_REASONING);
     assert_eq!(
         child_snapshot.reasoning_effort,
         Some(DEFAULT_SUBAGENT_REASONING_EFFORT)

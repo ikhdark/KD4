@@ -8,6 +8,7 @@ use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
+use crate::desktop_activation::DesktopActivationBootstrap;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
@@ -143,6 +144,7 @@ pub(crate) struct InitializedConnectionSessionState {
     pub(crate) client_version: String,
     pub(crate) request_attestation: bool,
     pub(crate) supports_openai_form_elicitation: bool,
+    pub(crate) desktop_activation_receipts: bool,
 }
 
 impl Default for ConnectionSessionState {
@@ -199,6 +201,12 @@ impl ConnectionSessionState {
             .get()
             .is_some_and(|session| session.supports_openai_form_elicitation)
     }
+    pub(crate) fn desktop_activation_receipts(&self) -> bool {
+        self.initialized
+            .get()
+            .is_some_and(|session| session.desktop_activation_receipts)
+    }
+
     pub(crate) fn initialize(&self, session: InitializedConnectionSessionState) -> Result<(), ()> {
         self.initialized.set(session).map_err(|_| ())
     }
@@ -221,6 +229,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
     pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
+    pub(crate) desktop_activation_bootstrap: Arc<DesktopActivationBootstrap>,
 }
 
 impl MessageProcessor {
@@ -244,6 +253,7 @@ impl MessageProcessor {
             rpc_transport,
             remote_control_handle,
             plugin_startup_tasks,
+            desktop_activation_bootstrap,
         } = args;
         let bug_worker_shutdown = CancellationToken::new();
         let thread_state_manager = ThreadStateManager::new();
@@ -430,6 +440,7 @@ impl MessageProcessor {
             log_db,
             Arc::clone(&skills_watcher),
             config_warnings,
+            desktop_activation_bootstrap,
         );
         let turn_processor = TurnRequestProcessor::new(
             auth_manager.clone(),
@@ -841,6 +852,17 @@ impl MessageProcessor {
         {
             return Err(invalid_request(experimental_required_message(reason)));
         }
+        if matches!(
+            &codex_request,
+            ClientRequest::ThreadDesktopActivationObligation { .. }
+                | ClientRequest::ThreadDesktopActivationChallenge { .. }
+                | ClientRequest::ThreadDesktopActivationRecord { .. }
+        ) && !session.desktop_activation_receipts()
+        {
+            return Err(invalid_request(
+                "Desktop activation receipts capability was not enabled during initialize",
+            ));
+        }
         let connection_id = connection_request_id.connection_id;
         self.initialize_processor.track_initialized_request(
             connection_id,
@@ -1075,6 +1097,21 @@ impl MessageProcessor {
                     )
                     .await
             }
+            ClientRequest::ThreadDesktopActivationObligation { params, .. } => {
+                self.thread_processor
+                    .desktop_activation_obligation(params)
+                    .await
+            }
+            ClientRequest::ThreadDesktopActivationChallenge { params, .. } => {
+                self.thread_processor
+                    .desktop_activation_challenge(connection_id, params)
+                    .await
+            }
+            ClientRequest::ThreadDesktopActivationRecord { params, .. } => {
+                self.thread_processor
+                    .desktop_activation_record(connection_id, params)
+                    .await
+            }
             ClientRequest::ThreadFork { params, .. } => {
                 self.thread_processor
                     .thread_fork(
@@ -1099,12 +1136,12 @@ impl MessageProcessor {
             }
             ClientRequest::ThreadIncrementElicitation { params, .. } => {
                 self.thread_processor
-                    .thread_increment_elicitation(params)
+                    .thread_increment_elicitation(&request_id, params)
                     .await
             }
             ClientRequest::ThreadDecrementElicitation { params, .. } => {
                 self.thread_processor
-                    .thread_decrement_elicitation(params)
+                    .thread_decrement_elicitation(&request_id, params)
                     .await
             }
             ClientRequest::ThreadSetName { params, .. } => {

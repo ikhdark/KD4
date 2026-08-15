@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::apply_skill_injection_observability;
+use crate::client::AttemptPreparedCallback;
 use crate::client::ModelClientSession;
+use crate::client::StartupPrewarmClaim;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::collect_explicit_skill_mentions;
@@ -21,6 +23,7 @@ use crate::context::ApprovalPromptContext;
 use crate::context::ContextualUserFragment;
 use crate::context::PermissionsInstructions;
 use crate::context::PromptContextCategory;
+use crate::context_manager::ContextManager;
 use crate::context_manager::PreparedPromptInput;
 use crate::feedback_tags;
 use crate::hook_runtime::inspect_pending_input;
@@ -47,7 +50,6 @@ use crate::mentions::collect_tool_mentions_from_messages;
 use crate::pending_turn_plan::CompletedEffect;
 use crate::pending_turn_plan::EffectImpact;
 use crate::pending_turn_plan::FixedPointPlanningState;
-use crate::pending_turn_plan::PlanningSnapshotIdentity;
 use crate::plan_skill_injections;
 use crate::plugins::PluginCapabilitySummary;
 use crate::plugins::build_plugin_injections;
@@ -58,9 +60,13 @@ use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
+use crate::session::reasoning_governor::AuthoritativeWaitResolution;
 use crate::session::reasoning_governor::ContinuationDisposition;
 use crate::session::reasoning_governor::GenerationRequestDisposition;
+use crate::session::reasoning_governor::InstructionSnapshotIdentity;
 use crate::session::reasoning_governor::PreEditConvergenceSeed;
+use crate::session::reasoning_governor::SamplingConvergenceDecision;
+use crate::session::reasoning_governor::SamplingGenerationDisposition;
 use crate::session::reasoning_governor::SamplingReasoningGovernor;
 use crate::session::reasoning_governor::SamplingReasoningPhase;
 use crate::session::reasoning_governor::SamplingRequestSettledState;
@@ -71,6 +77,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextTarget;
+use crate::state::SamplingAdmission;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
@@ -80,6 +87,7 @@ use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
+use crate::tasks::TurnTaskResult;
 use crate::tasks::completion_review::CompletionReviewTurnEvidence;
 use crate::tasks::emit_compact_metric;
 use crate::tool_history::ModelGenerationId;
@@ -144,9 +152,12 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::PlanDeltaEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SafetyBufferingEvent;
+use codex_protocol::protocol::SamplingBoundaryItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::WarningEvent;
@@ -177,7 +188,6 @@ use tracing::trace_span;
 use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
-const KD4_MIN_POST_COMPACTION_HEADROOM: i64 = 8_000;
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -209,6 +219,24 @@ fn ordinary_continuation_cause(
     }
 }
 
+fn prepare_sampling_prompt_for_client(
+    history: ContextManager,
+    turn_context: &TurnContext,
+    _client_session: &ModelClientSession,
+) -> PreparedPromptInput {
+    if turn_context.config.completed_tool_history_projection {
+        history.prepare_for_sampling_prompt_with_completed_tool_projection(
+            &turn_context.model_info.input_modalities,
+            StableContextTarget::Sampling,
+        )
+    } else {
+        history.prepare_for_sampling_prompt(
+            &turn_context.model_info.input_modalities,
+            StableContextTarget::Sampling,
+        )
+    }
+}
+
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -216,18 +244,7 @@ pub(crate) async fn run_turn(
     input: Vec<TurnInput>,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
-) -> CodexResult<Option<String>> {
-    let completion_review_turn_baseline = if turn_context
-        .config
-        .features
-        .enabled(Feature::TaskCompletionReviewer)
-        && sess.services.task_evidence.allows_kd4_completion()
-    {
-        Box::pin(crate::tasks::completion_review::capture_completion_review_turn_baseline(&sess))
-            .await
-    } else {
-        None
-    };
+) -> CodexResult<TurnTaskResult> {
     let mut completion_review_state =
         crate::tasks::completion_review::CompletionReviewState::default();
     let mut mutating_finalizer_ran = false;
@@ -238,20 +255,46 @@ pub(crate) async fn run_turn(
     );
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    if sess.reference_context_item().await.is_none() {
+        client_session
+            .invalidate_provider_history_inheritance("realized context baseline is unknown");
+    }
     let planning_timing_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::Planning);
-    let pending_turn_plan_result = stabilize_pending_turn_plan(
-        &sess,
-        &turn_context,
-        &input,
-        &mut client_session,
-        &cancellation_token,
-    )
-    .await;
+    let mut fixed_point = FixedPointPlanningState::default();
+    let pending_turn_plan_result = loop {
+        let pending_turn_plan = match stabilize_pending_turn_plan(
+            &sess,
+            &turn_context,
+            &input,
+            &mut client_session,
+            &mut fixed_point,
+            &cancellation_token,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(err) => break Err(err),
+        };
+        let (world_state, display_roots) = tokio::join!(
+            sess.compare_and_record_context_updates(
+                pending_turn_plan.step_context.as_ref(),
+                pending_turn_plan.planning_generation,
+            ),
+            turn_diff_display_roots(sess.as_ref(), turn_context.as_ref()),
+        );
+        let Some(world_state) = world_state else {
+            turn_context
+                .turn_timing_state
+                .record_planning_invalidation();
+            continue;
+        };
+        break Ok((pending_turn_plan, world_state, display_roots));
+    };
     drop(planning_timing_guard);
-    let pending_turn_plan = match pending_turn_plan_result {
-        Ok(plan) => plan,
+    let (pending_turn_plan, mut world_state, display_roots) = match pending_turn_plan_result {
+        Ok(committed) => committed,
         Err(err) => {
             if matches!(err, CodexErr::TurnAborted) {
                 run_hooks_and_record_inputs(&sess, &turn_context, &input).await;
@@ -261,7 +304,7 @@ pub(crate) async fn run_turn(
             sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                 .await;
             error!("Pending-turn planning failed before persistence or model send: {err}");
-            return Ok(None);
+            return Ok(TurnTaskResult::default());
         }
     };
     let PendingTurnPlan {
@@ -274,19 +317,15 @@ pub(crate) async fn run_turn(
     } = pending_turn_plan;
     let selected_skill_invocations = skill_plan.invocations;
 
-    // Pending-turn planning is now stable and all required effects have completed.
-    // Only now may normal turn persistence begin.
-    let (mut world_state, display_roots) = tokio::join!(
-        sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
-        turn_diff_display_roots(sess.as_ref(), turn_context.as_ref()),
-    );
+    // Pending-turn planning is stable and compare-and-commit has atomically
+    // begun persistence under the session-state owner.
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
-        return Ok(None);
+        return Ok(TurnTaskResult::default());
     }
     let mut can_drain_pending_input = input.is_empty();
     if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
-        return Ok(None);
+        return Ok(TurnTaskResult::default());
     }
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
@@ -312,6 +351,7 @@ pub(crate) async fn run_turn(
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
+    let mut surfaced_result: Option<SurfacedToolResult> = None;
     let mut stop_hook_active = false;
     let mut pending_continuation_cause = None;
     let mut pending_generation_request: Option<GenerationRequestDisposition> = None;
@@ -357,10 +397,18 @@ pub(crate) async fn run_turn(
         let recorded_input =
             run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await;
         if recorded_input.accepted_user_input {
+            let instruction_snapshot_identity = instruction_snapshot_identity(
+                sess.services
+                    .agents_md_manager
+                    .get_loaded()
+                    .await
+                    .as_deref(),
+            );
             let seed = build_pre_edit_convergence_seed_without_step(
                 &pending_input,
                 turn_context.as_ref(),
                 &pre_edit_display_roots,
+                instruction_snapshot_identity,
             );
             reasoning_governor.accepted_user_input_with_seed(seed);
         }
@@ -401,7 +449,6 @@ pub(crate) async fn run_turn(
                 reasoning_governor.initial_generation_request(&request_baselines)
             } else {
                 GenerationRequestDisposition {
-                    disposition: ContinuationDisposition::ModelRequired,
                     purpose: match pending_continuation_cause {
                         Some(ContinuationCause::Compaction) => {
                             Some(TurnTimingGenerationPurpose::CompactionRecovery)
@@ -416,16 +463,11 @@ pub(crate) async fn run_turn(
                         }
                         _ => None,
                     },
-                    decision_bearing: true,
+                    sampling: SamplingGenerationDisposition::DecisionBearing,
                     relevant_state_fingerprint: request_baselines.relevant_state_fingerprint(),
                 }
             }
         });
-        debug_assert_eq!(
-            generation_request.disposition,
-            ContinuationDisposition::ModelRequired,
-            "only ModelRequired dispositions may enter sampling"
-        );
         has_started_generation = true;
         let generation_id = ModelGenerationId {
             turn_id: turn_context.sub_id.clone(),
@@ -460,21 +502,11 @@ pub(crate) async fn run_turn(
                 let normalization_guard = turn_context
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::Normalization);
-                let prepared = if turn_context.config.completed_tool_history_projection
-                    && client_session
-                        .provider_history_baseline_generation()
-                        .is_none()
-                {
-                    history.prepare_for_sampling_prompt_with_completed_tool_projection(
-                        &turn_context.model_info.input_modalities,
-                        StableContextTarget::Sampling,
-                    )
-                } else {
-                    history.prepare_for_sampling_prompt(
-                        &turn_context.model_info.input_modalities,
-                        StableContextTarget::Sampling,
-                    )
-                };
+                let prepared = prepare_sampling_prompt_for_client(
+                    history,
+                    turn_context.as_ref(),
+                    &client_session,
+                );
                 drop(normalization_guard);
                 prepared
             }
@@ -531,9 +563,24 @@ pub(crate) async fn run_turn(
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
-                let needs_follow_up = model_needs_follow_up || has_pending_input;
+                let mut needs_follow_up = model_needs_follow_up || has_pending_input;
                 let progress_kinds =
                     request_signals.progress_kinds(&request_baselines, &settled_state);
+                let convergence_decision = if needs_follow_up && !has_pending_input {
+                    Some(reasoning_governor.evaluate_convergence(
+                        &request_baselines,
+                        &request_signals,
+                        &settled_state,
+                    ))
+                } else {
+                    None
+                };
+                let authoritative_wait_terminal_surface = convergence_decision
+                    .as_ref()
+                    .and_then(authoritative_wait_terminal_surface);
+                if authoritative_wait_terminal_surface.is_some() {
+                    needs_follow_up = false;
+                }
                 let next_generation_request = needs_follow_up.then(|| {
                     reasoning_governor.continuation_generation_request(
                         &request_baselines,
@@ -554,15 +601,6 @@ pub(crate) async fn run_turn(
                 if request_signals.is_wait_only() {
                     turn_context.turn_timing_state.record_wait_only_generation();
                 }
-                let convergence_decision = if needs_follow_up && !has_pending_input {
-                    Some(reasoning_governor.evaluate_convergence(
-                        &request_baselines,
-                        &request_signals,
-                        &settled_state,
-                    ))
-                } else {
-                    None
-                };
                 let token_limit_reached = token_status.token_limit_reached;
 
                 trace!(
@@ -597,17 +635,8 @@ pub(crate) async fn run_turn(
                     );
                 }
 
-                super::token_budget::maybe_record(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    token_status.tokens_until_compaction,
-                )
-                .await;
-
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if needs_follow_up
-                    && (sess.take_new_context_window_request().await || token_limit_reached)
-                {
+                if needs_follow_up && token_limit_reached {
                     if let Err(err) = run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
@@ -625,7 +654,7 @@ pub(crate) async fn run_turn(
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
-                        return Ok(None);
+                        return Ok(TurnTaskResult::default());
                     }
                     turn_diff_tracker
                         .lock()
@@ -639,7 +668,12 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
-                    last_agent_message = sampling_request_last_agent_message;
+                    if let Some(authoritative_result) = authoritative_wait_terminal_surface {
+                        last_agent_message = authoritative_result.canonical_message.clone();
+                        surfaced_result = Some(authoritative_result);
+                    } else {
+                        last_agent_message = sampling_request_last_agent_message;
+                    }
                     let observed_stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &turn_context,
@@ -746,7 +780,6 @@ pub(crate) async fn run_turn(
                             &sess,
                             &turn_context,
                             &cancellation_token,
-                            completion_review_turn_baseline.as_ref(),
                             &completion_review_turn_evidence,
                             last_agent_message.as_deref(),
                             &mut completion_review_state,
@@ -758,7 +791,7 @@ pub(crate) async fn run_turn(
                             .await;
                     if repair_injected {
                         if mutating_finalizer_aborted {
-                            return Ok(None);
+                            return Ok(TurnTaskResult::default());
                         }
                         reasoning_governor.host_diagnose();
                         pending_generation_request = None;
@@ -771,7 +804,7 @@ pub(crate) async fn run_turn(
                         AfterAgentPolicy::MutatingFinalizer
                     ) {
                         if mutating_finalizer_aborted {
-                            return Ok(None);
+                            return Ok(TurnTaskResult::default());
                         }
                         break;
                     }
@@ -819,7 +852,7 @@ pub(crate) async fn run_turn(
                             .await;
                         } else if has_review_lineage {
                             if after_agent_outcome.aborted {
-                                return Ok(None);
+                                return Ok(TurnTaskResult::default());
                             }
 
                             let observed_stop_outcome = run_turn_stop_hooks(
@@ -879,7 +912,6 @@ pub(crate) async fn run_turn(
                                     &sess,
                                     &turn_context,
                                     &cancellation_token,
-                                    completion_review_turn_baseline.as_ref(),
                                     &completion_review_turn_evidence,
                                     last_agent_message.as_deref(),
                                     &mut completion_review_state,
@@ -902,7 +934,7 @@ pub(crate) async fn run_turn(
                         }
                     }
                     if after_agent_outcome.aborted {
-                        return Ok(None);
+                        return Ok(TurnTaskResult::default());
                     }
                     break;
                 }
@@ -998,7 +1030,26 @@ pub(crate) async fn run_turn(
         }
     }
 
-    Ok(last_agent_message)
+    Ok(TurnTaskResult {
+        last_agent_message,
+        surfaced_result,
+    })
+}
+
+fn authoritative_wait_terminal_surface(
+    decision: &SamplingConvergenceDecision,
+) -> Option<SurfacedToolResult> {
+    if decision.continuation != ContinuationDisposition::SurfaceExistingResult {
+        return None;
+    }
+    match &decision.authoritative_wait {
+        Some(AuthoritativeWaitResolution::Terminal(result)) => Some(SurfacedToolResult {
+            adapter: result.adapter.clone(),
+            value: result.value.clone(),
+            canonical_message: result.surfaceable_message.clone(),
+        }),
+        Some(AuthoritativeWaitResolution::Blocked(_)) | None => None,
+    }
 }
 
 async fn record_completion_review_partial_reason(sess: &Session, reason: String) {
@@ -1063,21 +1114,19 @@ fn build_pre_edit_convergence_seed(
     step_context: &StepContext,
     display_roots: &[(String, PathBuf)],
 ) -> PreEditConvergenceSeed {
-    let mut seed = build_pre_edit_convergence_seed_without_step(input, turn_context, display_roots);
-    seed.instructions_digest = Some(
-        step_context
-            .loaded_agents_md
-            .as_ref()
-            .map(|instructions| format!("{:?}", instructions.semantic_digest()))
-            .unwrap_or_else(|| "none".to_string()),
-    );
-    seed
+    build_pre_edit_convergence_seed_without_step(
+        input,
+        turn_context,
+        display_roots,
+        instruction_snapshot_identity(step_context.loaded_agents_md.as_deref()),
+    )
 }
 
 fn build_pre_edit_convergence_seed_without_step(
     input: &[TurnInput],
     turn_context: &TurnContext,
     display_roots: &[(String, PathBuf)],
+    instruction_snapshot_identity: InstructionSnapshotIdentity,
 ) -> PreEditConvergenceSeed {
     let mut text = String::new();
     let mut owner_candidates = Vec::new();
@@ -1121,11 +1170,17 @@ fn build_pre_edit_convergence_seed_without_step(
     PreEditConvergenceSeed {
         active: mutation_oriented && normal_mode && !read_only_session,
         owner_candidates,
-        // A missing instruction document is still an authoritative loaded-empty
-        // snapshot; pending steering does not need to reread it.
-        instructions_digest: Some("captured".to_string()),
+        instruction_snapshot_identity,
         task_mandated_proof,
     }
+}
+
+fn instruction_snapshot_identity(
+    loaded: Option<&crate::agents_md::LoadedAgentsMd>,
+) -> InstructionSnapshotIdentity {
+    loaded.map_or(InstructionSnapshotIdentity::Empty, |instructions| {
+        InstructionSnapshotIdentity::loaded(instructions.semantic_digest())
+    })
 }
 
 fn mutation_intent_is_explicit(text: &str) -> bool {
@@ -1237,7 +1292,7 @@ async fn run_hooks_and_record_inputs_detailed(
 }
 
 struct PendingTurnPlan {
-    identity: PlanningSnapshotIdentity,
+    planning_generation: u64,
     step_context: Arc<StepContext>,
     first_router: Arc<ToolRouter>,
     injection_items: Vec<ResponseItem>,
@@ -1261,10 +1316,10 @@ async fn build_pure_pending_turn_plan(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
     input: &[TurnInput],
+    planning_generation: u64,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<PendingTurnPlanBuild> {
     let turn_context = step_context.turn.as_ref();
-    let generation = sess.services.planning_generation();
     let user_input = input
         .iter()
         .filter_map(|item| match item {
@@ -1282,21 +1337,7 @@ async fn build_pure_pending_turn_plan(
     );
 
     if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        let (prepared_history, first_router, context_update_items) = tokio::join!(
-            async {
-                let history_snapshot_guard = turn_context
-                    .turn_timing_state
-                    .begin_local_phase(TurnLocalPhase::HistorySnapshot);
-                let history = sess.clone_history().await;
-                drop(history_snapshot_guard);
-                let normalization_guard = turn_context
-                    .turn_timing_state
-                    .begin_local_phase(TurnLocalPhase::Normalization);
-                let prepared =
-                    history.prepare_for_prompt(&turn_context.model_info.input_modalities);
-                drop(normalization_guard);
-                prepared
-            },
+        let (first_router, context_update_items) = tokio::join!(
             built_tools(
                 sess.as_ref(),
                 step_context.as_ref(),
@@ -1306,31 +1347,14 @@ async fn build_pure_pending_turn_plan(
             sess.estimate_context_update_items(step_context.as_ref()),
         );
         let first_router = first_router?;
-        let identity = PlanningSnapshotIdentity {
-            generation,
-            state_digest: {
-                let _planning_identity_guard = turn_context
-                    .turn_timing_state
-                    .begin_local_phase(TurnLocalPhase::PlanningIdentity);
-                planning_state_digest(PlanningStateDigestInput {
-                    step_context: step_context.as_ref(),
-                    mcp_tools: &[],
-                    connectors: &[],
-                    plugins: &[],
-                    injection_items: &[],
-                    context_update_items: &context_update_items,
-                    user_input: &user_input,
-                    router: first_router.as_ref(),
-                    history_items: prepared_history.items(),
-                    history_fingerprint: prepared_history.fingerprint(),
-                })
-            },
-        };
+        if sess.services.planning_generation() != planning_generation {
+            return Ok(PendingTurnPlanBuild::Stale);
+        }
         let pending_token_estimate =
             estimate_pending_tokens(input, &[], &context_update_items, first_router.as_ref());
         let warnings = first_router.planning_warnings().to_vec();
         return Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
-            identity,
+            planning_generation,
             step_context,
             first_router,
             injection_items: Vec::new(),
@@ -1471,22 +1495,9 @@ async fn build_pure_pending_turn_plan(
     injection_items.extend(plugin_items);
     injection_items.extend(extension_injection_items);
 
-    // Final read-only DAG leaves: capture the model-visible history and build the
-    // router concurrently, then validate the generation before accepting either.
-    let (prepared_history, first_router, context_update_items) = tokio::join!(
-        async {
-            let history_snapshot_guard = turn_context
-                .turn_timing_state
-                .begin_local_phase(TurnLocalPhase::HistorySnapshot);
-            let history = sess.clone_history().await;
-            drop(history_snapshot_guard);
-            let normalization_guard = turn_context
-                .turn_timing_state
-                .begin_local_phase(TurnLocalPhase::Normalization);
-            let prepared = history.prepare_for_prompt(&turn_context.model_info.input_modalities);
-            drop(normalization_guard);
-            prepared
-        },
+    // Final read-only DAG leaves build the router and context estimate concurrently,
+    // then validate the generation before accepting either.
+    let (first_router, context_update_items) = tokio::join!(
         built_tools(
             sess.as_ref(),
             step_context.as_ref(),
@@ -1496,32 +1507,12 @@ async fn build_pure_pending_turn_plan(
         sess.estimate_context_update_items(step_context.as_ref()),
     );
     let first_router = first_router?;
-    if sess.services.planning_generation() != generation {
+    if sess.services.planning_generation() != planning_generation {
         return Ok(PendingTurnPlanBuild::Stale);
     }
     let mut warnings = planned_mcp.warnings;
     warnings.extend(first_router.planning_warnings().iter().cloned());
     warnings.extend(skill_plan.injections.warnings.iter().cloned());
-    let identity = PlanningSnapshotIdentity {
-        generation,
-        state_digest: {
-            let _planning_identity_guard = turn_context
-                .turn_timing_state
-                .begin_local_phase(TurnLocalPhase::PlanningIdentity);
-            planning_state_digest(PlanningStateDigestInput {
-                step_context: step_context.as_ref(),
-                mcp_tools,
-                connectors: &available_connectors,
-                plugins: &mentioned_plugins,
-                injection_items: &injection_items,
-                context_update_items: &context_update_items,
-                user_input: &user_input,
-                router: first_router.as_ref(),
-                history_items: prepared_history.items(),
-                history_fingerprint: prepared_history.fingerprint(),
-            })
-        },
-    };
     let pending_token_estimate = estimate_pending_tokens(
         input,
         &injection_items,
@@ -1529,7 +1520,7 @@ async fn build_pure_pending_turn_plan(
         first_router.as_ref(),
     );
     Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
-        identity,
+        planning_generation,
         step_context,
         first_router,
         pending_token_estimate,
@@ -1549,6 +1540,7 @@ async fn stabilize_pending_turn_plan(
     turn_context: &Arc<TurnContext>,
     input: &[TurnInput],
     client_session: &mut ModelClientSession,
+    fixed_point: &mut FixedPointPlanningState,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<PendingTurnPlan> {
     if cancellation_token.is_cancelled() {
@@ -1567,7 +1559,6 @@ async fn stabilize_pending_turn_plan(
             .await;
     }
 
-    let mut fixed_point = FixedPointPlanningState::default();
     let mut check_previous_model_compaction = true;
     let mut incoming_precompaction_completed = false;
     loop {
@@ -1597,7 +1588,6 @@ async fn stabilize_pending_turn_plan(
                 incoming_precompaction_completed = true;
             }
             client_session.invalidate_incremental_history("compaction");
-            sess.services.bump_planning_generation();
             turn_context
                 .turn_timing_state
                 .record_planning_invalidation();
@@ -1616,19 +1606,26 @@ async fn stabilize_pending_turn_plan(
             }
         }
 
+        let planning_generation = sess.services.planning_generation();
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
-        let plan = match build_pure_pending_turn_plan(sess, step_context, input, cancellation_token)
-            .await?
+        let plan = match build_pure_pending_turn_plan(
+            sess,
+            step_context,
+            input,
+            planning_generation,
+            cancellation_token,
+        )
+        .await?
         {
             PendingTurnPlanBuild::Stale => continue,
             PendingTurnPlanBuild::Ready(plan) => *plan,
         };
-        let repeated_digest = fixed_point
-            .begin_iteration(&plan.identity)
+        fixed_point
+            .begin_iteration()
             .map_err(|message| planning_failure_with_timing(turn_context, message))?;
         turn_context
             .turn_timing_state
-            .record_planning_fixed_point_iteration(repeated_digest);
+            .record_planning_fixed_point_iteration();
 
         // Compaction is maintenance of the pre-existing history, not persistence
         // of this pending turn. Any compaction invalidates this pure plan and loops
@@ -1651,7 +1648,6 @@ async fn stabilize_pending_turn_plan(
         }
         if compaction_reason.is_some() {
             client_session.invalidate_incremental_history("compaction");
-            sess.services.bump_planning_generation();
             turn_context
                 .turn_timing_state
                 .record_planning_invalidation();
@@ -1705,7 +1701,7 @@ async fn stabilize_pending_turn_plan(
                     .record_planning_invalidation();
                 fixed_point
                     .require_generation_advance(
-                        &plan.identity,
+                        plan.planning_generation,
                         sess.services.planning_generation(),
                         impact,
                     )
@@ -1856,7 +1852,7 @@ async fn stabilize_pending_turn_plan(
             }
         }
 
-        if sess.services.planning_generation() != plan.identity.generation {
+        if sess.services.planning_generation() != plan.planning_generation {
             turn_context
                 .turn_timing_state
                 .record_planning_invalidation();
@@ -1891,78 +1887,6 @@ fn semantic_effect_id(kind: &str, values: &[String]) -> String {
         hasher.update(value.as_bytes());
     }
     format!("{kind}:{:x}", hasher.finalize())
-}
-
-struct PlanningStateDigestInput<'a> {
-    step_context: &'a StepContext,
-    mcp_tools: &'a [codex_mcp::ToolInfo],
-    connectors: &'a [connectors::AppInfo],
-    plugins: &'a [PluginCapabilitySummary],
-    injection_items: &'a [ResponseItem],
-    context_update_items: &'a [ResponseItem],
-    user_input: &'a [UserInput],
-    router: &'a ToolRouter,
-    history_items: &'a [ResponseItem],
-    history_fingerprint: Option<[u8; 32]>,
-}
-
-fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
-    let PlanningStateDigestInput {
-        step_context,
-        mcp_tools,
-        connectors,
-        plugins,
-        injection_items,
-        context_update_items,
-        user_input,
-        router,
-        history_items,
-        history_fingerprint,
-    } = input;
-    let mut hasher = Sha256::new();
-    for environment in &step_context.environments.turn_environments {
-        hasher.update(environment.environment_id.as_bytes());
-        hasher.update(environment.cwd().to_string().as_bytes());
-    }
-    for starting in &step_context.environments.starting {
-        hasher.update(format!("{:?}", starting.selection).as_bytes());
-    }
-    hasher.update(format!("{:?}", step_context.selected_capability_roots).as_bytes());
-    hasher.update(format!("{:?}", step_context.loaded_agents_md).as_bytes());
-    for plugin in plugins {
-        hasher.update(plugin.config_name.as_bytes());
-        hasher.update(plugin.display_name.as_bytes());
-        for server in &plugin.mcp_server_names {
-            hasher.update(server.as_bytes());
-        }
-        for connector in &plugin.app_connector_ids {
-            hasher.update(connector.0.as_bytes());
-        }
-    }
-    for serialized in [
-        serde_json::to_vec(mcp_tools),
-        serde_json::to_vec(connectors),
-        serde_json::to_vec(injection_items),
-        serde_json::to_vec(context_update_items),
-        serde_json::to_vec(user_input),
-        serde_json::to_vec(&router.tool_manifest(step_context.turn.as_ref())),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        hasher.update(serialized);
-        hasher.update([0xff]);
-    }
-    if crate::latency_switches::history_identity_enabled()
-        && let Some(fingerprint) = history_fingerprint
-    {
-        hasher.update(b"prepared-history-fingerprint-v1");
-        hasher.update(fingerprint);
-    } else if let Ok(serialized) = serde_json::to_vec(history_items) {
-        hasher.update(serialized);
-        hasher.update([0xff]);
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 fn estimate_pending_tokens(
@@ -2392,48 +2316,6 @@ async fn run_auto_compact(
     phase: CompactionPhase,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
-    if turn_context.config.features.enabled(Feature::TokenBudget) {
-        // Compaction is the reset request, so force a new context window
-        // instead of consuming a pending `new_context` tool request.
-        crate::compact_token_budget::run_inline_auto_compact_task(
-            Arc::clone(sess),
-            Arc::clone(&step_context),
-            initial_context_injection,
-        )
-        .await?;
-        let status = super::context_window::context_window_token_status(
-            sess.as_ref(),
-            turn_context.as_ref(),
-        )
-        .await;
-        if sess.services.task_evidence.allows_kd4_completion() {
-            let Some(effective) = status.effective_provider_occupancy else {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "budget_unverifiable: local_projected_occupancy={} basis={}",
-                    status.local_projected_occupancy, status.effective_estimate_basis
-                )));
-            };
-            if effective >= super::context_window::KD4_HARD_OPERATING_LIMIT {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "mandatory_context_floor_exceeded: local_projected_occupancy={} effective_provider_occupancy={effective} hard_operating_limit={}",
-                    status.local_projected_occupancy,
-                    super::context_window::KD4_HARD_OPERATING_LIMIT
-                )));
-            }
-            if effective >= super::context_window::KD4_SOFT_WORKING_SET_LIMIT {
-                // Prompt request properties are not available at this pre-turn
-                // stage. Preserve a runtime-only handoff marker so final
-                // dispatch does not compact the same state a second time. The
-                // dispatch gate replaces it with the complete receipt identity
-                // (including tool/schema and provider-baseline identity) before
-                // the provider is called.
-                sess.record_soft_floor_receipt(status.context_identity)
-                    .await;
-            }
-        }
-        return Ok(());
-    }
-
     if should_use_remote_compact_task(turn_context.provider.info()) {
         if turn_context
             .config
@@ -2551,7 +2433,11 @@ pub(crate) fn build_prompt(
     let input = input.into();
     Prompt {
         input: Arc::clone(&input),
-        stable_context_fallback_input: input,
+        stable_context_fallback_input: Arc::clone(&input),
+        tool_history_fallback_input: Arc::clone(&input),
+        stable_context_tool_history_fallback_input: input,
+        tool_history_substitutions: Arc::from([]),
+        stable_context_fallback_tool_history_substitutions: Arc::from([]),
         stable_context_manifest: Default::default(),
         prompt_provenance: Default::default(),
         tools: router.model_visible_specs(),
@@ -2573,6 +2459,8 @@ fn build_projected_prompt(
 ) -> Prompt {
     let input = prepared.shared_items();
     let fallback_input = prepared.shared_fallback_items();
+    let tool_history_fallback_input = prepared.shared_unreplaced_items();
+    let stable_context_tool_history_fallback_input = prepared.shared_unreplaced_fallback_items();
     let tools = router.model_visible_specs();
     let tool_bytes = serde_json::to_vec(&tools).unwrap_or_default();
     let input_bytes = serde_json::to_vec(&input).unwrap_or_default();
@@ -2688,6 +2576,11 @@ fn build_projected_prompt(
     Prompt {
         input,
         stable_context_fallback_input: fallback_input,
+        tool_history_fallback_input,
+        stable_context_tool_history_fallback_input,
+        tool_history_substitutions: prepared.tool_history_substitutions(),
+        stable_context_fallback_tool_history_substitutions: prepared
+            .fallback_tool_history_substitutions(),
         stable_context_manifest: manifest,
         prompt_provenance,
         tools,
@@ -2777,15 +2670,16 @@ async fn run_sampling_request(
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
     )
-    .with_sampling_request_signals(request_signals);
+    .with_sampling_request_signals(request_signals.clone());
     let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
         &sess,
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
+        request_signals,
     );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
-    let mut initial_input = prepared_input.shared_items();
+    let initial_input = prepared_input.shared_items();
     let prompt_construction_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::PromptConstruction);
@@ -2797,33 +2691,13 @@ async fn run_sampling_request(
         base_instructions.clone(),
     );
     drop(prompt_construction_guard);
-    let kd4_dispatch_telemetry = enforce_kd4_dispatch_budget(
-        &sess,
-        &step_context,
-        client_session,
-        router.as_ref(),
-        &base_instructions,
-        &mut prompt,
-        &mut initial_input,
-    )
-    .await?;
-    let mut effective_responses_metadata = responses_metadata.clone();
-    if let Some(context) = kd4_dispatch_telemetry {
-        effective_responses_metadata.window_id = sess.current_window_id().await;
-        client_session.set_kd4_dispatch_telemetry(
-            sess.services.agent_control.amplification_telemetry(),
-            context,
-        );
-    } else {
-        client_session.clear_kd4_dispatch_telemetry();
-    }
     turn_context
         .turn_timing_state
         .begin_model_generation_with_metadata(
             pending_continuation_cause,
             &turn_context.session_source,
             generation_request.purpose,
-            generation_request.decision_bearing,
+            generation_request.timing_disposition(),
             Some(generation_request.relevant_state_fingerprint.clone()),
         );
     loop {
@@ -2833,14 +2707,14 @@ async fn run_sampling_request(
             Arc::clone(&turn_context),
             Arc::clone(&turn_store),
             client_session,
-            &effective_responses_metadata,
+            responses_metadata,
             Arc::clone(&turn_diff_tracker),
             &prompt,
             &generation_id,
             preparation_timing_guard,
             reasoning_phase,
             reasoning_trigger,
-            !generation_request.decision_bearing,
+            generation_request.sampling.clone(),
             cancellation_token.child_token(),
         )
         .await
@@ -2882,21 +2756,8 @@ async fn run_sampling_request(
         turn_context.turn_timing_state.record_sampling_retry();
         if !crate::latency_switches::shared_prompt_input_enabled() {
             let history = sess.clone_history().await;
-            let retry_input = if turn_context.config.completed_tool_history_projection
-                && client_session
-                    .provider_history_baseline_generation()
-                    .is_none()
-            {
-                history.prepare_for_sampling_prompt_with_completed_tool_projection(
-                    &turn_context.model_info.input_modalities,
-                    StableContextTarget::Sampling,
-                )
-            } else {
-                history.prepare_for_sampling_prompt(
-                    &turn_context.model_info.input_modalities,
-                    StableContextTarget::Sampling,
-                )
-            };
+            let retry_input =
+                prepare_sampling_prompt_for_client(history, turn_context.as_ref(), client_session);
             prompt = build_projected_prompt(
                 sess.as_ref(),
                 &retry_input,
@@ -2913,295 +2774,6 @@ fn finalized_router_matches_exposure(
     current_identity: &ToolExposureIdentity,
 ) -> bool {
     router.exposure_identity() == current_identity
-}
-
-async fn enforce_kd4_dispatch_budget(
-    sess: &Arc<Session>,
-    step_context: &Arc<StepContext>,
-    client_session: &mut ModelClientSession,
-    router: &ToolRouter,
-    base_instructions: &BaseInstructions,
-    prompt: &mut Prompt,
-    initial_input: &mut Arc<[ResponseItem]>,
-) -> CodexResult<Option<crate::amplification::Kd4DispatchTelemetryContext>> {
-    let turn_context = &step_context.turn;
-    if !turn_context.config.features.enabled(Feature::TokenBudget)
-        || !sess.services.task_evidence.allows_kd4_completion()
-    {
-        return Ok(None);
-    }
-
-    let mut compacted = false;
-    let mut operating_budget_compaction_before: Option<i64> = None;
-    loop {
-        let Some(local_projected_occupancy) = estimate_prompt_occupancy(prompt) else {
-            if compacted {
-                return Err(CodexErr::InvalidRequest(
-                    "budget_unverifiable: local_projected_occupancy=unknown after one compaction/rebase"
-                        .to_string(),
-                ));
-            }
-            crate::compact_token_budget::run_inline_auto_compact_task(
-                Arc::clone(sess),
-                Arc::clone(step_context),
-                InitialContextInjection::DoNotInject,
-            )
-            .await?;
-            client_session.invalidate_incremental_history("KD4 occupancy estimate unavailable");
-            let rebuilt_input = sess.clone_history().await.prepare_for_sampling_prompt(
-                &turn_context.model_info.input_modalities,
-                StableContextTarget::Sampling,
-            );
-            *initial_input = rebuilt_input.shared_items();
-            *prompt = build_projected_prompt(
-                sess.as_ref(),
-                &rebuilt_input,
-                router,
-                step_context.as_ref(),
-                base_instructions.clone(),
-            );
-            compacted = true;
-            continue;
-        };
-        let baseline_generation = client_session.provider_history_baseline_generation();
-        let baseline_local_occupancy = client_session.provider_history_local_occupancy_baseline();
-        let server_accounted_baseline = if baseline_generation.is_some() {
-            let token_info = sess.token_usage_info().await;
-            let trustworthy = token_info.as_ref().is_some_and(|info| {
-                let usage = &info.last_token_usage;
-                usage.input_tokens > 0
-                    || usage.output_tokens > 0
-                    || usage.reasoning_output_tokens > 0
-                    || usage.total_tokens > 0
-            });
-            if trustworthy {
-                Some(sess.get_total_token_usage().await)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let Some((effective_provider_occupancy, estimate_basis)) =
-            effective_provider_occupancy_for_dispatch(
-                local_projected_occupancy,
-                baseline_generation,
-                server_accounted_baseline,
-                baseline_local_occupancy,
-            )
-        else {
-            // A full next request is the supported provider rebase. Do not
-            // pretend locally retired state vanished while reuse is live.
-            client_session
-                .invalidate_incremental_history("provider occupancy baseline unavailable");
-            continue;
-        };
-        if let Some(pre_compaction_occupancy) = operating_budget_compaction_before.take() {
-            let meaningful_headroom =
-                kd4_compaction_created_meaningful_headroom(effective_provider_occupancy);
-            sess.record_budget_compaction_outcome(turn_context.sub_id.clone(), meaningful_headroom)
-                .await;
-            let reclaimed_tokens =
-                pre_compaction_occupancy.saturating_sub(effective_provider_occupancy);
-            if meaningful_headroom {
-                tracing::trace!(
-                    pre_compaction_occupancy,
-                    post_compaction_occupancy = effective_provider_occupancy,
-                    reclaimed_tokens,
-                    "KD4 operating-budget compaction created useful headroom"
-                );
-            } else {
-                tracing::warn!(
-                    turn_id = %turn_context.sub_id,
-                    pre_compaction_occupancy,
-                    post_compaction_occupancy = effective_provider_occupancy,
-                    reclaimed_tokens,
-                    required_headroom = KD4_MIN_POST_COMPACTION_HEADROOM,
-                    "KD4 operating-budget compaction was ineffective; suppressing another compaction for this turn"
-                );
-            }
-        }
-
-        let status = super::context_window::context_window_token_status(
-            sess.as_ref(),
-            turn_context.as_ref(),
-        )
-        .await;
-        let receipt_identity =
-            dispatch_soft_floor_identity(&status.context_identity, prompt, baseline_generation);
-        let receipt_active = sess.soft_floor_receipt_matches(&receipt_identity).await;
-        let budget_compaction_blocked = sess
-            .budget_compaction_blocked_for_turn(&turn_context.sub_id)
-            .await;
-        tracing::trace!(
-            local_projected_occupancy,
-            effective_provider_occupancy,
-            estimate_basis,
-            estimate_complete = true,
-            provider_baseline_generation = ?baseline_generation,
-            checkpoint_tokens = ?checkpoint_tokens(prompt.input.as_ref()),
-            soft_floor_receipt_active = receipt_active,
-            ineffective_compaction_guard_active = budget_compaction_blocked,
-            "KD4 final dispatch occupancy"
-        );
-
-        if effective_provider_occupancy >= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
-            && !status.soft_floor_receipt_active
-            && !receipt_active
-            && !budget_compaction_blocked
-            && !compacted
-        {
-            operating_budget_compaction_before = Some(effective_provider_occupancy);
-            crate::compact_token_budget::run_inline_auto_compact_task(
-                Arc::clone(sess),
-                Arc::clone(step_context),
-                InitialContextInjection::DoNotInject,
-            )
-            .await?;
-            client_session.invalidate_incremental_history("KD4 operating-budget compaction");
-            let rebuilt_input = sess.clone_history().await.prepare_for_sampling_prompt(
-                &turn_context.model_info.input_modalities,
-                StableContextTarget::Sampling,
-            );
-            *initial_input = rebuilt_input.shared_items();
-            *prompt = build_projected_prompt(
-                sess.as_ref(),
-                &rebuilt_input,
-                router,
-                step_context.as_ref(),
-                base_instructions.clone(),
-            );
-            compacted = true;
-            continue;
-        }
-
-        if effective_provider_occupancy >= super::context_window::KD4_HARD_OPERATING_LIMIT {
-            return Err(CodexErr::InvalidRequest(format!(
-                "mandatory_context_floor_exceeded: local_projected_occupancy={local_projected_occupancy} effective_provider_occupancy={effective_provider_occupancy} hard_operating_limit={} basis={estimate_basis}",
-                super::context_window::KD4_HARD_OPERATING_LIMIT
-            )));
-        }
-
-        let inherited_post_compaction_marker = status.soft_floor_receipt_active;
-        let recorded_receipt = effective_provider_occupancy
-            >= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
-            && (compacted || inherited_post_compaction_marker);
-        if recorded_receipt {
-            sess.record_soft_floor_receipt(receipt_identity.clone())
-                .await;
-        }
-        let soft_floor_status = if budget_compaction_blocked
-            && effective_provider_occupancy >= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
-        {
-            "ineffective_compaction_guard"
-        } else if receipt_active || recorded_receipt {
-            "receipt_active"
-        } else if effective_provider_occupancy >= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
-        {
-            "unavoidable_soft_floor"
-        } else {
-            "below_soft_limit"
-        };
-        return Ok(Some(crate::amplification::Kd4DispatchTelemetryContext {
-            local_projected_occupancy,
-            effective_provider_occupancy: Some(effective_provider_occupancy),
-            estimate_basis,
-            estimate_complete: true,
-            soft_floor_status,
-            compactions: sess.auto_compact_window_number().await,
-        }));
-    }
-}
-
-fn kd4_compaction_created_meaningful_headroom(post_compaction_occupancy: i64) -> bool {
-    post_compaction_occupancy
-        <= super::context_window::KD4_SOFT_WORKING_SET_LIMIT
-            .saturating_sub(KD4_MIN_POST_COMPACTION_HEADROOM)
-}
-
-fn dispatch_soft_floor_identity(
-    prepared_identity: &str,
-    prompt: &Prompt,
-    provider_baseline_generation: Option<u64>,
-) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"codex.kd4.soft-floor-dispatch.v1");
-    hasher.update(prepared_identity.as_bytes());
-    hasher.update(
-        provider_baseline_generation
-            .unwrap_or_default()
-            .to_be_bytes(),
-    );
-    if let Ok(tools) = serde_json::to_vec(&prompt.tools) {
-        hasher.update(tools);
-    }
-    if let Ok(output_schema) = serde_json::to_vec(&prompt.output_schema) {
-        hasher.update(output_schema);
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn effective_provider_occupancy_for_dispatch(
-    local_projected_occupancy: i64,
-    provider_baseline_generation: Option<u64>,
-    server_accounted_baseline: Option<i64>,
-    baseline_local_occupancy: Option<i64>,
-) -> Option<(i64, &'static str)> {
-    if provider_baseline_generation.is_some() {
-        server_accounted_baseline.zip(baseline_local_occupancy).map(
-            |(server_baseline, local_baseline)| {
-                let known_request_delta = local_projected_occupancy
-                    .saturating_sub(local_baseline)
-                    .max(0);
-                (
-                    server_baseline
-                        .saturating_add(known_request_delta)
-                        .max(local_projected_occupancy),
-                    "server_baseline_plus_known_request_delta",
-                )
-            },
-        )
-    } else {
-        Some((
-            local_projected_occupancy,
-            "full_request_local_authoritative",
-        ))
-    }
-}
-
-fn estimate_prompt_occupancy(prompt: &Prompt) -> Option<i64> {
-    let history_and_instructions =
-        crate::context_manager::ContextManager::estimate_items_token_count_with_base_instructions(
-            prompt.input.as_ref(),
-            &prompt.base_instructions,
-        )?;
-    let tool_bytes = serde_json::to_vec(&prompt.tools).ok()?.len();
-    let output_schema_bytes = prompt
-        .output_schema
-        .as_ref()
-        .map(serde_json::to_vec)
-        .transpose()
-        .ok()?
-        .map_or(0, |value| value.len());
-    let request_property_bytes = tool_bytes.checked_add(output_schema_bytes)?;
-    let request_property_tokens = i64::try_from(request_property_bytes.div_ceil(4)).ok()?;
-    history_and_instructions.checked_add(request_property_tokens)
-}
-
-fn checkpoint_tokens(items: &[ResponseItem]) -> Option<i64> {
-    items.iter().rev().find_map(|item| {
-        let ResponseItem::Message { content, .. } = item else {
-            return None;
-        };
-        content.iter().find_map(|content| {
-            let ContentItem::InputText { text } = content else {
-                return None;
-            };
-            text.contains("<task_checkpoint_v1>").then(|| {
-                i64::try_from(codex_utils_string::approx_token_count(text)).unwrap_or(i64::MAX)
-            })
-        })
-    })
 }
 
 #[instrument(level = "trace",
@@ -3703,6 +3275,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::ModelReroute(_)
         | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
+        | EventMsg::TurnTerminalizationComplete(_)
         | EventMsg::SafetyBuffering(_)
         | EventMsg::ContextCompacted(_)
         | EventMsg::ThreadRolledBack(_)
@@ -4061,8 +3634,33 @@ async fn drain_in_flight(
         match res {
             Ok(response_input) => {
                 let response_item = response_input.into();
-                sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
+                let interrupt_terminal = sess
+                    .active_turn
+                    .lock()
+                    .await
+                    .as_ref()
+                    .and_then(|active| active.terminal.clone())
+                    .filter(|terminal| terminal.interrupt_pending());
+                if let Some(terminal) = interrupt_terminal {
+                    if let Err(err) = sess
+                        .record_conversation_items_durable(
+                            &turn_context,
+                            std::slice::from_ref(&response_item),
+                        )
+                        .await
+                    {
+                        terminal.mark_interrupt_persistence_failed();
+                        return Err(CodexErr::Fatal(format!(
+                            "failed to durably append interrupted tool output: {err}"
+                        )));
+                    }
+                } else {
+                    sess.record_conversation_items(
+                        &turn_context,
+                        std::slice::from_ref(&response_item),
+                    )
                     .await;
+                }
                 mark_thread_memory_mode_polluted_if_external_context(
                     sess.as_ref(),
                     turn_context.as_ref(),
@@ -4130,16 +3728,38 @@ async fn try_run_sampling_request(
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     reasoning_phase: Option<SamplingReasoningPhase>,
     reasoning_trigger: codex_protocol::protocol::ReasoningPolicyTrigger,
-    deterministic_continuation: bool,
+    sampling: SamplingGenerationDisposition,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
+    if sess.reference_context_item().await.is_none() {
+        client_session.invalidate_provider_history_inheritance(
+            "realized context baseline is unknown before sampling",
+        );
+    }
+    let terminal = {
+        let active_turn = sess.active_turn.lock().await;
+        active_turn
+            .as_ref()
+            .and_then(|active| active.terminal.clone())
+    };
+    if let Some(terminal) = terminal
+        && terminal.sampling_admission() == SamplingAdmission::Fenced
+    {
+        terminal.wait_for_interrupt_resolution().await;
+        if terminal.interrupt_persistence_failed() {
+            return Err(CodexErr::Fatal(
+                "interrupted request_user_input output was not durably persisted".to_string(),
+            ));
+        }
+        return Err(CodexErr::TurnAborted);
+    }
     sess.ensure_rollout_budget_available()?;
     let request_policy = crate::session::reasoning_governor::resolve_request_policy_for_generation(
         reasoning_phase,
         turn_context.config.reasoning_phase_efforts.as_ref(),
         turn_context.configured_reasoning_effort.clone(),
         &turn_context.model_info,
-        deterministic_continuation,
+        &sampling,
     );
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
@@ -4177,7 +3797,7 @@ async fn try_run_sampling_request(
         let (timing_status, claim_status) = match resolution {
             SessionStartupPrewarmResolution::Cancelled => return Err(CodexErr::TurnAborted),
             SessionStartupPrewarmResolution::Ready(prewarmed_session) => {
-                let reused = client_session
+                let claim = client_session
                     .claim_startup_prewarm(
                         *prewarmed_session,
                         prompt,
@@ -4188,10 +3808,14 @@ async fn try_run_sampling_request(
                         responses_metadata,
                     )
                     .await?;
-                if reused {
-                    ("prewarm_winner", "ready_compatible_reuse")
-                } else {
-                    ("stale_incompatible", "stale_incompatible")
+                match claim {
+                    StartupPrewarmClaim::ResponseChain => {
+                        ("prewarm_winner", "ready_compatible_reuse")
+                    }
+                    StartupPrewarmClaim::TransportOnly => {
+                        ("prewarm_transport_winner", "ready_transport_reuse")
+                    }
+                    StartupPrewarmClaim::Rejected => ("stale_incompatible", "stale_incompatible"),
                 }
             }
             SessionStartupPrewarmResolution::Unavailable { .. } => {
@@ -4233,8 +3857,58 @@ async fn try_run_sampling_request(
             msg: EventMsg::ReasoningPolicyUpdated(snapshot),
         });
     }
+    let boundary_session = Arc::clone(&sess);
+    let boundary_turn_id = turn_context.sub_id.clone();
+    let attempt_prepared: AttemptPreparedCallback = Arc::new(move |identity| {
+        let sess = Arc::clone(&boundary_session);
+        let turn_id = boundary_turn_id.clone();
+        Box::pin(async move {
+            let terminal = sess
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|active| active.terminal.clone());
+            let sampling_admission = if let Some(terminal) = terminal.as_ref() {
+                let Some(admission) = terminal.acquire_sampling_admission().await else {
+                    terminal.wait_for_interrupt_resolution().await;
+                    return if terminal.interrupt_persistence_failed() {
+                        Err(CodexErr::Fatal(
+                            "interrupted request_user_input output was not durably persisted"
+                                .to_string(),
+                        ))
+                    } else {
+                        Err(CodexErr::TurnAborted)
+                    };
+                };
+                Some(admission)
+            } else {
+                None
+            };
+            sess.persist_rollout_items_durable(&[RolloutItem::SamplingBoundary(
+                SamplingBoundaryItem {
+                    sampling_request_id: identity.sampling_request_id.clone(),
+                    physical_attempt_id: identity.physical_attempt_id.clone(),
+                    turn_id: Some(turn_id),
+                    unresolved_context: true,
+                },
+            )])
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "failed to persist sampling boundary before provider dispatch: {err}"
+                ))
+            })?;
+            sess.bind_context_baseline_candidate(
+                &identity.sampling_request_id,
+                &identity.physical_attempt_id,
+            )
+            .await;
+            Ok(sampling_admission)
+        })
+    });
     let stream_result = client_session
-        .stream(
+        .stream_with_attempt_prepared(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
@@ -4243,12 +3917,14 @@ async fn try_run_sampling_request(
             turn_context.config.service_tier.clone(),
             responses_metadata,
             &inference_trace,
+            Some(attempt_prepared),
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await;
     drop(model_request_timing_guard);
     let mut stream = stream_result??;
+    let attempt_identity = stream.attempt_identity().cloned();
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut earlier_tool_calls_eligible = true;
@@ -4341,7 +4017,24 @@ async fn try_run_sampling_request(
         record_turn_ttft_metric(&turn_context, &event).await;
 
         match event {
-            ResponseEvent::Created => {}
+            ResponseEvent::Created => {
+                if let Some(identity) = attempt_identity.as_ref()
+                    && let Err(err) = sess
+                        .commit_context_baseline_candidate(
+                            &identity.sampling_request_id,
+                            &identity.physical_attempt_id,
+                        )
+                        .await
+                {
+                    sess.mark_context_baseline_unknown().await;
+                    client_session.invalidate_provider_history_inheritance(
+                        "authoritative context persistence failed after provider acceptance",
+                    );
+                    break Err(CodexErr::Fatal(format!(
+                        "provider accepted sampling attempt but authoritative context persistence failed: {err}"
+                    )));
+                }
+            }
             ResponseEvent::OutputItemDone(mut item) => {
                 if turn_context.item_ids_enabled() {
                     assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
@@ -4756,6 +4449,25 @@ async fn try_run_sampling_request(
     };
     drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
     drop(tool_blocking_timing_guard);
+
+    let terminal = {
+        let active_turn = sess.active_turn.lock().await;
+        active_turn
+            .as_ref()
+            .and_then(|active| active.terminal.clone())
+    };
+    if let Some(terminal) = terminal
+        && terminal.interrupt_pending()
+    {
+        if let Err(err) = sess.flush_rollout().await {
+            terminal.mark_interrupt_persistence_failed();
+            return Err(CodexErr::Fatal(format!(
+                "failed to durably flush interrupted request_user_input output: {err}"
+            )));
+        }
+        terminal.mark_interrupt_output_durable();
+        return Err(CodexErr::TurnAborted);
+    }
 
     // A tool result guarantees another request in this turn. A later assistant
     // item in the same response must not defer already queued mailbox input.

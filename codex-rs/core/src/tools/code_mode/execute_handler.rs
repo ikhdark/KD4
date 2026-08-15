@@ -13,6 +13,12 @@ use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
 use super::handle_runtime_response;
 use super::is_exec_tool_name;
+use super::wait_handler::OwnerHeldCodeModeExit;
+use super::wait_handler::attach_drained_wait_evidence;
+use super::wait_handler::effective_observation_yield_time_ms;
+use super::wait_handler::hold_unchanged_waits;
+use super::wait_handler::input_activity_response;
+use super::wait_handler::record_internally_drained_waits;
 
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
@@ -39,6 +45,7 @@ impl CodeModeExecuteHandler {
         turn: std::sync::Arc<crate::session::turn_context::TurnContext>,
         call_id: String,
         code: String,
+        cancellation_token: tokio_util::sync::CancellationToken,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
@@ -52,6 +59,10 @@ impl CodeModeExecuteHandler {
         );
         let enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
         let started_at = std::time::Instant::now();
+        let yield_time_ms = effective_observation_yield_time_ms(
+            args.yield_time_ms
+                .unwrap_or(codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS),
+        );
         let started_cell = exec
             .session
             .services
@@ -60,7 +71,10 @@ impl CodeModeExecuteHandler {
                 tool_call_id: call_id.clone(),
                 enabled_tools,
                 source: args.code.clone(),
-                yield_time_ms: args.yield_time_ms,
+                // Initial observation is an internal hand-off from the
+                // runtime to the code-mode owner. The owner applies the
+                // requested cadence to all subsequent observations.
+                yield_time_ms: Some(0),
                 max_output_tokens: args.max_output_tokens,
             })
             .await
@@ -81,17 +95,82 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .mark_cell_ready_for_dispatch(&cell_id);
-        let response = started_cell
-            .initial_response()
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
+        let turn_state = exec
+            .session
+            .input_queue
+            .turn_state_for_sub_id(&exec.session.active_turn, &exec.turn.sub_id)
+            .await;
+        let (activity_rx, pending_activity) = exec
+            .session
+            .input_queue
+            .subscribe_activity(turn_state.as_deref())
+            .await;
+        // Consume the immediate initial observation before making the held
+        // wait steerable. This clears the runtime's initial observer, so
+        // steering cannot leave a stale observer that rejects a later wait.
+        let initial_response = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                return Err(FunctionCallError::RespondToModel("exec cancelled".to_string()));
+            }
+            response = started_cell.initial_response() => {
+                response.map_err(FunctionCallError::RespondToModel)?
+            }
+        };
+        let initial_is_empty = matches!(
+            &initial_response,
+            codex_code_mode::RuntimeResponse::Yielded { content_items, .. }
+                if content_items.is_empty()
+        );
+        let (response, live_cell, drained_observations) = if initial_is_empty {
+            let held = hold_unchanged_waits(
+                || {
+                    exec.session
+                        .services
+                        .code_mode_service
+                        .wait(codex_code_mode::WaitRequest {
+                            cell_id: cell_id.clone(),
+                            yield_time_ms,
+                        })
+                },
+                &cancellation_token,
+                activity_rx,
+                pending_activity,
+                "exec cancelled",
+            )
+            .await;
+            let held = match held {
+                Ok(held) => held,
+                Err(mut error) => {
+                    error.drained_observations = error.drained_observations.saturating_add(1);
+                    record_internally_drained_waits(&exec, error.drained_observations);
+                    return Err(FunctionCallError::RespondToModel(error.message));
+                }
+            };
+            let drained_observations = held.drained_observations.saturating_add(1);
+            match held.exit {
+                OwnerHeldCodeModeExit::Runtime(codex_code_mode::WaitOutcome::LiveCell(
+                    response,
+                )) => (response, true, drained_observations),
+                OwnerHeldCodeModeExit::Runtime(codex_code_mode::WaitOutcome::MissingCell(
+                    response,
+                )) => (response, false, drained_observations),
+                OwnerHeldCodeModeExit::InputActivity(activity) => (
+                    input_activity_response(&cell_id, activity),
+                    true,
+                    drained_observations,
+                ),
+            }
+        } else {
+            (initial_response, true, 0)
+        };
         // Record the raw runtime boundary. The model-visible custom-tool output
         // is produced by `handle_runtime_response` and later linked through
         // `CodeCell.output_item_ids` in the reduced trace.
         code_cell_trace.record_initial_response(&response);
         // Yielded cells keep running, so terminal lifecycle is only emitted
         // here when the first response also ended the runtime.
-        if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+        if live_cell && !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
             code_cell_trace.record_ended(&response);
             exec.session
                 .services
@@ -99,9 +178,15 @@ impl CodeModeExecuteHandler {
                 .finish_cell_dispatch(&cell_id);
         }
         exec.session.services.elicitations.wait_until_clear().await;
-        handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
+        let output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .await
-            .map_err(FunctionCallError::RespondToModel)
+            .map_err(FunctionCallError::RespondToModel)?;
+        Ok(attach_drained_wait_evidence(
+            &exec,
+            output,
+            &cell_id,
+            drained_observations,
+        ))
     }
 }
 
@@ -154,12 +239,13 @@ impl CodeModeExecuteHandler {
             call_id,
             tool_name,
             payload,
+            cancellation_token,
             ..
         } = invocation;
 
         match payload {
             ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
-                .execute(session, turn, call_id, input)
+                .execute(session, turn, call_id, input, cancellation_token)
                 .await
                 .map(boxed_tool_output),
             _ => Err(FunctionCallError::RespondToModel(format!(

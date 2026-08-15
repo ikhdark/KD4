@@ -58,6 +58,10 @@ fn source_revision(tracker: &TurnDiffTracker, content_hash: &str) -> SourceCover
         modified_at_ms: 20,
         mutation_revision: tracker.current_mutation_revision(),
         compaction_epoch: tracker.current_compaction_epoch(),
+        watcher_generation: 30,
+        host_mutation_generation: 40,
+        stable_file_identity: "file-a".to_string(),
+        freshness_identity: "fresh-a".to_string(),
     }
 }
 
@@ -125,6 +129,104 @@ fn exact_source_coverage_unions_intervals_and_emits_only_missing_spans() {
             start_line: 10,
             end_line: 25,
         }]
+    );
+}
+
+#[test]
+fn current_source_coverage_can_suppress_a_fully_covered_read_without_mutation() {
+    let mut tracker = TurnDiffTracker::new();
+    let key = SourceCoverageKey::new("env-a", "repo-a", Path::new("src/lib.rs"));
+    let revision = source_revision(&tracker, "hash-a");
+    tracker.record_source_coverage(
+        key.clone(),
+        revision.clone(),
+        SourceLineInterval {
+            start_line: 10,
+            end_line: 20,
+        },
+        false,
+    );
+
+    let (current, decision) = tracker
+        .current_source_coverage(
+            &key,
+            revision.size,
+            revision.created_at_ms,
+            revision.modified_at_ms,
+            revision.watcher_generation,
+            revision.host_mutation_generation,
+            &revision.stable_file_identity,
+            &revision.freshness_identity,
+            SourceLineInterval {
+                start_line: 12,
+                end_line: 18,
+            },
+        )
+        .expect("current exact coverage");
+
+    assert_eq!(current, revision);
+    assert!(decision.missing.is_empty());
+    assert_eq!(
+        decision.reused,
+        vec![SourceLineInterval {
+            start_line: 12,
+            end_line: 18,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn known_mutation_preserves_only_non_overlapping_source_coverage() {
+    let dir = tempdir().expect("temp dir");
+    let mut tracker = tracker_with_root(dir.path());
+    let interval = SourceLineInterval {
+        start_line: 1,
+        end_line: 5,
+    };
+    let unchanged_path = dir.path().join("src/unchanged.rs");
+    let changed_path = dir.path().join("src/changed.rs");
+    let unchanged_key = SourceCoverageKey::new("", "repo", &unchanged_path);
+    let changed_key = SourceCoverageKey::new("", "repo", &changed_path);
+    let revision = source_revision(&tracker, "hash-a");
+    tracker.record_source_coverage(unchanged_key.clone(), revision.clone(), interval, false);
+    tracker.record_source_coverage(changed_key.clone(), revision.clone(), interval, false);
+
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: src/changed.rs\n+changed\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &delta);
+
+    assert!(
+        tracker
+            .current_source_coverage(
+                &unchanged_key,
+                revision.size,
+                revision.created_at_ms,
+                revision.modified_at_ms,
+                revision.watcher_generation.saturating_add(1),
+                revision.host_mutation_generation.saturating_add(1),
+                &revision.stable_file_identity,
+                &revision.freshness_identity,
+                interval,
+            )
+            .is_some()
+    );
+    assert!(
+        tracker
+            .current_source_coverage(
+                &changed_key,
+                revision.size,
+                revision.created_at_ms,
+                revision.modified_at_ms,
+                revision.watcher_generation,
+                revision.host_mutation_generation,
+                &revision.stable_file_identity,
+                &revision.freshness_identity,
+                interval,
+            )
+            .is_none()
     );
 }
 

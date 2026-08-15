@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::status::is_final;
+use crate::session::InputQueueActivity;
 use crate::session::session::Session;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v1;
@@ -14,8 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch::Receiver;
 use tokio::time::Instant;
-
-use tokio::time::timeout_at;
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -59,6 +58,7 @@ impl Handler {
             turn,
             payload,
             call_id,
+            cancellation_token,
             ..
         } = invocation;
         let arguments = function_arguments(payload)?;
@@ -95,9 +95,18 @@ impl Handler {
                     "Omit timeout_ms for the normal wait. wait_agent returns immediately when a target has already completed.".to_owned(),
                 ));
             }
-            Some(ms) => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
-            None => DEFAULT_WAIT_TIMEOUT_MS,
+            Some(ms) => Some(ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS)),
+            None => None,
         };
+
+        let turn_state = session
+            .input_queue
+            .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
+            .await;
+        let (mut activity_rx, mut pending_activity) = session
+            .input_queue
+            .subscribe_activity(turn_state.as_deref())
+            .await;
 
         session
             .emit_turn_item_started(
@@ -156,62 +165,111 @@ impl Handler {
             }
         }
 
-        let statuses = match args.return_when {
-            WaitReturnWhen::First if !initial_final_statuses.is_empty() => initial_final_statuses,
-            WaitReturnWhen::First => {
-                let mut futures = FuturesUnordered::new();
-                for (id, rx) in status_rxs {
-                    let session = session.clone();
-                    futures.push(wait_for_final_status(session, id, rx));
+        let partial_statuses = initial_final_statuses.clone();
+        let receiver_count = receiver_thread_ids.len();
+        let status_session = session.clone();
+        let status_wait = async move {
+            match args.return_when {
+                WaitReturnWhen::First if !initial_final_statuses.is_empty() => {
+                    Ok(initial_final_statuses)
                 }
-                let mut results = Vec::new();
-                let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-                loop {
-                    match timeout_at(deadline, futures.next()).await {
-                        Ok(Some(Some(result))) => {
-                            results.push(result);
-                            break;
+                WaitReturnWhen::First => {
+                    let mut futures = FuturesUnordered::new();
+                    for (id, rx) in status_rxs {
+                        let session = status_session.clone();
+                        futures.push(wait_for_final_status(session, id, rx));
+                    }
+                    while let Some(result) = futures.next().await {
+                        if let Some(result) = result {
+                            let mut results = vec![result];
+                            loop {
+                                match futures.next().now_or_never() {
+                                    Some(Some(Some(result))) => results.push(result),
+                                    Some(Some(None)) => continue,
+                                    Some(None) | None => break,
+                                }
+                            }
+                            return Ok(results);
                         }
-                        Ok(Some(None)) => continue,
-                        Ok(None) | Err(_) => break,
                     }
+                    Err("wait_agent status subscriptions ended before a target reached a final state"
+                        .to_string())
                 }
-                if !results.is_empty() {
-                    loop {
-                        match futures.next().now_or_never() {
-                            Some(Some(Some(result))) => results.push(result),
-                            Some(Some(None)) => continue,
-                            Some(None) | None => break,
+                WaitReturnWhen::All => {
+                    let mut results = initial_final_statuses;
+                    let mut futures = FuturesUnordered::new();
+                    for (id, rx) in status_rxs {
+                        if results.iter().any(|(final_id, _)| *final_id == id) {
+                            continue;
+                        }
+                        let session = status_session.clone();
+                        futures.push(wait_for_final_status(session, id, rx));
+                    }
+                    while results.len() < receiver_count {
+                        match futures.next().await {
+                            Some(Some(result)) => results.push(result),
+                            Some(None) => continue,
+                            None => {
+                                return Err(
+                                    "wait_agent status subscriptions ended before all targets reached a final state"
+                                        .to_string(),
+                                );
+                            }
                         }
                     }
+                    Ok(results)
                 }
-                results
-            }
-            WaitReturnWhen::All => {
-                let mut results = initial_final_statuses;
-                let mut futures = FuturesUnordered::new();
-                for (id, rx) in status_rxs {
-                    if results.iter().any(|(final_id, _)| *final_id == id) {
-                        continue;
-                    }
-                    let session = session.clone();
-                    futures.push(wait_for_final_status(session, id, rx));
-                }
-                let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-                while results.len() < receiver_thread_ids.len() {
-                    match timeout_at(deadline, futures.next()).await {
-                        Ok(Some(Some(result))) => results.push(result),
-                        Ok(Some(None)) => continue,
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-                results
             }
         };
-
-        let timed_out = match args.return_when {
-            WaitReturnWhen::First => statuses.is_empty(),
-            WaitReturnWhen::All => statuses.len() < receiver_thread_ids.len(),
+        tokio::pin!(status_wait);
+        let deadline =
+            timeout_ms.map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms as u64));
+        let completion = if let Some(deadline) = deadline {
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    return Err(FunctionCallError::RespondToModel(
+                        "wait_agent cancelled".to_string(),
+                    ));
+                }
+                activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
+                    LegacyWaitCompletion::InputActivity(activity)
+                }
+                statuses = &mut status_wait => {
+                    LegacyWaitCompletion::Statuses(
+                        statuses.map_err(FunctionCallError::RespondToModel)?,
+                    )
+                }
+                _ = tokio::time::sleep_until(deadline) => LegacyWaitCompletion::TimedOut,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    return Err(FunctionCallError::RespondToModel(
+                        "wait_agent cancelled".to_string(),
+                    ));
+                }
+                activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
+                    LegacyWaitCompletion::InputActivity(activity)
+                }
+                statuses = &mut status_wait => {
+                    LegacyWaitCompletion::Statuses(
+                        statuses.map_err(FunctionCallError::RespondToModel)?,
+                    )
+                }
+            }
+        };
+        let (statuses, timed_out, interruption) = match completion {
+            LegacyWaitCompletion::Statuses(statuses) => (statuses, false, None),
+            LegacyWaitCompletion::TimedOut => (partial_statuses, true, None),
+            LegacyWaitCompletion::InputActivity(activity) => {
+                let message = match activity {
+                    InputQueueActivity::Mailbox => "wait_agent interrupted by mailbox activity",
+                    InputQueueActivity::Steer => "wait_agent interrupted by new user input",
+                };
+                (partial_statuses, false, Some(message.to_string()))
+            }
         };
         let statuses_by_id = statuses.clone().into_iter().collect::<HashMap<_, _>>();
         let result = WaitAgentResult {
@@ -244,6 +302,10 @@ impl Handler {
                 }),
             )
             .await;
+
+        if let Some(message) = interruption {
+            return Err(FunctionCallError::RespondToModel(message));
+        }
 
         Ok(boxed_tool_output(result))
     }
@@ -301,6 +363,27 @@ enum WaitReturnWhen {
     #[default]
     First,
     All,
+}
+
+enum LegacyWaitCompletion {
+    Statuses(Vec<(ThreadId, AgentStatus)>),
+    TimedOut,
+    InputActivity(InputQueueActivity),
+}
+
+async fn next_input_activity(
+    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
+    pending_activity: &mut Option<InputQueueActivity>,
+) -> InputQueueActivity {
+    if let Some(activity) = pending_activity.take() {
+        return activity;
+    }
+    loop {
+        if activity_rx.changed().await.is_ok() {
+            return *activity_rx.borrow_and_update();
+        }
+        std::future::pending::<()>().await;
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]

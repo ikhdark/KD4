@@ -38,8 +38,9 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         path.write_text(
             textwrap.dedent(
                 f"""
-                schema_version = 1
+                schema_version = 2
                 upstream_commit = "1111111111111111111111111111111111111111"
+                status_semantics = "implementation_lifecycle"
 
                 [[features]]
                 id = "feature"
@@ -95,6 +96,53 @@ class CheckKd4FeaturesTest(unittest.TestCase):
 
         self.assertTrue(result.ok, result.findings)
         self.assertEqual(result.status_counts, {"enabled": 1})
+        self.assertEqual(result.runtime_status_counts, {})
+
+    def test_feature_config_requires_runtime_status(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                "config_keys = []",
+                'config_keys = ["features.example"]',
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "invalid-runtime-status", {finding.code for finding in result.findings}
+        )
+
+    def test_project_runtime_status_must_match_effective_config(self) -> None:
+        (self.repo_root / ".codex").mkdir()
+        (self.repo_root / ".codex" / "config.toml").write_text(
+            "[features]\nexample = false\n",
+            encoding="utf-8",
+        )
+        manifest = self.write_manifest(self.valid_evidence())
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                "config_keys = []",
+                'config_keys = ["features.example"]\n'
+                'runtime_feature_key = "features.example"\n'
+                'runtime_status = "enabled"\n'
+                'runtime_status_source = ".codex/config.toml"',
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "stale-runtime-status", {finding.code for finding in result.findings}
+        )
 
     def test_enabled_feature_without_registration_fails(self) -> None:
         evidence = self.valid_evidence().replace(
@@ -248,8 +296,9 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         manifest.write_text(
             textwrap.dedent(
                 """
-                schema_version = 1
+                schema_version = 2
                 upstream_commit = "0123456789abcdef0123456789abcdef01234567"
+                status_semantics = "implementation_lifecycle"
 
                 [[features]]
                 id = "one"
@@ -371,6 +420,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["featureCount"], 1)
+        self.assertEqual(payload["runtimeStatusCounts"], {})
 
     def test_missing_upstream_commit_is_rejected(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())

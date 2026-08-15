@@ -24,10 +24,13 @@ use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;
+use crate::tools::known_delta_store;
+use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::network_approval::DeferredNetworkApproval;
 use crate::tools::network_approval::finish_deferred_network_approval;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::is_managed_proxy_env_var;
+use crate::tools::runtimes::unified_exec::UnifiedExecLaunch;
 use crate::tools::runtimes::unified_exec::UnifiedExecRequest as UnifiedExecToolRequest;
 use crate::tools::runtimes::unified_exec::UnifiedExecRuntime;
 use crate::tools::sandboxing::SandboxAttempt;
@@ -53,6 +56,7 @@ use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::lagged_output_marker;
 use crate::unified_exec::async_watcher::omitted_output_marker;
+use crate::unified_exec::async_watcher::record_known_delta_from_transcript;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time_for_readiness;
@@ -770,6 +774,16 @@ impl UnifiedExecProcessManager {
                 &mut registration,
             )
             .await;
+        if result.is_err()
+            && let Some(known_delta) = request.known_delta.as_ref()
+        {
+            known_delta_store::record_execution(
+                context.turn.config.codex_home.as_path(),
+                known_delta,
+                KnownDeltaExecutionObservation::CompleteFailure,
+            )
+            .await;
+        }
         if !registration.committed
             && let Err(error) = registration.cleanup().await
         {
@@ -788,20 +802,84 @@ impl UnifiedExecProcessManager {
         registration: &mut PendingProcessRegistration,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
+        let known_delta_executor_started_at = Instant::now();
         let executor_readiness_timing_guard = context
             .turn
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::ExecutorReadinessWait);
-        let process = self
+        let launch = self
             .open_session_with_sandbox(request, cwd.clone(), context, registration.pending_spawns())
             .await;
         drop(executor_readiness_timing_guard);
 
-        let (process, mut deferred_network_approval) = match process {
-            Ok((process, deferred_network_approval)) => (process, deferred_network_approval),
+        let (launch, mut deferred_network_approval) = match launch {
+            Ok((launch, deferred_network_approval)) => (launch, deferred_network_approval),
             Err(err) => {
                 self.release_process_id(request.process_id).await;
                 return Err(err);
+            }
+        };
+        let process = match launch {
+            UnifiedExecLaunch::Process(process) => process,
+            UnifiedExecLaunch::KnownDelta(hit) => {
+                let started_at = Instant::now();
+                let event_ctx = ToolEventCtx::new(
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
+                    &context.call_id,
+                    context.tracker.as_ref(),
+                );
+                let emitter = ToolEmitter::unified_exec(
+                    &request.command_for_safety,
+                    cwd.clone(),
+                    ExecCommandSource::UnifiedExecStartup,
+                    None,
+                    request.turn_environment.environment_id.clone(),
+                );
+                emitter.emit(event_ctx, ToolEventStage::Begin).await;
+                if let Err(message) = finish_deferred_network_approval_for_session(
+                    Some(&context.session),
+                    deferred_network_approval.take(),
+                )
+                .await
+                {
+                    self.release_process_id(request.process_id).await;
+                    return Err(UnifiedExecError::process_failed(message));
+                }
+                let raw_output = hit.rendered_output().as_bytes().to_vec();
+                let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+                transcript.lock().await.push_chunk(raw_output.clone());
+                let wall_time = Instant::now().saturating_duration_since(started_at);
+                emit_exec_end_for_unified_exec(
+                    Arc::clone(&context.session),
+                    Arc::clone(&context.turn),
+                    context.call_id.clone(),
+                    request.command_for_safety.clone(),
+                    cwd,
+                    request.turn_environment.environment_id.clone(),
+                    None,
+                    transcript,
+                    String::new(),
+                    0,
+                    wall_time,
+                    context.tracker.clone(),
+                )
+                .await;
+                self.release_process_id(request.process_id).await;
+                return Ok(ExecCommandToolOutput {
+                    event_call_id: context.call_id.clone(),
+                    chunk_id: generate_chunk_id(),
+                    wall_time,
+                    raw_output,
+                    truncation_policy: context.turn.model_info.truncation_policy.into(),
+                    max_output_tokens: request.max_output_tokens,
+                    process_id: None,
+                    exit_code: Some(0),
+                    original_token_count: Some(approx_token_count(hit.rendered_output())),
+                    hook_command: Some(request.hook_command.clone()),
+                    raw_output_artifact: Some(hit.raw_output_artifact().clone()),
+                    repair_notice: None,
+                });
             }
         };
         registration.attach_process(Arc::clone(&process), deferred_network_approval.clone());
@@ -886,8 +964,14 @@ impl UnifiedExecProcessManager {
                     .ok()
                     .and_then(|mut slot| slot.take()),
                 request.validation_waiter.take(),
+                request.known_delta.clone(),
+                request
+                    .known_delta
+                    .as_ref()
+                    .map(|_| known_delta_executor_started_at),
             )
             .await?;
+            request.known_delta = None;
             Some(InitialExecCommandGuard {
                 active: initial_exec_command_active,
             })
@@ -1071,6 +1155,16 @@ impl UnifiedExecProcessManager {
         }
 
         if response.process_id.is_none() {
+            if let Some(known_delta) = request.known_delta.as_ref() {
+                record_known_delta_from_transcript(
+                    context.turn.config.codex_home.as_path(),
+                    known_delta,
+                    &transcript,
+                    response.exit_code == Some(0) && !process.termination_was_requested(),
+                    Instant::now().saturating_duration_since(known_delta_executor_started_at),
+                )
+                .await;
+            }
             let duration_ms = u64::try_from(response.wall_time.as_millis()).unwrap_or(u64::MAX);
             if let Some(observation) = request
                 .validation_observation
@@ -1369,6 +1463,8 @@ impl UnifiedExecProcessManager {
         validation_observation: Option<crate::validation_admission::ValidationObservationToken>,
         validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
         validation_waiter: Option<crate::validation_admission::ValidationLeader>,
+        known_delta: Option<crate::tools::known_delta_store::PreparedKnownDelta>,
+        known_delta_executor_started_at: Option<Instant>,
     ) -> Result<(), UnifiedExecError> {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
@@ -1444,6 +1540,8 @@ impl UnifiedExecProcessManager {
             validation_observation,
             validation_leader,
             validation_waiter,
+            known_delta,
+            known_delta_executor_started_at,
         );
         registration.commit();
         Ok(())
@@ -1668,7 +1766,7 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         context: &UnifiedExecContext,
         pending_spawns: PendingSpawnRegistration,
-    ) -> Result<(Arc<UnifiedExecProcess>, Option<DeferredNetworkApproval>), UnifiedExecError> {
+    ) -> Result<(UnifiedExecLaunch, Option<DeferredNetworkApproval>), UnifiedExecError> {
         let (env, local_policy_env) = build_unified_exec_environment(context);
         let exec_server_env_config = ExecServerEnvConfig {
             policy: exec_env_policy_from_shell_policy(
@@ -1778,6 +1876,10 @@ impl UnifiedExecProcessManager {
             exec_approval_requirement,
             validation_launch: request.validation_launch.clone(),
             validation_observation: Arc::clone(&request.validation_observation),
+            known_delta_hit: request
+                .known_delta
+                .as_ref()
+                .and_then(|prepared| prepared.hit().cloned()),
         };
         let tool_ctx = ToolCtx {
             session: context.session.clone(),

@@ -121,17 +121,63 @@ declare const tools: { apply_patch(input: string): Promise<unknown>; };
 }
 
 #[test]
-fn tool_spec_to_code_mode_tool_definition_skips_unsupported_variants() {
+fn tool_search_code_mode_declaration_matches_structured_result_contract() {
+    let definition = tool_spec_to_code_mode_tool_definition(&ToolSpec::ToolSearch {
+        execution: "client".to_string(),
+        description: "Search deferred tools.".to_string(),
+        parameters: JsonSchema::object(
+            BTreeMap::from([(
+                "query".to_string(),
+                JsonSchema::string(/*description*/ None),
+            )]),
+            Some(vec!["query".to_string()]),
+            Some(false.into()),
+        ),
+    })
+    .expect("tool_search code-mode definition");
+
+    assert_eq!(definition.name, "tool_search");
+    assert!(definition.description.contains("Inspect `status`"));
+    assert!(definition.description.contains("`aborted`"));
+    assert!(
+        definition
+            .description
+            .contains("type CodeModeToolSearchResult =")
+    );
+    assert!(
+        definition
+            .description
+            .contains("status: \"completed\" | \"incomplete\" | \"aborted\";")
+    );
+    assert!(definition.description.contains("execution: \"client\";"));
+    assert!(definition.description.contains("tools: unknown[];"));
+    assert!(
+        definition
+            .description
+            .contains("omitted_result_count: number | null;")
+    );
+    assert!(
+        definition
+            .description
+            .contains("Promise<CodeModeToolSearchResult>")
+    );
     assert_eq!(
-        tool_spec_to_code_mode_tool_definition(&ToolSpec::ToolSearch {
-            execution: "sync".to_string(),
-            description: "Search".to_string(),
-            parameters: JsonSchema::object(
-                BTreeMap::new(),
-                /*required*/ None,
-                /*additional_properties*/ None
-            ),
+        definition.output_schema,
+        Some(super::code_mode_tool_search_output_schema())
+    );
+}
+
+#[test]
+fn tool_spec_to_code_mode_tool_definition_still_skips_web_search() {
+    assert_eq!(
+        tool_spec_to_code_mode_tool_definition(&ToolSpec::WebSearch {
+            external_web_access: None,
+            indexed_web_access: None,
+            filters: None,
+            user_location: None,
+            search_context_size: None,
+            search_content_types: None,
         }),
-        None
+        None,
     );
 }

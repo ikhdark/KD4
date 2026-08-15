@@ -1,7 +1,8 @@
 use crate::agent::AgentStatus;
 use crate::agent::control::AgentExecutionGuard;
 use crate::config::ConstraintResult;
-use crate::elicitation::ElicitationRegistration;
+use crate::elicitation::OutOfBandElicitationLeaseId;
+use crate::elicitation::OutOfBandElicitationLeases;
 use crate::session::Codex;
 use crate::session::SessionSettingsUpdate;
 use crate::session::SteerInputError;
@@ -53,7 +54,6 @@ use rmcp::model::ReadResourceRequestParams;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::sync::watch;
 
 use codex_rollout::state_db::StateDbHandle;
@@ -67,6 +67,7 @@ pub struct ThreadConfigSnapshot {
     pub approvals_reviewer: ApprovalsReviewer,
     pub permission_profile: PermissionProfile,
     pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub windows_sandbox_level: WindowsSandboxLevel,
     pub environments: TurnEnvironmentSelections,
     pub workspace_roots: Vec<AbsolutePathBuf>,
     pub profile_workspace_roots: Vec<AbsolutePathBuf>,
@@ -165,13 +166,7 @@ pub struct CodexThread {
     pub(crate) session_source: SessionSource,
     session_configured: SessionConfiguredEvent,
     rollout_path: Option<PathBuf>,
-    out_of_band_elicitations: Mutex<OutOfBandElicitations>,
-}
-
-#[derive(Default)]
-struct OutOfBandElicitations {
-    count: i64,
-    registration: Option<ElicitationRegistration>,
+    out_of_band_elicitations: OutOfBandElicitationLeases,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -191,12 +186,14 @@ impl CodexThread {
         rollout_path: Option<PathBuf>,
         session_source: SessionSource,
     ) -> Self {
+        let out_of_band_elicitations =
+            OutOfBandElicitationLeases::new(codex.session.services.elicitations.clone());
         Self {
             codex,
             session_source,
             session_configured,
             rollout_path,
-            out_of_band_elicitations: Mutex::new(OutOfBandElicitations::default()),
+            out_of_band_elicitations,
         }
     }
 
@@ -209,8 +206,52 @@ impl CodexThread {
         self.codex.session.services.session_telemetry.clone()
     }
 
+    pub async fn desktop_activation_obligation(
+        &self,
+    ) -> Option<crate::DesktopActivationObligation> {
+        self.codex
+            .session
+            .services
+            .task_evidence
+            .desktop_activation_obligation()
+            .await
+    }
+
+    pub async fn issue_desktop_activation_challenge(
+        &self,
+        evidence: crate::DesktopPublishInstallEvidenceV1,
+        bootstrap_consumed_at: String,
+    ) -> Result<crate::DesktopActivationChallenge, crate::DesktopActivationVerificationError> {
+        self.codex
+            .session
+            .services
+            .task_evidence
+            .issue_desktop_activation_challenge(evidence, bootstrap_consumed_at)
+            .await
+    }
+
+    pub async fn record_desktop_activation(
+        &self,
+        observation: crate::DesktopActivationRecordObservation,
+    ) -> Result<crate::DesktopActivationRecordResult, crate::DesktopActivationVerificationError>
+    {
+        self.codex
+            .session
+            .services
+            .task_evidence
+            .record_desktop_activation(observation)
+            .await
+    }
+
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
+        self.out_of_band_elicitations.close();
         self.codex.shutdown_and_wait().await
+    }
+
+    /// Submit an irreversible shutdown request without waiting for session termination.
+    pub async fn request_shutdown(&self) -> CodexResult<()> {
+        self.out_of_band_elicitations.close();
+        self.codex.request_shutdown().await
     }
 
     /// Wait until the underlying session loop has terminated.
@@ -257,6 +298,9 @@ impl CodexThread {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
+        if matches!(&op, Op::Shutdown) {
+            self.out_of_band_elicitations.close();
+        }
         let execution_guard = self.reserve_execution_guard(&op).await?;
         self.submit_op_with_execution_guard(
             op,
@@ -368,13 +412,22 @@ impl CodexThread {
         app_server_client_version: Option<String>,
         mcp_elicitations_auto_deny: bool,
     ) -> ConstraintResult<()> {
-        self.codex
+        let app_server_delivery_enabled = app_server_client_name.is_some();
+        let result = self
+            .codex
             .set_app_server_client_info(
                 app_server_client_name,
                 app_server_client_version,
                 mcp_elicitations_auto_deny,
             )
-            .await
+            .await;
+        if result.is_ok() && app_server_delivery_enabled {
+            self.codex
+                .session
+                .resume_pending_terminal_deliveries()
+                .await;
+        }
+        result
     }
 
     pub async fn set_openai_form_elicitation_support(&self, supported: bool) -> anyhow::Result<()> {
@@ -518,6 +571,16 @@ impl CodexThread {
 
     pub async fn next_event(&self) -> CodexResult<Event> {
         self.codex.next_event().await
+    }
+
+    /// Confirms that app-server reduced the authoritative terminal event and handed its client
+    /// notification to the outbound delivery owner.
+    #[doc(hidden)]
+    pub async fn acknowledge_terminal_event(&self, turn_id: &str, fingerprint: &str) -> bool {
+        self.codex
+            .session
+            .acknowledge_terminal_event(turn_id, fingerprint)
+            .await
     }
 
     pub async fn agent_status(&self) -> AgentStatus {
@@ -774,30 +837,21 @@ impl CodexThread {
         self.codex.enabled(feature)
     }
 
-    pub async fn increment_out_of_band_elicitation_count(&self) -> CodexResult<i64> {
-        let mut elicitations = self.out_of_band_elicitations.lock().await;
-        let incremented = elicitations.count.checked_add(1).ok_or_else(|| {
-            CodexErr::Fatal("out-of-band elicitation count overflowed".to_string())
-        })?;
-        if elicitations.count == 0 {
-            elicitations.registration = Some(self.codex.session.services.elicitations.register());
-        }
-        elicitations.count = incremented;
-        Ok(incremented)
+    pub fn acquire_out_of_band_elicitation_lease(
+        &self,
+        lease_id: OutOfBandElicitationLeaseId,
+    ) -> CodexResult<i64> {
+        self.out_of_band_elicitations.acquire(lease_id)
     }
 
-    pub async fn decrement_out_of_band_elicitation_count(&self) -> CodexResult<i64> {
-        let mut elicitations = self.out_of_band_elicitations.lock().await;
-        if elicitations.count == 0 {
-            return Err(CodexErr::InvalidRequest(
-                "out-of-band elicitation count is already zero".to_string(),
-            ));
-        }
+    pub fn release_out_of_band_elicitation_lease(
+        &self,
+        lease_id: &OutOfBandElicitationLeaseId,
+    ) -> i64 {
+        self.out_of_band_elicitations.release(lease_id)
+    }
 
-        elicitations.count -= 1;
-        if elicitations.count == 0 {
-            elicitations.registration = None;
-        }
-        Ok(elicitations.count)
+    pub fn active_out_of_band_elicitation_lease_count(&self) -> i64 {
+        self.out_of_band_elicitations.active_count()
     }
 }

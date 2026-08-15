@@ -1824,13 +1824,19 @@ fn repository_overlay_path_is_excluded(path: &str) -> bool {
 }
 
 fn spawn_repository_overlay_command(root: &Path, args: &[&str]) -> std::io::Result<Child> {
-    Command::new("git")
+    repository_overlay_command(root, args).spawn()
+}
+
+fn repository_overlay_command(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    command
 }
 
 fn collect_repository_files_fallback(
@@ -2660,5 +2666,18 @@ mod overlay_observation_tests {
             "codex-rs/example/build.rs"
         ));
         assert!(!repository_overlay_path_is_excluded("src/targeting.rs"));
+    }
+
+    #[test]
+    fn repository_overlay_commands_do_not_refresh_the_git_index() {
+        let command = repository_overlay_command(Path::new("repo"), &["diff", "--name-only"]);
+
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "GIT_OPTIONAL_LOCKS")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("0"))
+        );
     }
 }

@@ -1184,6 +1184,7 @@ mod tests {
         Event {
             id: turn_id.to_string(),
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: turn_id.to_string(),
                 last_agent_message: last_agent_message.map(str::to_string),
                 error: None,

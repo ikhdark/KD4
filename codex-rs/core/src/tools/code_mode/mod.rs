@@ -135,11 +135,38 @@ impl CodeModeService {
         self.dispatch_broker.close_cell(cell_id);
     }
 
+    pub(crate) fn record_owner_drained_continuation(
+        &self,
+        cell_id: &CellId,
+        continuation: crate::session::reasoning_governor::PendingOwnerDrainedContinuation,
+    ) {
+        self.dispatch_broker
+            .record_continuation(cell_id, continuation);
+    }
+
+    pub(crate) fn owner_drained_continuation_snapshot(
+        &self,
+        owner_key: &str,
+    ) -> Vec<crate::session::reasoning_governor::PendingOwnerDrainedContinuation> {
+        self.dispatch_broker
+            .continuation_snapshot(&CellId::new(owner_key.to_string()))
+    }
+
+    pub(crate) fn acknowledge_owner_drained_continuations(
+        &self,
+        owner_key: &str,
+        accepted: &[codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt],
+    ) {
+        self.dispatch_broker
+            .acknowledge_continuations(&CellId::new(owner_key.to_string()), accepted);
+    }
+
     pub(crate) fn start_turn_worker(
         &self,
         session: &Arc<Session>,
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
+        request_signals: crate::session::reasoning_governor::SamplingRequestSignalCollector,
     ) -> Option<CodeModeDispatchWorker> {
         let turn = &step_context.turn;
         let tool_mode = effective_tool_mode(turn);
@@ -153,7 +180,7 @@ impl CodeModeService {
         };
         Some(
             self.dispatch_broker
-                .start_turn_worker(exec, step_context, tracker),
+                .start_turn_worker(exec, step_context, tracker, request_signals),
         )
     }
 
@@ -206,6 +233,11 @@ fn format_runtime_response(
     original_image_detail_supported: bool,
     started_at: std::time::Instant,
 ) -> FunctionToolOutput {
+    let continuation_owner_key = match &response {
+        RuntimeResponse::Yielded { cell_id, .. }
+        | RuntimeResponse::Terminated { cell_id, .. }
+        | RuntimeResponse::Result { cell_id, .. } => cell_id.to_string(),
+    };
     let script_status = format_script_status(&response);
     let (mut content_items, outcome, success) = match response {
         RuntimeResponse::Yielded { content_items, .. } => {
@@ -241,7 +273,15 @@ fn format_runtime_response(
     let mut content_items =
         truncate_code_mode_result(content_items, max_output_tokens, outcome, hard_limit);
     prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
+    let typed_outcome = match outcome {
+        OutputOutcome::Success => codex_tools::ToolOutputOutcome::Success,
+        OutputOutcome::Failure => codex_tools::ToolOutputOutcome::Failure,
+        OutputOutcome::TimedOut => codex_tools::ToolOutputOutcome::TimedOut,
+        OutputOutcome::Skipped => codex_tools::ToolOutputOutcome::Skipped,
+    };
     FunctionToolOutput::from_content(content_items, Some(success))
+        .with_outcome(typed_outcome)
+        .with_deterministic_continuation_owner_key(continuation_owner_key)
 }
 
 fn format_script_status(response: &RuntimeResponse) -> String {
@@ -310,7 +350,7 @@ fn code_mode_text_content(items: &[FunctionCallOutputContentItem]) -> String {
 }
 
 async fn call_nested_tool(
-    _exec: ExecContext,
+    exec: ExecContext,
     tool_runtime: ToolCallRuntime,
     invocation: CodeModeNestedToolCall,
     cancellation_token: CancellationToken,
@@ -334,11 +374,12 @@ async fn call_nested_tool(
     };
 
     let call = ToolCall {
-        tool_name,
+        tool_name: tool_name.clone(),
         call_id: format!("{PUBLIC_TOOL_NAME}-{}", uuid::Uuid::new_v4()),
-        payload,
+        payload: payload.clone(),
     };
     let result = tool_runtime
+        .clone()
         .handle_tool_call_with_source(
             call,
             ToolCallSource::CodeMode {
@@ -348,7 +389,23 @@ async fn call_nested_tool(
             cancellation_token,
         )
         .await?;
-    Ok(result.code_mode_result())
+    let signal = result.sampling_request_signal();
+    let receipts = result.intrinsic_deterministic_continuation_receipts();
+    if let Some(continuation) = result.owner_drained_continuation() {
+        exec.session
+            .services
+            .code_mode_service
+            .record_owner_drained_continuation(&cell_id, continuation);
+    }
+    let result_value = result.code_mode_result();
+    tool_runtime.record_code_mode_result(
+        &tool_name,
+        &payload,
+        signal.as_ref(),
+        result_value.clone(),
+        &receipts,
+    );
+    Ok(result_value)
 }
 
 fn build_nested_tool_payload(

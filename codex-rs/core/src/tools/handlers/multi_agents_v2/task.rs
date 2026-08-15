@@ -34,6 +34,7 @@ use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::TaskActor;
+use codex_agent_task_store::TaskCapsuleV1;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationProofKind;
@@ -1150,8 +1151,12 @@ const TASK_OUTPUT_INLINE_LIMIT_BYTES: usize = 8 * 1024;
 const MAX_PROJECTED_CHANGED_PATHS: usize = 8;
 const MAX_PROJECTED_PROOF_REFERENCES: usize = 8;
 const MAX_PROJECTED_VALIDATION_CALLS: usize = 8;
+const MAX_PROJECTED_RECENT_OBSERVATIONS: usize = 4;
+const MAX_PROJECTED_OBLIGATIONS_PER_KIND: usize = 4;
 const MAX_PROJECTED_EXACT_STRING_BYTES: usize = 192;
 const MAX_PROJECTED_PROSE_BYTES: usize = 512;
+const MAX_PROJECTED_DETAIL_BYTES: usize = 384;
+const MAX_PREDETERMINED_JSON_POINTERS: usize = 64;
 
 fn bounded_receipt_projection(receipt: &AgentReceipt) -> JsonValue {
     bounded_receipt_projection_with_proof_limit(receipt, MAX_PROJECTED_PROOF_REFERENCES)
@@ -1186,6 +1191,9 @@ fn bounded_receipt_projection_with_proof_limit(
         "assignment_id": receipt.assignment_id,
         "attempt_id": receipt.attempt_id,
         "status": receipt.status,
+        "evidence_epoch": receipt.evidence_epoch,
+        "evidence_manifest_hash": (receipt.evidence_manifest_hash.len() <= MAX_PROJECTED_EXACT_STRING_BYTES).then_some(receipt.evidence_manifest_hash.as_str()),
+        "sealed_at": receipt.sealed_at,
         "proof_references": proof_references,
         "changed_paths": changed_paths,
         "criterion_counts": {
@@ -1221,19 +1229,49 @@ fn bounded_exact_strings<'a>(
 }
 
 fn bounded_prose(value: Option<&str>) -> Option<String> {
+    bounded_prose_to(value, MAX_PROJECTED_PROSE_BYTES)
+}
+
+fn bounded_detail(value: Option<&str>) -> Option<String> {
+    bounded_prose_to(value, MAX_PROJECTED_DETAIL_BYTES)
+}
+
+fn bounded_prose_to(value: Option<&str>, limit: usize) -> Option<String> {
     let value = value?;
-    if value.len() <= MAX_PROJECTED_PROSE_BYTES {
+    if value.len() <= limit {
         return Some(value.to_string());
     }
-    let mut end = MAX_PROJECTED_PROSE_BYTES.saturating_sub(3);
+    let mut end = limit.saturating_sub(3);
     while !value.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
     Some(format!("{}...", &value[..end]))
 }
 
+fn required_evidence_is_satisfied(task: &AgentTask, requirement: &str) -> bool {
+    task.validation_calls.iter().any(|call| {
+        task.receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.validation_call_ids.contains(&call.call_id))
+            && call.command_summary == requirement
+            && call.status == ValidationCallStatus::Succeeded
+            && call.proof_kind == ValidationProofKind::Focused
+            && call.evidence.end_epoch.is_some()
+            && call.evidence.stale_reason.is_none()
+            && call
+                .resolved_executable
+                .as_deref()
+                .is_some_and(|path| Path::new(path).is_absolute())
+    })
+}
+
 fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
     let task = &result.task;
+    let capsule = task
+        .assignment
+        .task_capsule
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<TaskCapsuleV1>(payload).ok());
     let proof_references = task
         .validation_calls
         .iter()
@@ -1254,6 +1292,99 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         .validation_calls
         .len()
         .saturating_sub(proof_references.len());
+    let recent_observation_start = task
+        .observations
+        .len()
+        .saturating_sub(MAX_PROJECTED_RECENT_OBSERVATIONS);
+    let recent_observations = task.observations[recent_observation_start..]
+        .iter()
+        .map(|observation| {
+            json!({
+                "event_id": observation.event_id,
+                "wake_event_id": observation.wake_event_id,
+                "attempt_id": observation.attempt_id,
+                "kind": observation.kind,
+                "summary": bounded_detail(Some(&observation.summary)),
+                "call_id": observation.call_id.as_deref().filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
+                "created_at": observation.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let criteria = task
+        .current_attempt
+        .amendment
+        .as_ref()
+        .and_then(|amendment| amendment.acceptance_criteria.as_deref())
+        .unwrap_or(&task.assignment.acceptance_criteria);
+    let unresolved_criteria = criteria
+        .iter()
+        .filter_map(|criterion| {
+            let status = task.receipt.as_ref().and_then(|receipt| {
+                receipt
+                    .criterion_results
+                    .iter()
+                    .find(|result| result.criterion_id == criterion.id)
+                    .map(|result| result.status)
+            });
+            if status == Some(CriterionStatus::Passed)
+                || criterion.id.len() > MAX_PROJECTED_EXACT_STRING_BYTES
+            {
+                return None;
+            }
+            Some(json!({
+                "id": criterion.id,
+                "status": status,
+                "text": bounded_detail(Some(&criterion.text)),
+            }))
+        })
+        .take(MAX_PROJECTED_OBLIGATIONS_PER_KIND)
+        .collect::<Vec<_>>();
+    let unresolved_criteria_total = criteria
+        .iter()
+        .filter(|criterion| {
+            task.receipt.as_ref().and_then(|receipt| {
+                receipt
+                    .criterion_results
+                    .iter()
+                    .find(|result| result.criterion_id == criterion.id)
+                    .map(|result| result.status)
+            }) != Some(CriterionStatus::Passed)
+        })
+        .count();
+    let unresolved_required_evidence = task
+        .assignment
+        .required_evidence
+        .iter()
+        .enumerate()
+        .filter(|(_, requirement)| !required_evidence_is_satisfied(task, requirement))
+        .map(|(ordinal, requirement)| {
+            json!({
+                "ordinal": ordinal + 1,
+                "requirement": bounded_detail(Some(requirement)),
+            })
+        })
+        .take(MAX_PROJECTED_OBLIGATIONS_PER_KIND)
+        .collect::<Vec<_>>();
+    let unresolved_required_evidence_total = task
+        .assignment
+        .required_evidence
+        .iter()
+        .filter(|requirement| !required_evidence_is_satisfied(task, requirement))
+        .count();
+    let omitted_observations = task
+        .observations
+        .len()
+        .saturating_sub(recent_observations.len());
+    let omitted_acceptance_criteria = criteria.len().saturating_sub(unresolved_criteria.len());
+    let omitted_unresolved_criteria =
+        unresolved_criteria_total.saturating_sub(unresolved_criteria.len());
+    let omitted_required_evidence = task
+        .assignment
+        .required_evidence
+        .len()
+        .saturating_sub(unresolved_required_evidence.len());
+    let omitted_unresolved_required_evidence =
+        unresolved_required_evidence_total.saturating_sub(unresolved_required_evidence.len());
     json!({
         "assignment_id": task.assignment.assignment_id,
         "attempt_id": task.current_attempt.attempt_id,
@@ -1263,17 +1394,34 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
             "kind": gate.kind,
             "status": gate.status,
         })).collect::<Vec<_>>(),
+        "unresolved_gates": task.gates.iter().filter(|gate| !matches!(gate.status, GateStatus::Passed | GateStatus::Waived)).map(|gate| json!({
+            "kind": gate.kind,
+            "status": gate.status,
+            "reason": bounded_detail(Some(&gate.reason)),
+            "evidence_epoch": gate.evidence_epoch,
+        })).collect::<Vec<_>>(),
+        "unresolved_obligations": {
+            "acceptance_criteria": unresolved_criteria,
+            "required_evidence": unresolved_required_evidence,
+        },
+        "recent_observations": recent_observations,
         "receipt": task.receipt.as_ref().map(|receipt| bounded_receipt_projection_with_proof_limit(receipt, 0)),
         "proof_references": proof_references,
         "workspace": {
             "epoch": task.workspace_status.epoch,
+            "current_epoch": task.workspace_status.epoch,
+            "snapshot_epoch": capsule.as_ref().map(|capsule| capsule.workspace_epoch),
+            "snapshot_manifest_hash": capsule.as_ref().map(|capsule| capsule.workspace_manifest_hash.as_str()).filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
             "last_progress_at": task.workspace_status.last_progress_at,
             "lease_state": task.workspace_status.lease_state,
             "next_required_action": bounded_prose(task.workspace_status.next_required_action.as_deref()),
         },
         "omitted_item_counts": {
-            "observations": task.observations.len(),
-            "acceptance_criteria": task.assignment.acceptance_criteria.len(),
+            "observations": omitted_observations,
+            "acceptance_criteria": omitted_acceptance_criteria,
+            "unresolved_acceptance_criteria": omitted_unresolved_criteria,
+            "required_evidence": omitted_required_evidence,
+            "unresolved_required_evidence": omitted_unresolved_required_evidence,
             "read_scope": task.assignment.read_scope.len(),
             "write_scope": task.assignment.write_scope.len(),
             "proof_references": omitted_validation_calls,
@@ -1281,9 +1429,304 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
     })
 }
 
+fn push_predetermined_json_pointer(
+    selectors: &mut Vec<codex_tools::ToolOutputProjectionJsonPointer>,
+    id: impl Into<String>,
+    pointer: impl Into<String>,
+) {
+    if selectors.len() >= MAX_PREDETERMINED_JSON_POINTERS {
+        return;
+    }
+    let id = id.into();
+    let pointer = pointer.into();
+    if selectors
+        .iter()
+        .any(|selector| selector.id == id || selector.pointer == pointer)
+    {
+        return;
+    }
+    selectors.push(codex_tools::ToolOutputProjectionJsonPointer { id, pointer });
+}
+
+fn append_receipt_projection_json_pointers(
+    selectors: &mut Vec<codex_tools::ToolOutputProjectionJsonPointer>,
+    receipt: &AgentReceipt,
+    pointer_prefix: &str,
+    id_prefix: &str,
+    proof_limit: usize,
+) {
+    for (index, _) in receipt.blockers.iter().enumerate() {
+        push_predetermined_json_pointer(
+            selectors,
+            format!("{id_prefix}:blocker:{index}"),
+            format!("{pointer_prefix}/blockers/{index}"),
+        );
+    }
+    for (index, _) in receipt.risks.iter().enumerate() {
+        push_predetermined_json_pointer(
+            selectors,
+            format!("{id_prefix}:risk:{index}"),
+            format!("{pointer_prefix}/risks/{index}"),
+        );
+    }
+    for (index, result) in receipt.criterion_results.iter().enumerate() {
+        if result.status == CriterionStatus::Passed {
+            continue;
+        }
+        push_predetermined_json_pointer(
+            selectors,
+            format!("{id_prefix}:criterion:{}", result.criterion_id),
+            format!("{pointer_prefix}/criterion_results/{index}"),
+        );
+    }
+    if receipt.next_action.is_some() {
+        push_predetermined_json_pointer(
+            selectors,
+            format!("{id_prefix}:next-action"),
+            format!("{pointer_prefix}/next_action"),
+        );
+    }
+    push_predetermined_json_pointer(
+        selectors,
+        format!("{id_prefix}:summary"),
+        format!("{pointer_prefix}/summary"),
+    );
+    for (index, _) in receipt.declared_changes.iter().enumerate() {
+        push_predetermined_json_pointer(
+            selectors,
+            format!("{id_prefix}:declared-change:{index}"),
+            format!("{pointer_prefix}/declared_changes/{index}"),
+        );
+    }
+    let mut retained_proofs = 0_usize;
+    for (index, call_id) in receipt.validation_call_ids.iter().enumerate() {
+        let inline_eligible = call_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES;
+        let retained_inline = inline_eligible && retained_proofs < proof_limit;
+        if retained_inline {
+            retained_proofs = retained_proofs.saturating_add(1);
+        } else {
+            push_predetermined_json_pointer(
+                selectors,
+                format!("{id_prefix}:proof:{call_id}"),
+                format!("{pointer_prefix}/validation_call_ids/{index}"),
+            );
+        }
+    }
+    if receipt.architecture_contract.is_some() {
+        push_predetermined_json_pointer(
+            selectors,
+            format!("{id_prefix}:architecture-contract"),
+            format!("{pointer_prefix}/architecture_contract"),
+        );
+    }
+}
+
+fn receipt_projection_json_pointers(
+    receipt: &AgentReceipt,
+) -> Vec<codex_tools::ToolOutputProjectionJsonPointer> {
+    let mut selectors = Vec::new();
+    append_receipt_projection_json_pointers(
+        &mut selectors,
+        receipt,
+        "/receipt",
+        "receipt",
+        MAX_PROJECTED_PROOF_REFERENCES,
+    );
+    selectors
+}
+
+fn task_projection_json_pointers(
+    result: &GetAgentTaskResult,
+) -> Vec<codex_tools::ToolOutputProjectionJsonPointer> {
+    let task = &result.task;
+    let mut selectors = Vec::new();
+    if let Some(receipt) = task.receipt.as_ref() {
+        for (index, _) in receipt.blockers.iter().enumerate() {
+            push_predetermined_json_pointer(
+                &mut selectors,
+                format!("task-receipt:blocker:{index}"),
+                format!("/task/receipt/blockers/{index}"),
+            );
+        }
+    }
+    for (index, gate) in task.gates.iter().enumerate() {
+        if matches!(gate.status, GateStatus::Passed | GateStatus::Waived) {
+            continue;
+        }
+        push_predetermined_json_pointer(
+            &mut selectors,
+            format!("task:unresolved-gate:{index}"),
+            format!("/task/gates/{index}"),
+        );
+    }
+    let (criteria, criteria_pointer) = task
+        .current_attempt
+        .amendment
+        .as_ref()
+        .and_then(|amendment| amendment.acceptance_criteria.as_deref())
+        .map_or(
+            (
+                task.assignment.acceptance_criteria.as_slice(),
+                "/task/assignment/acceptance_criteria",
+            ),
+            |criteria| {
+                (
+                    criteria,
+                    "/task/current_attempt/amendment/acceptance_criteria",
+                )
+            },
+        );
+    let mut retained_unresolved_criteria = 0_usize;
+    for (index, criterion) in criteria.iter().enumerate() {
+        let passed = task.receipt.as_ref().is_some_and(|receipt| {
+            receipt.criterion_results.iter().any(|result| {
+                result.criterion_id == criterion.id && result.status == CriterionStatus::Passed
+            })
+        });
+        if !passed {
+            let inline_eligible = criterion.id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES;
+            let retained_inline = inline_eligible
+                && retained_unresolved_criteria < MAX_PROJECTED_OBLIGATIONS_PER_KIND;
+            if retained_inline {
+                retained_unresolved_criteria = retained_unresolved_criteria.saturating_add(1);
+            }
+            if !retained_inline || criterion.text.len() > MAX_PROJECTED_DETAIL_BYTES {
+                push_predetermined_json_pointer(
+                    &mut selectors,
+                    format!("task:unresolved-criterion:{}", criterion.id),
+                    format!("{criteria_pointer}/{index}"),
+                );
+            }
+        }
+    }
+    let mut retained_unresolved_evidence = 0_usize;
+    for (index, requirement) in task.assignment.required_evidence.iter().enumerate() {
+        if !required_evidence_is_satisfied(task, requirement) {
+            let retained_inline = retained_unresolved_evidence < MAX_PROJECTED_OBLIGATIONS_PER_KIND;
+            retained_unresolved_evidence = retained_unresolved_evidence.saturating_add(1);
+            if !retained_inline || requirement.len() > MAX_PROJECTED_DETAIL_BYTES {
+                push_predetermined_json_pointer(
+                    &mut selectors,
+                    format!("task:required-evidence:{index}"),
+                    format!("/task/assignment/required_evidence/{index}"),
+                );
+            }
+        }
+    }
+    for (id, pointer) in [
+        ("task:objective", "/task/assignment/objective"),
+        ("task:stop-condition", "/task/assignment/stop_condition"),
+    ] {
+        push_predetermined_json_pointer(&mut selectors, id, pointer);
+    }
+    if task.current_attempt.amendment.is_some() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            "task:active-amendment",
+            "/task/current_attempt/amendment",
+        );
+    }
+    if task
+        .workspace_status
+        .next_required_action
+        .as_ref()
+        .is_some_and(|action| action.len() > MAX_PROJECTED_PROSE_BYTES)
+    {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            "task:next-required-action",
+            "/task/workspace_status/next_required_action",
+        );
+    }
+    for (id_field, json_field, values) in [
+        ("read-scope", "read_scope", task.assignment.read_scope.len()),
+        (
+            "write-scope",
+            "write_scope",
+            task.assignment.write_scope.len(),
+        ),
+        (
+            "dependency",
+            "dependencies",
+            task.assignment.dependencies.len(),
+        ),
+        ("risk-hint", "risk_hints", task.assignment.risk_hints.len()),
+        (
+            "prohibited-change",
+            "prohibited_changes",
+            task.assignment.prohibited_changes.len(),
+        ),
+        (
+            "contract-claim",
+            "contract_claims",
+            task.assignment.contract_claims.len(),
+        ),
+    ] {
+        for index in 0..values {
+            push_predetermined_json_pointer(
+                &mut selectors,
+                format!("task:{id_field}:{index}"),
+                format!("/task/assignment/{json_field}/{index}"),
+            );
+        }
+    }
+    if task.assignment.relation.is_some() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            "task:relationship",
+            "/task/assignment/relation",
+        );
+    }
+    if task.assignment.architecture_contract_ref.is_some() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            "task:architecture-contract-reference",
+            "/task/assignment/architecture_contract_ref",
+        );
+    }
+    if result.cold_review_context.is_some() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            "task:cold-review-context",
+            "/cold_review_context",
+        );
+    }
+    let observation_start = task
+        .observations
+        .len()
+        .saturating_sub(MAX_PROJECTED_RECENT_OBSERVATIONS);
+    for index in observation_start..task.observations.len() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            format!("task:recent-observation:{index}"),
+            format!("/task/observations/{index}"),
+        );
+    }
+    if let Some(receipt) = task.receipt.as_ref() {
+        for (index, call) in task.validation_calls.iter().enumerate() {
+            if receipt.validation_call_ids.contains(&call.call_id) {
+                push_predetermined_json_pointer(
+                    &mut selectors,
+                    format!("task:validation-call:{}", call.call_id),
+                    format!("/task/validation_calls/{index}"),
+                );
+            }
+        }
+        append_receipt_projection_json_pointers(
+            &mut selectors,
+            receipt,
+            "/task/receipt",
+            "task-receipt",
+            0,
+        );
+    }
+    selectors
+}
+
 fn bounded_task_projection_metadata<T: Serialize>(
     full: &T,
     mut essential_inline: JsonValue,
+    predetermined_json_pointers: Vec<codex_tools::ToolOutputProjectionJsonPointer>,
 ) -> Option<codex_tools::ToolOutputProjectionMetadata> {
     let spillable = serde_json::to_string(full).ok()?;
     let inline_bytes = serde_json::to_vec(&essential_inline).ok()?.len();
@@ -1309,6 +1752,7 @@ fn bounded_task_projection_metadata<T: Serialize>(
         essential_inline,
         requested_limit: Some(TASK_OUTPUT_INLINE_LIMIT_BYTES),
         predetermined_ranges: Vec::new(),
+        predetermined_json_pointers,
     })
 }
 
@@ -1370,7 +1814,17 @@ impl ToolOutput for GetAgentTaskResult {
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
-        bounded_task_projection_metadata(self, task_projection(self))
+        bounded_task_projection_metadata(
+            self,
+            task_projection(self),
+            task_projection_json_pointers(self),
+        )
+    }
+
+    fn canonical_result(&self, _payload: &ToolPayload) -> Option<codex_tools::CanonicalToolResult> {
+        serde_json::to_value(self)
+            .ok()
+            .map(codex_tools::CanonicalToolResult::json)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -1392,7 +1846,17 @@ impl ToolOutput for SubmitAgentReceiptResult {
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
-        bounded_task_projection_metadata(self, bounded_receipt_projection(&self.receipt))
+        bounded_task_projection_metadata(
+            self,
+            bounded_receipt_projection(&self.receipt),
+            receipt_projection_json_pointers(&self.receipt),
+        )
+    }
+
+    fn canonical_result(&self, _payload: &ToolPayload) -> Option<codex_tools::CanonicalToolResult> {
+        serde_json::to_value(self)
+            .ok()
+            .map(codex_tools::CanonicalToolResult::json)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -1830,10 +2294,21 @@ fn object_schema<const N: usize>(
 mod projection_tests {
     use super::*;
     use chrono::Utc;
+    use codex_agent_task_store::Assignment;
     use codex_agent_task_store::AttemptId;
+    use codex_agent_task_store::AttemptState;
+    use codex_agent_task_store::CapabilityProfile;
+    use codex_agent_task_store::LeaseState;
+    use codex_agent_task_store::MutationEventId;
+    use codex_agent_task_store::ObservationKind;
+    use codex_agent_task_store::RuntimeObservation;
+    use codex_agent_task_store::ValidationEvidence;
+    use codex_agent_task_store::WakeEventId;
+    use codex_agent_task_store::WorkspaceStrategy;
+    use codex_agent_task_store::WorkspaceTaskStatus;
 
     #[test]
-    fn oversized_receipt_projection_is_hard_bounded_and_spills_full_evidence() {
+    fn oversized_receipt_projection_owner_recovery_is_hard_bounded_and_prioritized() {
         let receipt = AgentReceipt {
             assignment_id: AssignmentId::new(),
             attempt_id: AttemptId::new(),
@@ -1866,9 +2341,12 @@ mod projection_tests {
         let result = SubmitAgentReceiptResult {
             receipt: receipt.clone(),
         };
-        let metadata =
-            bounded_task_projection_metadata(&result, bounded_receipt_projection(&result.receipt))
-                .expect("bounded projection metadata");
+        let metadata = bounded_task_projection_metadata(
+            &result,
+            bounded_receipt_projection(&result.receipt),
+            receipt_projection_json_pointers(&result.receipt),
+        )
+        .expect("bounded projection metadata");
 
         assert!(
             serde_json::to_vec(&metadata.essential_inline)
@@ -1881,6 +2359,15 @@ mod projection_tests {
             serde_json::to_value(receipt.assignment_id).expect("assignment id serializes")
         );
         assert_eq!(metadata.essential_inline["criterion_counts"]["total"], 100);
+        assert_eq!(metadata.essential_inline["evidence_epoch"], 7);
+        assert_eq!(
+            metadata.essential_inline["evidence_manifest_hash"],
+            receipt.evidence_manifest_hash
+        );
+        assert_eq!(
+            metadata.essential_inline["sealed_at"],
+            serde_json::to_value(receipt.sealed_at).expect("sealed timestamp serializes")
+        );
         assert_eq!(
             metadata.essential_inline["omitted_item_counts"]["changed_paths"],
             92
@@ -1892,6 +2379,284 @@ mod projection_tests {
         assert!(
             metadata.spillable_text[0].contains("full durable receipt"),
             "the spill retains the complete canonical receipt"
+        );
+        assert_eq!(
+            metadata.predetermined_json_pointers.len(),
+            MAX_PREDETERMINED_JSON_POINTERS
+        );
+        assert_eq!(
+            metadata.predetermined_json_pointers[0].pointer,
+            "/receipt/blockers/0"
+        );
+        assert_eq!(
+            metadata.predetermined_json_pointers[1].pointer,
+            "/receipt/risks/0"
+        );
+        assert!(
+            metadata
+                .predetermined_json_pointers
+                .iter()
+                .all(|selector| !selector.pointer.starts_with("/receipt/criterion_results/")),
+            "passed criterion evidence stays summarized"
+        );
+        let canonical = result
+            .canonical_result(&ToolPayload::Function {
+                arguments: "{}".to_string(),
+            })
+            .expect("canonical receipt JSON");
+        assert_eq!(canonical.kind, codex_tools::CanonicalToolResultKind::Json);
+        assert!(
+            metadata
+                .predetermined_json_pointers
+                .iter()
+                .all(|selector| canonical.json_pointers.contains_key(&selector.pointer))
+        );
+    }
+
+    #[test]
+    fn agent_snapshot_projection_owner_recovery_prioritizes_actionable_exact_fields() {
+        let assignment_id = AssignmentId::new();
+        let attempt_id = AttemptId::new();
+        let now = Utc::now();
+        let criteria = vec![
+            AcceptanceCriterion {
+                id: "criterion-closed".to_string(),
+                text: "closed criterion".to_string(),
+            },
+            AcceptanceCriterion {
+                id: "criterion-open".to_string(),
+                text: "open criterion".to_string(),
+            },
+        ];
+        let capsule = TaskCapsuleV1 {
+            schema_version: 1,
+            assignment_id,
+            attempt_id,
+            role: AgentRole::Worker,
+            capability_profile: CapabilityProfile::ScopedSourceWrite,
+            requirements: criteria.clone(),
+            objective: "full canonical objective".to_string(),
+            read_scope: Vec::new(),
+            write_scope: Vec::new(),
+            relevant_handles: Vec::new(),
+            workspace_epoch: 11,
+            workspace_manifest_hash: "a".repeat(64),
+            prohibited_changes: Vec::new(),
+            required_evidence: vec![
+                "focused validation one".to_string(),
+                "focused validation two".to_string(),
+            ],
+        };
+        let observations = (0..6)
+            .map(|index| RuntimeObservation {
+                event_id: MutationEventId::new(),
+                wake_event_id: WakeEventId::new(),
+                assignment_id,
+                attempt_id,
+                kind: ObservationKind::Reading,
+                summary: format!("observation-{index}"),
+                call_id: Some(format!("call-{index}")),
+                created_at: now,
+            })
+            .collect::<Vec<_>>();
+        let first_retained_event = observations[2].event_id;
+        let receipt = AgentReceipt {
+            assignment_id,
+            attempt_id,
+            status: AgentStatusClaim::NeedsMain,
+            summary: "terminal receipt".to_string(),
+            criterion_results: vec![
+                CriterionResult {
+                    criterion_id: "criterion-closed".to_string(),
+                    status: CriterionStatus::Passed,
+                    evidence: Some("proof".to_string()),
+                },
+                CriterionResult {
+                    criterion_id: "criterion-open".to_string(),
+                    status: CriterionStatus::NotRun,
+                    evidence: None,
+                },
+            ],
+            declared_changes: Vec::new(),
+            validation_call_ids: vec!["validation-satisfied".to_string()],
+            blockers: Vec::new(),
+            risks: Vec::new(),
+            next_action: Some("finish the open criterion".to_string()),
+            architecture_contract: None,
+            evidence_epoch: 13,
+            evidence_manifest_hash: "b".repeat(64),
+            sealed_at: now,
+        };
+        let result = GetAgentTaskResult {
+            task: AgentTask {
+                assignment: Assignment {
+                    assignment_id,
+                    root_session_id: "root-session".to_string(),
+                    admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
+                    repository_id: "repository".to_string(),
+                    workspace_id: "workspace".to_string(),
+                    role: AgentRole::Worker,
+                    capability_profile: CapabilityProfile::ScopedSourceWrite,
+                    objective: "full canonical objective".to_string(),
+                    acceptance_criteria: criteria,
+                    read_scope: Vec::new(),
+                    write_scope: Vec::new(),
+                    stop_condition: "done".to_string(),
+                    dependencies: Vec::new(),
+                    risk_hints: Vec::new(),
+                    required_evidence: vec![
+                        "focused validation one".to_string(),
+                        "focused validation two".to_string(),
+                    ],
+                    prohibited_changes: Vec::new(),
+                    contract_claims: Vec::new(),
+                    workspace_strategy: WorkspaceStrategy::Shared,
+                    start_epoch: 11,
+                    relation: None,
+                    architecture_contract_ref: None,
+                    task_capsule: Some(
+                        serde_json::to_string(&capsule).expect("task capsule serializes"),
+                    ),
+                    created_at: now,
+                },
+                current_attempt: Attempt {
+                    attempt_id,
+                    assignment_id,
+                    ordinal: 2,
+                    amendment: None,
+                    state: AttemptState::NeedsMain,
+                    created_at: now,
+                    sealed_at: Some(now),
+                },
+                gates: vec![
+                    AgentGate {
+                        assignment_id,
+                        kind: GateKind::Review,
+                        status: GateStatus::Pending,
+                        reason: "review remains open".to_string(),
+                        waiver_reason: None,
+                        evidence_epoch: 12,
+                        updated_at: now,
+                        sealed_at: None,
+                    },
+                    AgentGate {
+                        assignment_id,
+                        kind: GateKind::Verification,
+                        status: GateStatus::Passed,
+                        reason: "verification passed".to_string(),
+                        waiver_reason: None,
+                        evidence_epoch: 12,
+                        updated_at: now,
+                        sealed_at: Some(now),
+                    },
+                ],
+                receipt: Some(receipt),
+                validation_calls: vec![ValidationCall {
+                    call_id: "validation-satisfied".to_string(),
+                    attempt_id,
+                    command_summary: "focused validation one".to_string(),
+                    resolved_executable: Some(r"C:\focused-validation.exe".to_string()),
+                    proof_kind: ValidationProofKind::Focused,
+                    evidence: ValidationEvidence {
+                        end_epoch: Some(13),
+                        ..ValidationEvidence::default()
+                    },
+                    status: ValidationCallStatus::Succeeded,
+                    recorded_at: now,
+                }],
+                workspace_status: WorkspaceTaskStatus {
+                    epoch: 14,
+                    last_progress_at: Some(now),
+                    lease_state: Some(LeaseState::Active),
+                    pending_gates: vec![GateKind::Review],
+                    stale_reason: None,
+                    next_required_action: Some("resolve review".to_string()),
+                    nudge_sent_at: None,
+                },
+                isolation_handoff: None,
+                integration_handoffs: Vec::new(),
+                observations,
+            },
+            cold_review_context: None,
+        };
+        let metadata = bounded_task_projection_metadata(
+            &result,
+            task_projection(&result),
+            task_projection_json_pointers(&result),
+        )
+        .expect("bounded projection metadata");
+        let projection = &metadata.essential_inline;
+
+        assert!(
+            serde_json::to_vec(projection)
+                .expect("inline projection serializes")
+                .len()
+                <= TASK_OUTPUT_INLINE_LIMIT_BYTES
+        );
+        assert_eq!(projection["workspace"]["epoch"], 14);
+        assert_eq!(projection["workspace"]["snapshot_epoch"], 11);
+        assert_eq!(
+            projection["workspace"]["snapshot_manifest_hash"],
+            "a".repeat(64)
+        );
+        assert_eq!(projection["receipt"]["evidence_epoch"], 13);
+        assert_eq!(
+            projection["receipt"]["evidence_manifest_hash"],
+            "b".repeat(64)
+        );
+        assert_eq!(projection["unresolved_gates"].as_array().unwrap().len(), 1);
+        assert_eq!(projection["unresolved_gates"][0]["kind"], "review");
+        assert_eq!(
+            projection["unresolved_obligations"]["acceptance_criteria"][0]["id"],
+            "criterion-open"
+        );
+        assert_eq!(
+            projection["unresolved_obligations"]["required_evidence"][0]["ordinal"],
+            2
+        );
+        assert_eq!(
+            projection["recent_observations"].as_array().unwrap().len(),
+            4
+        );
+        assert_eq!(
+            projection["recent_observations"][0]["event_id"],
+            serde_json::to_value(first_retained_event).expect("event id serializes")
+        );
+        assert_eq!(projection["omitted_item_counts"]["observations"], 2);
+        assert!(
+            metadata.spillable_text[0].contains("full canonical objective"),
+            "the spill retains the full structured task snapshot"
+        );
+        let pointers = metadata
+            .predetermined_json_pointers
+            .iter()
+            .map(|selector| selector.pointer.as_str())
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "/task/gates/0",
+            "/task/assignment/objective",
+            "/task/validation_calls/0",
+            "/task/receipt/criterion_results/1",
+        ] {
+            assert!(pointers.contains(expected), "missing {expected}");
+        }
+        assert!(!pointers.contains("/task/assignment/acceptance_criteria/0"));
+        assert!(!pointers.contains("/task/assignment/acceptance_criteria/1"));
+        assert!(!pointers.contains("/task/assignment/required_evidence/1"));
+        assert!(!pointers.contains("/task/workspace_status/next_required_action"));
+        assert!(!pointers.contains("/task/observations/0"));
+        assert!(!pointers.contains("/task/observations/1"));
+        let canonical = result
+            .canonical_result(&ToolPayload::Function {
+                arguments: "{}".to_string(),
+            })
+            .expect("canonical task JSON");
+        assert_eq!(canonical.kind, codex_tools::CanonicalToolResultKind::Json);
+        assert!(
+            metadata
+                .predetermined_json_pointers
+                .iter()
+                .all(|selector| canonical.json_pointers.contains_key(&selector.pointer))
         );
     }
 }

@@ -4,10 +4,14 @@ sandbox_mode = "danger-full-access"
 allow_login_shell = false
 
 [features]
-task_completion_reviewer = false
+task_completion_reviewer = true
 
-[features.token_budget]
-enabled = false
+[features.rollout_budget]
+enabled = true
+limit_tokens = 1_000_000
+reminder_at_remaining_tokens = [500_000, 250_000, 100_000]
+sampling_token_weight = 1.0
+prefill_token_weight = 1.0
 
 [agents]
 max_depth = 1

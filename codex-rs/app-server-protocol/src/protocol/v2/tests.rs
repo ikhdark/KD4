@@ -42,6 +42,7 @@ use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConfig;
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
 use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
+use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 use codex_protocol::user_input::UserInput as CoreUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -310,7 +311,7 @@ fn thread_list_params_accepts_single_cwd() {
         params.cwd,
         Some(ThreadListCwdFilter::One("/workspace".to_string()))
     );
-    assert!(!params.use_state_db_only);
+    assert_eq!(params.use_state_db_only, None);
 }
 
 #[test]
@@ -336,7 +337,17 @@ fn thread_list_params_accepts_state_db_only_flag() {
     }))
     .expect("state db only flag should deserialize");
 
-    assert!(params.use_state_db_only);
+    assert_eq!(params.use_state_db_only, Some(true));
+}
+
+#[test]
+fn thread_list_params_preserves_explicit_scan_and_repair_flag() {
+    let params = serde_json::from_value::<ThreadListParams>(json!({
+        "useStateDbOnly": false,
+    }))
+    .expect("scan-and-repair flag should deserialize");
+
+    assert_eq!(params.use_state_db_only, Some(false));
 }
 
 #[test]
@@ -346,6 +357,28 @@ fn collab_agent_state_maps_interrupted_status() {
         CollabAgentState {
             status: CollabAgentStatus::Interrupted,
             message: None,
+            surfaced_result: None,
+        }
+    );
+}
+
+#[test]
+fn collab_agent_state_preserves_authoritative_surfaced_result() {
+    let surfaced_result = SurfacedToolResult {
+        adapter: "owner".to_string(),
+        value: json!({"answer": 42}),
+        canonical_message: None,
+    };
+
+    assert_eq!(
+        CollabAgentState::from(CoreAgentStatus::CompletedWithSurface {
+            last_agent_message: None,
+            surfaced_result: surfaced_result.clone(),
+        }),
+        CollabAgentState {
+            status: CollabAgentStatus::Completed,
+            message: None,
+            surfaced_result: Some(surfaced_result),
         }
     );
 }
@@ -2774,6 +2807,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
                 CollabAgentState {
                     status: CollabAgentStatus::Completed,
                     message: None,
+                    surfaced_result: None,
                 },
             )]
             .into_iter()
@@ -4105,6 +4139,28 @@ fn thread_lifecycle_responses_default_missing_optional_fields() {
 }
 
 #[test]
+fn legacy_turn_defaults_terminal_outcome_fields_to_absent() {
+    let turn: Turn = serde_json::from_value(json!({
+        "id": "turn-id",
+        "items": [],
+        "status": "completed",
+        "error": null,
+        "startedAt": null,
+        "completedAt": null,
+        "durationMs": null
+    }))
+    .expect("legacy turn");
+
+    assert_eq!(turn.completion, None);
+    assert_eq!(turn.timing, None);
+    assert_eq!(turn.surfaced_result, None);
+    let serialized = serde_json::to_value(turn).expect("turn serialization");
+    assert!(serialized.get("completion").is_none());
+    assert!(serialized.get("timing").is_none());
+    assert!(serialized.get("surfacedResult").is_none());
+}
+
+#[test]
 fn thread_recency_sort_key_serializes_as_snake_case() {
     assert_eq!(
         serde_json::to_value(ThreadSortKey::RecencyAt).expect("sort key should serialize"),
@@ -4376,5 +4432,50 @@ fn realtime_append_text_defaults_role_to_user() {
             text: "hello".to_string(),
             role: ConversationTextRole::User,
         }
+    );
+}
+
+#[test]
+fn out_of_band_elicitation_lease_uses_an_explicit_token() {
+    let response = ThreadIncrementElicitationResponse {
+        lease_id: "0198a123-4567-7890-abcd-ef0123456789".to_string(),
+        count: 1,
+        paused: true,
+    };
+    assert_eq!(
+        serde_json::to_value(response).expect("response should serialize"),
+        json!({
+            "leaseId": "0198a123-4567-7890-abcd-ef0123456789",
+            "count": 1,
+            "paused": true,
+        })
+    );
+
+    let release: ThreadDecrementElicitationParams = serde_json::from_value(json!({
+        "threadId": "thread-123",
+        "leaseId": "0198a123-4567-7890-abcd-ef0123456789",
+    }))
+    .expect("release should deserialize");
+    assert_eq!(
+        release,
+        ThreadDecrementElicitationParams {
+            thread_id: "thread-123".to_string(),
+            lease_id: "0198a123-4567-7890-abcd-ef0123456789".to_string(),
+        }
+    );
+    assert!(
+        serde_json::from_value::<ThreadDecrementElicitationParams>(json!({
+            "threadId": "thread-123",
+        }))
+        .is_err(),
+        "a release without the server-issued lease token must be rejected"
+    );
+    assert!(
+        serde_json::from_value::<ThreadDecrementElicitationParams>(json!({
+            "threadId": "thread-123",
+            "leaseId": 42,
+        }))
+        .is_err(),
+        "lease tokens must use the server-issued string form"
     );
 }

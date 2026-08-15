@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -35,6 +36,28 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use tokio::sync::Mutex;
 
 const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
+
+async fn run_exec_command_for_test(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<crate::session::turn_context::TurnContext>,
+    call_id: &str,
+    payload: ToolPayload,
+) -> Box<dyn ToolOutput> {
+    ExecCommandHandler::default()
+        .handle(ToolInvocation {
+            session: Arc::clone(session),
+            step_context: StepContext::for_test(Arc::clone(turn)),
+            turn: Arc::clone(turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload,
+        })
+        .await
+        .expect("exec_command test invocation succeeds")
+}
 
 #[test]
 fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
@@ -217,6 +240,181 @@ fn test_get_command_launches_structured_argv_without_shell_wrapping() -> anyhow:
     assert_eq!(resolved.safety_command, resolved.command);
     assert_eq!(resolved.preflight_shell_type, None);
     Ok(())
+}
+
+#[tokio::test]
+async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches() {
+    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
+    assert!(
+        session
+            .features()
+            .enabled(codex_features::Feature::KnownDeltaStore)
+    );
+    #[allow(deprecated)]
+    let repo_root = get_git_repo_root(turn.cwd.as_path()).expect("test cwd is in a git repository");
+    let blob_output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD:codex-rs/core/src/task_evidence.rs"])
+        .current_dir(&repo_root)
+        .output()
+        .expect("resolve committed test blob");
+    assert!(
+        blob_output.status.success(),
+        "git rev-parse failed: {}",
+        String::from_utf8_lossy(&blob_output.stderr)
+    );
+    let blob = String::from_utf8(blob_output.stdout)
+        .expect("blob id is UTF-8")
+        .trim()
+        .to_string();
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "git",
+            "args": ["show", blob.clone()],
+            "yield_time_ms": 10_000,
+        })
+        .to_string(),
+    };
+
+    let ((first, second, third), launches) =
+        crate::tools::runtimes::unified_exec::test_observation::observe(async {
+            let first = run_exec_command_for_test(
+                &session,
+                &turn,
+                "known-delta-unified-first",
+                payload.clone(),
+            )
+            .await;
+            let second = run_exec_command_for_test(
+                &session,
+                &turn,
+                "known-delta-unified-second",
+                payload.clone(),
+            )
+            .await;
+            let third = run_exec_command_for_test(
+                &session,
+                &turn,
+                "known-delta-unified-third",
+                payload.clone(),
+            )
+            .await;
+            (first, second, third)
+        })
+        .await;
+    assert_eq!(launches.process_launches, 2);
+
+    let canonical_text = |output: &dyn ToolOutput| {
+        String::from_utf8(
+            output
+                .canonical_result(&payload)
+                .expect("exec output has canonical bytes")
+                .bytes,
+        )
+        .expect("git show output is UTF-8")
+    };
+    assert!(!canonical_text(first.as_ref()).contains("known-delta cache hit"));
+    assert!(!canonical_text(second.as_ref()).contains("known-delta cache hit"));
+    assert!(canonical_text(third.as_ref()).contains("known-delta cache hit"));
+    let third_code_mode = third.code_mode_result(&payload);
+    assert_eq!(third_code_mode["exit_code"], 0);
+    assert!(third_code_mode.get("session_id").is_none());
+    let second_artifact_id = second.code_mode_result(&payload)["raw_output_artifact_id"]
+        .as_str()
+        .expect("shadow validation has an output artifact")
+        .to_string();
+    let third_artifact_id = third_code_mode["raw_output_artifact_id"]
+        .as_str()
+        .expect("cache hit has a reminted output artifact");
+    assert_ne!(third_artifact_id, second_artifact_id);
+
+    let force_fresh_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "git",
+            "args": ["show", blob],
+            "yield_time_ms": 10_000,
+            "force_fresh": true,
+        })
+        .to_string(),
+    };
+    let (fresh, fresh_launches) =
+        crate::tools::runtimes::unified_exec::test_observation::observe(run_exec_command_for_test(
+            &session,
+            &turn,
+            "known-delta-unified-force-fresh",
+            force_fresh_payload.clone(),
+        ))
+        .await;
+    assert_eq!(fresh_launches.process_launches, 1);
+    let fresh_text = String::from_utf8(
+        fresh
+            .canonical_result(&force_fresh_payload)
+            .expect("fresh exec output has canonical bytes")
+            .bytes,
+    )
+    .expect("fresh git show output is UTF-8");
+    assert!(!fresh_text.contains("known-delta cache hit"));
+
+    let (reused_after_fresh, post_fresh_launches) =
+        crate::tools::runtimes::unified_exec::test_observation::observe(run_exec_command_for_test(
+            &session,
+            &turn,
+            "known-delta-unified-after-fresh",
+            payload.clone(),
+        ))
+        .await;
+    assert_eq!(post_fresh_launches.process_launches, 0);
+    assert!(canonical_text(reused_after_fresh.as_ref()).contains("known-delta cache hit"));
+
+    let expected_call_ids = [
+        "known-delta-unified-first",
+        "known-delta-unified-second",
+        "known-delta-unified-third",
+        "known-delta-unified-force-fresh",
+        "known-delta-unified-after-fresh",
+    ];
+    let mut begin_ids = Vec::new();
+    let mut end_ids = Vec::new();
+    let mut cached_begin_has_process_id = None;
+    let mut cached_end_has_process_id = None;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while begin_ids.len() < expected_call_ids.len() || end_ids.len() < expected_call_ids.len() {
+            let event = rx_event
+                .recv()
+                .await
+                .expect("session event channel remains open");
+            match event.msg {
+                codex_protocol::protocol::EventMsg::ExecCommandBegin(event)
+                    if expected_call_ids.contains(&event.call_id.as_str()) =>
+                {
+                    if event.call_id == "known-delta-unified-third" {
+                        cached_begin_has_process_id = Some(event.process_id.is_some());
+                    }
+                    begin_ids.push(event.call_id);
+                }
+                codex_protocol::protocol::EventMsg::ExecCommandEnd(event)
+                    if expected_call_ids.contains(&event.call_id.as_str()) =>
+                {
+                    if event.call_id == "known-delta-unified-third" {
+                        cached_end_has_process_id = Some(event.process_id.is_some());
+                    }
+                    end_ids.push(event.call_id);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("all unified exec begin/end events arrive");
+    begin_ids.sort();
+    end_ids.sort();
+    let mut expected = expected_call_ids.map(str::to_string).to_vec();
+    expected.sort();
+    assert_eq!(begin_ids, expected);
+    assert_eq!(end_ids, expected);
+    assert_eq!(cached_begin_has_process_id, Some(false));
+    assert_eq!(cached_end_has_process_id, Some(false));
 }
 
 #[test]

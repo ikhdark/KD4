@@ -1174,6 +1174,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                 }
             }
             RolloutItem::ToolManifest(_) => {}
+            RolloutItem::SamplingBoundary(_) => {}
             RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
                 summary
                     .created_at
@@ -1254,6 +1255,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::ToolManifest(_)
+                | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)

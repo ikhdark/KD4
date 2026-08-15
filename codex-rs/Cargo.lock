@@ -2092,6 +2092,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows-sys 0.52.0",
  "wiremock",
 ]
 
@@ -3534,6 +3535,7 @@ dependencies = [
  "shlex",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "wiremock",
@@ -3639,8 +3641,10 @@ dependencies = [
  "http 1.4.0",
  "pretty_assertions",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
+ "url",
  "wiremock",
 ]
 
@@ -4157,6 +4161,7 @@ dependencies = [
  "codex-protocol",
  "codex-rollout",
  "codex-state",
+ "codex-utils-absolute-path",
  "codex-utils-path",
  "pretty_assertions",
  "serde",

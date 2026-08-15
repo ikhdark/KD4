@@ -34,6 +34,16 @@
         },
         "status": {
           "$ref": "#/definitions/CollabAgentStatus"
+        },
+        "surfacedResult": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SurfacedToolResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -517,6 +527,26 @@
         "interrupted"
       ],
       "type": "string"
+    },
+    "SurfacedToolResult": {
+      "description": "Authoritative typed tool result surfaced as the terminal result of a turn. `canonical_message`, when present, is owner-authored and may be copied unchanged into legacy last-message consumers. `value` is never rendered into synthetic assistant prose by the host.",
+      "properties": {
+        "adapter": {
+          "type": "string"
+        },
+        "canonicalMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": true
+      },
+      "required": [
+        "adapter",
+        "value"
+      ],
+      "type": "object"
     },
     "TextElement": {
       "properties": {

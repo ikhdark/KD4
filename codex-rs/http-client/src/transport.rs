@@ -10,6 +10,7 @@ use futures::stream::BoxStream;
 use http::HeaderMap;
 use http::Method;
 use http::StatusCode;
+use http::header::IF_NONE_MATCH;
 use tracing::Level;
 use tracing::enabled;
 use tracing::trace;
@@ -114,13 +115,14 @@ impl HttpTransport for ReqwestTransport {
     async fn execute(&self, req: Request) -> Result<Response, TransportError> {
         self.trace_request(&req);
 
+        let accepts_not_modified = req.headers.contains_key(IF_NONE_MATCH);
         let url = req.url.clone();
         let builder = self.build(req)?;
         let resp = builder.send().await.map_err(Self::map_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let bytes = resp.bytes().await.map_err(Self::map_error)?;
-        if !status.is_success() {
+        if !(status.is_success() || status == StatusCode::NOT_MODIFIED && accepts_not_modified) {
             let body = String::from_utf8(bytes.to_vec()).ok();
             return Err(TransportError::Http {
                 status,

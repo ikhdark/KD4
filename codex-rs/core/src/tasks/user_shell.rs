@@ -91,7 +91,7 @@ impl SessionTask for UserShellCommandTask {
             UserShellCommandMode::StandaloneTurn,
         )
         .await;
-        Ok(None)
+        Ok(super::TurnTaskResult::default())
     }
 }
 

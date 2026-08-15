@@ -552,11 +552,22 @@ pub(super) fn validation_structured_output(value: serde_json::Value) -> Function
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| value.to_string());
-    let success = value
-        .get("success")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let mut output = FunctionToolOutput::from_text(text, Some(success));
+    let execution_outcome = super::ValidationExecutionOutcome::from_value_or_legacy_success(&value);
+    let skip_disposition = value
+        .get("skip_disposition")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let mut output = FunctionToolOutput::from_text(text, execution_outcome.success())
+        .with_outcome(execution_outcome.tool_outcome());
+    if let Some(skip_disposition) = skip_disposition {
+        output = output.with_skip_disposition(skip_disposition);
+    } else if value
+        .get("execution_outcome")
+        .and_then(serde_json::Value::as_str)
+        == Some("not_executed")
+    {
+        output = output.with_outcome(codex_tools::ToolOutputOutcome::Skipped);
+    }
     output.post_tool_use_response = Some(value);
     output
 }

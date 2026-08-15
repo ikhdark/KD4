@@ -879,9 +879,34 @@ impl RequestUserInputOverlay {
     fn submit_answers(&mut self) {
         self.confirm_unanswered = None;
         self.save_current_draft();
+        let answers = self.response_answers(/*committed_only*/ false);
+        self.app_event_tx.user_input_answer(
+            self.request.turn_id.clone(),
+            ToolRequestUserInputResponse {
+                answers: answers.clone(),
+                interrupted: false,
+            },
+        );
+        self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+            history_cell::RequestUserInputResultCell {
+                questions: self.request.questions.clone(),
+                answers,
+                interrupted: false,
+            },
+        )));
+        self.advance_queue_or_complete_at(Instant::now());
+    }
+
+    fn response_answers(
+        &self,
+        committed_only: bool,
+    ) -> HashMap<String, ToolRequestUserInputAnswer> {
         let mut answers = HashMap::new();
         for (idx, question) in self.request.questions.iter().enumerate() {
             let answer_state = &self.answers[idx];
+            if committed_only && !answer_state.answer_committed {
+                continue;
+            }
             let options = question.options.as_ref();
             // For option questions we may still produce no selection.
             let selected_idx =
@@ -910,20 +935,27 @@ impl RequestUserInputOverlay {
                 },
             );
         }
+        answers
+    }
+
+    fn interrupt_with_committed_answers(&mut self) {
+        let answers = self.response_answers(/*committed_only*/ true);
         self.app_event_tx.user_input_answer(
             self.request.turn_id.clone(),
             ToolRequestUserInputResponse {
                 answers: answers.clone(),
+                interrupted: true,
             },
         );
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
             history_cell::RequestUserInputResultCell {
                 questions: self.request.questions.clone(),
                 answers,
-                interrupted: false,
+                interrupted: true,
             },
         )));
-        self.advance_queue_or_complete_at(Instant::now());
+        self.queue.clear();
+        self.done = true;
     }
 
     fn submit_empty_auto_resolution(&mut self, now: Instant) {
@@ -933,6 +965,7 @@ impl RequestUserInputOverlay {
             self.request.turn_id.clone(),
             ToolRequestUserInputResponse {
                 answers: answers.clone(),
+                interrupted: false,
             },
         );
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
@@ -1216,10 +1249,7 @@ impl BottomPaneView for RequestUserInputOverlay {
         }
 
         if self.interrupt_turn_keys.is_pressed(key_event) {
-            // TODO: Emit interrupted request_user_input results (including committed answers)
-            // once core supports persisting them reliably without follow-up turn issues.
-            self.app_event_tx.interrupt();
-            self.done = true;
+            self.interrupt_with_committed_answers();
             return;
         }
 
@@ -1443,10 +1473,7 @@ impl BottomPaneView for RequestUserInputOverlay {
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         if self.confirm_unanswered_active() {
             self.close_unanswered_confirmation();
-            // TODO: Emit interrupted request_user_input results (including committed answers)
-            // once core supports persisting them reliably without follow-up turn issues.
-            self.app_event_tx.interrupt();
-            self.done = true;
+            self.interrupt_with_committed_answers();
             return CancellationEvent::Handled;
         }
         if self.focus_is_notes() && !self.composer.current_text_with_pending().is_empty() {
@@ -1454,10 +1481,7 @@ impl BottomPaneView for RequestUserInputOverlay {
             return CancellationEvent::Handled;
         }
 
-        // TODO: Emit interrupted request_user_input results (including committed answers)
-        // once core supports persisting them reliably without follow-up turn issues.
-        self.app_event_tx.interrupt();
-        self.done = true;
+        self.interrupt_with_committed_answers();
         CancellationEvent::Handled
     }
 
@@ -1533,16 +1557,23 @@ mod tests {
         (AppEventSender::new(tx_raw), rx)
     }
 
-    fn expect_interrupt_only(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
-        let event = rx.try_recv().expect("expected interrupt AppEvent");
+    fn expect_interrupted_answer(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) -> ToolRequestUserInputResponse {
+        let event = rx.try_recv().expect("expected interrupted answer AppEvent");
         let AppEvent::CodexOp(op) = event else {
             panic!("expected CodexOp");
         };
-        assert_eq!(op, Op::interrupt());
+        let Op::UserInputAnswer { response, .. } = op else {
+            panic!("expected UserInputAnswer");
+        };
+        assert!(response.interrupted);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_))));
         assert!(
             rx.try_recv().is_err(),
             "unexpected AppEvents before interrupt completion"
         );
+        response
     }
 
     fn question_with_options(id: &str, header: &str) -> ToolRequestUserInputQuestion {
@@ -1756,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_discards_queued_requests_and_emits_interrupt() {
+    fn interrupt_discards_queued_requests_and_emits_interrupted_answer() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "First")]),
@@ -1783,7 +1814,7 @@ mod tests {
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
 
         assert!(overlay.done, "expected overlay to be done");
-        expect_interrupt_only(&mut rx);
+        assert!(expect_interrupted_answer(&mut rx).answers.is_empty());
     }
 
     #[test]
@@ -2502,7 +2533,7 @@ mod tests {
         overlay.handle_key_event(KeyEvent::from(KeyCode::F(12)));
 
         assert_eq!(overlay.done, true);
-        expect_interrupt_only(&mut rx);
+        assert!(expect_interrupted_answer(&mut rx).answers.is_empty());
     }
 
     #[test]
@@ -2608,7 +2639,7 @@ mod tests {
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
 
         assert_eq!(overlay.done, true);
-        expect_interrupt_only(&mut rx);
+        assert!(expect_interrupted_answer(&mut rx).answers.is_empty());
     }
 
     #[test]
@@ -2625,7 +2656,7 @@ mod tests {
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
 
         assert_eq!(overlay.done, true);
-        expect_interrupt_only(&mut rx);
+        assert!(expect_interrupted_answer(&mut rx).answers.is_empty());
     }
 
     #[test]
@@ -2686,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_drops_committed_answers() {
+    fn esc_persists_only_committed_answers() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event(
@@ -2710,7 +2741,17 @@ mod tests {
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
 
-        expect_interrupt_only(&mut rx);
+        let response = expect_interrupted_answer(&mut rx);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(
+            response
+                .answers
+                .get("q1")
+                .expect("committed answer")
+                .answers,
+            vec!["Option 1".to_string()]
+        );
+        assert!(!response.answers.contains_key("q2"));
     }
 
     #[test]

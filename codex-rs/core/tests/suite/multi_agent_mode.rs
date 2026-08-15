@@ -93,7 +93,7 @@ async fn submit_turn(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ultra_reasoning_uses_max_and_proactive_mode() -> Result<()> {
+async fn ultra_reasoning_uses_max_and_requires_explicit_request() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -122,20 +122,20 @@ async fn ultra_reasoning_uses_max_and_proactive_mode() -> Result<()> {
             count_containing(&texts, NO_SPAWN_TEXT),
             count_containing(&texts, PROACTIVE_TEXT),
         ),
-        (0, 1)
+        (1, 0)
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sol_high_and_xhigh_require_explicit_request() -> Result<()> {
+async fn sol_high_xhigh_and_max_require_explicit_request() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
         &server,
-        (1..=2)
+        (1..=3)
             .map(|index| {
                 sse(vec![
                     ev_response_created(&format!("resp-{index}")),
@@ -153,10 +153,11 @@ async fn sol_high_and_xhigh_require_explicit_request() -> Result<()> {
 
     submit_turn(&test.codex, "high", Some(ReasoningEffort::High)).await?;
     submit_turn(&test.codex, "xhigh", Some(ReasoningEffort::XHigh)).await?;
+    submit_turn(&test.codex, "max", Some(ReasoningEffort::Max)).await?;
 
     let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    for (request, expected_effort) in requests.iter().zip(["high", "xhigh"]) {
+    assert_eq!(requests.len(), 3);
+    for (request, expected_effort) in requests.iter().zip(["high", "xhigh", "max"]) {
         assert_eq!(
             request.body_json()["reasoning"]["effort"].as_str(),
             Some(expected_effort)

@@ -77,6 +77,7 @@ impl RepoFixture {
         };
         let mut assignment = AssignmentDraft {
             root_session_id: "root".to_string(),
+            admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
             role,
             capability_profile: profile,
             objective: "exercise pure capability policy".to_string(),

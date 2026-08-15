@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::reasoning_governor::AuthoritativeWaitOwnerResult;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -56,48 +57,62 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+fn authoritative_wait_result(
+    surfaceable_message: Option<&str>,
+) -> crate::session::reasoning_governor::AuthoritativeWaitOwnerResult {
+    crate::session::reasoning_governor::AuthoritativeWaitOwnerResult {
+        adapter: "code_mode_cell".to_string(),
+        value: serde_json::json!("arbitrary raw execution output"),
+        surfaceable_message: surfaceable_message.map(ToOwned::to_owned),
+    }
+}
+
 #[test]
-fn kd4_stateless_dispatch_uses_local_occupancy_authoritatively() {
+fn authoritative_wait_terminal_surface_requires_explicit_owner_projection() {
+    let without_projection = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::SurfaceExistingResult,
+        authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
+            authoritative_wait_result(None),
+        )),
+        ..Default::default()
+    };
     assert_eq!(
-        effective_provider_occupancy_for_dispatch(60_000, None, None, None),
-        Some((60_000, "full_request_local_authoritative"))
+        authoritative_wait_terminal_surface(&without_projection),
+        Some(SurfacedToolResult {
+            adapter: "code_mode_cell".to_string(),
+            value: serde_json::json!("arbitrary raw execution output"),
+            canonical_message: None,
+        }),
+        "raw code-mode output must not become last_agent_message"
+    );
+
+    let with_projection = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::SurfaceExistingResult,
+        authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
+            authoritative_wait_result(Some("owner-designated completion")),
+        )),
+        ..Default::default()
+    };
+    assert_eq!(
+        authoritative_wait_terminal_surface(&with_projection),
+        Some(SurfacedToolResult {
+            adapter: "code_mode_cell".to_string(),
+            value: serde_json::json!("arbitrary raw execution output"),
+            canonical_message: Some("owner-designated completion".to_string()),
+        })
     );
 }
 
 #[test]
-fn kd4_continuation_dispatch_never_hides_provider_baseline_occupancy() {
-    assert_eq!(
-        effective_provider_occupancy_for_dispatch(60_000, Some(7), Some(81_000), Some(55_000)),
-        Some((86_000, "server_baseline_plus_known_request_delta"))
-    );
-    assert_eq!(
-        effective_provider_occupancy_for_dispatch(90_000, Some(7), Some(70_000), Some(80_000)),
-        Some((90_000, "server_baseline_plus_known_request_delta"))
-    );
-}
-
-#[test]
-fn kd4_continuation_dispatch_requires_rebase_when_baseline_is_missing() {
-    assert_eq!(
-        effective_provider_occupancy_for_dispatch(60_000, Some(7), None, Some(55_000)),
-        None
-    );
-    assert_eq!(
-        effective_provider_occupancy_for_dispatch(60_000, Some(7), Some(75_000), None),
-        None
-    );
-    assert_eq!(
-        effective_provider_occupancy_for_dispatch(60_000, None, None, None),
-        Some((60_000, "full_request_local_authoritative"))
-    );
-}
-
-#[test]
-fn kd4_compaction_requires_real_post_compaction_headroom() {
-    assert!(kd4_compaction_created_meaningful_headroom(64_000));
-    assert!(!kd4_compaction_created_meaningful_headroom(64_001));
-    assert!(!kd4_compaction_created_meaningful_headroom(68_500));
-    assert!(!kd4_compaction_created_meaningful_headroom(72_000));
+fn blocked_authoritative_wait_never_enters_terminal_surface() {
+    let blocked = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::ModelRequired,
+        authoritative_wait: Some(AuthoritativeWaitResolution::Blocked(
+            authoritative_wait_result(Some("must not surface")),
+        )),
+        ..Default::default()
+    };
+    assert_eq!(authoritative_wait_terminal_surface(&blocked), None);
 }
 
 fn run_turn_multi_thread_test_with_stack<F, Fut, T>(test_name: &'static str, test: F) -> T
@@ -186,7 +201,7 @@ impl SessionTask for SignalCompletingTask {
             _ = self.finish.cancelled() => {}
             _ = cancellation_token.cancelled() => {}
         }
-        Ok(None)
+        Ok(crate::tasks::TurnTaskResult::default())
     }
 }
 
@@ -1076,10 +1091,12 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() ->
         client_id: None,
     }];
     let cancellation_token = CancellationToken::new();
+    let planning_generation = session.services.planning_generation();
     let PendingTurnPlanBuild::Ready(plan) = build_pure_pending_turn_plan(
         &session,
         Arc::clone(&step_context),
         &input,
+        planning_generation,
         &cancellation_token,
     )
     .await?
@@ -1122,6 +1139,237 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() ->
         }),
         "the advertised router must be built from the seeded StepContext inventory; expected namespace {SNAPSHOT_TOOL_NAMESPACE:?}, got {router_tool_names:?}"
     );
+    Ok(())
+}
+
+fn wait_for_concurrent_state_attempt(attempted: &std::sync::atomic::AtomicBool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !attempted.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        attempted.load(Ordering::Acquire),
+        "concurrent state attempt did not start"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_plan_commit_and_invalidation_share_the_session_state_owner() {
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let stale_generation = session.services.planning_generation();
+    let history_before = session.clone_history().await.into_raw_items();
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .pending_context_baseline()
+            .is_none()
+    );
+
+    // Invalidation owns SessionState first. The pending commit cannot perform
+    // its final comparison until after generation N has been invalidated.
+    let commit = {
+        let mut state_owner = session.state.lock().await;
+        let commit_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let commit_attempted_task = Arc::clone(&commit_attempted);
+        let commit_session = Arc::clone(&session);
+        let commit_step_context = Arc::clone(&step_context);
+        let commit = tokio::spawn(async move {
+            commit_attempted_task.store(true, Ordering::Release);
+            commit_session
+                .compare_and_record_context_updates(commit_step_context.as_ref(), stale_generation)
+                .await
+        });
+        wait_for_concurrent_state_attempt(&commit_attempted);
+        assert!(!commit.is_finished());
+        session
+            .services
+            .advance_planning_generation(&mut state_owner);
+        commit
+    };
+    assert!(commit.await.expect("commit task completed").is_none());
+    assert_eq!(
+        session.clone_history().await.into_raw_items(),
+        history_before
+    );
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .pending_context_baseline()
+            .is_none()
+    );
+
+    // Prepare a real context candidate, then replay the exact synchronous
+    // compare-and-commit primitive while retaining SessionState ownership.
+    let current_generation = session.services.planning_generation();
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    assert!(
+        session
+            .compare_and_record_context_updates(step_context.as_ref(), current_generation)
+            .await
+            .is_some()
+    );
+    let invalidation = {
+        let mut state_owner = session.state.lock().await;
+        let candidate = state_owner
+            .pending_context_baseline()
+            .expect("successful context commit stages its baseline");
+        state_owner.clear_pending_context_baseline();
+        let marker = ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: Vec::new(),
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let history_len_before_commit = state_owner.clone_history().into_raw_items().len();
+        let invalidation_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invalidation_attempted_task = Arc::clone(&invalidation_attempted);
+        let invalidation_session = Arc::clone(&session);
+        let invalidation = tokio::spawn(async move {
+            invalidation_attempted_task.store(true, Ordering::Release);
+            let mut state_owner = invalidation_session.state.lock().await;
+            invalidation_session
+                .services
+                .advance_planning_generation(&mut state_owner)
+        });
+        wait_for_concurrent_state_attempt(&invalidation_attempted);
+        assert!(!invalidation.is_finished());
+
+        assert!(
+            session
+                .compare_and_commit_planning_state(
+                    &mut state_owner,
+                    Some(current_generation),
+                    |state| {
+                        state.record_items(
+                            std::iter::once(&marker),
+                            turn_context.model_info.truncation_policy.into(),
+                        );
+                        state.stage_context_baseline(candidate);
+                    },
+                )
+                .is_some()
+        );
+        assert_eq!(
+            state_owner.clone_history().into_raw_items().len(),
+            history_len_before_commit + 1
+        );
+        assert!(state_owner.pending_context_baseline().is_some());
+        assert!(!invalidation.is_finished());
+        invalidation
+    };
+
+    let next_generation = invalidation.await.expect("invalidation task completed");
+    assert!(next_generation > current_generation);
+}
+
+#[tokio::test]
+async fn realized_context_commits_only_the_bound_physical_attempt() {
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    session
+        .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+        .await;
+
+    assert!(
+        session
+            .bind_context_baseline_candidate("request-1", "attempt-1")
+            .await
+    );
+    assert!(
+        session
+            .bind_context_baseline_candidate("request-1", "attempt-2")
+            .await
+    );
+    assert!(
+        !session
+            .commit_context_baseline_candidate("request-1", "attempt-1")
+            .await
+            .expect("stale attempt must be ignored")
+    );
+    assert!(session.reference_context_item().await.is_none());
+
+    assert!(
+        session
+            .commit_context_baseline_candidate("request-1", "attempt-2")
+            .await
+            .expect("matching attempt commits")
+    );
+    let realized = session
+        .reference_context_item()
+        .await
+        .expect("matching accepted attempt realizes context");
+    let provenance = realized
+        .context_provenance
+        .expect("realized context records accepted attempt provenance");
+    assert_eq!(provenance.accepted_attempt.sampling_request_id, "request-1");
+    assert_eq!(provenance.accepted_attempt.physical_attempt_id, "attempt-2");
+    assert!(!provenance.fragment_digests.is_empty());
+    assert!(
+        !session
+            .commit_context_baseline_candidate("request-1", "attempt-2")
+            .await
+            .expect("duplicate Created must be ignored")
+    );
+}
+
+#[tokio::test]
+async fn pending_plan_rebuilds_after_generation_changes_during_planning() -> Result<()> {
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let history_before = session.clone_history().await.into_raw_items();
+    let planning_generation = session.services.planning_generation();
+    let stale_step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    {
+        let mut state_owner = session.state.lock().await;
+        session
+            .services
+            .advance_planning_generation(&mut state_owner);
+    }
+
+    let build = build_pure_pending_turn_plan(
+        &session,
+        stale_step_context,
+        &[],
+        planning_generation,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert!(matches!(build, PendingTurnPlanBuild::Stale));
+    assert_eq!(
+        session.clone_history().await.into_raw_items(),
+        history_before
+    );
+
+    let rebuilt_generation = session.services.planning_generation();
+    let rebuilt_step_context = session.capture_step_context(turn_context).await;
+    let rebuilt = build_pure_pending_turn_plan(
+        &session,
+        rebuilt_step_context,
+        &[],
+        rebuilt_generation,
+        &CancellationToken::new(),
+    )
+    .await?;
+    let PendingTurnPlanBuild::Ready(rebuilt) = rebuilt else {
+        panic!("a plan rebuilt from the current generation should be ready");
+    };
+    assert_eq!(rebuilt.planning_generation, rebuilt_generation);
     Ok(())
 }
 
@@ -1680,4 +1928,43 @@ async fn dropping_in_flight_collection_aborts_eager_tool_work() {
     dropped_rx
         .await
         .expect("dropping the collection must abort, not detach, eager work");
+}
+#[test]
+fn terminal_surface_preserves_typed_owner_result_without_json_message_synthesis() {
+    let value = serde_json::json!({"status": "complete", "nested": {"answer": 42}});
+    let decision = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::SurfaceExistingResult,
+        authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
+            AuthoritativeWaitOwnerResult {
+                adapter: "owner_adapter".to_string(),
+                value: value.clone(),
+                surfaceable_message: None,
+            },
+        )),
+        ..Default::default()
+    };
+
+    let surfaced = authoritative_wait_terminal_surface(&decision).expect("typed surface");
+    assert_eq!(surfaced.adapter, "owner_adapter");
+    assert_eq!(surfaced.value, value);
+    assert_eq!(surfaced.canonical_message, None);
+}
+
+#[test]
+fn terminal_surface_preserves_owner_canonical_message_exactly() {
+    let canonical = "  owner-authored completion\n";
+    let decision = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::SurfaceExistingResult,
+        authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
+            AuthoritativeWaitOwnerResult {
+                adapter: "owner_adapter".to_string(),
+                value: serde_json::json!({"message": "different structured value"}),
+                surfaceable_message: Some(canonical.to_string()),
+            },
+        )),
+        ..Default::default()
+    };
+
+    let surfaced = authoritative_wait_terminal_surface(&decision).expect("typed surface");
+    assert_eq!(surfaced.canonical_message.as_deref(), Some(canonical));
 }

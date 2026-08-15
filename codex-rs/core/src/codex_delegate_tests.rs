@@ -627,6 +627,7 @@ async fn delegated_mcp_guardian_abort_returns_synthetic_decline_answer() {
                     answers: vec![MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC.to_string()],
                 },
             )]),
+            interrupted: false,
         })
     );
 }

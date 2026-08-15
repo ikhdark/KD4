@@ -76,6 +76,9 @@ pub(super) fn server_notification_thread_target(
         }
         ServerNotification::HookStarted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::TurnCompleted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::TurnTerminalizationCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::HookCompleted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::TurnDiffUpdated(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::TurnPlanUpdated(notification) => Some(notification.thread_id.as_str()),
@@ -206,12 +209,16 @@ mod tests {
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::ThreadSettings;
     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+    use codex_app_server_protocol::TurnTerminalizationCompletedNotification;
     use codex_app_server_protocol::WarningNotification;
     use codex_protocol::ThreadId;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
     use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::TerminalizationDeliveryState;
+    use codex_protocol::protocol::TerminalizationRecoveryState;
+    use codex_protocol::protocol::TurnTerminalizationReceipt;
     use pretty_assertions::assert_eq;
 
     fn test_thread_settings() -> ThreadSettings {
@@ -320,6 +327,30 @@ mod tests {
                 thread_id: thread_id.to_string(),
                 thread_settings: test_thread_settings(),
             });
+
+        let target = server_notification_thread_target(&notification);
+
+        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn terminalization_completed_notifications_route_to_threads() {
+        let thread_id = ThreadId::new();
+        let notification = ServerNotification::TurnTerminalizationCompleted(
+            TurnTerminalizationCompletedNotification {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn".to_string(),
+                receipt: TurnTerminalizationReceipt {
+                    terminal_identity: format!("{thread_id}:turn"),
+                    terminalization: Default::default(),
+                    delivery_state: TerminalizationDeliveryState::Delivered,
+                    active_turn_detached: true,
+                    terminal_interaction_released: true,
+                    recovery_state: TerminalizationRecoveryState::None,
+                    deadline_exhausted_phase: None,
+                },
+            },
+        );
 
         let target = server_notification_thread_target(&notification);
 

@@ -606,16 +606,19 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         internal_chat_message_metadata_passthrough: None,
     })?
     .expect("function_call should produce a tool call");
+    let terminal_outcome_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let result = router
-        .dispatch_tool_call_with_code_mode_result(
+        .dispatch_tool_call_with_terminal_outcome(
             Arc::new(session),
             step_context,
             CancellationToken::new(),
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call,
             ToolCallSource::Direct,
+            Arc::clone(&terminal_outcome_reached),
         )
         .await?;
+    assert!(terminal_outcome_reached.load(std::sync::atomic::Ordering::Acquire));
 
     let response = result.into_response();
     match response {

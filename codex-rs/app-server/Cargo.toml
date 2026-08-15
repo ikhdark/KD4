@@ -111,6 +111,7 @@ uuid = { workspace = true, features = ["serde", "v7"] }
 
 [target.'cfg(windows)'.dependencies]
 codex-windows-sandbox = { workspace = true }
+windows-sys = { version = "0.52", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 app_test_support = { workspace = true }

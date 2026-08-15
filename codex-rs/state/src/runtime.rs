@@ -16,7 +16,6 @@ use crate::SortKey;
 use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
-use crate::apply_rollout_item;
 use crate::migrations::ensure_kd4_compatibility_indexes;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::migrations::runtime_goals_migrator;

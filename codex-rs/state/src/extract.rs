@@ -1,10 +1,11 @@
 use crate::model::ThreadMetadata;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::persisted_thread_settings::PersistedThreadSettingsReducer;
+use codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMetaLine;
-use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::strip_user_message_prefix;
 use codex_protocol::protocol::user_message_preview;
@@ -17,18 +18,54 @@ pub fn apply_rollout_item(
     item: &RolloutItem,
     default_provider: &str,
 ) {
+    apply_non_setting_rollout_item(metadata, item);
+    let item_belongs_to_thread = !matches!(
+        item,
+        RolloutItem::SessionMeta(meta_line) if meta_line.meta.id != metadata.id
+    );
+    if item_belongs_to_thread {
+        apply_persisted_thread_settings(metadata, item);
+    }
+    if metadata.model_provider.is_empty() {
+        metadata.model_provider = default_provider.to_string();
+    }
+}
+
+/// Apply a rollout batch while reducing persistent settings across the whole
+/// supplied history prefix in order.
+pub fn apply_rollout_items(
+    metadata: &mut ThreadMetadata,
+    items: &[RolloutItem],
+    default_provider: &str,
+) {
+    let mut settings_reducer = PersistedThreadSettingsReducer::default();
+    for item in items {
+        apply_non_setting_rollout_item(metadata, item);
+        if !matches!(
+            item,
+            RolloutItem::SessionMeta(meta_line) if meta_line.meta.id != metadata.id
+        ) {
+            settings_reducer.apply_item(item);
+        }
+    }
+    apply_reduced_persisted_thread_settings(metadata, settings_reducer.into_settings());
+    if metadata.model_provider.is_empty() {
+        metadata.model_provider = default_provider.to_string();
+    }
+}
+
+fn apply_non_setting_rollout_item(metadata: &mut ThreadMetadata, item: &RolloutItem) {
     match item {
         RolloutItem::SessionMeta(meta_line) => apply_session_meta_from_item(metadata, meta_line),
-        RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
+        RolloutItem::TurnContext(_) => {}
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
-        RolloutItem::Compacted(_) | RolloutItem::ToolManifest(_) => {}
+        RolloutItem::Compacted(_)
+        | RolloutItem::ToolManifest(_)
+        | RolloutItem::SamplingBoundary(_) => {}
         RolloutItem::WorldState(_) => {}
-    }
-    if metadata.model_provider.is_empty() {
-        metadata.model_provider = default_provider.to_string();
     }
 }
 
@@ -37,7 +74,10 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
     match item {
         RolloutItem::SessionMeta(_) | RolloutItem::TurnContext(_) => true,
         RolloutItem::EventMsg(
-            EventMsg::TokenCount(_) | EventMsg::UserMessage(_) | EventMsg::ThreadGoalUpdated(_),
+            EventMsg::TokenCount(_)
+            | EventMsg::UserMessage(_)
+            | EventMsg::ThreadGoalUpdated(_)
+            | EventMsg::ThreadSettingsApplied(_),
         ) => true,
         RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
             if matches!(event.item, TurnItem::UserMessage(_)) =>
@@ -50,6 +90,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::SamplingBoundary(_)
         | RolloutItem::WorldState(_) => false,
     }
 }
@@ -83,15 +124,33 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     }
 }
 
-fn apply_turn_context(metadata: &mut ThreadMetadata, turn_ctx: &TurnContextItem) {
-    if metadata.cwd.as_os_str().is_empty() {
-        metadata.cwd = turn_ctx.cwd.clone().into_path_buf();
+fn apply_persisted_thread_settings(metadata: &mut ThreadMetadata, item: &RolloutItem) {
+    let settings = reduce_persisted_thread_settings(std::slice::from_ref(item), Default::default());
+    apply_reduced_persisted_thread_settings(metadata, settings);
+}
+
+fn apply_reduced_persisted_thread_settings(
+    metadata: &mut ThreadMetadata,
+    settings: codex_protocol::persisted_thread_settings::PersistedThreadSettings,
+) {
+    if let Some(model_provider_id) = settings.model_provider_id {
+        metadata.model_provider = model_provider_id;
     }
-    metadata.model = Some(turn_ctx.model.clone());
-    metadata.reasoning_effort = turn_ctx.effort.clone();
-    metadata.sandbox_policy =
-        serde_json::to_string(&turn_ctx.permission_profile()).unwrap_or_default();
-    metadata.approval_mode = enum_to_string(&turn_ctx.approval_policy);
+    if let Some(model) = settings.model {
+        metadata.model = Some(model);
+    }
+    if let Some(reasoning_effort) = settings.reasoning_effort {
+        metadata.reasoning_effort = reasoning_effort;
+    }
+    if let Some(environments) = settings.environments {
+        metadata.cwd = environments.legacy_fallback_cwd.into_path_buf();
+    }
+    if let Some(permission_profile) = settings.permission_profile {
+        metadata.sandbox_policy = serde_json::to_string(&permission_profile).unwrap_or_default();
+    }
+    if let Some(approval_policy) = settings.approval_policy {
+        metadata.approval_mode = enum_to_string(&approval_policy);
+    }
 }
 
 fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
@@ -174,7 +233,10 @@ mod tests {
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+    use codex_protocol::protocol::ThreadSettingsSnapshot;
     use codex_protocol::protocol::TurnContextItem;
+    use codex_protocol::protocol::TurnEnvironmentSelections;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::UserInput;
@@ -331,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_context_does_not_override_session_cwd() {
+    fn turn_context_updates_effective_thread_cwd() {
         let mut metadata = metadata_for_test();
         metadata.cwd = PathBuf::new();
         let thread_id = metadata.id;
@@ -368,16 +430,15 @@ mod tests {
             }),
             "test-provider",
         );
+        let turn_cwd = std::env::current_dir()
+            .expect("current directory")
+            .join("parent/workspace");
         apply_rollout_item(
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
-                cwd: serde_json::from_value(serde_json::json!(
-                    std::env::current_dir()
-                        .expect("current directory")
-                        .join("parent/workspace")
-                ))
-                .expect("absolute parent cwd"),
+                cwd: serde_json::from_value(serde_json::json!(&turn_cwd))
+                    .expect("absolute parent cwd"),
                 workspace_roots: None,
                 current_date: None,
                 timezone: None,
@@ -395,12 +456,13 @@ mod tests {
                 multi_agent_mode: None,
                 realtime_active: None,
                 effort: None,
+                context_provenance: None,
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
             "test-provider",
         );
 
-        assert_eq!(metadata.cwd, PathBuf::from("/child/worktree"));
+        assert_eq!(metadata.cwd, turn_cwd);
         let permission_profile: PermissionProfile = PermissionProfile::Disabled;
         assert_eq!(
             metadata.sandbox_policy,
@@ -441,11 +503,70 @@ mod tests {
                 multi_agent_mode: None,
                 realtime_active: None,
                 effort: None,
+                context_provenance: None,
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
             "test-provider",
         );
 
+        assert_eq!(
+            metadata.sandbox_policy,
+            serde_json::to_string(&permission_profile).expect("serialize permission profile")
+        );
+    }
+
+    #[test]
+    fn thread_settings_event_updates_sqlite_metadata_projection() {
+        let mut metadata = metadata_for_test();
+        let environments: TurnEnvironmentSelections = serde_json::from_value(serde_json::json!({
+            "legacy_fallback_cwd": std::env::current_dir()
+                .expect("current directory")
+                .join("settings-cwd"),
+            "environments": [],
+        }))
+        .expect("settings environments");
+        let cwd = environments.legacy_fallback_cwd.clone();
+        let permission_profile = PermissionProfile::workspace_write();
+        let item = RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+            ThreadSettingsAppliedEvent {
+                thread_settings: ThreadSettingsSnapshot {
+                    model: "persisted-model".to_string(),
+                    model_provider_id: "persisted-provider".to_string(),
+                    service_tier: Some(Some("flex".to_string())),
+                    approval_policy: AskForApproval::Never,
+                    approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::AutoReview,
+                    permission_profile: permission_profile.clone(),
+                    active_permission_profile: Some(None),
+                    environments: Some(environments),
+                    workspace_roots: Some(vec![cwd.clone()]),
+                    profile_workspace_roots: Some(Vec::new()),
+                    sandbox_policy: Some(SandboxPolicy::new_workspace_write_policy()),
+                    windows_sandbox_level: Some(
+                        codex_protocol::config_types::WindowsSandboxLevel::Disabled,
+                    ),
+                    cwd: cwd.clone(),
+                    reasoning_effort: Some(Some(ReasoningEffort::High)),
+                    reasoning_summary: Some(None),
+                    personality: Some(None),
+                    collaboration_mode: codex_protocol::config_types::CollaborationMode {
+                        mode: codex_protocol::config_types::ModeKind::Default,
+                        settings: codex_protocol::config_types::Settings {
+                            model: "persisted-model".to_string(),
+                            reasoning_effort: Some(ReasoningEffort::High),
+                            developer_instructions: None,
+                        },
+                    },
+                },
+            },
+        ));
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(metadata.model.as_deref(), Some("persisted-model"));
+        assert_eq!(metadata.model_provider, "persisted-provider");
+        assert_eq!(metadata.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(metadata.cwd, cwd.into_path_buf());
+        assert_eq!(metadata.approval_mode, "never");
         assert_eq!(
             metadata.sandbox_policy,
             serde_json::to_string(&permission_profile).expect("serialize permission profile")
@@ -483,6 +604,7 @@ mod tests {
                 multi_agent_mode: None,
                 realtime_active: None,
                 effort: Some(ReasoningEffort::High),
+                context_provenance: None,
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
             "test-provider",
@@ -522,6 +644,7 @@ mod tests {
                 multi_agent_mode: None,
                 realtime_active: None,
                 effort: Some(ReasoningEffort::High),
+                context_provenance: None,
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
             "test-provider",

@@ -46,9 +46,32 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
         client_version: &'a str,
         http_client_factory: HttpClientFactory,
     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>>;
+
+    fn list_models_conditional<'a>(
+        &'a self,
+        client_version: &'a str,
+        http_client_factory: HttpClientFactory,
+        _etag: Option<&'a str>,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsFetchResult>> {
+        Box::pin(async move {
+            let (models, etag) = self
+                .list_models(client_version, http_client_factory)
+                .await?;
+            Ok(ModelsFetchResult::Modified { models, etag })
+        })
+    }
 }
 
 pub type ModelsEndpointFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Debug)]
+pub enum ModelsFetchResult {
+    Modified {
+        models: Vec<ModelInfo>,
+        etag: Option<String>,
+    },
+    NotModified,
+}
 
 /// Strategy for refreshing available models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +101,12 @@ impl fmt::Display for RefreshStrategy {
 }
 
 type SharedModelsEndpointClient = Arc<dyn ModelsEndpointClient>;
+
+/// Resolves the complete provider/auth/account identity used by the disk cache.
+///
+/// The resolver is evaluated for every cache operation so an account or
+/// workspace switch cannot keep using the identity captured at construction.
+pub type ModelsCacheIdentity = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Coordinates model discovery plus cached metadata on disk.
 pub trait ModelsManager: fmt::Debug + Send + Sync {
@@ -218,6 +247,7 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
 pub struct OpenAiModelsManager {
     remote_models: RwLock<Vec<ModelInfo>>,
     etag: RwLock<Option<String>>,
+    active_cache_identity: RwLock<String>,
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
@@ -253,13 +283,17 @@ impl OpenAiModelsManager {
         codex_home: PathBuf,
         endpoint_client: Arc<dyn ModelsEndpointClient>,
         auth_manager: Option<Arc<AuthManager>>,
+        cache_identity: ModelsCacheIdentity,
     ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
-        let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
+        let cache_manager =
+            ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL, cache_identity);
+        let active_cache_identity = cache_manager.current_identity();
         let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
             remote_models: RwLock::new(remote_models),
             etag: RwLock::new(None),
+            active_cache_identity: RwLock::new(active_cache_identity),
             cache_manager,
             endpoint_client,
             auth_manager,
@@ -407,13 +441,32 @@ impl OpenAiModelsManager {
                 return;
             };
 
+            let refresh_identity = self.ensure_current_cache_identity().await;
+
             if self.get_etag().await.as_deref() == Some(notice.etag.as_str()) {
-                if let Err(err) = self.cache_manager.renew_cache_ttl().await {
+                if let Err(err) = self
+                    .cache_manager
+                    .renew_cache_ttl_for_identity(
+                        &crate::client_version_to_whole(),
+                        &notice.etag,
+                        &refresh_identity,
+                    )
+                    .await
+                {
                     error!("failed to renew cache TTL: {err}");
+                    self.ensure_current_cache_identity().await;
                 }
             } else {
-                match self.fetch_models(&notice.http_client_factory).await {
-                    Ok((models, etag)) => {
+                let current_etag = self.get_etag().await;
+                match self
+                    .fetch_models(&notice.http_client_factory, current_etag.as_deref())
+                    .await
+                {
+                    Ok(ModelsFetchResult::Modified { models, etag }) => {
+                        if !self.cache_manager.identity_is_current(&refresh_identity) {
+                            self.ensure_current_cache_identity().await;
+                            continue;
+                        }
                         let merged_models = self.merged_remote_models(models.clone());
                         let should_apply = {
                             let (mut remote_models, mut current_etag) =
@@ -430,10 +483,36 @@ impl OpenAiModelsManager {
                                 false
                             }
                         };
-                        if should_apply {
-                            self.cache_manager
-                                .persist_cache(&models, etag, crate::client_version_to_whole())
-                                .await;
+                        if should_apply
+                            && !self
+                                .cache_manager
+                                .persist_cache_for_identity(
+                                    &models,
+                                    etag,
+                                    crate::client_version_to_whole(),
+                                    &refresh_identity,
+                                )
+                                .await
+                        {
+                            self.ensure_current_cache_identity().await;
+                        }
+                    }
+                    Ok(ModelsFetchResult::NotModified) => {
+                        if !self.cache_manager.identity_is_current(&refresh_identity) {
+                            self.ensure_current_cache_identity().await;
+                            continue;
+                        }
+                        if let Some(etag) = current_etag
+                            && let Err(err) = self
+                                .cache_manager
+                                .renew_cache_ttl_for_identity(
+                                    &crate::client_version_to_whole(),
+                                    &etag,
+                                    &refresh_identity,
+                                )
+                                .await
+                        {
+                            error!("failed to renew cache TTL after conditional refresh: {err}");
                         }
                     }
                     Err(err) => error!("failed to refresh available models: {err}"),
@@ -454,6 +533,7 @@ impl OpenAiModelsManager {
         refresh_strategy: RefreshStrategy,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
+        self.ensure_current_cache_identity().await;
         if !self.should_refresh_models().await {
             if matches!(
                 refresh_strategy,
@@ -490,24 +570,56 @@ impl OpenAiModelsManager {
         &self,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
+        let fetch_identity = self.ensure_current_cache_identity().await;
         let client_version = crate::client_version_to_whole();
-        let (models, etag) = self.fetch_models(http_client_factory).await?;
-        self.apply_remote_models(models.clone()).await;
-        *self.etag.write().await = etag.clone();
-        self.cache_manager
-            .persist_cache(&models, etag, client_version)
-            .await;
+        let current_etag = self.get_etag().await;
+        match self
+            .fetch_models(http_client_factory, current_etag.as_deref())
+            .await?
+        {
+            ModelsFetchResult::Modified { models, etag } => {
+                if !self.cache_manager.identity_is_current(&fetch_identity) {
+                    self.ensure_current_cache_identity().await;
+                    return Ok(());
+                }
+                self.apply_remote_models(models.clone()).await;
+                *self.etag.write().await = etag.clone();
+                if !self
+                    .cache_manager
+                    .persist_cache_for_identity(&models, etag, client_version, &fetch_identity)
+                    .await
+                {
+                    self.ensure_current_cache_identity().await;
+                }
+            }
+            ModelsFetchResult::NotModified => {
+                if !self.cache_manager.identity_is_current(&fetch_identity) {
+                    self.ensure_current_cache_identity().await;
+                    return Ok(());
+                }
+                if let Some(etag) = current_etag
+                    && let Err(err) = self
+                        .cache_manager
+                        .renew_cache_ttl_for_identity(&client_version, &etag, &fetch_identity)
+                        .await
+                {
+                    error!("failed to renew cache TTL after conditional refresh: {err}");
+                }
+            }
+        }
         Ok(())
     }
 
     async fn fetch_models(
         &self,
         http_client_factory: &HttpClientFactory,
-    ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+        etag: Option<&str>,
+    ) -> CoreResult<ModelsFetchResult> {
         self.endpoint_client
-            .list_models(
+            .list_models_conditional(
                 &crate::client_version_to_whole(),
                 http_client_factory.clone(),
+                etag,
             )
             .await
     }
@@ -518,6 +630,26 @@ impl OpenAiModelsManager {
 
     async fn get_etag(&self) -> Option<String> {
         self.etag.read().await.clone()
+    }
+
+    /// Reset identity-scoped in-memory state when the authoritative auth scope changes.
+    async fn ensure_current_cache_identity(&self) -> String {
+        let current_identity = self.cache_manager.current_identity();
+        let (mut active_identity, mut remote_models, mut etag) = tokio::join!(
+            self.active_cache_identity.write(),
+            self.remote_models.write(),
+            self.etag.write()
+        );
+        if *active_identity != current_identity {
+            *remote_models = load_remote_models_from_file().unwrap_or_default();
+            *etag = None;
+            *active_identity = current_identity.clone();
+            info!(
+                mismatch_category = "provider_cache_identity",
+                "models cache: reset identity-scoped in-memory catalog"
+            );
+        }
+        current_identity
     }
 
     /// Replace the cached remote models and rebuild the derived presets list.
@@ -557,24 +689,35 @@ impl OpenAiModelsManager {
         merged_models
     }
 
-    /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
+    /// Attempt to satisfy the refresh from the cache when its complete identity and TTL match.
     async fn try_load_cache(&self) -> bool {
+        let load_identity = self.ensure_current_cache_identity().await;
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::client_version_to_whole();
         info!(client_version, "models cache: evaluating cache eligibility");
-        // TODO(celia-oai): Include provider identity in cache eligibility so switching
-        // providers does not reuse a fresh models_cache.json entry from another provider.
-        let cache = match self.cache_manager.load_fresh(&client_version).await {
+        let cache = match self
+            .cache_manager
+            .load_fresh_for_identity(&client_version, &load_identity)
+            .await
+        {
             Some(cache) => cache,
             None => {
                 info!("models cache: no usable cache entry");
                 return false;
             }
         };
+        if !self.cache_manager.identity_is_current(&load_identity) {
+            self.ensure_current_cache_identity().await;
+            return false;
+        }
         let models = cache.models.clone();
         *self.etag.write().await = cache.etag.clone();
         self.apply_remote_models(models.clone()).await;
+        if !self.cache_manager.identity_is_current(&load_identity) {
+            self.ensure_current_cache_identity().await;
+            return false;
+        }
         info!(
             models_count = models.len(),
             etag = ?cache.etag,

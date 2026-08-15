@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DesktopActivationObligation": {
+      "properties": {
+        "activationObligationIdentity": {
+          "type": "string"
+        },
+        "evidenceEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "implementationIdentity": {
+          "type": "string"
+        },
+        "requiringPlanStepIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "activationObligationIdentity",
+        "evidenceEpoch",
+        "implementationIdentity",
+        "requiringPlanStepIds",
+        "threadId"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "obligation": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DesktopActivationObligation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "title": "ThreadDesktopActivationObligationResponse",
+  "type": "object"
+}

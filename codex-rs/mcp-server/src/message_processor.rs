@@ -221,6 +221,15 @@ impl MessageProcessor {
             return;
         }
 
+        let elicitation = params.capabilities.elicitation.as_ref();
+        self.outgoing.set_elicitation_capabilities(
+            elicitation
+                .and_then(|capability| capability.form.as_ref())
+                .is_some(),
+            elicitation
+                .and_then(|capability| capability.url.as_ref())
+                .is_some(),
+        );
         let client_info = params.client_info;
         let name = client_info.name;
         let version = client_info.version;

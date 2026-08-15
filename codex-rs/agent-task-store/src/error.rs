@@ -127,10 +127,6 @@ pub enum StoreError {
     MutationAlreadyFinalized { attempt_id: AttemptId, path: String },
     #[error("private mutation snapshot is unavailable for {path} under attempt {attempt_id}")]
     SnapshotUnavailable { attempt_id: AttemptId, path: String },
-    #[error(
-        "private mutation snapshot cannot be garbage-collected before the task and gates are sealed"
-    )]
-    SnapshotRetentionRequired,
     #[error("agent task store contains invalid persisted data: {0}")]
     CorruptData(String),
     #[error(transparent)]

@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::OwnedMutexGuard;
 use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -98,12 +99,18 @@ pub(crate) struct RunningTask {
 pub(crate) struct TurnTerminalCoordinator {
     turn_id: String,
     claimed: AtomicBool,
+    analytics_emission_claimed: AtomicBool,
     durable_terminal_committed: AtomicBool,
     interaction_released: AtomicBool,
     cleanup_completed: AtomicBool,
     delivery_state: AtomicU8,
     completion_notify: Notify,
     cleanup_completion_notify: Notify,
+    interrupt_pending: AtomicBool,
+    interrupt_terminal_ready: AtomicBool,
+    interrupt_persistence_failed: AtomicBool,
+    interrupt_resolution_notify: Notify,
+    sampling_admission_gate: Arc<Mutex<()>>,
     #[cfg(test)]
     panic_before_worker_cancellation: AtomicBool,
 }
@@ -115,6 +122,12 @@ pub(crate) enum TerminalDeliveryState {
     Claimed = 1,
     Delivered = 2,
     DeliveryFailed = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SamplingAdmission {
+    Allowed,
+    Fenced,
 }
 
 impl TerminalDeliveryState {
@@ -133,12 +146,18 @@ impl TurnTerminalCoordinator {
         Arc::new(Self {
             turn_id,
             claimed: AtomicBool::new(false),
+            analytics_emission_claimed: AtomicBool::new(false),
             durable_terminal_committed: AtomicBool::new(false),
             interaction_released: AtomicBool::new(false),
             cleanup_completed: AtomicBool::new(false),
             delivery_state: AtomicU8::new(TerminalDeliveryState::NotAttempted as u8),
             completion_notify: Notify::new(),
             cleanup_completion_notify: Notify::new(),
+            interrupt_pending: AtomicBool::new(false),
+            interrupt_terminal_ready: AtomicBool::new(false),
+            interrupt_persistence_failed: AtomicBool::new(false),
+            interrupt_resolution_notify: Notify::new(),
+            sampling_admission_gate: Arc::new(Mutex::new(())),
             #[cfg(test)]
             panic_before_worker_cancellation: AtomicBool::new(false),
         })
@@ -152,6 +171,12 @@ impl TurnTerminalCoordinator {
         self.claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
+        if self.interrupt_pending.load(Ordering::Acquire)
+            && !self.interrupt_terminal_ready.load(Ordering::Acquire)
+        {
+            self.claimed.store(false, Ordering::Release);
+            return None;
+        }
         Some(TurnTerminalPermit {
             coordinator: Arc::clone(self),
             cleanup_completed: false,
@@ -166,8 +191,92 @@ impl TurnTerminalCoordinator {
         self.interaction_released.load(Ordering::Acquire)
     }
 
+    pub(crate) fn mark_interaction_released(&self) {
+        self.interaction_released.store(true, Ordering::Release);
+        self.completion_notify.notify_waiters();
+    }
+
     pub(crate) fn durable_terminal_committed(&self) -> bool {
         self.durable_terminal_committed.load(Ordering::Acquire)
+    }
+
+    /// Establish a pre-terminal fence. This deliberately does not claim or
+    /// terminalize the turn; it only closes provider sampling admission.
+    pub(crate) async fn mark_interrupt_pending(&self) -> bool {
+        let _admission_gate = self.sampling_admission_gate.lock().await;
+        if self.claimed.load(Ordering::Acquire) {
+            return false;
+        }
+        self.interrupt_persistence_failed
+            .store(false, Ordering::Release);
+        self.interrupt_terminal_ready
+            .store(false, Ordering::Release);
+        self.interrupt_pending.store(true, Ordering::Release);
+        if self.claimed.load(Ordering::Acquire) {
+            self.interrupt_pending.store(false, Ordering::Release);
+            self.interrupt_resolution_notify.notify_waiters();
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(crate) async fn acquire_sampling_admission(&self) -> Option<OwnedMutexGuard<()>> {
+        let guard = Arc::clone(&self.sampling_admission_gate).lock_owned().await;
+        if self.interrupt_pending() {
+            None
+        } else {
+            Some(guard)
+        }
+    }
+
+    pub(crate) fn sampling_admission(&self) -> SamplingAdmission {
+        if self.interrupt_pending.load(Ordering::Acquire) {
+            SamplingAdmission::Fenced
+        } else {
+            SamplingAdmission::Allowed
+        }
+    }
+
+    pub(crate) fn interrupt_pending(&self) -> bool {
+        self.interrupt_pending.load(Ordering::Acquire)
+    }
+
+    /// Open terminal admission after the interrupted tool output has crossed
+    /// its durability barrier. Sampling remains fenced until cleanup.
+    pub(crate) fn mark_interrupt_output_durable(&self) {
+        debug_assert!(self.interrupt_pending());
+        self.interrupt_terminal_ready.store(true, Ordering::Release);
+        self.interrupt_resolution_notify.notify_waiters();
+    }
+
+    pub(crate) fn mark_interrupt_persistence_failed(&self) {
+        debug_assert!(self.interrupt_pending());
+        self.interrupt_persistence_failed
+            .store(true, Ordering::Release);
+        self.interrupt_terminal_ready.store(true, Ordering::Release);
+        self.interrupt_resolution_notify.notify_waiters();
+    }
+
+    pub(crate) fn interrupt_persistence_failed(&self) -> bool {
+        self.interrupt_persistence_failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_interrupt_resolution(&self) {
+        loop {
+            let notified = self.interrupt_resolution_notify.notified();
+            if self.interrupt_terminal_ready.load(Ordering::Acquire) || !self.interrupt_pending() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn release_interrupt_fence(&self) {
+        self.interrupt_terminal_ready
+            .store(false, Ordering::Release);
+        self.interrupt_pending.store(false, Ordering::Release);
+        self.interrupt_resolution_notify.notify_waiters();
     }
 
     pub(crate) async fn wait_completed(&self) {
@@ -214,6 +323,15 @@ pub(crate) struct TurnTerminalPermit {
 }
 
 impl TurnTerminalPermit {
+    /// Claims the single best-effort analytics attempt for this coordinator.
+    /// This marker is process-local and intentionally is not durable across restarts.
+    pub(crate) fn try_claim_analytics_emission(&self) -> bool {
+        self.coordinator
+            .analytics_emission_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     pub(crate) fn mark_durable_commit(&self, committed: bool) {
         self.coordinator
             .durable_terminal_committed
@@ -221,10 +339,23 @@ impl TurnTerminalPermit {
     }
 
     pub(crate) fn mark_delivery_claimed(&self) -> bool {
-        self.coordinator
+        if self
+            .coordinator
             .delivery_state
             .compare_exchange(
                 TerminalDeliveryState::NotAttempted as u8,
+                TerminalDeliveryState::Claimed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        self.coordinator
+            .delivery_state
+            .compare_exchange(
+                TerminalDeliveryState::DeliveryFailed as u8,
                 TerminalDeliveryState::Claimed as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -248,24 +379,28 @@ impl TurnTerminalPermit {
     }
 
     pub(crate) fn mark_interaction_released(&self) {
-        self.coordinator
-            .interaction_released
-            .store(true, Ordering::Release);
-        self.coordinator.completion_notify.notify_waiters();
+        self.coordinator.mark_interaction_released();
     }
 
     pub(crate) fn complete_cleanup(mut self) {
-        // If both terminal dispatch paths failed before reaching the interactive milestone,
-        // preserve the old full-finalizer fallback so abort/replacement callers cannot wait
-        // forever after cleanup has definitively ended.
-        self.coordinator
-            .interaction_released
-            .store(true, Ordering::Release);
-        self.coordinator.completion_notify.notify_waiters();
+        // Cleanup cannot release a durably authoritative turn whose live handoff is still
+        // claimed or failed. The at-least-once delivery loop releases that fence after a later
+        // successful handoff. A turn with no authoritative attempt keeps the legacy cleanup
+        // fallback; an already delivered turn is safe to wake.
+        if matches!(
+            self.coordinator.delivery_state(),
+            TerminalDeliveryState::NotAttempted | TerminalDeliveryState::Delivered
+        ) {
+            self.coordinator
+                .interaction_released
+                .store(true, Ordering::Release);
+            self.coordinator.completion_notify.notify_waiters();
+        }
         self.coordinator
             .cleanup_completed
             .store(true, Ordering::Release);
         self.coordinator.cleanup_completion_notify.notify_waiters();
+        self.coordinator.release_interrupt_fence();
         self.cleanup_completed = true;
     }
 }

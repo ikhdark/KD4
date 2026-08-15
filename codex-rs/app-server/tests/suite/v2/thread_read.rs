@@ -16,6 +16,8 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::SortDirection;
+use codex_app_server_protocol::SurfacedToolResult;
+use codex_app_server_protocol::TaskCompletionGate;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
@@ -41,6 +43,7 @@ use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::TurnTiming;
 use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -54,10 +57,15 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
+use codex_protocol::protocol::TaskCompletionGate as CoreTaskCompletionGate;
+use codex_protocol::protocol::TaskCompletionStatus as CoreTaskCompletionStatus;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_rollout::append_rollout_item_to_path;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::CreateThreadParams;
 use codex_thread_store::InMemoryThreadStore;
@@ -207,6 +215,214 @@ async fn thread_read_can_include_turns() -> Result<()> {
 }
 
 #[tokio::test]
+async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "legacy turn",
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let terminal_turn_id = "turn-terminal";
+    let surfaced_result = SurfacedToolResult {
+        adapter: "code_mode_cell".to_string(),
+        value: json!({"answer": 42, "nested": [true, null]}),
+        canonical_message: None,
+    };
+    let core_completion = CoreTaskCompletionGate {
+        status: CoreTaskCompletionStatus::Partial,
+        reasons: vec!["focused validation is stale".to_string()],
+        evidence_path: Some("task-evidence/thread.json".to_string()),
+    };
+    let expected_completion = TaskCompletionGate::from(core_completion.clone());
+    let timing = TurnTiming {
+        schema_version: 7,
+        profile_valid: true,
+        classification_complete: true,
+        started_at_unix_ms: Some(10_000),
+        completed_at_unix_ms: Some(12_500),
+        inclusive_duration_ns: 2_500_000_000,
+        inclusive_duration_ms: 2_500,
+        machine_duration_ns: 2_400_000_000,
+        machine_duration_ms: 2_400,
+        ..Default::default()
+    };
+    for item in [
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: terminal_turn_id.to_string(),
+            trace_id: None,
+            started_at: Some(10),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
+            message: "surface the existing result".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+            ..Default::default()
+        })),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: terminal_turn_id.to_string(),
+            last_agent_message: None,
+            surfaced_result: Some(surfaced_result.clone()),
+            error: None,
+            completion: Some(core_completion),
+            completed_at: Some(12),
+            duration_ms: Some(2_500),
+            time_to_first_token_ms: Some(125),
+            timing: Some(timing.clone()),
+        })),
+    ] {
+        append_rollout_item_to_path(&path, &item).await?;
+    }
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: conversation_id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+        ..
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    let legacy_turn = read_thread
+        .turns
+        .iter()
+        .find(|turn| turn.id != terminal_turn_id)
+        .expect("legacy turn");
+    assert_eq!(legacy_turn.completion, None);
+    assert_eq!(legacy_turn.timing, None);
+    assert_eq!(legacy_turn.surfaced_result, None);
+    let read_terminal = read_thread
+        .turns
+        .iter()
+        .find(|turn| turn.id == terminal_turn_id)
+        .expect("terminal turn from thread/read")
+        .clone();
+    assert_eq!(read_terminal.status, TurnStatus::Completed);
+    assert_eq!(read_terminal.completed_at, Some(12));
+    assert_eq!(read_terminal.duration_ms, Some(2_500));
+    assert_eq!(read_terminal.completion, Some(expected_completion.clone()));
+    assert_eq!(read_terminal.timing, Some(timing.clone()));
+    assert_eq!(read_terminal.surfaced_result, Some(surfaced_result.clone()));
+    assert!(
+        read_terminal
+            .items
+            .iter()
+            .all(|item| !matches!(item, ThreadItem::AgentMessage { .. })),
+        "typed surfaced result must not be converted into assistant prose"
+    );
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed_thread,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    let resumed_terminal = resumed_thread
+        .turns
+        .iter()
+        .find(|turn| turn.id == terminal_turn_id)
+        .expect("terminal turn from cold thread/resume");
+    assert_eq!(resumed_terminal.completion, read_terminal.completion);
+    assert_eq!(resumed_terminal.timing, read_terminal.timing);
+    assert_eq!(
+        resumed_terminal.surfaced_result,
+        read_terminal.surfaced_result
+    );
+    assert_eq!(resumed_terminal.status, read_terminal.status);
+    assert_eq!(resumed_terminal.error, read_terminal.error);
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id,
+            last_turn_id: Some(terminal_turn_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse {
+        thread: forked_thread,
+        ..
+    } = to_response::<ThreadForkResponse>(fork_resp)?;
+    let forked_terminal = forked_thread
+        .turns
+        .iter()
+        .find(|turn| turn.id == terminal_turn_id)
+        .expect("historical terminal turn in fork");
+    assert_eq!(forked_terminal.completion, read_terminal.completion);
+    assert_eq!(forked_terminal.timing, read_terminal.timing);
+    assert_eq!(
+        forked_terminal.surfaced_result,
+        read_terminal.surfaced_result
+    );
+
+    let forked_thread_id = forked_thread.id;
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: forked_thread_id,
+            input: vec![UserInput::Text {
+                text: "new fork turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let TurnStartResponse { turn: active_turn } =
+        to_response::<TurnStartResponse>(turn_start_resp)?;
+    assert_eq!(active_turn.status, TurnStatus::InProgress);
+    assert_eq!(active_turn.completion, None);
+    assert_eq!(active_turn.timing, None);
+    assert_eq!(active_turn.surfaced_result, None);
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn paginated_stored_thread_allows_metadata_discovery_and_rejects_legacy_history_paths()
 -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
@@ -259,7 +475,7 @@ async fn paginated_stored_thread_allows_metadata_discovery_and_rejects_legacy_hi
             source_kinds: None,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -701,7 +917,7 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
                 source_kinds: None,
                 archived: None,
                 cwd: None,
-                use_state_db_only: false,
+                use_state_db_only: None,
                 search_term: None,
                 parent_thread_id: None,
                 ancestor_thread_id: None,
@@ -1120,7 +1336,7 @@ async fn thread_name_set_is_reflected_in_read_list_and_resume() -> Result<()> {
             source_kinds: None,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,

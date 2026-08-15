@@ -14,13 +14,11 @@ use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
-use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
 use crate::tools::handlers::LocateTaskHandler;
 use crate::tools::handlers::McpHandler;
-use crate::tools::handlers::NewContextWindowHandler;
 use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadFileSpanHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
@@ -814,11 +812,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     if environment_mode.has_environment() && features.enabled(Feature::RequestPermissionsTool) {
         planned_tools.add(RequestPermissionsHandler);
-    }
-
-    if features.enabled(Feature::TokenBudget) {
-        planned_tools.add_with_exposure(NewContextWindowHandler, ToolExposure::DirectModelOnly);
-        planned_tools.add(GetContextRemainingHandler);
     }
 
     if features.enabled(Feature::CurrentTimeReminder) {

@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::warn;
@@ -45,8 +46,14 @@ struct V2EvictionClaim {
 
 enum UnloadOneResult {
     Reserved(V2ResidencySlot),
+    WaitingForLateShutdown(oneshot::Receiver<CompletedUnloadResult>),
     Retry,
     Unavailable,
+}
+
+enum CompletedUnloadResult {
+    Reserved(V2ResidencySlot),
+    Retry,
 }
 
 enum EvictionDisposition {
@@ -125,6 +132,10 @@ impl V2Residency {
                 .await
             {
                 UnloadOneResult::Reserved(slot) => return Ok(slot),
+                UnloadOneResult::WaitingForLateShutdown(completion) => match completion.await {
+                    Ok(CompletedUnloadResult::Reserved(slot)) => return Ok(slot),
+                    Ok(CompletedUnloadResult::Retry) | Err(_) => continue,
+                },
                 UnloadOneResult::Retry => continue,
                 UnloadOneResult::Unavailable => {
                     return Err(CodexErr::AgentLimitReached {
@@ -158,6 +169,20 @@ impl V2Residency {
         manager: &Arc<ThreadManagerState>,
         protected_thread_id: Option<ThreadId>,
     ) -> UnloadOneResult {
+        self.try_unload_one_resident_with_shutdown_timeout(
+            manager,
+            protected_thread_id,
+            RESIDENCY_SHUTDOWN_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn try_unload_one_resident_with_shutdown_timeout(
+        self: &Arc<Self>,
+        manager: &Arc<ThreadManagerState>,
+        protected_thread_id: Option<ThreadId>,
+        shutdown_timeout: Duration,
+    ) -> UnloadOneResult {
         let candidates_to_scan = self.resident_count();
         for _ in 0..candidates_to_scan {
             let Some(claim) = self.claim_lru_candidate(protected_thread_id) else {
@@ -188,42 +213,46 @@ impl V2Residency {
                 claim.restore();
                 continue;
             }
-            match timeout(
-                RESIDENCY_SHUTDOWN_TIMEOUT,
-                candidate_thread.shutdown_and_wait(),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    warn!(
-                        "failed to shut down v2 resident thread before unloading {candidate_thread_id}: {err}"
-                    );
-                    claim.restore();
-                    continue;
-                }
-                Err(_) => {
-                    warn!("timed out shutting down v2 resident thread {candidate_thread_id}");
-                    claim.restore();
-                    continue;
-                }
-            }
-            if manager
-                .remove_thread_if_same(&candidate_thread_id, &candidate_thread)
-                .await
-            {
-                return UnloadOneResult::Reserved(claim.into_pending_slot());
-            }
-            if manager
-                .get_thread(candidate_thread_id)
-                .await
-                .is_ok_and(|thread| is_resident_candidate(thread.as_ref()))
-            {
+            if let Err(err) = candidate_thread.request_shutdown().await {
+                warn!(
+                    "failed to submit shutdown for v2 resident thread {candidate_thread_id}: {err}"
+                );
                 claim.restore();
                 continue;
             }
-            claim.discard();
-            return UnloadOneResult::Retry;
+            if timeout(shutdown_timeout, candidate_thread.wait_until_terminated())
+                .await
+                .is_err()
+            {
+                warn!(
+                    "timed out shutting down v2 resident thread {candidate_thread_id}; waiting for late termination"
+                );
+                let (completion_tx, completion_rx) = oneshot::channel();
+                let manager = Arc::clone(manager);
+                tokio::spawn(async move {
+                    candidate_thread.wait_until_terminated().await;
+                    let result = finish_completed_unload(
+                        &manager,
+                        candidate_thread_id,
+                        &candidate_thread,
+                        claim,
+                    )
+                    .await;
+                    let _ = completion_tx.send(result);
+                });
+                return UnloadOneResult::WaitingForLateShutdown(completion_rx);
+            }
+            return match finish_completed_unload(
+                manager,
+                candidate_thread_id,
+                &candidate_thread,
+                claim,
+            )
+            .await
+            {
+                CompletedUnloadResult::Reserved(slot) => UnloadOneResult::Reserved(slot),
+                CompletedUnloadResult::Retry => UnloadOneResult::Retry,
+            };
         }
         UnloadOneResult::Unavailable
     }
@@ -337,6 +366,30 @@ impl V2Residency {
     }
 }
 
+async fn finish_completed_unload(
+    manager: &Arc<ThreadManagerState>,
+    candidate_thread_id: ThreadId,
+    candidate_thread: &Arc<CodexThread>,
+    claim: V2EvictionClaim,
+) -> CompletedUnloadResult {
+    if manager
+        .remove_thread_if_same(&candidate_thread_id, candidate_thread)
+        .await
+    {
+        return CompletedUnloadResult::Reserved(claim.into_pending_slot());
+    }
+    if manager
+        .get_thread(candidate_thread_id)
+        .await
+        .is_ok_and(|thread| is_resident_candidate(thread.as_ref()))
+    {
+        claim.restore();
+    } else {
+        claim.discard();
+    }
+    CompletedUnloadResult::Retry
+}
+
 impl V2EvictionClaim {
     fn into_pending_slot(mut self) -> V2ResidencySlot {
         let residency = Arc::clone(&self.residency);
@@ -386,7 +439,10 @@ pub(super) fn is_v2_resident_session_source(session_source: &SessionSource) -> b
 async fn is_unloadable(thread: &CodexThread) -> bool {
     matches!(
         thread.agent_status().await,
-        AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
+        AgentStatus::Completed(_)
+            | AgentStatus::CompletedWithSurface { .. }
+            | AgentStatus::Errored(_)
+            | AgentStatus::Interrupted
     ) && thread.codex.session.active_turn.lock().await.is_none()
         && !thread
             .codex

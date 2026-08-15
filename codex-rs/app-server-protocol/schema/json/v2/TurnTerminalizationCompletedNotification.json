@@ -1,0 +1,240 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "TerminalizationDeliveryState": {
+      "enum": [
+        "not_attempted",
+        "claimed",
+        "delivered",
+        "delivery_failed"
+      ],
+      "type": "string"
+    },
+    "TerminalizationRecoveryState": {
+      "enum": [
+        "none",
+        "pending",
+        "recovered"
+      ],
+      "type": "string"
+    },
+    "TurnTerminalizationReceipt": {
+      "properties": {
+        "activeTurnDetached": {
+          "type": "boolean"
+        },
+        "deadlineExhaustedPhase": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deliveryState": {
+          "$ref": "#/definitions/TerminalizationDeliveryState"
+        },
+        "recoveryState": {
+          "$ref": "#/definitions/TerminalizationRecoveryState"
+        },
+        "terminalIdentity": {
+          "type": "string"
+        },
+        "terminalInteractionReleased": {
+          "type": "boolean"
+        },
+        "terminalization": {
+          "$ref": "#/definitions/TurnTimingTerminalization"
+        }
+      },
+      "required": [
+        "activeTurnDetached",
+        "deliveryState",
+        "recoveryState",
+        "terminalIdentity",
+        "terminalInteractionReleased",
+        "terminalization"
+      ],
+      "type": "object"
+    },
+    "TurnTimingTerminalization": {
+      "properties": {
+        "checkpointTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "completionGateNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "conservativeRerunCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "deliveryAttemptNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "diffRefreshCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "diffReuseCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "durableCommitNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "fenceNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "finalMutationToSealNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "freshnessNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "gateNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "hooksQuiescenceNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "interactionReleaseNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "postCleanupNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "preparationNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "proofReuseCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reviewNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reviewPreflightNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reviewerInfrastructureMemoHitCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reviewsPreventedByCorrectnessCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "terminalMemoHitCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unclassifiedNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "validationAggregateCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "validationAggregateNs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "validationLaunchCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "validationProcessNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "completionGateNs",
+        "validationProcessNs"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "receipt": {
+      "$ref": "#/definitions/TurnTerminalizationReceipt"
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "receipt",
+    "threadId",
+    "turnId"
+  ],
+  "title": "TurnTerminalizationCompletedNotification",
+  "type": "object"
+}

@@ -14,6 +14,8 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
+use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputSkipDisposition;
 
 tokio::task_local! {
     static ACTIVE_TOOL_DISPATCH_TIMING: Arc<ToolDispatchTiming>;
@@ -167,16 +169,28 @@ impl ToolDispatchTrace {
         else {
             return;
         };
-        let status = if result.success_for_logging() {
-            ExecutionStatus::Completed
-        } else {
-            ExecutionStatus::Failed
-        };
+        let status = execution_status_for_outcome(result.outcome_context());
         self.context.record_completed(status, result_payload);
     }
 
     pub(crate) fn record_failed(&self, error: &FunctionCallError) {
         self.context.record_failed(error);
+    }
+}
+
+fn execution_status_for_outcome(context: codex_tools::ToolOutputOutcomeContext) -> ExecutionStatus {
+    match context.outcome {
+        ToolOutputOutcome::Success => ExecutionStatus::Completed,
+        ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => ExecutionStatus::Failed,
+        ToolOutputOutcome::Skipped => {
+            if context.skip_disposition
+                == Some(ToolOutputSkipDisposition::BlockingRequiredOperation)
+            {
+                ExecutionStatus::Failed
+            } else {
+                ExecutionStatus::Cancelled
+            }
+        }
     }
 }
 

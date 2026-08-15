@@ -460,6 +460,40 @@ async fn repository_manifest_falls_back_when_host_mutations_prevent_cache_admiss
 }
 
 #[tokio::test]
+async fn source_freshness_tracks_watcher_and_host_mutations_by_path() {
+    let root = TempDir::new().expect("source freshness root");
+    let first = root.path().join("first.rs");
+    let second = root.path().join("second.rs");
+    std::fs::write(&first, "first\n").expect("first fixture");
+    std::fs::write(&second, "second\n").expect("second fixture");
+    let watcher = Arc::new(FileWatcher::noop());
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::clone(&watcher)));
+    let first_registration = cache
+        .register_source_freshness_paths([first])
+        .expect("first registration");
+    let second_registration = cache
+        .register_source_freshness_paths([second.clone()])
+        .expect("second registration");
+
+    cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
+    cache.record_source_watcher_event(FileWatcherEvent {
+        paths: vec![second.clone()],
+        rescan_required: false,
+    });
+
+    assert!(cache.source_registration_is_current(&first_registration));
+    assert!(!cache.source_registration_is_current(&second_registration));
+
+    let refreshed_second = cache
+        .register_source_freshness_paths([second])
+        .expect("refreshed second registration");
+    cache.note_host_workspace_mutation_paths(root.path(), &["first.rs".to_string()]);
+
+    assert!(!cache.source_registration_is_current(&first_registration));
+    assert!(cache.source_registration_is_current(&refreshed_second));
+}
+
+#[tokio::test]
 async fn final_repository_manifest_seeds_the_post_commit_receipt_without_an_extra_scan() {
     let (_repo_dir, repo) = create_clean_git_repo().await;
     let codex_home = TempDir::new().expect("codex home");
@@ -509,7 +543,13 @@ async fn final_repository_manifest_seeds_the_post_commit_receipt_without_an_extr
     cache.record_final_manifest_work(outcome.work());
     cache.note_host_workspace_mutation();
     cache
-        .publish_final_repository_manifest(&store, repo.as_path(), final_manifest.clone(), guard)
+        .publish_final_repository_manifest(
+            &store,
+            repo.as_path(),
+            final_manifest.clone(),
+            guard,
+            true,
+        )
         .await
         .expect("fresh final receipt publishes");
 
@@ -578,7 +618,7 @@ async fn watcher_change_during_finalization_prevents_receipt_seeding() {
         .clone();
     cache.note_host_workspace_mutation();
     cache
-        .publish_final_repository_manifest(&store, repo.as_path(), final_manifest, guard)
+        .publish_final_repository_manifest(&store, repo.as_path(), final_manifest, guard, true)
         .await
         .expect("stale receipt is ignored without failing finalization");
 

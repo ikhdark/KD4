@@ -72,7 +72,7 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
     assert!(description.contains(&spawn_agent_default_guidance()));
     assert!(
         description
-            .contains("Available model overrides (optional; `gpt-5.6-sol` is the spawn default):")
+            .contains("Available model overrides (optional; `gpt-5.6-luna` is the spawn default):")
     );
     assert!(description.contains(
         "- `visible-model`: visible description Reasoning efforts: medium (catalog default). Service tiers: priority."
@@ -93,10 +93,8 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
             .get("fork_turns")
             .and_then(|schema| schema.description.as_deref())
             .is_some_and(|description| {
-                description.contains("typed assignments, omitted or `none` creates a lineage-preserving TaskCapsule fork")
-                    && description.contains(
-                        "legacy messages, omitted or `none` creates a fresh non-forked child",
-                    )
+                description
+                    .contains("Omitted or `none` creates a lineage-preserving TaskCapsule fork")
                     && description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE)
             })
     );
@@ -155,7 +153,10 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
         Some(&vec!["task_name".to_string()])
     );
     let output_schema = output_schema.expect("spawn_agent output schema");
-    assert_eq!(output_schema["required"], json!(["task_name", "nickname"]));
+    assert_eq!(
+        output_schema["required"],
+        json!(["task_name", "nickname", "assignment_id"])
+    );
     assert_eq!(
         output_schema["properties"]["assignment_id"]["type"],
         json!("string")
@@ -423,6 +424,16 @@ fn wait_agent_tool_v1_advertises_first_and_all() {
         return_when.enum_values.as_ref(),
         Some(&vec![json!("first"), json!("all")])
     );
+    assert_eq!(
+        parameters
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("timeout_ms"))
+            .and_then(|schema| schema.description.as_deref()),
+        Some(
+            "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Explicit values must be between 10000 and 3600000. Completed targets return immediately."
+        )
+    );
 }
 
 #[test]
@@ -457,7 +468,9 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
         properties
             .get("timeout_ms")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000.")
+        Some(
+            "Explicit caller deadline in milliseconds. Omit to keep waiting; the default 30000 ms interval is internal maintenance cadence only and does not return an unchanged result. Explicit values must be between 10000 and 3600000. Use list_agents or get_agent_task for an immediate status snapshot."
+        )
     );
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(

@@ -18,6 +18,7 @@ use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::plan_tool::ValidationRouteLeaf;
 use codex_protocol::plan_tool::ValidationRouteOrdering;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::validation::ValidationTerminalStatus;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::shell_command_backend_for_features;
@@ -37,6 +38,7 @@ pub struct PlanHandler;
 pub struct PlanToolOutput {
     normalized_plan: Option<UpdatePlanArgs>,
     governor_plan: Option<UpdatePlanArgs>,
+    unfinished_mutation_obligation: Option<bool>,
     validation_results: Vec<JsonValue>,
 }
 
@@ -121,12 +123,11 @@ impl ToolOutput for PlanToolOutput {
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
-        self.governor_plan.as_ref().map(|plan| {
-            serde_json::json!({
-                "kind": "plan_update",
-                "plan": plan,
-            })
-        })
+        Some(serde_json::json!({
+            "kind": "plan_update",
+            "plan": self.governor_plan,
+            "unfinished_mutation_obligation": self.unfinished_mutation_obligation,
+        }))
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
@@ -268,6 +269,7 @@ impl PlanHandler {
         Ok(boxed_tool_output(PlanToolOutput {
             normalized_plan,
             governor_plan: outcome.effect.requests_generation().then_some(args),
+            unfinished_mutation_obligation: outcome.unfinished_mutation_obligation,
             validation_results,
         }))
     }
@@ -371,7 +373,8 @@ async fn run_bound_validation_route(
             else {
                 break;
             };
-            let success = result.get("success").and_then(JsonValue::as_bool) == Some(true);
+            let success = super::shell::ValidationExecutionOutcome::from_value(&result)
+                == Some(super::shell::ValidationExecutionOutcome::ExecutedSuccess);
             results.push(result);
             if !success {
                 break;
@@ -379,9 +382,19 @@ async fn run_bound_validation_route(
         }
     }
     if !results.is_empty() {
-        let success = results
-            .iter()
-            .all(|result| result.get("success").and_then(JsonValue::as_bool) == Some(true));
+        let aggregate_outcome = if results.iter().any(|result| {
+            super::shell::ValidationExecutionOutcome::from_value(result)
+                == Some(super::shell::ValidationExecutionOutcome::ExecutedFailure)
+        }) {
+            super::shell::ValidationExecutionOutcome::ExecutedFailure
+        } else if results.iter().all(|result| {
+            super::shell::ValidationExecutionOutcome::from_value(result)
+                == Some(super::shell::ValidationExecutionOutcome::ExecutedSuccess)
+        }) {
+            super::shell::ValidationExecutionOutcome::ExecutedSuccess
+        } else {
+            super::shell::ValidationExecutionOutcome::NotExecuted
+        };
         let completed_leaf_count = results.len();
         results.push(serde_json::json!({
             "step_id": candidate.step_id,
@@ -389,7 +402,9 @@ async fn run_bound_validation_route(
             "ordering": candidate.route.ordering,
             "declared_leaf_count": candidate.route.leaves.len(),
             "completed_leaf_count": completed_leaf_count,
-            "success": success,
+            "success": aggregate_outcome.success(),
+            "execution_outcome": aggregate_outcome.as_str(),
+            "command_was_executed": aggregate_outcome != super::shell::ValidationExecutionOutcome::NotExecuted,
             "duration_ms": u64::try_from(route_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
         }));
     }
@@ -508,24 +523,53 @@ async fn run_bound_validation_leaf(
             .validation_result_for_call(&synthetic_call_id)
             .await
     };
-    let (success, output) = match result {
+    let (execution_outcome, output) = match result {
         Ok(output) => {
             if let Some(settled) = settled {
-                let success = settled.status.is_success();
-                (success, serde_json::json!({ "validation_result": settled }))
+                let execution_outcome = match settled.status {
+                    ValidationTerminalStatus::Succeeded => {
+                        super::shell::ValidationExecutionOutcome::ExecutedSuccess
+                    }
+                    ValidationTerminalStatus::Superseded => {
+                        super::shell::ValidationExecutionOutcome::NotExecuted
+                    }
+                    ValidationTerminalStatus::Failed => {
+                        super::shell::ValidationExecutionOutcome::ExecutedFailure
+                    }
+                };
+                (
+                    execution_outcome,
+                    serde_json::json!({ "validation_result": settled }),
+                )
             } else {
-                let success = output.success_for_logging();
-                (success, output.code_mode_result(&payload))
+                let execution_outcome = match output.outcome_context().outcome {
+                    codex_tools::ToolOutputOutcome::Success => {
+                        super::shell::ValidationExecutionOutcome::ExecutedSuccess
+                    }
+                    codex_tools::ToolOutputOutcome::Failure
+                    | codex_tools::ToolOutputOutcome::TimedOut => {
+                        super::shell::ValidationExecutionOutcome::ExecutedFailure
+                    }
+                    codex_tools::ToolOutputOutcome::Skipped => {
+                        super::shell::ValidationExecutionOutcome::NotExecuted
+                    }
+                };
+                (execution_outcome, output.code_mode_result(&payload))
             }
         }
-        Err(error) => (false, serde_json::json!({ "error": error.to_string() })),
+        Err(error) => (
+            super::shell::ValidationExecutionOutcome::ExecutedFailure,
+            serde_json::json!({ "error": error.to_string() }),
+        ),
     };
     Some(serde_json::json!({
         "step_id": candidate.step_id,
         "leaf_index": index,
         "call_id": synthetic_call_id,
         "freshness": "executed_or_shared",
-        "success": success,
+        "success": execution_outcome.success(),
+        "execution_outcome": execution_outcome.as_str(),
+        "command_was_executed": execution_outcome != super::shell::ValidationExecutionOutcome::NotExecuted,
         "duration_ms": u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
         "output": output,
     }))

@@ -140,7 +140,10 @@ fn prompt_for_answers_with(
         );
     }
 
-    Ok(ToolRequestUserInputResponse { answers })
+    Ok(ToolRequestUserInputResponse {
+        answers,
+        interrupted: false,
+    })
 }
 
 #[cfg(test)]

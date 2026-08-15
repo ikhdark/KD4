@@ -16,6 +16,7 @@ use tempfile::TempDir;
 fn assignment_draft() -> AssignmentDraft {
     AssignmentDraft {
         root_session_id: "root-session".to_string(),
+        admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
         role: AgentRole::Worker,
         capability_profile: CapabilityProfile::ScopedSourceWrite,
         objective: "complete the task".to_string(),

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -10,17 +11,21 @@ use codex_api::SharedAuthProvider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_models_manager::manager::ModelsCacheIdentity;
 use codex_models_manager::manager::OpenAiModelsManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::account::ProviderAccount;
 use codex_protocol::error::CodexErr;
 use codex_protocol::openai_models::ModelsResponse;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::auth::ProviderAuthScope;
 use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
+use crate::auth::provider_cache_auth_identity;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
 use crate::models_endpoint::OpenAiModelsEndpoint;
@@ -196,6 +201,7 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     /// Creates the model manager implementation appropriate for this provider.
     fn models_manager(
         &self,
+        model_provider_id: &str,
         codex_home: PathBuf,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager;
@@ -212,6 +218,151 @@ fn provider_uses_first_party_auth_path(provider: &ModelProviderInfo) -> bool {
         && provider.experimental_bearer_token.is_none()
         && provider.auth.is_none()
         && provider.aws.is_none()
+}
+
+fn model_provider_cache_identity(
+    model_provider_id: &str,
+    provider_info: &ModelProviderInfo,
+    auth_manager: Option<&AuthManager>,
+) -> String {
+    fn normalize_base_url(raw: &str) -> String {
+        let Ok(mut url) = url::Url::parse(raw) else {
+            return raw.trim().trim_end_matches('/').to_string();
+        };
+        url.set_fragment(None);
+        let mut query = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        query.sort();
+        url.set_query(None);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let normalized_path = url.path().trim_end_matches('/').to_string();
+        url.set_path(if normalized_path.is_empty() {
+            "/"
+        } else {
+            &normalized_path
+        });
+        url.to_string().trim_end_matches('/').to_string()
+    }
+
+    fn secret_component(domain: &[u8], value: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"CODEX_MODELS_CACHE_SECRET_COMPONENT_V1\0");
+        hasher.update(domain);
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    let auth_identity = provider_cache_auth_identity(auth_manager);
+    let uses_chatgpt_endpoint = matches!(
+        auth_identity.auth_mode,
+        Some(
+            codex_protocol::auth::AuthMode::Chatgpt
+                | codex_protocol::auth::AuthMode::ChatgptAuthTokens
+                | codex_protocol::auth::AuthMode::Headers
+                | codex_protocol::auth::AuthMode::AgentIdentity
+                | codex_protocol::auth::AuthMode::PersonalAccessToken
+        )
+    );
+    let effective_base_url = normalize_base_url(provider_info.base_url.as_deref().unwrap_or(
+        if uses_chatgpt_endpoint {
+            codex_model_provider_info::CHATGPT_CODEX_BASE_URL
+        } else {
+            "https://api.openai.com/v1"
+        },
+    ));
+    let query_parameters = provider_info
+        .query_params
+        .as_ref()
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .map(|(key, value)| (key.clone(), secret_component(b"query-parameter", value)))
+        .collect::<BTreeMap<_, _>>();
+    let http_headers = provider_info
+        .http_headers
+        .as_ref()
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .map(|(key, value)| {
+            (
+                key.to_ascii_lowercase(),
+                secret_component(b"http-header", value),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let env_http_headers = provider_info
+        .env_http_headers
+        .as_ref()
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .map(|(header, env_var)| {
+            let value_digest = std::env::var(env_var)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| secret_component(b"environment-header", &value));
+            (
+                header.to_ascii_lowercase(),
+                serde_json::json!({"env_var": env_var, "value_digest": value_digest}),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let env_key = provider_info.env_key.as_ref().map(|env_var| {
+        serde_json::json!({
+            "env_var": env_var,
+            "value_digest": std::env::var(env_var)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| secret_component(b"environment-api-key", &value)),
+        })
+    });
+    let command_auth = provider_info.auth.as_ref().map(|auth| {
+        serde_json::json!({
+            "command": &auth.command,
+            "args": &auth.args,
+            "cwd": &auth.cwd,
+        })
+    });
+    let value = serde_json::json!({
+        "version": 2,
+        "provider_id": model_provider_id,
+        "provider_name": &provider_info.name,
+        "effective_base_url": effective_base_url,
+        "wire_api": provider_info.wire_api.to_string(),
+        "query_parameters": query_parameters,
+        "http_headers": http_headers,
+        "env_http_headers": env_http_headers,
+        "env_key": env_key,
+        "experimental_bearer_token_digest": provider_info.experimental_bearer_token.as_deref()
+            .map(|value| secret_component(b"experimental-bearer-token", value)),
+        "command_auth": command_auth,
+        "requires_openai_auth": provider_info.requires_openai_auth,
+        "effective_auth_mode": auth_identity.auth_mode,
+        "account_scope_digest": auth_identity.account_scope_digest,
+        "aws": &provider_info.aws,
+        "request_max_retries": provider_info.request_max_retries,
+        "stream_max_retries": provider_info.stream_max_retries,
+        "stream_idle_timeout_ms": provider_info.stream_idle_timeout_ms,
+        "websocket_connect_timeout_ms": provider_info.websocket_connect_timeout_ms,
+        "supports_websockets": provider_info.supports_websockets,
+    });
+    let canonical = serde_json::to_vec(&value).unwrap_or_else(|error| {
+        let mut fallback = b"\0provider-cache-identity-serialization-error:".to_vec();
+        fallback.extend_from_slice(error.to_string().as_bytes());
+        fallback
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"CODEX_MODELS_CACHE_IDENTITY_V2\0");
+    hasher.update(canonical);
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Creates the default runtime model provider for configured provider metadata.
@@ -313,6 +464,7 @@ impl ModelProvider for ConfiguredModelProvider {
 
     fn models_manager(
         &self,
+        model_provider_id: &str,
         codex_home: PathBuf,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
@@ -326,10 +478,21 @@ impl ModelProvider for ConfiguredModelProvider {
                     self.info.clone(),
                     self.auth_manager.clone(),
                 ));
+                let model_provider_id = model_provider_id.to_string();
+                let provider_info = self.info.clone();
+                let auth_manager = self.auth_manager.clone();
+                let cache_identity: ModelsCacheIdentity = Arc::new(move || {
+                    model_provider_cache_identity(
+                        &model_provider_id,
+                        &provider_info,
+                        auth_manager.as_deref(),
+                    )
+                });
                 Arc::new(OpenAiModelsManager::new(
                     codex_home,
                     endpoint,
                     self.auth_manager.clone(),
+                    cache_identity,
                 ))
             }
         }
@@ -365,6 +528,8 @@ mod tests {
     use super::*;
     use crate::auth::AgentIdentitySessionFallback;
 
+    const TEST_CHATGPT_ACCESS_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidXNlci0xMjM0NSIsInVzZXJfaWQiOiJ1c2VyLTEyMzQ1IiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwcm8iLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50LTEyMyJ9fQ.c2ln";
+
     fn provider_info_with_command_auth() -> ModelProviderInfo {
         ModelProviderInfo {
             auth: Some(ModelProviderAuthInfo {
@@ -380,6 +545,110 @@ mod tests {
             requires_openai_auth: false,
             ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
         }
+    }
+
+    #[test]
+    fn provider_cache_identity_is_canonical_and_covers_provider_configuration() {
+        let mut first = ModelProviderInfo {
+            base_url: Some("https://catalog.example/v1/".to_string()),
+            query_params: Some(std::collections::HashMap::from([
+                ("region".to_string(), "us".to_string()),
+                ("tenant".to_string(), "one".to_string()),
+            ])),
+            http_headers: Some(std::collections::HashMap::from([
+                ("X-Tenant".to_string(), "one".to_string()),
+                ("X-Route".to_string(), "blue".to_string()),
+            ])),
+            request_max_retries: Some(2),
+            stream_idle_timeout_ms: Some(10_000),
+            ..Default::default()
+        };
+        let mut second = first.clone();
+        second.query_params = Some(std::collections::HashMap::from([
+            ("tenant".to_string(), "one".to_string()),
+            ("region".to_string(), "us".to_string()),
+        ]));
+        second.http_headers = Some(std::collections::HashMap::from([
+            ("X-Route".to_string(), "blue".to_string()),
+            ("X-Tenant".to_string(), "one".to_string()),
+        ]));
+        assert_eq!(
+            model_provider_cache_identity("custom", &first, None),
+            model_provider_cache_identity("custom", &second, None)
+        );
+
+        first.base_url = Some("https://other.example/v1".to_string());
+        assert_ne!(
+            model_provider_cache_identity("custom", &first, None),
+            model_provider_cache_identity("custom", &second, None)
+        );
+
+        first = second.clone();
+        first.request_max_retries = Some(100);
+        assert_ne!(
+            model_provider_cache_identity("custom", &first, None),
+            model_provider_cache_identity("custom", &second, None)
+        );
+    }
+
+    #[test]
+    fn provider_cache_identity_changes_for_routing_and_provider_changes() {
+        let mut first = ModelProviderInfo {
+            http_headers: Some(std::collections::HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer secret-one".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let first_identity = model_provider_cache_identity("one", &first, None);
+        assert_eq!(first_identity.len(), 64);
+        assert!(first_identity.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        first
+            .http_headers
+            .as_mut()
+            .expect("headers")
+            .insert("Authorization".to_string(), "Bearer secret-two".to_string());
+        assert_ne!(
+            first_identity,
+            model_provider_cache_identity("one", &first, None)
+        );
+        assert_ne!(
+            model_provider_cache_identity("one", &first, None),
+            model_provider_cache_identity("two", &first, None)
+        );
+        assert!(!first_identity.contains("secret-one"));
+    }
+
+    #[test]
+    fn provider_cache_identity_changes_with_same_mode_account_scope() {
+        let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        let first_auth = CodexAuth::from_external_chatgpt_tokens(
+            TEST_CHATGPT_ACCESS_TOKEN,
+            "account-one",
+            Some("pro"),
+        )
+        .expect("first ChatGPT auth should parse");
+        let second_auth = CodexAuth::from_external_chatgpt_tokens(
+            TEST_CHATGPT_ACCESS_TOKEN,
+            "account-two",
+            Some("pro"),
+        )
+        .expect("second ChatGPT auth should parse");
+        assert_eq!(first_auth.auth_mode(), second_auth.auth_mode());
+        let first_auth_manager = AuthManager::from_auth_for_testing(first_auth);
+        let second_auth_manager = AuthManager::from_auth_for_testing(second_auth);
+
+        let first =
+            model_provider_cache_identity("openai", &provider, Some(first_auth_manager.as_ref()));
+        let second =
+            model_provider_cache_identity("openai", &provider, Some(second_auth_manager.as_ref()));
+
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(!first.contains("account-one"));
+        assert!(!second.contains("account-two"));
+        assert!(!first.contains("user-12345"));
+        assert!(!first.contains(TEST_CHATGPT_ACCESS_TOKEN));
     }
 
     fn test_codex_home() -> std::path::PathBuf {
@@ -434,6 +703,17 @@ mod tests {
             "experimental_supported_tools": [],
         }))
         .expect("valid model")
+    }
+
+    fn unique_test_codex_home(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should follow the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "codex-model-provider-{label}-{}-{unique}",
+            std::process::id()
+        ))
     }
 
     fn bedrock_api_key_auth() -> CodexAuth {
@@ -656,8 +936,11 @@ mod tests {
             ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
             /*auth_manager*/ None,
         );
-        let manager =
-            provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
+        let manager = provider.models_manager(
+            "amazon-bedrock",
+            test_codex_home(),
+            /*config_model_catalog*/ None,
+        );
 
         let catalog = manager
             .raw_model_catalog(
@@ -711,6 +994,7 @@ mod tests {
             /*auth_manager*/ None,
         );
         let manager = provider.models_manager(
+            "amazon-bedrock",
             test_codex_home(),
             Some(ModelsResponse {
                 models: vec![configured_model],
@@ -762,8 +1046,11 @@ mod tests {
             )),
         );
 
-        let manager =
-            provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
+        let manager = provider.models_manager(
+            "test-provider",
+            test_codex_home(),
+            /*config_model_catalog*/ None,
+        );
         let catalog = manager
             .raw_model_catalog(
                 RefreshStrategy::Online,
@@ -777,5 +1064,157 @@ mod tests {
                 .iter()
                 .any(|model| model.slug == "provider-model")
         );
+    }
+
+    #[tokio::test]
+    async fn model_cache_misses_for_different_chatgpt_account_with_same_mode_and_provider() {
+        let server = MockServer::start().await;
+        let codex_home = unique_test_codex_home("account-scoped-cache");
+        std::fs::create_dir_all(&codex_home).expect("create test Codex home");
+        let first_account_id = "workspace-sensitive-alpha";
+        let second_account_id = "workspace-sensitive-beta";
+
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(wiremock::matchers::header(
+                "ChatGPT-Account-ID",
+                first_account_id,
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(ModelsResponse {
+                        models: vec![remote_model("first-scope-model")],
+                    }),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(wiremock::matchers::header(
+                "ChatGPT-Account-ID",
+                second_account_id,
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(ModelsResponse {
+                        models: vec![remote_model("second-scope-model")],
+                    }),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider_info = ModelProviderInfo::create_openai_provider(Some(server.uri()));
+        let first_auth = CodexAuth::from_external_chatgpt_tokens(
+            TEST_CHATGPT_ACCESS_TOKEN,
+            first_account_id,
+            Some("pro"),
+        )
+        .expect("first ChatGPT auth should parse");
+        let first_auth_manager = AuthManager::from_auth_for_testing(first_auth);
+        let first_provider =
+            create_model_provider(provider_info.clone(), Some(Arc::clone(&first_auth_manager)));
+        let first_manager = first_provider.models_manager(
+            "openai",
+            codex_home.clone(),
+            /*config_model_catalog*/ None,
+        );
+        let first_catalog = first_manager
+            .raw_model_catalog(
+                RefreshStrategy::Online,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await;
+        assert!(
+            first_catalog
+                .models
+                .iter()
+                .any(|model| model.slug == "first-scope-model")
+        );
+
+        let cache_json = std::fs::read_to_string(codex_home.join("models_cache.json"))
+            .expect("models cache should be written");
+        assert!(!cache_json.contains(first_account_id));
+        assert!(!cache_json.contains("user-12345"));
+        assert!(!cache_json.contains(TEST_CHATGPT_ACCESS_TOKEN));
+
+        let same_scope_manager = first_provider.models_manager(
+            "openai",
+            codex_home.clone(),
+            /*config_model_catalog*/ None,
+        );
+        let same_scope_catalog = same_scope_manager
+            .raw_model_catalog(
+                RefreshStrategy::OnlineIfUncached,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await;
+        assert!(
+            same_scope_catalog
+                .models
+                .iter()
+                .any(|model| model.slug == "first-scope-model"),
+            "the same authoritative account scope should reuse a fresh cache entry"
+        );
+
+        first_auth_manager
+            .set_forced_chatgpt_workspace_id(Some(vec![first_account_id.to_string()]));
+        let restricted_catalog = first_manager
+            .raw_model_catalog(
+                RefreshStrategy::Offline,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await;
+        assert!(
+            !restricted_catalog
+                .models
+                .iter()
+                .any(|model| model.slug == "first-scope-model"),
+            "a runtime workspace-scope change must not retain the old in-memory catalog"
+        );
+
+        let second_auth = CodexAuth::from_external_chatgpt_tokens(
+            TEST_CHATGPT_ACCESS_TOKEN,
+            second_account_id,
+            Some("pro"),
+        )
+        .expect("second ChatGPT auth should parse");
+        let second_provider = create_model_provider(
+            provider_info,
+            Some(AuthManager::from_auth_for_testing(second_auth)),
+        );
+        let second_manager = second_provider.models_manager(
+            "openai",
+            codex_home.clone(),
+            /*config_model_catalog*/ None,
+        );
+        let second_catalog = second_manager
+            .raw_model_catalog(
+                RefreshStrategy::OnlineIfUncached,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await;
+
+        assert!(
+            second_catalog
+                .models
+                .iter()
+                .any(|model| model.slug == "second-scope-model")
+        );
+        assert!(
+            !second_catalog
+                .models
+                .iter()
+                .any(|model| model.slug == "first-scope-model")
+        );
+        server.verify().await;
+
+        drop(first_manager);
+        drop(same_scope_manager);
+        drop(second_manager);
+        std::fs::remove_dir_all(&codex_home).expect("remove test Codex home");
     }
 }

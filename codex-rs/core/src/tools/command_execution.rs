@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
+#[cfg(test)]
 use std::sync::atomic::AtomicU64;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -16,6 +18,7 @@ use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::WorkspaceMutationLease;
 use codex_agent_task_store::WorkspaceMutationRequest;
+use codex_agent_task_store::WorkspaceMutationResult;
 use codex_protocol::plan_tool::ValidationRoute;
 use codex_protocol::validation::ValidationFreshness;
 use codex_protocol::validation::ValidationProofKey;
@@ -150,7 +153,6 @@ impl CommandAttemptKey {
         self.with_context_fingerprint("repository_epoch", &epoch)
     }
 
-    #[cfg(test)]
     pub(crate) fn fingerprint(&self) -> String {
         format!("{:016x}", fingerprint_value(self))
     }
@@ -181,7 +183,7 @@ impl CommandAttemptBlocked {
     pub(crate) fn render_for_model(&self) -> String {
         format!(
             "Command failed: exact repeat of deterministic `{}` failure from the original attempt (fingerprint `{}`, exit code {}, evidence {:?}); execution was suppressed.",
-            self.prior_failure.outcome_class,
+            self.prior_failure.proof.outcome_class(),
             self.fingerprint,
             self.prior_failure.exit_code,
             self.prior_failure.evidence,
@@ -189,9 +191,42 @@ impl CommandAttemptBlocked {
     }
 }
 
+mod deterministic_failure_proof {
+    /// Sealed proof that a failure outcome is determined by captured inputs
+    /// and state. Production deliberately has no constructor until an
+    /// authoritative classifier can define and capture its complete
+    /// dependency identity.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct InputStateDetermined {
+        outcome_class: String,
+        _proof_identity: String,
+    }
+
+    impl InputStateDetermined {
+        #[cfg(test)]
+        pub(super) fn for_test(outcome_class: &str, proof_identity: &str) -> Self {
+            Self {
+                outcome_class: outcome_class.to_string(),
+                _proof_identity: proof_identity.to_string(),
+            }
+        }
+
+        pub(super) fn outcome_class(&self) -> &str {
+            &self.outcome_class
+        }
+
+        #[cfg(test)]
+        pub(super) fn proof_identity(&self) -> &str {
+            &self._proof_identity
+        }
+    }
+}
+
+use deterministic_failure_proof::InputStateDetermined;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeterministicFailureRecord {
-    pub(crate) outcome_class: String,
+    proof: InputStateDetermined,
     pub(crate) evidence: RawOutputArtifact,
     pub(crate) exit_code: i32,
     pub(crate) execution_started_at: SystemTime,
@@ -201,8 +236,9 @@ pub(crate) struct DeterministicFailureRecord {
 }
 
 impl DeterministicFailureRecord {
-    pub(crate) fn from_trusted_classification(
-        outcome_class: impl Into<String>,
+    #[cfg(test)]
+    fn from_input_state_determined(
+        proof: InputStateDetermined,
         evidence: RawOutputArtifact,
         exit_code: i32,
         execution_ended_at: SystemTime,
@@ -213,7 +249,7 @@ impl DeterministicFailureRecord {
             .checked_sub(execution_duration)
             .unwrap_or(execution_ended_at);
         Self {
-            outcome_class: outcome_class.into(),
+            proof,
             evidence,
             exit_code,
             execution_started_at,
@@ -475,18 +511,41 @@ pub(crate) async fn acquire_workspace_mutation_lease_cached(
         if cancellation.is_cancelled() {
             return Err(WorkspaceMutationAcquireError::Cancelled);
         }
-        let prepared = git_workspace_cache
-            .prepare_repository_manifest(store, repo_root)
-            .await
-            .map_err(WorkspaceMutationAcquireError::Store)?;
-        let lease = if let Some(prepared) = prepared {
-            store
-                .begin_workspace_mutation_prepared(repo_root, request.clone(), prepared)
-                .await
-        } else {
-            store
-                .begin_workspace_mutation(repo_root, request.clone())
-                .await
+        let prepared = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(WorkspaceMutationAcquireError::Cancelled);
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(WorkspaceMutationAcquireError::TimedOut {
+                    details: vec!["repository manifest preparation did not become ready".to_string()],
+                });
+            }
+            prepared = git_workspace_cache.prepare_repository_manifest(store, repo_root) => {
+                prepared.map_err(WorkspaceMutationAcquireError::Store)?
+            }
+        };
+        let lease = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(WorkspaceMutationAcquireError::Cancelled);
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(WorkspaceMutationAcquireError::TimedOut {
+                    details: vec!["workspace mutation admission did not become ready".to_string()],
+                });
+            }
+            lease = async {
+                if let Some(prepared) = prepared {
+                    store
+                        .begin_workspace_mutation_prepared(repo_root, request.clone(), prepared)
+                        .await
+                } else {
+                    store
+                        .begin_workspace_mutation(repo_root, request.clone())
+                        .await
+                }
+            } => lease,
         };
 
         match lease {
@@ -518,15 +577,14 @@ pub(crate) async fn acquire_workspace_mutation_lease_cached(
     }
 }
 
-async fn finish_workspace_mutation_and_seed(
+pub(crate) async fn finish_workspace_mutation_and_seed(
     store: &dyn AgentTaskStore,
     repo_root: &Path,
     lease: WorkspaceMutationLease,
     git_workspace_cache: Option<&GitWorkspaceCache>,
-) -> Result<(), StoreError> {
+) -> Result<WorkspaceMutationResult, StoreError> {
     let Some(cache) = git_workspace_cache else {
-        store.finish_workspace_mutation(repo_root, lease).await?;
-        return Ok(());
+        return store.finish_workspace_mutation(repo_root, lease).await;
     };
     let finalization_guard = cache
         .begin_repository_manifest_finalization(repo_root)
@@ -534,21 +592,53 @@ async fn finish_workspace_mutation_and_seed(
     let outcome = store
         .finish_workspace_mutation_with_receipt(repo_root, lease)
         .await?;
+    #[cfg(test)]
     cache.record_final_manifest_work(outcome.work());
-    cache.note_host_workspace_mutation();
+    let host_mutation_recorded =
+        record_finalized_workspace_mutation(cache, repo_root, outcome.result());
     if let (Some(prepared), Some(finalization_guard)) =
-        (outcome.final_manifest(), finalization_guard)
+        (outcome.final_manifest().cloned(), finalization_guard)
     {
         cache
             .publish_final_repository_manifest(
                 store,
                 repo_root,
-                prepared.clone(),
+                prepared,
                 finalization_guard,
+                host_mutation_recorded,
             )
             .await?;
     }
-    Ok(())
+    Ok(outcome.into_result())
+}
+
+pub(crate) fn workspace_mutation_result_reports_change(result: &WorkspaceMutationResult) -> bool {
+    result.end_epoch > result.start_epoch
+        || !result.changed_paths.is_empty()
+        || !result.drift_paths.is_empty()
+}
+
+pub(crate) fn record_finalized_workspace_mutation(
+    cache: &GitWorkspaceCache,
+    repo_root: &Path,
+    result: &WorkspaceMutationResult,
+) -> bool {
+    if !workspace_mutation_result_reports_change(result) {
+        return false;
+    }
+
+    let exact_paths_are_complete = !result.changed_paths.is_empty()
+        && result.drift_paths.is_empty()
+        && result
+            .changed_paths
+            .iter()
+            .all(|path| path != codex_agent_task_store::REPOSITORY_WIDE_PATH);
+    if exact_paths_are_complete {
+        cache.note_host_workspace_mutation_paths(repo_root, &result.changed_paths);
+    } else {
+        cache.note_host_workspace_mutation();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -761,6 +851,8 @@ struct CommandExecutionState {
     completed_validation_order: VecDeque<ValidationProofKey>,
     validation_results_by_call: HashMap<String, ValidationResult>,
     validation_result_call_order: VecDeque<String>,
+    workspace_admission_blocks: HashMap<(CommandAttemptKey, String), String>,
+    workspace_admission_block_order: VecDeque<(CommandAttemptKey, String)>,
 }
 
 #[derive(Default)]
@@ -768,9 +860,11 @@ pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
     workspace_mutation_gates: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     bound_auto_validations: Mutex<HashMap<String, BoundAutoValidationLeaf>>,
+    #[cfg(test)]
     workspace_lease_diagnostics: WorkspaceLeaseDiagnostics,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct WorkspaceLeaseDiagnostics {
     logical_requests: AtomicU64,
@@ -780,6 +874,43 @@ struct WorkspaceLeaseDiagnostics {
 }
 
 impl CommandExecutionLedger {
+    pub(crate) async fn workspace_admission_block(
+        &self,
+        key: &CommandAttemptKey,
+        turn_id: &str,
+    ) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .workspace_admission_blocks
+            .get(&(key.clone(), turn_id.to_string()))
+            .cloned()
+    }
+
+    pub(crate) async fn record_workspace_admission_block(
+        &self,
+        key: &CommandAttemptKey,
+        turn_id: &str,
+        reason: String,
+    ) {
+        let identity = (key.clone(), turn_id.to_string());
+        let mut state = self.state.lock().await;
+        if state
+            .workspace_admission_blocks
+            .insert(identity.clone(), reason)
+            .is_none()
+        {
+            state.workspace_admission_block_order.push_back(identity);
+        }
+        while state.workspace_admission_block_order.len() > MAX_TRACKED_COMMANDS {
+            let Some(expired) = state.workspace_admission_block_order.pop_front() else {
+                break;
+            };
+            state.workspace_admission_blocks.remove(&expired);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn record_workspace_mutation_scope(
         &self,
         scope: &WorkspaceMutationScope,
@@ -983,13 +1114,33 @@ impl CommandExecutionLedger {
         state.repository_epoch
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_attempt(
         &self,
         key: &CommandAttemptKey,
         repaired: bool,
     ) -> Result<(), CommandAttemptBlocked> {
+        self.begin_attempt_with_freshness(key, repaired, false)
+            .await
+    }
+
+    pub(crate) async fn begin_attempt_with_freshness(
+        &self,
+        key: &CommandAttemptKey,
+        repaired: bool,
+        force_fresh: bool,
+    ) -> Result<(), CommandAttemptBlocked> {
         let mut state = self.state.lock().await;
         let entry = attempt_entry_locked(&mut state, key);
+        if !repaired
+            && !force_fresh
+            && let Some(prior_failure) = entry.deterministic_failure.clone()
+        {
+            return Err(CommandAttemptBlocked {
+                fingerprint: key.fingerprint(),
+                prior_failure,
+            });
+        }
         entry.attempts = entry.attempts.saturating_add(1);
         if repaired {
             entry.repairs = entry.repairs.saturating_add(1);
@@ -997,9 +1148,8 @@ impl CommandExecutionLedger {
         Ok(())
     }
 
-    /// Claims one diagnosis for an exact deterministic failure and selected
-    /// hypothesis/recovery identity. This suppresses only duplicate diagnosis;
-    /// `begin_attempt` always leaves command execution to its normal owner.
+    /// Claims one diagnosis for an exact synthetically proven deterministic
+    /// failure and selected hypothesis/recovery identity.
     #[cfg(test)]
     pub(crate) async fn claim_failure_diagnosis(
         &self,
@@ -1014,9 +1164,10 @@ impl CommandExecutionLedger {
             return false;
         };
         let diagnosis_identity = format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             key.fingerprint(),
-            failure.outcome_class,
+            failure.proof.outcome_class(),
+            failure.proof.proof_identity(),
             failure.exit_code,
             selected_hypothesis_recovery_identity,
         );
@@ -1032,6 +1183,7 @@ impl CommandExecutionLedger {
         record_exit_locked(&mut state, key, exit_code);
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_deterministic_failure(
         &self,
         key: &CommandAttemptKey,
@@ -1434,24 +1586,7 @@ fn record_running_exit_locked(
     running: &RunningCommand,
     exit_code: i32,
 ) {
-    if exit_code != 0 && running.validation_launch.is_some() {
-        let execution_ended_at = SystemTime::now();
-        let execution_duration = Instant::now().saturating_duration_since(running.started_at);
-        let entry = attempt_entry_locked(state, &running.key);
-        entry.last_exit_code = Some(exit_code);
-        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-        entry.deterministic_failure =
-            Some(DeterministicFailureRecord::from_trusted_classification(
-                "focused-validation",
-                running.artifact.clone(),
-                exit_code,
-                execution_ended_at,
-                execution_duration,
-                None,
-            ));
-    } else {
-        record_exit_locked(state, &running.key, exit_code);
-    }
+    record_exit_locked(state, &running.key, exit_code);
 }
 
 fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey, exit_code: i32) {
@@ -1568,8 +1703,8 @@ mod tests {
     }
 
     fn deterministic_failure(class: &str, exit_code: i32) -> DeterministicFailureRecord {
-        DeterministicFailureRecord::from_trusted_classification(
-            class,
+        DeterministicFailureRecord::from_input_state_determined(
+            InputStateDetermined::for_test(class, "synthetic-complete-identity-v1"),
             RawOutputArtifact::unavailable("original deterministic failure fixture"),
             exit_code,
             SystemTime::now(),
@@ -1590,6 +1725,70 @@ mod tests {
             structured_route: None,
             validation_call_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn completion_hook_authoritative_mutation_without_paths_uses_broad_invalidation() {
+        let repo = TempDir::new().expect("repository tempdir");
+        let first = repo.path().join("first.rs");
+        let second = repo.path().join("second.rs");
+        std::fs::write(&first, "first\n").expect("first source fixture");
+        std::fs::write(&second, "second\n").expect("second source fixture");
+        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+        let first_registration = cache
+            .register_source_freshness_paths([first])
+            .expect("first source freshness registration");
+        let second_registration = cache
+            .register_source_freshness_paths([second])
+            .expect("second source freshness registration");
+        let result = WorkspaceMutationResult {
+            lease_id: "legacy-completion-hook".to_string(),
+            start_epoch: 8,
+            end_epoch: 9,
+            changed_paths: Vec::new(),
+            drift_paths: Vec::new(),
+        };
+
+        assert!(record_finalized_workspace_mutation(
+            cache.as_ref(),
+            repo.path(),
+            &result,
+        ));
+        assert!(!cache.source_registration_is_current(&first_registration));
+        assert!(!cache.source_registration_is_current(&second_registration));
+    }
+
+    #[tokio::test]
+    async fn structural_workspace_admission_block_is_scoped_to_attempt_and_turn() {
+        let ledger = CommandExecutionLedger::default();
+        let blocked = key("node inspect.js").with_repository_epoch(4);
+        ledger
+            .record_workspace_admission_block(
+                &blocked,
+                "turn-1",
+                "workspace state initialization failed".to_string(),
+            )
+            .await;
+
+        assert_eq!(
+            ledger.workspace_admission_block(&blocked, "turn-1").await,
+            Some("workspace state initialization failed".to_string())
+        );
+        assert_eq!(
+            ledger.workspace_admission_block(&blocked, "turn-2").await,
+            None,
+            "a new turn is a fresh runtime-state observation"
+        );
+        assert_eq!(
+            ledger
+                .workspace_admission_block(
+                    &key("node inspect.js").with_repository_epoch(5),
+                    "turn-1",
+                )
+                .await,
+            None,
+            "a repository revision change must unblock admission"
+        );
     }
 
     #[tokio::test]
@@ -1806,7 +2005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_failure_suppresses_only_duplicate_diagnosis_and_never_command_retry() {
+    async fn synthetic_input_state_proof_blocks_exact_retry_but_freshness_bypasses() {
         let ledger = CommandExecutionLedger::default();
         let attempt_key = key("fails.exe").with_repository_epoch(1);
 
@@ -1831,12 +2030,18 @@ mod tests {
                 .claim_failure_diagnosis(&attempt_key, "hypothesis-a/recovery-a")
                 .await
         );
-        for _ in 0..3 {
-            ledger
-                .begin_attempt(&attempt_key, false)
-                .await
-                .expect("normal owner must execute every requested retry");
-        }
+        ledger
+            .begin_attempt(&attempt_key, false)
+            .await
+            .expect_err("the synthetic closed proof blocks an exact retry");
+        ledger
+            .begin_attempt(&attempt_key, true)
+            .await
+            .expect("a repaired command bypasses the retained proof");
+        ledger
+            .begin_attempt_with_freshness(&attempt_key, false, true)
+            .await
+            .expect("force_fresh bypasses the retained proof");
         assert!(
             ledger
                 .claim_failure_diagnosis(&attempt_key, "hypothesis-b/recovery-b")
@@ -1969,17 +2174,11 @@ mod tests {
 
         let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
         assert_eq!(snapshot.consecutive_failures, 1);
-        let failure = snapshot
-            .deterministic_failure
-            .expect("trusted tracked validation is classified");
-        assert_eq!(failure.outcome_class, "focused-validation");
-        assert_eq!(failure.exit_code, 7);
-        assert_eq!(failure.evidence, finalized_artifact);
-        let blocked = ledger
+        assert_eq!(snapshot.deterministic_failure, None);
+        ledger
             .begin_attempt(&command_key, false)
             .await
-            .expect_err("the exact deterministic repeat is suppressed");
-        assert_eq!(blocked.prior_failure.evidence, finalized_artifact);
+            .expect("a nonzero validation without typed proof remains retryable");
     }
 
     #[tokio::test]
@@ -2017,12 +2216,11 @@ mod tests {
 
         let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
         assert_eq!(snapshot.consecutive_failures, 1);
-        let failure = snapshot
-            .deterministic_failure
-            .expect("trusted tracked validation is classified");
-        assert_eq!(failure.outcome_class, "focused-validation");
-        assert_eq!(failure.exit_code, 9);
-        assert_eq!(failure.evidence, finalized_artifact);
+        assert_eq!(snapshot.deterministic_failure, None);
+        ledger
+            .begin_attempt(&command_key, false)
+            .await
+            .expect("handler-completed validation without typed proof remains retryable");
     }
 
     #[tokio::test]

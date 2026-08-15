@@ -5,6 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::OutOfBandElicitationLeaseId;
 use codex_core::config::Config;
 use codex_core::config::CurrentTimeReminderConfig;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -227,6 +228,36 @@ async fn run_code_mode_turn_with_builder(
 
     test.submit_turn(prompt).await?;
     Ok((test, second_mock))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_exec_heartbeats_do_not_add_model_generations() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, completion) = run_code_mode_turn(
+        &server,
+        "hold the exec until meaningful output",
+        r#"// @exec: {"yield_time_ms": 5}
+await new Promise(resolve => setTimeout(resolve, 40));
+text("heartbeat-complete");"#,
+    )
+    .await?;
+
+    let request = completion.single_request();
+    let items = custom_tool_output_items(&request, "call-1");
+    assert!(text_item(&items, 0).starts_with("Script completed\n"));
+    assert_eq!(text_item(&items, 1), "heartbeat-complete");
+
+    let model_request_count = server
+        .received_requests()
+        .await
+        .expect("received requests")
+        .into_iter()
+        .filter(|request| request.url.path().contains("responses"))
+        .count();
+    assert_eq!(model_request_count, 2);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -563,12 +594,16 @@ async fn code_mode_exec_holds_captured_result_during_elicitation() -> Result<()>
     )
     .await;
 
+    let first_lease = OutOfBandElicitationLeaseId::new(1, "exec-first".to_string());
+    let second_lease = OutOfBandElicitationLeaseId::new(2, "exec-second".to_string());
     assert_eq!(
-        test.codex.increment_out_of_band_elicitation_count().await?,
+        test.codex
+            .acquire_out_of_band_elicitation_lease(first_lease.clone())?,
         1
     );
     assert_eq!(
-        test.codex.increment_out_of_band_elicitation_count().await?,
+        test.codex
+            .acquire_out_of_band_elicitation_lease(second_lease.clone())?,
         2
     );
     let release_elicitation = async {
@@ -585,7 +620,8 @@ async fn code_mode_exec_holds_captured_result_during_elicitation() -> Result<()>
             "captured exec result should not return during an elicitation"
         );
         assert_eq!(
-            test.codex.decrement_out_of_band_elicitation_count().await?,
+            test.codex
+                .release_out_of_band_elicitation_lease(&first_lease),
             1
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -594,7 +630,8 @@ async fn code_mode_exec_holds_captured_result_during_elicitation() -> Result<()>
             "captured exec result should wait for every elicitation"
         );
         assert_eq!(
-            test.codex.decrement_out_of_band_elicitation_count().await?,
+            test.codex
+                .release_out_of_band_elicitation_lease(&second_lease),
             0
         );
         Ok::<(), anyhow::Error>(())
@@ -602,6 +639,102 @@ async fn code_mode_exec_holds_captured_result_during_elicitation() -> Result<()>
 
     tokio::try_join!(test.submit_turn("run code mode"), release_elicitation)?;
     second_mock.single_request();
+    Ok(())
+}
+
+#[tokio::test]
+async fn code_mode_wait_holds_captured_result_during_elicitation_lease() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        });
+    let test = builder.build(&server).await?;
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call(
+                "call-1",
+                "exec",
+                r#"
+text("phase 1");
+yield_control();
+text("phase 2");
+"#,
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let first_completion = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "waiting"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    test.submit_turn("start the code cell").await?;
+    let first_request = first_completion.single_request();
+    let first_items = custom_tool_output_items(&first_request, "call-1");
+    let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
+
+    let wait_call = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-3"),
+            responses::ev_function_call(
+                "call-2",
+                "wait",
+                &serde_json::to_string(&serde_json::json!({
+                    "cell_id": cell_id,
+                    "yield_time_ms": 1_000,
+                }))?,
+            ),
+            ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+    let final_completion = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-4"),
+        ]),
+    )
+    .await;
+
+    let lease = OutOfBandElicitationLeaseId::new(1, "wait-lease".to_string());
+    assert_eq!(
+        test.codex
+            .acquire_out_of_band_elicitation_lease(lease.clone())?,
+        1
+    );
+    let release_elicitation = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while wait_call.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("wait request should arrive");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            final_completion.requests().is_empty(),
+            "captured wait result should not return during an elicitation lease"
+        );
+        assert_eq!(test.codex.release_out_of_band_elicitation_lease(&lease), 0);
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::try_join!(
+        test.submit_turn("wait for the code cell"),
+        release_elicitation
+    )?;
+    final_completion.single_request();
     Ok(())
 }
 
@@ -654,15 +787,28 @@ async fn code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools() -
                 "call-1",
                 "exec",
                 r#"
+const search = await tools.tool_search({
+  query: "calendar timezone option 99",
+  limit: 8,
+});
 const tool = ALL_TOOLS.find(
   ({ name }) => name === "mcp__codex_apps__calendar_timezone_option_99"
 );
 if (!tool) {
-  text(JSON.stringify({ found: false }));
+  text(JSON.stringify({
+    found: false,
+    searchStatus: search.status,
+    searchExecution: search.execution,
+    searchOmitted: search.omitted_result_count,
+  }));
 } else {
   const result = await tools[tool.name]({ timezone: "UTC" });
   text(JSON.stringify({
     found: true,
+    searchStatus: search.status,
+    searchExecution: search.execution,
+    searchOmitted: search.omitted_result_count,
+    searchReturnedTools: Array.isArray(search.tools),
     isError: Boolean(result.isError),
     text: result.content?.[0]?.text ?? "",
   }));
@@ -744,6 +890,11 @@ if (!tool) {
         .expect("exec description should be present");
     assert!(exec_description.contains("filter `ALL_TOOLS` by `name` and `description`"));
     assert!(exec_description.contains("Shared MCP Types:"));
+    assert!(exec_description.contains("### `tool_search`"));
+    assert!(exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
+    assert!(exec_description.contains("execution: \"client\";"));
+    assert!(exec_description.contains("tools: unknown[];"));
+    assert!(exec_description.contains("omitted_result_count: number | null;"));
     assert!(!exec_description.contains("calendar_timezone_option_99"));
 
     let request = follow_up_mock.single_request();
@@ -758,6 +909,10 @@ if (!tool) {
         parsed,
         serde_json::json!({
             "found": true,
+            "searchStatus": "completed",
+            "searchExecution": "client",
+            "searchOmitted": 0,
+            "searchReturnedTools": true,
             "isError": false,
             "text": "called calendar_timezone_option_99 for  at  with ",
         })
@@ -929,47 +1084,6 @@ text(JSON.stringify(result));
 
     let parsed: Value = serde_json::from_str(&output)?;
     assert_eq!(parsed, serde_json::json!({}));
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_get_context_remaining_returns_structured_result() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn_with_config(
-        &server,
-        "use exec to get remaining context",
-        r#"
-const result = await tools.get_context_remaining({});
-text(JSON.stringify(result));
-"#,
-        |config| {
-            config.model_context_window = Some(10_000);
-            config
-                .features
-                .enable(Feature::TokenBudget)
-                .expect("test config should allow token budget");
-        },
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(false),
-        "exec get_context_remaining call failed unexpectedly: {output}"
-    );
-
-    let parsed: Value = serde_json::from_str(&output)?;
-    assert_eq!(
-        parsed,
-        serde_json::json!({
-            "tokens_left": 9000,
-        })
-    );
 
     Ok(())
 }

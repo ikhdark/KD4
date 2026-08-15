@@ -14,15 +14,189 @@ use codex_login::auth::AgentIdentityAuth;
 use codex_login::auth::AgentIdentityAuthError;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::account::PlanType;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
 use http::HeaderValue;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::bearer_auth_provider::BearerAuthProvider;
 
 const BEDROCK_API_KEY_UNSUPPORTED_MESSAGE: &str =
     "Bedrock API key auth is only supported by the Amazon Bedrock model provider";
+const MODELS_CACHE_AUTH_SCOPE_DOMAIN: &[u8] = b"CODEX_MODELS_CACHE_AUTH_SCOPE_V1\0";
+const MODELS_CACHE_CREDENTIAL_SCOPE_DOMAIN: &[u8] = b"CODEX_MODELS_CACHE_CREDENTIAL_SCOPE_V1\0";
+
+/// Account-scoped request authority derived from the same auth snapshot used
+/// to construct provider request headers.
+///
+/// This type deliberately has no `Debug` implementation: its raw values are
+/// only transient digest input and must never be logged or persisted.
+#[derive(Clone, Eq, PartialEq)]
+struct ProviderAccountScope {
+    auth_mode: Option<AuthMode>,
+    account_id: Option<Vec<u8>>,
+    chatgpt_user_id: Option<Vec<u8>>,
+    account_plan_type: Option<PlanType>,
+    workspace_account: Option<bool>,
+    fedramp_header: Option<Vec<u8>>,
+    credential_scope_digest: Option<Vec<u8>>,
+}
+
+impl ProviderAccountScope {
+    fn from_auth(auth: Option<&CodexAuth>) -> Self {
+        let Some(auth) = auth else {
+            return Self {
+                auth_mode: None,
+                account_id: None,
+                chatgpt_user_id: None,
+                account_plan_type: None,
+                workspace_account: None,
+                fedramp_header: None,
+                credential_scope_digest: None,
+            };
+        };
+
+        let (account_id, fedramp_header, workspace_account) = match auth {
+            CodexAuth::Headers(auth) => (
+                auth.headers()
+                    .get("ChatGPT-Account-ID")
+                    .map(|value| value.as_bytes().to_vec()),
+                auth.headers()
+                    .get("X-OpenAI-Fedramp")
+                    .map(|value| value.as_bytes().to_vec()),
+                None,
+            ),
+            CodexAuth::ApiKey(_) | CodexAuth::BedrockApiKey(_) => (None, None, None),
+            CodexAuth::Chatgpt(_)
+            | CodexAuth::ChatgptAuthTokens(_)
+            | CodexAuth::AgentIdentity(_)
+            | CodexAuth::PersonalAccessToken(_) => (
+                auth.get_account_id().map(String::into_bytes),
+                auth.is_fedramp_account().then(|| b"true".to_vec()),
+                Some(auth.is_workspace_account()),
+            ),
+        };
+
+        let chatgpt_user_id = auth.get_chatgpt_user_id().map(String::into_bytes);
+        let credential_scope_digest = if account_id.is_none() && chatgpt_user_id.is_none() {
+            match auth {
+                CodexAuth::Headers(auth) => {
+                    Some(credential_scope_digest_for_headers(auth.headers()))
+                }
+                CodexAuth::ApiKey(_) => auth
+                    .get_token()
+                    .ok()
+                    .map(|token| credential_scope_digest(token.as_bytes())),
+                CodexAuth::BedrockApiKey(auth) => {
+                    Some(credential_scope_digest(auth.api_key.as_bytes()))
+                }
+                CodexAuth::Chatgpt(_)
+                | CodexAuth::ChatgptAuthTokens(_)
+                | CodexAuth::PersonalAccessToken(_) => auth
+                    .get_token()
+                    .ok()
+                    .map(|token| credential_scope_digest(token.as_bytes())),
+                CodexAuth::AgentIdentity(_) => None,
+            }
+        } else {
+            None
+        };
+
+        Self {
+            auth_mode: Some(auth.auth_mode()),
+            account_id,
+            chatgpt_user_id,
+            account_plan_type: auth.account_plan_type(),
+            workspace_account,
+            fedramp_header,
+            credential_scope_digest,
+        }
+    }
+}
+
+fn credential_scope_digest(credential: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(MODELS_CACHE_CREDENTIAL_SCOPE_DOMAIN);
+    hasher.update(credential);
+    hasher.finalize().to_vec()
+}
+
+fn credential_scope_digest_for_headers(headers: &HeaderMap) -> Vec<u8> {
+    let mut entries = headers
+        .keys()
+        .flat_map(|name| {
+            headers
+                .get_all(name)
+                .iter()
+                .map(move |value| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    let mut canonical = Vec::new();
+    for (name, value) in entries {
+        canonical.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(&name);
+        canonical.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(&value);
+    }
+    credential_scope_digest(&canonical)
+}
+
+/// Non-sensitive material incorporated into the complete model-cache identity.
+pub(crate) struct ProviderCacheAuthIdentity {
+    pub(crate) auth_mode: Option<AuthMode>,
+    pub(crate) account_scope_digest: String,
+}
+
+/// Returns a stable digest of the current authoritative account/workspace
+/// scope. Raw account and user identifiers never leave this function.
+pub(crate) fn provider_cache_auth_identity(
+    auth_manager: Option<&AuthManager>,
+) -> ProviderCacheAuthIdentity {
+    let auth = auth_manager.and_then(AuthManager::auth_cached);
+    let account_scope = ProviderAccountScope::from_auth(auth.as_ref());
+    let auth_mode = account_scope.auth_mode;
+    let effective_chatgpt_workspaces = auth_manager
+        .and_then(AuthManager::effective_chatgpt_workspaces)
+        .map(|mut workspaces| {
+            workspaces.sort();
+            workspaces.dedup();
+            workspaces
+        });
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "version": 2,
+        "auth_mode": account_scope.auth_mode,
+        "account_id": account_scope.account_id,
+        "chatgpt_user_id": account_scope.chatgpt_user_id,
+        "account_plan_type": account_scope.account_plan_type,
+        "workspace_account": account_scope.workspace_account,
+        "fedramp_header": account_scope.fedramp_header,
+        "credential_scope_digest": account_scope.credential_scope_digest,
+        "effective_chatgpt_workspaces": effective_chatgpt_workspaces,
+    }))
+    .unwrap_or_else(|error| {
+        let mut fallback = b"\0provider-auth-cache-identity-serialization-error:".to_vec();
+        fallback.extend_from_slice(error.to_string().as_bytes());
+        fallback
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(MODELS_CACHE_AUTH_SCOPE_DOMAIN);
+    hasher.update(canonical);
+    let account_scope_digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    ProviderCacheAuthIdentity {
+        auth_mode,
+        account_scope_digest,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ProviderAuthScope {
@@ -125,7 +299,7 @@ struct AuthManagerAuthProvider {
     auth_manager: Arc<AuthManager>,
     // Startup auth is only the account-scoped identity anchor. Request
     // headers always come from the current AuthManager snapshot below.
-    expected_auth: CodexAuth,
+    expected_scope: ProviderAccountScope,
 }
 
 impl AuthProvider for AuthManagerAuthProvider {
@@ -140,10 +314,7 @@ impl AuthProvider for AuthManagerAuthProvider {
         // The caller's account-scoped state was built for the expected
         // identity. Follow token refreshes for that identity, but never cross
         // an account or workspace boundary without rebuilding that state.
-        if auth.get_account_id() != self.expected_auth.get_account_id()
-            || auth.get_chatgpt_user_id() != self.expected_auth.get_chatgpt_user_id()
-            || auth.is_workspace_account() != self.expected_auth.is_workspace_account()
-        {
+        if ProviderAccountScope::from_auth(Some(&auth)) != self.expected_scope {
             return;
         }
         auth_provider_from_auth(&auth).add_auth_headers(headers);
@@ -308,7 +479,7 @@ pub fn auth_provider_from_auth_manager(
 ) -> SharedAuthProvider {
     Arc::new(AuthManagerAuthProvider {
         auth_manager,
-        expected_auth: expected_auth.clone(),
+        expected_scope: ProviderAccountScope::from_auth(Some(expected_auth)),
     })
 }
 
@@ -322,7 +493,6 @@ mod tests {
     use codex_login::auth::login_with_chatgpt_auth_tokens;
     use codex_model_provider_info::WireApi;
     use codex_model_provider_info::create_oss_provider_with_base_url;
-    use codex_protocol::account::PlanType;
     use http::header::AUTHORIZATION;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -341,16 +511,21 @@ mod tests {
     static NEXT_CODEX_HOME_ID: AtomicUsize = AtomicUsize::new(0);
     const TEST_CHATGPT_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfdXNlcl9pZCI6InVzZXItMTIzNDUiLCJ1c2VyX2lkIjoidXNlci0xMjM0NSIsImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC0xMjMifX0.c2ln";
 
-    async fn agent_identity_auth(chatgpt_account_is_fedramp: bool) -> AgentIdentityAuth {
+    async fn agent_identity_auth_for_scope(
+        account_id: &str,
+        chatgpt_user_id: &str,
+        plan_type: PlanType,
+        chatgpt_account_is_fedramp: bool,
+    ) -> AgentIdentityAuth {
         let key_material = generate_agent_key_material().expect("generate key material");
         AgentIdentityAuth::from_record(
             AgentIdentityAuthRecord {
                 agent_runtime_id: "agent-runtime-1".to_string(),
                 agent_private_key: key_material.private_key_pkcs8_base64,
-                account_id: "account-1".to_string(),
-                chatgpt_user_id: "user-1".to_string(),
+                account_id: account_id.to_string(),
+                chatgpt_user_id: chatgpt_user_id.to_string(),
                 email: Some("agent@example.com".to_string()),
-                plan_type: PlanType::Plus,
+                plan_type,
                 chatgpt_account_is_fedramp,
                 task_id: Some("task-run-1".to_string()),
             },
@@ -359,6 +534,16 @@ mod tests {
         )
         .await
         .expect("agent identity auth record should include task id")
+    }
+
+    async fn agent_identity_auth(chatgpt_account_is_fedramp: bool) -> AgentIdentityAuth {
+        agent_identity_auth_for_scope(
+            "account-1",
+            "user-1",
+            PlanType::Plus,
+            chatgpt_account_is_fedramp,
+        )
+        .await
     }
 
     fn provider_auth_scope(
@@ -460,6 +645,187 @@ mod tests {
         let actual = auth_provider_from_auth(&auth).to_auth_headers();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn model_cache_auth_identity_uses_external_account_routing_header() {
+        fn identity(
+            account_id: &'static str,
+            authorization: &'static str,
+        ) -> ProviderCacheAuthIdentity {
+            let mut headers = HeaderMap::new();
+            headers.insert("ChatGPT-Account-ID", HeaderValue::from_static(account_id));
+            headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(authorization),
+            );
+            let auth_manager =
+                AuthManager::from_auth_for_testing(CodexAuth::Headers(AuthHeaders::new(headers)));
+            provider_cache_auth_identity(Some(auth_manager.as_ref()))
+        }
+
+        let first = identity("external-account-one", "Bearer external-secret");
+        let rotated_credentials =
+            identity("external-account-one", "Bearer rotated-external-secret");
+        let second = identity("external-account-two", "Bearer external-secret");
+
+        assert_eq!(first.auth_mode, Some(AuthMode::Headers));
+        assert_eq!(
+            first.account_scope_digest,
+            rotated_credentials.account_scope_digest
+        );
+        assert_ne!(first.account_scope_digest, second.account_scope_digest);
+        assert!(!first.account_scope_digest.contains("external-account-one"));
+        assert!(!first.account_scope_digest.contains("external-secret"));
+    }
+
+    #[test]
+    fn model_cache_auth_identity_distinguishes_credential_only_accounts() {
+        fn api_key_identity(api_key: &str) -> ProviderCacheAuthIdentity {
+            let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key(api_key));
+            provider_cache_auth_identity(Some(auth_manager.as_ref()))
+        }
+
+        fn header_identity(entries: &[(&'static str, &'static str)]) -> ProviderCacheAuthIdentity {
+            let mut headers = HeaderMap::new();
+            for (name, value) in entries {
+                headers.insert(
+                    http::HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+            let auth_manager =
+                AuthManager::from_auth_for_testing(CodexAuth::Headers(AuthHeaders::new(headers)));
+            provider_cache_auth_identity(Some(auth_manager.as_ref()))
+        }
+
+        let api_key_one = api_key_identity("sk-test-one");
+        let api_key_two = api_key_identity("sk-test-two");
+        let header_one = header_identity(&[("authorization", "Bearer external-one")]);
+        let header_two = header_identity(&[("authorization", "Bearer external-two")]);
+        let arbitrary_header_one = header_identity(&[("x-api-key", "external-one")]);
+        let arbitrary_header_two = header_identity(&[("x-api-key", "external-two")]);
+        let ordered_headers = header_identity(&[
+            ("x-api-key", "external-one"),
+            ("x-external-auth", "enabled"),
+        ]);
+        let reordered_headers = header_identity(&[
+            ("x-external-auth", "enabled"),
+            ("x-api-key", "external-one"),
+        ]);
+
+        assert_ne!(
+            api_key_one.account_scope_digest,
+            api_key_two.account_scope_digest
+        );
+        assert_ne!(
+            header_one.account_scope_digest,
+            header_two.account_scope_digest
+        );
+        assert_ne!(
+            arbitrary_header_one.account_scope_digest,
+            arbitrary_header_two.account_scope_digest
+        );
+        assert_eq!(
+            ordered_headers.account_scope_digest,
+            reordered_headers.account_scope_digest
+        );
+        for identity in [
+            api_key_one,
+            api_key_two,
+            header_one,
+            header_two,
+            arbitrary_header_one,
+            arbitrary_header_two,
+            ordered_headers,
+            reordered_headers,
+        ] {
+            assert!(!identity.account_scope_digest.contains("sk-test"));
+            assert!(!identity.account_scope_digest.contains("external"));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_cache_auth_identity_covers_authoritative_account_scope() {
+        async fn identity(
+            account_id: &str,
+            user_id: &str,
+            plan_type: PlanType,
+            fedramp: bool,
+        ) -> ProviderCacheAuthIdentity {
+            let auth = CodexAuth::AgentIdentity(
+                agent_identity_auth_for_scope(account_id, user_id, plan_type, fedramp).await,
+            );
+            let auth_manager = AuthManager::from_auth_for_testing(auth);
+            provider_cache_auth_identity(Some(auth_manager.as_ref()))
+        }
+
+        let first = identity("account-one", "user-one", PlanType::Plus, false).await;
+        let same_scope_new_credentials =
+            identity("account-one", "user-one", PlanType::Plus, false).await;
+        let other_account = identity("account-two", "user-one", PlanType::Plus, false).await;
+        let other_user = identity("account-one", "user-two", PlanType::Plus, false).await;
+        let other_plan = identity("account-one", "user-one", PlanType::Pro, false).await;
+        let workspace_account = identity("account-one", "user-one", PlanType::Team, false).await;
+        let fedramp_account = identity("account-one", "user-one", PlanType::Plus, true).await;
+
+        assert_eq!(first.auth_mode, Some(AuthMode::AgentIdentity));
+        assert_eq!(
+            first.account_scope_digest,
+            same_scope_new_credentials.account_scope_digest
+        );
+        assert_ne!(
+            first.account_scope_digest,
+            other_account.account_scope_digest
+        );
+        assert_ne!(first.account_scope_digest, other_user.account_scope_digest);
+        assert_ne!(first.account_scope_digest, other_plan.account_scope_digest);
+        assert_ne!(
+            first.account_scope_digest,
+            workspace_account.account_scope_digest
+        );
+        assert_ne!(
+            first.account_scope_digest,
+            fedramp_account.account_scope_digest
+        );
+        assert_eq!(first.account_scope_digest.len(), 64);
+        assert!(
+            first
+                .account_scope_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert!(!first.account_scope_digest.contains("account-one"));
+        assert!(!first.account_scope_digest.contains("user-one"));
+    }
+
+    #[tokio::test]
+    async fn model_cache_auth_identity_covers_effective_workspace_restriction() {
+        let auth = CodexAuth::AgentIdentity(agent_identity_auth(false).await);
+        let auth_manager = AuthManager::from_auth_for_testing(auth);
+        let unrestricted = provider_cache_auth_identity(Some(auth_manager.as_ref()));
+
+        auth_manager.set_forced_chatgpt_workspace_id(Some(vec![
+            "workspace-b".to_string(),
+            "workspace-a".to_string(),
+        ]));
+        let restricted = provider_cache_auth_identity(Some(auth_manager.as_ref()));
+        auth_manager.set_forced_chatgpt_workspace_id(Some(vec![
+            "workspace-a".to_string(),
+            "workspace-b".to_string(),
+            "workspace-a".to_string(),
+        ]));
+        let reordered = provider_cache_auth_identity(Some(auth_manager.as_ref()));
+
+        assert_ne!(
+            unrestricted.account_scope_digest,
+            restricted.account_scope_digest
+        );
+        assert_eq!(
+            restricted.account_scope_digest,
+            reordered.account_scope_digest
+        );
+        assert!(!restricted.account_scope_digest.contains("workspace-a"));
     }
 
     #[test]

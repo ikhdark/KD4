@@ -50,6 +50,7 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_execution::RunningWorkspaceMutation;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
@@ -151,6 +152,7 @@ pub(crate) struct ExecCommandRequest {
     pub validation_leader:
         Arc<StdMutex<Option<crate::validation_admission::ValidationLeaderOwnership>>>,
     pub validation_waiter: Option<crate::validation_admission::ValidationLeader>,
+    pub known_delta: Option<PreparedKnownDelta>,
 }
 
 impl Drop for ExecCommandRequest {

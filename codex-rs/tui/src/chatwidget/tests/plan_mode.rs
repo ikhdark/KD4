@@ -821,6 +821,9 @@ async fn plan_implementation_popup_skips_replayed_turn_complete() {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             reasoning_policy_history: None,
         }],
         ReplayKind::ResumeInitialMessages,
@@ -860,6 +863,9 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             reasoning_policy_history: None,
         }],
         ReplayKind::ResumeInitialMessages,
@@ -1143,6 +1149,9 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }),
@@ -1179,6 +1188,7 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
 
     chat.handle_server_notification(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: thread_id.to_string(),
             completion: None,
             turn: AppServerTurn {
@@ -1190,6 +1200,9 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,

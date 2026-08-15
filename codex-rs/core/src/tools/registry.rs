@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use crate::hook_runtime::run_pre_tool_use_hooks;
 use crate::memory_usage::emit_metric_for_tool_read;
 use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
+use crate::session::reasoning_governor::PendingOwnerDrainedContinuation;
 use crate::session::turn_context::TurnContext;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
@@ -20,6 +22,7 @@ use crate::tools::command_output_artifact::attach_canonical_output_artifact;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::read_tool_output_selectors;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -42,12 +45,14 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_rollout::state_db;
 use codex_tools::CanonicalByteRange;
+use codex_tools::CanonicalJsonPointer;
 use codex_tools::CanonicalToolResult;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolOutputProjectionFragment;
 use codex_tools::ToolOutputProjectionFragmentKind;
+use codex_tools::ToolOutputProjectionJsonPointer;
 use codex_tools::ToolOutputProjectionRange;
 use codex_tools::ToolProjectionInclusion;
 use codex_tools::ToolProjectionSection;
@@ -209,8 +214,9 @@ pub(crate) struct AnyToolResult {
 }
 
 pub(crate) struct ModelToolProjection {
-    response: ResponseInputItem,
-    candidate: crate::tool_history::ToolHistoryCandidate,
+    original_response: ResponseInputItem,
+    bounded: BoundedModelProjection,
+    candidate: Option<crate::tool_history::ToolHistoryCandidate>,
     projected_tokens: u64,
     canonical_bytes: u64,
     canonical_tokens: u64,
@@ -219,6 +225,58 @@ pub(crate) struct ModelToolProjection {
     projection_truncated: bool,
     omitted_sections: u64,
     deterministic_continuation_receipt: Option<TurnTimingDeterministicContinuationReceipt>,
+    deterministic_continuation_content: Vec<Value>,
+    applied_token_limit: usize,
+}
+
+#[derive(Clone, Debug)]
+enum BoundedModelProjection {
+    Envelope {
+        envelope: ToolProjectionV1,
+        rendered: String,
+    },
+    Fallback {
+        value: Value,
+        rendered: String,
+    },
+}
+
+impl BoundedModelProjection {
+    fn envelope(&self) -> Option<&ToolProjectionV1> {
+        match self {
+            Self::Envelope { envelope, .. } => Some(envelope),
+            Self::Fallback { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn value(&self) -> Value {
+        match self {
+            Self::Envelope { envelope, .. } => {
+                serde_json::to_value(envelope).unwrap_or(Value::Null)
+            }
+            Self::Fallback { value, .. } => value.clone(),
+        }
+    }
+
+    fn rendered(&self) -> &str {
+        match self {
+            Self::Envelope { rendered, .. } | Self::Fallback { rendered, .. } => rendered,
+        }
+    }
+
+    fn into_rendered(self) -> String {
+        match self {
+            Self::Envelope { rendered, .. } => rendered,
+            Self::Fallback { value, rendered } => {
+                debug_assert_eq!(
+                    serde_json::to_string(&value).ok().as_deref(),
+                    Some(rendered.as_str()),
+                );
+                rendered
+            }
+        }
+    }
 }
 
 impl AnyToolResult {
@@ -228,6 +286,10 @@ impl AnyToolResult {
 
     pub(crate) fn outcome_for_logging(&self) -> ToolOutputOutcome {
         self.result.outcome_for_logging()
+    }
+
+    pub(crate) fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
+        self.result.outcome_context()
     }
 
     pub(crate) fn sampling_request_signal(&self) -> Option<serde_json::Value> {
@@ -248,9 +310,68 @@ impl AnyToolResult {
         receipts
     }
 
+    pub(crate) fn intrinsic_deterministic_continuation_receipts(
+        &self,
+    ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
+        let owner_drained_identity = self
+            .owner_drained_continuation()
+            .and_then(|continuation| continuation.receipt.runtime_identity());
+        self.result
+            .deterministic_continuation_receipts()
+            .into_iter()
+            .filter(|receipt| {
+                owner_drained_identity
+                    .as_ref()
+                    .is_none_or(|identity| receipt.runtime_identity().as_ref() != Some(identity))
+            })
+            .collect()
+    }
+
+    pub(crate) fn deterministic_continuation_owner_key(&self) -> Option<String> {
+        self.result.deterministic_continuation_owner_key()
+    }
+
+    pub(crate) fn owner_drained_continuation(&self) -> Option<PendingOwnerDrainedContinuation> {
+        let result_content = self.result.deterministic_continuation_content();
+        if !result_content.is_empty() {
+            let mut receipts = self
+                .result
+                .deterministic_continuation_receipts()
+                .into_iter();
+            let receipt = receipts.next()?;
+            if receipts.next().is_none() && valid_owner_drained_receipt(&receipt) {
+                return Some(PendingOwnerDrainedContinuation {
+                    preserved_content: result_content,
+                    receipt,
+                });
+            }
+        }
+        let projection = self.model_projection.as_ref()?;
+        let receipt = projection.deterministic_continuation_receipt.clone()?;
+        if !valid_owner_drained_receipt(&receipt) {
+            return None;
+        }
+        Some(PendingOwnerDrainedContinuation {
+            preserved_content: (!projection.deterministic_continuation_content.is_empty())
+                .then(|| projection.deterministic_continuation_content.clone())?,
+            receipt,
+        })
+    }
+
+    pub(crate) fn merge_owner_drained_continuations(
+        &mut self,
+        continuations: Vec<PendingOwnerDrainedContinuation>,
+    ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
+        self.model_projection
+            .as_mut()
+            .map_or_else(Vec::new, |projection| {
+                projection.merge_owner_drained_continuations(continuations)
+            })
+    }
+
     pub(crate) fn into_response(self) -> ResponseInputItem {
         if let Some(projection) = self.model_projection {
-            return projection.response;
+            return projection.into_response();
         }
         let Self {
             call_id,
@@ -269,6 +390,92 @@ impl AnyToolResult {
     }
 }
 
+impl ModelToolProjection {
+    #[cfg(test)]
+    fn response(&self) -> ResponseInputItem {
+        projected_response_item(
+            self.original_response.clone(),
+            self.bounded.rendered().to_string(),
+        )
+    }
+
+    fn into_response(self) -> ResponseInputItem {
+        projected_response_item(self.original_response, self.bounded.into_rendered())
+    }
+
+    fn merge_owner_drained_continuations(
+        &mut self,
+        continuations: Vec<PendingOwnerDrainedContinuation>,
+    ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
+        if continuations.is_empty() {
+            return Vec::new();
+        }
+        let mut identities = std::collections::HashSet::with_capacity(continuations.len());
+        let Some(mut envelope) = self.bounded.envelope().cloned() else {
+            return Vec::new();
+        };
+        let projected_text = envelope.result["selected_text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let mut bounded = self.bounded.clone();
+        let mut accepted = Vec::new();
+        for continuation in continuations {
+            if !valid_owner_drained_receipt(&continuation.receipt)
+                || !continuation
+                    .receipt
+                    .runtime_identity()
+                    .is_some_and(|identity| identities.insert(identity))
+            {
+                continue;
+            }
+            let mut candidate = envelope.clone();
+            let mut preserved = candidate.result["preserved_content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let preserved_start = preserved.len();
+            preserved.extend(continuation.preserved_content.iter().cloned());
+            candidate.result["preserved_content"] = Value::Array(preserved);
+            let candidate_bounded = serialize_projection_with_limit(
+                candidate,
+                &projected_text,
+                self.applied_token_limit,
+            );
+            if let Some(candidate_bounded) = candidate_bounded
+                && let Some(accepted_envelope) = candidate_bounded.envelope().cloned()
+                && drained_content_survived(
+                    &accepted_envelope,
+                    preserved_start,
+                    &continuation.preserved_content,
+                )
+            {
+                envelope = accepted_envelope;
+                bounded = candidate_bounded;
+                accepted.push(continuation.receipt);
+            }
+        }
+        if accepted.is_empty() {
+            return accepted;
+        }
+        self.bounded = bounded;
+        let rendered = self.bounded.rendered().to_string();
+        self.projected_tokens = approx_token_count(&rendered) as u64;
+        self.model_bytes = rendered.len() as u64;
+        if let Some(candidate) = &mut self.candidate {
+            candidate.bounded_model_output = rendered;
+        }
+        accepted
+    }
+}
+
+fn valid_owner_drained_receipt(receipt: &TurnTimingDeterministicContinuationReceipt) -> bool {
+    !receipt.resource_identity_hash.is_empty()
+        && !receipt.state_revision.is_empty()
+        && receipt.runtime_identity().is_some()
+        && receipt.suppressed_continuation_count > 0
+}
+
 struct PostToolUseFeedbackOutput {
     original: Box<dyn ToolOutput>,
     model_visible: FunctionToolOutput,
@@ -283,6 +490,18 @@ impl ToolOutput for PostToolUseFeedbackOutput {
         self.original.success_for_logging()
     }
 
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        self.original.outcome_for_logging()
+    }
+
+    fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
+        self.original.outcome_context()
+    }
+
+    fn requires_canonical_artifact(&self) -> bool {
+        self.original.requires_canonical_artifact()
+    }
+
     fn sampling_request_signal(&self) -> Option<Value> {
         self.original.sampling_request_signal()
     }
@@ -291,6 +510,10 @@ impl ToolOutput for PostToolUseFeedbackOutput {
         &self,
     ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
         self.original.deterministic_continuation_receipts()
+    }
+
+    fn deterministic_continuation_owner_key(&self) -> Option<String> {
+        self.original.deterministic_continuation_owner_key()
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
@@ -506,15 +729,6 @@ impl ToolRegistry {
         Some(tool.waits_for_runtime_cancellation())
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn dispatch_any(
-        &self,
-        invocation: ToolInvocation,
-    ) -> Result<AnyToolResult, FunctionCallError> {
-        self.dispatch_any_with_terminal_outcome(invocation, /*terminal_outcome_reached*/ None)
-            .await
-    }
-
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "tool dispatch must keep active-turn accounting atomic"
@@ -522,7 +736,7 @@ impl ToolRegistry {
     pub(crate) async fn dispatch_any_with_terminal_outcome(
         &self,
         mut invocation: ToolInvocation,
-        terminal_outcome_reached: Option<Arc<AtomicBool>>,
+        terminal_outcome_reached: Arc<AtomicBool>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let tool_name_flat = flat_tool_name(&tool_name);
@@ -623,7 +837,7 @@ impl ToolRegistry {
                     dispatch_trace.record_failed(&err);
                     notify_tool_finish_if_unclaimed(
                         &invocation,
-                        terminal_outcome_reached.as_deref(),
+                        terminal_outcome_reached.as_ref(),
                         ToolCallOutcome::Blocked,
                     )
                     .await;
@@ -639,7 +853,7 @@ impl ToolRegistry {
                         dispatch_trace.record_failed(&err);
                         notify_tool_finish_if_unclaimed(
                             &invocation,
-                            terminal_outcome_reached.as_deref(),
+                            terminal_outcome_reached.as_ref(),
                             ToolCallOutcome::Failed {
                                 handler_executed: false,
                             },
@@ -744,7 +958,7 @@ impl ToolRegistry {
         };
         notify_tool_finish_if_unclaimed(
             &invocation,
-            terminal_outcome_reached.as_deref(),
+            terminal_outcome_reached.as_ref(),
             lifecycle_outcome,
         )
         .await;
@@ -774,12 +988,33 @@ impl ToolRegistry {
                         });
                     }
                 }
-                let projection_input = prepare_model_projection(&invocation, &result);
+                let force_inline_carrier = result
+                    .deterministic_continuation_owner_key()
+                    .is_some_and(|owner_key| {
+                        !invocation
+                            .session
+                            .services
+                            .code_mode_service
+                            .owner_drained_continuation_snapshot(&owner_key)
+                            .is_empty()
+                    });
+                let canonical_artifact_required = result.result.requires_canonical_artifact();
+                let projection_input =
+                    prepare_model_projection(&invocation, &result, force_inline_carrier);
                 let model_projection = match projection_input {
                     Some(input) => project_model_output(input).await,
                     None => None,
                 };
-                if let Some(projection) = &model_projection {
+                if canonical_artifact_required && model_projection.is_none() {
+                    let err = FunctionCallError::Fatal(format!(
+                        "failed to preserve the fully received result for {} as a canonical artifact",
+                        flat_tool_name(&invocation.tool_name)
+                    ));
+                    dispatch_trace.record_failed(&err);
+                    return Err(err);
+                }
+                let provider_visible = projection_is_provider_visible(&invocation.source);
+                if provider_visible && let Some(projection) = &model_projection {
                     invocation
                         .turn
                         .turn_timing_state
@@ -796,18 +1031,22 @@ impl ToolRegistry {
                             projection.projection_truncated,
                             projection.omitted_sections,
                         );
-                    invocation
-                        .session
-                        .register_tool_history_candidate(
-                            invocation.turn.config.codex_home.as_path(),
-                            projection.candidate.clone(),
-                        )
-                        .await;
+                    if let Some(candidate) = &projection.candidate {
+                        invocation
+                            .session
+                            .register_tool_history_candidate(
+                                invocation.turn.config.codex_home.as_path(),
+                                candidate.clone(),
+                            )
+                            .await;
+                    }
                 }
-                if matches!(
-                    flat_tool_name(&invocation.tool_name).as_ref(),
-                    "locate_task" | "search_source" | "read_file_span" | "read_tool_output"
-                ) {
+                if provider_visible
+                    && matches!(
+                        flat_tool_name(&invocation.tool_name).as_ref(),
+                        "locate_task" | "search_source" | "read_file_span" | "read_tool_output"
+                    )
+                {
                     let injected_tokens = model_projection.as_ref().map_or_else(
                         || {
                             let response = result
@@ -840,12 +1079,16 @@ impl ToolRegistry {
     }
 }
 
+fn projection_is_provider_visible(source: &ToolCallSource) -> bool {
+    matches!(source, ToolCallSource::Direct)
+}
+
 async fn notify_tool_finish_if_unclaimed(
     invocation: &ToolInvocation,
-    terminal_outcome_reached: Option<&AtomicBool>,
+    terminal_outcome_reached: &AtomicBool,
     outcome: ToolCallOutcome,
 ) -> bool {
-    if terminal_outcome_reached.is_some_and(|reached| reached.swap(true, Ordering::AcqRel)) {
+    if terminal_outcome_reached.swap(true, Ordering::AcqRel) {
         return false;
     }
 
@@ -902,7 +1145,15 @@ struct ModelProjectionInput {
     projection_eligible: bool,
     projection_truncated: bool,
     predetermined_ranges: Vec<ToolOutputProjectionRange>,
+    predetermined_json_pointers: Vec<ToolOutputProjectionJsonPointer>,
     original_response: ResponseInputItem,
+    materialization: ProjectionMaterialization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectionMaterialization {
+    CanonicalArtifact,
+    InlineCarrier,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -919,6 +1170,7 @@ struct ProjectionSelectionFacts {
 fn prepare_model_projection(
     invocation: &ToolInvocation,
     result: &AnyToolResult,
+    force_inline_carrier: bool,
 ) -> Option<ModelProjectionInput> {
     // Exact artifact reads are already bounded and must never recursively spill.
     if invocation.tool_name.name == "read_tool_output" {
@@ -954,31 +1206,56 @@ fn prepare_model_projection(
     );
     let generic_projection = formatted_truncate_text_with_output_limit(&spillable_text, limits);
     let projection_truncated = generic_projection.was_truncated;
-    if !generic_projection.was_truncated
-        && !requires_canonical_projection_artifact(
+    let needs_canonical_artifact = result.result.requires_canonical_artifact()
+        || generic_projection.was_truncated
+        || requires_canonical_projection_artifact(
             invocation.tool_name.name.as_ref(),
             &metadata.fragments,
         )
-        && metadata.predetermined_ranges.is_empty()
-    {
+        || !metadata.predetermined_ranges.is_empty()
+        || !metadata.predetermined_json_pointers.is_empty();
+    if !needs_canonical_artifact && !force_inline_carrier {
         return None;
     }
-    let (projected_text, selection_facts) = if metadata.fragments.is_empty() {
-        (
-            generic_projection.text,
-            ProjectionSelectionFacts {
-                mode: "generic_fallback",
-                available_fragments: 0,
-                selected_fragments: 0,
-                exact_duplicates_removed: 0,
-                selected_ids: Vec::new(),
-                omitted_inline_ids: Vec::new(),
-                partial_ids: Vec::new(),
-            },
-        )
+    let materialization = if needs_canonical_artifact {
+        ProjectionMaterialization::CanonicalArtifact
     } else {
-        select_typed_projection_fragments(&metadata.fragments, limits.applied_limit)
+        ProjectionMaterialization::InlineCarrier
     };
+    let (projected_text, selection_facts) =
+        if materialization == ProjectionMaterialization::InlineCarrier {
+            (
+                spillable_text.clone(),
+                ProjectionSelectionFacts {
+                    mode: "inline_continuation_carrier",
+                    available_fragments: metadata.fragments.len(),
+                    selected_fragments: metadata.fragments.len(),
+                    exact_duplicates_removed: 0,
+                    selected_ids: metadata
+                        .fragments
+                        .iter()
+                        .filter_map(|fragment| fragment.id.clone())
+                        .collect(),
+                    omitted_inline_ids: Vec::new(),
+                    partial_ids: Vec::new(),
+                },
+            )
+        } else if metadata.fragments.is_empty() {
+            (
+                generic_projection.text,
+                ProjectionSelectionFacts {
+                    mode: "generic_fallback",
+                    available_fragments: 0,
+                    selected_fragments: 0,
+                    exact_duplicates_removed: 0,
+                    selected_ids: Vec::new(),
+                    omitted_inline_ids: Vec::new(),
+                    partial_ids: Vec::new(),
+                },
+            )
+        } else {
+            select_typed_projection_fragments(&metadata.fragments, limits.applied_limit)
+        };
 
     let original_response = result
         .result
@@ -998,8 +1275,11 @@ fn prepare_model_projection(
         _ => return None,
     };
     let preserved_content = preserved_non_text_content(&original_response);
-    canonical.sections =
-        canonical_projection_sections(&canonical, &metadata.fragments, &selection_facts);
+    canonical.sections = if materialization == ProjectionMaterialization::InlineCarrier {
+        Vec::new()
+    } else {
+        canonical_projection_sections(&canonical, &metadata.fragments, &selection_facts)
+    };
     let validation_material = metadata.fragments.iter().any(|fragment| {
         fragment.kind == ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
     });
@@ -1038,8 +1318,10 @@ fn prepare_model_projection(
         semantic_class: semantic_class.to_string(),
         projection_eligible: true,
         projection_truncated,
-        predetermined_ranges: validated_predetermined_ranges(&metadata.predetermined_ranges),
+        predetermined_ranges: metadata.predetermined_ranges,
+        predetermined_json_pointers: metadata.predetermined_json_pointers,
         original_response,
+        materialization,
     })
 }
 
@@ -1316,10 +1598,70 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         projection_eligible,
         projection_truncated,
         predetermined_ranges,
+        predetermined_json_pointers,
         original_response,
+        materialization,
     } = input;
     if !projection_eligible {
         return None;
+    }
+    let outcome = match outcome {
+        ToolOutputOutcome::Success => "success",
+        ToolOutputOutcome::Failure => "failure",
+        ToolOutputOutcome::TimedOut => "timeout",
+        ToolOutputOutcome::Skipped => "skipped",
+    };
+    if materialization == ProjectionMaterialization::InlineCarrier {
+        let result_value = serde_json::json!({
+            "essential": essential_inline,
+            "selection": {
+                "mode": selection_facts.mode,
+                "origin_call_id": origin_call_id,
+                "available_fragments": selection_facts.available_fragments,
+                "selected_fragments": selection_facts.selected_fragments,
+                "exact_duplicates_removed": selection_facts.exact_duplicates_removed,
+                "selected_ids": selection_facts.selected_ids,
+                "omitted_inline_ids": selection_facts.omitted_inline_ids,
+                "partial_ids": selection_facts.partial_ids,
+            },
+            "selected_text": "",
+            "preserved_content": preserved_content,
+            "artifact": null,
+        });
+        let envelope = ToolProjectionV1 {
+            version: 1,
+            tool: tool_name,
+            outcome: outcome.to_string(),
+            canonical_sha256: canonical.sha256,
+            canonical_bytes: canonical.exact_bytes,
+            canonical_approximate_tokens: canonical.approximate_tokens,
+            canonical_complete: canonical.complete,
+            model_bytes: 0,
+            model_approximate_tokens: 0,
+            artifact_id: None,
+            sections: Vec::new(),
+            omitted_sections: Vec::new(),
+            result: result_value,
+        };
+        let bounded =
+            serialize_projection_with_limit(envelope, &projected_text, applied_token_limit)?;
+        bounded.envelope()?;
+        let rendered = bounded.rendered().to_string();
+        return Some(ModelToolProjection {
+            original_response,
+            bounded,
+            candidate: None,
+            projected_tokens: approx_token_count(&rendered) as u64,
+            canonical_bytes: canonical.exact_bytes,
+            canonical_tokens: canonical.approximate_tokens,
+            model_bytes: rendered.len() as u64,
+            artifact_created: false,
+            projection_truncated,
+            omitted_sections: 0,
+            deterministic_continuation_receipt: None,
+            deterministic_continuation_content: Vec::new(),
+            applied_token_limit,
+        });
     }
     let existing_artifact_id = essential_inline
         .get("raw_output_artifact_id")
@@ -1347,12 +1689,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
     )
     .await
     .ok()?;
-    let outcome = match outcome {
-        ToolOutputOutcome::Success => "success",
-        ToolOutputOutcome::Failure => "failure",
-        ToolOutputOutcome::TimedOut => "timeout",
-        ToolOutputOutcome::Skipped => "skipped",
-    };
+    let preserved_content_start = preserved_content.len();
     let result_value = serde_json::json!({
         "essential": essential_inline,
         "selection": {
@@ -1381,7 +1718,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         .map(|section| section.id.clone())
         .collect::<Vec<_>>();
     let omitted_section_count = omitted_sections.len() as u64;
-    let envelope = ToolProjectionV1 {
+    let mut envelope = ToolProjectionV1 {
         version: 1,
         tool: tool_name.clone(),
         outcome: outcome.to_string(),
@@ -1396,23 +1733,58 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         omitted_sections,
         result: result_value,
     };
-    let (projected_text, deterministic_continuation_receipt) = drain_predetermined_artifact_ranges(
-        &codex_home,
-        &thread_id,
-        &artifact_id,
-        &canonical.sha256,
-        projected_text,
-        predetermined_ranges,
-        applied_token_limit,
-    )
-    .await;
-    let (_envelope, rendered) =
+    let (predetermined_ranges, predetermined_json_pointers) =
+        validated_omitted_predetermined_selectors(
+            &predetermined_ranges,
+            &predetermined_json_pointers,
+            &canonical.sections,
+            &canonical.json_pointers,
+        );
+    let (drained_content, mut deterministic_continuation_receipt) =
+        drain_predetermined_artifact_selectors(
+            &codex_home,
+            &thread_id,
+            &artifact_id,
+            &canonical.sha256,
+            predetermined_ranges,
+            predetermined_json_pointers,
+            &canonical.sections,
+            &canonical.json_pointers,
+        )
+        .await;
+    let base_envelope = envelope.clone();
+    if !drained_content.is_empty() {
+        envelope.result["preserved_content"] = Value::Array(
+            envelope.result["preserved_content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(drained_content.iter().cloned())
+                .collect(),
+        );
+    }
+    let mut bounded =
         serialize_projection_with_limit(envelope, &projected_text, applied_token_limit)?;
+    if bounded.envelope().is_none_or(|envelope| {
+        !drained_content_survived(envelope, preserved_content_start, &drained_content)
+    }) {
+        deterministic_continuation_receipt = None;
+        bounded =
+            serialize_projection_with_limit(base_envelope, &projected_text, applied_token_limit)?;
+    }
+    let rendered = bounded.rendered().to_string();
     let projected_tokens = approx_token_count(&rendered) as u64;
     let model_bytes = rendered.len() as u64;
+    let deterministic_continuation_content = if deterministic_continuation_receipt.is_some() {
+        drained_content
+    } else {
+        Vec::new()
+    };
     Some(ModelToolProjection {
-        response: projected_response_item(original_response, rendered.clone()),
-        candidate: crate::tool_history::ToolHistoryCandidate {
+        original_response,
+        bounded,
+        candidate: Some(crate::tool_history::ToolHistoryCandidate {
             call_id: origin_call_id,
             tool_identity: tool_name,
             semantic_class,
@@ -1421,13 +1793,13 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             artifact_sha256: canonical.sha256,
             original_output_sha256,
             original_tokens: original_output_tokens,
-            bounded_digest: rendered,
+            bounded_model_output: rendered,
             complete: canonical.complete,
             projection_eligible,
             proof_identity: None,
             supersession_identity: None,
             consumed_by_generation: None,
-        },
+        }),
         projected_tokens,
         canonical_bytes: canonical.exact_bytes,
         canonical_tokens: canonical.approximate_tokens,
@@ -1436,6 +1808,8 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         projection_truncated,
         omitted_sections: omitted_section_count,
         deterministic_continuation_receipt,
+        deterministic_continuation_content,
+        applied_token_limit,
     })
 }
 
@@ -1516,17 +1890,145 @@ fn validated_predetermined_ranges(
     normalized
 }
 
-async fn drain_predetermined_artifact_ranges(
+fn validated_omitted_predetermined_ranges(
+    ranges: &[ToolOutputProjectionRange],
+    sections: &[ToolProjectionSection],
+) -> Vec<ToolOutputProjectionRange> {
+    let section_by_id = sections
+        .iter()
+        .map(|section| (section.id.as_str(), section))
+        .collect::<HashMap<_, _>>();
+    let candidates = ranges
+        .iter()
+        .filter(|range| {
+            section_by_id
+                .get(range.id.as_str())
+                .is_some_and(|section| section.inclusion != ToolProjectionInclusion::Included)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    validated_predetermined_ranges(&candidates)
+}
+
+fn validated_predetermined_json_pointers(
+    pointers: &[ToolOutputProjectionJsonPointer],
+    canonical_json_pointers: &BTreeMap<String, CanonicalJsonPointer>,
+) -> Vec<ToolOutputProjectionJsonPointer> {
+    if pointers.is_empty() || pointers.len() > 64 {
+        return Vec::new();
+    }
+    let mut normalized = pointers.to_vec();
+    normalized.sort_unstable_by(|left, right| {
+        left.pointer
+            .cmp(&right.pointer)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut ids = HashSet::new();
+    let mut selectors = HashSet::new();
+    if normalized.iter().any(|selector| {
+        selector.id.is_empty()
+            || selector.pointer.is_empty()
+            || !selector.pointer.starts_with('/')
+            || !ids.insert(selector.id.clone())
+            || !selectors.insert(selector.pointer.clone())
+            || !canonical_json_pointers.contains_key(&selector.pointer)
+    }) {
+        return Vec::new();
+    }
+    normalized
+}
+
+fn validated_omitted_predetermined_json_pointers(
+    pointers: &[ToolOutputProjectionJsonPointer],
+    sections: &[ToolProjectionSection],
+    canonical_json_pointers: &BTreeMap<String, CanonicalJsonPointer>,
+) -> Vec<ToolOutputProjectionJsonPointer> {
+    let validated = validated_predetermined_json_pointers(pointers, canonical_json_pointers);
+    if !pointers.is_empty() && validated.len() != pointers.len() {
+        return Vec::new();
+    }
+    let section_by_id = sections
+        .iter()
+        .map(|section| (section.id.as_str(), section))
+        .collect::<HashMap<_, _>>();
+    let has_section_identity = validated
+        .iter()
+        .any(|selector| section_by_id.contains_key(selector.id.as_str()));
+    if !has_section_identity {
+        return validated;
+    }
+    validated
+        .into_iter()
+        .filter(|selector| {
+            section_by_id
+                .get(selector.id.as_str())
+                .is_some_and(|section| section.inclusion != ToolProjectionInclusion::Included)
+        })
+        .collect()
+}
+
+fn validated_omitted_predetermined_selectors(
+    ranges: &[ToolOutputProjectionRange],
+    pointers: &[ToolOutputProjectionJsonPointer],
+    sections: &[ToolProjectionSection],
+    canonical_json_pointers: &BTreeMap<String, CanonicalJsonPointer>,
+) -> (
+    Vec<ToolOutputProjectionRange>,
+    Vec<ToolOutputProjectionJsonPointer>,
+) {
+    if ranges.len().saturating_add(pointers.len()) > 64 {
+        return (Vec::new(), Vec::new());
+    }
+    let validated_ranges = validated_predetermined_ranges(ranges);
+    if !ranges.is_empty() && validated_ranges.len() != ranges.len() {
+        return (Vec::new(), Vec::new());
+    }
+    let validated_pointers =
+        validated_predetermined_json_pointers(pointers, canonical_json_pointers);
+    if !pointers.is_empty() && validated_pointers.len() != pointers.len() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut ids = HashSet::new();
+    if validated_ranges
+        .iter()
+        .map(|range| range.id.as_str())
+        .chain(
+            validated_pointers
+                .iter()
+                .map(|selector| selector.id.as_str()),
+        )
+        .any(|id| !ids.insert(id))
+    {
+        return (Vec::new(), Vec::new());
+    }
+    (
+        validated_omitted_predetermined_ranges(&validated_ranges, sections),
+        validated_omitted_predetermined_json_pointers(
+            &validated_pointers,
+            sections,
+            canonical_json_pointers,
+        ),
+    )
+}
+
+// Range and JSON-pointer projections share this private drain boundary but
+// retain separate inputs so their persisted continuation contracts stay clear.
+#[allow(clippy::too_many_arguments)]
+async fn drain_predetermined_artifact_selectors(
     codex_home: &std::path::Path,
     thread_id: &str,
     artifact_id: &str,
     state_revision: &str,
-    projected_text: String,
     ranges: Vec<ToolOutputProjectionRange>,
-    applied_token_limit: usize,
-) -> (String, Option<TurnTimingDeterministicContinuationReceipt>) {
-    if ranges.is_empty() {
-        return (projected_text, None);
+    json_pointers: Vec<ToolOutputProjectionJsonPointer>,
+    sections: &[ToolProjectionSection],
+    canonical_json_pointers: &BTreeMap<String, CanonicalJsonPointer>,
+) -> (
+    Vec<Value>,
+    Option<TurnTimingDeterministicContinuationReceipt>,
+) {
+    if ranges.is_empty() && json_pointers.is_empty() {
+        return (Vec::new(), None);
     }
     let selectors = ranges
         .iter()
@@ -1534,67 +2036,191 @@ async fn drain_predetermined_artifact_ranges(
             start: range.start_line,
             end: range.end_line,
         })
-        .collect();
+        .chain(
+            json_pointers
+                .iter()
+                .map(|selector| ToolOutputSelector::JsonPointer {
+                    pointer: selector.pointer.clone(),
+                }),
+        )
+        .collect::<Vec<_>>();
     let Ok(result) =
-        read_tool_output_selectors(codex_home, thread_id, artifact_id, selectors).await
+        read_tool_output_selectors(codex_home, thread_id, artifact_id, selectors.clone()).await
     else {
-        return (projected_text, None);
+        return (Vec::new(), None);
     };
     if !result.complete
         || !result.unavailable_ranges.is_empty()
-        || result.results.len() != ranges.len()
+        || result.results.len() != selectors.len()
+        || result.artifact_id != artifact_id
+        || result.canonical_sha256 != state_revision
     {
-        return (projected_text, None);
+        return (Vec::new(), None);
     }
-    for selected in &result.results {
-        if selected.status != ToolOutputSelectorStatus::Ok
+
+    if result.results.iter().enumerate().any(|(index, selected)| {
+        selected.status != ToolOutputSelectorStatus::Ok
             || !selected.complete
             || selected.continuation.is_some()
-            || selected.text.is_none()
-        {
-            return (projected_text, None);
-        }
+            || selected.selector != selectors[index]
+            || if index < ranges.len() {
+                selected.text.is_none()
+            } else {
+                selected.value.is_none()
+            }
+    }) {
+        return (Vec::new(), None);
     }
-    let drained = serde_json::json!({
-        "artifact_id": result.artifact_id,
-        "canonical_sha256": result.canonical_sha256,
-        "predetermined_ranges": ranges.iter().zip(result.results).map(|(range, selected)| {
+
+    if !recovery_matches_section_identity(&ranges, sections, &result.results[..ranges.len()])
+        || !recovery_matches_json_pointer_identity(
+            &json_pointers,
+            canonical_json_pointers,
+            &result.results[ranges.len()..],
+        )
+    {
+        return (Vec::new(), None);
+    }
+
+    let action_bounds = serde_json::json!({
+        "predetermined_ranges": ranges.iter().map(|range| {
             serde_json::json!({
                 "id": range.id,
                 "start_line": range.start_line,
                 "end_line": range.end_line,
-                "text": selected.text,
-                "continuation": selected.continuation,
             })
         }).collect::<Vec<_>>(),
-    })
-    .to_string();
-    if drained.len() > 16 * 1024 {
-        return (projected_text, None);
-    }
-    let combined =
-        format!("{projected_text}\nHost-drained predetermined artifact ranges:\n{drained}");
-    if approx_token_count(&combined) > applied_token_limit {
-        return (projected_text, None);
+        "predetermined_json_pointers": json_pointers,
+    });
+    let drained = serde_json::json!({
+        "type": "deterministic_tool_output_recovery",
+        "artifact_id": result.artifact_id,
+        "canonical_sha256": result.canonical_sha256,
+        "predetermined_ranges": action_bounds["predetermined_ranges"].clone(),
+        "predetermined_json_pointers": action_bounds["predetermined_json_pointers"].clone(),
+        "results": result.results,
+    });
+    if serde_json::to_string(&drained).map_or(true, |value| value.len() > 16 * 1024) {
+        return (Vec::new(), None);
     }
     (
-        combined,
+        vec![drained],
         Some(TurnTimingDeterministicContinuationReceipt {
             class: DeterministicContinuationClass::ArtifactRange,
+            wire_identity: String::new(),
             resource_identity_hash: crate::tool_history::sha256(artifact_id.as_bytes()),
             state_revision: state_revision.to_string(),
             host_action: DeterministicContinuationHostAction::DrainArtifactRanges,
-            suppressed_continuation_count: u32::try_from(ranges.len()).unwrap_or(u32::MAX),
-            avoided_token_usage: None,
+            action_bounds_hash: crate::tool_history::sha256(
+                serde_json::to_string(&action_bounds)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            ),
+            suppressed_continuation_count: 1,
         }),
     )
+}
+
+#[cfg(test)]
+async fn drain_predetermined_artifact_ranges(
+    codex_home: &std::path::Path,
+    thread_id: &str,
+    artifact_id: &str,
+    state_revision: &str,
+    ranges: Vec<ToolOutputProjectionRange>,
+    sections: &[ToolProjectionSection],
+) -> (
+    Vec<Value>,
+    Option<TurnTimingDeterministicContinuationReceipt>,
+) {
+    drain_predetermined_artifact_selectors(
+        codex_home,
+        thread_id,
+        artifact_id,
+        state_revision,
+        ranges,
+        Vec::new(),
+        sections,
+        &BTreeMap::new(),
+    )
+    .await
+}
+
+fn recovery_matches_section_identity(
+    ranges: &[ToolOutputProjectionRange],
+    sections: &[ToolProjectionSection],
+    results: &[crate::tools::command_output_artifact::ToolOutputSelectorResult],
+) -> bool {
+    let expected = ranges
+        .iter()
+        .filter_map(|range| {
+            sections
+                .iter()
+                .find(|section| section.id == range.id)
+                .and_then(|section| section.canonical_range)
+        })
+        .collect::<Vec<_>>();
+    if expected.is_empty() {
+        return true;
+    }
+    let actual = results
+        .iter()
+        .filter_map(|result| result.canonical_range)
+        .collect::<Vec<_>>();
+    if actual.is_empty() {
+        return false;
+    }
+    expected.iter().all(|expected| {
+        let covering = actual
+            .iter()
+            .filter(|actual| actual.start >= expected.start && actual.end <= expected.end)
+            .collect::<Vec<_>>();
+        covering
+            .first()
+            .is_some_and(|range| range.start == expected.start)
+            && covering
+                .last()
+                .is_some_and(|range| range.end == expected.end)
+            && covering.windows(2).all(|pair| pair[0].end == pair[1].start)
+    })
+}
+
+fn recovery_matches_json_pointer_identity(
+    pointers: &[ToolOutputProjectionJsonPointer],
+    canonical_json_pointers: &BTreeMap<String, CanonicalJsonPointer>,
+    results: &[crate::tools::command_output_artifact::ToolOutputSelectorResult],
+) -> bool {
+    pointers.len() == results.len()
+        && pointers.iter().zip(results).all(|(selector, result)| {
+            canonical_json_pointers
+                .get(&selector.pointer)
+                .is_some_and(|entry| result.canonical_range == Some(entry.range))
+        })
+}
+
+fn drained_content_survived(
+    envelope: &ToolProjectionV1,
+    preserved_start: usize,
+    drained_content: &[Value],
+) -> bool {
+    if drained_content.is_empty() {
+        return true;
+    }
+    let Some(preserved) = envelope
+        .result
+        .get("preserved_content")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    preserved.get(preserved_start..preserved_start + drained_content.len()) == Some(drained_content)
 }
 
 fn serialize_projection_with_limit(
     mut envelope: ToolProjectionV1,
     output: &str,
     token_limit: usize,
-) -> Option<(Value, String)> {
+) -> Option<BoundedModelProjection> {
     // A JSON value cannot represent zero tokens. Keep that degenerate request to
     // the smallest valid JSON value while enforcing every positive limit exactly.
     let effective_limit = token_limit.max(1);
@@ -1608,7 +2234,7 @@ fn serialize_projection_with_limit(
         let rendered = serde_json::to_string(&envelope).ok()?;
         let rendered_tokens = approx_token_count(&rendered);
         if rendered_tokens <= effective_limit {
-            return Some((serde_json::to_value(envelope).ok()?, rendered));
+            return Some(BoundedModelProjection::Envelope { envelope, rendered });
         }
         if output_limit == 0 {
             break;
@@ -1629,7 +2255,10 @@ fn serialize_projection_with_limit(
     ] {
         let rendered = serde_json::to_string(&fallback).ok()?;
         if approx_token_count(&rendered) <= effective_limit {
-            return Some((fallback, rendered));
+            return Some(BoundedModelProjection::Fallback {
+                value: fallback,
+                rendered,
+            });
         }
     }
     None

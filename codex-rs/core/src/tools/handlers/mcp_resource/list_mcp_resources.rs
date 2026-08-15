@@ -12,6 +12,8 @@ use rmcp::model::PaginatedRequestParams;
 
 use super::ListResourcesArgs;
 use super::ListResourcesPayload;
+use super::canonical_all_list_resources;
+use super::canonical_single_list_resources;
 use super::ensure_model_can_access_mcp_server;
 use super::execute_resource_call;
 use super::model_can_access_mcp_server;
@@ -83,7 +85,7 @@ impl ListMcpResourcesHandler {
             invocation,
             cancellation_token,
             async {
-                let payload = if let Some(server_name) = server.clone() {
+                let (payload, canonical) = if let Some(server_name) = server.clone() {
                     ensure_model_can_access_mcp_server(turn.as_ref(), &server_name)?;
                     let params = cursor
                         .clone()
@@ -97,11 +99,13 @@ impl ListMcpResourcesHandler {
                                     "resources/list failed: {err:#}"
                                 ))
                             })?;
-                    ListResourcesPayload::from_single_server(
+                    let canonical = canonical_single_list_resources(&server_name, &result)?;
+                    let payload = ListResourcesPayload::from_single_server(
                         server_name,
                         result,
                         truncation_policy,
-                    )?
+                    )?;
+                    (payload, canonical)
                 } else {
                     if cursor.is_some() {
                         return Err(FunctionCallError::RespondToModel(
@@ -114,9 +118,11 @@ impl ListMcpResourcesHandler {
                             model_can_access_mcp_server(turn.as_ref(), server_name)
                         })
                         .await;
-                    ListResourcesPayload::from_all_servers(pages, truncation_policy)?
+                    let canonical = canonical_all_list_resources(&pages)?;
+                    let payload = ListResourcesPayload::from_all_servers(pages, truncation_policy)?;
+                    (payload, canonical)
                 };
-                serialize_function_output(payload, truncation_policy)
+                serialize_function_output(payload, canonical, truncation_policy)
             },
         )
         .await

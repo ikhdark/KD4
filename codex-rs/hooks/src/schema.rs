@@ -594,6 +594,10 @@ pub(crate) struct SubagentStopCommandInput {
     pub last_assistant_message: NullableString,
 }
 
+// These generated schemas are published contracts for hook authors and tooling.
+// Runtime serialization and parsing use the typed wire structs in this module,
+// while semantic output constraints remain owned by `engine::output_parser`.
+// Runtime JSON Schema validation would require a separate compatibility decision.
 pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
     let generated_dir = schema_root.join(GENERATED_DIR);
     ensure_empty_dir(&generated_dir)?;

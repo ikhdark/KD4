@@ -17,14 +17,25 @@ use tokio_util::sync::CancellationToken;
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
 use super::call_nested_tool;
+use crate::session::reasoning_governor::PendingOwnerDrainedContinuation;
 use crate::session::step_context::StepContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 
+const MAX_PENDING_CONTINUATIONS_PER_CELL: usize = 64;
+
+struct CellDispatchState {
+    ready: watch::Sender<bool>,
+    terminal: bool,
+    pending_continuations: Vec<PendingOwnerDrainedContinuation>,
+}
+
+type CellDispatchStates = Arc<Mutex<HashMap<CellId, CellDispatchState>>>;
+
 pub(super) struct CodeModeDispatchBroker {
     dispatch_tx: async_channel::Sender<DispatchMessage>,
     dispatch_rx: async_channel::Receiver<DispatchMessage>,
-    dispatch_gates: Arc<Mutex<HashMap<CellId, watch::Sender<bool>>>>,
+    cells: CellDispatchStates,
 }
 
 impl CodeModeDispatchBroker {
@@ -33,24 +44,95 @@ impl CodeModeDispatchBroker {
         Self {
             dispatch_tx,
             dispatch_rx,
-            dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+            cells: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub(super) fn mark_cell_ready_for_dispatch(&self, cell_id: &CellId) {
-        dispatch_gate(&self.dispatch_gates, cell_id).send_replace(true);
+        dispatch_gate(&self.cells, cell_id).send_replace(true);
     }
 
     pub(super) fn close_cell(&self, cell_id: &CellId) {
-        remove_dispatch_gate(&self.dispatch_gates, cell_id);
+        close_cell(&self.cells, cell_id);
+    }
+
+    pub(super) fn record_continuation(
+        &self,
+        cell_id: &CellId,
+        continuation: PendingOwnerDrainedContinuation,
+    ) {
+        let mut cells = self
+            .cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cell) = cells.get_mut(cell_id) else {
+            return;
+        };
+        let Some(identity) = continuation.receipt.runtime_identity() else {
+            return;
+        };
+        if cell.pending_continuations.len() < MAX_PENDING_CONTINUATIONS_PER_CELL
+            && !cell
+                .pending_continuations
+                .iter()
+                .any(|pending| pending.receipt.runtime_identity().as_ref() == Some(&identity))
+        {
+            cell.pending_continuations.push(continuation);
+        }
+    }
+
+    pub(super) fn continuation_snapshot(
+        &self,
+        cell_id: &CellId,
+    ) -> Vec<PendingOwnerDrainedContinuation> {
+        let cells = self
+            .cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cells
+            .get(cell_id)
+            .map(|cell| cell.pending_continuations.clone())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn acknowledge_continuations(
+        &self,
+        cell_id: &CellId,
+        accepted: &[codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt],
+    ) {
+        if accepted.is_empty() {
+            return;
+        }
+        let identities = accepted
+            .iter()
+            .filter_map(
+                codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt::runtime_identity,
+            )
+            .collect::<std::collections::HashSet<_>>();
+        let mut cells = self
+            .cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = cells.get_mut(cell_id).is_some_and(|cell| {
+            cell.pending_continuations.retain(|pending| {
+                pending
+                    .receipt
+                    .runtime_identity()
+                    .is_none_or(|identity| !identities.contains(&identity))
+            });
+            cell.terminal && cell.pending_continuations.is_empty()
+        });
+        if remove {
+            cells.remove(cell_id);
+        }
     }
 
     pub(super) fn has_waitable_cells(&self) -> bool {
-        !self
-            .dispatch_gates
+        self.cells
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+            .values()
+            .any(|cell| !cell.terminal)
     }
 
     pub(super) fn start_turn_worker(
@@ -58,11 +140,13 @@ impl CodeModeDispatchBroker {
         exec: ExecContext,
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
+        request_signals: crate::session::reasoning_governor::SamplingRequestSignalCollector,
     ) -> CodeModeDispatchWorker {
-        let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker);
+        let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker)
+            .with_sampling_request_signals(request_signals);
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
         let dispatch_rx = self.dispatch_rx.clone();
-        let dispatch_gates = Arc::clone(&self.dispatch_gates);
+        let cells = Arc::clone(&self.cells);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
             loop {
@@ -82,7 +166,7 @@ impl CodeModeDispatchBroker {
                         response_tx,
                     } => {
                         let response = if wait_until_cell_ready_for_dispatch(
-                            &dispatch_gates,
+                            &cells,
                             &cell_id,
                             &cancellation_token,
                         )
@@ -90,7 +174,7 @@ impl CodeModeDispatchBroker {
                         {
                             host.notify(call_id, cell_id, text).await
                         } else {
-                            remove_dispatch_gate(&dispatch_gates, &cell_id);
+                            close_cell(&cells, &cell_id);
                             Err("code mode notification cancelled".to_string())
                         };
                         let _ = response_tx.send(response);
@@ -102,13 +186,13 @@ impl CodeModeDispatchBroker {
                     } => {
                         let cell_id = invocation.cell_id.clone();
                         if !wait_until_cell_ready_for_dispatch(
-                            &dispatch_gates,
+                            &cells,
                             &cell_id,
                             &cancellation_token,
                         )
                         .await
                         {
-                            remove_dispatch_gate(&dispatch_gates, &cell_id);
+                            close_cell(&cells, &cell_id);
                             continue;
                         }
                         let host = Arc::clone(&host);
@@ -125,6 +209,7 @@ impl CodeModeDispatchBroker {
                     }
                 }
             }
+            cleanup_terminal_cells(&cells);
         });
         CodeModeDispatchWorker {
             shutdown_tx: Some(shutdown_tx),
@@ -133,39 +218,54 @@ impl CodeModeDispatchBroker {
 }
 
 fn dispatch_gate(
-    dispatch_gates: &Mutex<HashMap<CellId, watch::Sender<bool>>>,
+    cells: &Mutex<HashMap<CellId, CellDispatchState>>,
     cell_id: &CellId,
 ) -> watch::Sender<bool> {
-    let mut dispatch_gates = match dispatch_gates.lock() {
-        Ok(dispatch_gates) => dispatch_gates,
+    let mut cells = match cells.lock() {
+        Ok(cells) => cells,
         Err(poisoned) => poisoned.into_inner(),
     };
-    dispatch_gates
+    cells
         .entry(cell_id.clone())
-        .or_insert_with(|| watch::channel(false).0)
+        .or_insert_with(|| CellDispatchState {
+            ready: watch::channel(false).0,
+            terminal: false,
+            pending_continuations: Vec::new(),
+        })
+        .ready
         .clone()
 }
 
-fn remove_dispatch_gate(
-    dispatch_gates: &Mutex<HashMap<CellId, watch::Sender<bool>>>,
-    cell_id: &CellId,
-) {
-    let mut dispatch_gates = match dispatch_gates.lock() {
-        Ok(dispatch_gates) => dispatch_gates,
+fn close_cell(cells: &Mutex<HashMap<CellId, CellDispatchState>>, cell_id: &CellId) {
+    let mut cells = match cells.lock() {
+        Ok(cells) => cells,
         Err(poisoned) => poisoned.into_inner(),
     };
-    dispatch_gates.remove(cell_id);
+    let remove = cells.get_mut(cell_id).is_some_and(|cell| {
+        cell.terminal = true;
+        cell.pending_continuations.is_empty()
+    });
+    if remove {
+        cells.remove(cell_id);
+    }
+}
+
+fn cleanup_terminal_cells(cells: &Mutex<HashMap<CellId, CellDispatchState>>) {
+    cells
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, cell| !cell.terminal);
 }
 
 async fn wait_until_cell_ready_for_dispatch(
-    dispatch_gates: &Mutex<HashMap<CellId, watch::Sender<bool>>>,
+    cells: &Mutex<HashMap<CellId, CellDispatchState>>,
     cell_id: &CellId,
     cancellation_token: &CancellationToken,
 ) -> bool {
     if cancellation_token.is_cancelled() {
         return false;
     }
-    let mut ready_rx = dispatch_gate(dispatch_gates, cell_id).subscribe();
+    let mut ready_rx = dispatch_gate(cells, cell_id).subscribe();
     loop {
         if *ready_rx.borrow_and_update() {
             return true;
@@ -312,5 +412,134 @@ impl CoreTurnHost {
             .map_err(|_| {
                 format!("failed to inject exec notify message for cell {cell_id}: no active turn")
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::DeterministicContinuationClass;
+    use codex_protocol::protocol::DeterministicContinuationHostAction;
+    use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
+    use serde_json::json;
+
+    fn continuation(ordinal: usize) -> PendingOwnerDrainedContinuation {
+        PendingOwnerDrainedContinuation {
+            preserved_content: vec![json!({"ordinal": ordinal})],
+            receipt: TurnTimingDeterministicContinuationReceipt {
+                class: DeterministicContinuationClass::ArtifactRange,
+                wire_identity: String::new(),
+                resource_identity_hash: format!("artifact-{ordinal}"),
+                state_revision: "revision".to_string(),
+                host_action: DeterministicContinuationHostAction::DrainArtifactRanges,
+                action_bounds_hash: "test-bounds".to_string(),
+                suppressed_continuation_count: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn cell_owner_continuations_are_bounded_and_acknowledged_by_receipt() {
+        let broker = CodeModeDispatchBroker::new();
+        let cell_id = CellId::new("cell-a".to_string());
+        broker.mark_cell_ready_for_dispatch(&cell_id);
+        for ordinal in 0..=MAX_PENDING_CONTINUATIONS_PER_CELL {
+            broker.record_continuation(&cell_id, continuation(ordinal));
+        }
+
+        broker.close_cell(&cell_id);
+        assert!(!broker.has_waitable_cells());
+        let snapshot = broker.continuation_snapshot(&cell_id);
+        assert_eq!(snapshot.len(), MAX_PENDING_CONTINUATIONS_PER_CELL);
+        assert_eq!(snapshot[0].preserved_content, vec![json!({"ordinal": 0})]);
+        assert_eq!(
+            snapshot[MAX_PENDING_CONTINUATIONS_PER_CELL - 1].preserved_content,
+            vec![json!({"ordinal": MAX_PENDING_CONTINUATIONS_PER_CELL - 1})]
+        );
+        broker.acknowledge_continuations(&cell_id, &[snapshot[0].receipt.clone()]);
+        assert_eq!(
+            broker.continuation_snapshot(&cell_id).len(),
+            MAX_PENDING_CONTINUATIONS_PER_CELL - 1
+        );
+        broker.acknowledge_continuations(
+            &cell_id,
+            &snapshot
+                .into_iter()
+                .skip(1)
+                .map(|continuation| continuation.receipt)
+                .collect::<Vec<_>>(),
+        );
+        assert!(broker.continuation_snapshot(&cell_id).is_empty());
+    }
+
+    #[test]
+    fn continuation_snapshot_is_non_destructive_until_acknowledged() {
+        let broker = CodeModeDispatchBroker::new();
+        let cell_id = CellId::new("cell-b".to_string());
+        broker.mark_cell_ready_for_dispatch(&cell_id);
+        broker.record_continuation(&cell_id, continuation(0));
+
+        let snapshot = broker.continuation_snapshot(&cell_id);
+        assert_eq!(snapshot.len(), 1);
+        let repeated = broker.continuation_snapshot(&cell_id);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(
+            repeated[0].receipt.runtime_identity(),
+            snapshot[0].receipt.runtime_identity()
+        );
+        assert!(broker.has_waitable_cells());
+        broker.acknowledge_continuations(&cell_id, &[snapshot[0].receipt.clone()]);
+        assert!(broker.continuation_snapshot(&cell_id).is_empty());
+        broker.close_cell(&cell_id);
+        assert!(!broker.has_waitable_cells());
+    }
+
+    #[test]
+    fn wire_only_receipt_cannot_acknowledge_bounds_sensitive_continuation() {
+        let broker = CodeModeDispatchBroker::new();
+        let cell_id = CellId::new("cell-wire-only".to_string());
+        broker.mark_cell_ready_for_dispatch(&cell_id);
+        broker.record_continuation(&cell_id, continuation(0));
+
+        let authoritative = broker.continuation_snapshot(&cell_id);
+        let wire = serde_json::to_value(&authoritative[0].receipt).expect("serialize receipt");
+        let wire_only: TurnTimingDeterministicContinuationReceipt =
+            serde_json::from_value(wire).expect("deserialize validated public receipt");
+        assert!(wire_only.runtime_identity().is_none());
+
+        broker.acknowledge_continuations(&cell_id, &[wire_only]);
+        assert_eq!(broker.continuation_snapshot(&cell_id).len(), 1);
+    }
+
+    #[test]
+    fn duplicate_receipt_is_recorded_only_once() {
+        let broker = CodeModeDispatchBroker::new();
+        let cell_id = CellId::new("cell-c".to_string());
+        broker.mark_cell_ready_for_dispatch(&cell_id);
+        let first = continuation(0);
+        let duplicate = PendingOwnerDrainedContinuation {
+            preserved_content: vec![json!({"ordinal": "duplicate"})],
+            receipt: first.receipt.clone(),
+        };
+
+        broker.record_continuation(&cell_id, first);
+        broker.record_continuation(&cell_id, duplicate);
+
+        let snapshot = broker.continuation_snapshot(&cell_id);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].preserved_content, vec![json!({"ordinal": 0})]);
+    }
+
+    #[test]
+    fn terminal_unacknowledged_continuations_are_cleaned_up_explicitly() {
+        let broker = CodeModeDispatchBroker::new();
+        let cell_id = CellId::new("cell-d".to_string());
+        broker.mark_cell_ready_for_dispatch(&cell_id);
+        broker.record_continuation(&cell_id, continuation(0));
+        broker.close_cell(&cell_id);
+
+        assert_eq!(broker.continuation_snapshot(&cell_id).len(), 1);
+        cleanup_terminal_cells(&broker.cells);
+        assert!(broker.continuation_snapshot(&cell_id).is_empty());
     }
 }

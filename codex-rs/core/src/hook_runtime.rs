@@ -3,10 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codex_agent_task_store::AgentTaskStore;
+use codex_agent_task_store::PreparedWorkspaceManifest;
 use codex_agent_task_store::REPOSITORY_WIDE_PATH;
 use codex_agent_task_store::WorkspaceActorKind;
 use codex_agent_task_store::WorkspaceMutationLease;
 use codex_agent_task_store::WorkspaceMutationRequest;
+use codex_agent_task_store::WorkspaceMutationResult;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::HookRunFact;
 use codex_analytics::build_track_events_context;
@@ -50,9 +52,12 @@ use tracing::instrument;
 use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
 use crate::event_mapping::parse_turn_item;
+use crate::git_workspace::GitWorkspaceCache;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::command_execution::finish_workspace_mutation_and_seed;
+use crate::tools::command_execution::workspace_mutation_result_reports_change;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
 
@@ -547,14 +552,17 @@ pub(crate) async fn run_legacy_after_agent_hook(
     }
 }
 
-type CompletionHookWorkspaceObservation = Result<
-    Option<(
-        Arc<dyn AgentTaskStore>,
-        std::path::PathBuf,
-        WorkspaceMutationLease,
-    )>,
-    String,
->;
+struct CompletionHookWorkspaceObservationState {
+    store: Arc<dyn AgentTaskStore>,
+    repo_root: std::path::PathBuf,
+    lease: WorkspaceMutationLease,
+    git_workspace_cache: Arc<GitWorkspaceCache>,
+    #[cfg(test)]
+    used_prepared_manifest: bool,
+}
+
+type CompletionHookWorkspaceObservation =
+    Result<Option<CompletionHookWorkspaceObservationState>, String>;
 
 async fn begin_completion_hook_workspace_observation(
     sess: &Session,
@@ -587,45 +595,101 @@ async fn begin_completion_hook_workspace_observation(
         ));
     };
     let repo_root = repo_root.to_path_buf();
-    let lease = store
-        .begin_workspace_mutation(
-            &repo_root,
-            WorkspaceMutationRequest {
-                actor_id: format!("root:{root_session_id}"),
-                root_session_id,
-                kind: WorkspaceActorKind::Root,
-                attempt_id: None,
-                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
-                contracts: vec![format!(
-                    "kd4-completion-review-{}",
-                    hook_name.to_ascii_lowercase()
-                )],
-                expected_manifest: Vec::new(),
-            },
-        )
-        .await
-        .map_err(|error| format!("the {hook_name} workspace observer could not start: {error}"))?;
-    Ok(Some((store, repo_root, lease)))
+    let request = WorkspaceMutationRequest {
+        actor_id: format!("root:{root_session_id}"),
+        root_session_id,
+        kind: WorkspaceActorKind::Root,
+        attempt_id: None,
+        paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+        contracts: vec![format!(
+            "kd4-completion-review-{}",
+            hook_name.to_ascii_lowercase()
+        )],
+        expected_manifest: Vec::new(),
+    };
+    begin_completion_hook_workspace_observation_cached(
+        store,
+        Arc::clone(&sess.services.git_workspace),
+        repo_root,
+        request,
+    )
+    .await
+    .map(Some)
+    .map_err(|error| format!("the {hook_name} workspace observer could not start: {error}"))
+}
+
+async fn begin_completion_hook_workspace_observation_cached(
+    store: Arc<dyn AgentTaskStore>,
+    git_workspace_cache: Arc<GitWorkspaceCache>,
+    repo_root: std::path::PathBuf,
+    request: WorkspaceMutationRequest,
+) -> Result<CompletionHookWorkspaceObservationState, codex_agent_task_store::StoreError> {
+    let prepared = git_workspace_cache
+        .prepare_repository_manifest(store.as_ref(), &repo_root)
+        .await?;
+    begin_completion_hook_workspace_observation_prepared(
+        store,
+        git_workspace_cache,
+        repo_root,
+        request,
+        prepared,
+    )
+    .await
+}
+
+async fn begin_completion_hook_workspace_observation_prepared(
+    store: Arc<dyn AgentTaskStore>,
+    git_workspace_cache: Arc<GitWorkspaceCache>,
+    repo_root: std::path::PathBuf,
+    request: WorkspaceMutationRequest,
+    prepared: Option<PreparedWorkspaceManifest>,
+) -> Result<CompletionHookWorkspaceObservationState, codex_agent_task_store::StoreError> {
+    #[cfg(test)]
+    let used_prepared_manifest = prepared.is_some();
+    let lease = if let Some(prepared) = prepared {
+        store
+            .begin_workspace_mutation_prepared(&repo_root, request, prepared)
+            .await?
+    } else {
+        store.begin_workspace_mutation(&repo_root, request).await?
+    };
+    Ok(CompletionHookWorkspaceObservationState {
+        store,
+        repo_root,
+        lease,
+        git_workspace_cache,
+        #[cfg(test)]
+        used_prepared_manifest,
+    })
 }
 
 async fn finish_completion_hook_workspace_observation(
     observation: CompletionHookWorkspaceObservation,
     hook_name: &'static str,
 ) -> (bool, Option<String>) {
-    match observation {
-        Ok(Some((store, repo_root, lease))) => {
-            match store.finish_workspace_mutation(&repo_root, lease).await {
-                Ok(result) => (!result.changed_paths.is_empty(), None),
-                Err(error) => (
-                    false,
-                    Some(format!(
-                        "the {hook_name} workspace observer could not finish: {error}"
-                    )),
-                ),
-            }
-        }
+    match finalize_completion_hook_workspace_observation(observation, hook_name).await {
+        Ok(Some(result)) => (workspace_mutation_result_reports_change(&result), None),
         Ok(None) => (false, None),
         Err(error) => (false, Some(error)),
+    }
+}
+
+async fn finalize_completion_hook_workspace_observation(
+    observation: CompletionHookWorkspaceObservation,
+    hook_name: &'static str,
+) -> Result<Option<WorkspaceMutationResult>, String> {
+    match observation {
+        Ok(Some(observation)) => finish_workspace_mutation_and_seed(
+            observation.store.as_ref(),
+            &observation.repo_root,
+            observation.lease,
+            Some(observation.git_workspace_cache.as_ref()),
+        )
+        .await
+        .map(Some)
+        .map_err(|error| format!("the {hook_name} workspace observer could not finish: {error}")),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -931,6 +995,15 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::FileTimes;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use codex_agent_task_store::AgentTaskStore;
+    use codex_agent_task_store::LocalAgentTaskStore;
+    use codex_agent_task_store::REPOSITORY_WIDE_PATH;
+    use codex_agent_task_store::WorkspaceActorKind;
+    use codex_agent_task_store::WorkspaceMutationRequest;
     use codex_protocol::models::ContentItem;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
@@ -938,16 +1011,227 @@ mod tests {
     use codex_protocol::protocol::HookRunStatus;
     use codex_protocol::protocol::HookScope;
     use codex_protocol::protocol::HookSource;
+    use codex_state::StateRuntime;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
 
     use super::additional_context_messages;
+    use super::begin_completion_hook_workspace_observation_cached;
+    use super::begin_completion_hook_workspace_observation_prepared;
+    use super::finalize_completion_hook_workspace_observation;
+    use super::finish_completion_hook_workspace_observation;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
+    use crate::git_workspace::GitWorkspaceCache;
     use crate::session::tests::make_session_and_context;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn create_clean_git_repo() -> TempDir {
+        let repo = TempDir::new().expect("temp repo");
+        run_git(repo.path(), &["init", "-q"]);
+        run_git(repo.path(), &["config", "user.name", "Codex Tests"]);
+        run_git(
+            repo.path(),
+            &["config", "user.email", "codex-tests@example.com"],
+        );
+        std::fs::write(repo.path().join("README.md"), "initial\n").expect("write tracked fixture");
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-q", "-m", "initial"]);
+        repo
+    }
+
+    fn completion_observation_request(root_session_id: &str) -> WorkspaceMutationRequest {
+        WorkspaceMutationRequest {
+            actor_id: format!("root:{root_session_id}"),
+            root_session_id: root_session_id.to_string(),
+            kind: WorkspaceActorKind::Root,
+            attempt_id: None,
+            paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+            contracts: vec!["kd4-completion-review-test".to_string()],
+            expected_manifest: Vec::new(),
+        }
+    }
+
+    async fn completion_observation_store() -> (TempDir, Arc<dyn AgentTaskStore>) {
+        let codex_home = TempDir::new().expect("codex home");
+        let state =
+            StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+                .await
+                .expect("state runtime");
+        let store = LocalAgentTaskStore::initialize(&state)
+            .await
+            .expect("task store");
+        (codex_home, Arc::new(store))
+    }
+
+    #[tokio::test]
+    async fn completion_hook_workspace_observation_uses_prepared_manifest_and_seeds_receipt() {
+        let repo = create_clean_git_repo();
+        let (_codex_home, store) = completion_observation_store().await;
+        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+        let unchanged_source = cache
+            .register_source_freshness_paths([repo.path().join("README.md")])
+            .expect("unchanged source freshness registration");
+
+        let unchanged = begin_completion_hook_workspace_observation_cached(
+            Arc::clone(&store),
+            Arc::clone(&cache),
+            repo.path().to_path_buf(),
+            completion_observation_request("hook-stop-root"),
+        )
+        .await
+        .expect("prepared completion observation starts");
+        assert!(unchanged.used_prepared_manifest);
+        assert_eq!(
+            finish_completion_hook_workspace_observation(Ok(Some(unchanged)), "Stop").await,
+            (false, None)
+        );
+        assert!(cache.source_registration_is_current(&unchanged_source));
+
+        let after_unchanged = cache
+            .prepare_repository_manifest(store.as_ref(), repo.path())
+            .await
+            .expect("prepare after unchanged completion")
+            .expect("prepared manifests supported");
+        assert_eq!(after_unchanged.work().files_hashed, 0);
+        assert_eq!(after_unchanged.work().manifests_constructed, 0);
+
+        let changed = begin_completion_hook_workspace_observation_cached(
+            Arc::clone(&store),
+            Arc::clone(&cache),
+            repo.path().to_path_buf(),
+            completion_observation_request("hook-after-agent-root"),
+        )
+        .await
+        .expect("second prepared completion observation starts");
+        assert!(changed.used_prepared_manifest);
+        std::fs::write(repo.path().join("changed.txt"), "changed\n")
+            .expect("mutate observed repository");
+        assert_eq!(
+            finish_completion_hook_workspace_observation(Ok(Some(changed)), "AfterAgent").await,
+            (true, None)
+        );
+
+        let after_changed = cache
+            .prepare_repository_manifest(store.as_ref(), repo.path())
+            .await
+            .expect("prepare after changed completion")
+            .expect("prepared manifests supported");
+        assert_eq!(after_changed.work().files_hashed, 0);
+        assert_eq!(after_changed.work().manifests_constructed, 0);
+    }
+
+    #[tokio::test]
+    async fn completion_hook_workspace_observation_propagates_exact_paths_before_source_reuse() {
+        let repo = create_clean_git_repo();
+        std::fs::create_dir_all(repo.path().join("src")).expect("source directory");
+        let first = repo.path().join("src/first.rs");
+        let second = repo.path().join("src/second.rs");
+        let untouched = repo.path().join("src/untouched.rs");
+        std::fs::write(&first, "aaaa\n").expect("first source fixture");
+        std::fs::write(&second, "cccc\n").expect("second source fixture");
+        std::fs::write(&untouched, "untouched\n").expect("untouched source fixture");
+        run_git(repo.path(), &["add", "src"]);
+        run_git(repo.path(), &["commit", "-q", "-m", "source fixtures"]);
+
+        let (_codex_home, store) = completion_observation_store().await;
+        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+        let first_source = cache
+            .register_source_freshness_paths([first.clone()])
+            .expect("first source freshness registration");
+        let second_source = cache
+            .register_source_freshness_paths([second.clone()])
+            .expect("second source freshness registration");
+        let untouched_source = cache
+            .register_source_freshness_paths([untouched])
+            .expect("untouched source freshness registration");
+        let observation = begin_completion_hook_workspace_observation_cached(
+            Arc::clone(&store),
+            Arc::clone(&cache),
+            repo.path().to_path_buf(),
+            completion_observation_request("hook-exact-paths-root"),
+        )
+        .await
+        .expect("prepared completion observation starts");
+
+        rewrite_with_preserved_modified_time(&first, "bbbb\n");
+        rewrite_with_preserved_modified_time(&second, "dddd\n");
+        let result =
+            finalize_completion_hook_workspace_observation(Ok(Some(observation)), "AfterAgent")
+                .await
+                .expect("completion observation finalizes")
+                .expect("authoritative mutation result");
+
+        assert_eq!(
+            result.changed_paths,
+            vec!["src/first.rs".to_string(), "src/second.rs".to_string()]
+        );
+        assert!(!cache.source_registration_is_current(&first_source));
+        assert!(!cache.source_registration_is_current(&second_source));
+        assert!(
+            cache.source_registration_is_current(&untouched_source),
+            "exact completion-hook paths must not broaden source invalidation"
+        );
+
+        let seeded = cache
+            .prepare_repository_manifest(store.as_ref(), repo.path())
+            .await
+            .expect("prepare after exact hook mutation")
+            .expect("prepared manifests supported");
+        assert_eq!(seeded.receipt().epoch(), result.end_epoch);
+        assert_eq!(seeded.work().files_hashed, 0);
+        assert_eq!(seeded.work().manifests_constructed, 0);
+    }
+
+    fn rewrite_with_preserved_modified_time(path: &Path, contents: &str) {
+        let modified = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .expect("original modified time");
+        std::fs::write(path, contents).expect("rewrite source fixture");
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_times(FileTimes::new().set_modified(modified)))
+            .expect("restore source modified time");
+    }
+
+    #[tokio::test]
+    async fn completion_hook_workspace_observation_retains_legacy_begin_fallback() {
+        let repo = create_clean_git_repo();
+        let (_codex_home, store) = completion_observation_store().await;
+        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+
+        let observation = begin_completion_hook_workspace_observation_prepared(
+            Arc::clone(&store),
+            cache,
+            repo.path().to_path_buf(),
+            completion_observation_request("legacy-hook-root"),
+            None,
+        )
+        .await
+        .expect("legacy completion observation starts");
+        assert!(!observation.used_prepared_manifest);
+        assert_eq!(
+            finish_completion_hook_workspace_observation(Ok(Some(observation)), "Stop").await,
+            (false, None)
+        );
+    }
 
     #[test]
     fn additional_context_messages_stay_separate_and_ordered() {

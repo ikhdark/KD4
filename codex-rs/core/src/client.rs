@@ -124,12 +124,11 @@ use tracing::trace;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::amplification::Kd4DispatchTelemetryContext;
-use crate::amplification::RootAmplificationTelemetry;
 use crate::attestation::AttestationContext;
 use crate::attestation::AttestationProvider;
 use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
+use crate::client_common::ResponseAttemptIdentity;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::context::PromptContextBreakdown;
@@ -208,31 +207,16 @@ struct ModelRequestMeasurements {
     reconciliation_residual_bytes: i64,
     prompt_context_categories: Vec<PromptContextMeasurement>,
     fixed_prefix_reuse_eligible: bool,
-    root_task_id: Option<String>,
-    local_projected_occupancy: Option<i64>,
-    effective_provider_occupancy: Option<i64>,
-    estimate_basis: Option<&'static str>,
-    estimate_complete: Option<bool>,
-    checkpoint_tokens: i64,
-    completed_tool_receipt_tokens: i64,
-    raw_tool_output_tokens: i64,
-    completed_call_tokens: i64,
-    continuity_tokens: i64,
-    unique_new_tokens: Option<i64>,
-    amplification_measurement_complete: bool,
-    amplification_null_reason: Option<&'static str>,
-    soft_floor_status: Option<&'static str>,
-    compactions: u64,
     stable_context_manifest: StableContextManifest,
     logical_context_tokens: i64,
     active_component_bytes: u64,
     local_constructed_bytes: u64,
     local_reused_bytes: u64,
-    component_cache_hits: u64,
+    local_component_reuse_count: u64,
     baseline_generation: Option<u64>,
     provider_baseline: ModelAttemptProviderBaseline,
     previous_response_id_present: bool,
-    projection_savings_eligible: bool,
+    local_projection_policy_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -246,9 +230,6 @@ impl ModelRequestMeasurements {
     fn for_responses_request(
         request: &ResponsesApiRequest,
         provenance: &PromptProvenanceSidecar,
-        amplification: Option<&Arc<RootAmplificationTelemetry>>,
-        kd4_context: Option<&Kd4DispatchTelemetryContext>,
-        root_task_id: Option<&str>,
     ) -> serde_json::Result<Self> {
         let logical_request_bytes = serialized_len(request)?;
         let base_instructions_bytes = serialized_len(&request.instructions)?;
@@ -299,11 +280,6 @@ impl ModelRequestMeasurements {
             reconciliation_residual_bytes.abs() <= MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES
         );
 
-        let categories = model_visible_category_tokens(&request.input)?;
-        let unique_material = amplification
-            .map(|runtime| measure_unique_request_material(runtime, request))
-            .transpose()?;
-
         Ok(Self {
             tool_token_count: serialized_tools.as_deref().map_or(0, |tools| {
                 i64::try_from(approx_token_count(tools)).unwrap_or(i64::MAX)
@@ -322,38 +298,16 @@ impl ModelRequestMeasurements {
             reconciliation_residual_bytes,
             prompt_context_categories: context.measurements(),
             fixed_prefix_reuse_eligible: false,
-            root_task_id: root_task_id.map(str::to_owned),
-            local_projected_occupancy: kd4_context.map(|context| context.local_projected_occupancy),
-            effective_provider_occupancy: kd4_context
-                .and_then(|context| context.effective_provider_occupancy),
-            estimate_basis: kd4_context.map(|context| context.estimate_basis),
-            estimate_complete: kd4_context.map(|context| context.estimate_complete),
-            checkpoint_tokens: categories.checkpoint_tokens,
-            completed_tool_receipt_tokens: categories.completed_tool_receipt_tokens,
-            raw_tool_output_tokens: categories.raw_tool_output_tokens,
-            completed_call_tokens: categories.completed_call_tokens,
-            continuity_tokens: categories.continuity_tokens,
-            unique_new_tokens: unique_material
-                .as_ref()
-                .and_then(|measurement| measurement.unique_new_tokens),
-            amplification_measurement_complete: unique_material
-                .as_ref()
-                .is_some_and(|measurement| measurement.measurement_complete),
-            amplification_null_reason: unique_material
-                .as_ref()
-                .and_then(|measurement| measurement.null_reason),
-            soft_floor_status: kd4_context.map(|context| context.soft_floor_status),
-            compactions: kd4_context.map_or(0, |context| context.compactions),
             stable_context_manifest: StableContextManifest::default(),
             logical_context_tokens: 0,
             active_component_bytes: 0,
             local_constructed_bytes: 0,
             local_reused_bytes: 0,
-            component_cache_hits: 0,
+            local_component_reuse_count: 0,
             baseline_generation: None,
             provider_baseline: ModelAttemptProviderBaseline::StatelessFull,
             previous_response_id_present: false,
-            projection_savings_eligible: false,
+            local_projection_policy_active: false,
         })
     }
 
@@ -417,7 +371,7 @@ impl ModelRequestMeasurements {
             .filter(|component| component.active && component.local_reused)
             .map(|component| component.identity.serialized_bytes)
             .fold(0_u64, u64::saturating_add);
-        self.component_cache_hits = u64::try_from(
+        self.local_component_reuse_count = u64::try_from(
             manifest
                 .components()
                 .iter()
@@ -428,88 +382,9 @@ impl ModelRequestMeasurements {
         self.baseline_generation = baseline_generation;
         self.provider_baseline = provider_baseline;
         self.previous_response_id_present = previous_response_id_present;
-        self.projection_savings_eligible = manifest.projection_enabled()
-            && !manifest.fail_open()
-            && provider_baseline != ModelAttemptProviderBaseline::FailOpenStaleRetained;
+        self.local_projection_policy_active =
+            manifest.projection_enabled() && !manifest.fail_open();
     }
-}
-
-#[derive(Debug, Default)]
-struct ModelVisibleCategoryTokens {
-    checkpoint_tokens: i64,
-    completed_tool_receipt_tokens: i64,
-    raw_tool_output_tokens: i64,
-    completed_call_tokens: i64,
-    continuity_tokens: i64,
-}
-
-fn model_visible_category_tokens(
-    input: &[ResponseItem],
-) -> serde_json::Result<ModelVisibleCategoryTokens> {
-    let mut totals = ModelVisibleCategoryTokens::default();
-    for item in input {
-        let encoded = serde_json::to_string(item)?;
-        let tokens = i64::try_from(approx_token_count(&encoded)).unwrap_or(i64::MAX);
-        if encoded.contains("<task_checkpoint_v1>") {
-            totals.checkpoint_tokens = totals.checkpoint_tokens.saturating_add(tokens);
-        }
-        if encoded.contains("<kd4_continuity_capsule_v1>") {
-            totals.continuity_tokens = totals.continuity_tokens.saturating_add(tokens);
-        }
-        if matches!(
-            item,
-            ResponseItem::FunctionCall { .. }
-                | ResponseItem::CustomToolCall { .. }
-                | ResponseItem::LocalShellCall { .. }
-                | ResponseItem::ToolSearchCall { .. }
-        ) {
-            totals.completed_call_tokens = totals.completed_call_tokens.saturating_add(tokens);
-        }
-        if matches!(
-            item,
-            ResponseItem::FunctionCallOutput { .. }
-                | ResponseItem::CustomToolCallOutput { .. }
-                | ResponseItem::ToolSearchOutput { .. }
-        ) {
-            if model_visible_output_is_receipt(&encoded) {
-                totals.completed_tool_receipt_tokens =
-                    totals.completed_tool_receipt_tokens.saturating_add(tokens);
-            } else {
-                totals.raw_tool_output_tokens =
-                    totals.raw_tool_output_tokens.saturating_add(tokens);
-            }
-        }
-    }
-    Ok(totals)
-}
-
-fn model_visible_output_is_receipt(encoded: &str) -> bool {
-    encoded.contains("exact output retained as artifact")
-        || encoded.contains("artifact_ref")
-        || encoded.contains("artifactReference")
-        || encoded.contains("projection_receipt")
-}
-
-fn measure_unique_request_material(
-    runtime: &RootAmplificationTelemetry,
-    request: &ResponsesApiRequest,
-) -> serde_json::Result<crate::amplification::UniqueMaterialMeasurement> {
-    let instructions = serde_json::to_vec(&request.instructions)?;
-    let input = request
-        .input
-        .iter()
-        .map(serde_json::to_vec)
-        .collect::<serde_json::Result<Vec<_>>>()?;
-    let tools = request.tools.as_ref().map(serde_json::to_vec).transpose()?;
-    let text = serde_json::to_vec(&request.text)?;
-    let mut units = Vec::with_capacity(input.len().saturating_add(3));
-    units.push(("base_instructions", instructions.as_slice()));
-    units.extend(input.iter().map(|item| ("response_item", item.as_slice())));
-    if let Some(tools) = tools.as_ref() {
-        units.push(("tool_schemas", tools.as_slice()));
-    }
-    units.push(("output_schema", text.as_slice()));
-    Ok(runtime.measure_units(units))
 }
 
 fn serialized_len(value: &impl serde::Serialize) -> serde_json::Result<u64> {
@@ -638,6 +513,13 @@ impl ModelAttemptGuard {
         self.clock.clone()
     }
 
+    fn response_identity(&self) -> crate::client_common::ResponseAttemptIdentity {
+        crate::client_common::ResponseAttemptIdentity {
+            sampling_request_id: self.sampling_request_id.clone(),
+            physical_attempt_id: self.attempt_id.clone(),
+        }
+    }
+
     fn tool_token_count(&self) -> i64 {
         self.measurements.tool_token_count
     }
@@ -683,7 +565,7 @@ impl ModelAttemptGuard {
                 baseline_generation: self.measurements.baseline_generation,
                 provider_baseline: self.measurements.provider_baseline,
                 previous_response_id_present: self.measurements.previous_response_id_present,
-                projection_savings_eligible: self.measurements.projection_savings_eligible,
+                local_projection_policy_active: self.measurements.local_projection_policy_active,
                 fresh_response_id_established,
                 input_tokens,
                 cached_input_tokens,
@@ -719,29 +601,7 @@ impl ModelAttemptGuard {
                 active_component_bytes: self.measurements.active_component_bytes,
                 local_constructed_bytes: self.measurements.local_constructed_bytes,
                 local_reused_bytes: self.measurements.local_reused_bytes,
-                component_cache_hits: self.measurements.component_cache_hits,
-                root_task_id: self.measurements.root_task_id.clone(),
-                measurement_window_id: self.sampling_request_id.clone(),
-                local_projected_occupancy: self.measurements.local_projected_occupancy,
-                effective_provider_occupancy: self.measurements.effective_provider_occupancy,
-                estimate_basis: self.measurements.estimate_basis.map(str::to_owned),
-                estimate_complete: self.measurements.estimate_complete,
-                checkpoint_tokens: self.measurements.checkpoint_tokens,
-                completed_tool_receipt_tokens: self.measurements.completed_tool_receipt_tokens,
-                raw_tool_output_tokens: self.measurements.raw_tool_output_tokens,
-                completed_call_tokens: self.measurements.completed_call_tokens,
-                schema_tokens: self.measurements.tool_token_count,
-                continuity_tokens: self.measurements.continuity_tokens,
-                unique_new_tokens: self.measurements.unique_new_tokens,
-                amplification_measurement_complete: self
-                    .measurements
-                    .amplification_measurement_complete,
-                amplification_null_reason: self
-                    .measurements
-                    .amplification_null_reason
-                    .map(str::to_owned),
-                soft_floor_status: self.measurements.soft_floor_status.map(str::to_owned),
-                compactions: self.measurements.compactions,
+                local_component_reuse_count: self.measurements.local_component_reuse_count,
                 dispatch_ready_us: offsets.dispatch_ready_us,
                 stream_established_us: offsets.stream_established_us,
                 first_provider_event_us: offsets.first_provider_event_us,
@@ -767,7 +627,9 @@ impl ModelAttemptGuard {
                     baseline_generation: self.measurements.baseline_generation,
                     provider_baseline: self.measurements.provider_baseline,
                     previous_response_id_present: self.measurements.previous_response_id_present,
-                    projection_savings_eligible: self.measurements.projection_savings_eligible,
+                    local_projection_policy_active: self
+                        .measurements
+                        .local_projection_policy_active,
                     fresh_response_id_established,
                 });
         }
@@ -945,6 +807,15 @@ struct CurrentClientSetup {
     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
 }
 
+pub(crate) type AttemptPreparedCallback = Arc<
+    dyn Fn(
+            ResponseAttemptIdentity,
+        )
+            -> futures::future::BoxFuture<'static, Result<Option<tokio::sync::OwnedMutexGuard<()>>>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone, Copy)]
 struct RequestRouteTelemetry {
     endpoint: &'static str,
@@ -997,8 +868,6 @@ pub struct ModelClientSession {
     last_stream_was_websocket: bool,
     turn_timing: Option<Arc<TurnTimingState>>,
     logical_sampling_request_count: u32,
-    amplification_telemetry: Option<Arc<RootAmplificationTelemetry>>,
-    kd4_dispatch_telemetry: Option<Kd4DispatchTelemetryContext>,
     prompt_context_baseline: Option<PromptContextBaseline>,
     /// Turn state for sticky routing.
     ///
@@ -1096,6 +965,13 @@ struct PreparedStartupWebsocketAttempt {
     request: ResponsesApiRequest,
     transport_readiness_guard: Option<TurnTimingGuard>,
     request_transformation_guard: Option<TurnTimingGuard>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartupPrewarmClaim {
+    ResponseChain,
+    TransportOnly,
+    Rejected,
 }
 
 fn responses_request_properties_fingerprint(
@@ -1203,9 +1079,24 @@ fn responses_request_properties_match(
         && previous_text == current_text
 }
 
+fn rebase_empty_startup_prewarm_stable_context(
+    baseline: &mut WebsocketHistoryBaseline,
+    previous_request_input_empty: bool,
+    stable_context_fingerprint: [u8; 32],
+) -> bool {
+    if baseline.stable_context_fingerprint == stable_context_fingerprint {
+        return true;
+    }
+    if baseline.request_prefix.item_count != 0 || !previous_request_input_empty {
+        return false;
+    }
+    baseline.stable_context_fingerprint = stable_context_fingerprint;
+    true
+}
+
 impl WebsocketSession {
     async fn is_compatible_startup_prewarm(
-        &self,
+        &mut self,
         setup_fingerprint: Option<WebsocketSetupFingerprint>,
         request: &ResponsesApiRequest,
         stable_context_fingerprint: [u8; 32],
@@ -1224,7 +1115,6 @@ impl WebsocketSession {
             || self.last_response_rx.is_none()
             || baseline.normalization_policy_version
                 != WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION
-            || baseline.stable_context_fingerprint != stable_context_fingerprint
             || !responses_request_properties_match(previous_request, request)
             || responses_request_properties_fingerprint(request).ok()
                 != Some(baseline.request_properties_fingerprint)
@@ -1232,8 +1122,39 @@ impl WebsocketSession {
         {
             return false;
         }
-        CanonicalPrefixHash::from_items(&request.input[..baseline.request_prefix.item_count]).ok()
-            == Some(baseline.request_prefix)
+        if CanonicalPrefixHash::from_items(&request.input[..baseline.request_prefix.item_count])
+            .ok()
+            != Some(baseline.request_prefix)
+        {
+            return false;
+        }
+
+        // The startup request deliberately has an empty input prefix. It therefore cannot have
+        // established any provider-side stable context: the complete first-turn input will still
+        // be sent as the delta. Rebase only that empty proof to the realized first-turn manifest.
+        // A non-empty warmup prefix remains fail-closed because it may already have established
+        // context that the projected request omits.
+        let previous_request_input_empty = previous_request.input.is_empty();
+        let Some(baseline) = self.last_request_history.as_mut() else {
+            return false;
+        };
+        rebase_empty_startup_prewarm_stable_context(
+            baseline,
+            previous_request_input_empty,
+            stable_context_fingerprint,
+        )
+    }
+
+    async fn has_compatible_startup_transport(
+        &self,
+        setup_fingerprint: Option<WebsocketSetupFingerprint>,
+    ) -> bool {
+        let (Some(setup_fingerprint), Some(connection)) =
+            (setup_fingerprint, self.connection.as_ref())
+        else {
+            return false;
+        };
+        self.setup_fingerprint == Some(setup_fingerprint) && !connection.is_closed().await
     }
 
     fn into_transport_only(mut self) -> Self {
@@ -1375,8 +1296,6 @@ impl ModelClient {
             last_stream_was_websocket: false,
             turn_timing: None,
             logical_sampling_request_count: 0,
-            amplification_telemetry: None,
-            kd4_dispatch_telemetry: None,
             prompt_context_baseline: None,
             turn_state: Arc::new(OnceLock::new()),
         }
@@ -1393,8 +1312,6 @@ impl ModelClient {
             last_stream_was_websocket: false,
             turn_timing: None,
             logical_sampling_request_count: 0,
-            amplification_telemetry: None,
-            kd4_dispatch_telemetry: None,
             prompt_context_baseline: None,
             turn_state: Arc::new(OnceLock::new()),
         }
@@ -1862,7 +1779,38 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
         use_stable_context_fallback: bool,
     ) -> Result<ResponsesApiRequest> {
-        let mut input = if use_stable_context_fallback {
+        self.build_responses_request_with_fallbacks(
+            provider,
+            prompt,
+            model_info,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            use_stable_context_fallback,
+            /* use_tool_history_fallback */ false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_responses_request_with_fallbacks(
+        &self,
+        provider: &codex_api::Provider,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        use_stable_context_fallback: bool,
+        use_tool_history_fallback: bool,
+    ) -> Result<ResponsesApiRequest> {
+        let mut input = if use_tool_history_fallback {
+            prompt.get_formatted_tool_history_fallback_input_for_request(
+                model_info.use_responses_lite,
+                use_stable_context_fallback,
+            )
+        } else if use_stable_context_fallback {
             prompt.get_formatted_fallback_input_for_request(model_info.use_responses_lite)
         } else {
             prompt.get_formatted_input_for_request(model_info.use_responses_lite)
@@ -2168,38 +2116,6 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
-    pub(crate) fn set_kd4_dispatch_telemetry(
-        &mut self,
-        runtime: Arc<RootAmplificationTelemetry>,
-        context: Kd4DispatchTelemetryContext,
-    ) {
-        self.amplification_telemetry = Some(runtime);
-        self.kd4_dispatch_telemetry = Some(context);
-    }
-
-    pub(crate) fn clear_kd4_dispatch_telemetry(&mut self) {
-        self.amplification_telemetry = None;
-        self.kd4_dispatch_telemetry = None;
-    }
-
-    pub(crate) fn provider_history_baseline_generation(&self) -> Option<u64> {
-        self.websocket_session
-            .last_request_history
-            .as_ref()
-            .filter(|baseline| baseline.provider_response_id_established)
-            .map(|baseline| baseline.generation)
-    }
-
-    pub(crate) fn provider_history_local_occupancy_baseline(&self) -> Option<i64> {
-        self.websocket_session
-            .last_request_history
-            .as_ref()
-            .filter(|baseline| baseline.provider_response_id_established)?;
-        self.kd4_dispatch_telemetry
-            .as_ref()
-            .map(|context| context.local_projected_occupancy)
-    }
-
     pub(crate) fn revoke_cache_publication(&mut self) {
         self.websocket_cache_publication = None;
     }
@@ -2218,12 +2134,12 @@ impl ModelClientSession {
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
-    ) -> Result<bool> {
+    ) -> Result<StartupPrewarmClaim> {
         prewarmed_session.revoke_cache_publication();
         if !Arc::ptr_eq(&self.client.state, &prewarmed_session.client.state)
             || !self.client.responses_websocket_enabled()
         {
-            return Ok(false);
+            return Ok(StartupPrewarmClaim::Rejected);
         }
 
         let transport_readiness_guard = self
@@ -2254,6 +2170,11 @@ impl ModelClientSession {
                 prompt.stable_context_manifest.fingerprint(),
             )
             .await;
+        let transport_compatible = compatible
+            || prewarmed_session
+                .websocket_session
+                .has_compatible_startup_transport(setup_fingerprint)
+                .await;
 
         self.prepared_startup_websocket_attempt = Some(PreparedStartupWebsocketAttempt {
             client_setup,
@@ -2261,14 +2182,25 @@ impl ModelClientSession {
             transport_readiness_guard,
             request_transformation_guard,
         });
-        if !compatible {
-            return Ok(false);
+        if !transport_compatible {
+            return Ok(StartupPrewarmClaim::Rejected);
         }
 
         let adopted_session = std::mem::take(&mut prewarmed_session.websocket_session);
+        let adopted_session = if compatible {
+            adopted_session
+        } else {
+            // Request-property or non-empty-prefix incompatibility must discard response IDs and
+            // history, but the already-authenticated socket is still valid for the real request.
+            adopted_session.into_transport_only()
+        };
         let replaced_session = std::mem::replace(&mut self.websocket_session, adopted_session);
         drop(replaced_session);
-        Ok(true)
+        Ok(if compatible {
+            StartupPrewarmClaim::ResponseChain
+        } else {
+            StartupPrewarmClaim::TransportOnly
+        })
     }
 
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
@@ -2305,6 +2237,16 @@ impl ModelClientSession {
             .next_history_generation
             .wrapping_add(1)
             .max(1);
+    }
+
+    /// Central invalidation for an unknown realized context baseline. This
+    /// disables every provider-held inheritance path while retaining a healthy
+    /// transport for the next complete request.
+    pub(crate) fn invalidate_provider_history_inheritance(&mut self, reason: &'static str) {
+        self.invalidate_incremental_history(reason);
+        self.prompt_context_baseline = None;
+        self.prepared_startup_websocket_attempt = None;
+        self.revoke_cache_publication();
     }
 
     fn remember_request_history(
@@ -2550,6 +2492,7 @@ impl ModelClientSession {
         payload: ResponseCreateWsRequest,
         request: &ResponsesApiRequest,
         stable_context_fingerprint: [u8; 32],
+        tool_history_substitutions: &[crate::tool_history::ToolHistorySubstitution],
     ) -> (ResponsesWsRequest, bool) {
         let baseline_is_stale = self
             .websocket_session
@@ -2571,6 +2514,30 @@ impl ModelClientSession {
         };
         let previous_response_id_from_untraced_warmup =
             self.websocket_session.last_response_from_untraced_warmup;
+        if !tool_history_substitutions.is_empty() {
+            if !crate::tool_history::substitutions_match_items(
+                tool_history_substitutions,
+                &request.input,
+            ) {
+                trace!("completed-tool substitution metadata did not match request input");
+            }
+            let mut provider_prefix = self
+                .websocket_session
+                .last_request
+                .as_ref()
+                .map(|request| request.input.to_vec())
+                .unwrap_or_default();
+            provider_prefix.extend(last_response.items_added.iter().cloned());
+            if crate::tool_history::substitutions_overlap_items(
+                tool_history_substitutions,
+                &provider_prefix,
+            ) {
+                self.invalidate_provider_history_inheritance(
+                    "completed-tool receipt replaced inherited provider history",
+                );
+                return (ResponsesWsRequest::ResponseCreate(payload), false);
+            }
+        }
         let Some(incremental_items) = self.get_incremental_items(
             request,
             Some(&last_response),
@@ -2763,6 +2730,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
+        attempt_prepared: Option<AttemptPreparedCallback>,
     ) -> Result<ResponseStream> {
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
@@ -2825,9 +2793,6 @@ impl ModelClientSession {
             let mut measurements = ModelRequestMeasurements::for_responses_request(
                 &request,
                 &prompt.prompt_provenance,
-                self.amplification_telemetry.as_ref(),
-                self.kd4_dispatch_telemetry.as_ref(),
-                Some(&responses_metadata.session_id),
             )?;
             measurements.record_stable_context(
                 &prompt.stable_context_manifest,
@@ -2857,6 +2822,10 @@ impl ModelClientSession {
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
+            let _sampling_admission = match attempt_prepared.as_ref() {
+                Some(attempt_prepared) => attempt_prepared(attempt.response_identity()).await?,
+                None => None,
+            };
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
@@ -2959,6 +2928,7 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
+        attempt_prepared: Option<AttemptPreparedCallback>,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.provider.auth_manager();
 
@@ -3088,6 +3058,9 @@ impl ModelClientSession {
                     ws_payload,
                     &request,
                     prompt.stable_context_manifest.fingerprint(),
+                    prompt.tool_history_substitutions_for_request(
+                        /* use_stable_context_fallback */ false,
+                    ),
                 );
             let inherited_stable_context_matches = self
                 .websocket_session
@@ -3161,9 +3134,6 @@ impl ModelClientSession {
                 let mut measurements = ModelRequestMeasurements::for_responses_request(
                     &logical_request,
                     &prompt.prompt_provenance,
-                    self.amplification_telemetry.as_ref(),
-                    self.kd4_dispatch_telemetry.as_ref(),
-                    Some(&responses_metadata.session_id),
                 )?;
                 measurements.wire_request_bytes = serialized_len(&ws_request)?;
                 measurements.record_stable_context(
@@ -3209,6 +3179,12 @@ impl ModelClientSession {
                         )
                     });
             let attempt_clock = attempt.as_ref().map(ModelAttemptGuard::clock);
+            let _sampling_admission = match (attempt.as_ref(), attempt_prepared.as_ref()) {
+                (Some(attempt), Some(attempt_prepared)) => {
+                    attempt_prepared(attempt.response_identity()).await?
+                }
+                _ => None,
+            };
             let turn_timing = self.turn_timing.clone();
             let serialization_timing_guard = self
                 .turn_timing
@@ -3334,6 +3310,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
+                None,
             )
             .await
         {
@@ -3376,6 +3353,33 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.stream_with_attempt_prepared(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            inference_trace,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_with_attempt_prepared(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+        attempt_prepared: Option<AttemptPreparedCallback>,
+    ) -> Result<ResponseStream> {
         let sampling_request_id = new_sampling_request_id();
         let request_kind = if self.logical_sampling_request_count == 0 {
             ModelAttemptRequestKind::Initial
@@ -3403,6 +3407,7 @@ impl ModelClientSession {
                             /*warmup*/ false,
                             request_trace,
                             inference_trace,
+                            attempt_prepared.clone(),
                         )
                         .await?
                     {
@@ -3425,6 +3430,7 @@ impl ModelClientSession {
                     service_tier,
                     responses_metadata,
                     inference_trace,
+                    attempt_prepared,
                 )
                 .await
             }
@@ -3560,6 +3566,7 @@ where
         + Send
         + 'static,
 {
+    let attempt_identity = attempt.as_ref().map(ModelAttemptGuard::response_identity);
     let (tx_event, rx_event) =
         mpsc::channel::<Result<ResponseEvent>>(RESPONSE_STREAM_CHANNEL_CAPACITY);
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
@@ -3731,6 +3738,7 @@ where
     (
         ResponseStream {
             rx_event,
+            attempt_identity,
             consumer_dropped: consumer_dropped_for_stream,
         },
         rx_last_response,

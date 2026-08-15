@@ -14,6 +14,8 @@ use codex_core::NewThread;
 use codex_core::ThreadManager;
 use codex_core::config::Config as CodexConfig;
 use codex_protocol::ThreadId;
+use codex_protocol::approvals::ElicitationAction;
+use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
@@ -21,13 +23,16 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use rmcp::model::CallToolResult;
 use rmcp::model::Content;
 use rmcp::model::RequestId;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// To adhere to MCP `tools/call` response format, include the Codex
 /// `threadId` in the `structured_content` field of the response.
@@ -38,16 +43,85 @@ pub(crate) fn create_call_tool_result_with_thread_id(
     text: String,
     is_error: Option<bool>,
 ) -> CallToolResult {
+    create_call_tool_result_with_thread_id_and_surfaced_result(thread_id, text, is_error, None)
+}
+
+fn create_call_tool_result_with_thread_id_and_surfaced_result(
+    thread_id: ThreadId,
+    text: String,
+    is_error: Option<bool>,
+    surfaced_result: Option<SurfacedToolResult>,
+) -> CallToolResult {
     let content_text = text;
     let content = vec![Content::text(content_text.clone())];
-    let structured_content = json!({
+    let mut structured_content = json!({
         "threadId": thread_id,
         "content": content_text,
     });
+    if let Some(surfaced_result) = surfaced_result {
+        structured_content["surfacedResult"] = json!(surfaced_result);
+    }
     let mut result = CallToolResult::success(content);
     result.is_error = is_error;
     result.structured_content = Some(structured_content);
     result
+}
+
+#[derive(Deserialize)]
+struct ElicitationCreateResponse {
+    action: ElicitationAction,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(rename = "_meta", default)]
+    meta: Option<serde_json::Value>,
+}
+
+async fn forward_elicitation(
+    event: ElicitationRequestEvent,
+    outgoing: Arc<OutgoingMessageSender>,
+    thread: Arc<CodexThread>,
+    cancellation: CancellationToken,
+) {
+    if !outgoing.supports_elicitation(&event.request) {
+        let _ = thread
+            .submit(Op::ResolveElicitation {
+                server_name: event.server_name,
+                request_id: event.id,
+                decision: ElicitationAction::Cancel,
+                content: None,
+                meta: None,
+            })
+            .await;
+        return;
+    }
+    let params = event.request.to_mcp_create_params();
+    let receiver = outgoing
+        .send_request("elicitation/create", Some(params))
+        .await;
+    tokio::spawn(async move {
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            response = receiver => response.ok(),
+        }
+        .and_then(|value| serde_json::from_value::<ElicitationCreateResponse>(value).ok());
+        let (decision, content, meta) = response
+            .map_or((ElicitationAction::Cancel, None, None), |response| {
+                (response.action, response.content, response.meta)
+            });
+        if let Err(err) = thread
+            .submit(Op::ResolveElicitation {
+                server_name: event.server_name,
+                request_id: event.id,
+                decision,
+                content,
+                meta,
+            })
+            .await
+        {
+            tracing::error!("failed to submit elicitation response: {err}");
+        }
+    });
 }
 
 /// Run a complete Codex session and stream events back to the client.
@@ -199,6 +273,7 @@ async fn run_codex_tool_session_inner(
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
 ) {
     let request_id_str = request_id.to_string();
+    let elicitation_cancellation = CancellationToken::new();
 
     // Stream events until the task needs to pause for user interaction or
     // completes.
@@ -273,8 +348,18 @@ async fn run_codex_tool_session_inner(
                     EventMsg::GuardianAssessment(_) => {
                         continue;
                     }
-                    EventMsg::ElicitationRequest(_) => {
-                        // TODO: forward elicitation requests to the client?
+                    EventMsg::ElicitationRequest(event) => {
+                        forward_elicitation(
+                            event,
+                            outgoing.clone(),
+                            thread.clone(),
+                            elicitation_cancellation.clone(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    EventMsg::TurnAborted(_) => {
+                        elicitation_cancellation.cancel();
                         continue;
                     }
                     EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
@@ -301,14 +386,16 @@ async fn run_codex_tool_session_inner(
                         continue;
                     }
                     EventMsg::TurnComplete(TurnCompleteEvent {
-                        last_agent_message, ..
+                        last_agent_message,
+                        surfaced_result,
+                        ..
                     }) => {
-                        let text = match last_agent_message {
-                            Some(msg) => msg,
-                            None => "".to_string(),
-                        };
-                        let result = create_call_tool_result_with_thread_id(
-                            thread_id, text, /*is_error*/ None,
+                        let text = last_agent_message.unwrap_or_default();
+                        let result = create_call_tool_result_with_thread_id_and_surfaced_result(
+                            thread_id,
+                            text,
+                            /*is_error*/ None,
+                            surfaced_result,
                         );
                         outgoing.send_response(request_id.clone(), result).await;
                         // unregister the id so we don't keep it in the map
@@ -332,6 +419,7 @@ async fn run_codex_tool_session_inner(
                     }
                     EventMsg::AgentReasoningRawContent(_)
                     | EventMsg::TurnStarted(_)
+                    | EventMsg::TurnTerminalizationComplete(_)
                     | EventMsg::ThreadSettingsApplied(_)
                     | EventMsg::TokenCount(_)
                     | EventMsg::AgentReasoning(_)
@@ -351,7 +439,6 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::WebSearchBegin(_)
                     | EventMsg::WebSearchEnd(_)
                     | EventMsg::PlanUpdate(_)
-                    | EventMsg::TurnAborted(_)
                     | EventMsg::UserMessage(_)
                     | EventMsg::ShutdownComplete
                     | EventMsg::ImageGenerationBegin(_)
@@ -412,6 +499,7 @@ async fn run_codex_tool_session_inner(
             }
         }
     }
+    elicitation_cancellation.cancel();
 }
 
 #[cfg(test)]
@@ -432,6 +520,31 @@ mod tests {
             Some(json!({
                 "threadId": thread_id,
                 "content": "done",
+            }))
+        );
+    }
+
+    #[test]
+    fn call_tool_result_preserves_typed_surface_without_synthesizing_text() {
+        let thread_id = ThreadId::new();
+        let surfaced_result = SurfacedToolResult {
+            adapter: "owner".to_string(),
+            value: json!({"answer": 42}),
+            canonical_message: None,
+        };
+        let result = create_call_tool_result_with_thread_id_and_surfaced_result(
+            thread_id,
+            String::new(),
+            /*is_error*/ None,
+            Some(surfaced_result.clone()),
+        );
+
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "threadId": thread_id,
+                "content": "",
+                "surfacedResult": surfaced_result,
             }))
         );
     }

@@ -82,6 +82,7 @@ fn turn_started(turn_id: &str) -> RolloutItem {
 
 fn turn_completed(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        surfaced_result: None,
         turn_id: turn_id.to_string(),
         last_agent_message: None,
         error: None,
@@ -110,6 +111,27 @@ fn truncates_rollout_after_terminal_canonical_turn_id() {
     assert_eq!(
         serde_json::to_value(&truncated).unwrap(),
         serde_json::to_value(&rollout[..4]).unwrap()
+    );
+}
+
+#[test]
+fn truncation_excludes_events_recorded_after_selected_turn_completed() {
+    let rollout = vec![
+        turn_started("turn-1"),
+        turn_completed("turn-1"),
+        RolloutItem::EventMsg(EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+            message: "later settings placeholder".to_string(),
+        })),
+        turn_started("turn-2"),
+        turn_completed("turn-2"),
+    ];
+
+    let truncated =
+        truncate_rollout_after_turn_id(&rollout, "turn-1").expect("truncate through turn-1");
+
+    assert_eq!(
+        serde_json::to_value(&truncated).unwrap(),
+        serde_json::to_value(&rollout[..2]).unwrap()
     );
 }
 

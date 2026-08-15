@@ -3,6 +3,7 @@ use super::TerminalDeadline;
 use super::TerminalWaitError;
 use super::WORKSPACE_FINALIZATION_DISPATCH_SEAL_FAILED_REASON;
 use super::WorkspaceFinalizationGuard;
+use super::apply_terminal_phase_timings_to_timing;
 use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
@@ -10,6 +11,7 @@ use super::merge_completion_review_partial;
 use super::seal_passed_completion_for_terminal_dispatch;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
+use crate::state::SamplingAdmission;
 use crate::state::TerminalDeliveryState;
 use crate::state::TurnTerminalCoordinator;
 use codex_agent_task_store::AgentTaskStore;
@@ -24,6 +26,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnTiming;
 use codex_state::StateRuntime;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -343,6 +346,95 @@ async fn terminal_delivery_claim_is_one_shot_and_cleanup_is_a_separate_milestone
 
     permit.complete_cleanup();
     cleanup_waiter.await.expect("cleanup waiter joins");
+}
+
+#[test]
+fn cleanup_does_not_release_authoritative_turn_before_live_handoff() {
+    let coordinator = TurnTerminalCoordinator::new("turn-pending-handoff".to_string());
+    let permit = coordinator.try_claim().expect("terminal claimant");
+    assert!(permit.mark_delivery_claimed());
+    permit.mark_delivery_attempted(false);
+    permit.complete_cleanup();
+
+    assert!(!coordinator.interaction_released());
+    assert_eq!(
+        coordinator.delivery_state(),
+        TerminalDeliveryState::DeliveryFailed
+    );
+}
+
+#[tokio::test]
+async fn interrupt_pending_fences_sampling_without_terminalizing() {
+    let coordinator = TurnTerminalCoordinator::new("turn-fenced".to_string());
+    assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Allowed);
+    assert!(coordinator.mark_interrupt_pending().await);
+    assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Fenced);
+    assert!(!coordinator.durable_terminal_committed());
+
+    // The fence is pre-terminal: the normal coordinator can still claim the
+    // eventual TurnAborted transition after output persistence.
+    assert!(coordinator.try_claim().is_none());
+    assert!(coordinator.interrupt_pending());
+    coordinator.mark_interrupt_output_durable();
+    let permit = coordinator
+        .try_claim()
+        .expect("terminal claim opens after durability");
+    permit.complete_cleanup();
+    coordinator.wait_for_interrupt_resolution().await;
+    assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Allowed);
+}
+
+#[test]
+fn terminal_analytics_claim_is_process_local_one_shot_independent_of_delivery() {
+    let coordinator = TurnTerminalCoordinator::new("turn-analytics".to_string());
+    let permit = coordinator.try_claim().expect("terminal claimant");
+    assert_eq!(
+        coordinator.delivery_state(),
+        TerminalDeliveryState::NotAttempted
+    );
+    assert!(permit.try_claim_analytics_emission());
+    assert!(!permit.try_claim_analytics_emission());
+    assert_eq!(
+        coordinator.delivery_state(),
+        TerminalDeliveryState::NotAttempted
+    );
+}
+
+#[test]
+fn terminal_analytics_claim_converges_across_in_process_recovery() {
+    let before_claim = TurnTerminalCoordinator::new("turn-before-claim".to_string());
+    drop(before_claim.try_claim().expect("normal terminal claimant"));
+    let recovery = before_claim
+        .try_claim()
+        .expect("fail-safe terminal claimant");
+    assert!(recovery.try_claim_analytics_emission());
+
+    let after_claim = TurnTerminalCoordinator::new("turn-after-claim".to_string());
+    let normal = after_claim.try_claim().expect("normal terminal claimant");
+    assert!(normal.try_claim_analytics_emission());
+    drop(normal);
+    let recovery = after_claim
+        .try_claim()
+        .expect("fail-safe terminal claimant");
+    assert!(!recovery.try_claim_analytics_emission());
+}
+
+#[test]
+fn analytics_timing_snapshot_receives_all_final_terminal_phases() {
+    let mut timing = TurnTiming::default();
+    let phases = BTreeMap::from([
+        ("delivery_attempt".to_string(), 11),
+        ("interaction_release".to_string(), 13),
+        ("post_cleanup".to_string(), 17),
+        ("unclassified".to_string(), 19),
+    ]);
+
+    apply_terminal_phase_timings_to_timing(&mut timing, &phases);
+
+    assert_eq!(timing.terminalization.delivery_attempt_ns, 11);
+    assert_eq!(timing.terminalization.interaction_release_ns, 13);
+    assert_eq!(timing.terminalization.post_cleanup_ns, 17);
+    assert_eq!(timing.terminalization.unclassified_ns, 19);
 }
 
 #[test]

@@ -20,14 +20,18 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_tools::CanonicalToolResult;
+use codex_tools::CodeModeToolSearchStatus;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputOutcomeContext;
 use codex_tools::ToolOutputProjectionFragment;
 use codex_tools::ToolOutputProjectionFragmentKind;
 use codex_tools::ToolOutputProjectionMetadata;
 use codex_tools::ToolOutputProjectionRange;
+use codex_tools::ToolOutputSkipDisposition;
+use codex_tools::code_mode_tool_search_result;
 use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -107,9 +111,7 @@ impl ToolOutput for McpToolOutput {
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
-        serde_json::to_value(&self.result).ok().map(|value| {
-            ToolOutputProjectionMetadata::from_json(&value, self.result.success(), None)
-        })
+        ToolOutput::projection_metadata(&self.result)
     }
 
     fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
@@ -217,16 +219,39 @@ impl ToolOutput for ToolSearchOutput {
                 .collect(),
         }
     }
+
+    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+        let status = if self.omitted_result_count == 0 {
+            CodeModeToolSearchStatus::Completed
+        } else {
+            CodeModeToolSearchStatus::Incomplete
+        };
+        code_mode_tool_search_result(
+            status,
+            self.tools
+                .iter()
+                .map(|tool| {
+                    serde_json::to_value(tool).unwrap_or_else(|err| {
+                        JsonValue::String(format!("failed to serialize tool_search output: {err}"))
+                    })
+                })
+                .collect(),
+            Some(self.omitted_result_count),
+        )
+    }
 }
 
 pub struct FunctionToolOutput {
     pub body: Vec<FunctionCallOutputContentItem>,
     pub success: Option<bool>,
+    pub outcome: Option<ToolOutputOutcome>,
     pub post_tool_use_response: Option<JsonValue>,
     /// Private signal consumed by the request-local reasoning governor. This is
     /// never included in the model-facing tool result or public protocol.
     pub sampling_request_signal: Option<JsonValue>,
     pub deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
+    pub deterministic_continuation_owner_key: Option<String>,
+    pub skip_disposition: Option<ToolOutputSkipDisposition>,
 }
 
 impl FunctionToolOutput {
@@ -234,9 +259,12 @@ impl FunctionToolOutput {
         Self {
             body: vec![FunctionCallOutputContentItem::InputText { text }],
             success,
+            outcome: None,
             post_tool_use_response: None,
             sampling_request_signal: None,
             deterministic_continuation_receipts: Vec::new(),
+            deterministic_continuation_owner_key: None,
+            skip_disposition: None,
         }
     }
 
@@ -247,9 +275,12 @@ impl FunctionToolOutput {
         Self {
             body: content,
             success,
+            outcome: None,
             post_tool_use_response: None,
             sampling_request_signal: None,
             deterministic_continuation_receipts: Vec::new(),
+            deterministic_continuation_owner_key: None,
+            skip_disposition: None,
         }
     }
 
@@ -266,6 +297,28 @@ impl FunctionToolOutput {
         self
     }
 
+    pub(crate) fn with_deterministic_continuation_owner_key(mut self, owner_key: String) -> Self {
+        self.deterministic_continuation_owner_key = Some(owner_key);
+        self
+    }
+
+    pub(crate) fn with_skip_disposition(mut self, disposition: ToolOutputSkipDisposition) -> Self {
+        self.outcome = Some(ToolOutputOutcome::Skipped);
+        self.success = None;
+        self.skip_disposition = Some(disposition);
+        self
+    }
+
+    pub(crate) fn with_outcome(mut self, outcome: ToolOutputOutcome) -> Self {
+        self.outcome = Some(outcome);
+        self.success = match outcome {
+            ToolOutputOutcome::Success => Some(true),
+            ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => Some(false),
+            ToolOutputOutcome::Skipped => None,
+        };
+        self
+    }
+
     pub fn into_text(self) -> String {
         function_call_output_content_items_to_text(&self.body).unwrap_or_default()
     }
@@ -279,22 +332,26 @@ impl ToolOutput for FunctionToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        self.success.unwrap_or(true)
+        self.outcome_for_logging() == ToolOutputOutcome::Success
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
-        if self
-            .post_tool_use_response
-            .as_ref()
-            .and_then(|value| value.get("command_was_executed"))
-            .and_then(JsonValue::as_bool)
-            == Some(false)
-        {
+        if self.skip_disposition.is_some() {
             ToolOutputOutcome::Skipped
+        } else if let Some(outcome) = self.outcome {
+            outcome
         } else if self.success.unwrap_or(true) {
             ToolOutputOutcome::Success
         } else {
             ToolOutputOutcome::Failure
+        }
+    }
+
+    fn outcome_context(&self) -> ToolOutputOutcomeContext {
+        if self.outcome_for_logging() == ToolOutputOutcome::Skipped {
+            ToolOutputOutcomeContext::skipped(self.skip_disposition)
+        } else {
+            ToolOutputOutcomeContext::new(self.outcome_for_logging())
         }
     }
 
@@ -308,7 +365,16 @@ impl ToolOutput for FunctionToolOutput {
         self.deterministic_continuation_receipts.clone()
     }
 
+    fn deterministic_continuation_owner_key(&self) -> Option<String> {
+        self.deterministic_continuation_owner_key.clone()
+    }
+
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        let model_success = if self.outcome.is_some() || self.skip_disposition.is_some() {
+            Some(self.outcome_for_logging() == ToolOutputOutcome::Success)
+        } else {
+            self.success
+        };
         Some(ToolOutputProjectionMetadata {
             outcome: self.outcome_for_logging(),
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
@@ -322,14 +388,20 @@ impl ToolOutput for FunctionToolOutput {
                     | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
                 })
                 .collect(),
-            essential_inline: serde_json::json!({ "success": self.success }),
+            essential_inline: serde_json::json!({ "success": model_success }),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
+            predetermined_json_pointers: Vec::new(),
         })
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        function_tool_response(call_id, payload, self.body.clone(), self.success)
+        let success = if self.outcome.is_some() || self.skip_disposition.is_some() {
+            Some(self.outcome_for_logging() == ToolOutputOutcome::Success)
+        } else {
+            self.success
+        };
+        function_tool_response(call_id, payload, self.body.clone(), success)
     }
 
     fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
@@ -365,6 +437,7 @@ impl ToolOutput for ApplyPatchToolOutput {
             essential_inline: JsonValue::Object(serde_json::Map::new()),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
+            predetermined_json_pointers: Vec::new(),
         })
     }
 
@@ -413,11 +486,12 @@ impl ToolOutput for AbortedToolOutput {
             essential_inline: serde_json::json!({ "state": "aborted" }),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
+            predetermined_json_pointers: Vec::new(),
         })
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
-        Some(serde_json::json!({ "kind": "recoverable_cancellation" }))
+        Some(serde_json::json!({ "outcome": "recoverable_cancellation" }))
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -436,6 +510,15 @@ impl ToolOutput for AbortedToolOutput {
                 }],
                 /*success*/ None,
             ),
+        }
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
+        match payload {
+            ToolPayload::ToolSearch { .. } => {
+                code_mode_tool_search_result(CodeModeToolSearchStatus::Aborted, Vec::new(), None)
+            }
+            _ => JsonValue::String(self.message.clone()),
         }
     }
 }
@@ -463,7 +546,17 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        true
+        self.outcome_for_logging() == ToolOutputOutcome::Success
+    }
+
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        if self.process_id.is_some() {
+            ToolOutputOutcome::TimedOut
+        } else if self.exit_code.is_some_and(|code| code != 0) {
+            ToolOutputOutcome::Failure
+        } else {
+            ToolOutputOutcome::Success
+        }
     }
 
     fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
@@ -483,13 +576,7 @@ impl ToolOutput for ExecCommandToolOutput {
             .raw_output_artifact
             .as_ref()
             .is_some_and(RawOutputArtifact::retention_limit_hit);
-        let outcome = if self.process_id.is_some() {
-            ToolOutputOutcome::TimedOut
-        } else if self.exit_code.is_some_and(|code| code != 0) {
-            ToolOutputOutcome::Failure
-        } else {
-            ToolOutputOutcome::Success
-        };
+        let outcome = self.outcome_for_logging();
         let response_text = self.response_text();
         Some(ToolOutputProjectionMetadata {
             outcome,
@@ -533,6 +620,7 @@ impl ToolOutput for ExecCommandToolOutput {
                 &raw_output,
                 self.hook_command.as_deref(),
             ),
+            predetermined_json_pointers: Vec::new(),
         })
     }
 
@@ -543,7 +631,7 @@ impl ToolOutput for ExecCommandToolOutput {
             vec![FunctionCallOutputContentItem::InputText {
                 text: self.response_text(),
             }],
-            Some(true),
+            Some(self.outcome_for_logging() == ToolOutputOutcome::Success),
         )
     }
 

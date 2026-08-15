@@ -179,6 +179,7 @@ fn token_count_item(last_model_visible_tokens: i64) -> RolloutItem {
 
 fn turn_complete_item(turn_id: String, completed_at: Option<i64>) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        surfaced_result: None,
         turn_id,
         last_agent_message: None,
         error: None,

@@ -8,8 +8,8 @@ use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
 use crate::session::step_context::StepContext;
-use crate::session::tests::make_session_and_context;
-use crate::session::tests::make_session_and_context_with_rx;
+use crate::session::tests::make_session_and_context as make_session_and_context_base;
+use crate::session::tests::make_session_and_context_with_rx as make_session_and_context_with_rx_base;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
@@ -28,8 +28,8 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID;
-use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -78,6 +78,24 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+async fn make_session_and_context() -> (crate::session::Session, TurnContext) {
+    let (session, turn) = make_session_and_context_base().await;
+    turn.multi_agent_spawn_authorized
+        .store(true, std::sync::atomic::Ordering::Release);
+    (session, turn)
+}
+
+async fn make_session_and_context_with_rx() -> (
+    Arc<crate::session::Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<codex_protocol::protocol::Event>,
+) {
+    let (session, turn, events) = make_session_and_context_with_rx_base().await;
+    turn.multi_agent_spawn_authorized
+        .store(true, std::sync::atomic::Ordering::Release);
+    (session, turn, events)
+}
 
 struct RemoveFileOnDrop(Option<PathBuf>);
 
@@ -371,6 +389,7 @@ async fn spawn_agent_uses_bedrock_qualified_default_model_and_reasoning() {
     let provider_info = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None);
     let provider = create_model_provider(provider_info.clone(), turn.auth_manager.clone());
     session.services.models_manager = provider.models_manager(
+        &turn.config.model_provider_id,
         turn.config.codex_home.to_path_buf(),
         /*config_model_catalog*/ None,
     );
@@ -416,7 +435,7 @@ async fn spawn_agent_uses_bedrock_qualified_default_model_and_reasoning() {
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID);
+    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID);
     assert_eq!(
         snapshot.reasoning_effort,
         Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
@@ -679,6 +698,36 @@ async fn spawn_agent_fork_context_rejects_child_model_overrides() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_spawn_requires_explicit_turn_authorization() {
+    let (session, mut turn) = make_session_and_context().await;
+    turn.multi_agent_version = MultiAgentVersion::V2;
+    turn.multi_agent_spawn_authorized
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    let error = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "unauthorized"
+            })),
+        ))
+        .await
+        .err()
+        .expect("spawn must be rejected without a direct user grant");
+
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "spawn_agent: this turn is in explicit-request-only mode and the user did not explicitly authorize spawning agents"
+                .to_string(),
+        )
+    );
+}
+
+#[tokio::test]
 async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
@@ -754,7 +803,7 @@ async fn multi_agent_v2_spawn_model_override_defaults_to_no_fork() {
             })),
         ))
         .await
-        .expect("model override should default to an unforked spawn");
+        .expect("model override should preserve durable admission");
     let (content, _) = expect_text_output(output);
     let result: serde_json::Value =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
@@ -2421,6 +2470,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
         .send_event(
             child_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: child_turn.sub_id.clone(),
                 last_agent_message: Some("done".to_string()),
                 error: None,
@@ -2873,6 +2923,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         .send_event(
             first_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: first_turn.sub_id.clone(),
                 last_agent_message: Some("first done".to_string()),
                 error: None,
@@ -2917,6 +2968,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         .send_event(
             second_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: second_turn.sub_id.clone(),
                 last_agent_message: Some("second done".to_string()),
                 error: None,
@@ -4391,7 +4443,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() 
 }
 
 #[tokio::test]
-async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
+async fn multi_agent_v2_wait_agent_keeps_configured_default_timeout_internal() {
     let (session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
@@ -4420,8 +4472,8 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
         "wait_agent should not return before the configured default timeout"
     );
 
-    let output = timeout(
-        Duration::from_secs(/*secs*/ 1),
+    let after_multiple_maintenance_intervals = timeout(
+        Duration::from_millis(/*millis*/ 120),
         WaitAgentHandlerV2::default().handle(invocation(
             session,
             turn,
@@ -4429,25 +4481,15 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
             function_payload(json!({})),
         )),
     )
-    .await
-    .expect("configured default should be shorter than the test timeout")
-    .expect("wait_agent should succeed");
-    let (content, success) = expect_text_output(output);
-    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
-        serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
-            ..Default::default()
-        }
+    .await;
+    assert!(
+        after_multiple_maintenance_intervals.is_err(),
+        "omitted timeout_ms must remain pending across default maintenance intervals"
     );
-    assert_eq!(success, None);
 }
 
 #[tokio::test]
-async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
+async fn multi_agent_v2_wait_agent_treats_zero_default_as_internal_cadence() {
     let (session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
@@ -4461,8 +4503,8 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
-    let output = timeout(
-        Duration::from_secs(/*secs*/ 1),
+    let pending = timeout(
+        Duration::from_millis(/*millis*/ 20),
         WaitAgentHandlerV2::default().handle(invocation(
             session,
             turn,
@@ -4470,21 +4512,46 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
             function_payload(json!({})),
         )),
     )
-    .await
-    .expect("zero timeout should complete immediately")
-    .expect("wait_agent should succeed");
-    let (content, success) = expect_text_output(output);
-    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
-        serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
-            ..Default::default()
-        }
+    .await;
+    assert!(
+        pending.is_err(),
+        "an omitted timeout must not become a zero deadline"
     );
-    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_cancellation_wakes_immediately() {
+    let (session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({})),
+    );
+    let cancellation_token = invocation.cancellation_token.clone();
+    let wait = tokio::spawn(async move { WaitAgentHandlerV2::default().handle(invocation).await });
+    tokio::task::yield_now().await;
+
+    cancellation_token.cancel();
+
+    let result = timeout(Duration::from_millis(250), wait)
+        .await
+        .expect("cancellation should wake the wait immediately")
+        .expect("wait task should join");
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("cancelled wait should report cancellation"),
+    };
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel("wait_agent cancelled".to_string())
+    );
 }
 
 #[tokio::test]
@@ -4667,33 +4734,30 @@ async fn wait_agent_returns_final_status_without_timeout() {
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
-    let mut status_rx = manager
-        .agent_control()
-        .subscribe_status(agent_id)
-        .await
-        .expect("subscribe should succeed");
-
-    let _ = thread
-        .thread
-        .submit(Op::Shutdown {})
-        .await
-        .expect("shutdown should submit");
-    let _ = timeout(Duration::from_secs(1), status_rx.changed())
-        .await
-        .expect("shutdown status should arrive");
-
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
         "wait_agent",
         function_payload(json!({
-            "targets": [agent_id.to_string()],
-            "timeout_ms": 10_000
+            "targets": [agent_id.to_string()]
         })),
     );
-    let output = WaitAgentHandler::default()
-        .handle(invocation)
+    let wait = tokio::spawn(async move { WaitAgentHandler::default().handle(invocation).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !wait.is_finished(),
+        "omitted timeout_ms must leave the V1 wait owned while the agent is live"
+    );
+
+    thread
+        .thread
+        .submit(Op::Shutdown {})
         .await
+        .expect("shutdown should submit");
+    let output = timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("shutdown should wake the held wait")
+        .expect("wait task should join")
         .expect("wait_agent should succeed");
     let (content, success) = expect_text_output(output);
     let result: wait::WaitAgentResult =

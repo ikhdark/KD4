@@ -56,6 +56,8 @@ pub(crate) struct ExecCommandArgs {
     justification: Option<String>,
     #[serde(default)]
     prefix_rule: Option<Vec<String>>,
+    #[serde(default)]
+    force_fresh: bool,
 }
 
 impl ExecCommandArgs {

@@ -3,7 +3,8 @@ use super::*;
 #[tokio::test]
 async fn multi_selector_recovery_returns_several_omitted_sections_exactly() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let canonical = CanonicalToolResult::text("primary\ncaller\ntest\n").with_sections(vec![
+    let mut canonical = CanonicalToolResult::text("primary\ncaller\ntest\n");
+    canonical.sections = vec![
         ToolProjectionSection {
             id: "primary".to_string(),
             value: None,
@@ -31,7 +32,7 @@ async fn multi_selector_recovery_returns_several_omitted_sections_exactly() {
             children: Vec::new(),
             recovery_chunk_bytes: None,
         },
-    ]);
+    ];
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
 
@@ -64,6 +65,33 @@ async fn multi_selector_recovery_returns_several_omitted_sections_exactly() {
             (ToolOutputSelectorStatus::Ok, true, Some("test\n"), None),
         ]
     );
+}
+
+#[tokio::test]
+async fn receipt_reuse_completed_exact_recovery_avoids_reopening_the_artifact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("one\ntwo\nthree\n");
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let selectors = vec![ToolOutputSelector::Lines { start: 2, end: 3 }];
+
+    let first = read_tool_output_selectors(temp.path(), "thread", &artifact_id, selectors.clone())
+        .await
+        .expect("first exact recovery");
+    std::fs::remove_file(
+        temp.path()
+            .join("tool-output/thread")
+            .join(format!("{artifact_id}.log")),
+    )
+    .expect("remove artifact after its exact result is proved");
+
+    let (replayed, reused) =
+        read_tool_output_selectors_with_reuse(temp.path(), "thread", &artifact_id, selectors)
+            .await
+            .expect("replay exact recovery");
+
+    assert!(reused);
+    assert_eq!(replayed, first);
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -114,7 +142,8 @@ async fn four_chunk_fixture_recovers_every_omitted_chunk_in_one_combined_call() 
             recovery_chunk_bytes: None,
         });
     }
-    let canonical = CanonicalToolResult::text(content.clone()).with_sections(sections.clone());
+    let mut canonical = CanonicalToolResult::text(content.clone());
+    canonical.sections = sections.clone();
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
     let omitted = sections
@@ -322,6 +351,31 @@ async fn oversized_json_pointer_exposes_exact_chunkable_canonical_range() {
         1,
         "recovery must not recursively spill into another artifact",
     );
+}
+
+#[tokio::test]
+async fn stall_nested_recovery_budget_returns_a_bounded_subdivision_plan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("source line\n".repeat(600));
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+
+    let recovered = read_tool_output_selectors_with_ceiling(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Lines { start: 1, end: 600 }],
+        512,
+    )
+    .await
+    .expect("bounded nested recovery");
+
+    assert!(response_fits_recovery_token_ceiling(&recovered, 512));
+    let selected = &recovered.results[0];
+    assert_eq!(selected.status, ToolOutputSelectorStatus::SelectorTooLarge);
+    assert!(selected.text.is_none());
+    assert!(selected.subdivision_plan.is_some());
+    assert!(selected.continuation.is_some());
 }
 
 #[tokio::test]
@@ -1065,31 +1119,17 @@ async fn generation_is_not_reused_after_root_eviction_and_reinitialization() {
         .map(|index| temp.path().join(format!("tool-output-{index}")))
         .collect::<Vec<_>>();
     let mut registry = RetentionRegistry::default();
-    let first = insert_dirty_root(
-        &mut registry,
-        roots[0].clone(),
-        RetentionDiagnostics::default(),
-    )
-    .expect("first generation");
+    let first = insert_dirty_root(&mut registry, roots[0].clone()).expect("first generation");
     for root in &roots[1..MAX_RETENTION_INDEX_ROOTS] {
-        insert_dirty_root(&mut registry, root.clone(), RetentionDiagnostics::default())
-            .expect("root generation");
+        insert_dirty_root(&mut registry, root.clone()).expect("root generation");
     }
     assert_eq!(registry.roots.len(), MAX_RETENTION_INDEX_ROOTS);
 
-    insert_dirty_root(
-        &mut registry,
-        roots[MAX_RETENTION_INDEX_ROOTS].clone(),
-        RetentionDiagnostics::default(),
-    )
-    .expect("evicting generation");
+    insert_dirty_root(&mut registry, roots[MAX_RETENTION_INDEX_ROOTS].clone())
+        .expect("evicting generation");
     assert!(!registry.roots.contains_key(&roots[0]));
-    let second = insert_dirty_root(
-        &mut registry,
-        roots[0].clone(),
-        RetentionDiagnostics::default(),
-    )
-    .expect("reinitialized generation");
+    let second =
+        insert_dirty_root(&mut registry, roots[0].clone()).expect("reinitialized generation");
 
     assert_ne!(first, second);
     assert_eq!(MAX_RETENTION_INDEX_ROOTS, 4);

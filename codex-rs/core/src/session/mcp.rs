@@ -167,16 +167,15 @@ impl Session {
             // Availability is only an input to the MCP projection. When that input changes but
             // the projected servers and connectors do not, advance the input key without
             // replacing the live manager and restarting its processes.
-            let runtime = Arc::new(McpRuntimeSnapshot::new(
-                current.generation(),
+            let mut state_owner = self.state.lock().await;
+            return self.services.publish_mcp_runtime_reusing_manager(
+                &mut state_owner,
                 Arc::new(current.config().clone()),
                 mcp_projection.plugins_available,
-                current.manager_arc(),
                 current.runtime_context().clone(),
                 available_environment_ids,
-            ));
-            self.services.mcp_runtime.store(Some(Arc::clone(&runtime)));
-            return runtime;
+                current.manager_arc(),
+            );
         }
         self.refresh_mcp_servers_inner(
             turn_context,
@@ -407,7 +406,9 @@ impl Session {
         .await;
         refreshed_manager
             .set_elicitations_auto_deny(current_runtime.manager().elicitations_auto_deny());
+        let mut state_owner = self.state.lock().await;
         self.services.publish_mcp_runtime(
+            &mut state_owner,
             mcp_config,
             plugins_available,
             mcp_runtime_context,
@@ -604,7 +605,7 @@ impl Session {
     }
 }
 
-async fn review_guardian_mcp_elicitation(
+pub(crate) async fn review_guardian_mcp_elicitation(
     session: Arc<Session>,
     request: ElicitationReviewRequest,
 ) -> anyhow::Result<Option<ElicitationResponse>> {

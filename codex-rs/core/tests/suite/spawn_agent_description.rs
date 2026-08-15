@@ -190,12 +190,12 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
     );
     assert!(
         description
-            .contains("Available model overrides (optional; `gpt-5.6-sol` is the spawn default):"),
+            .contains("Available model overrides (optional; `gpt-5.6-luna` is the spawn default):"),
         "expected model choices to be framed as overrides in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
-            "Spawned agents use `gpt-5.6-sol` with `high` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If a model override does not support `high`, also set `reasoning_effort` to a supported value listed for that model."
+            "Spawned agents use `gpt-5.6-luna` with `max` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If a model override does not support `max`, also set `reasoning_effort` to a supported value listed for that model."
         ),
         "expected built-in model and reasoning defaults in spawn_agent description: {description:?}"
     );

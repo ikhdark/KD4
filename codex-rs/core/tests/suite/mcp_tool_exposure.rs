@@ -204,6 +204,7 @@ async fn apps_guidance_appears_after_background_recovery_within_a_turn() -> Resu
                         answers: vec!["Yes (Recommended)".to_string()],
                     },
                 )]),
+                interrupted: false,
             },
         })
         .await?;

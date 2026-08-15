@@ -6,6 +6,9 @@ use async_channel::Sender;
 use codex_analytics::GuardianApprovalRequestSource;
 use codex_async_utils::OrCancelExt;
 use codex_extension_api::LoadedUserInstructions;
+use codex_protocol::approvals::ElicitationAction as ProtocolElicitationAction;
+use codex_protocol::approvals::ElicitationRequest;
+use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -450,6 +453,19 @@ async fn forward_events(
                         .await;
                     }
                     Event {
+                        msg: EventMsg::ElicitationRequest(event),
+                        ..
+                    } => {
+                        handle_elicitation_request(
+                            &codex,
+                            &parent_session,
+                            &parent_ctx,
+                            event,
+                            &cancel_token,
+                        )
+                        .await;
+                    }
+                    Event {
                         id,
                         msg: EventMsg::McpToolCallBegin(event),
                     } => {
@@ -808,6 +824,123 @@ async fn handle_request_user_input(
     let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
 }
 
+fn protocol_elicitation_id(id: &codex_protocol::mcp::RequestId) -> rmcp::model::RequestId {
+    match id {
+        codex_protocol::mcp::RequestId::String(value) => {
+            rmcp::model::NumberOrString::String(Arc::from(value.as_str()))
+        }
+        codex_protocol::mcp::RequestId::Integer(value) => {
+            rmcp::model::NumberOrString::Number(*value)
+        }
+    }
+}
+
+fn delegated_elicitation(
+    request: &ElicitationRequest,
+) -> anyhow::Result<codex_rmcp_client::Elicitation> {
+    Ok(match request {
+        ElicitationRequest::OpenAiForm {
+            meta,
+            message,
+            requested_schema,
+        } => codex_rmcp_client::Elicitation::OpenAiForm {
+            meta: meta.clone(),
+            message: message.clone(),
+            requested_schema: requested_schema.clone(),
+        },
+        ElicitationRequest::Form { .. } | ElicitationRequest::Url { .. } => {
+            codex_rmcp_client::Elicitation::Mcp(serde_json::from_value(
+                request.to_mcp_create_params(),
+            )?)
+        }
+    })
+}
+
+async fn handle_elicitation_request(
+    codex: &Codex,
+    parent_session: &Arc<Session>,
+    parent_ctx: &Arc<TurnContext>,
+    event: ElicitationRequestEvent,
+    cancel_token: &CancellationToken,
+) {
+    let rmcp_id = protocol_elicitation_id(&event.id);
+    let elicitation = match delegated_elicitation(&event.request) {
+        Ok(elicitation) => elicitation,
+        Err(err) => {
+            tracing::warn!(%err, "failed to convert delegated MCP elicitation");
+            let _ = codex
+                .submit(Op::ResolveElicitation {
+                    server_name: event.server_name,
+                    request_id: event.id,
+                    decision: ProtocolElicitationAction::Cancel,
+                    content: None,
+                    meta: None,
+                })
+                .await;
+            return;
+        }
+    };
+    let review_request = codex_mcp::ElicitationReviewRequest {
+        server_name: event.server_name.clone(),
+        request_id: rmcp_id.clone(),
+        elicitation,
+    };
+    let reviewed =
+        crate::session::review_guardian_mcp_elicitation(Arc::clone(parent_session), review_request)
+            .await;
+    let response = match reviewed {
+        Ok(Some(response)) => Some(response),
+        Ok(None) => {
+            let request = parent_session.request_mcp_server_elicitation(
+                parent_ctx,
+                event.server_name.clone(),
+                rmcp_id.clone(),
+                event.request.clone(),
+            );
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    let _ = parent_session.resolve_elicitation(
+                        event.server_name.clone(),
+                        rmcp_id,
+                        codex_rmcp_client::ElicitationResponse {
+                            action: codex_rmcp_client::ElicitationAction::Cancel,
+                            content: None,
+                            meta: None,
+                        },
+                    ).await;
+                    None
+                },
+                outcome = request => outcome.response,
+            }
+        }
+        Err(err) => {
+            tracing::warn!(%err, "delegated Guardian elicitation review failed");
+            None
+        }
+    };
+    let (decision, content, meta) = response.map_or(
+        (ProtocolElicitationAction::Cancel, None, None),
+        |response| {
+            let decision = match response.action {
+                codex_rmcp_client::ElicitationAction::Accept => ProtocolElicitationAction::Accept,
+                codex_rmcp_client::ElicitationAction::Decline => ProtocolElicitationAction::Decline,
+                codex_rmcp_client::ElicitationAction::Cancel => ProtocolElicitationAction::Cancel,
+            };
+            (decision, response.content, response.meta)
+        },
+    );
+    let _ = codex
+        .submit(Op::ResolveElicitation {
+            server_name: event.server_name,
+            request_id: event.id,
+            decision,
+            content,
+            meta,
+        })
+        .await;
+}
+
 /// Intercepts delegated legacy MCP approval prompts on the RequestUserInput
 /// compatibility path and, when guardian is active, answers them
 /// programmatically after running the guardian review.
@@ -884,6 +1017,7 @@ async fn maybe_auto_review_mcp_request_user_input(
                 answers: vec![selected_label],
             },
         )]),
+        interrupted: false,
     })
 }
 
@@ -936,6 +1070,7 @@ where
         _ = cancel_token.cancelled() => {
             let empty = RequestUserInputResponse {
                 answers: HashMap::new(),
+                interrupted: false,
             };
             parent_session
                 .notify_user_input_response(sub_id, empty.clone())
@@ -944,6 +1079,7 @@ where
         }
         response = fut => response.unwrap_or_else(|| RequestUserInputResponse {
             answers: HashMap::new(),
+            interrupted: false,
         }),
     }
 }

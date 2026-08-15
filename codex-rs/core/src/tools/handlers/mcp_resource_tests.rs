@@ -379,9 +379,11 @@ fn serialize_function_output_preserves_small_payload() {
     let payload = json!({"server": "hosted", "resources": []});
     let expected = serde_json::to_string(&payload).expect("serialize payload");
 
-    let output = serialize_function_output(payload, TruncationPolicy::Bytes(1_024))
-        .expect("serialize function output")
-        .into_text();
+    let output =
+        serialize_function_output(payload.clone(), payload, TruncationPolicy::Bytes(1_024))
+            .expect("serialize function output")
+            .visible
+            .into_text();
 
     assert_eq!(output, expected);
 }
@@ -429,9 +431,45 @@ fn aggregate_resources_keep_whole_pages_and_continuation_metadata() {
 }
 
 #[test]
-fn single_server_pages_fail_instead_of_skipping_entries_before_next_cursor() {
+fn cursorless_single_server_resource_page_is_bounded_to_a_prefix() {
     let truncation_policy = TruncationPolicy::Bytes(650);
-    let resource_error = ListResourcesPayload::from_single_server(
+    let resource_count = 81;
+    let payload = ListResourcesPayload::from_single_server(
+        "codex_apps".to_string(),
+        ListResourcesResult {
+            meta: None,
+            next_cursor: None,
+            resources: (0..resource_count)
+                .map(|index| {
+                    resource(
+                        &format!("app://connector-{index}"),
+                        &format!("connector-{index}-{}", "x".repeat(80)),
+                    )
+                })
+                .collect(),
+        },
+        truncation_policy,
+    )
+    .expect("cursorless oversized page should be shortened");
+
+    assert!(serialized_payload_fits(&payload, truncation_policy).unwrap());
+    let value = serde_json::to_value(&payload).expect("serialize bounded resource payload");
+    let resources = value["resources"].as_array().expect("resources array");
+    assert!(!resources.is_empty());
+    assert!(resources.len() < resource_count);
+    assert_eq!(resources[0]["uri"], json!("app://connector-0"));
+    assert_eq!(value["truncated"], json!(true));
+    assert_eq!(
+        value["omittedCount"],
+        json!(resource_count - resources.len())
+    );
+    assert!(value.get("nextCursor").is_none());
+}
+
+#[test]
+fn single_server_pages_bound_projection_without_losing_opaque_cursor() {
+    let truncation_policy = TruncationPolicy::Bytes(650);
+    let resources = ListResourcesPayload::from_single_server(
         "srv".to_string(),
         ListResourcesResult {
             meta: None,
@@ -447,8 +485,8 @@ fn single_server_pages_fail_instead_of_skipping_entries_before_next_cursor() {
         },
         truncation_policy,
     )
-    .expect_err("oversized resource page must fail intact");
-    let template_error = ListResourceTemplatesPayload::from_single_server(
+    .expect("oversized resource page should have a bounded projection");
+    let templates = ListResourceTemplatesPayload::from_single_server(
         "srv".to_string(),
         ListResourceTemplatesResult {
             meta: None,
@@ -464,17 +502,24 @@ fn single_server_pages_fail_instead_of_skipping_entries_before_next_cursor() {
         },
         truncation_policy,
     )
-    .expect_err("oversized template page must fail intact");
+    .expect("oversized template page should have a bounded projection");
 
+    let resources = serde_json::to_value(resources).expect("serialize resource projection");
+    assert_eq!(resources["nextCursor"], json!("opaque-resource-cursor"));
+    assert_eq!(resources["truncated"], json!(true));
     assert!(
-        resource_error
-            .to_string()
-            .contains("before its next cursor")
+        resources["omittedCount"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
     );
+
+    let templates = serde_json::to_value(templates).expect("serialize template projection");
+    assert_eq!(templates["nextCursor"], json!("opaque-template-cursor"));
+    assert_eq!(templates["truncated"], json!(true));
     assert!(
-        template_error
-            .to_string()
-            .contains("before its next cursor")
+        templates["omittedCount"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
     );
 }
 
@@ -577,8 +622,10 @@ fn serialize_function_output_bounds_large_read_inside_text_field() {
         truncation_policy,
     )
     .expect("build bounded read payload");
-    let output = serialize_function_output(payload, truncation_policy)
+    let canonical = serde_json::to_value(&payload).expect("serialize canonical payload");
+    let output = serialize_function_output(payload, canonical, truncation_policy)
         .expect("serialize bounded function output")
+        .visible
         .into_text();
     let value: Value = serde_json::from_str(&output).expect("bounded read must remain valid JSON");
     let bounded_text = value["contents"][0]["text"]
@@ -738,7 +785,7 @@ async fn failed_resource_call_emits_one_failed_terminal_item() {
         },
         CancellationToken::new(),
         async {
-            Err::<FunctionToolOutput, FunctionCallError>(FunctionCallError::RespondToModel(
+            Err::<McpResourceToolOutput, FunctionCallError>(FunctionCallError::RespondToModel(
                 FAILURE_MESSAGE.to_string(),
             ))
         },
@@ -793,11 +840,27 @@ async fn successful_resource_call_emits_one_completed_terminal_item() {
             arguments: None,
         },
         CancellationToken::new(),
-        async { Ok(FunctionToolOutput::from_text("{}".to_string(), Some(true))) },
+        async {
+            Ok(McpResourceToolOutput {
+                visible: FunctionToolOutput::from_text("{}".to_string(), Some(true)),
+                canonical: json!({"server": "ready", "result": {"nextCursor": "opaque-tail"}}),
+            })
+        },
     )
     .await
     .expect("resource operation should succeed");
     assert!(output.success_for_logging());
+    assert!(output.requires_canonical_artifact());
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let canonical = output
+        .canonical_result(&payload)
+        .expect("fully received MCP result remains canonical");
+    let expected = codex_tools::CanonicalToolResult::json(
+        json!({"server": "ready", "result": {"nextCursor": "opaque-tail"}}),
+    );
+    assert_eq!(canonical.bytes, expected.bytes);
 
     let completed = tokio::time::timeout(Duration::from_secs(1), async {
         loop {

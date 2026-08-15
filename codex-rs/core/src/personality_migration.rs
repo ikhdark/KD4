@@ -91,7 +91,7 @@ async fn has_threads(store: &LocalThreadStore, archived: bool) -> io::Result<boo
             relation_filter: None,
             archived,
             search_term: None,
-            use_state_db_only: false,
+            storage_mode: codex_thread_store::ThreadListStorageMode::PreferStateDb,
         })
         .await
         .map(|page| !page.items.is_empty())

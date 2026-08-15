@@ -628,7 +628,7 @@ async fn lookup_session_target_by_name_with_app_server(
                 parent_thread_id: None,
                 ancestor_thread_id: None,
                 cwd: None,
-                use_state_db_only: false,
+                use_state_db_only: None,
                 search_term: Some(name.to_string()),
             })
             .await?;
@@ -743,8 +743,8 @@ fn latest_session_lookup_params(
         ancestor_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().to_string())),
         use_state_db_only: match lookup_mode {
-            LatestSessionLookupMode::StateDbOnly => true,
-            LatestSessionLookupMode::ScanAndRepair => false,
+            LatestSessionLookupMode::StateDbOnly => Some(true),
+            LatestSessionLookupMode::ScanAndRepair => Some(false),
         },
         search_term: None,
     }
@@ -2401,7 +2401,7 @@ mod tests {
             params.cwd,
             Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
         );
-        assert!(params.use_state_db_only);
+        assert_eq!(params.use_state_db_only, Some(true));
 
         let scan_params = latest_session_lookup_params(
             /*uses_remote_workspace*/ false,
@@ -2410,7 +2410,7 @@ mod tests {
             /*include_non_interactive*/ false,
             LatestSessionLookupMode::ScanAndRepair,
         );
-        assert!(!scan_params.use_state_db_only);
+        assert_eq!(scan_params.use_state_db_only, Some(false));
         Ok(())
     }
 

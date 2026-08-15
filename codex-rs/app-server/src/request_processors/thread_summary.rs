@@ -224,6 +224,7 @@ pub(crate) fn thread_settings_from_core_snapshot(
         reasoning_summary,
         personality,
         collaboration_mode,
+        ..
     } = snapshot;
     let sandbox_policy = thread_response_sandbox_policy(&permission_profile, cwd.as_path());
     ThreadSettings {
@@ -232,16 +233,16 @@ pub(crate) fn thread_settings_from_core_snapshot(
         approval_policy: approval_policy.into(),
         approvals_reviewer: approvals_reviewer.into(),
         active_permission_profile: thread_response_active_permission_profile(
-            active_permission_profile,
+            active_permission_profile.flatten(),
         ),
         model,
         model_provider: model_provider_id,
-        service_tier,
-        effort: reasoning_effort,
-        summary: reasoning_summary,
+        service_tier: service_tier.flatten(),
+        effort: reasoning_effort.flatten(),
+        summary: reasoning_summary.flatten(),
         collaboration_mode,
         multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
-        personality,
+        personality: personality.flatten(),
     }
 }
 

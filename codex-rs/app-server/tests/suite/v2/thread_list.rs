@@ -97,7 +97,7 @@ async fn list_threads_with_sort(
             source_kinds,
             archived,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -123,6 +123,7 @@ async fn list_threads_for_relation(
     limit: u32,
     model_providers: Option<Vec<String>>,
     source_kinds: Option<Vec<ThreadSourceKind>>,
+    use_state_db_only: Option<bool>,
 ) -> Result<ThreadListResponse> {
     let (parent_thread_id, ancestor_thread_id) = match relation {
         ThreadListRelation::DirectChildrenOf(thread_id) => (Some(thread_id.to_string()), None),
@@ -138,7 +139,7 @@ async fn list_threads_for_relation(
             source_kinds,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only,
             search_term: None,
             parent_thread_id,
             ancestor_thread_id,
@@ -582,7 +583,7 @@ async fn thread_list_respects_cwd_filters() -> Result<()> {
                 first_target_cwd.to_string_lossy().into_owned(),
                 second_target_cwd.to_string_lossy().into_owned(),
             ])),
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -693,7 +694,7 @@ sqlite = true
             source_kinds: None,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: Some("needle".to_string()),
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -911,7 +912,7 @@ sqlite = true
             source_kinds: None,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: Some(false),
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -951,7 +952,7 @@ sqlite = true
             cwd: Some(ThreadListCwdFilter::One(
                 stale_cwd.to_string_lossy().into_owned(),
             )),
-            use_state_db_only: true,
+            use_state_db_only: Some(true),
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -982,7 +983,7 @@ sqlite = true
             cwd: Some(ThreadListCwdFilter::One(
                 stale_cwd.to_string_lossy().into_owned(),
             )),
-            use_state_db_only: false,
+            use_state_db_only: Some(false),
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -1072,8 +1073,37 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
         /*limit*/ 1,
         /*model_providers*/ None,
         /*source_kinds*/ None,
+        /*use_state_db_only*/ None,
     )
     .await?;
+    for cursor in [None, first_page.next_cursor.clone()] {
+        let request_id = mcp
+            .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+                cursor,
+                limit: Some(1),
+                sort_key: None,
+                sort_direction: None,
+                model_providers: None,
+                source_kinds: None,
+                archived: None,
+                cwd: None,
+                use_state_db_only: Some(false),
+                search_term: None,
+                parent_thread_id: Some(parent_id.to_string()),
+                ancestor_thread_id: None,
+            })
+            .await?;
+        let error = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert_eq!(error.error.code, -32600);
+        assert_eq!(
+            error.error.message,
+            "relationship-filtered thread listing does not support scan-and-repair storage"
+        );
+    }
     let second_page = list_threads_for_relation(
         &mut mcp,
         ThreadListRelation::DirectChildrenOf(parent_id),
@@ -1081,6 +1111,7 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
         /*limit*/ 1,
         /*model_providers*/ None,
         /*source_kinds*/ None,
+        /*use_state_db_only*/ Some(true),
     )
     .await?;
 
@@ -1101,6 +1132,18 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
         vec![older_child_id.to_string()]
     );
     assert_eq!(second_page.next_cursor, None);
+    assert!(
+        first_page
+            .next_cursor
+            .as_deref()
+            .is_some_and(|cursor| cursor.starts_with("thread-list-v1:state-db:"))
+    );
+    assert!(
+        first_page
+            .backwards_cursor
+            .as_deref()
+            .is_some_and(|cursor| cursor.starts_with("thread-list-v1:state-db:"))
+    );
     let expected_parent_id = parent_id.to_string();
     assert!(
         first_page
@@ -1116,6 +1159,7 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
         /*limit*/ 10,
         /*model_providers*/ None,
         /*source_kinds*/ Some(Vec::new()),
+        /*use_state_db_only*/ None,
     )
     .await?;
     assert_eq!(
@@ -1134,6 +1178,7 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
         /*limit*/ 10,
         /*model_providers*/ None,
         /*source_kinds*/ None,
+        /*use_state_db_only*/ Some(true),
     )
     .await?;
     assert_eq!(
@@ -1167,7 +1212,7 @@ async fn thread_list_relation_filters_reject_invalid_requests() -> Result<()> {
             source_kinds: None,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
             parent_thread_id: Some("not-a-thread-id".to_string()),
             ancestor_thread_id: None,
@@ -1191,7 +1236,7 @@ async fn thread_list_relation_filters_reject_invalid_requests() -> Result<()> {
             source_kinds: None,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
             parent_thread_id: Some(thread_id.clone()),
             ancestor_thread_id: Some(thread_id),
@@ -1980,7 +2025,7 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
                 source_kinds: None,
                 archived: None,
                 cwd: None,
-                use_state_db_only: false,
+                use_state_db_only: None,
                 search_term: None,
                 parent_thread_id: None,
                 ancestor_thread_id: None,
@@ -1996,7 +2041,10 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
     let ids_page1: Vec<_> = page1.iter().map(|thread| thread.id.as_str()).collect();
     assert_eq!(ids_page1, vec![id_watermark.as_str()]);
     let backwards_cursor = backwards_cursor.expect("expected backwardsCursor on first page");
-    assert_eq!(backwards_cursor, "2025-02-02T23:59:59.999Z");
+    assert_eq!(
+        backwards_cursor,
+        "thread-list-v1:state-db:2025-02-02T23:59:59.999Z"
+    );
 
     let id_new = create_fake_rollout(
         codex_home.path(),
@@ -2024,7 +2072,7 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
                 source_kinds: None,
                 archived: None,
                 cwd: None,
-                use_state_db_only: false,
+                use_state_db_only: None,
                 search_term: None,
                 parent_thread_id: None,
                 ancestor_thread_id: None,
@@ -2264,7 +2312,7 @@ async fn thread_list_invalid_cursor_returns_error() -> Result<()> {
             source_kinds: None,
             archived: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: None,
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,

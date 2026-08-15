@@ -84,6 +84,11 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Optional per-sampling-request effort overrides for orient, inspect, implement, diagnose, verify, and finalize phases.",
     ),
     doc(
+        "reasoning_phase_efforts.deterministic_continuation",
+        "Reasoning and output",
+        "Reasoning effort for a proven non-decision-bearing residual request; it takes precedence over the broader phase effort and defaults to `low` or the model's lowest supported equivalent.",
+    ),
+    doc(
         "model_reasoning_summary",
         "Reasoning and output",
         "Reasoning summary style: `auto`, `concise`, `detailed`, or `none`.",

@@ -35,13 +35,6 @@ terminalization: TurnTimingTerminalization,
  */
 modelRequests?: Array<TurnTimingModelRequest>,
 /**
- * Provider input attributable only to generations carrying a matching
- * owner-proved deterministic continuation receipt at the same state
- * revision. This is intentionally independent from observational
- * nonprogress.
- */
-provablyAvoidableTokens: TurnTimingDiagnosticTokenAggregate,
-/**
  * Provider usage observed on generations where neither relevant
  * structured state nor the next-correct-action changed. This is a
  * diagnostic and is never treated as measured avoidable savings.

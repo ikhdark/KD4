@@ -320,6 +320,7 @@ pub(crate) struct ValidationPrediction {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ValidationSkippedToolOutput {
     pub(crate) reason: ValidationSkipReason,
+    pub(crate) skip_disposition: codex_tools::ToolOutputSkipDisposition,
     pub(crate) command_was_executed: bool,
     pub(crate) predicted_duration_ms: Option<u64>,
     pub(crate) predictive_lower_bound_ms: Option<u64>,
@@ -336,6 +337,7 @@ impl ValidationSkippedToolOutput {
     fn prohibited(descriptor: &ValidationCommandDescriptor) -> Self {
         Self {
             reason: ValidationSkipReason::UserProhibitedValidation,
+            skip_disposition: codex_tools::ToolOutputSkipDisposition::Suppressed,
             command_was_executed: false,
             predicted_duration_ms: None,
             predictive_lower_bound_ms: None,
@@ -355,6 +357,7 @@ impl ValidationSkippedToolOutput {
     ) -> Self {
         Self {
             reason: ValidationSkipReason::PredictedValidationCost,
+            skip_disposition: codex_tools::ToolOutputSkipDisposition::Deferred,
             command_was_executed: false,
             predicted_duration_ms: Some(prediction.predicted_duration_ms),
             predictive_lower_bound_ms: Some(prediction.predictive_lower_bound_ms),

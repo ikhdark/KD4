@@ -627,6 +627,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         validation_observation: Arc::new(std::sync::Mutex::new(None)),
         validation_leader: Arc::new(std::sync::Mutex::new(None)),
         validation_waiter: None,
+        known_delta: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));

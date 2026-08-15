@@ -49,6 +49,8 @@ pub struct TurnStartedEvent {}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct TurnCompletedEvent {
     pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surfaced_result: Option<codex_app_server_protocol::SurfacedToolResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -243,6 +245,9 @@ pub enum CollabAgentStatus {
 pub struct CollabAgentState {
     pub status: CollabAgentStatus,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub surfaced_result: Option<codex_protocol::protocol::SurfacedToolResult>,
 }
 
 /// A call to a collab tool.

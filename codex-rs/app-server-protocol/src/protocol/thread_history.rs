@@ -16,12 +16,15 @@ use crate::protocol::v2::McpToolCallError;
 use crate::protocol::v2::McpToolCallResult;
 use crate::protocol::v2::McpToolCallStatus;
 use crate::protocol::v2::ReasoningPolicyHistory;
+use crate::protocol::v2::SurfacedToolResult;
+use crate::protocol::v2::TaskCompletionGate;
 use crate::protocol::v2::ThreadItem;
 use crate::protocol::v2::Turn;
 use crate::protocol::v2::TurnError as V2TurnError;
 use crate::protocol::v2::TurnError;
 use crate::protocol::v2::TurnItemsView;
 use crate::protocol::v2::TurnStatus;
+use crate::protocol::v2::TurnTiming;
 use crate::protocol::v2::UserInput;
 #[cfg(test)]
 use crate::protocol::v2::WebSearchAction;
@@ -108,6 +111,9 @@ pub struct ThreadHistoryTurnChange {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub duration_ms: Option<i64>,
+    pub completion: Option<TaskCompletionGate>,
+    pub timing: Option<TurnTiming>,
+    pub surfaced_result: Option<SurfacedToolResult>,
     pub reasoning_policy_history: Option<ReasoningPolicyHistory>,
 }
 
@@ -136,6 +142,9 @@ impl ThreadHistoryTurnChange {
             started_at: turn.started_at,
             completed_at: turn.completed_at,
             duration_ms: turn.duration_ms,
+            completion: turn.completion.clone(),
+            timing: turn.timing.clone(),
+            surfaced_result: turn.surfaced_result.clone(),
             reasoning_policy_history: turn.reasoning_policy_history.clone(),
         }
     }
@@ -148,6 +157,9 @@ impl ThreadHistoryTurnChange {
             started_at: turn.started_at,
             completed_at: turn.completed_at,
             duration_ms: turn.duration_ms,
+            completion: turn.completion.clone(),
+            timing: turn.timing.clone(),
+            surfaced_result: turn.surfaced_result.clone(),
             reasoning_policy_history: turn.reasoning_policy_history.clone(),
         }
     }
@@ -409,6 +421,7 @@ impl ThreadHistoryBuilder {
             RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::ToolManifest(_)
+            | RolloutItem::SamplingBoundary(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::SessionMeta(_) => {}
@@ -1217,6 +1230,9 @@ impl ThreadHistoryBuilder {
             turn.status = TurnStatus::Interrupted;
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
+            turn.completion = None;
+            turn.timing = payload.timing.clone();
+            turn.surfaced_result = None;
             ThreadHistoryTurnChange::from_pending_turn(turn)
         };
         if let Some(turn_id) = payload.turn_id.as_deref() {
@@ -1231,6 +1247,9 @@ impl ThreadHistoryBuilder {
                 turn.status = TurnStatus::Interrupted;
                 turn.completed_at = payload.completed_at;
                 turn.duration_ms = payload.duration_ms;
+                turn.completion = None;
+                turn.timing = payload.timing.clone();
+                turn.surfaced_result = None;
                 let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
                 self.record_changed_turn(changed_turn);
                 return;
@@ -1270,6 +1289,9 @@ impl ThreadHistoryBuilder {
             }
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
+            turn.completion = payload.completion.clone().map(Into::into);
+            turn.timing = payload.timing.clone();
+            turn.surfaced_result = payload.surfaced_result.clone();
             ThreadHistoryTurnChange::from_pending_turn(turn)
         };
 
@@ -1298,13 +1320,23 @@ impl ThreadHistoryBuilder {
             }
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
+            turn.completion = payload.completion.clone().map(Into::into);
+            turn.timing = payload.timing.clone();
+            turn.surfaced_result = payload.surfaced_result.clone();
             let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
             self.record_changed_turn(changed_turn);
             return;
         }
 
-        // If the completion event cannot be matched, apply it to the active turn.
-        if let Some(current_turn) = self.current_turn.as_mut() {
+        // Legacy histories can lack an explicit turn boundary, so retain the
+        // historical fallback only for an implicitly opened turn. Never attach
+        // an unmatched historical completion to a different explicit active turn
+        // (for example, the first new turn in a fork).
+        if let Some(current_turn) = self
+            .current_turn
+            .as_mut()
+            .filter(|turn| !turn.opened_explicitly)
+        {
             let changed_turn = apply_completion(current_turn);
             self.record_changed_turn(changed_turn);
             self.finish_current_turn();
@@ -1400,6 +1432,9 @@ impl ThreadHistoryBuilder {
             started_at: None,
             completed_at: None,
             duration_ms: None,
+            completion: None,
+            timing: None,
+            surfaced_result: None,
             reasoning_policy_history: None,
             opened_explicitly: false,
             saw_compaction: false,
@@ -1583,6 +1618,9 @@ struct PendingTurn {
     started_at: Option<i64>,
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
+    completion: Option<TaskCompletionGate>,
+    timing: Option<TurnTiming>,
+    surfaced_result: Option<SurfacedToolResult>,
     reasoning_policy_history: Option<ReasoningPolicyHistory>,
     /// True when this turn originated from an explicit `turn_started`/`turn_complete`
     /// boundary, so we preserve it even if it has no renderable items.
@@ -1622,6 +1660,9 @@ impl From<PendingTurn> for Turn {
             started_at: value.started_at,
             completed_at: value.completed_at,
             duration_ms: value.duration_ms,
+            completion: value.completion,
+            timing: value.timing,
+            surfaced_result: value.surfaced_result,
             reasoning_policy_history: value.reasoning_policy_history,
         }
     }
@@ -1638,6 +1679,9 @@ impl From<&PendingTurn> for Turn {
             started_at: value.started_at,
             completed_at: value.completed_at,
             duration_ms: value.duration_ms,
+            completion: value.completion.clone(),
+            timing: value.timing.clone(),
+            surfaced_result: value.surfaced_result.clone(),
             reasoning_policy_history: value.reasoning_policy_history.clone(),
         }
     }
@@ -1830,6 +1874,7 @@ mod tests {
                 review_output: None,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-1".into(),
                 last_agent_message: None,
                 error: None,
@@ -1891,6 +1936,7 @@ mod tests {
                 completed_at_ms: 0,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-1".into(),
                 last_agent_message: None,
                 error: None,
@@ -1996,6 +2042,7 @@ mod tests {
                 started_at_ms: 0,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
@@ -2050,6 +2097,7 @@ mod tests {
                 completed_at_ms: 1_000,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
@@ -2105,6 +2153,7 @@ mod tests {
                 completed_at_ms: 1_000,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
@@ -2171,6 +2220,7 @@ mod tests {
                 completed_at_ms: 1_000,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
@@ -2242,6 +2292,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
@@ -2323,6 +2374,7 @@ mod tests {
                 saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-image".into(),
                 last_agent_message: None,
                 error: None,
@@ -2345,6 +2397,9 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
                 items_view: TurnItemsView::Full,
                 items: vec![
@@ -2625,6 +2680,7 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::ReasoningPolicySummary(history.clone())),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -2654,6 +2710,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -2700,6 +2757,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -2731,6 +2789,7 @@ mod tests {
                 "turn-a",
             ))),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -2815,6 +2874,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -3387,6 +3447,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -3432,6 +3493,7 @@ mod tests {
                 status: CoreExecCommandStatus::Completed,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-b".into(),
                 last_agent_message: None,
                 error: None,
@@ -3491,6 +3553,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -3536,6 +3599,7 @@ mod tests {
                 status: CoreExecCommandStatus::Completed,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-b".into(),
                 last_agent_message: None,
                 error: None,
@@ -3727,6 +3791,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -3752,6 +3817,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -3767,6 +3833,7 @@ mod tests {
                 memory_citation: None,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-b".into(),
                 last_agent_message: None,
                 error: None,
@@ -3823,6 +3890,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: Some(ErrorEvent {
@@ -3868,6 +3936,9 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(10_000),
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 },
                 Turn {
@@ -3886,6 +3957,9 @@ mod tests {
                     started_at: Some(30),
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 },
             ]
@@ -3911,6 +3985,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -3980,6 +4055,7 @@ mod tests {
                 window_id: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-compact".into(),
                 last_agent_message: None,
                 error: None,
@@ -4001,6 +4077,9 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
                 items_view: TurnItemsView::Full,
                 items: Vec::new(),
@@ -4055,6 +4134,7 @@ mod tests {
                     CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Completed,
                         message: None,
+                        surfaced_result: None,
                     },
                 )]
                 .into_iter()
@@ -4115,6 +4195,7 @@ mod tests {
                     CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Running,
                         message: None,
+                        surfaced_result: None,
                     },
                 )]
                 .into_iter()
@@ -4187,6 +4268,7 @@ mod tests {
                     CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Interrupted,
                         message: None,
+                        surfaced_result: None,
                     },
                 )]
                 .into_iter()
@@ -4246,6 +4328,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -4276,6 +4359,9 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
                 items_view: TurnItemsView::Full,
                 items: vec![ThreadItem::UserMessage {
@@ -4288,6 +4374,223 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn persisted_turn_complete_materializes_authoritative_terminal_outcome() {
+        let surfaced_result = SurfacedToolResult {
+            adapter: "code_mode_cell".to_string(),
+            value: serde_json::json!({"answer": 42, "nested": [true, null]}),
+            canonical_message: None,
+        };
+        let core_completion = codex_protocol::protocol::TaskCompletionGate {
+            status: codex_protocol::protocol::TaskCompletionStatus::Partial,
+            reasons: vec!["focused validation is stale".to_string()],
+            evidence_path: Some("task-evidence/thread.json".to_string()),
+        };
+        let timing = TurnTiming {
+            schema_version: 7,
+            profile_valid: true,
+            classification_complete: true,
+            started_at_unix_ms: Some(10_000),
+            completed_at_unix_ms: Some(12_500),
+            inclusive_duration_ns: 2_500_000_000,
+            inclusive_duration_ms: 2_500,
+            ..Default::default()
+        };
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-terminal".into(),
+                trace_id: None,
+                started_at: Some(10),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: None,
+                message: "return the existing tool result".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-terminal".into(),
+                last_agent_message: None,
+                surfaced_result: Some(surfaced_result.clone()),
+                error: None,
+                completion: Some(core_completion.clone()),
+                completed_at: Some(12),
+                duration_ms: Some(2_500),
+                time_to_first_token_ms: Some(125),
+                timing: Some(timing.clone()),
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        let turn = turns.first().expect("materialized turn");
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(turn.completed_at, Some(12));
+        assert_eq!(turn.duration_ms, Some(2_500));
+        assert_eq!(turn.surfaced_result, Some(surfaced_result));
+        assert_eq!(
+            turn.completion,
+            Some(crate::protocol::v2::TaskCompletionGate::from(
+                core_completion
+            ))
+        );
+        assert_eq!(turn.timing, Some(timing));
+        assert!(
+            turn.items
+                .iter()
+                .all(|item| !matches!(item, ThreadItem::AgentMessage { .. })),
+            "a surfaced result without a canonical message must not fabricate assistant prose"
+        );
+    }
+
+    #[test]
+    fn legacy_turn_complete_without_terminal_fields_materializes_absent_outcome() {
+        let legacy: TurnCompleteEvent = serde_json::from_value(serde_json::json!({
+            "turn_id": "turn-legacy",
+            "last_agent_message": null
+        }))
+        .expect("legacy turn_complete event");
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-legacy".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(legacy)),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        let turn = turns.first().expect("legacy materialized turn");
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(turn.completion, None);
+        assert_eq!(turn.timing, None);
+        assert_eq!(turn.surfaced_result, None);
+    }
+
+    #[test]
+    fn persisted_turn_aborted_materializes_interrupted_timing_without_success_outcome() {
+        let timing = TurnTiming {
+            schema_version: 3,
+            profile_valid: true,
+            inclusive_duration_ms: 800,
+            ..Default::default()
+        };
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-aborted".into(),
+                trace_id: None,
+                started_at: Some(20),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some("turn-aborted".into()),
+                reason: TurnAbortReason::Interrupted,
+                completed_at: Some(21),
+                duration_ms: Some(800),
+                timing: Some(timing.clone()),
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        let turn = turns.first().expect("aborted materialized turn");
+        assert_eq!(turn.status, TurnStatus::Interrupted);
+        assert_eq!(turn.completed_at, Some(21));
+        assert_eq!(turn.duration_ms, Some(800));
+        assert_eq!(turn.timing, Some(timing));
+        assert_eq!(turn.completion, None);
+        assert_eq!(turn.surfaced_result, None);
+    }
+
+    #[test]
+    fn historical_terminal_outcome_does_not_flow_into_next_active_turn() {
+        let surfaced_result = SurfacedToolResult {
+            adapter: "code_mode_cell".to_string(),
+            value: serde_json::json!({"parent": true}),
+            canonical_message: None,
+        };
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "parent-turn".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "parent-turn".into(),
+                last_agent_message: None,
+                surfaced_result: Some(surfaced_result.clone()),
+                error: None,
+                completion: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "fork-active-turn".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].surfaced_result, Some(surfaced_result));
+        assert_eq!(turns[1].id, "fork-active-turn");
+        assert_eq!(turns[1].status, TurnStatus::InProgress);
+        assert_eq!(turns[1].completion, None);
+        assert_eq!(turns[1].timing, None);
+        assert_eq!(turns[1].surfaced_result, None);
+    }
+
+    #[test]
+    fn unmatched_parent_completion_does_not_close_explicit_fork_turn() {
+        let surfaced_result = SurfacedToolResult {
+            adapter: "code_mode_cell".to_string(),
+            value: serde_json::json!({"parent": true}),
+            canonical_message: None,
+        };
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "fork-active-turn".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "omitted-parent-turn".into(),
+                last_agent_message: None,
+                surfaced_result: Some(surfaced_result),
+                error: None,
+                completion: None,
+                completed_at: Some(1),
+                duration_ms: Some(1_000),
+                time_to_first_token_ms: None,
+                timing: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, "fork-active-turn");
+        assert_eq!(turns[0].status, TurnStatus::InProgress);
+        assert_eq!(turns[0].completed_at, None);
+        assert_eq!(turns[0].duration_ms, None);
+        assert_eq!(turns[0].completion, None);
+        assert_eq!(turns[0].timing, None);
+        assert_eq!(turns[0].surfaced_result, None);
     }
 
     #[test]
@@ -4315,6 +4618,7 @@ mod tests {
                 }),
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -4367,6 +4671,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: Some(ErrorEvent {
@@ -4408,6 +4713,9 @@ mod tests {
                 started_at: Some(10),
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             }]
         );
@@ -4438,6 +4746,7 @@ mod tests {
             })),
             RolloutItem::ResponseItem(hook_prompt),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -4522,6 +4831,7 @@ mod tests {
                 internal_chat_message_metadata_passthrough: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -4573,6 +4883,9 @@ mod tests {
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
@@ -4674,6 +4987,9 @@ mod tests {
                     started_at: Some(10),
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
@@ -4692,6 +5008,7 @@ mod tests {
         )));
         let complete_changes = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
             EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -4714,6 +5031,9 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(123),
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
@@ -4758,6 +5078,9 @@ mod tests {
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),
@@ -4777,6 +5100,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
@@ -4799,6 +5123,9 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(123),
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 }],
                 removed_turn_ids: Vec::new(),

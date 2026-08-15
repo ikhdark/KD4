@@ -164,6 +164,9 @@ fn turn_started_emits_turn_started_event() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
         }));
@@ -756,6 +759,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                     ApiCollabAgentState {
                         status: ApiCollabAgentStatus::Running,
                         message: None,
+                        surfaced_result: None,
                     },
                 )]),
             },
@@ -800,6 +804,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                             CollabAgentState {
                                 status: CollabAgentStatus::Running,
                                 message: None,
+                                surfaced_result: None,
                             },
                         )]),
                         status: CollabToolCallStatus::Completed,
@@ -1156,6 +1161,7 @@ fn plan_update_emits_started_then_updated_then_completed() {
 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1167,6 +1173,9 @@ fn plan_update_emits_started_then_updated_then_completed() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1194,6 +1203,7 @@ fn plan_update_emits_started_then_updated_then_completed() {
                     },
                 }),
                 ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                    surfaced_result: None,
                     usage: Usage::default(),
                 }),
             ],
@@ -1220,6 +1230,7 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
     ));
     let _ = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1231,6 +1242,9 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1307,6 +1321,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1318,6 +1333,9 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1327,6 +1345,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
         completed,
         CollectedThreadEvents {
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                surfaced_result: None,
                 usage: Usage {
                     input_tokens: 10,
                     cached_input_tokens: 3,
@@ -1345,6 +1364,7 @@ fn turn_completion_recovers_final_message_from_turn_items() {
 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1361,6 +1381,9 @@ fn turn_completion_recovers_final_message_from_turn_items() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1371,6 +1394,7 @@ fn turn_completion_recovers_final_message_from_turn_items() {
         completed,
         CollectedThreadEvents {
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                surfaced_result: None,
                 usage: Usage::default(),
             })],
             status: CodexStatus::InitiateShutdown,
@@ -1421,6 +1445,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1443,6 +1468,9 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1465,6 +1493,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                     },
                 }),
                 ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                    surfaced_result: None,
                     usage: Usage::default(),
                 }),
             ],
@@ -1492,6 +1521,7 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1508,6 +1538,9 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1518,6 +1551,7 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
         completed,
         CollectedThreadEvents {
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                surfaced_result: None,
                 usage: Usage::default(),
             })],
             status: CodexStatus::InitiateShutdown,
@@ -1545,6 +1579,7 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1556,6 +1591,9 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1566,12 +1604,62 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
         completed,
         CollectedThreadEvents {
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                surfaced_result: None,
                 usage: Usage::default(),
             })],
             status: CodexStatus::InitiateShutdown,
         }
     );
     assert_eq!(processor.final_message(), Some("streamed answer"));
+}
+
+#[test]
+fn surfaced_result_without_canonical_message_clears_plain_output_and_stays_typed() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+    let surfaced_result = codex_protocol::protocol::SurfacedToolResult {
+        adapter: "owner".to_string(),
+        value: serde_json::json!({"answer": 42}),
+        canonical_message: None,
+    };
+
+    let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+        TurnCompletedNotification {
+            surfaced_result: Some(surfaced_result.clone()),
+            thread_id: "thread-1".to_string(),
+            completion: None,
+            turn: Turn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: vec![ThreadItem::AgentMessage {
+                    id: "stale".to_string(),
+                    text: "must not replace the owner result".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                }],
+                status: TurnStatus::Completed,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
+                reasoning_policy_history: None,
+            },
+            timing: None,
+        },
+    ));
+
+    assert_eq!(processor.final_message(), None);
+    assert!(completed.events.iter().any(|event| {
+        matches!(
+            event,
+            ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                surfaced_result: Some(actual),
+                ..
+            }) if actual == &surfaced_result
+        )
+    }));
 }
 
 #[test]
@@ -1597,6 +1685,7 @@ fn failed_turn_clears_stale_final_message() {
 
     let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1612,6 +1701,9 @@ fn failed_turn_clears_stale_final_message() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1628,6 +1720,7 @@ fn turn_completion_falls_back_to_final_plan_text() {
 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1642,6 +1735,9 @@ fn turn_completion_falls_back_to_final_plan_text() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1652,6 +1748,7 @@ fn turn_completion_falls_back_to_final_plan_text() {
         completed,
         CollectedThreadEvents {
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                surfaced_result: None,
                 usage: Usage::default(),
             })],
             status: CodexStatus::InitiateShutdown,
@@ -1686,6 +1783,7 @@ fn turn_failure_prefers_structured_error_message() {
 
     let failed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1697,6 +1795,9 @@ fn turn_failure_prefers_structured_error_message() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,
@@ -1752,6 +1853,7 @@ fn interrupted_turn_emits_turn_failed_terminal_event() {
 
     let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread-1".to_string(),
             completion: None,
             turn: Turn {
@@ -1763,6 +1865,9 @@ fn interrupted_turn_emits_turn_failed_terminal_event() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
             timing: None,

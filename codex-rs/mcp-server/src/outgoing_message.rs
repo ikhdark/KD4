@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
@@ -26,6 +27,8 @@ pub(crate) type OutgoingJsonRpcMessage = JsonRpcMessage<CustomRequest, Value, Cu
 /// Sends messages to the client and manages request callbacks.
 pub(crate) struct OutgoingMessageSender {
     next_request_id: AtomicI64,
+    supports_form_elicitation: AtomicBool,
+    supports_url_elicitation: AtomicBool,
     sender: mpsc::UnboundedSender<OutgoingMessage>,
     request_id_to_callback: Mutex<HashMap<RequestId, oneshot::Sender<Value>>>,
 }
@@ -34,8 +37,31 @@ impl OutgoingMessageSender {
     pub(crate) fn new(sender: mpsc::UnboundedSender<OutgoingMessage>) -> Self {
         Self {
             next_request_id: AtomicI64::new(0),
+            supports_form_elicitation: AtomicBool::new(false),
+            supports_url_elicitation: AtomicBool::new(false),
             sender,
             request_id_to_callback: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn set_elicitation_capabilities(&self, form: bool, url: bool) {
+        self.supports_form_elicitation
+            .store(form, Ordering::Release);
+        self.supports_url_elicitation.store(url, Ordering::Release);
+    }
+
+    pub(crate) fn supports_elicitation(
+        &self,
+        request: &codex_protocol::approvals::ElicitationRequest,
+    ) -> bool {
+        match request {
+            codex_protocol::approvals::ElicitationRequest::Form { .. }
+            | codex_protocol::approvals::ElicitationRequest::OpenAiForm { .. } => {
+                self.supports_form_elicitation.load(Ordering::Acquire)
+            }
+            codex_protocol::approvals::ElicitationRequest::Url { .. } => {
+                self.supports_url_elicitation.load(Ordering::Acquire)
+            }
         }
     }
 
@@ -45,6 +71,7 @@ impl OutgoingMessageSender {
         params: Option<serde_json::Value>,
     ) -> oneshot::Receiver<Value> {
         let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
+        let callback_id = id.clone();
         let outgoing_message_id = id.clone();
         let (tx_approve, rx_approve) = oneshot::channel();
         {
@@ -57,7 +84,12 @@ impl OutgoingMessageSender {
             method: method.to_string(),
             params,
         });
-        let _ = self.sender.send(outgoing_message);
+        if self.sender.send(outgoing_message).is_err() {
+            self.request_id_to_callback
+                .lock()
+                .await
+                .remove(&callback_id);
+        }
         rx_approve
     }
 

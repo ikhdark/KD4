@@ -160,11 +160,6 @@ impl CanonicalToolResult {
         }
     }
 
-    pub fn with_sections(mut self, sections: Vec<ToolProjectionSection>) -> Self {
-        self.sections = sections;
-        self
-    }
-
     pub fn with_retention_policy(mut self, policy: CanonicalRetentionPolicy) -> Self {
         self.retention_policy = policy;
         self
@@ -267,11 +262,76 @@ pub enum ToolOutputOutcome {
     Skipped,
 }
 
+/// Why a tool intentionally did not execute.
+///
+/// A skipped result is non-success, but only `BlockingRequiredOperation`
+/// constitutes failure evidence for the sampling governor.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputSkipDisposition {
+    Deferred,
+    Suppressed,
+    NotApplicable,
+    BlockingRequiredOperation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolOutputOutcomeContext {
+    pub outcome: ToolOutputOutcome,
+    pub skip_disposition: Option<ToolOutputSkipDisposition>,
+}
+
+impl ToolOutputOutcomeContext {
+    pub const fn new(outcome: ToolOutputOutcome) -> Self {
+        Self {
+            outcome,
+            skip_disposition: None,
+        }
+    }
+
+    pub const fn skipped(disposition: Option<ToolOutputSkipDisposition>) -> Self {
+        Self {
+            outcome: ToolOutputOutcome::Skipped,
+            skip_disposition: disposition,
+        }
+    }
+}
+
 /// Producer-supplied diagnostic classification used by model-output projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolOutputDiagnosticClass {
     Normal,
     HighSignal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodeModeToolSearchStatus {
+    Completed,
+    Incomplete,
+    Aborted,
+}
+
+impl CodeModeToolSearchStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+pub fn code_mode_tool_search_result(
+    status: CodeModeToolSearchStatus,
+    tools: Vec<JsonValue>,
+    omitted_result_count: Option<usize>,
+) -> JsonValue {
+    serde_json::json!({
+        "status": status.as_str(),
+        "execution": "client",
+        "tools": tools,
+        "omitted_result_count": omitted_result_count,
+    })
 }
 
 /// Producer-owned category for a structured model-projection fragment.
@@ -337,15 +397,27 @@ pub struct ToolOutputProjectionMetadata {
     /// artifact without another model decision. Empty means fail open to the
     /// existing model-driven `read_tool_output` path.
     pub predetermined_ranges: Vec<ToolOutputProjectionRange>,
+    /// Producer-owned exact JSON Pointer selectors that are safe to drain from
+    /// the canonical JSON artifact without another model decision. Empty means
+    /// fail open to the existing model-driven `read_tool_output` path.
+    pub predetermined_json_pointers: Vec<ToolOutputProjectionJsonPointer>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct ToolOutputProjectionRange {
     /// Stable producer-owned range identity; never inferred from rendered text.
     pub id: String,
     /// Inclusive one-based line bounds in the canonical raw artifact.
     pub start_line: usize,
     pub end_line: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct ToolOutputProjectionJsonPointer {
+    /// Stable producer-owned selector identity; never inferred from rendered text.
+    pub id: String,
+    /// RFC 6901 pointer into the canonical JSON artifact.
+    pub pointer: String,
 }
 
 /// Model-facing output contract returned by executable tool runtimes.
@@ -362,6 +434,10 @@ pub trait ToolOutput: Send {
         }
     }
 
+    fn outcome_context(&self) -> ToolOutputOutcomeContext {
+        ToolOutputOutcomeContext::new(self.outcome_for_logging())
+    }
+
     /// Internal, request-local signal consumed by the normal sampling loop.
     /// This is never serialized into the public protocol.
     fn sampling_request_signal(&self) -> Option<JsonValue> {
@@ -376,6 +452,18 @@ pub trait ToolOutput: Send {
         Vec::new()
     }
 
+    /// Request-local owner key used to carry deterministic nested-tool evidence
+    /// to the model-facing result that owns the next sampling boundary.
+    fn deterministic_continuation_owner_key(&self) -> Option<String> {
+        None
+    }
+
+    /// Exact model-facing values recovered by the tool owner. The runtime only
+    /// accepts these when paired with one deterministic continuation receipt.
+    fn deterministic_continuation_content(&self) -> Vec<JsonValue> {
+        Vec::new()
+    }
+
     /// Whether this output contains external context that should disable memory generation when
     /// `memories.disable_on_external_context` is enabled.
     fn contains_external_context(&self) -> bool {
@@ -386,6 +474,15 @@ pub trait ToolOutput: Send {
     /// be reduced for a direct or code-mode model consumer.
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         None
+    }
+
+    /// Whether the dispatcher must materialize the canonical result even when
+    /// the already-bounded model projection would otherwise fit inline.
+    ///
+    /// Producers use this when their visible response is intentionally only a
+    /// projection of a larger authoritative result.
+    fn requires_canonical_artifact(&self) -> bool {
+        false
     }
 
     /// Returns the exact producer result before any model-facing rendering.
@@ -448,6 +545,10 @@ where
         (**self).outcome_for_logging()
     }
 
+    fn outcome_context(&self) -> ToolOutputOutcomeContext {
+        (**self).outcome_context()
+    }
+
     fn sampling_request_signal(&self) -> Option<JsonValue> {
         (**self).sampling_request_signal()
     }
@@ -458,12 +559,24 @@ where
         (**self).deterministic_continuation_receipts()
     }
 
+    fn deterministic_continuation_owner_key(&self) -> Option<String> {
+        (**self).deterministic_continuation_owner_key()
+    }
+
+    fn deterministic_continuation_content(&self) -> Vec<JsonValue> {
+        (**self).deterministic_continuation_content()
+    }
+
     fn contains_external_context(&self) -> bool {
         (**self).contains_external_context()
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         (**self).projection_metadata()
+    }
+
+    fn requires_canonical_artifact(&self) -> bool {
+        (**self).requires_canonical_artifact()
     }
 
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
@@ -496,6 +609,7 @@ pub struct JsonToolOutput {
     value: JsonValue,
     success: Option<bool>,
     outcome: Option<ToolOutputOutcome>,
+    skip_disposition: Option<ToolOutputSkipDisposition>,
     contains_external_context: bool,
 }
 
@@ -505,6 +619,7 @@ impl JsonToolOutput {
             value,
             success: Some(true),
             outcome: None,
+            skip_disposition: None,
             contains_external_context: false,
         }
     }
@@ -514,6 +629,7 @@ impl JsonToolOutput {
             value,
             success,
             outcome: None,
+            skip_disposition: None,
             contains_external_context: false,
         }
     }
@@ -521,8 +637,22 @@ impl JsonToolOutput {
     pub fn skipped(value: JsonValue) -> Self {
         Self {
             value,
-            success: Some(true),
+            success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
+            skip_disposition: None,
+            contains_external_context: false,
+        }
+    }
+
+    pub fn skipped_with_disposition(
+        value: JsonValue,
+        disposition: ToolOutputSkipDisposition,
+    ) -> Self {
+        Self {
+            value,
+            success: Some(false),
+            outcome: Some(ToolOutputOutcome::Skipped),
+            skip_disposition: Some(disposition),
             contains_external_context: false,
         }
     }
@@ -547,6 +677,7 @@ impl ToolOutputProjectionMetadata {
             essential_inline: essential_json_fields(value),
             requested_limit,
             predetermined_ranges: Vec::new(),
+            predetermined_json_pointers: Vec::new(),
         }
     }
 }
@@ -620,6 +751,13 @@ impl ToolOutput for JsonToolOutput {
                 ToolOutputOutcome::Failure
             }
         })
+    }
+
+    fn outcome_context(&self) -> ToolOutputOutcomeContext {
+        match self.outcome_for_logging() {
+            ToolOutputOutcome::Skipped => ToolOutputOutcomeContext::skipped(self.skip_disposition),
+            outcome => ToolOutputOutcomeContext::new(outcome),
+        }
     }
 
     fn contains_external_context(&self) -> bool {
@@ -715,6 +853,7 @@ impl ToolOutput for codex_protocol::mcp::CallToolResult {
             }),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
+            predetermined_json_pointers: Vec::new(),
         })
     }
 
@@ -764,7 +903,17 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
                 content_items_to_code_mode_result(&items)
             }
         },
-        ResponseInputItem::ToolSearchOutput { tools, .. } => JsonValue::Array(tools),
+        ResponseInputItem::ToolSearchOutput {
+            status,
+            execution,
+            tools,
+            ..
+        } => serde_json::json!({
+            "status": status,
+            "execution": execution,
+            "tools": tools,
+            "omitted_result_count": JsonValue::Null,
+        }),
         ResponseInputItem::McpToolCallOutput { output, .. } => serde_json::to_value(output)
             .unwrap_or_else(|err| {
                 JsonValue::String(format!("failed to serialize mcp result: {err}"))
@@ -893,12 +1042,16 @@ mod canonical_tests {
     }
 
     #[test]
-    fn json_projection_cannot_claim_producer_owned_predetermined_ranges() {
+    fn json_projection_cannot_claim_producer_owned_predetermined_selectors() {
         let value = serde_json::json!({
             "predetermined_ranges": [{
                 "id": "untrusted",
                 "start_line": 1,
                 "end_line": 2,
+            }],
+            "predetermined_json_pointers": [{
+                "id": "untrusted-json",
+                "pointer": "/output",
             }],
             "output": "fixture",
         });
@@ -906,6 +1059,25 @@ mod canonical_tests {
         let metadata = ToolOutputProjectionMetadata::from_json(&value, true, None);
 
         assert!(metadata.predetermined_ranges.is_empty());
+        assert!(metadata.predetermined_json_pointers.is_empty());
         assert_eq!(metadata.spillable_text, vec![value.to_string()]);
+    }
+
+    #[test]
+    fn generic_tool_search_conversion_preserves_status_and_execution() {
+        assert_eq!(
+            response_input_to_code_mode_result(ResponseInputItem::ToolSearchOutput {
+                call_id: "search".to_string(),
+                status: "incomplete".to_string(),
+                execution: "client".to_string(),
+                tools: vec![serde_json::json!({"name": "lookup"})],
+            }),
+            serde_json::json!({
+                "status": "incomplete",
+                "execution": "client",
+                "tools": [{"name": "lookup"}],
+                "omitted_result_count": null,
+            })
+        );
     }
 }

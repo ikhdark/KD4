@@ -294,6 +294,7 @@ impl EventProcessorWithJsonOutput {
                                         }
                                     },
                                     message: state.message,
+                                    surfaced_result: state.surfaced_result,
                                 },
                             )
                         })
@@ -549,7 +550,9 @@ impl EventProcessorWithJsonOutput {
                 events.extend(self.reconcile_unfinished_started_items(&notification.turn.items));
                 match notification.turn.status {
                     TurnStatus::Completed => {
-                        if let Some(final_message) =
+                        if let Some(surfaced_result) = notification.surfaced_result.as_ref() {
+                            self.final_message = surfaced_result.canonical_message.clone();
+                        } else if let Some(final_message) =
                             Self::final_message_from_turn_items(notification.turn.items.as_slice())
                         {
                             self.final_message = Some(final_message);
@@ -557,6 +560,7 @@ impl EventProcessorWithJsonOutput {
                         self.emit_final_message_on_shutdown = true;
                         events.push(ThreadEvent::TurnCompleted(TurnCompletedEvent {
                             usage: self.usage_from_last_total(),
+                            surfaced_result: notification.surfaced_result,
                         }));
                         CodexStatus::InitiateShutdown
                     }

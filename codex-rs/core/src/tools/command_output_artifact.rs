@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -15,6 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+#[cfg(test)]
 use std::time::Instant;
 use std::time::SystemTime;
 
@@ -54,6 +56,16 @@ const RETENTION_RECONCILIATION_INTERVAL: u64 = 128;
 const RETENTION_BYTE_GUARD_BAND: u64 = MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
 pub(crate) const RECOVERY_AGGREGATE_TOKEN_CEILING: usize = 10_000;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
+const MAX_DETERMINISTIC_RECOVERY_CACHE_ENTRIES: usize = 128;
+
+#[derive(Default)]
+struct DeterministicRecoveryCache {
+    entries: BTreeMap<String, ReadToolOutputResult>,
+    insertion_order: VecDeque<String>,
+}
+
+static DETERMINISTIC_RECOVERY_CACHE: OnceLock<StdMutex<DeterministicRecoveryCache>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -177,6 +189,7 @@ impl CanonicalOutputArtifact {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RetentionDiagnostics {
     scans: u64,
@@ -196,6 +209,16 @@ struct RetentionDiagnostics {
     scan_only_operations: u64,
     scan_only_entries: u64,
     scan_only_exits: u64,
+}
+
+#[cfg(test)]
+macro_rules! record_retention_diagnostics {
+    ($($body:tt)*) => {{ $($body)* }};
+}
+
+#[cfg(not(test))]
+macro_rules! record_retention_diagnostics {
+    ($($body:tt)*) => {{}};
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +372,7 @@ struct RetentionRootState {
     generation: u64,
     mode: RetentionRootMode,
     last_access: u64,
+    #[cfg(test)]
     diagnostics: RetentionDiagnostics,
     #[cfg(test)]
     index_capacity_override: Option<usize>,
@@ -373,7 +397,9 @@ enum LogicalRetentionMutation {
     Delete,
     AppendReplace,
     Protection,
+    #[cfg(test)]
     EvidenceReconcile,
+    #[cfg(test)]
     StreamComplete,
     Cleanup,
 }
@@ -493,11 +519,7 @@ fn evict_registry_root_if_needed(registry: &mut RetentionRegistry, keep_root: &P
     }
 }
 
-fn insert_dirty_root(
-    registry: &mut RetentionRegistry,
-    root: PathBuf,
-    diagnostics: RetentionDiagnostics,
-) -> Option<u64> {
+fn insert_dirty_root(registry: &mut RetentionRegistry, root: PathBuf) -> Option<u64> {
     let generation = next_index_generation()?;
     evict_registry_root_if_needed(registry, &root);
     registry.access_clock = registry.access_clock.saturating_add(1);
@@ -507,7 +529,8 @@ fn insert_dirty_root(
             generation,
             mode: RetentionRootMode::Dirty,
             last_access: registry.access_clock,
-            diagnostics,
+            #[cfg(test)]
+            diagnostics: RetentionDiagnostics::default(),
             #[cfg(test)]
             index_capacity_override: None,
         },
@@ -535,8 +558,7 @@ fn capture_retention_token(directory: &Path) -> RetentionIndexToken {
             starting_mode: root_mode_kind(&state.mode),
         };
     }
-    let generation =
-        insert_dirty_root(&mut registry, root.clone(), RetentionDiagnostics::default());
+    let generation = insert_dirty_root(&mut registry, root.clone());
     RetentionIndexToken {
         root,
         generation,
@@ -559,17 +581,18 @@ fn transition_current_root_to_dirty_for_conflict(registry: &mut RetentionRegistr
 fn transition_root_to_dirty(
     registry: &mut RetentionRegistry,
     root: &Path,
-    stale_delta_rejected: bool,
+    #[cfg_attr(not(test), allow(unused_variables))] stale_delta_rejected: bool,
 ) {
     let Some(state) = registry.roots.get_mut(root) else {
-        let diagnostics = RetentionDiagnostics {
-            stale_delta_rejections: u64::from(stale_delta_rejected),
-            dirty_transitions: 1,
-            ..RetentionDiagnostics::default()
-        };
-        let _ = insert_dirty_root(registry, root.to_path_buf(), diagnostics);
+        let _ = insert_dirty_root(registry, root.to_path_buf());
+        #[cfg(test)]
+        if let Some(state) = registry.roots.get_mut(root) {
+            state.diagnostics.stale_delta_rejections = u64::from(stale_delta_rejected);
+            state.diagnostics.dirty_transitions = 1;
+        }
         return;
     };
+    #[cfg(test)]
     if stale_delta_rejected {
         state.diagnostics.stale_delta_rejections =
             state.diagnostics.stale_delta_rejections.saturating_add(1);
@@ -590,8 +613,10 @@ fn transition_root_to_dirty(
             };
             state.generation = generation;
             state.mode = RetentionRootMode::Dirty;
-            state.diagnostics.dirty_transitions =
-                state.diagnostics.dirty_transitions.saturating_add(1);
+            record_retention_diagnostics! {
+                state.diagnostics.dirty_transitions =
+                    state.diagnostics.dirty_transitions.saturating_add(1);
+            }
         }
         RetentionRootMode::Indexed(_) => {
             let Some(generation) = next_index_generation() else {
@@ -600,8 +625,10 @@ fn transition_root_to_dirty(
             };
             state.generation = generation;
             state.mode = RetentionRootMode::Dirty;
-            state.diagnostics.dirty_transitions =
-                state.diagnostics.dirty_transitions.saturating_add(1);
+            record_retention_diagnostics! {
+                state.diagnostics.dirty_transitions =
+                    state.diagnostics.dirty_transitions.saturating_add(1);
+            }
         }
     }
 }
@@ -1440,6 +1467,28 @@ fn logical_segment_path(path: &Path, index: u32) -> PathBuf {
     }
 }
 
+fn logical_artifact_family_exists(path: &Path) -> std::io::Result<bool> {
+    let Some(directory) = path.parent() else {
+        return Ok(false);
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let name = entry?.file_name();
+        if name.to_string_lossy().starts_with(&format!("{stem}.")) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn canonical_line_starts(bytes: &[u8]) -> Vec<u64> {
     let mut starts = vec![0];
     starts.extend(
@@ -1452,9 +1501,14 @@ fn canonical_line_starts(bytes: &[u8]) -> Vec<u64> {
     starts
 }
 
+#[cfg(test)]
 fn response_fits_recovery_ceiling(value: &impl Serialize) -> bool {
+    response_fits_recovery_token_ceiling(value, RECOVERY_AGGREGATE_TOKEN_CEILING)
+}
+
+fn response_fits_recovery_token_ceiling(value: &impl Serialize, token_ceiling: usize) -> bool {
     serde_json::to_string(value)
-        .is_ok_and(|rendered| approx_token_count(&rendered) <= RECOVERY_AGGREGATE_TOKEN_CEILING)
+        .is_ok_and(|rendered| approx_token_count(&rendered) <= token_ceiling)
 }
 
 fn successful_byte_selector_result(
@@ -1488,6 +1542,7 @@ fn largest_fitting_byte_chunk(
     artifact_id: &str,
     canonical_bytes: u64,
     range: CanonicalByteRange,
+    token_ceiling: usize,
 ) -> u64 {
     if range.is_empty() {
         return 0;
@@ -1506,7 +1561,7 @@ fn largest_fitting_byte_chunk(
                 &vec![0; candidate_bytes as usize],
             )],
         };
-        response_fits_recovery_ceiling(&result)
+        response_fits_recovery_token_ceiling(&result, token_ceiling)
     };
     let mut best = 1_u64;
     let mut first_failure = range.len();
@@ -1542,6 +1597,7 @@ fn populate_recovery_subdivisions(metadata: &mut LogicalArtifactMetadata) {
             &metadata.artifact_id,
             metadata.canonical_bytes,
             pointer.range,
+            RECOVERY_AGGREGATE_TOKEN_CEILING,
         ));
     }
     for section in &mut metadata.sections {
@@ -1550,6 +1606,7 @@ fn populate_recovery_subdivisions(metadata: &mut LogicalArtifactMetadata) {
                 &metadata.artifact_id,
                 metadata.canonical_bytes,
                 range,
+                RECOVERY_AGGREGATE_TOKEN_CEILING,
             ));
         }
     }
@@ -1563,6 +1620,21 @@ pub(crate) async fn create_canonical_output_artifact(
     thread_id: &str,
     canonical: &CanonicalToolResult,
 ) -> CanonicalOutputArtifact {
+    create_canonical_output_artifact_with_id(
+        codex_home,
+        thread_id,
+        canonical,
+        ToolOutputArtifactId::new(),
+    )
+    .await
+}
+
+async fn create_canonical_output_artifact_with_id(
+    codex_home: &Path,
+    thread_id: &str,
+    canonical: &CanonicalToolResult,
+    id: ToolOutputArtifactId,
+) -> CanonicalOutputArtifact {
     let directory = codex_home.join("tool-output").join(thread_id);
     let _retention_permit = retention_sweep_permit().await;
     if let Err(err) = tokio::fs::create_dir_all(&directory).await {
@@ -1574,8 +1646,6 @@ pub(crate) async fn create_canonical_output_artifact(
             error: Some(format!("failed to create `{}`: {err}", directory.display())),
         };
     }
-
-    let id = ToolOutputArtifactId::new();
     let path = directory.join(format!("{id}.log"));
     enforce_retention_locked(&directory, &path, canonical.exact_bytes, 1).await;
     let usage = retention_usage_locked(&directory).await;
@@ -1847,6 +1917,158 @@ pub(crate) async fn attach_canonical_output_artifact(
         unavailable_ranges,
         error: None,
     }
+}
+
+/// Copies one exact, complete logical artifact into a new thread-owned artifact namespace.
+///
+/// Forks cannot reuse the parent's handle because `read_tool_output` is deliberately confined to
+/// the current thread. Preserve the opaque ID inside the child namespace so already-persisted
+/// bounded output does not expose a stale handle, while validating and copying the exact bytes.
+/// Any failure is fail-open for callers: the fork keeps the bounded output in canonical history
+/// and simply omits the receipt candidate.
+pub(crate) async fn remint_tool_history_artifact_for_thread(
+    codex_home: &Path,
+    source_thread_id: &str,
+    target_thread_id: &str,
+    artifact_id: &str,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<String, String> {
+    if source_thread_id == target_thread_id {
+        return Err("tool-history artifact remint requires a distinct target thread".to_string());
+    }
+    let source_id = artifact_id
+        .parse::<ToolOutputArtifactId>()
+        .map_err(|_| "invalid source tool-output artifact id".to_string())?;
+    if source_id.to_string() != artifact_id {
+        return Err("non-canonical source tool-output artifact id".to_string());
+    }
+    let source_path = codex_home
+        .join("tool-output")
+        .join(source_thread_id)
+        .join(format!("{source_id}.log"));
+    let expected_sha256 = expected_sha256.to_string();
+    let expected_sha256_for_check = expected_sha256.clone();
+    let (metadata, bytes) = tokio::task::spawn_blocking(move || {
+        let metadata = load_logical_metadata(&source_path, source_id).map_err(|err| {
+            format!(
+                "failed to load source artifact metadata: {}",
+                err.for_model()
+            )
+        })?;
+        if !metadata.complete
+            || metadata.retained_bytes != expected_bytes
+            || metadata.canonical_bytes != expected_bytes
+            || !metadata.unavailable_ranges.is_empty()
+            || metadata.canonical_sha256 != expected_sha256_for_check
+        {
+            return Err(
+                "source artifact identity does not match tool-history metadata".to_string(),
+            );
+        }
+        let bytes = read_logical_range(
+            &source_path,
+            &metadata,
+            CanonicalByteRange::new(0, expected_bytes),
+        )
+        .map_err(|err| format!("failed to read source artifact: {}", err.for_model()))?;
+        if format!("{:x}", Sha256::digest(&bytes)) != expected_sha256_for_check {
+            return Err("source artifact digest does not match tool-history metadata".to_string());
+        }
+        Ok((metadata, bytes))
+    })
+    .await
+    .map_err(|err| format!("artifact remint verification task failed: {err}"))??;
+
+    let expected_target_metadata = metadata.clone();
+    let mut canonical = CanonicalToolResult::bytes(bytes);
+    canonical.kind = metadata.canonical_kind;
+    canonical.json_pointers = metadata.json_pointers;
+    canonical.sections = metadata.sections;
+
+    let target_path = codex_home
+        .join("tool-output")
+        .join(target_thread_id)
+        .join(format!("{source_id}.log"));
+    let target_path_for_check = target_path.clone();
+    let expected_sha256_for_target = expected_sha256.clone();
+    let target_already_exists = tokio::task::spawn_blocking(move || {
+        if !logical_artifact_family_exists(&target_path_for_check)
+            .map_err(|err| format!("failed to inspect target artifact namespace: {err}"))?
+        {
+            return Ok(false);
+        }
+        let target_metadata = load_logical_metadata(&target_path_for_check, source_id)
+            .map_err(|err| format!("target artifact collision: {}", err.for_model()))?;
+        if target_metadata != expected_target_metadata {
+            return Err("target artifact collision has different metadata".to_string());
+        }
+        let target_bytes = read_logical_range(
+            &target_path_for_check,
+            &target_metadata,
+            CanonicalByteRange::new(0, expected_bytes),
+        )
+        .map_err(|err| format!("failed to verify target artifact: {}", err.for_model()))?;
+        if format!("{:x}", Sha256::digest(&target_bytes)) != expected_sha256_for_target {
+            return Err("target artifact collision has different bytes".to_string());
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|err| format!("target artifact verification task failed: {err}"))??;
+
+    if target_already_exists {
+        protect_active_tool_history_artifact(
+            codex_home,
+            target_thread_id,
+            artifact_id,
+            expected_bytes,
+            &expected_sha256,
+        )
+        .await
+        .map_err(|err| format!("failed to protect existing target artifact: {err}"))?;
+        return Ok(artifact_id.to_string());
+    }
+
+    let reminted = create_canonical_output_artifact_with_id(
+        codex_home,
+        target_thread_id,
+        &canonical,
+        source_id,
+    )
+    .await;
+    let reminted_id = reminted.artifact_id().ok_or_else(|| {
+        reminted
+            .error
+            .clone()
+            .unwrap_or_else(|| "artifact remint failed".to_string())
+    })?;
+    let target_retention_token =
+        capture_retention_token(target_path.parent().unwrap_or_else(|| Path::new(".")));
+    if !reminted.complete
+        || reminted.retained_bytes != expected_bytes
+        || !reminted.unavailable_ranges.is_empty()
+    {
+        rollback_logical_artifact_creation(&target_retention_token, &target_path);
+        return Err(reminted
+            .error
+            .clone()
+            .unwrap_or_else(|| "reminted artifact is not complete".to_string()));
+    }
+    if let Err(err) = protect_active_tool_history_artifact(
+        codex_home,
+        target_thread_id,
+        &reminted_id,
+        expected_bytes,
+        &expected_sha256,
+    )
+    .await
+    {
+        let _ = std::fs::remove_file(active_tool_history_protection_path(&target_path));
+        rollback_logical_artifact_creation(&target_retention_token, &target_path);
+        return Err(format!("failed to protect reminted artifact: {err}"));
+    }
+    Ok(reminted_id)
 }
 
 fn rollback_logical_artifact_creation(token: &RetentionIndexToken, path: &Path) {
@@ -2847,9 +3069,14 @@ fn too_large_result(
     range: CanonicalByteRange,
     child_selectors: Vec<ToolOutputSelector>,
     metadata: &LogicalArtifactMetadata,
+    token_ceiling: usize,
 ) -> ToolOutputSelectorResult {
-    let chunk_bytes =
-        largest_fitting_byte_chunk(&metadata.artifact_id, metadata.canonical_bytes, range);
+    let chunk_bytes = largest_fitting_byte_chunk(
+        &metadata.artifact_id,
+        metadata.canonical_bytes,
+        range,
+        token_ceiling,
+    );
     let mut children = Vec::new();
     if !range.is_empty() {
         children.push(ToolOutputSelector::Bytes {
@@ -2878,15 +3105,18 @@ fn too_large_result(
         message: None,
     };
     result.continuation = result.child_selectors.first().cloned();
-    while !response_fits_recovery_ceiling(&ReadToolOutputResult {
-        artifact_id: metadata.artifact_id.clone(),
-        canonical_sha256: metadata.canonical_sha256.clone(),
-        canonical_bytes: metadata.canonical_bytes,
-        retained_bytes: metadata.retained_bytes,
-        complete: metadata.complete,
-        unavailable_ranges: metadata.unavailable_ranges.clone(),
-        results: vec![result.clone()],
-    }) && result.child_selectors.len() > 1
+    while !response_fits_recovery_token_ceiling(
+        &ReadToolOutputResult {
+            artifact_id: metadata.artifact_id.clone(),
+            canonical_sha256: metadata.canonical_sha256.clone(),
+            canonical_bytes: metadata.canonical_bytes,
+            retained_bytes: metadata.retained_bytes,
+            complete: metadata.complete,
+            unavailable_ranges: metadata.unavailable_ranges.clone(),
+            results: vec![result.clone()],
+        },
+        token_ceiling,
+    ) && result.child_selectors.len() > 1
     {
         result.child_selectors.pop();
     }
@@ -2897,6 +3127,7 @@ fn select_logical_artifact(
     path: &Path,
     metadata: &LogicalArtifactMetadata,
     selector: ToolOutputSelector,
+    token_ceiling: usize,
 ) -> ToolOutputSelectorResult {
     let (range, children, directory_value) = match selector_range_and_children(&selector, metadata)
     {
@@ -2963,8 +3194,8 @@ fn select_logical_artifact(
         unavailable_ranges: metadata.unavailable_ranges.clone(),
         results: vec![result.clone()],
     };
-    if !response_fits_recovery_ceiling(&individual) {
-        result = too_large_result(selector, range, children, metadata);
+    if !response_fits_recovery_token_ceiling(&individual, token_ceiling) {
+        result = too_large_result(selector, range, children, metadata, token_ceiling);
     }
     result
 }
@@ -2975,17 +3206,74 @@ pub(crate) async fn read_tool_output_selectors(
     artifact_id: &str,
     selectors: Vec<ToolOutputSelector>,
 ) -> Result<ReadToolOutputResult, ReadToolOutputError> {
+    read_tool_output_selectors_with_reuse(codex_home, thread_id, artifact_id, selectors)
+        .await
+        .map(|(result, _)| result)
+}
+
+pub(crate) async fn read_tool_output_selectors_with_reuse(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    selectors: Vec<ToolOutputSelector>,
+) -> Result<(ReadToolOutputResult, bool), ReadToolOutputError> {
+    read_tool_output_selectors_with_ceiling_and_reuse(
+        codex_home,
+        thread_id,
+        artifact_id,
+        selectors,
+        RECOVERY_AGGREGATE_TOKEN_CEILING,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn read_tool_output_selectors_with_ceiling(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    selectors: Vec<ToolOutputSelector>,
+    token_ceiling: usize,
+) -> Result<ReadToolOutputResult, ReadToolOutputError> {
+    read_tool_output_selectors_with_ceiling_and_reuse(
+        codex_home,
+        thread_id,
+        artifact_id,
+        selectors,
+        token_ceiling,
+    )
+    .await
+    .map(|(result, _)| result)
+}
+
+pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    selectors: Vec<ToolOutputSelector>,
+    token_ceiling: usize,
+) -> Result<(ReadToolOutputResult, bool), ReadToolOutputError> {
     let id = artifact_id
         .parse::<ToolOutputArtifactId>()
         .map_err(|_| ReadToolOutputError::InvalidArtifactId)?;
     if id.to_string() != artifact_id {
         return Err(ReadToolOutputError::InvalidArtifactId);
     }
+    let cache_key = deterministic_recovery_cache_key(
+        codex_home,
+        thread_id,
+        artifact_id,
+        &selectors,
+        token_ceiling,
+    );
+    if let Some(result) = deterministic_recovery_cache_get(&cache_key) {
+        return Ok((result, true));
+    }
     let path = codex_home
         .join("tool-output")
         .join(thread_id)
         .join(format!("{id}.log"));
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         open_regular_artifact(&path)?;
         let metadata = load_logical_metadata(&path, id)?;
         let mut response = ReadToolOutputResult {
@@ -2998,9 +3286,9 @@ pub(crate) async fn read_tool_output_selectors(
             results: Vec::with_capacity(selectors.len()),
         };
         for selector in selectors {
-            let selected = select_logical_artifact(&path, &metadata, selector);
+            let selected = select_logical_artifact(&path, &metadata, selector, token_ceiling);
             response.results.push(selected);
-            if response_fits_recovery_ceiling(&response) {
+            if response_fits_recovery_token_ceiling(&response, token_ceiling) {
                 continue;
             }
             let Some(selected) = response.results.last_mut() else {
@@ -3021,7 +3309,67 @@ pub(crate) async fn read_tool_output_selectors(
         Ok(response)
     })
     .await
-    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
+    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
+    if deterministic_recovery_result_is_reusable(&result) {
+        deterministic_recovery_cache_insert(cache_key, result.clone());
+    }
+    Ok((result, false))
+}
+
+fn deterministic_recovery_cache_key(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    selectors: &[ToolOutputSelector],
+    token_ceiling: usize,
+) -> String {
+    let identity = serde_json::json!({
+        "codex_home": codex_home.to_string_lossy(),
+        "thread_id": thread_id,
+        "artifact_id": artifact_id,
+        "selectors": selectors,
+        "token_ceiling": token_ceiling,
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).unwrap_or_default())
+    )
+}
+
+fn deterministic_recovery_cache_get(key: &str) -> Option<ReadToolOutputResult> {
+    DETERMINISTIC_RECOVERY_CACHE
+        .get_or_init(|| StdMutex::new(DeterministicRecoveryCache::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .get(key)
+        .cloned()
+}
+
+fn deterministic_recovery_cache_insert(key: String, result: ReadToolOutputResult) {
+    let mut cache = DETERMINISTIC_RECOVERY_CACHE
+        .get_or_init(|| StdMutex::new(DeterministicRecoveryCache::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.entries.insert(key.clone(), result).is_none() {
+        cache.insertion_order.push_back(key);
+    }
+    while cache.entries.len() > MAX_DETERMINISTIC_RECOVERY_CACHE_ENTRIES {
+        let Some(expired) = cache.insertion_order.pop_front() else {
+            break;
+        };
+        cache.entries.remove(&expired);
+    }
+}
+
+fn deterministic_recovery_result_is_reusable(result: &ReadToolOutputResult) -> bool {
+    result.complete
+        && result.unavailable_ranges.is_empty()
+        && result.results.iter().all(|selected| {
+            selected.status == ToolOutputSelectorStatus::Ok
+                && selected.complete
+                && selected.continuation.is_none()
+        })
 }
 
 #[cfg(test)]
@@ -3323,6 +3671,7 @@ async fn artifact_is_protected(artifact_path: &Path) -> std::io::Result<bool> {
     .map_err(std::io::Error::other)?
 }
 
+#[cfg(test)]
 fn note_logical_mutation_diagnostics(
     diagnostics: &mut RetentionDiagnostics,
     mutation: LogicalRetentionMutation,
@@ -3347,18 +3696,22 @@ fn note_completed_evidence_reconciliation(root: &Path, installed_mode: Retention
     let Some(state) = registry.roots.get_mut(root) else {
         return;
     };
-    note_logical_mutation_diagnostics(
-        &mut state.diagnostics,
-        LogicalRetentionMutation::EvidenceReconcile,
-    );
+    record_retention_diagnostics! {
+        note_logical_mutation_diagnostics(
+            &mut state.diagnostics,
+            LogicalRetentionMutation::EvidenceReconcile,
+        );
+    }
     if installed_mode != RetentionModeKind::Indexed
         && let RetentionRootMode::ScanOnly {
             operations_since_probe,
         } = &mut state.mode
     {
         *operations_since_probe = operations_since_probe.saturating_add(1);
-        state.diagnostics.scan_only_operations =
-            state.diagnostics.scan_only_operations.saturating_add(1);
+        record_retention_diagnostics! {
+            state.diagnostics.scan_only_operations =
+                state.diagnostics.scan_only_operations.saturating_add(1);
+        }
     }
 }
 
@@ -3381,7 +3734,11 @@ fn publish_known_record(
         transition_current_root_to_dirty(&mut registry, &token.root);
         return;
     }
-    note_logical_mutation_diagnostics(&mut state.diagnostics, mutation);
+    #[cfg(not(test))]
+    let _ = mutation;
+    record_retention_diagnostics! {
+        note_logical_mutation_diagnostics(&mut state.diagnostics, mutation);
+    }
     match disposition {
         RetentionDeltaDisposition::ApplyIndexed => {}
         RetentionDeltaDisposition::IgnoreScanOnly => return,
@@ -3434,10 +3791,14 @@ fn publish_known_remove(
         transition_current_root_to_dirty(&mut registry, &token.root);
         return;
     }
-    if eviction {
-        state.diagnostics.evictions = state.diagnostics.evictions.saturating_add(1);
-    } else {
-        note_logical_mutation_diagnostics(&mut state.diagnostics, mutation);
+    #[cfg(not(test))]
+    let _ = mutation;
+    record_retention_diagnostics! {
+        if eviction {
+            state.diagnostics.evictions = state.diagnostics.evictions.saturating_add(1);
+        } else {
+            note_logical_mutation_diagnostics(&mut state.diagnostics, mutation);
+        }
     }
     match disposition {
         RetentionDeltaDisposition::ApplyIndexed => {}
@@ -3486,13 +3847,15 @@ fn publish_streaming_size(
         transition_current_root_to_dirty(&mut registry, &token.root);
         return;
     }
-    state.diagnostics.streaming_size_updates =
-        state.diagnostics.streaming_size_updates.saturating_add(1);
-    if completed {
-        note_logical_mutation_diagnostics(
-            &mut state.diagnostics,
-            LogicalRetentionMutation::StreamComplete,
-        );
+    record_retention_diagnostics! {
+        state.diagnostics.streaming_size_updates =
+            state.diagnostics.streaming_size_updates.saturating_add(1);
+        if completed {
+            note_logical_mutation_diagnostics(
+                &mut state.diagnostics,
+                LogicalRetentionMutation::StreamComplete,
+            );
+        }
     }
     match disposition {
         RetentionDeltaDisposition::ApplyIndexed => {}
@@ -3543,7 +3906,12 @@ fn publish_streaming_abandonment(token: &RetentionIndexToken) {
         transition_current_root_to_dirty(&mut registry, &token.root);
         return;
     }
-    note_logical_mutation_diagnostics(&mut state.diagnostics, LogicalRetentionMutation::Cleanup);
+    record_retention_diagnostics! {
+        note_logical_mutation_diagnostics(
+            &mut state.diagnostics,
+            LogicalRetentionMutation::Cleanup,
+        );
+    }
     match disposition {
         RetentionDeltaDisposition::ApplyIndexed => {}
         RetentionDeltaDisposition::IgnoreScanOnly => return,
@@ -3568,8 +3936,7 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
     let (generation, capacity, was_scan_only) = {
         let mut registry = lock_retention_registry();
         if !registry.roots.contains_key(&root)
-            && insert_dirty_root(&mut registry, root.clone(), RetentionDiagnostics::default())
-                .is_none()
+            && insert_dirty_root(&mut registry, root.clone()).is_none()
         {
             return RetentionModeKind::Disabled;
         }
@@ -3585,8 +3952,11 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
         state.generation = generation;
         state.mode = RetentionRootMode::Reconciling { invalidated: false };
         state.last_access = access;
-        state.diagnostics.reconciliations = state.diagnostics.reconciliations.saturating_add(1);
-        state.diagnostics.scans = state.diagnostics.scans.saturating_add(1);
+        record_retention_diagnostics! {
+            state.diagnostics.reconciliations =
+                state.diagnostics.reconciliations.saturating_add(1);
+            state.diagnostics.scans = state.diagnostics.scans.saturating_add(1);
+        }
         let capacity = {
             #[cfg(test)]
             {
@@ -3601,22 +3971,28 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
         };
         (generation, capacity, was_scan_only)
     };
+    #[cfg(not(test))]
+    let _ = was_scan_only;
 
+    #[cfg(test)]
     let started = Instant::now();
     let scan = scan_retention_root(&root, capacity).await;
+    #[cfg(test)]
     let elapsed_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(&root) else {
-        let _ = insert_dirty_root(&mut registry, root, RetentionDiagnostics::default());
+        let _ = insert_dirty_root(&mut registry, root);
         return RetentionModeKind::Dirty;
     };
     if state.generation != generation {
         return root_mode_kind(&state.mode);
     }
-    state.diagnostics.scan_wall_nanos = state
-        .diagnostics
-        .scan_wall_nanos
-        .saturating_add(elapsed_nanos);
+    record_retention_diagnostics! {
+        state.diagnostics.scan_wall_nanos = state
+            .diagnostics
+            .scan_wall_nanos
+            .saturating_add(elapsed_nanos);
+    }
     let invalidated = matches!(
         state.mode,
         RetentionRootMode::Reconciling { invalidated: true }
@@ -3626,25 +4002,35 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
             state.generation = generation;
         }
         state.mode = RetentionRootMode::Dirty;
-        state.diagnostics.dirty_transitions = state.diagnostics.dirty_transitions.saturating_add(1);
+        record_retention_diagnostics! {
+            state.diagnostics.dirty_transitions =
+                state.diagnostics.dirty_transitions.saturating_add(1);
+        }
         return RetentionModeKind::Dirty;
     }
     match scan {
         Ok((candidate, directories, candidates)) => {
-            state.diagnostics.directories_visited = state
-                .diagnostics
-                .directories_visited
-                .saturating_add(directories);
-            state.diagnostics.candidates_visited = state
-                .diagnostics
-                .candidates_visited
-                .saturating_add(candidates);
+            record_retention_diagnostics! {
+                state.diagnostics.directories_visited = state
+                    .diagnostics
+                    .directories_visited
+                    .saturating_add(directories);
+                state.diagnostics.candidates_visited = state
+                    .diagnostics
+                    .candidates_visited
+                    .saturating_add(candidates);
+            }
+            #[cfg(not(test))]
+            let _ = (directories, candidates);
             match candidate {
                 RetentionScanCandidate::Indexed(index) => {
                     state.mode = RetentionRootMode::Indexed(index);
+                    #[cfg(test)]
                     if was_scan_only {
-                        state.diagnostics.scan_only_exits =
-                            state.diagnostics.scan_only_exits.saturating_add(1);
+                        record_retention_diagnostics! {
+                            state.diagnostics.scan_only_exits =
+                                state.diagnostics.scan_only_exits.saturating_add(1);
+                        }
                     }
                     RetentionModeKind::Indexed
                 }
@@ -3652,11 +4038,16 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
                     state.mode = RetentionRootMode::ScanOnly {
                         operations_since_probe: 0,
                     };
-                    state.diagnostics.oversized_root_fallbacks =
-                        state.diagnostics.oversized_root_fallbacks.saturating_add(1);
+                    record_retention_diagnostics! {
+                        state.diagnostics.oversized_root_fallbacks =
+                            state.diagnostics.oversized_root_fallbacks.saturating_add(1);
+                    }
+                    #[cfg(test)]
                     if !was_scan_only {
-                        state.diagnostics.scan_only_entries =
-                            state.diagnostics.scan_only_entries.saturating_add(1);
+                        record_retention_diagnostics! {
+                            state.diagnostics.scan_only_entries =
+                                state.diagnostics.scan_only_entries.saturating_add(1);
+                        }
                     }
                     RetentionModeKind::ScanOnly
                 }
@@ -3664,8 +4055,10 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
         }
         Err(_) => {
             state.mode = RetentionRootMode::Dirty;
-            state.diagnostics.dirty_transitions =
-                state.diagnostics.dirty_transitions.saturating_add(1);
+            record_retention_diagnostics! {
+                state.diagnostics.dirty_transitions =
+                    state.diagnostics.dirty_transitions.saturating_add(1);
+            }
             RetentionModeKind::Dirty
         }
     }
@@ -3703,8 +4096,10 @@ async fn prepare_retention_mode(root: &Path, force_reconciliation: bool) -> Rete
                         RetentionModeKind::Dirty
                     } else {
                         *operations_since_probe = operations_since_probe.saturating_add(1);
-                        state.diagnostics.scan_only_operations =
-                            state.diagnostics.scan_only_operations.saturating_add(1);
+                        record_retention_diagnostics! {
+                            state.diagnostics.scan_only_operations =
+                                state.diagnostics.scan_only_operations.saturating_add(1);
+                        }
                         RetentionModeKind::ScanOnly
                     }
                 }
@@ -3719,7 +4114,9 @@ async fn prepare_retention_mode(root: &Path, force_reconciliation: bool) -> Rete
     let reconciled = reconcile_retention_root(&root).await;
     if reconciled != RetentionModeKind::Indexed {
         if reconciled == RetentionModeKind::ScanOnly {
+            #[cfg(test)]
             let mut registry = lock_retention_registry();
+            #[cfg(test)]
             if let Some(state) = registry.roots.get_mut(&root) {
                 state.diagnostics.scan_only_operations =
                     state.diagnostics.scan_only_operations.saturating_add(1);
@@ -3733,11 +4130,7 @@ async fn prepare_retention_mode(root: &Path, force_reconciliation: bool) -> Rete
 fn invalidate_root_after_ambiguous_failure(root: &Path) {
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(root) else {
-        let _ = insert_dirty_root(
-            &mut registry,
-            root.to_path_buf(),
-            RetentionDiagnostics::default(),
-        );
+        let _ = insert_dirty_root(&mut registry, root.to_path_buf());
         return;
     };
     match &mut state.mode {
@@ -3752,8 +4145,10 @@ fn invalidate_root_after_ambiguous_failure(root: &Path) {
             if let Some(generation) = next_index_generation() {
                 state.generation = generation;
                 state.mode = RetentionRootMode::Dirty;
-                state.diagnostics.dirty_transitions =
-                    state.diagnostics.dirty_transitions.saturating_add(1);
+                record_retention_diagnostics! {
+                    state.diagnostics.dirty_transitions =
+                        state.diagnostics.dirty_transitions.saturating_add(1);
+                }
             }
         }
     }
@@ -3997,18 +4392,23 @@ async fn run_scan_only_retention(
     reserved_bytes: u64,
     reserved_artifacts: usize,
 ) {
+    #[cfg(test)]
     let started = Instant::now();
     let thread_scan =
         enforce_retention_scan_locked(directory, keep_path, reserved_bytes, reserved_artifacts)
             .await;
+    #[cfg_attr(not(test), allow(unused_variables))]
     let global_scan = if thread_scan.complete {
         enforce_global_retention_scan_locked(root, keep_path, reserved_bytes, reserved_artifacts)
             .await
     } else {
         RetentionScanProgress::default()
     };
+    #[cfg(test)]
     let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    #[cfg(test)]
     let mut registry = lock_retention_registry();
+    #[cfg(test)]
     if let Some(state) = registry.roots.get_mut(root) {
         state.diagnostics.scans = state.diagnostics.scans.saturating_add(1);
         state.diagnostics.scan_wall_nanos =

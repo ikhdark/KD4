@@ -50,6 +50,8 @@ pub const SOURCE_READ_MAX_LINES: usize = 400;
 pub const SOURCE_READ_MAX_BYTES: usize = 512 * 1024;
 const SOURCE_SEARCH_HYDRATION_MAX_BYTES: usize = 5 * 1024;
 const SOURCE_SEARCH_HYDRATION_LINES: usize = 120;
+const SOURCE_SEARCH_HYDRATION_MAX_SPANS: usize = 8;
+const SOURCE_SEARCH_HYDRATION_PACKET_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy)]
 struct SourceWalkLimits {
@@ -469,6 +471,8 @@ pub struct SourceSearchOutput {
     pub hydration_status: SourceSearchHydrationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hydrated_span: Option<SourceSearchHydratedSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_packet: Option<SourceSearchHydrationPacket>,
     #[serde(skip)]
     pub diagnostics: SourceSearchDiagnostics,
 }
@@ -485,6 +489,7 @@ impl PartialEq for SourceSearchOutput {
             && self.matches == other.matches
             && self.hydration_status == other.hydration_status
             && self.hydrated_span == other.hydrated_span
+            && self.hydration_packet == other.hydration_packet
     }
 }
 
@@ -497,7 +502,10 @@ pub enum SourceSearchHydrationStatus {
     HydratedAuthoritativeDefinition,
     HydratedStructuredContext,
     HydratedDeterministicWindow,
+    HydratedBoundedPacket,
+    PartiallyHydratedBoundedPacket,
     SkippedCoverageIncomplete,
+    SkippedIndexIncomplete,
     SkippedNoUniqueMatch,
     SkippedObservationUnavailable,
 }
@@ -506,6 +514,57 @@ pub enum SourceSearchHydrationStatus {
 pub struct SourceSearchHydratedSpan {
     pub content_hash: String,
     pub observation: ReadFileSpanOutput,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SourceSearchHydrationPacket {
+    pub schema_version: u32,
+    pub observation_set_id: String,
+    pub exact_content_byte_limit: usize,
+    pub exact_content_bytes: usize,
+    pub spans: Vec<SourceSearchHydrationPacketSpan>,
+    pub issues: Vec<SourceSearchHydrationIssue>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SourceSearchHydrationPacketSpan {
+    pub id: String,
+    pub match_ids: Vec<String>,
+    pub path: String,
+    pub requested_start_line: usize,
+    pub requested_end_line: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub file_content_hash: String,
+    pub span_content_hash: String,
+    pub selection: SourceSearchHydrationSelection,
+    pub truncated: bool,
+    pub exact_content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSearchHydrationSelection {
+    AuthoritativeDefinition,
+    StructuredContext,
+    DeterministicWindow,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SourceSearchHydrationIssue {
+    pub match_id: String,
+    pub reason: SourceSearchHydrationIssueReason,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSearchHydrationIssueReason {
+    AmbiguousAuthoritativeCandidate,
+    AmbiguousStructuredCandidate,
+    ByteCap,
+    SpanCap,
+    ObservationUnavailable,
+    OversizedMatchedLine,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -826,6 +885,98 @@ pub fn read_file_span_from_bytes(
     })
 }
 
+/// Retains only the requested absolute line intervals in an exact read result.
+///
+/// Coverage consumers use this after discovering that some of a read is
+/// already present in the current turn. Rebuilding the exact payload and its
+/// chunks here keeps the rendered lines, canonical artifact, and projection
+/// ranges on the same evidence boundary.
+pub fn retain_read_file_span_intervals(
+    output: &mut ReadFileSpanOutput,
+    intervals: &[(usize, usize)],
+) {
+    let Some(first_source_line) = output.chunks.first().map(|chunk| chunk.start_line) else {
+        output.lines.clear();
+        output.start_line = None;
+        output.end_line = None;
+        output.bytes_returned = 0;
+        output.requested_bytes = 0;
+        output.exact_content.clear();
+        output.requested_content_sha256 = format!("{:x}", Sha256::digest([]));
+        output.chunks.clear();
+        return;
+    };
+    let source_ranges = exact_line_ranges(&output.exact_content);
+    let mut retained = intervals
+        .iter()
+        .filter_map(|(start_line, end_line)| {
+            let start_line = (*start_line).max(first_source_line);
+            let last_source_line =
+                first_source_line.saturating_add(source_ranges.len().saturating_sub(1));
+            let end_line = (*end_line).min(last_source_line);
+            (start_line <= end_line).then_some((start_line, end_line))
+        })
+        .collect::<Vec<_>>();
+    retained.sort_unstable();
+    let mut merged = Vec::<(usize, usize)>::with_capacity(retained.len());
+    for (start_line, end_line) in retained {
+        if let Some((_, prior_end)) = merged.last_mut()
+            && start_line <= prior_end.saturating_add(1)
+        {
+            *prior_end = (*prior_end).max(end_line);
+        } else {
+            merged.push((start_line, end_line));
+        }
+    }
+
+    let mut exact_content = String::new();
+    let mut retained_segments = Vec::new();
+    for (start_line, end_line) in &merged {
+        let start_index = start_line.saturating_sub(first_source_line);
+        let end_index = end_line.saturating_sub(first_source_line).saturating_add(1);
+        let Some((byte_start, _)) = source_ranges.get(start_index).copied() else {
+            continue;
+        };
+        let Some((_, byte_end)) = end_index
+            .checked_sub(1)
+            .and_then(|index| source_ranges.get(index))
+            .copied()
+        else {
+            continue;
+        };
+        let artifact_start = exact_content.len();
+        exact_content.push_str(&output.exact_content[byte_start..byte_end]);
+        retained_segments.push((*start_line, *end_line, artifact_start, exact_content.len()));
+    }
+
+    output.lines.retain(|line| {
+        merged.iter().any(|(start_line, end_line)| {
+            line.line_number >= *start_line && line.line_number <= *end_line
+        })
+    });
+    output.start_line = output.lines.first().map(|line| line.line_number);
+    output.end_line = output.lines.last().map(|line| line.line_number);
+    output.bytes_returned = output.lines.iter().map(|line| line.text.len()).sum();
+    output.requested_bytes = exact_content.len();
+    output.requested_content_sha256 = format!("{:x}", Sha256::digest(exact_content.as_bytes()));
+    output.chunks = retained_segments
+        .into_iter()
+        .flat_map(|(start_line, _end_line, byte_start, byte_end)| {
+            let segment_ranges = exact_line_ranges(&exact_content[byte_start..byte_end])
+                .into_iter()
+                .map(|(start, end)| (start + byte_start, end + byte_start))
+                .collect::<Vec<_>>();
+            source_read_chunks(
+                &segment_ranges,
+                start_line.saturating_sub(1),
+                0,
+                &output.requested_content_sha256,
+            )
+        })
+        .collect();
+    output.exact_content = exact_content;
+}
+
 fn exact_line_ranges(text: &str) -> Vec<(usize, usize)> {
     let mut cursor = 0_usize;
     text.split_inclusive('\n')
@@ -900,6 +1051,7 @@ pub struct SourceSearchAccumulator {
     unscoped: bool,
     hydrate_selected_span: bool,
     hydration_candidates: Vec<SourceSearchHydrationCandidate>,
+    hydration_observations: HashMap<String, CapturedHydrationObservation>,
     unique_observation: Option<UniqueSearchObservation>,
     started_at: Instant,
     traversal_duration: Duration,
@@ -939,6 +1091,7 @@ impl SourceSearchAccumulator {
             unscoped: options.roots.is_empty(),
             hydrate_selected_span: options.hydrate_selected_span,
             hydration_candidates: options.hydration_candidates.clone(),
+            hydration_observations: HashMap::new(),
             unique_observation: None,
             started_at: Instant::now(),
             traversal_duration: Duration::ZERO,
@@ -1002,6 +1155,7 @@ impl SourceSearchAccumulator {
             return;
         };
         let matches_before = self.state.total_matches;
+        let returned_matches_before = self.state.matches.len();
         collect_matches(
             relative_path,
             &text,
@@ -1014,6 +1168,19 @@ impl SourceSearchAccumulator {
             },
             &mut self.state,
         );
+        for matched in self.state.matches[returned_matches_before..]
+            .iter()
+            .cloned()
+        {
+            let observation = capture_hydration_observation(
+                &matched,
+                &text,
+                &content_hash,
+                &self.hydration_candidates,
+            );
+            self.hydration_observations
+                .insert(matched.id.clone(), observation);
+        }
         if self.state.total_matches == 1 && self.state.total_matches > matches_before {
             self.unique_observation = Some(UniqueSearchObservation {
                 path: relative_path.to_path_buf(),
@@ -1082,6 +1249,7 @@ impl SourceSearchAccumulator {
             left.path
                 .cmp(&right.path)
                 .then_with(|| left.line_number.cmp(&right.line_number))
+                .then_with(|| left.id.cmp(&right.id))
         });
         let coverage_limit = self.state.coverage_limit;
         let mut result_limit = self.state.result_limit;
@@ -1119,13 +1287,15 @@ impl SourceSearchAccumulator {
             matches: self.state.matches,
             hydration_status: SourceSearchHydrationStatus::SkippedNoUniqueMatch,
             hydrated_span: None,
+            hydration_packet: None,
             diagnostics: SourceSearchDiagnostics::default(),
         };
         update_search_output_status(&mut output, coverage_limit, result_limit, self.unscoped);
-        apply_unique_search_hydration(
+        apply_search_hydration(
             &mut output,
             self.hydrate_selected_span,
             self.unique_observation.take(),
+            &self.hydration_observations,
             &self.hydration_candidates,
         );
         let result_cap_reached = result_limit == Some(SourceTruncatedReason::MaxMatches);
@@ -1163,6 +1333,9 @@ impl SourceSearchAccumulator {
             result_limit.get_or_insert(SourceTruncatedReason::MaxResultBytes);
             update_search_output_status(&mut output, coverage_limit, result_limit, self.unscoped);
         }
+        if identity_cap_reached && output.hydration_packet.take().is_some() {
+            output.hydration_status = SourceSearchHydrationStatus::SkippedIndexIncomplete;
+        }
         output.coverage.result_cap_reached = result_cap_reached || identity_cap_reached;
         output.coverage.index_complete =
             output.coverage_complete && !result_cap_reached && !identity_cap_reached;
@@ -1198,6 +1371,475 @@ struct UniqueSearchObservation {
     path: PathBuf,
     bytes: Vec<u8>,
     content_hash: String,
+}
+
+#[derive(Clone)]
+enum CapturedHydrationObservation {
+    Span(CapturedHydrationSpan),
+    Issue(SourceSearchHydrationIssueReason),
+}
+
+#[derive(Clone)]
+struct CapturedHydrationSpan {
+    match_ids: Vec<String>,
+    match_lines: Vec<usize>,
+    path: String,
+    requested_start_line: usize,
+    requested_end_line: usize,
+    start_line: usize,
+    end_line: usize,
+    file_content_hash: String,
+    selection: SourceSearchHydrationSelection,
+    truncated: bool,
+    exact_content: String,
+}
+
+fn apply_search_hydration(
+    output: &mut SourceSearchOutput,
+    enabled: bool,
+    unique_observation: Option<UniqueSearchObservation>,
+    observations: &HashMap<String, CapturedHydrationObservation>,
+    candidates: &[SourceSearchHydrationCandidate],
+) {
+    if !enabled {
+        output.hydration_status = SourceSearchHydrationStatus::Disabled;
+        return;
+    }
+    if !output.coverage_complete {
+        output.hydration_status = SourceSearchHydrationStatus::SkippedCoverageIncomplete;
+        return;
+    }
+    match output.coverage.total_matches {
+        0 => {
+            output.hydration_status = SourceSearchHydrationStatus::SkippedNoUniqueMatch;
+        }
+        1 => apply_unique_search_hydration(
+            output,
+            /* enabled */ true,
+            unique_observation,
+            candidates,
+        ),
+        _ if !output.coverage.index_complete => {
+            output.hydration_status = SourceSearchHydrationStatus::SkippedIndexIncomplete;
+        }
+        _ => apply_bounded_search_hydration_packet(output, observations),
+    }
+}
+
+fn capture_hydration_observation(
+    matched: &SourceSearchMatch,
+    text: &str,
+    content_hash: &str,
+    candidates: &[SourceSearchHydrationCandidate],
+) -> CapturedHydrationObservation {
+    let selected = select_hydration_candidate(matched, candidates);
+    let (requested_start_line, requested_end_line, selection) = match selected {
+        Ok(Some(candidate)) => (
+            candidate.start_line,
+            candidate.end_line,
+            match candidate.kind {
+                SourceSearchHydrationCandidateKind::AuthoritativeDefinition => {
+                    SourceSearchHydrationSelection::AuthoritativeDefinition
+                }
+                SourceSearchHydrationCandidateKind::StructuredContext => {
+                    SourceSearchHydrationSelection::StructuredContext
+                }
+            },
+        ),
+        Ok(None) => {
+            let start_line = matched.line_number.saturating_sub(20).max(1);
+            (
+                start_line,
+                start_line.saturating_add(SOURCE_SEARCH_HYDRATION_LINES.saturating_sub(1)),
+                SourceSearchHydrationSelection::DeterministicWindow,
+            )
+        }
+        Err(reason) => return CapturedHydrationObservation::Issue(reason),
+    };
+    capture_exact_hydration_span(
+        matched,
+        text,
+        content_hash,
+        requested_start_line,
+        requested_end_line,
+        selection,
+    )
+    .map_or_else(
+        CapturedHydrationObservation::Issue,
+        CapturedHydrationObservation::Span,
+    )
+}
+
+fn select_hydration_candidate<'a>(
+    matched: &SourceSearchMatch,
+    candidates: &'a [SourceSearchHydrationCandidate],
+) -> Result<Option<&'a SourceSearchHydrationCandidate>, SourceSearchHydrationIssueReason> {
+    for (kind, ambiguity) in [
+        (
+            SourceSearchHydrationCandidateKind::AuthoritativeDefinition,
+            SourceSearchHydrationIssueReason::AmbiguousAuthoritativeCandidate,
+        ),
+        (
+            SourceSearchHydrationCandidateKind::StructuredContext,
+            SourceSearchHydrationIssueReason::AmbiguousStructuredCandidate,
+        ),
+    ] {
+        let mut covering = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == kind
+                    && candidate.path.replace('\\', "/") == matched.path
+                    && candidate.start_line > 0
+                    && candidate.end_line >= candidate.start_line
+                    && candidate.start_line <= matched.line_number
+                    && candidate.end_line >= matched.line_number
+            })
+            .collect::<Vec<_>>();
+        covering.sort_by_key(|candidate| (candidate.start_line, candidate.end_line));
+        covering.dedup_by_key(|candidate| (candidate.start_line, candidate.end_line));
+        match covering.as_slice() {
+            [] => {}
+            [candidate] => return Ok(Some(*candidate)),
+            _ => return Err(ambiguity),
+        }
+    }
+    Ok(None)
+}
+
+fn capture_exact_hydration_span(
+    matched: &SourceSearchMatch,
+    text: &str,
+    content_hash: &str,
+    requested_start_line: usize,
+    requested_end_line: usize,
+    selection: SourceSearchHydrationSelection,
+) -> Result<CapturedHydrationSpan, SourceSearchHydrationIssueReason> {
+    let line_ranges = exact_line_ranges(text);
+    let matched_index = matched.line_number.saturating_sub(1);
+    let requested_start_index = requested_start_line.saturating_sub(1);
+    let requested_end_index = requested_end_line.min(line_ranges.len());
+    if matched_index >= line_ranges.len()
+        || matched_index < requested_start_index
+        || matched_index >= requested_end_index
+    {
+        return Err(SourceSearchHydrationIssueReason::ObservationUnavailable);
+    }
+    let matched_range = line_ranges[matched_index];
+    if matched_range.1.saturating_sub(matched_range.0) > SOURCE_SEARCH_HYDRATION_MAX_BYTES {
+        return Err(SourceSearchHydrationIssueReason::OversizedMatchedLine);
+    }
+
+    let mut start_index = matched_index;
+    let mut end_index = matched_index + 1;
+    let mut left_open = start_index > requested_start_index;
+    let mut right_open = end_index < requested_end_index;
+    while left_open || right_open {
+        let mut expanded = false;
+        if left_open {
+            let candidate_start = start_index - 1;
+            let bytes = line_ranges[end_index - 1]
+                .1
+                .saturating_sub(line_ranges[candidate_start].0);
+            if bytes <= SOURCE_SEARCH_HYDRATION_MAX_BYTES {
+                start_index = candidate_start;
+                expanded = true;
+                left_open = start_index > requested_start_index;
+            } else {
+                left_open = false;
+            }
+        }
+        if right_open {
+            let candidate_end = end_index + 1;
+            let bytes = line_ranges[candidate_end - 1]
+                .1
+                .saturating_sub(line_ranges[start_index].0);
+            if bytes <= SOURCE_SEARCH_HYDRATION_MAX_BYTES {
+                end_index = candidate_end;
+                expanded = true;
+                right_open = end_index < requested_end_index;
+            } else {
+                right_open = false;
+            }
+        }
+        if !expanded {
+            break;
+        }
+    }
+
+    let byte_start = line_ranges[start_index].0;
+    let byte_end = line_ranges[end_index - 1].1;
+    Ok(CapturedHydrationSpan {
+        match_ids: vec![matched.id.clone()],
+        match_lines: vec![matched.line_number],
+        path: matched.path.clone(),
+        requested_start_line,
+        requested_end_line,
+        start_line: start_index + 1,
+        end_line: end_index,
+        file_content_hash: content_hash.to_string(),
+        selection,
+        truncated: start_index != requested_start_index
+            || end_index != requested_end_index
+            || requested_end_line > line_ranges.len(),
+        exact_content: text[byte_start..byte_end].to_string(),
+    })
+}
+
+fn apply_bounded_search_hydration_packet(
+    output: &mut SourceSearchOutput,
+    observations: &HashMap<String, CapturedHydrationObservation>,
+) {
+    let mut grouped = Vec::<CapturedHydrationSpan>::new();
+    let mut issues = Vec::new();
+    for matched in &output.matches {
+        match observations.get(&matched.id) {
+            Some(CapturedHydrationObservation::Span(captured)) => {
+                if let Some(existing) = grouped.iter_mut().find(|existing| {
+                    existing.path == captured.path
+                        && existing.file_content_hash == captured.file_content_hash
+                        && existing.start_line == captured.start_line
+                        && existing.end_line == captured.end_line
+                        && existing.exact_content == captured.exact_content
+                }) {
+                    existing
+                        .match_ids
+                        .extend(captured.match_ids.iter().cloned());
+                    existing
+                        .match_lines
+                        .extend(captured.match_lines.iter().copied());
+                    existing.match_ids.sort();
+                    existing.match_ids.dedup();
+                    existing.match_lines.sort_unstable();
+                    existing.match_lines.dedup();
+                    existing.selection = existing.selection.min(captured.selection);
+                    existing.requested_start_line = existing
+                        .requested_start_line
+                        .min(captured.requested_start_line);
+                    existing.requested_end_line =
+                        existing.requested_end_line.max(captured.requested_end_line);
+                    existing.truncated |= captured.truncated;
+                } else {
+                    grouped.push(captured.clone());
+                }
+            }
+            Some(CapturedHydrationObservation::Issue(reason)) => {
+                issues.push(SourceSearchHydrationIssue {
+                    match_id: matched.id.clone(),
+                    reason: *reason,
+                });
+            }
+            None => issues.push(SourceSearchHydrationIssue {
+                match_id: matched.id.clone(),
+                reason: SourceSearchHydrationIssueReason::ObservationUnavailable,
+            }),
+        }
+    }
+    grouped.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| {
+                left.match_lines
+                    .iter()
+                    .min()
+                    .cmp(&right.match_lines.iter().min())
+            })
+            .then_with(|| {
+                left.match_ids
+                    .iter()
+                    .min()
+                    .cmp(&right.match_ids.iter().min())
+            })
+    });
+
+    let mut spans = Vec::new();
+    let mut exact_content_bytes = 0usize;
+    for captured in grouped {
+        if spans.len() >= SOURCE_SEARCH_HYDRATION_MAX_SPANS {
+            push_hydration_issues(
+                &mut issues,
+                &captured.match_ids,
+                SourceSearchHydrationIssueReason::SpanCap,
+            );
+            continue;
+        }
+        let remaining = SOURCE_SEARCH_HYDRATION_MAX_BYTES.saturating_sub(exact_content_bytes);
+        let captured_match_ids = captured.match_ids.clone();
+        let Some(captured) = fit_captured_hydration_span(captured, remaining) else {
+            push_hydration_issues(
+                &mut issues,
+                &captured_match_ids,
+                SourceSearchHydrationIssueReason::ByteCap,
+            );
+            continue;
+        };
+        exact_content_bytes = exact_content_bytes.saturating_add(captured.exact_content.len());
+        spans.push(finalize_hydration_packet_span(captured));
+    }
+
+    issues.sort_by_key(|issue| {
+        output
+            .matches
+            .iter()
+            .position(|matched| matched.id == issue.match_id)
+            .unwrap_or(usize::MAX)
+    });
+    let observation_set_id = hydration_observation_set_id(output, &spans, &issues);
+    output.hydration_status = if issues.is_empty() {
+        SourceSearchHydrationStatus::HydratedBoundedPacket
+    } else {
+        SourceSearchHydrationStatus::PartiallyHydratedBoundedPacket
+    };
+    output.hydration_packet = Some(SourceSearchHydrationPacket {
+        schema_version: SOURCE_SEARCH_HYDRATION_PACKET_SCHEMA_VERSION,
+        observation_set_id,
+        exact_content_byte_limit: SOURCE_SEARCH_HYDRATION_MAX_BYTES,
+        exact_content_bytes,
+        spans,
+        issues,
+    });
+}
+
+fn push_hydration_issues(
+    issues: &mut Vec<SourceSearchHydrationIssue>,
+    match_ids: &[String],
+    reason: SourceSearchHydrationIssueReason,
+) {
+    issues.extend(
+        match_ids
+            .iter()
+            .cloned()
+            .map(|match_id| SourceSearchHydrationIssue { match_id, reason }),
+    );
+}
+
+fn fit_captured_hydration_span(
+    mut captured: CapturedHydrationSpan,
+    byte_limit: usize,
+) -> Option<CapturedHydrationSpan> {
+    if captured.exact_content.len() <= byte_limit {
+        return Some(captured);
+    }
+    let line_ranges = exact_line_ranges(&captured.exact_content);
+    let first_match_line = *captured.match_lines.iter().min()?;
+    let last_match_line = *captured.match_lines.iter().max()?;
+    let required_start = first_match_line.checked_sub(captured.start_line)?;
+    let required_end = last_match_line
+        .checked_sub(captured.start_line)?
+        .checked_add(1)?;
+    if required_start >= line_ranges.len() || required_end > line_ranges.len() {
+        return None;
+    }
+    let required_bytes = line_ranges[required_end - 1]
+        .1
+        .saturating_sub(line_ranges[required_start].0);
+    if required_bytes > byte_limit {
+        return None;
+    }
+
+    let mut start = required_start;
+    let mut end = required_end;
+    let mut left_open = start > 0;
+    let mut right_open = end < line_ranges.len();
+    while left_open || right_open {
+        let mut expanded = false;
+        if left_open {
+            let candidate_start = start - 1;
+            let bytes = line_ranges[end - 1]
+                .1
+                .saturating_sub(line_ranges[candidate_start].0);
+            if bytes <= byte_limit {
+                start = candidate_start;
+                expanded = true;
+                left_open = start > 0;
+            } else {
+                left_open = false;
+            }
+        }
+        if right_open {
+            let candidate_end = end + 1;
+            let bytes = line_ranges[candidate_end - 1]
+                .1
+                .saturating_sub(line_ranges[start].0);
+            if bytes <= byte_limit {
+                end = candidate_end;
+                expanded = true;
+                right_open = end < line_ranges.len();
+            } else {
+                right_open = false;
+            }
+        }
+        if !expanded {
+            break;
+        }
+    }
+    let original_start_line = captured.start_line;
+    let byte_start = line_ranges[start].0;
+    let byte_end = line_ranges[end - 1].1;
+    captured.start_line = original_start_line + start;
+    captured.end_line = original_start_line + end - 1;
+    captured.exact_content = captured.exact_content[byte_start..byte_end].to_string();
+    captured.truncated = true;
+    Some(captured)
+}
+
+fn finalize_hydration_packet_span(
+    captured: CapturedHydrationSpan,
+) -> SourceSearchHydrationPacketSpan {
+    let span_content_hash = format!("{:x}", Sha256::digest(captured.exact_content.as_bytes()));
+    let id_hash = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}\0{}\0{}\0{}\0{}",
+                captured.path,
+                captured.file_content_hash,
+                captured.start_line,
+                captured.end_line,
+                span_content_hash,
+            )
+            .as_bytes(),
+        )
+    );
+    SourceSearchHydrationPacketSpan {
+        id: format!("source-hydration:{}", &id_hash[..16]),
+        match_ids: captured.match_ids,
+        path: captured.path,
+        requested_start_line: captured.requested_start_line,
+        requested_end_line: captured.requested_end_line,
+        start_line: captured.start_line,
+        end_line: captured.end_line,
+        file_content_hash: captured.file_content_hash,
+        span_content_hash,
+        selection: captured.selection,
+        truncated: captured.truncated,
+        exact_content: captured.exact_content,
+    }
+}
+
+fn hydration_observation_set_id(
+    output: &SourceSearchOutput,
+    spans: &[SourceSearchHydrationPacketSpan],
+    issues: &[SourceSearchHydrationIssue],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"source_search_hydration_packet_v1");
+    hasher.update(output.query.as_bytes());
+    for root in &output.roots {
+        hasher.update([0]);
+        hasher.update(root.as_bytes());
+    }
+    for matched in &output.matches {
+        hasher.update([1]);
+        hasher.update(matched.id.as_bytes());
+        hasher.update(matched.path.as_bytes());
+        hasher.update(matched.source_revision.as_bytes());
+        hasher.update(matched.line_number.to_le_bytes());
+    }
+    hasher.update([2]);
+    hasher.update(serde_json::to_vec(spans).unwrap_or_default());
+    hasher.update([3]);
+    hasher.update(serde_json::to_vec(issues).unwrap_or_default());
+    format!("{:x}", hasher.finalize())
 }
 
 fn apply_unique_search_hydration(

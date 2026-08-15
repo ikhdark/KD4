@@ -1,4 +1,5 @@
 use chrono::Utc;
+use codex_agent_task_store::StoreError;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
 use codex_agent_task_store::WorkspaceActorKind;
@@ -24,6 +25,7 @@ use crate::agent::task_capabilities::is_independent_review_source;
 use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::exec::ExecExpiration;
 use crate::exec::ExecParams;
+use crate::exec::cancel_when_either;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
 use crate::session::turn_context::TurnContext;
@@ -48,8 +50,8 @@ use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::known_delta_store;
+use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::orchestrator::ToolOrchestrator;
-use crate::tools::runtimes::shell::KnownDeltaShellRequest;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
@@ -68,6 +70,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolOutputProjectionFragment;
 use codex_tools::ToolOutputProjectionFragmentKind;
 use codex_tools::ToolOutputProjectionMetadata;
+use codex_tools::ToolOutputProjectionRange;
 use codex_utils_path_uri::PathUri;
 
 mod shell_command;
@@ -182,8 +185,60 @@ pub(super) struct RunExecLikeArgs {
 pub(super) struct RunExecLikeResult {
     pub(super) output: FunctionToolOutput,
     pub(super) exit_code: Option<i32>,
-    pub(super) validation_reuse_success: Option<bool>,
+    pub(super) validation_execution_outcome: ValidationExecutionOutcome,
     pub(super) canonical_output: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ValidationExecutionOutcome {
+    ExecutedSuccess,
+    ExecutedFailure,
+    NotExecuted,
+}
+
+impl ValidationExecutionOutcome {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutedSuccess => "executed_success",
+            Self::ExecutedFailure => "executed_failure",
+            Self::NotExecuted => "not_executed",
+        }
+    }
+
+    pub(super) fn success(self) -> Option<bool> {
+        match self {
+            Self::ExecutedSuccess => Some(true),
+            Self::ExecutedFailure => Some(false),
+            Self::NotExecuted => None,
+        }
+    }
+
+    pub(super) fn from_value(value: &serde_json::Value) -> Option<Self> {
+        match value.get("execution_outcome")?.as_str()? {
+            "executed_success" => Some(Self::ExecutedSuccess),
+            "executed_failure" => Some(Self::ExecutedFailure),
+            "not_executed" => Some(Self::NotExecuted),
+            _ => None,
+        }
+    }
+
+    pub(super) fn from_value_or_legacy_success(value: &serde_json::Value) -> Self {
+        Self::from_value(value).unwrap_or_else(|| {
+            if value.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+                Self::ExecutedFailure
+            } else {
+                Self::ExecutedSuccess
+            }
+        })
+    }
+
+    pub(super) fn tool_outcome(self) -> codex_tools::ToolOutputOutcome {
+        match self {
+            Self::ExecutedSuccess => codex_tools::ToolOutputOutcome::Success,
+            Self::ExecutedFailure => codex_tools::ToolOutputOutcome::Failure,
+            Self::NotExecuted => codex_tools::ToolOutputOutcome::Skipped,
+        }
+    }
 }
 
 pub(super) struct LegacyShellToolOutput {
@@ -191,6 +246,7 @@ pub(super) struct LegacyShellToolOutput {
     pub(super) canonical_output: Option<Vec<u8>>,
     pub(super) exit_code: Option<i32>,
     pub(super) call_id: String,
+    pub(super) validation_failure: bool,
 }
 
 impl ToolOutput for LegacyShellToolOutput {
@@ -199,11 +255,27 @@ impl ToolOutput for LegacyShellToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        self.inner.success_for_logging()
+        self.outcome_for_logging() == codex_tools::ToolOutputOutcome::Success
     }
 
     fn outcome_for_logging(&self) -> codex_tools::ToolOutputOutcome {
-        self.inner.outcome_for_logging()
+        let outcome = self.inner.outcome_for_logging();
+        if outcome != codex_tools::ToolOutputOutcome::Success {
+            outcome
+        } else if self.exit_code.is_some_and(|code| code != 0) {
+            codex_tools::ToolOutputOutcome::Failure
+        } else {
+            codex_tools::ToolOutputOutcome::Success
+        }
+    }
+
+    fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
+        let inner = self.inner.outcome_context();
+        if inner.outcome != codex_tools::ToolOutputOutcome::Success {
+            inner
+        } else {
+            codex_tools::ToolOutputOutcomeContext::new(self.outcome_for_logging())
+        }
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
@@ -234,6 +306,26 @@ impl ToolOutput for LegacyShellToolOutput {
         );
         metadata.essential_inline["exit_code"] = serde_json::json!(self.exit_code);
         metadata.essential_inline["call_id"] = serde_json::json!(&self.call_id);
+        if self.validation_failure
+            && let Some(canonical_output) = self.canonical_output.as_deref()
+            && let Ok(diagnostics) = std::str::from_utf8(canonical_output)
+            && !diagnostics.is_empty()
+        {
+            const VALIDATION_DIAGNOSTICS_ID: &str = "validation:diagnostics";
+            metadata.fragments.insert(
+                1,
+                ToolOutputProjectionFragment::new(
+                    ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary,
+                    diagnostics,
+                )
+                .with_id(VALIDATION_DIAGNOSTICS_ID),
+            );
+            if let Some(range) =
+                validation_diagnostic_range(VALIDATION_DIAGNOSTICS_ID, canonical_output)
+            {
+                metadata.predetermined_ranges.push(range);
+            }
+        }
         Some(metadata)
     }
 
@@ -265,6 +357,42 @@ struct OwnedOperationLease {
     hard_deadline: chrono::DateTime<Utc>,
     progress_revision: u64,
     terminal: bool,
+}
+
+struct ShellOperationTimeout {
+    cancellation: CancellationToken,
+    _timer: Option<AbortOnDropHandle<()>>,
+}
+
+impl ShellOperationTimeout {
+    fn new(timeout_ms: Option<u64>) -> Self {
+        let cancellation = CancellationToken::new();
+        let timer = timeout_ms.map(|timeout_ms| {
+            let cancellation = cancellation.clone();
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+                cancellation.cancel();
+            }))
+        });
+        Self {
+            cancellation,
+            _timer: timer,
+        }
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    fn timed_out(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
+
+impl Drop for ShellOperationTimeout {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 impl OwnedOperationLease {
@@ -305,9 +433,8 @@ impl Drop for OwnedOperationLease {
 }
 
 impl RunExecLikeResult {
-    pub(super) fn validation_reuse_succeeded(&self) -> bool {
-        self.validation_reuse_success
-            .unwrap_or(self.exit_code == Some(0))
+    pub(super) fn validation_execution_outcome(&self) -> ValidationExecutionOutcome {
+        self.validation_execution_outcome
     }
 }
 
@@ -315,12 +442,39 @@ pub(super) async fn run_exec_like(
     args: RunExecLikeArgs,
 ) -> Result<LegacyShellToolOutput, FunctionCallError> {
     let call_id = args.call_id.clone();
+    let validation_output_owned = args.validation_launch.is_some();
     let result = run_exec_like_with_exit_code(args).await?;
+    let validation_failure =
+        validation_output_owned && result.exit_code.is_some_and(|code| code != 0);
     Ok(LegacyShellToolOutput {
         inner: result.output,
         canonical_output: result.canonical_output,
         exit_code: result.exit_code,
         call_id,
+        validation_failure,
+    })
+}
+
+fn validation_diagnostic_range(
+    id: &str,
+    canonical_output: &[u8],
+) -> Option<ToolOutputProjectionRange> {
+    const MAX_DIAGNOSTIC_BYTES: usize = 12 * 1024;
+    const MAX_DIAGNOSTIC_LINES: usize = 200;
+
+    if id.is_empty() || canonical_output.is_empty() || canonical_output.len() > MAX_DIAGNOSTIC_BYTES
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(canonical_output).ok()?;
+    let line_count = text.lines().count();
+    if line_count == 0 || line_count > MAX_DIAGNOSTIC_LINES {
+        return None;
+    }
+    Some(ToolOutputProjectionRange {
+        id: id.to_string(),
+        start_line: 1,
+        end_line: line_count,
     })
 }
 
@@ -331,9 +485,17 @@ fn operation_lease_deadline(hard_deadline: Option<chrono::DateTime<Utc>>) -> chr
     })
 }
 
+fn is_structural_workspace_admission_block(error: &StoreError) -> bool {
+    matches!(error, StoreError::WorkspaceStateInitialization(_))
+}
+
 pub(super) async fn run_exec_like_with_exit_code(
     mut args: RunExecLikeArgs,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
+    // The public timeout covers admission and cleanup as well as the spawned
+    // process. Previously the process timeout did not start until after lease
+    // admission, so a command could yield a live cell without ever spawning.
+    let operation_timeout = ShellOperationTimeout::new(args.exec_params.expiration.timeout_ms());
     let coordinator = args
         .session
         .services
@@ -424,6 +586,7 @@ pub(super) async fn run_exec_like_with_exit_code(
         admitted_nonmutating_validation,
     );
     if !intercepted_apply_patch {
+        #[cfg(test)]
         args.session
             .services
             .command_execution
@@ -433,6 +596,21 @@ pub(super) async fn run_exec_like_with_exit_code(
             );
     }
     if let Some(mutation_paths) = workspace_mutation_scope.into_paths() {
+        args.cancellation_token =
+            cancel_when_either(args.cancellation_token.clone(), operation_timeout.token());
+        if !args.force_fresh
+            && let Some(attempt_key) = args.attempt_key.as_ref()
+            && let Some(reason) = args
+                .session
+                .services
+                .command_execution
+                .workspace_admission_block(attempt_key, &args.turn.sub_id)
+                .await
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "shell execution lane is structurally blocked for the current repository state: {reason}; equivalent admission was suppressed until repository or turn state changes"
+            )));
+        }
         let reservation = args
             .session
             .services
@@ -444,7 +622,11 @@ pub(super) async fn run_exec_like_with_exit_code(
 
                 let message = match error {
                     WorkspaceMutationReservationAcquireError::Cancelled => {
-                        "shell command mutation-reservation wait was cancelled"
+                        if operation_timeout.timed_out() {
+                            "shell command timed out before process spawn while waiting for mutation admission"
+                        } else {
+                            "shell command mutation-reservation wait was cancelled"
+                        }
                     }
                     WorkspaceMutationReservationAcquireError::TimedOut => {
                         "shell command could not reserve repository-wide mutation execution within 10 seconds"
@@ -453,19 +635,26 @@ pub(super) async fn run_exec_like_with_exit_code(
                 FunctionCallError::RespondToModel(message.to_string())
             })?;
         if coordinator.store().is_none() {
-            coordinator
-                .initialize_for_workspace_coordination(
+            tokio::select! {
+                biased;
+                _ = args.cancellation_token.cancelled() => {
+                    return Err(FunctionCallError::RespondToModel(if operation_timeout.timed_out() {
+                        "shell command timed out before process spawn while initializing workspace coordination".to_string()
+                    } else {
+                        "shell workspace coordination initialization was cancelled".to_string()
+                    }));
+                }
+                result = coordinator.initialize_for_workspace_coordination(
                     args.session.services.state_db.clone(),
                     args.turn.config.sqlite_home.clone(),
                     args.turn.config.model_provider_id.clone(),
                     args.session.services.agent_control.session_id().to_string(),
-                )
-                .await
-                .map_err(|error| {
+                ) => result.map_err(|error| {
                     FunctionCallError::RespondToModel(format!(
                         "shell workspace coordination could not initialize: {error}"
                     ))
-                })?;
+                })?,
+            }
         }
         let store = coordinator.store().ok_or_else(|| {
             FunctionCallError::RespondToModel(
@@ -489,16 +678,23 @@ pub(super) async fn run_exec_like_with_exit_code(
             WorkspaceActorKind::Legacy => format!("legacy:{root_session_id}:{agent_path}"),
             WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
         };
-        args.session
-            .services
-            .agent_control
-            .reconcile_live_typed_actor_heartbeats()
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "shell typed-agent liveness could not be reconciled: {error}"
-                ))
-            })?;
+        tokio::select! {
+            biased;
+            _ = args.cancellation_token.cancelled() => {
+                return Err(FunctionCallError::RespondToModel(if operation_timeout.timed_out() {
+                    "shell command timed out before process spawn while reconciling workspace actors".to_string()
+                } else {
+                    "shell workspace actor reconciliation was cancelled".to_string()
+                }));
+            }
+            result = args.session.services.agent_control.reconcile_live_typed_actor_heartbeats() => {
+                result.map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "shell typed-agent liveness could not be reconciled: {error}"
+                    ))
+                })?;
+            }
+        }
         let request = WorkspaceMutationRequest {
             root_session_id,
             actor_id,
@@ -515,23 +711,44 @@ pub(super) async fn run_exec_like_with_exit_code(
             &request,
             &args.cancellation_token,
         )
-        .await
-        .map_err(|error| match error {
-            WorkspaceMutationAcquireError::Cancelled => FunctionCallError::RespondToModel(
-                "shell command mutation-lease wait was cancelled".to_string(),
-            ),
-            WorkspaceMutationAcquireError::TimedOut { details } => {
-                FunctionCallError::RespondToModel(format!(
+        .await;
+        let lease = match lease {
+            Ok(lease) => lease,
+            Err(WorkspaceMutationAcquireError::Cancelled) => {
+                return Err(FunctionCallError::RespondToModel(
+                    if operation_timeout.timed_out() {
+                        "shell command timed out before process spawn while waiting for the repository-wide mutation lease".to_string()
+                    } else {
+                        "shell command mutation-lease wait was cancelled".to_string()
+                    },
+                ));
+            }
+            Err(WorkspaceMutationAcquireError::TimedOut { details }) => {
+                return Err(FunctionCallError::RespondToModel(format!(
                     "shell command could not acquire the repository-wide mutation lease within 10 seconds: {}",
                     details.join("; ")
-                ))
+                )));
             }
-            WorkspaceMutationAcquireError::Store(error) => {
-                FunctionCallError::RespondToModel(format!(
-                    "shell command could not acquire the repository-wide mutation lease: {error}"
-                ))
+            Err(WorkspaceMutationAcquireError::Store(error)) => {
+                let reason = error.to_string();
+                if is_structural_workspace_admission_block(&error)
+                    && let Some(attempt_key) = args.attempt_key.as_ref()
+                {
+                    args.session
+                        .services
+                        .command_execution
+                        .record_workspace_admission_block(
+                            attempt_key,
+                            &args.turn.sub_id,
+                            reason.clone(),
+                        )
+                        .await;
+                }
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "shell command could not acquire the repository-wide mutation lease: {reason}"
+                )));
             }
-        })?;
+        };
         workspace_mutation = Some(WorkspaceMutationGuard::new_with_cache(
             store,
             repo_root.clone(),
@@ -766,12 +983,23 @@ pub(super) async fn run_exec_like_with_exit_code(
                         },
                     ],
                     success: Some(status.is_success()),
+                    outcome: Some(if status.is_success() {
+                        codex_tools::ToolOutputOutcome::Success
+                    } else {
+                        codex_tools::ToolOutputOutcome::Failure
+                    }),
                     post_tool_use_response: None,
                     sampling_request_signal: None,
                     deterministic_continuation_receipts: Vec::new(),
+                    deterministic_continuation_owner_key: None,
+                    skip_disposition: None,
                 },
                 exit_code: Some(if status.is_success() { 0 } else { 1 }),
-                validation_reuse_success: None,
+                validation_execution_outcome: if status.is_success() {
+                    ValidationExecutionOutcome::ExecutedSuccess
+                } else {
+                    ValidationExecutionOutcome::ExecutedFailure
+                },
                 canonical_output: None,
             });
         }
@@ -796,11 +1024,8 @@ pub(super) async fn run_exec_like_with_exit_code(
                 "shared validation execution ended without a reusable result".to_string(),
             )
         })?;
-        let success = result
-            .value
-            .get("success")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
+        let execution_outcome =
+            ValidationExecutionOutcome::from_value_or_legacy_success(&result.value);
         let text = result.value.get("text").cloned().unwrap_or_default();
         let validation_result = result
             .value
@@ -814,10 +1039,10 @@ pub(super) async fn run_exec_like_with_exit_code(
                 result
             });
         if let Some(token) = focused_validation.take() {
-            let status = if success {
-                ValidationCallStatus::Succeeded
-            } else {
-                ValidationCallStatus::Failed
+            let status = match execution_outcome {
+                ValidationExecutionOutcome::ExecutedSuccess => ValidationCallStatus::Succeeded,
+                ValidationExecutionOutcome::ExecutedFailure => ValidationCallStatus::Failed,
+                ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
             };
             coordinator
                 .finish_focused_validation_with_result(
@@ -851,11 +1076,18 @@ pub(super) async fn run_exec_like_with_exit_code(
                 "admission_disposition": "joined",
                 "shared_from_call_id": shared_from_call_id,
                 "text": text,
-                "success": success,
+                "success": execution_outcome.success(),
+                "execution_outcome": execution_outcome.as_str(),
+                "command_was_executed": execution_outcome != ValidationExecutionOutcome::NotExecuted,
+                "skip_disposition": result.value.get("skip_disposition").cloned(),
                 "validation_result": validation_result,
             })),
-            exit_code: Some(if success { 0 } else { 1 }),
-            validation_reuse_success: None,
+            exit_code: match execution_outcome {
+                ValidationExecutionOutcome::ExecutedSuccess => Some(0),
+                ValidationExecutionOutcome::ExecutedFailure => Some(1),
+                ValidationExecutionOutcome::NotExecuted => None,
+            },
+            validation_execution_outcome: execution_outcome,
             canonical_output: None,
         });
     }
@@ -952,6 +1184,7 @@ pub(super) async fn run_exec_like_with_exit_code(
     if let Some(leader) = validation_leader {
         match &result {
             Ok(result) => {
+                let execution_outcome = result.validation_execution_outcome();
                 leader
                     .complete(crate::validation_admission::ReusableValidationResult {
                         value: serde_json::json!({
@@ -959,7 +1192,10 @@ pub(super) async fn run_exec_like_with_exit_code(
                                 codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
                                 _ => None,
                             }).collect::<Vec<_>>().join("\n"),
-                            "success": result.validation_reuse_succeeded(),
+                            "success": execution_outcome.success(),
+                            "execution_outcome": execution_outcome.as_str(),
+                            "command_was_executed": execution_outcome != ValidationExecutionOutcome::NotExecuted,
+                            "skip_disposition": result.output.skip_disposition,
                             "validation_result": terminal_validation_result.clone(),
                         }),
                     })
@@ -981,11 +1217,21 @@ pub(super) async fn run_exec_like_with_exit_code(
         tracing::warn!(%error, "workspace mutation heartbeat task failed");
     }
     let workspace_record_result = match workspace_mutation {
-        Some(workspace_mutation) => workspace_mutation.finish().await.map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "shell workspace mutation could not be finalized: {error}"
-            ))
-        }),
+        Some(workspace_mutation) => tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                Err(FunctionCallError::RespondToModel(if operation_timeout.timed_out() {
+                    "shell command timed out while finalizing its workspace mutation; cleanup continues in the background".to_string()
+                } else {
+                    "shell workspace mutation finalization was cancelled; cleanup continues in the background".to_string()
+                }))
+            }
+            result = workspace_mutation.finish() => result.map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "shell workspace mutation could not be finalized: {error}"
+                ))
+            }),
+        },
         None => Ok(()),
     };
     let Some(token) = focused_validation else {
@@ -1005,8 +1251,11 @@ pub(super) async fn run_exec_like_with_exit_code(
     workspace_record_result?;
     let status = match (&result, cancellation_token.is_cancelled()) {
         (_, true) => ValidationCallStatus::Cancelled,
-        (Ok(result), false) if result.exit_code == Some(0) => ValidationCallStatus::Succeeded,
-        (Ok(_), false) => ValidationCallStatus::Failed,
+        (Ok(result), false) => match result.validation_execution_outcome() {
+            ValidationExecutionOutcome::ExecutedSuccess => ValidationCallStatus::Succeeded,
+            ValidationExecutionOutcome::ExecutedFailure => ValidationCallStatus::Failed,
+            ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
+        },
         (Err(FunctionCallError::RespondToModel(message)), false)
             if message.contains("rejected by user") =>
         {
@@ -2064,50 +2313,22 @@ async fn run_exec_like_with_exit_code_inner(
         } else {
             None
         };
-        if let Some(identity) =
-            known_delta_store::immutable_git_show_identity_with_project_namespace(
-                &exec_params.cwd,
-                &exec_params.command[0],
-                &exec_params.command[1..],
-                project_namespace.as_deref(),
-            )
-            .await
-        {
-            let candidate =
-                known_delta_store::lookup(turn.config.codex_home.as_path(), &identity).await;
-            let hit_output = if !force_fresh
-                && let Some(candidate) = candidate.as_ref()
-                && candidate.reusable()
-            {
-                let artifact = known_delta_store::remint_task_handle(
-                    turn.config.codex_home.as_path(),
-                    &session.thread_id.to_string(),
-                    candidate,
-                )
-                .await;
-                if artifact.model_projection().2.is_none() {
-                    Some(known_delta_store::render_hit(candidate, &artifact))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            Some(KnownDeltaShellRequest {
-                identity,
-                candidate,
-                hit_output,
-                force_fresh,
-            })
-        } else {
-            None
-        }
+        known_delta_store::prepare_immutable_git_show(
+            turn.config.codex_home.as_path(),
+            &session.thread_id.to_string(),
+            &exec_params.cwd,
+            &exec_params.command[0],
+            &exec_params.command[1..],
+            project_namespace.as_deref(),
+            force_fresh,
+        )
+        .await
     } else {
         None
     };
     let known_delta_hit = known_delta
         .as_ref()
-        .is_some_and(|request| request.hit_output.is_some());
+        .is_some_and(known_delta_store::PreparedKnownDelta::is_hit);
 
     // Approval policy guard for explicit escalation in non-OnRequest modes.
     // Sticky turn permissions have already been approved, so they should
@@ -2131,7 +2352,7 @@ async fn run_exec_like_with_exit_code_inner(
         session
             .services
             .command_execution
-            .begin_attempt(attempt_key, repair_notice.is_some())
+            .begin_attempt_with_freshness(attempt_key, repair_notice.is_some(), force_fresh)
             .await
             .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
     }
@@ -2180,7 +2401,7 @@ async fn run_exec_like_with_exit_code_inner(
         return Ok(RunExecLikeResult {
             output,
             exit_code: Some(0),
-            validation_reuse_success: None,
+            validation_execution_outcome: ValidationExecutionOutcome::ExecutedSuccess,
             canonical_output: None,
         });
     }
@@ -2315,49 +2536,39 @@ async fn run_exec_like_with_exit_code_inner(
     {
         Ok(result) => Ok(result.output),
         Err(ToolError::ValidationSkipped(skipped)) => {
+            let skip_disposition = skipped.skip_disposition;
             let value = serde_json::to_value(skipped).unwrap_or_default();
-            let mut output = FunctionToolOutput::from_text(value.to_string(), Some(true));
+            let mut output = FunctionToolOutput::from_text(value.to_string(), None)
+                .with_skip_disposition(skip_disposition);
             output.post_tool_use_response = Some(value);
             return Ok(RunExecLikeResult {
                 output,
                 exit_code: None,
-                validation_reuse_success: Some(true),
+                validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
                 canonical_output: None,
             });
         }
         Err(error) => Err(error),
     };
     if !known_delta_hit && let Some(known_delta) = known_delta.as_ref() {
-        match &out {
+        let observation = match &out {
             Ok(output) if is_complete_success(output) => {
-                let _ = known_delta_store::record_success(
-                    turn.config.codex_home.as_path(),
-                    &known_delta.identity,
-                    known_delta.candidate.as_ref(),
-                    output.aggregated_output.text.as_bytes(),
-                    output.duration,
-                )
-                .await;
+                KnownDeltaExecutionObservation::CompleteSuccess {
+                    output: output.aggregated_output.text.as_bytes(),
+                    executor_cost: output.duration,
+                }
             }
-            Ok(output) if output.aggregated_output.truncated_after_lines.is_some() => {}
-            Err(_) if known_delta.force_fresh => {
-                known_delta_store::record_contradictory_failure(
-                    turn.config.codex_home.as_path(),
-                    &known_delta.identity,
-                    known_delta.candidate.is_some(),
-                )
-                .await;
+            Ok(output) if output.aggregated_output.truncated_after_lines.is_some() => {
+                KnownDeltaExecutionObservation::Incomplete
             }
-            Ok(_) if known_delta.force_fresh => {
-                known_delta_store::record_contradictory_failure(
-                    turn.config.codex_home.as_path(),
-                    &known_delta.identity,
-                    known_delta.candidate.is_some(),
-                )
-                .await;
-            }
-            _ => {}
-        }
+            Err(_) | Ok(_) => KnownDeltaExecutionObservation::CompleteFailure,
+        };
+        known_delta_store::record_execution(
+            turn.config.codex_home.as_path(),
+            known_delta,
+            observation,
+        )
+        .await;
     }
     let exit_code = out.as_ref().ok().map(|output| output.exit_code);
     let retry_exit_code = retry_exit_code(&out);
@@ -2448,12 +2659,23 @@ async fn run_exec_like_with_exit_code_inner(
                 codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
             ],
             success: Some(true),
+            outcome: Some(match exit_code {
+                Some(0) => codex_tools::ToolOutputOutcome::Success,
+                Some(_) => codex_tools::ToolOutputOutcome::Failure,
+                None => codex_tools::ToolOutputOutcome::TimedOut,
+            }),
             post_tool_use_response,
             sampling_request_signal: None,
             deterministic_continuation_receipts: Vec::new(),
+            deterministic_continuation_owner_key: None,
+            skip_disposition: None,
         },
         exit_code,
-        validation_reuse_success: None,
+        validation_execution_outcome: match exit_code {
+            Some(0) => ValidationExecutionOutcome::ExecutedSuccess,
+            Some(_) => ValidationExecutionOutcome::ExecutedFailure,
+            None => ValidationExecutionOutcome::ExecutedFailure,
+        },
         canonical_output,
     })
 }

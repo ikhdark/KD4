@@ -335,8 +335,8 @@ fn collaboration_reset_removes_plan_and_the_reset_notice() {
 fn checkpoint_reconstruction_keeps_only_current_canonical_variants() {
     let repository_a = repository("old");
     let repository_b = repository("current");
-    let checkpoint_a = "<context_window>\nA\n</context_window>";
-    let checkpoint_b = "<context_window>\nB\n</context_window>";
+    let checkpoint_a = "<rollout_budget>\nA\n</rollout_budget>";
+    let checkpoint_b = "<rollout_budget>\nB\n</rollout_budget>";
     let projection = project_stable_context(
         vec![
             text_message("user", &repository_a),

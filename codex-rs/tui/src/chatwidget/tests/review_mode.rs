@@ -1178,6 +1178,9 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 },
             },
@@ -1206,6 +1209,7 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
     chat.handle_server_notification(
         codex_app_server_protocol::ServerNotification::TurnCompleted(
             codex_app_server_protocol::TurnCompletedNotification {
+                surfaced_result: None,
                 thread_id: "thread-1".to_string(),
                 completion: None,
                 timing: None,
@@ -1218,6 +1222,9 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
+                    completion: None,
+                    timing: None,
+                    surfaced_result: None,
                     reasoning_policy_history: None,
                 },
             },

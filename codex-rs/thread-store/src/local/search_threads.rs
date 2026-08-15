@@ -14,10 +14,9 @@ use super::helpers::distinct_thread_metadata_title;
 use super::helpers::set_thread_name_from_title;
 use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::thread_item_titles;
-use super::list_threads::list_rollout_threads;
+use super::list_threads::list_rollout_threads_for_storage;
 use crate::ListThreadsParams;
 use crate::SearchThreadsParams;
-use crate::SortDirection;
 use crate::StoredThreadSearchResult;
 use crate::ThreadSearchPage;
 use crate::ThreadSortKey;
@@ -52,15 +51,6 @@ pub(super) async fn search_threads(
             })
         })
         .transpose()?;
-    let sort_key = match params.sort_key {
-        ThreadSortKey::CreatedAt => codex_rollout::ThreadSortKey::CreatedAt,
-        ThreadSortKey::UpdatedAt => codex_rollout::ThreadSortKey::UpdatedAt,
-        ThreadSortKey::RecencyAt => codex_rollout::ThreadSortKey::RecencyAt,
-    };
-    let sort_direction = match params.sort_direction {
-        SortDirection::Asc => codex_rollout::SortDirection::Asc,
-        SortDirection::Desc => codex_rollout::SortDirection::Desc,
-    };
     let state_db = store.state_db().await;
     let rollout_config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
@@ -100,19 +90,26 @@ pub(super) async fn search_threads(
         archived: params.archived,
         search_term: None,
         relation_filter: None,
-        use_state_db_only: state_db.is_some(),
+        storage_mode: if state_db.is_some() {
+            crate::ThreadListStorageMode::StateDbOnly
+        } else {
+            crate::ThreadListStorageMode::ScanAndRepair
+        },
     };
     let mut remaining_rollouts = matching_rollouts;
 
     loop {
-        let page = list_rollout_threads(
+        let page = list_rollout_threads_for_storage(
             state_db.clone(),
             &rollout_config,
             store.config.default_model_provider_id.as_str(),
             &scan_params,
             page_cursor.as_ref(),
-            sort_key,
-            sort_direction,
+            if state_db.is_some() {
+                crate::types::ThreadListStoragePath::StateDb
+            } else {
+                crate::types::ThreadListStoragePath::ScanAndRepair
+            },
         )
         .await?;
         for item in page.items {

@@ -63,6 +63,18 @@ pub(crate) fn format_inter_agent_completion_message(
             ));
         }
         AgentStatus::Completed(None) => String::new(),
+        AgentStatus::CompletedWithSurface {
+            last_agent_message: Some(message),
+            ..
+        } => {
+            return Some(format_bounded_inter_agent_completion_message(
+                task_name, sender, message,
+            ));
+        }
+        AgentStatus::CompletedWithSurface {
+            last_agent_message: None,
+            ..
+        } => String::new(),
         AgentStatus::Errored(error) => {
             let error = truncate_text(error, TruncationPolicy::Tokens(ERROR_MAX_TOKENS));
             format!("Agent errored: {error}\n\n{ERROR_NEXT_ACTION}")

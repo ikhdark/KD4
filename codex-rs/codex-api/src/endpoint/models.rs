@@ -8,8 +8,18 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
 use http::Method;
+use http::StatusCode;
 use http::header::ETAG;
 use std::sync::Arc;
+
+#[derive(Debug)]
+pub enum ModelsListResult {
+    Modified {
+        models: Vec<ModelInfo>,
+        etag: Option<String>,
+    },
+    NotModified,
+}
 
 pub struct ModelsClient<T: HttpTransport> {
     session: EndpointSession<T>,
@@ -48,6 +58,22 @@ impl<T: HttpTransport> ModelsClient<T> {
         request_url: String,
         extra_headers: HeaderMap,
     ) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
+        match self
+            .list_models_conditional(request_url, extra_headers)
+            .await?
+        {
+            ModelsListResult::Modified { models, etag } => Ok((models, etag)),
+            ModelsListResult::NotModified => Err(ApiError::Stream(
+                "models endpoint returned 304 without a conditional request".to_string(),
+            )),
+        }
+    }
+
+    pub async fn list_models_conditional(
+        &self,
+        request_url: String,
+        extra_headers: HeaderMap,
+    ) -> Result<ModelsListResult, ApiError> {
         let resp = self
             .session
             .execute_with(
@@ -60,6 +86,10 @@ impl<T: HttpTransport> ModelsClient<T> {
                 },
             )
             .await?;
+
+        if resp.status == StatusCode::NOT_MODIFIED {
+            return Ok(ModelsListResult::NotModified);
+        }
 
         let header_etag = resp
             .headers
@@ -75,7 +105,10 @@ impl<T: HttpTransport> ModelsClient<T> {
                 ))
             })?;
 
-        Ok((models, header_etag))
+        Ok(ModelsListResult::Modified {
+            models,
+            etag: header_etag,
+        })
     }
 }
 
@@ -101,6 +134,7 @@ mod tests {
         last_request: Arc<Mutex<Option<Request>>>,
         body: Arc<ModelsResponse>,
         etag: Option<String>,
+        status: StatusCode,
     }
 
     impl Default for CapturingTransport {
@@ -109,6 +143,7 @@ mod tests {
                 last_request: Arc::new(Mutex::new(None)),
                 body: Arc::new(ModelsResponse { models: Vec::new() }),
                 etag: None,
+                status: StatusCode::OK,
             }
         }
     }
@@ -122,7 +157,7 @@ mod tests {
                 headers.insert(ETAG, etag.parse().unwrap());
             }
             Ok(Response {
-                status: StatusCode::OK,
+                status: self.status,
                 headers,
                 body: body.into(),
             })
@@ -165,6 +200,7 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: None,
+            status: StatusCode::OK,
         };
 
         let provider = provider("https://example.com/api/codex");
@@ -227,6 +263,7 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: None,
+            status: StatusCode::OK,
         };
 
         let provider = provider("https://example.com/api/codex");
@@ -252,6 +289,7 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: Some("\"abc\"".to_string()),
+            status: StatusCode::OK,
         };
 
         let provider = provider("https://example.com/api/codex");
@@ -265,5 +303,23 @@ mod tests {
 
         assert_eq!(models.len(), 0);
         assert_eq!(etag, Some("\"abc\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn conditional_list_models_accepts_not_modified_without_a_body() {
+        let transport = CapturingTransport {
+            status: StatusCode::NOT_MODIFIED,
+            ..Default::default()
+        };
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
+        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
+
+        let result = client
+            .list_models_conditional(request_url, HeaderMap::new())
+            .await
+            .expect("304 should be a successful conditional response");
+
+        assert!(matches!(result, ModelsListResult::NotModified));
     }
 }

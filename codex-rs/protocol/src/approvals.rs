@@ -369,6 +369,52 @@ impl ElicitationRequest {
             | Self::Url { message, .. } => message,
         }
     }
+
+    /// Canonical parameters for the MCP `elicitation/create` request. Keeping
+    /// this projection in protocol ensures every bridge preserves extension
+    /// modes and metadata identically.
+    pub fn to_mcp_create_params(&self) -> JsonValue {
+        let mut params = match self {
+            Self::Form {
+                meta,
+                message,
+                requested_schema,
+            } => serde_json::json!({
+                "mode": "form",
+                "message": message,
+                "requestedSchema": requested_schema,
+                "_meta": meta,
+            }),
+            Self::OpenAiForm {
+                meta,
+                message,
+                requested_schema,
+            } => serde_json::json!({
+                "mode": "openai/form",
+                "message": message,
+                "requestedSchema": requested_schema,
+                "_meta": meta,
+            }),
+            Self::Url {
+                meta,
+                message,
+                url,
+                elicitation_id,
+            } => serde_json::json!({
+                "mode": "url",
+                "message": message,
+                "url": url,
+                "elicitationId": elicitation_id,
+                "_meta": meta,
+            }),
+        };
+        if let Some(object) = params.as_object_mut()
+            && object.get("_meta").is_some_and(JsonValue::is_null)
+        {
+            object.remove("_meta");
+        }
+        params
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -416,6 +462,52 @@ mod tests {
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn elicitation_create_projection_preserves_all_modes_and_metadata() {
+        let meta = Some(serde_json::json!({"trace": "value"}));
+        let form = ElicitationRequest::Form {
+            meta: meta.clone(),
+            message: "form message".to_string(),
+            requested_schema: serde_json::json!({"type": "object"}),
+        };
+        assert_eq!(
+            form.to_mcp_create_params(),
+            serde_json::json!({
+                "mode": "form",
+                "message": "form message",
+                "requestedSchema": {"type": "object"},
+                "_meta": meta,
+            })
+        );
+
+        let openai_form = ElicitationRequest::OpenAiForm {
+            meta: None,
+            message: "extension form".to_string(),
+            requested_schema: serde_json::json!({"type": "string"}),
+        };
+        assert_eq!(
+            openai_form.to_mcp_create_params()["mode"],
+            serde_json::json!("openai/form")
+        );
+
+        let url = ElicitationRequest::Url {
+            meta: Some(serde_json::json!({"source": "server"})),
+            message: "open URL".to_string(),
+            url: "https://example.test/approve".to_string(),
+            elicitation_id: "elicitation-1".to_string(),
+        };
+        assert_eq!(
+            url.to_mcp_create_params(),
+            serde_json::json!({
+                "mode": "url",
+                "message": "open URL",
+                "url": "https://example.test/approve",
+                "elicitationId": "elicitation-1",
+                "_meta": {"source": "server"},
+            })
+        );
+    }
 
     #[test]
     fn guardian_assessment_action_deserializes_command_shape() {

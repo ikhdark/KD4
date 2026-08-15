@@ -434,7 +434,7 @@ impl RolloutRecorder {
         }
 
         if matches!(repair_mode, ThreadListRepairMode::StateDbOnly) {
-            return Ok(state_db::list_threads_db(
+            let page = state_db::list_threads_db(
                 state_db_ctx.as_deref(),
                 codex_home,
                 page_size,
@@ -449,8 +449,8 @@ impl RolloutRecorder {
                 search_term,
             )
             .await
-            .map(Into::into)
-            .unwrap_or_default());
+            .ok_or_else(|| std::io::Error::other("state DB unavailable for thread listing"))?;
+            return Ok(page.into());
         }
 
         let listing_has_metadata_filters = !allowed_sources.is_empty()
@@ -458,8 +458,7 @@ impl RolloutRecorder {
             || cwd_filters.is_some()
             || search_term.is_some();
         // Filesystem-first listing intentionally overfetches so we can repair stale/missing
-        // SQLite rows before returning the scan page for filtered listings or the DB page for
-        // unfiltered listings.
+        // SQLite rows while keeping the returned page and cursor filesystem-backed.
         let fs_page = match sort_direction {
             SortDirection::Asc => {
                 list_threads_from_files_asc(
@@ -509,8 +508,8 @@ impl RolloutRecorder {
             ));
         }
 
-        // For metadata-filtered listings the filesystem page is the page we return. Track those
-        // IDs so the later DB page only triggers full reconciliation for DB-only hits.
+        // Track filesystem IDs so the later DB comparison only triggers full reconciliation for
+        // DB-only hits.
         let fs_page_thread_ids = fs_page
             .items
             .iter()
@@ -572,25 +571,12 @@ impl RolloutRecorder {
                     )
                     .await;
                 }
-                if let Some(repaired_db_page) = state_db::list_threads_db(
+                let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
+                return Ok(fill_missing_thread_item_metadata_from_state_db(
                     state_db_ctx.as_deref(),
-                    codex_home,
-                    page_size,
-                    cursor,
-                    sort_key,
-                    sort_direction,
-                    allowed_sources,
-                    model_providers,
-                    cwd_filters,
-                    /*relation_filter*/ None,
-                    archived,
-                    search_term,
+                    page,
                 )
-                .await
-                {
-                    return Ok(repaired_db_page.into());
-                }
-                return Ok(db_page.into());
+                .await);
             }
             if listing_has_metadata_filters {
                 for item in &db_page.items {
@@ -612,25 +598,13 @@ impl RolloutRecorder {
                     .await;
                 }
                 if sort_key == ThreadSortKey::RecencyAt {
-                    if let Some(repaired_db_page) = state_db::list_threads_db(
+                    let page =
+                        page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
+                    return Ok(fill_missing_thread_item_metadata_from_state_db(
                         state_db_ctx.as_deref(),
-                        codex_home,
-                        page_size,
-                        cursor,
-                        sort_key,
-                        sort_direction,
-                        allowed_sources,
-                        model_providers,
-                        cwd_filters,
-                        /*relation_filter*/ None,
-                        archived,
-                        search_term,
+                        page,
                     )
-                    .await
-                    {
-                        return Ok(repaired_db_page.into());
-                    }
-                    return Ok(db_page.into());
+                    .await);
                 }
                 codex_state::record_fallback(
                     "list_threads",
@@ -644,7 +618,12 @@ impl RolloutRecorder {
                 )
                 .await);
             }
-            return Ok(db_page.into());
+            let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
+            return Ok(fill_missing_thread_item_metadata_from_state_db(
+                state_db_ctx.as_deref(),
+                page,
+            )
+            .await);
         }
         if listing_has_metadata_filters {
             let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
@@ -2257,6 +2236,7 @@ async fn resume_candidate_matches_cwd(
         RolloutItem::TurnContext(turn_context) => Some(&turn_context.cwd),
         RolloutItem::SessionMeta(_)
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::SamplingBoundary(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }

@@ -172,6 +172,7 @@ async fn request_user_input_holds_an_elicitation_until_response() {
 
     let response = RequestUserInputResponse {
         answers: HashMap::new(),
+        interrupted: false,
     };
     session
         .notify_user_input_response(&turn_context.sub_id, response)

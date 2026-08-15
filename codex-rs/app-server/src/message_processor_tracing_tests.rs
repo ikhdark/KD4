@@ -267,6 +267,9 @@ async fn build_test_processor(
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
         plugin_startup_tasks: crate::PluginStartupTasks::Start,
+        desktop_activation_bootstrap: Arc::new(
+            crate::desktop_activation::DesktopActivationBootstrap::Absent,
+        ),
     }));
     (processor, outgoing_rx)
 }

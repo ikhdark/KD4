@@ -2,7 +2,6 @@ pub(crate) mod command_runner;
 pub(crate) mod discovery;
 pub(crate) mod dispatcher;
 pub(crate) mod output_parser;
-pub(crate) mod schema_loader;
 
 use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactOutcome;
@@ -122,7 +121,6 @@ impl ClaudeHooksEngine {
             };
         }
 
-        let _ = schema_loader::generated_hook_schemas();
         let discovered = discovery::discover_handlers(
             config_layer_stack,
             plugin_hook_sources,

@@ -20,6 +20,21 @@ use tokio::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn plan_output_always_signals_mutation_obligation_state() {
+    let output = PlanToolOutput {
+        normalized_plan: None,
+        governor_plan: None,
+        unfinished_mutation_obligation: None,
+        validation_results: Vec::new(),
+    };
+    let signal = output
+        .sampling_request_signal()
+        .expect("successful status-only and no-op plan updates must emit obligation state");
+    assert_eq!(signal["kind"], "plan_update");
+    assert!(signal["unfinished_mutation_obligation"].is_null());
+}
+
 async fn enable_task_evidence(
     session: &mut Arc<crate::session::session::Session>,
 ) -> (TempDir, PathBuf) {
@@ -126,6 +141,7 @@ fn unchanged_plan_output_remains_compact() {
             explanation: None,
             plan: Vec::new(),
         }),
+        unfinished_mutation_obligation: Some(false),
         validation_results: Vec::new(),
     };
     let payload = ToolPayload::Function {

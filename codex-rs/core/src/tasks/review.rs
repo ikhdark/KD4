@@ -108,7 +108,7 @@ impl SessionTask for ReviewTask {
         if !cancellation_token.is_cancelled() {
             exit_review_mode(session.clone_session(), output.clone(), ctx.clone()).await;
         }
-        Ok(None)
+        Ok(super::TurnTaskResult::default())
     }
 
     async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {

@@ -192,7 +192,10 @@ async fn request_user_input_round_trip_for_mode(
             answers: vec!["yes".to_string()],
         },
     );
-    let response = RequestUserInputResponse { answers };
+    let response = RequestUserInputResponse {
+        answers,
+        interrupted: false,
+    };
     codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id.clone(),
@@ -211,7 +214,8 @@ async fn request_user_input_round_trip_for_mode(
         json!({
             "answers": {
                 "confirm_path": { "answers": ["yes"] }
-            }
+            },
+            "interrupted": false
         })
     );
 

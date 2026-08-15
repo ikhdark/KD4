@@ -220,15 +220,29 @@ pub fn truncate_rollout_after_turn_id(
         )));
     }
 
-    let cut_index = items
+    let terminal_index = items
         .iter()
         .enumerate()
         .skip(target_start_index.saturating_add(1))
-        .find_map(|(index, item)| {
-            matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))).then_some(index)
+        .find_map(|(index, item)| match item {
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                if event.turn_id == last_turn_id =>
+            {
+                Some(index)
+            }
+            RolloutItem::EventMsg(EventMsg::TurnAborted(event))
+                if event.turn_id.as_deref().is_none_or(|id| id == last_turn_id) =>
+            {
+                Some(index)
+            }
+            _ => None,
         })
-        .unwrap_or(items.len());
-    Ok(items[..cut_index].to_vec())
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(format!(
+                "lastTurnId '{last_turn_id}' has no persisted terminal boundary"
+            ))
+        })?;
+    Ok(items[..=terminal_index].to_vec())
 }
 
 /// Return a suffix of `items` that keeps the last `n_from_end` fork turns.

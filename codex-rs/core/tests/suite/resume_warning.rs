@@ -47,6 +47,7 @@ fn resume_history(
         multi_agent_mode: None,
         realtime_active: None,
         effort: config.model_reasoning_effort.clone(),
+        context_provenance: None,
         summary: config
             .model_reasoning_summary
             .unwrap_or(ReasoningSummary::Auto),
@@ -72,6 +73,7 @@ fn resume_history(
             })),
             RolloutItem::TurnContext(turn_ctx),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
                 turn_id,
                 last_agent_message: None,
                 error: None,

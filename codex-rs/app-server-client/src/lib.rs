@@ -352,6 +352,7 @@ impl InProcessClientStartArgs {
         let capabilities = InitializeCapabilities {
             experimental_api: self.experimental_api,
             request_attestation: false,
+            desktop_activation_receipts: false,
             opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
                 None
             } else {
@@ -1214,6 +1215,7 @@ mod tests {
 
     fn turn_completed_notification() -> ServerNotification {
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
+            surfaced_result: None,
             thread_id: "thread".to_string(),
             completion: None,
             timing: None,
@@ -1226,8 +1228,17 @@ mod tests {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: Some(1),
+                completion: None,
+                timing: None,
+                surfaced_result: None,
                 reasoning_policy_history: None,
             },
+        })
+    }
+
+    fn thread_closed_notification() -> ServerNotification {
+        ServerNotification::ThreadClosed(codex_app_server_protocol::ThreadClosedNotification {
+            thread_id: "thread".to_string(),
         })
     }
 
@@ -1394,7 +1405,7 @@ mod tests {
 
         let receive_task = tokio::spawn(async move {
             let mut events = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..6 {
                 events.push(
                     timeout(Duration::from_secs(2), event_rx.recv())
                         .await
@@ -1409,6 +1420,7 @@ mod tests {
             agent_message_delta_notification("hello"),
             item_completed_notification("hello"),
             turn_completed_notification(),
+            thread_closed_notification(),
         ] {
             let result = forward_in_process_event(
                 &event_tx,
@@ -1454,6 +1466,12 @@ mod tests {
             InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                 notification
             )) if notification.turn.status == codex_app_server_protocol::TurnStatus::Completed
+        ));
+        assert!(matches!(
+            &events[5],
+            InProcessServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                notification
+            )) if notification.thread_id == "thread"
         ));
     }
 
@@ -1857,6 +1875,7 @@ mod tests {
                 agent_message_delta_notification("hello"),
                 item_completed_notification("hello"),
                 turn_completed_notification(),
+                thread_closed_notification(),
             ] {
                 write_websocket_message(
                     &mut websocket,
@@ -1934,6 +1953,16 @@ mod tests {
             turn_completed,
             AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(notification))
                 if notification.turn.status == codex_app_server_protocol::TurnStatus::Completed
+        ));
+
+        let thread_closed = timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("thread close should arrive before timeout")
+            .expect("event stream should stay open");
+        assert!(matches!(
+            thread_closed,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(notification))
+                if notification.thread_id == "thread"
         ));
 
         done_tx
@@ -2234,6 +2263,7 @@ mod tests {
             &InProcessServerEvent::ServerNotification(
                 codex_app_server_protocol::ServerNotification::TurnCompleted(
                     codex_app_server_protocol::TurnCompletedNotification {
+                        surfaced_result: None,
                         thread_id: "thread".to_string(),
                         completion: None,
                         timing: None,
@@ -2246,6 +2276,9 @@ mod tests {
                             started_at: None,
                             completed_at: Some(0),
                             duration_ms: None,
+                            completion: None,
+                            timing: None,
+                            surfaced_result: None,
                             reasoning_policy_history: None,
                         },
                     }
