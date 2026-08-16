@@ -131,6 +131,7 @@ fn write_rollout_with_metadata(path: &Path, thread_id: ThreadId) -> std::io::Res
                 cwd: ".".into(),
                 originator: "test_originator".into(),
                 cli_version: "test_version".into(),
+                build_info: None,
                 source: SessionSource::Cli,
                 thread_source: None,
                 agent_path: None,

@@ -614,6 +614,21 @@ async fn replacement_does_not_truncate_before_acquiring_the_lock() {
 }
 
 #[tokio::test]
+async fn reduction_notice_directs_one_bounded_recovery_call() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = create_raw_output_artifact(temp.path(), "thread", b"retained output").await;
+
+    let notice = artifact.reduction_notice().expect("stored artifact notice");
+    let (sha256, complete) = artifact.proof_projection();
+
+    assert!(notice.contains("Use read_tool_output once"));
+    assert!(notice.contains("batch every needed exact range or section in one call"));
+    assert!(notice.contains("Do not reread broad ranges"));
+    assert!(notice.contains(sha256.as_deref().expect("artifact sha256")));
+    assert_eq!(complete, Some(true));
+}
+
+#[tokio::test]
 async fn per_thread_retention_skips_active_artifacts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let directory = temp.path().join("tool-output").join("thread");

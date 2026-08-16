@@ -448,15 +448,24 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         StableContextKind::SkillUsage
         | StableContextKind::SkillCatalog
         | StableContextKind::SelectedSkill => PromptContextCategory::Skills,
-        StableContextKind::DesktopApp => PromptContextCategory::AppDesktop,
-        StableContextKind::Plugins => PromptContextCategory::Plugins,
-        StableContextKind::EnvironmentPermissions => PromptContextCategory::EnvironmentPermissions,
+        StableContextKind::DesktopApp | StableContextKind::AppContext => {
+            PromptContextCategory::AppDesktop
+        }
+        StableContextKind::Plugins | StableContextKind::RecommendedPlugins => {
+            PromptContextCategory::Plugins
+        }
+        StableContextKind::Environment | StableContextKind::EnvironmentPermissions => {
+            PromptContextCategory::EnvironmentPermissions
+        }
         StableContextKind::RootCoordinator | StableContextKind::MultiAgent => {
             PromptContextCategory::AgentRole
         }
         StableContextKind::RequestUserInput
         | StableContextKind::Wait
-        | StableContextKind::DynamicHistory => PromptContextCategory::OtherInjected,
+        | StableContextKind::DynamicHistory
+        | StableContextKind::ModelSwitch
+        | StableContextKind::Personality
+        | StableContextKind::Realtime => PromptContextCategory::OtherInjected,
     }
 }
 

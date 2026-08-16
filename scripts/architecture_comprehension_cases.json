@@ -1,0 +1,44 @@
+[
+  {
+    "id": "nested_repository_identity",
+    "description": "A nested repository must retain its own workspace identity instead of inheriting the outer checkout.",
+    "owners": ["repository-context-discovery"],
+    "expected": [
+      {"facet": "registration_and_entrypoints", "target_contains": "git_workspace.rs"},
+      {"facet": "callers_and_consumers", "target_contains": "session/mod.rs"},
+      {"facet": "invariants", "target_contains": "snapshot-scoped-discovery"}
+    ]
+  },
+  {
+    "id": "failed_instruction_read_cache",
+    "description": "A failed AGENTS.md read must remain visible and must not become successful cached evidence.",
+    "owners": ["repository-context-discovery"],
+    "expected": [
+      {"facet": "control_and_data_flow", "target_contains": "agents_md.rs"},
+      {"facet": "tests_and_contracts", "target_contains": "agents_md_tests.rs"},
+      {"facet": "invariants", "target_contains": "snapshot-scoped-discovery"}
+    ]
+  },
+  {
+    "id": "feature_gated_runtime_wiring",
+    "description": "A feature change must include the registry, managed configuration consumer, runtime entrypoint, and compatibility contract.",
+    "owners": ["feature-registry", "core-agent-runtime"],
+    "expected": [
+      {"facet": "configuration_and_gates", "target_contains": "kd4_features.toml"},
+      {"facet": "callers_and_consumers", "target_contains": "core-agent-runtime"},
+      {"facet": "registration_and_entrypoints", "target_contains": "features/src/lib.rs"},
+      {"facet": "invariants", "target_contains": "feature-key-compatibility"}
+    ]
+  },
+  {
+    "id": "generated_protocol_consumer",
+    "description": "A protocol change must connect source generation, checked-in fixtures, the app-server consumer, and parity validation.",
+    "owners": ["app-server-protocol-contracts", "app-server-runtime"],
+    "expected": [
+      {"facet": "generated_artifacts", "target_contains": "app-server-protocol/schema"},
+      {"facet": "callers_and_consumers", "target_contains": "app-server-runtime"},
+      {"facet": "registration_and_entrypoints", "target_contains": "app-server-schema-check"},
+      {"facet": "invariants", "target_contains": "schema-source-parity"}
+    ]
+  }
+]

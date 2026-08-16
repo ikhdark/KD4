@@ -76,7 +76,6 @@ use crate::task_evidence::UserSourceKind;
 use crate::task_evidence::UserSourceRecord;
 use crate::task_evidence::build_repair_baseline;
 use crate::task_evidence::repair_baseline_hash;
-use crate::task_evidence::sha256_file;
 use crate::task_evidence::source_classification_cache_key;
 use crate::task_evidence::source_local_classification_is_valid_for_source;
 use crate::task_evidence::source_local_classifications_with_manifest_gaps;
@@ -1975,7 +1974,10 @@ fn captured_file_snapshot(source: &UserSourceRecord) -> Result<Option<(&str, &st
     Ok(Some((path, expected_hash)))
 }
 
-pub(crate) async fn user_sources_still_current(dossier: &CompletionReviewDossier) -> bool {
+pub(crate) async fn user_sources_still_current(
+    dossier: &CompletionReviewDossier,
+    ledger: &TaskEvidenceLedger,
+) -> bool {
     for source in &dossier.sources {
         let snapshot = match captured_file_snapshot(source) {
             Ok(snapshot) => snapshot,
@@ -1984,10 +1986,10 @@ pub(crate) async fn user_sources_still_current(dossier: &CompletionReviewDossier
         let Some((path, expected_hash)) = snapshot else {
             continue;
         };
-        let Ok(observed_hash) = sha256_file(Path::new(path)).await else {
-            return false;
-        };
-        if observed_hash != expected_hash {
+        if !ledger
+            .source_file_matches_sha256(Path::new(path), expected_hash)
+            .await
+        {
             return false;
         }
     }
@@ -2690,7 +2692,7 @@ async fn materialize_pending_sources(
     };
     let resolved_sources = match route {
         source_classification::ClassificationRoute::LocalOnly(resolved_sources) => {
-            if !user_sources_still_current(dossier).await {
+            if !user_sources_still_current(dossier, &sess.services.task_evidence).await {
                 return Ok(Err(ReviewFailureCategory::SourceDrift));
             }
             resolved_sources
@@ -2717,7 +2719,7 @@ async fn materialize_pending_sources(
                 }
                 None => ReviewerExecution::failed(ReviewFailureCategory::Capacity),
             };
-            if !user_sources_still_current(dossier).await {
+            if !user_sources_still_current(dossier, &sess.services.task_evidence).await {
                 return Ok(Err(ReviewFailureCategory::SourceDrift));
             }
             let Some(ReviewerPayload::Classification(output)) = execution.payload else {
@@ -2751,7 +2753,7 @@ async fn materialize_pending_sources(
                 }
                 None => ReviewerExecution::failed(ReviewFailureCategory::Capacity),
             };
-            if !user_sources_still_current(dossier).await {
+            if !user_sources_still_current(dossier, &sess.services.task_evidence).await {
                 return Ok(Err(ReviewFailureCategory::SourceDrift));
             }
             let Some(ReviewerPayload::ClassificationV2(output)) = execution.payload else {
@@ -2819,7 +2821,7 @@ async fn materialize_sources(
                 }
                 None => ReviewerExecution::failed(ReviewFailureCategory::Capacity),
             };
-            if !user_sources_still_current(dossier).await {
+            if !user_sources_still_current(dossier, &sess.services.task_evidence).await {
                 return Ok(Err(ReviewFailureCategory::SourceDrift));
             }
             let Some(ReviewerPayload::LocalClassification(output)) = execution.payload else {
@@ -2853,7 +2855,7 @@ async fn materialize_sources(
         }
         None => ReviewerExecution::failed(ReviewFailureCategory::Capacity),
     };
-    if !user_sources_still_current(dossier).await {
+    if !user_sources_still_current(dossier, &sess.services.task_evidence).await {
         return Ok(Err(ReviewFailureCategory::SourceDrift));
     }
     let Some(ReviewerPayload::RelationshipResolution(output)) = execution.payload else {
@@ -3522,7 +3524,9 @@ pub(crate) async fn coordinate_completion_review(
                 ..Default::default()
             });
         }
-        if !pending_lineage && !user_sources_still_current(&dossier).await {
+        if !pending_lineage
+            && !user_sources_still_current(&dossier, &sess.services.task_evidence).await
+        {
             let reasons = vec!["user source evidence changed before review admission".to_string()];
             record_review_not_admitted_correctness(
                 sess,
@@ -4326,7 +4330,7 @@ async fn run_contract_review(
         state.phase = TurnReviewPhase::Terminal;
         return Ok(CompletionReviewCoordinatorOutcome::default());
     };
-    if !user_sources_still_current(&dossier).await {
+    if !user_sources_still_current(&dossier, &sess.services.task_evidence).await {
         record_review_infrastructure(
             sess,
             turn_context,
@@ -4592,7 +4596,7 @@ async fn run_contract_review(
         || revalidated.dossier_snapshot_id != dossier.dossier_snapshot_id
         || revalidated.requirement_manifest_hash != dossier.requirement_manifest_hash
         || revalidated_attempt.value != attempt_identity.value
-        || !user_sources_still_current(&revalidated).await
+        || !user_sources_still_current(&revalidated, &sess.services.task_evidence).await
     {
         prepared.shutdown().await;
         state.phase = TurnReviewPhase::Terminal;
@@ -5240,6 +5244,7 @@ mod tests {
     fn dossier() -> CompletionReviewDossier {
         let source = UserSourceRecord {
             source_id: "source-1".to_string(),
+            origin_source_id: "source-1".to_string(),
             message_id: "message-1".to_string(),
             source_kind: UserSourceKind::Text,
             content_hash: "source-hash".to_string(),
@@ -6615,6 +6620,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_backed_sources_are_rehashed_for_review_and_terminal_freshness() {
+        let ledger = TaskEvidenceLedger::disabled();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("immutable-source.bin");
         let original = (0..1024 * 1024 + 17)
@@ -6642,17 +6648,17 @@ mod tests {
             let mut dossier = dossier();
             dossier.sources[0].source_kind = kind;
             dossier.sources[0].exact_material = material;
-            assert!(user_sources_still_current(&dossier).await);
+            assert!(user_sources_still_current(&dossier, &ledger).await);
 
             tokio::fs::write(&path, b"changed source bytes")
                 .await
                 .expect("mutate source fixture");
-            assert!(!user_sources_still_current(&dossier).await);
+            assert!(!user_sources_still_current(&dossier, &ledger).await);
 
             tokio::fs::remove_file(&path)
                 .await
                 .expect("remove source fixture");
-            assert!(!user_sources_still_current(&dossier).await);
+            assert!(!user_sources_still_current(&dossier, &ledger).await);
         }
     }
 }

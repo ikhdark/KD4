@@ -153,3 +153,44 @@ fn oversized_single_line_retains_bounded_head_and_tail() {
     assert!(summary.contains("[line truncated]"));
     assert!(summary.len() <= SUMMARY_MAX_BYTES + "\n[summary capped]".len());
 }
+
+#[test]
+fn compiler_failure_routes_to_emitting_source() {
+    let diagnostic = normalized_command_failure_diagnostic(
+        "error[E0425]: cannot find value `needle`\n  --> src/lib.rs:41:9",
+        Some("cargo check -p example"),
+        Some(101),
+        false,
+    )
+    .expect("failed compiler command should produce a diagnostic");
+
+    assert_eq!(diagnostic.class, ToolFailureClass::Compiler);
+    assert_eq!(diagnostic.owner_hint.as_deref(), Some("src/lib.rs:41:9"));
+    assert!(!diagnostic.retryable);
+    assert!(
+        diagnostic
+            .next_action
+            .as_deref()
+            .is_some_and(|action| action.contains("src/lib.rs:41:9"))
+    );
+}
+
+#[test]
+fn compiler_failure_fingerprint_ignores_source_line_movement() {
+    let first = normalized_command_failure_diagnostic(
+        "error[E0425]: cannot find value `needle`\n  --> src/lib.rs:41:9",
+        Some("cargo check -p example"),
+        Some(101),
+        false,
+    )
+    .expect("first compiler diagnostic");
+    let moved = normalized_command_failure_diagnostic(
+        "error[E0425]: cannot find value `needle`\n  --> src/lib.rs:57:3",
+        Some("cargo check -p example"),
+        Some(101),
+        false,
+    )
+    .expect("moved compiler diagnostic");
+
+    assert_eq!(first.fingerprint, moved.fingerprint);
+}

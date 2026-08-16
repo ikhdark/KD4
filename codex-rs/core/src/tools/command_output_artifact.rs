@@ -257,6 +257,28 @@ enum RetentionModeKind {
     Disabled,
 }
 
+fn emit_retention_health_transition(
+    event: &'static str,
+    from: RetentionModeKind,
+    to: RetentionModeKind,
+    generation: u64,
+    capacity: usize,
+    directories_visited: u64,
+    candidates_visited: u64,
+) {
+    tracing::warn!(
+        target: "codex_core::tool_output_retention",
+        event,
+        from = ?from,
+        to = ?to,
+        generation,
+        capacity,
+        directories_visited,
+        candidates_visited,
+        "tool output retention health transition"
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetentionDeltaDisposition {
     ApplyIndexed,
@@ -968,6 +990,7 @@ pub(crate) enum RawOutputArtifact {
         path: PathBuf,
         bytes: u64,
         truncated: bool,
+        hasher: Sha256,
         handle: Arc<File>,
     },
     Failed {
@@ -987,6 +1010,7 @@ impl PartialEq for RawOutputArtifact {
                     path: left_path,
                     bytes: left_bytes,
                     truncated: left_truncated,
+                    hasher: left_hasher,
                     ..
                 },
                 Self::Stored {
@@ -994,6 +1018,7 @@ impl PartialEq for RawOutputArtifact {
                     path: right_path,
                     bytes: right_bytes,
                     truncated: right_truncated,
+                    hasher: right_hasher,
                     ..
                 },
             ) => {
@@ -1001,6 +1026,7 @@ impl PartialEq for RawOutputArtifact {
                     && left_path == right_path
                     && left_bytes == right_bytes
                     && left_truncated == right_truncated
+                    && left_hasher.clone().finalize() == right_hasher.clone().finalize()
             }
             (
                 Self::Failed {
@@ -1034,6 +1060,7 @@ pub(crate) struct RawOutputArtifactWriter {
     file: Option<tokio::fs::File>,
     bytes: u64,
     truncated: bool,
+    hasher: Sha256,
     handle: Option<Arc<File>>,
     retention_token: Option<RetentionIndexToken>,
     lifecycle_completed: bool,
@@ -1048,6 +1075,7 @@ impl RawOutputArtifactWriter {
             path,
             bytes,
             truncated,
+            hasher,
             handle,
         } = artifact
         else {
@@ -1057,6 +1085,7 @@ impl RawOutputArtifactWriter {
                 file: None,
                 bytes: 0,
                 truncated: false,
+                hasher: Sha256::new(),
                 handle: None,
                 retention_token: None,
                 lifecycle_completed: true,
@@ -1074,6 +1103,7 @@ impl RawOutputArtifactWriter {
                         file: Some(file),
                         bytes,
                         truncated,
+                        hasher,
                         handle: Some(handle),
                         retention_token: Some(retention_token),
                         lifecycle_completed: false,
@@ -1097,6 +1127,7 @@ impl RawOutputArtifactWriter {
                             file: None,
                             bytes,
                             truncated,
+                            hasher: Sha256::new(),
                             handle: Some(handle),
                             retention_token: Some(retention_token),
                             lifecycle_completed: true,
@@ -1119,6 +1150,7 @@ impl RawOutputArtifactWriter {
                     file: None,
                     bytes,
                     truncated,
+                    hasher: Sha256::new(),
                     handle: Some(handle),
                     retention_token: Some(retention_token),
                     lifecycle_completed: true,
@@ -1156,6 +1188,7 @@ impl RawOutputArtifactWriter {
             return;
         }
         self.bytes = self.bytes.saturating_add(retained.len() as u64);
+        self.hasher.update(retained);
         match file.metadata().await.and_then(|metadata| {
             metadata
                 .modified()
@@ -1180,6 +1213,7 @@ impl RawOutputArtifactWriter {
             path,
             bytes: self.bytes,
             truncated: self.truncated,
+            hasher: self.hasher.clone(),
             handle,
         };
     }
@@ -1287,7 +1321,13 @@ impl RawOutputArtifact {
                 } else {
                     ""
                 };
-                format!("Raw output artifact: {id} ({bytes} bytes retained{suffix})")
+                let sha256 = self
+                    .proof_projection()
+                    .0
+                    .unwrap_or_else(|| "unavailable".to_string());
+                format!(
+                    "Raw output artifact: {id} ({bytes} bytes retained{suffix}, sha256 {sha256})"
+                )
             }
             Self::Failed {
                 id: Some(id),
@@ -1311,6 +1351,20 @@ impl RawOutputArtifact {
         }
     }
 
+    /// Integrity metadata for the exact retained byte stream. `complete=false`
+    /// means the artifact is a safety-limited prefix, not full command proof.
+    pub(crate) fn proof_projection(&self) -> (Option<String>, Option<bool>) {
+        match self {
+            Self::Stored {
+                truncated, hasher, ..
+            } => (
+                Some(format!("{:x}", hasher.clone().finalize())),
+                Some(!*truncated),
+            ),
+            Self::Failed { .. } => (None, None),
+        }
+    }
+
     pub(crate) fn reduction_notice(&self) -> Option<String> {
         let Self::Stored {
             id,
@@ -1329,8 +1383,12 @@ impl RawOutputArtifact {
         } else {
             "full retained output"
         };
+        let (sha256, complete) = self.proof_projection();
+        let proof = sha256.map_or_else(String::new, |sha256| {
+            format!(", sha256 {sha256}, complete={}", complete.unwrap_or(false))
+        });
         Some(format!(
-            "[command output reduced; {scope} is available as artifact {id}.\nUse read_tool_output with that id; search once for targets or batch exact ranges in one call.]"
+            "[command output reduced; {scope} is available as artifact {id}{proof}.\nUse read_tool_output once with that id: search for the exact error or owner, or batch every needed exact range or section in one call. Do not reread broad ranges.]"
         ))
     }
 
@@ -1355,6 +1413,15 @@ impl RawOutputArtifact {
     /// validation artifact is still retrievable and uncorrupted before reuse.
     /// This is an integrity check, not an artifact-content cache.
     pub(crate) async fn validation_integrity(&self) -> Option<(String, String)> {
+        self.validation_evidence()
+            .await
+            .map(|(id, sha256, _)| (id, sha256))
+    }
+
+    /// Reads immutable validation evidence for publication. Content is
+    /// returned only to assess semantic proof conditions such as whether a
+    /// test selector actually executed any tests.
+    pub(crate) async fn validation_evidence(&self) -> Option<(String, String, Vec<u8>)> {
         let Self::Stored {
             id, bytes, path, ..
         } = self
@@ -1373,7 +1440,7 @@ impl RawOutputArtifact {
             );
             file.read_to_end(&mut retained).ok()?;
             (u64::try_from(retained.len()).ok()? == expected_bytes)
-                .then(|| (id, format!("{:x}", Sha256::digest(&retained))))
+                .then(|| (id, format!("{:x}", Sha256::digest(&retained)), retained))
         })
         .await
         .ok()?
@@ -1472,6 +1539,7 @@ pub(crate) async fn create_raw_output_artifact(
                 path,
                 bytes: retained.len() as u64,
                 truncated,
+                hasher: Sha256::new_with_prefix(retained),
                 handle,
             }
         }
@@ -2230,6 +2298,7 @@ async fn create_evidence_output_artifact_inner(
         id,
         path,
         bytes: output.len() as u64,
+        hasher: Sha256::new_with_prefix(output),
         handle,
         cleanup,
         retention_permit: Some(retention_permit),
@@ -2240,6 +2309,7 @@ pub(crate) struct PendingEvidenceArtifact {
     id: ToolOutputArtifactId,
     path: PathBuf,
     bytes: u64,
+    hasher: Sha256,
     handle: Arc<File>,
     cleanup: PendingEvidenceArtifactCleanup,
     retention_permit: Option<SemaphorePermit<'static>>,
@@ -2258,6 +2328,7 @@ impl PendingEvidenceArtifact {
             path: self.path.clone(),
             bytes: self.bytes,
             truncated: false,
+            hasher: self.hasher.clone(),
             handle: self.handle.clone(),
         }
     }
@@ -2679,6 +2750,7 @@ pub(crate) async fn append_raw_output_artifact(
         path,
         bytes,
         truncated,
+        hasher,
         handle,
     } = artifact
     else {
@@ -2748,6 +2820,11 @@ pub(crate) async fn append_raw_output_artifact(
                         path: path.clone(),
                         bytes: metadata.len(),
                         truncated,
+                        hasher: {
+                            let mut hasher = hasher.clone();
+                            hasher.update(retained);
+                            hasher
+                        },
                         handle: handle.clone(),
                     }
                 }
@@ -2864,6 +2941,7 @@ pub(crate) async fn replace_raw_output_artifact(
                 path: path.clone(),
                 bytes: retained.len() as u64,
                 truncated,
+                hasher: Sha256::new_with_prefix(retained),
                 handle: handle.clone(),
             }
         }
@@ -4211,9 +4289,6 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
         };
         (generation, capacity, was_scan_only)
     };
-    #[cfg(not(test))]
-    let _ = was_scan_only;
-
     #[cfg(test)]
     let started = Instant::now();
     let scan = scan_retention_root(&root, capacity).await;
@@ -4246,6 +4321,15 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
             state.diagnostics.dirty_transitions =
                 state.diagnostics.dirty_transitions.saturating_add(1);
         }
+        emit_retention_health_transition(
+            "reconciliation_invalidated",
+            RetentionModeKind::Reconciling,
+            RetentionModeKind::Dirty,
+            generation,
+            capacity,
+            0,
+            0,
+        );
         return RetentionModeKind::Dirty;
     }
     match scan {
@@ -4265,6 +4349,17 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
             match candidate {
                 RetentionScanCandidate::Indexed(index) => {
                     state.mode = RetentionRootMode::Indexed(index);
+                    if was_scan_only {
+                        emit_retention_health_transition(
+                            "scan_only_recovered",
+                            RetentionModeKind::ScanOnly,
+                            RetentionModeKind::Indexed,
+                            generation,
+                            capacity,
+                            directories,
+                            candidates,
+                        );
+                    }
                     #[cfg(test)]
                     if was_scan_only {
                         record_retention_diagnostics! {
@@ -4282,6 +4377,17 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
                         state.diagnostics.oversized_root_fallbacks =
                             state.diagnostics.oversized_root_fallbacks.saturating_add(1);
                     }
+                    if !was_scan_only {
+                        emit_retention_health_transition(
+                            "oversized_root_fallback",
+                            RetentionModeKind::Reconciling,
+                            RetentionModeKind::ScanOnly,
+                            generation,
+                            capacity,
+                            directories,
+                            candidates,
+                        );
+                    }
                     #[cfg(test)]
                     if !was_scan_only {
                         record_retention_diagnostics! {
@@ -4293,12 +4399,23 @@ async fn reconcile_retention_root(root: &Path) -> RetentionModeKind {
                 }
             }
         }
-        Err(_) => {
+        Err(error) => {
             state.mode = RetentionRootMode::Dirty;
             record_retention_diagnostics! {
                 state.diagnostics.dirty_transitions =
                     state.diagnostics.dirty_transitions.saturating_add(1);
             }
+            tracing::warn!(
+                target: "codex_core::tool_output_retention",
+                event = "retention_scan_failed",
+                from = ?RetentionModeKind::Reconciling,
+                to = ?RetentionModeKind::Dirty,
+                generation,
+                capacity,
+                error_kind = ?error.kind(),
+                raw_os_error = error.raw_os_error(),
+                "tool output retention health transition"
+            );
             RetentionModeKind::Dirty
         }
     }
@@ -5098,6 +5215,7 @@ mod tests {
         let oversized = vec![b'x'; MAX_RAW_OUTPUT_ARTIFACT_BYTES + 1];
 
         let artifact = create_raw_output_artifact(temp.path(), "thread", &oversized).await;
+        let (sha256, complete) = artifact.proof_projection();
 
         let RawOutputArtifact::Stored {
             path,
@@ -5110,6 +5228,14 @@ mod tests {
         };
         assert_eq!(bytes, MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64);
         assert!(truncated);
+        assert_eq!(complete, Some(false));
+        assert_eq!(
+            sha256,
+            Some(format!(
+                "{:x}",
+                Sha256::digest(&oversized[..MAX_RAW_OUTPUT_ARTIFACT_BYTES])
+            ))
+        );
         assert_eq!(
             tokio::fs::metadata(path)
                 .await

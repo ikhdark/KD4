@@ -404,6 +404,14 @@ fn model_requests_record_dispatch_output_completion_and_continuation() {
 
     clock.set_ms(10);
     let initial_wait = state.begin_model_request_wait();
+    state.record_model_request_token_categories(
+        codex_protocol::protocol::TurnTimingRequestTokenCategories {
+            base_instructions: 12,
+            tool_schemas: 34,
+            logical_total: 46,
+            ..Default::default()
+        },
+    );
     clock.set_ms(20);
     state.mark_model_request_dispatched();
     clock.set_ms(25);
@@ -433,16 +441,40 @@ fn model_requests_record_dispatch_output_completion_and_continuation() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 11);
+    assert_eq!(timing.schema_version, 13);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(30));
     assert_eq!(timing.model_requests[0].completed_ms, Some(40));
     assert!(!timing.model_requests[0].is_continuation);
+    let categories = timing.model_requests[0]
+        .request_token_categories
+        .as_ref()
+        .expect("request token category aggregates");
+    assert_eq!(categories.base_instructions, 12);
+    assert_eq!(categories.tool_schemas, 34);
+    assert_eq!(categories.logical_total, 46);
     assert_eq!(timing.model_requests[1].dispatch_ms, Some(60));
     assert_eq!(timing.model_requests[1].first_model_output_ms, Some(70));
     assert_eq!(timing.model_requests[1].completed_ms, Some(80));
     assert!(timing.model_requests[1].is_continuation);
+}
+
+#[test]
+fn architecture_comprehension_telemetry_is_aggregate_only() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    state.record_architecture_slice_evaluation(true, 9, 2, 0, 0, false, 3, 4, 1_024, 1);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.architecture_slice_attempt_count, 1);
+    assert_eq!(counters.architecture_slice_complete_count, 1);
+    assert_eq!(counters.architecture_relationship_count, 9);
+    assert_eq!(counters.architecture_invariant_count, 2);
+    assert_eq!(counters.architecture_tool_call_count, 3);
+    assert_eq!(counters.architecture_files_read, 4);
+    assert_eq!(counters.architecture_bytes_read, 1_024);
+    assert_eq!(counters.architecture_late_relationship_discovery_count, 1);
 }
 
 #[test]
@@ -1041,7 +1073,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 11);
+    assert_eq!(profile.schema_version, 13);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);

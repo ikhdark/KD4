@@ -87,6 +87,8 @@ use codex_protocol::protocol::TurnTerminalizationCompleteEvent;
 use codex_protocol::protocol::TurnTerminalizationReceipt;
 use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingTerminalization;
+use codex_tools::ToolFailureClass;
+use codex_tools::ToolFailureDiagnostic;
 
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
@@ -176,6 +178,17 @@ impl TerminalDeadline {
             }
             Err(_) => Err(TerminalWaitError::OperationTimedOut),
         }
+    }
+
+    async fn run_remaining<T, F>(
+        &self,
+        phase: &'static str,
+        future: F,
+    ) -> Result<T, TerminalWaitError>
+    where
+        F: Future<Output = T>,
+    {
+        self.run(phase, TERMINALIZATION_DEADLINE, future).await
     }
 
     fn record_exhausted(&self, phase: &'static str) {
@@ -579,6 +592,36 @@ struct TerminalInteractionMilestone {
     cleared_active_turn: bool,
 }
 
+fn terminal_wait_failure_reason(phase: &str, error: TerminalWaitError) -> String {
+    let (cause, message, retryable, next_action) = match error {
+        TerminalWaitError::OperationTimedOut => (
+            "operation_timed_out",
+            format!("terminal phase `{phase}` timed out before the shared deadline"),
+            true,
+            "inspect final-proof sealing latency and retry only after the underlying state changes",
+        ),
+        TerminalWaitError::DeadlineExhausted => (
+            "deadline_exhausted",
+            format!("terminalization deadline exhausted during `{phase}`"),
+            false,
+            "preserve the partial completion evidence and inspect the earlier terminal phases that consumed the deadline",
+        ),
+    };
+    ToolFailureDiagnostic::model_visible(
+        ToolFailureClass::Completion,
+        format!("completion.{phase}.{cause}"),
+        message,
+    )
+    .with_retryable(retryable)
+    .with_owner_hint("task evidence final-proof sealing")
+    .with_next_action(next_action)
+    .to_string()
+}
+
+fn terminal_final_proof_requires_sealing(has_task_attributed_mutations: bool) -> bool {
+    has_task_attributed_mutations
+}
+
 async fn seal_terminal_final_proof(
     session: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -602,6 +645,12 @@ async fn seal_terminal_final_proof(
             authoritative.default_children_quiescent,
         )
         .await?;
+    // Candidate sealing proves a task-attributed mutation. Read-only turns still use the
+    // ordinary completion gate, but must not enter the bounded Git/diff sealing path: doing so
+    // can turn a successful answer into a spurious partial result when that path times out.
+    if !terminal_final_proof_requires_sealing(dossier.has_task_attributed_mutations) {
+        return None;
+    }
     let identity_snapshot = session
         .services
         .task_evidence
@@ -2509,7 +2558,12 @@ impl Session {
                                     crate::task_evidence::CompletionReviewCyclePhase::ProvisionalClean,
                                 ) =>
                         {
-                            if !completion_review::user_sources_still_current(&dossier).await {
+                            if !completion_review::user_sources_still_current(
+                                &dossier,
+                                &self.services.task_evidence,
+                            )
+                            .await
+                            {
                                 let _ = self
                                     .services
                                     .task_evidence
@@ -2579,6 +2633,7 @@ impl Session {
                                                     )
                                                     && completion_review::user_sources_still_current(
                                                         retry_dossier,
+                                                        &self.services.task_evidence,
                                                     )
                                                     .await =>
                                             {
@@ -2787,9 +2842,8 @@ impl Session {
                 .record_elapsed("diff_refresh", Duration::ZERO);
             let sealed = finalization
                 .deadline
-                .run(
+                .run_remaining(
                     "final_proof_gate",
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
                     seal_terminal_final_proof(
                         self,
                         &turn_context,
@@ -2917,9 +2971,9 @@ impl Session {
                     completion = Some(gate);
                 }
                 Ok(None) => {}
-                Err(_) => merge_completion_review_partial(
+                Err(error) => merge_completion_review_partial(
                     &mut completion,
-                    vec!["final-proof candidate sealing timed out".to_string()],
+                    vec![terminal_wait_failure_reason("final_proof_gate", error)],
                 ),
             }
         }

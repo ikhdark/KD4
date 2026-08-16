@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
 use codex_exec_server::ExecutorFileSystem;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
@@ -128,12 +130,15 @@ impl SkillsService {
         input: &SkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
-        let roots = self.skill_roots_for_config(input, fs).await;
+        let extra_roots = self.extra_roots();
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
-        let cache_key = config_skills_cache_key(&roots, &skill_config_rules);
+        let cache_key = config_skills_cache_key(input, &extra_roots, &skill_config_rules);
         if let Some(snapshot) = self.cached_snapshot_for_config(&cache_key) {
             return snapshot;
         }
+        let roots = self
+            .skill_roots_for_config_with_extra_roots(input, fs, extra_roots)
+            .await;
 
         let snapshot = HostSkillsSnapshot::new(Arc::new(
             self.build_skill_outcome(input, roots, &skill_config_rules)
@@ -152,12 +157,22 @@ impl SkillsService {
         input: &SkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> Vec<SkillRoot> {
+        self.skill_roots_for_config_with_extra_roots(input, fs, self.extra_roots())
+            .await
+    }
+
+    async fn skill_roots_for_config_with_extra_roots(
+        &self,
+        input: &SkillsLoadInput,
+        fs: Option<Arc<dyn ExecutorFileSystem>>,
+        extra_roots: Vec<AbsolutePathBuf>,
+    ) -> Vec<SkillRoot> {
         let mut roots = skill_roots(
             fs,
             &input.config_layer_stack,
             &input.cwd,
             input.effective_skill_roots.clone(),
-            self.extra_roots(),
+            extra_roots,
         )
         .await;
         if !input.bundled_skills_enabled {
@@ -270,8 +285,76 @@ impl SkillsService {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConfigSkillsCacheKey {
-    roots: Vec<(AbsolutePathBuf, u8, Option<String>, Option<String>)>,
+    cwd: AbsolutePathBuf,
+    effective_skill_roots: Vec<PluginSkillRoot>,
+    config_layers: Vec<ConfigSkillsLayerKey>,
+    bundled_skills_enabled: bool,
+    extra_roots: Vec<AbsolutePathBuf>,
     skill_config_rules: SkillConfigRules,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConfigSkillsLayerKey {
+    source: ConfigSkillsLayerSource,
+    version: String,
+    disabled_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ConfigSkillsLayerSource {
+    Mdm {
+        domain: String,
+        key: String,
+    },
+    System {
+        file: AbsolutePathBuf,
+    },
+    EnterpriseManaged {
+        id: String,
+        name: String,
+    },
+    User {
+        file: AbsolutePathBuf,
+        profile: Option<String>,
+    },
+    Project {
+        dot_codex_folder: AbsolutePathBuf,
+    },
+    SessionFlags,
+    LegacyManagedConfigTomlFromFile {
+        file: AbsolutePathBuf,
+    },
+    LegacyManagedConfigTomlFromMdm,
+}
+
+impl From<&ConfigLayerSource> for ConfigSkillsLayerSource {
+    fn from(source: &ConfigLayerSource) -> Self {
+        match source {
+            ConfigLayerSource::Mdm { domain, key } => Self::Mdm {
+                domain: domain.clone(),
+                key: key.clone(),
+            },
+            ConfigLayerSource::System { file } => Self::System { file: file.clone() },
+            ConfigLayerSource::EnterpriseManaged { id, name } => Self::EnterpriseManaged {
+                id: id.clone(),
+                name: name.clone(),
+            },
+            ConfigLayerSource::User { file, profile } => Self::User {
+                file: file.clone(),
+                profile: profile.clone(),
+            },
+            ConfigLayerSource::Project { dot_codex_folder } => Self::Project {
+                dot_codex_folder: dot_codex_folder.clone(),
+            },
+            ConfigLayerSource::SessionFlags => Self::SessionFlags,
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => {
+                Self::LegacyManagedConfigTomlFromFile { file: file.clone() }
+            }
+            ConfigLayerSource::LegacyManagedConfigTomlFromMdm => {
+                Self::LegacyManagedConfigTomlFromMdm
+            }
+        }
+    }
 }
 
 pub fn bundled_skills_enabled_from_stack(
@@ -297,27 +380,28 @@ pub fn bundled_skills_enabled_from_stack(
 }
 
 fn config_skills_cache_key(
-    roots: &[SkillRoot],
+    input: &SkillsLoadInput,
+    extra_roots: &[AbsolutePathBuf],
     skill_config_rules: &SkillConfigRules,
 ) -> ConfigSkillsCacheKey {
     ConfigSkillsCacheKey {
-        roots: roots
-            .iter()
-            .map(|root| {
-                let scope_rank = match root.scope {
-                    SkillScope::Repo => 0,
-                    SkillScope::User => 1,
-                    SkillScope::System => 2,
-                    SkillScope::Admin => 3,
-                };
-                (
-                    root.path.clone(),
-                    scope_rank,
-                    root.plugin_id.clone(),
-                    root.plugin_namespace.clone(),
-                )
+        cwd: input.cwd.clone(),
+        effective_skill_roots: input.effective_skill_roots.clone(),
+        config_layers: input
+            .config_layer_stack
+            .get_layers(
+                ConfigLayerStackOrdering::LowestPrecedenceFirst,
+                /*include_disabled*/ true,
+            )
+            .into_iter()
+            .map(|layer| ConfigSkillsLayerKey {
+                source: (&layer.name).into(),
+                version: layer.version.clone(),
+                disabled_reason: layer.disabled_reason.clone(),
             })
             .collect(),
+        bundled_skills_enabled: input.bundled_skills_enabled,
+        extra_roots: extra_roots.to_vec(),
         skill_config_rules: skill_config_rules.clone(),
     }
 }

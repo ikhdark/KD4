@@ -260,36 +260,59 @@ async fn try_verify_apply_patch_args(
     }
 
     let mut changes = HashMap::new();
-    for hunk in hunks {
+    let mut source_preconditions = HashMap::new();
+    for hunk in &hunks {
         let path = hunk.resolve_path(&effective_cwd)?;
         match hunk {
             Hunk::AddFile { contents, .. } => {
-                changes.insert(path, ApplyPatchFileChange::Add { content: contents });
+                changes.insert(
+                    path,
+                    ApplyPatchFileChange::Add {
+                        content: contents.clone(),
+                    },
+                );
             }
             Hunk::DeleteFile { .. } => {
+                let before = fs.get_metadata(&path, sandbox).await.ok();
                 let content = fs.read_file_text(&path, sandbox).await.map_err(|source| {
                     ApplyPatchError::IoError(IoError {
                         context: format!("Failed to read {}", path.inferred_native_path_string()),
                         source,
                     })
                 })?;
+                let after = fs.get_metadata(&path, sandbox).await.ok();
+                if let (Some(before), Some(after)) = (before, after)
+                    && before == after
+                {
+                    source_preconditions.insert(path.clone(), before);
+                }
                 changes.insert(path, ApplyPatchFileChange::Delete { content });
             }
             Hunk::UpdateFile {
                 move_path, chunks, ..
             } => {
+                let before = fs.get_metadata(&path, sandbox).await.ok();
                 let ApplyPatchFileUpdate {
                     unified_diff,
+                    original_content,
                     content: contents,
                     ..
-                } = unified_diff_from_chunks(&path, &chunks, fs, sandbox).await?;
+                } = unified_diff_from_chunks(&path, chunks, fs, sandbox).await?;
+                let after = fs.get_metadata(&path, sandbox).await.ok();
+                if let (Some(before), Some(after)) = (before, after)
+                    && before == after
+                {
+                    source_preconditions.insert(path.clone(), before);
+                }
                 changes.insert(
                     path,
                     ApplyPatchFileChange::Update {
                         unified_diff,
                         move_path: move_path
+                            .as_ref()
                             .map(|path| effective_cwd.join(&path.to_string_lossy()))
                             .transpose()?,
+                        old_content: original_content,
                         new_content: contents,
                     },
                 );
@@ -298,6 +321,8 @@ async fn try_verify_apply_patch_args(
     }
     Ok(ApplyPatchAction {
         changes,
+        hunks,
+        source_preconditions,
         patch,
         cwd: effective_cwd,
     })
@@ -1050,6 +1075,12 @@ PATCH"#,
             /*sandbox*/ None,
         )
         .await;
+        let source_path = PathUri::from_host_native_path(session_dir.path().join(relative_path))
+            .expect("absolute test path");
+        let source_metadata = LOCAL_FS
+            .get_metadata(&source_path, /*sandbox*/ None)
+            .await
+            .expect("source metadata");
 
         // Verify the patch contents - as otherwise we may have pulled contents
         // from the wrong file (as we're using relative paths)
@@ -1057,8 +1088,7 @@ PATCH"#,
             result,
             MaybeApplyPatchVerified::Body(ApplyPatchAction {
                 changes: HashMap::from([(
-                    PathUri::from_host_native_path(session_dir.path().join(relative_path))
-                        .expect("absolute test path"),
+                    source_path.clone(),
                     ApplyPatchFileChange::Update {
                         unified_diff: r#"@@ -1 +1 @@
 -session directory content
@@ -1066,9 +1096,12 @@ PATCH"#,
 "#
                         .to_string(),
                         move_path: None,
+                        old_content: "session directory content\n".to_string(),
                         new_content: "updated session directory content\n".to_string(),
                     },
                 )]),
+                hunks: parse_patch(&argv[1]).expect("parse patch").hunks,
+                source_preconditions: HashMap::from([(source_path, source_metadata)]),
                 patch: argv[1].clone(),
                 cwd: PathUri::from_host_native_path(session_dir.path())
                     .expect("absolute test path"),

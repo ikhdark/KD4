@@ -92,6 +92,13 @@ pub fn create_update_plan_tool() -> ToolSpec {
             )),
         ),
         (
+            "finalize".to_string(),
+            JsonSchema::boolean(Some(
+                "Consume every newly admissible validation route and return explicit terminal or missing-evidence state in this call."
+                    .to_string(),
+            )),
+        ),
+        (
             "tier".to_string(),
             JsonSchema::string_enum(
                 vec![json!("focused"), json!("medium"), json!("complex")],
@@ -178,6 +185,10 @@ pub fn create_update_plan_tool() -> ToolSpec {
             "external_validation_route".to_string(),
             external_validation_route_schema(),
         ),
+        (
+            "architecture_slice".to_string(),
+            architecture_slice_schema(),
+        ),
         ("step_evidence".to_string(), step_evidence_schema()),
         (
             "plan".to_string(),
@@ -201,11 +212,13 @@ pub fn create_update_plan_tool() -> ToolSpec {
 Use focused only for one atomic owner/scope with no cross-owner contract, one mutation obligation, and one feasible validation route; it uses a stable internal work unit and an empty plan.
 Use a short evidence-first medium plan for bounded multi-surface work. Use the complete complex representation for multi-owner, architectural, generated-contract, migration, high-risk, or dependent-validation work.
 Internal tier selection never changes collaboration mode. Complexity escalation in Default mode upgrades only this representation. Omitted facts and steps remain active; removals need reasons.
-Stop exploration once owner, call path, affected contract/scope, validation route, and material risks are established. Keep focused work checklist-free and medium plans short.
+Before the first write, close a bounded architecture slice: identify the source owner; search and record or explicitly rule out constructors, direct builders/bypasses, callers/consumers, literals, serialization/configuration representations, registration/entrypoints, tests/contracts, generated artifacts, and invariants; and bind the nearest feasible validation route. Closure requires an untruncated snapshot with zero omissions and material unknowns; heuristic edges alone are insufficient. Keep focused work checklist-free and medium plans short.
+After closure, patch and semantically validate one owner slice at a time instead of batching speculative downstream edits. Keep validation-driven diagnosis and repair in that slice and rerun its focused proof; those repairs are useful evidence, not avoidable churn. Format once, scoped to touched files, after semantic behavior is proved; do not format between semantic edits.
 At most one step can be in_progress at a time.
 Use stable ids, owners, bounded surfaces, dependencies, obligations, and acceptance criteria. Edits
 record partial obligation progress. Set a step to passed only when applicable fresh proof exists; completion
 still checks declared artifacts, Desktop activation, plan structure, and blocking risks.
+Set finalize=true for terminal close-out instead of issuing separate no-op plan updates or status checks.
 "#
         .to_string(),
         strict: false,
@@ -302,11 +315,210 @@ fn step_evidence_schema() -> JsonSchema {
                     "external_validation_route".to_string(),
                     external_validation_route_schema(),
                 ),
+                (
+                    "architecture_slice".to_string(),
+                    architecture_slice_schema(),
+                ),
             ]),
             Some(vec!["step_id".to_string()]),
             Some(false.into()),
         ),
         Some("Stable-ID evidence patches for medium and complex steps.".to_string()),
+    )
+}
+
+fn architecture_slice_schema() -> JsonSchema {
+    let facet = || architecture_facet_schema();
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "snapshot".to_string(),
+                JsonSchema::string(Some(
+                    "Repository/index snapshot identity used for every relationship.".to_string(),
+                )),
+            ),
+            ("control_and_data_flow".to_string(), facet()),
+            ("callers_and_consumers".to_string(), facet()),
+            ("configuration_and_gates".to_string(), facet()),
+            ("registration_and_entrypoints".to_string(), facet()),
+            ("tests_and_contracts".to_string(), facet()),
+            ("generated_artifacts".to_string(), facet()),
+            ("invariants".to_string(), facet()),
+            (
+                "truncated".to_string(),
+                JsonSchema::boolean(Some(
+                    "Whether the producer truncated relationships; closure requires false."
+                        .to_string(),
+                )),
+            ),
+            (
+                "omitted_relationships".to_string(),
+                JsonSchema::integer(Some(
+                    "Known omitted relationship count; closure requires zero.".to_string(),
+                )),
+            ),
+            (
+                "material_unknowns".to_string(),
+                JsonSchema::array(
+                    JsonSchema::string(Some("Unresolved material relationship.".to_string())),
+                    Some("Material unknowns; closure requires an empty list.".to_string()),
+                ),
+            ),
+            (
+                "limitations".to_string(),
+                JsonSchema::array(
+                    JsonSchema::string(Some("Known non-blocking evidence limitation.".to_string())),
+                    Some("Limitations retained in the closure receipt.".to_string()),
+                ),
+            ),
+            ("metrics".to_string(), architecture_metrics_schema()),
+        ]),
+        Some(vec![
+            "snapshot".to_string(),
+            "control_and_data_flow".to_string(),
+            "callers_and_consumers".to_string(),
+            "configuration_and_gates".to_string(),
+            "registration_and_entrypoints".to_string(),
+            "tests_and_contracts".to_string(),
+            "generated_artifacts".to_string(),
+            "invariants".to_string(),
+        ]),
+        Some(false.into()),
+    )
+}
+
+fn architecture_facet_schema() -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "status".to_string(),
+                JsonSchema::string_enum(
+                    vec![json!("established"), json!("not_applicable")],
+                    Some(
+                        "Established needs exact/declared evidence; not_applicable needs a reason."
+                            .to_string(),
+                    ),
+                ),
+            ),
+            (
+                "relationships".to_string(),
+                JsonSchema::array(
+                    architecture_relationship_schema(),
+                    Some(
+                        "Bounded relationship evidence; the complete slice may contain at most 32 edges."
+                            .to_string(),
+                    ),
+                ),
+            ),
+            (
+                "not_applicable_reason".to_string(),
+                JsonSchema::string(Some(
+                    "Evidence-backed reason this facet cannot affect the work.".to_string(),
+                )),
+            ),
+        ]),
+        Some(vec!["status".to_string()]),
+        Some(false.into()),
+    )
+}
+
+fn architecture_relationship_schema() -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "kind".to_string(),
+                JsonSchema::string_enum(
+                    [
+                        "control_flow",
+                        "data_flow",
+                        "caller",
+                        "consumer",
+                        "constructor",
+                        "direct_builder",
+                        "direct_bypass",
+                        "literal",
+                        "serialization",
+                        "configuration",
+                        "config_gate",
+                        "feature_gate",
+                        "registration",
+                        "entrypoint",
+                        "test",
+                        "contract",
+                        "generated_by",
+                        "generated_consumer",
+                        "invariant",
+                    ]
+                    .into_iter()
+                    .map(serde_json::Value::from)
+                    .collect(),
+                    Some("Typed architectural edge.".to_string()),
+                ),
+            ),
+            (
+                "source".to_string(),
+                JsonSchema::string(Some("Edge source owner, path, or symbol.".to_string())),
+            ),
+            (
+                "target".to_string(),
+                JsonSchema::string(Some("Edge target owner, path, or symbol.".to_string())),
+            ),
+            (
+                "evidence".to_string(),
+                JsonSchema::string(Some(
+                    "Exact source location or declarative index record supporting the edge."
+                        .to_string(),
+                )),
+            ),
+            (
+                "provenance".to_string(),
+                JsonSchema::string_enum(
+                    vec![json!("exact"), json!("declared"), json!("heuristic")],
+                    Some(
+                        "Evidence strength; heuristic relationships cannot establish a facet alone."
+                            .to_string(),
+                    ),
+                ),
+            ),
+        ]),
+        Some(vec![
+            "kind".to_string(),
+            "source".to_string(),
+            "target".to_string(),
+            "evidence".to_string(),
+            "provenance".to_string(),
+        ]),
+        Some(false.into()),
+    )
+}
+
+fn architecture_metrics_schema() -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "tool_calls".to_string(),
+                JsonSchema::integer(Some(
+                    "Discovery tool calls used for this slice.".to_string(),
+                )),
+            ),
+            (
+                "files_read".to_string(),
+                JsonSchema::integer(Some("Files read before closure.".to_string())),
+            ),
+            (
+                "bytes_read".to_string(),
+                JsonSchema::integer(Some("Source bytes read before closure.".to_string())),
+            ),
+            (
+                "late_relationship_discoveries".to_string(),
+                JsonSchema::integer(Some(
+                    "Material relationships discovered after the first closure attempt."
+                        .to_string(),
+                )),
+            ),
+        ]),
+        None,
+        Some(false.into()),
     )
 }
 

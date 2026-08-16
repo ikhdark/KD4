@@ -6,6 +6,7 @@ use crate::tasks::SessionTaskContext;
 use crate::tasks::SessionTaskResult;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::GoalSurfaceState;
+use crate::tools::exposure::TaskToolPhase;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolRouter;
@@ -348,6 +349,56 @@ fn finalized_router_reuse_requires_identical_coarse_exposure_identity() {
 }
 
 #[test]
+fn durable_plan_status_derives_coarse_task_tool_phase() {
+    use codex_protocol::plan_tool::PlanItemArg;
+    use codex_protocol::plan_tool::StepStatus;
+    use codex_protocol::plan_tool::UpdatePlanArgs;
+
+    let plan_with = |statuses: &[StepStatus]| UpdatePlanArgs {
+        explanation: None,
+        plan: statuses
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, status)| PlanItemArg {
+                id: Some(format!("step-{index}")),
+                step: format!("step {index}"),
+                status,
+                ..PlanItemArg::default()
+            })
+            .collect(),
+    };
+
+    assert_eq!(task_tool_phase(None), TaskToolPhase::Discovery);
+    assert_eq!(
+        task_tool_phase(Some(&plan_with(&[]))),
+        TaskToolPhase::Discovery
+    );
+    assert_eq!(
+        task_tool_phase(Some(&plan_with(&[
+            StepStatus::Pending,
+            StepStatus::InProgress,
+        ]))),
+        TaskToolPhase::Implementation
+    );
+    assert_eq!(
+        task_tool_phase(Some(&plan_with(&[
+            StepStatus::Passed,
+            StepStatus::Implemented,
+        ]))),
+        TaskToolPhase::Validation
+    );
+    assert_eq!(
+        task_tool_phase(Some(&plan_with(&[
+            StepStatus::Passed,
+            StepStatus::Skipped,
+            StepStatus::Completed,
+        ]))),
+        TaskToolPhase::Completion
+    );
+}
+
+#[test]
 fn goal_surface_state_has_disabled_inactive_and_active_transitions() {
     let tool = |name, exposure| {
         Arc::new(ExposureOnlyTool { name, exposure })
@@ -373,7 +424,7 @@ fn goal_surface_state_has_disabled_inactive_and_active_transitions() {
 }
 
 #[test]
-fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
+fn agent_surface_stage_preserves_lifecycle_without_spawn_authorization() {
     assert_eq!(
         agent_surface_stage_from_snapshot(false, false, false),
         AgentSurfaceStage::Prohibited
@@ -387,11 +438,19 @@ fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
         AgentSurfaceStage::Lifecycle
     );
     assert_eq!(
+        agent_surface_stage_from_snapshot(false, true, false),
+        AgentSurfaceStage::Lifecycle
+    );
+    assert_eq!(
         agent_surface_stage_from_snapshot(true, false, true),
         AgentSurfaceStage::TypedAdministration
     );
     assert_eq!(
         agent_surface_stage_from_snapshot(true, true, true),
+        AgentSurfaceStage::TypedAdministration
+    );
+    assert_eq!(
+        agent_surface_stage_from_snapshot(false, false, true),
         AgentSurfaceStage::TypedAdministration
     );
 

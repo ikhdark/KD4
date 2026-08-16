@@ -1746,6 +1746,7 @@ fn sampling_boundary_fork_excludes_uncommitted_suffix() {
         physical_attempt_id: "attempt-1".to_string(),
         turn_id: Some("turn-1".to_string()),
         unresolved_context: true,
+        projection_manifest: None,
     });
     let unfinished_output = RolloutItem::ResponseItem(ResponseItem::Message {
         id: None,

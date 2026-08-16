@@ -96,6 +96,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TurnTimingRequestTokenCategories;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
@@ -227,6 +228,51 @@ struct PromptContextBaseline {
 }
 
 impl ModelRequestMeasurements {
+    fn request_token_categories(&self) -> TurnTimingRequestTokenCategories {
+        let tokens = |category: PromptContextCategory| {
+            self.prompt_context_categories
+                .iter()
+                .find(|measurement| measurement.category == category.as_str())
+                .map_or(0, |measurement| measurement.estimated_tokens)
+        };
+        let other_injected_context = [
+            PromptContextCategory::AgentRole,
+            PromptContextCategory::Plugins,
+            PromptContextCategory::AppDesktop,
+            PromptContextCategory::Collaboration,
+            PromptContextCategory::EnvironmentPermissions,
+            PromptContextCategory::OtherInjected,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, category| {
+            total.saturating_add(tokens(category))
+        });
+        let logical_total = self
+            .prompt_context_categories
+            .iter()
+            .fold(0_u64, |total, measurement| {
+                total.saturating_add(measurement.estimated_tokens)
+            });
+        let repeated_unchanged_context = self
+            .prompt_context_categories
+            .iter()
+            .filter(|measurement| measurement.unchanged_from_previous_request)
+            .fold(0_u64, |total, measurement| {
+                total.saturating_add(measurement.estimated_tokens)
+            });
+        TurnTimingRequestTokenCategories {
+            base_instructions: tokens(PromptContextCategory::BaseSystem),
+            tool_schemas: tokens(PromptContextCategory::ToolSchemas),
+            conversation_history: tokens(PromptContextCategory::History),
+            current_input: tokens(PromptContextCategory::TaskInput),
+            repository_context: tokens(PromptContextCategory::Repository),
+            skills: tokens(PromptContextCategory::Skills),
+            other_injected_context,
+            logical_total,
+            repeated_unchanged_context,
+        }
+    }
+
     fn for_responses_request(
         request: &ResponsesApiRequest,
         provenance: &PromptProvenanceSidecar,
@@ -810,6 +856,7 @@ struct CurrentClientSetup {
 pub(crate) type AttemptPreparedCallback = Arc<
     dyn Fn(
             ResponseAttemptIdentity,
+            bool,
         )
             -> futures::future::BoxFuture<'static, Result<Option<tokio::sync::OwnedMutexGuard<()>>>>
         + Send
@@ -2804,6 +2851,10 @@ impl ModelClientSession {
                 &mut self.prompt_context_baseline,
                 request.prompt_cache_key.as_deref(),
             );
+            if let Some(timing) = self.turn_timing.as_ref() {
+                timing
+                    .record_model_request_token_categories(measurements.request_token_categories());
+            }
             let mut attempt = ModelAttemptGuard::new(
                 request_session_telemetry.clone(),
                 sampling_request_id,
@@ -2823,7 +2874,9 @@ impl ModelClientSession {
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
             let _sampling_admission = match attempt_prepared.as_ref() {
-                Some(attempt_prepared) => attempt_prepared(attempt.response_identity()).await?,
+                Some(attempt_prepared) => {
+                    attempt_prepared(attempt.response_identity(), false).await?
+                }
                 None => None,
             };
             let client = ApiResponsesClient::new(
@@ -3071,7 +3124,9 @@ impl ModelClientSession {
                         == prompt.stable_context_manifest.fingerprint()
                 });
             let ResponsesWsRequest::ResponseCreate(final_payload) = &mut ws_request;
+            let mut stable_context_fallback_used = false;
             if final_payload.previous_response_id.is_some() && !inherited_stable_context_matches {
+                stable_context_fallback_used = true;
                 trace!("discarding unproven provider inheritance before stable-context dispatch");
                 self.invalidate_incremental_history("stable context inheritance unproven");
                 final_payload.previous_response_id = None;
@@ -3163,6 +3218,12 @@ impl ModelClientSession {
                         "websocket connection is unavailable".to_string(),
                     ))
                 })?;
+            if let (Some(measurements), Some(timing)) =
+                (request_measurements.as_ref(), self.turn_timing.as_ref())
+            {
+                timing
+                    .record_model_request_token_categories(measurements.request_token_categories());
+            }
             let mut attempt =
                 request_measurements
                     .zip(attempt_clock)
@@ -3181,7 +3242,8 @@ impl ModelClientSession {
             let attempt_clock = attempt.as_ref().map(ModelAttemptGuard::clock);
             let _sampling_admission = match (attempt.as_ref(), attempt_prepared.as_ref()) {
                 (Some(attempt), Some(attempt_prepared)) => {
-                    attempt_prepared(attempt.response_identity()).await?
+                    attempt_prepared(attempt.response_identity(), stable_context_fallback_used)
+                        .await?
                 }
                 _ => None,
             };

@@ -1,8 +1,8 @@
 # Investigation evaluation corpus
 
 This directory owns the frozen, local-only evaluation corpus used to measure
-the behavior governed by the
-[investigation evidence contract](../../docs/investigation-evidence-v1.md).
+investigation behavior. Its manifest, validators, scorer, and fixtures own the
+current local evaluation contract.
 The corpus measures model behavior; it does not grant completion authority and
 it does not implement investigation checkpoints, hypotheses, stopping, or
 refutation.

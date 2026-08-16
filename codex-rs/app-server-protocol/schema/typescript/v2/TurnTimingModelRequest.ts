@@ -7,6 +7,7 @@ import type { TurnTimingGenerationPurpose } from "./TurnTimingGenerationPurpose"
 import type { TurnTimingGenerationReason } from "./TurnTimingGenerationReason";
 import type { TurnTimingProgressKind } from "./TurnTimingProgressKind";
 import type { TurnTimingProviderTokenUsage } from "./TurnTimingProviderTokenUsage";
+import type { TurnTimingRequestTokenCategories } from "./TurnTimingRequestTokenCategories";
 
 export type TurnTimingModelRequest = {
 /**
@@ -34,4 +35,9 @@ toolCallCount: number, outputTokens: bigint, reasoningOutputTokens: bigint,
  * Provider-reported usage for this physical attempt. Missing usage stays
  * null, including failed attempts for which the provider reported none.
  */
-tokenUsage?: TurnTimingProviderTokenUsage, dispatchMs?: number | null, firstModelOutputMs?: number | null, completedMs?: number | null, };
+tokenUsage?: TurnTimingProviderTokenUsage,
+/**
+ * Aggregate-only, locally estimated request composition. No prompt text,
+ * repository paths, tool arguments, or hashes are persisted here.
+ */
+requestTokenCategories?: TurnTimingRequestTokenCategories, dispatchMs?: number, firstModelOutputMs?: number, completedMs?: number, };

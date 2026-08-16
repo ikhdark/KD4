@@ -271,6 +271,8 @@ struct SamplingToolOutcome {
     kind: SamplingToolOutcomeKind,
     skip_disposition: Option<ToolOutputSkipDisposition>,
     plan: Option<UpdatePlanArgs>,
+    source_closure_established: bool,
+    failure_fingerprint: Option<String>,
 }
 
 impl SamplingToolOutcome {
@@ -286,19 +288,20 @@ impl SamplingToolOutcome {
             kind,
             skip_disposition: outcome_context.skip_disposition,
             plan,
+            source_closure_established: sampling_source_closure_established(signal),
+            failure_fingerprint: sampling_failure_fingerprint(signal),
         }
     }
 
     fn plain(ordinal: u64, kind: SamplingToolOutcomeKind, plan: Option<UpdatePlanArgs>) -> Self {
-        let outcome = match kind {
-            SamplingToolOutcomeKind::Success => ToolOutputOutcome::Success,
-            SamplingToolOutcomeKind::Timeout => ToolOutputOutcome::TimedOut,
-            SamplingToolOutcomeKind::Skipped => ToolOutputOutcome::Skipped,
-            SamplingToolOutcomeKind::Failure
-            | SamplingToolOutcomeKind::Blocked
-            | SamplingToolOutcomeKind::RecoverableCancellation => ToolOutputOutcome::Failure,
-        };
-        Self::from_signal(ordinal, ToolOutputOutcomeContext::new(outcome), plan, None)
+        Self {
+            ordinal,
+            kind,
+            skip_disposition: None,
+            plan,
+            source_closure_established: false,
+            failure_fingerprint: None,
+        }
     }
 
     fn is_failure_evidence(&self) -> bool {
@@ -401,6 +404,8 @@ struct SamplingRequestSignalState {
     code_mode_nested_tool_count: usize,
     authoritative_wait_observations: Vec<AuthoritativeWaitObservation>,
 }
+
+const OBSERVATION_ONLY_CHECKPOINT_INTERVAL: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PendingOwnerDrainedContinuation {
@@ -592,16 +597,20 @@ impl SamplingRequestSignalCollector {
         state.authoritative_wait_observations.first().cloned()
     }
 
-    pub(crate) fn record_failure_with_mutation(&self, ordinal: u64, _mutation_advanced: bool) {
+    pub(crate) fn record_failure_with_mutation(
+        &self,
+        ordinal: u64,
+        failure_fingerprint: Option<String>,
+        _mutation_advanced: bool,
+    ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.outcomes.push(SamplingToolOutcome::plain(
-            ordinal,
-            SamplingToolOutcomeKind::Failure,
-            None,
-        ));
+        let mut outcome =
+            SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
+        outcome.failure_fingerprint = failure_fingerprint;
+        state.outcomes.push(outcome);
     }
 
     pub(crate) fn record_response_result_with_mutation(
@@ -633,7 +642,49 @@ impl SamplingRequestSignalCollector {
         if state.registered_count == 0 {
             return Some("empty".to_string());
         }
-        None
+        if state.outcomes.len() != state.registered_count
+            || !state
+                .outcomes
+                .iter()
+                .all(SamplingToolOutcome::is_failure_evidence)
+        {
+            return None;
+        }
+        let mut failures = state
+            .outcomes
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .failure_fingerprint
+                    .as_ref()
+                    .map(|fingerprint| (outcome.ordinal, fingerprint.as_str()))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        failures.sort_by_key(|(ordinal, _)| *ordinal);
+        Some(format!(
+            "failure:{}",
+            failures
+                .into_iter()
+                .map(|(_, fingerprint)| fingerprint)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    }
+
+    fn completed_with_successful_observations_only(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.registered_count > 0
+            && state.outcomes.len() == state.registered_count
+            && state.outcomes.iter().all(|outcome| {
+                outcome.kind == SamplingToolOutcomeKind::Success && outcome.plan.is_none()
+            })
+            && state.wait_call_count == 0
+            && !state.saw_validation
+            && !state.saw_mutation
+            && !state.saw_coordination
     }
 
     pub(crate) fn is_wait_only(&self) -> bool {
@@ -781,6 +832,23 @@ fn sampling_plan(signal: Option<&Value>) -> Option<UpdatePlanArgs> {
         .and_then(|value| serde_json::from_value::<UpdatePlanArgs>(value.clone()).ok())
 }
 
+fn sampling_source_closure_established(signal: Option<&Value>) -> bool {
+    signal
+        .filter(|value| value.get("kind").and_then(Value::as_str) == Some("plan_update"))
+        .and_then(|value| value.get("source_closure_established"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn sampling_failure_fingerprint(signal: Option<&Value>) -> Option<String> {
+    signal
+        .and_then(|value| value.get("failure"))
+        .and_then(|failure| failure.get("fingerprint"))
+        .and_then(Value::as_str)
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .map(str::to_owned)
+}
+
 fn deterministic_action_identity(tool_name: &ToolName, payload: &ToolPayload) -> Option<String> {
     if !tool_name_matches(tool_name, "wait") && !tool_name_matches(tool_name, "wait_agent") {
         return None;
@@ -887,6 +955,7 @@ fn authoritative_wait_observation(
         "action": action,
         "receipt_identity": (disposition == AuthoritativeWaitDisposition::Terminal)
             .then_some(receipt_identity),
+        "surfaceable_message": surfaceable_message.as_deref(),
     }))
     .ok()?;
     let assignment_ids = result
@@ -1011,6 +1080,9 @@ pub(crate) struct SamplingReasoningGovernor {
     directive_issued: bool,
     proven_loop_active: bool,
     wait_convergence: Option<WaitConvergenceHandle>,
+    source_closure_active: bool,
+    pending_source_closure_directive: bool,
+    consecutive_observation_only_generations: u32,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -1019,6 +1091,7 @@ pub(crate) struct SamplingConvergenceDecision {
     pub(crate) directive: Option<String>,
     pub(crate) proven_loop_activated: bool,
     pub(crate) authoritative_wait: Option<AuthoritativeWaitResolution>,
+    pub(crate) no_progress_directive: bool,
 }
 
 impl SamplingReasoningGovernor {
@@ -1045,6 +1118,9 @@ impl SamplingReasoningGovernor {
             directive_issued: false,
             proven_loop_active: false,
             wait_convergence: None,
+            source_closure_active: false,
+            pending_source_closure_directive: false,
+            consecutive_observation_only_generations: 0,
         }
     }
 
@@ -1184,6 +1260,9 @@ impl SamplingReasoningGovernor {
 
     pub(crate) fn accepted_user_input(&mut self) {
         self.input_revision = self.input_revision.saturating_add(1);
+        self.source_closure_active = false;
+        self.pending_source_closure_directive = false;
+        self.consecutive_observation_only_generations = 0;
         self.reset_convergence();
         let mut ledger = self
             .dispatch_ledger
@@ -1195,6 +1274,19 @@ impl SamplingReasoningGovernor {
         self.transition_to(
             SamplingReasoningPhase::Orient,
             ReasoningPolicyTrigger::UserInput,
+        );
+    }
+
+    pub(crate) fn reuse_source_closure(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.source_closure_active = true;
+        self.pending_source_closure_directive = false;
+        self.consecutive_observation_only_generations = 0;
+        self.transition_to(
+            SamplingReasoningPhase::Implement,
+            ReasoningPolicyTrigger::PlanUpdated,
         );
     }
 
@@ -1229,15 +1321,46 @@ impl SamplingReasoningGovernor {
         settled: &SamplingRequestSettledState,
     ) -> SamplingConvergenceDecision {
         let settled_revision = self.settled_revision_key(settled);
+        if std::mem::take(&mut self.pending_source_closure_directive) {
+            self.reset_convergence();
+            self.last_state_revision = Some(settled_revision);
+            return SamplingConvergenceDecision {
+                continuation: ContinuationDisposition::ModelRequired,
+                directive: Some(
+                    "Source closure is established for the next dependency-ready work from a complete architecture slice: owner/surfaces, control and data flow, callers/consumers, configuration and gates, runtime registration/entrypoints, tests/contracts, generated artifacts, invariants, and validation are accounted for with no omissions or material unknowns. Stop broad repository discovery and execute against the declared surfaces. Reopen discovery if the snapshot becomes stale or execution contradicts any relationship."
+                        .to_string(),
+                ),
+                ..Default::default()
+            };
+        }
         if settled.mutation_revision != baselines.mutation_revision
             || settled.validation_status != baselines.validation_status
             || settled.validation_revision != baselines.validation_revision
             || self.plan_revision != baselines.plan_revision
             || self.input_revision != baselines.input_revision
         {
+            self.consecutive_observation_only_generations = 0;
             self.reset_convergence();
             self.last_state_revision = Some(settled_revision);
             return SamplingConvergenceDecision::default();
+        }
+
+        if self.consecutive_observation_only_generations >= OBSERVATION_ONLY_CHECKPOINT_INTERVAL
+            && self
+                .consecutive_observation_only_generations
+                .is_multiple_of(OBSERVATION_ONLY_CHECKPOINT_INTERVAL)
+        {
+            self.reset_convergence();
+            self.last_state_revision = Some(settled_revision);
+            return SamplingConvergenceDecision {
+                continuation: ContinuationDisposition::ModelRequired,
+                directive: Some(
+                    "Inspection checkpoint: eight more consecutive generations completed successful observation-only work without changing task, plan, workspace, or validation state. If owner, call path, affected contracts, validation route, and material risks are known, stop investigating now: synthesize the requested audit/report or begin implementation. Otherwise state the one exact unresolved closure question and perform only the bounded read needed to answer it."
+                        .to_string(),
+                ),
+                no_progress_directive: true,
+                ..Default::default()
+            };
         }
 
         if let Some(observation) = collector.authoritative_wait_observation() {
@@ -1317,6 +1440,7 @@ impl SamplingReasoningGovernor {
                             authoritative_wait: Some(AuthoritativeWaitResolution::Blocked(
                                 observation.result,
                             )),
+                            ..Default::default()
                         }
                     }
                 };
@@ -1343,10 +1467,12 @@ impl SamplingReasoningGovernor {
             self.proven_loop_active = false;
         }
         let cycle_is_nonempty = cycle != "empty";
+        let repeated_failure = repeated_cycle && cycle_is_nonempty && cycle.starts_with("failure:");
         self.last_cycle = Some(cycle);
         self.last_state_revision = Some(settled_revision);
 
-        if self.consecutive_no_progress < 3 {
+        let directive_threshold = if repeated_failure { 1 } else { 3 };
+        if self.consecutive_no_progress < directive_threshold {
             return SamplingConvergenceDecision::default();
         }
 
@@ -1358,7 +1484,9 @@ impl SamplingReasoningGovernor {
             self.proven_loop_active = true;
         }
         self.directive_issued = true;
-        let directive = if self.consecutive_no_progress == 3 {
+        let directive = if repeated_failure {
+            "The same normalized tool failure repeated against unchanged state. Do not retry an equivalent call. Follow the diagnostic owner hint and next action, change the input or state, or report the blocker."
+        } else if self.consecutive_no_progress == 3 {
             "Convergence required: the last three generations produced no structured state progress. Use a new hypothesis, a state-changing action, a narrower observation, or truthfully complete. Do not repeat an equivalent action against unchanged state."
         } else if self.proven_loop_active {
             "Convergence escalation: an ordered deterministic action/result cycle has repeated after the convergence directive against identical state. Do not repeat it. Change the hypothesis or state, narrow the observation, or truthfully complete; existing task lifecycle rules still govern termination."
@@ -1370,6 +1498,7 @@ impl SamplingReasoningGovernor {
             directive: Some(directive.to_string()),
             proven_loop_activated,
             authoritative_wait: None,
+            no_progress_directive: true,
         }
     }
 
@@ -1402,19 +1531,35 @@ impl SamplingReasoningGovernor {
         if !self.enabled {
             return;
         }
+        let observation_only = collector.completed_with_successful_observations_only()
+            && matches!(
+                self.phase,
+                SamplingReasoningPhase::Orient | SamplingReasoningPhase::Inspect
+            );
         let outcomes = collector.snapshot();
         let latest_plan = outcomes
             .iter()
             .filter(|outcome| outcome.kind == SamplingToolOutcomeKind::Success)
-            .filter_map(|outcome| outcome.plan.as_ref().map(|plan| (outcome.ordinal, plan)))
-            .max_by_key(|(ordinal, _)| *ordinal)
-            .map(|(_, plan)| plan.clone());
-        let changed_plan = latest_plan.filter(|plan| {
-            self.plan
-                .as_ref()
-                .is_none_or(|current| !plans_semantically_equal(current, plan))
-        });
-        if let Some(plan) = changed_plan.as_ref() {
+            .filter_map(|outcome| {
+                outcome
+                    .plan
+                    .as_ref()
+                    .map(|plan| (outcome.ordinal, plan, outcome.source_closure_established))
+            })
+            .max_by_key(|(ordinal, _, _)| *ordinal)
+            .map(|(_, plan, source_closure_established)| {
+                (plan.clone(), source_closure_established)
+            });
+        let changed_plan = latest_plan
+            .as_ref()
+            .filter(|(plan, _)| {
+                self.plan
+                    .as_ref()
+                    .is_none_or(|current| !plans_semantically_equal(current, plan))
+            })
+            .cloned();
+        let plan_changed = changed_plan.is_some();
+        if let Some((plan, _)) = changed_plan.as_ref() {
             self.plan = Some(plan.clone());
             self.plan_revision = self.plan_revision.saturating_add(1);
         }
@@ -1423,6 +1568,7 @@ impl SamplingReasoningGovernor {
             .filter(|outcome| outcome.is_failure_evidence())
             .min_by_key(|outcome| outcome.ordinal)
         {
+            self.consecutive_observation_only_generations = 0;
             let trigger = match failure.kind {
                 SamplingToolOutcomeKind::Failure => ReasoningPolicyTrigger::ToolFailed,
                 SamplingToolOutcomeKind::Blocked => ReasoningPolicyTrigger::ToolBlocked,
@@ -1444,6 +1590,7 @@ impl SamplingReasoningGovernor {
                     | ValidationFreshnessStatus::TimedOut
             )
         {
+            self.consecutive_observation_only_generations = 0;
             self.transition_to(
                 SamplingReasoningPhase::Diagnose,
                 if settled.validation_status == ValidationFreshnessStatus::TimedOut {
@@ -1458,6 +1605,7 @@ impl SamplingReasoningGovernor {
             && settled.validation_revision == Some(settled.mutation_revision)
             && settled.validation_status == ValidationFreshnessStatus::PassedAfterLastMutation;
         if fresh_validation {
+            self.consecutive_observation_only_generations = 0;
             self.transition_to(
                 if self.plan.as_ref().is_some_and(plan_is_unfinished) {
                     SamplingReasoningPhase::Verify
@@ -1469,17 +1617,37 @@ impl SamplingReasoningGovernor {
             return;
         }
         if settled.mutation_revision > baselines.mutation_revision {
+            self.consecutive_observation_only_generations = 0;
             self.transition_to(
                 SamplingReasoningPhase::Implement,
                 ReasoningPolicyTrigger::WorkspaceMutation,
             );
             return;
         }
-        if self.plan_revision > baselines.plan_revision
-            && let Some(plan) = changed_plan.as_ref()
-        {
-            self.transition_to(phase_for_plan(plan), ReasoningPolicyTrigger::PlanUpdated);
-            return;
+        if let Some((plan, source_closure_established)) = latest_plan.as_ref() {
+            self.consecutive_observation_only_generations = 0;
+            let plan_phase = phase_for_plan(plan);
+            let implementation_ready = *source_closure_established
+                && (plan.plan.is_empty()
+                    || matches!(
+                        plan_phase,
+                        SamplingReasoningPhase::Inspect | SamplingReasoningPhase::Implement
+                    ));
+            let newly_closed =
+                implementation_ready && (!self.source_closure_active || plan_changed);
+            self.source_closure_active = implementation_ready;
+            if newly_closed {
+                self.pending_source_closure_directive = true;
+                self.transition_to(
+                    SamplingReasoningPhase::Implement,
+                    ReasoningPolicyTrigger::PlanUpdated,
+                );
+                return;
+            }
+            if self.plan_revision > baselines.plan_revision && plan_changed {
+                self.transition_to(plan_phase, ReasoningPolicyTrigger::PlanUpdated);
+                return;
+            }
         }
         if outcomes.iter().any(|outcome| {
             outcome.kind == SamplingToolOutcomeKind::Success && outcome.plan.is_none()
@@ -1493,6 +1661,15 @@ impl SamplingReasoningGovernor {
                 SamplingReasoningPhase::Finalize => SamplingReasoningPhase::Finalize,
             };
             self.transition_to(next_phase, ReasoningPolicyTrigger::ReadOnlyToolSuccess);
+            if observation_only {
+                self.consecutive_observation_only_generations = self
+                    .consecutive_observation_only_generations
+                    .saturating_add(1);
+            } else {
+                self.consecutive_observation_only_generations = 0;
+            }
+        } else if !outcomes.is_empty() {
+            self.consecutive_observation_only_generations = 0;
         }
     }
 }
@@ -1813,6 +1990,22 @@ mod tests {
             &collector,
             &settled(0, ValidationFreshnessStatus::None, None),
         );
+    }
+
+    fn settle_successful_observation(
+        governor: &mut SamplingReasoningGovernor,
+    ) -> SamplingConvergenceDecision {
+        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let collector = SamplingRequestSignalCollector::default();
+        let ordinal = collector.register_tool_call();
+        collector.push(SamplingToolOutcome::plain(
+            ordinal,
+            SamplingToolOutcomeKind::Success,
+            None,
+        ));
+        let settled = settled(0, ValidationFreshnessStatus::None, None);
+        governor.settle(&baselines, &collector, &settled);
+        governor.evaluate_convergence(&baselines, &collector, &settled)
     }
 
     #[test]
@@ -2557,6 +2750,140 @@ mod tests {
     }
 
     #[test]
+    fn source_closure_moves_pending_work_to_implementation_once() {
+        let config = config();
+        let mut governor = SamplingReasoningGovernor::new(Some(&config));
+        let initial_baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let initial_collector = SamplingRequestSignalCollector::default();
+        let initial_plan_signal = json!({
+            "kind": "plan_update",
+            "source_closure_established": false,
+        });
+        initial_collector.push(SamplingToolOutcome::from_signal(
+            0,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(plan(&[StepStatus::Pending])),
+            Some(&initial_plan_signal),
+        ));
+        governor.settle(
+            &initial_baseline,
+            &initial_collector,
+            &settled(0, ValidationFreshnessStatus::None, None),
+        );
+        assert_eq!(governor.phase, SamplingReasoningPhase::Inspect);
+
+        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let collector = SamplingRequestSignalCollector::default();
+        let source_closure_signal = json!({
+            "kind": "plan_update",
+            "source_closure_established": true,
+        });
+        collector.push(SamplingToolOutcome::from_signal(
+            0,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(plan(&[StepStatus::Pending])),
+            Some(&source_closure_signal),
+        ));
+
+        governor.settle(
+            &baseline,
+            &collector,
+            &settled(0, ValidationFreshnessStatus::None, None),
+        );
+
+        assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
+        let decision = governor.evaluate_convergence(
+            &baseline,
+            &collector,
+            &settled(0, ValidationFreshnessStatus::None, None),
+        );
+        assert_eq!(
+            decision.continuation,
+            ContinuationDisposition::ModelRequired
+        );
+        assert!(
+            decision
+                .directive
+                .as_deref()
+                .is_some_and(|directive| directive.contains("Stop broad repository discovery"))
+        );
+        assert!(!decision.no_progress_directive);
+
+        let repeated = governor.evaluate_convergence(
+            &baseline,
+            &collector,
+            &settled(0, ValidationFreshnessStatus::None, None),
+        );
+        assert_eq!(repeated, SamplingConvergenceDecision::default());
+    }
+
+    #[test]
+    fn observation_only_checkpoint_directs_after_eight_generations() {
+        let config = config();
+        let mut governor = SamplingReasoningGovernor::new(Some(&config));
+
+        for observation in 1..=OBSERVATION_ONLY_CHECKPOINT_INTERVAL {
+            let decision = settle_successful_observation(&mut governor);
+            assert_eq!(
+                decision.directive.is_some(),
+                observation == OBSERVATION_ONLY_CHECKPOINT_INTERVAL
+            );
+            if observation == OBSERVATION_ONLY_CHECKPOINT_INTERVAL {
+                assert!(
+                    decision
+                        .directive
+                        .as_deref()
+                        .is_some_and(|directive| directive.contains(
+                            "synthesize the requested audit/report or begin implementation"
+                        ))
+                );
+                assert!(decision.no_progress_directive);
+            }
+        }
+    }
+
+    #[test]
+    fn observation_only_streak_resets_on_structured_progress_or_failure() {
+        let config = config();
+        let mut governor = SamplingReasoningGovernor::new(Some(&config));
+
+        governor.consecutive_observation_only_generations = 7;
+        settle_plan(&mut governor, plan(&[StepStatus::Pending]));
+        assert_eq!(governor.consecutive_observation_only_generations, 0);
+
+        governor.consecutive_observation_only_generations = 7;
+        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        governor.settle(
+            &baselines,
+            &collector_with(SamplingToolOutcomeKind::Success),
+            &settled(1, ValidationFreshnessStatus::None, None),
+        );
+        assert_eq!(governor.consecutive_observation_only_generations, 0);
+
+        governor.consecutive_observation_only_generations = 7;
+        let baselines = governor.baselines(1, ValidationFreshnessStatus::None, None);
+        governor.settle(
+            &baselines,
+            &collector_with(SamplingToolOutcomeKind::Success),
+            &settled(1, ValidationFreshnessStatus::FailedAfterLastMutation, None),
+        );
+        assert_eq!(governor.consecutive_observation_only_generations, 0);
+
+        governor.consecutive_observation_only_generations = 7;
+        let baselines = governor.baselines(1, ValidationFreshnessStatus::None, None);
+        governor.settle(
+            &baselines,
+            &collector_with(SamplingToolOutcomeKind::Failure),
+            &settled(1, ValidationFreshnessStatus::None, None),
+        );
+        assert_eq!(governor.consecutive_observation_only_generations, 0);
+
+        governor.consecutive_observation_only_generations = 7;
+        governor.accepted_user_input();
+        assert_eq!(governor.consecutive_observation_only_generations, 0);
+    }
+
+    #[test]
     fn unchanged_plan_is_not_a_transition_and_diagnose_stays_sticky() {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
@@ -2743,6 +3070,20 @@ mod tests {
         disabled.host_mutation();
         disabled.accepted_user_input();
         assert_eq!(disabled.phase, SamplingReasoningPhase::Orient);
+    }
+
+    #[test]
+    fn fresh_source_closure_resumes_implementation_until_new_input_is_accepted() {
+        let config = config();
+        let mut governor = SamplingReasoningGovernor::new(Some(&config));
+
+        governor.reuse_source_closure();
+        assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
+        assert_eq!(governor.trigger(), ReasoningPolicyTrigger::PlanUpdated);
+
+        governor.accepted_user_input();
+        assert_eq!(governor.phase, SamplingReasoningPhase::Orient);
+        assert_eq!(governor.trigger(), ReasoningPolicyTrigger::UserInput);
     }
 
     fn unchanged_state(
@@ -3030,6 +3371,44 @@ mod tests {
             );
             assert!(collector.deterministic_cycle_key().is_none());
         }
+    }
+
+    #[test]
+    fn structured_failure_identity_directs_on_the_second_unchanged_failure() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+
+        for observation in 1..=2 {
+            let collector = governor.collector(&baselines);
+            let ordinal = collector.register_tool_call();
+            collector.record_failure_with_mutation(
+                ordinal,
+                Some("tool_search.invalid_payload".to_string()),
+                false,
+            );
+
+            let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
+            assert_eq!(decision.directive.is_some(), observation == 2);
+            if observation == 2 {
+                assert!(
+                    decision
+                        .directive
+                        .as_deref()
+                        .is_some_and(|directive| directive.contains("same normalized tool failure"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unstructured_failure_identity_fails_open() {
+        let governor = SamplingReasoningGovernor::new(None);
+        let (baselines, _) = unchanged_state(&governor);
+        let collector = governor.collector(&baselines);
+        let ordinal = collector.register_tool_call();
+        collector.record_failure_with_mutation(ordinal, None, false);
+
+        assert!(collector.deterministic_cycle_key().is_none());
     }
 
     #[test]

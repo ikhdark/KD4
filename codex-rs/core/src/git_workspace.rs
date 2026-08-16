@@ -145,28 +145,39 @@ pub(crate) struct CandidateDiffCapture {
 
 pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCapture> {
     let repo_root = get_git_repo_root(cwd)?;
-    let (head, index_diff, worktree_diff, index_paths, worktree_paths, untracked) = tokio::join!(
+    let (head, index_capture, worktree_capture, untracked) = tokio::join!(
         candidate_git_output(&repo_root, &["rev-parse", "--verify", "HEAD"]),
         candidate_git_output(
             &repo_root,
-            &["diff", "--cached", "--binary", "--no-ext-diff"]
+            &[
+                "diff",
+                "--cached",
+                "--raw",
+                "-z",
+                "--patch",
+                "--binary",
+                "--no-ext-diff",
+            ]
         ),
-        candidate_git_output(&repo_root, &["diff", "--binary", "--no-ext-diff"]),
         candidate_git_output(
             &repo_root,
-            &["diff", "--cached", "--name-only", "-z", "--no-ext-diff"],
+            &[
+                "diff",
+                "--raw",
+                "-z",
+                "--patch",
+                "--binary",
+                "--no-ext-diff",
+            ]
         ),
-        candidate_git_output(&repo_root, &["diff", "--name-only", "-z", "--no-ext-diff"],),
         candidate_git_output(
             &repo_root,
             &["ls-files", "--others", "--exclude-standard", "-z"],
         ),
     );
     let head = head?;
-    let index_diff = index_diff?;
-    let worktree_diff = worktree_diff?;
-    let index_paths = index_paths?;
-    let worktree_paths = worktree_paths?;
+    let (index_diff, index_paths) = candidate_diff_and_paths(&index_capture?)?;
+    let (worktree_diff, worktree_paths) = candidate_diff_and_paths(&worktree_capture?)?;
     let untracked = untracked?;
     let head_identity = String::from_utf8(head)
         .ok()
@@ -188,8 +199,8 @@ pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCa
     worktree_hasher.update(&worktree_diff);
     worktree_hasher.update(&untracked_manifest);
     let worktree_identity = Some(format!("{:x}", worktree_hasher.finalize()));
-    let mut changed_paths = candidate_changed_paths(&index_paths)?;
-    changed_paths.extend(candidate_changed_paths(&worktree_paths)?);
+    let mut changed_paths = index_paths;
+    changed_paths.extend(worktree_paths);
     changed_paths.extend(untracked_paths);
     changed_paths.sort();
     changed_paths.dedup();
@@ -261,14 +272,38 @@ async fn candidate_untracked_manifest(
     .ok()?
 }
 
-fn candidate_changed_paths(output: &[u8]) -> Option<Vec<String>> {
-    output
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(std::str::from_utf8)
-        .map(|path| path.map(str::to_string))
-        .collect::<Result<Vec<_>, _>>()
-        .ok()
+fn candidate_diff_and_paths(output: &[u8]) -> Option<(Vec<u8>, Vec<String>)> {
+    if output.is_empty() {
+        return Some((Vec::new(), Vec::new()));
+    }
+
+    let mut cursor = 0;
+    let mut paths = Vec::new();
+    while output.get(cursor) == Some(&b':') {
+        let header_end = output[cursor..].iter().position(|byte| *byte == 0)? + cursor;
+        let header = std::str::from_utf8(&output[cursor..header_end]).ok()?;
+        let status = header.split_ascii_whitespace().last()?.as_bytes().first()?;
+        cursor = header_end + 1;
+
+        let first_end = output[cursor..].iter().position(|byte| *byte == 0)? + cursor;
+        let first_path = std::str::from_utf8(&output[cursor..first_end]).ok()?;
+        cursor = first_end + 1;
+        if matches!(status, b'R' | b'C') {
+            let second_end = output[cursor..].iter().position(|byte| *byte == 0)? + cursor;
+            paths.push(
+                std::str::from_utf8(&output[cursor..second_end])
+                    .ok()?
+                    .to_string(),
+            );
+            cursor = second_end + 1;
+        } else {
+            paths.push(first_path.to_string());
+        }
+    }
+    if output.get(cursor) == Some(&0) {
+        cursor += 1;
+    }
+    Some((output[cursor..].to_vec(), paths))
 }
 
 async fn candidate_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -303,6 +338,10 @@ impl GitWorkspaceMetadataSource {
         &self.repo_root
     }
 
+    pub(crate) fn cwd(&self) -> &AbsolutePathBuf {
+        &self.cwd
+    }
+
     pub(crate) async fn metadata(&self) -> GitWorkspaceMetadata {
         let (stable, has_changes) = tokio::join!(
             self.cache.stable_metadata(self),
@@ -333,14 +372,12 @@ struct StableGitMetadata {
 
 struct RootCacheEntry {
     key: RootCacheKey,
-    dependencies: Vec<DependencyFingerprint>,
     watcher_generation: u64,
     entries: Vec<GitWorkspaceEntry>,
     _registration: WatchRegistration,
 }
 
 struct MetadataCacheEntry {
-    dependencies: StableMetadataDependencies,
     watcher_generation: u64,
     metadata: StableGitMetadata,
     _registration: WatchRegistration,
@@ -459,17 +496,13 @@ impl GitWorkspaceCache {
                 .iter()
                 .any(|environment| environment.remote)
             && self.watcher_reliable.load(Ordering::Acquire);
-        let dependencies = cacheable
-            .then(|| root_dependencies(&key.environments))
-            .flatten();
         let watcher_generation = self.watcher_generation.load(Ordering::Acquire);
 
-        if let Some(dependencies) = dependencies.as_ref() {
+        if cacheable {
             let state = self.state.lock().await;
             if let Some(entry) = state.root.as_ref()
                 && entry.key == key
                 && entry.watcher_generation == watcher_generation
-                && entry.dependencies == *dependencies
                 && self.watcher_reliable.load(Ordering::Acquire)
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
             {
@@ -480,6 +513,9 @@ impl GitWorkspaceCache {
                 };
             }
         }
+        let dependencies = cacheable
+            .then(|| root_dependencies(&key.environments))
+            .flatten();
 
         let mut entries = Vec::with_capacity(key.environments.len());
         for (environment, key_environment) in environments
@@ -510,7 +546,6 @@ impl GitWorkspaceCache {
                 let registration = self.register_dependencies(&before_dependencies);
                 self.state.lock().await.root = Some(RootCacheEntry {
                     key: key.clone(),
-                    dependencies: before_dependencies,
                     watcher_generation,
                     entries: entries.clone(),
                     _registration: registration,
@@ -527,20 +562,17 @@ impl GitWorkspaceCache {
 
     async fn stable_metadata(&self, source: &GitWorkspaceMetadataSource) -> StableGitMetadata {
         let watcher_generation = self.watcher_generation.load(Ordering::Acquire);
-        let dependencies = StableMetadataDependencies::capture(source).await;
-        if self.watcher_reliable.load(Ordering::Acquire)
-            && let Some(dependencies) = dependencies.as_ref()
-        {
+        if self.watcher_reliable.load(Ordering::Acquire) {
             let state = self.state.lock().await;
             if let Some(entry) = state.metadata.get(source.repo_root.as_path())
                 && entry.watcher_generation == watcher_generation
-                && entry.dependencies == *dependencies
                 && self.watcher_reliable.load(Ordering::Acquire)
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
             {
                 return entry.metadata.clone();
             }
         }
+        let dependencies = StableMetadataDependencies::capture(source).await;
 
         let (head_commit_hash, associated_remote_urls) = tokio::join!(
             get_head_commit_hash(source.cwd.as_path()),
@@ -561,7 +593,6 @@ impl GitWorkspaceCache {
                 self.state.lock().await.metadata.insert(
                     source.repo_root.to_path_buf(),
                     MetadataCacheEntry {
-                        dependencies: before_dependencies,
                         watcher_generation,
                         metadata: metadata.clone(),
                         _registration: registration,

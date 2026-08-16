@@ -49,6 +49,9 @@ use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::prelude::*;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 use codex_model_provider_info::ModelProviderInfo;
 
@@ -62,6 +65,8 @@ pub(crate) const MAX_RETAINED_USER_IMAGE_BYTES: usize =
     MAX_PROMPT_IMAGE_SOURCE_BYTES / 3 * 4 + 4096;
 pub(crate) const COMPACT_IMAGE_OMISSION_MARKER: &str =
     "[codex-local-compaction omitted user images: limits exceeded]";
+const RETAINED_USER_TURN_PROVENANCE_MAX_RECORDS: usize = 24;
+const RETAINED_USER_TURN_PROVENANCE_MAX_TOKENS: usize = 750;
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -330,7 +335,13 @@ async fn run_compact_task_inner_impl(
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.raw_items();
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
-    let summary_text = bounded_task_state_summary(&summary_suffix);
+    let decision_ledger = sess
+        .services
+        .task_evidence
+        .retained_decision_ledger_payload()
+        .await;
+    let summary_text =
+        bounded_task_state_summary_with_ledger(&summary_suffix, decision_ledger.as_deref());
     let compactable_history = strip_compaction_startup_envelopes(history_items.to_vec());
     let user_messages = collect_user_messages(&compactable_history);
 
@@ -410,11 +421,35 @@ pub(crate) fn strip_compaction_startup_envelopes(items: Vec<ResponseItem>) -> Ve
         .collect()
 }
 
+#[cfg(test)]
 fn bounded_task_state_summary(summary_suffix: &str) -> String {
-    truncate_text_to_token_ceiling(
+    bounded_task_state_summary_with_ledger(summary_suffix, None)
+}
+
+fn bounded_task_state_summary_with_ledger(
+    summary_suffix: &str,
+    decision_ledger: Option<&str>,
+) -> String {
+    let ledger = decision_ledger
+        .map(|ledger| format!("\n<kd4_decision_ledger_v1>\n{ledger}\n</kd4_decision_ledger_v1>"));
+    let summary_budget = COMPACT_TASK_STATE_MAX_TOKENS.saturating_sub(
+        ledger
+            .as_deref()
+            .map(approx_token_count)
+            .unwrap_or_default(),
+    );
+    let summary = truncate_text_to_token_ceiling(
         &format!("{SUMMARY_PREFIX}\n{summary_suffix}"),
-        COMPACT_TASK_STATE_MAX_TOKENS,
-    )
+        summary_budget,
+    );
+    let Some(ledger) = ledger else {
+        return summary;
+    };
+    // The structured ledger is the durable mutation/proof contract. Narrative yields its budget
+    // first; raw text truncation here could otherwise leave invalid JSON and silently drop the
+    // tail of a proof contract. An unusually large ledger may exceed the narrative budget, but it
+    // remains complete and can still be parsed after compaction.
+    format!("{summary}{ledger}")
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
@@ -535,6 +570,8 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
 pub(crate) struct CompactedUserMessage {
     content: Vec<UserInput>,
     internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
+    turn_id: Option<String>,
+    source_sha256: String,
 }
 
 pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUserMessage> {
@@ -558,6 +595,8 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
                     content,
                     internal_chat_message_metadata_passthrough:
                         internal_chat_message_metadata_passthrough.clone(),
+                    turn_id: item.turn_id().map(str::to_string),
+                    source_sha256: response_item_sha256(item),
                 })
             }
             _ => None,
@@ -713,6 +752,8 @@ fn build_compacted_history_with_limits(
                 internal_chat_message_metadata_passthrough: message
                     .internal_chat_message_metadata_passthrough
                     .clone(),
+                turn_id: message.turn_id.clone(),
+                source_sha256: message.source_sha256.clone(),
             });
         }
     }
@@ -747,10 +788,17 @@ fn build_compacted_history_with_limits(
     } else {
         summary_text.to_string()
     };
+    remove_retained_user_overlap(&mut summary_text, &selected_messages);
+    let mut summary_suffix = String::new();
     if omitted_images {
-        summary_text.push_str("\n\n");
-        summary_text.push_str(COMPACT_IMAGE_OMISSION_MARKER);
+        summary_suffix.push_str("\n\n");
+        summary_suffix.push_str(COMPACT_IMAGE_OMISSION_MARKER);
     }
+    if let Some(provenance) = retained_user_turn_provenance(&selected_messages) {
+        summary_suffix.push_str("\n\n");
+        summary_suffix.push_str(&provenance);
+    }
+    summary_text = bounded_compaction_summary_with_suffix(summary_text, &summary_suffix);
 
     history.push(ResponseItem::Message {
         id: None,
@@ -761,6 +809,99 @@ fn build_compacted_history_with_limits(
     });
 
     history
+}
+
+#[derive(Serialize)]
+struct RetainedUserTurnRecord<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<&'a str>,
+    source_sha256: &'a str,
+}
+
+fn response_item_sha256(item: &ResponseItem) -> String {
+    let bytes = serde_json::to_vec(item).unwrap_or_default();
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn remove_retained_user_overlap(summary_text: &mut String, retained: &[CompactedUserMessage]) {
+    let ledger_start = summary_text.find("\n<kd4_decision_ledger_v1>");
+    let mut narrative = ledger_start
+        .map(|index| summary_text[..index].to_string())
+        .unwrap_or_else(|| summary_text.clone());
+    for message in retained {
+        for text in message.content.iter().filter_map(|item| match item {
+            UserInput::Text { text, .. } if !text.is_empty() => Some(text),
+            _ => None,
+        }) {
+            if narrative.contains(text) {
+                let short_hash = message
+                    .source_sha256
+                    .get(..16)
+                    .unwrap_or(&message.source_sha256);
+                narrative = narrative.replace(
+                    text,
+                    &format!("<retained_user_turn_ref source_sha256=\"{short_hash}\" />"),
+                );
+            }
+        }
+    }
+    if let Some(index) = ledger_start {
+        narrative.push_str(&summary_text[index..]);
+    }
+    *summary_text = narrative;
+}
+
+fn retained_user_turn_provenance(retained: &[CompactedUserMessage]) -> Option<String> {
+    if retained.is_empty() {
+        return None;
+    }
+    let first_start = retained
+        .len()
+        .saturating_sub(RETAINED_USER_TURN_PROVENANCE_MAX_RECORDS);
+    for start in first_start..retained.len() {
+        let records = retained[start..]
+            .iter()
+            .map(|message| RetainedUserTurnRecord {
+                turn_id: message.turn_id.as_deref(),
+                source_sha256: &message.source_sha256,
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::to_string(&records).ok()?;
+        let rendered =
+            format!("<retained_user_turns version=\"1\">{payload}</retained_user_turns>");
+        if approx_token_count(&rendered) <= RETAINED_USER_TURN_PROVENANCE_MAX_TOKENS {
+            return Some(rendered);
+        }
+    }
+    let latest = retained.last()?;
+    let payload = serde_json::to_string(&[RetainedUserTurnRecord {
+        turn_id: None,
+        source_sha256: &latest.source_sha256,
+    }])
+    .ok()?;
+    Some(format!(
+        "<retained_user_turns version=\"1\">{payload}</retained_user_turns>"
+    ))
+}
+
+fn bounded_compaction_summary_with_suffix(summary: String, suffix: &str) -> String {
+    let suffix_tokens = approx_token_count(suffix);
+    let summary_budget = COMPACT_TASK_STATE_MAX_TOKENS.saturating_sub(suffix_tokens);
+    let Some(ledger_start) = summary.find("\n<kd4_decision_ledger_v1>") else {
+        return format!(
+            "{}{}",
+            truncate_text_to_token_ceiling(&summary, summary_budget),
+            suffix
+        );
+    };
+    let ledger = &summary[ledger_start..];
+    let narrative_budget = summary_budget.saturating_sub(approx_token_count(ledger));
+    format!(
+        "{}{}{}",
+        truncate_text_to_token_ceiling(&summary[..ledger_start], narrative_budget),
+        ledger,
+        suffix
+    )
 }
 
 async fn drain_to_completed(

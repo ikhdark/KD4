@@ -116,6 +116,7 @@ mod stream_events_utils;
 pub use stream_events_utils::image_generation_artifact_path;
 mod stable_context;
 mod startup_timing;
+mod task_history;
 pub mod test_support;
 mod unified_exec;
 pub mod windows_sandbox;

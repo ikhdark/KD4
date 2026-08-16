@@ -29,9 +29,13 @@ SCRIPT_KIND_BY_SUFFIX = {
 }
 SCRIPT_CANDIDATE_SUFFIXES = frozenset((*SCRIPT_KIND_BY_SUFFIX, ".bat", ".cmd", ".ts"))
 SCRIPT_LINE_ADVISORY_THRESHOLD = 1_000
-SCRIPT_AUDIT_PACKAGE_COMMAND = "python scripts/root_maintenance.py audit-scripts"
+SCRIPT_AUDIT_PACKAGE_COMMAND = (
+    "node scripts/run-python.js scripts/root_maintenance.py audit-scripts"
+)
 SCRIPT_AUDIT_JUST_RECIPE = "audit-scripts *args:"
-SCRIPT_AUDIT_JUST_COMMAND = "scripts/root_maintenance.py audit-scripts {args}"
+SCRIPT_AUDIT_JUST_COMMAND = (
+    '"{{ justfile_directory() }}/scripts/root_maintenance.py" audit-scripts {args}'
+)
 POWERSHELL_PARSE_ALL_SCRIPT = (
     "$failed = $false; "
     "foreach ($path in $paths) { "
@@ -364,7 +368,6 @@ def script_audit_context_issues() -> list[str]:
     required_paths = (
         REPO_ROOT / "AGENTS.md",
         SCRIPTS_ROOT / "AGENTS.md",
-        SCRIPTS_ROOT / "README.md",
         SCRIPTS_ROOT / "pyproject.toml",
         SCRIPTS_ROOT / "uv.lock",
         REPO_ROOT / "package.json",
@@ -425,16 +428,6 @@ def script_audit_context_issues() -> list[str]:
                 issues.append(f"justfile parse failed: {just_summary.stderr.strip()}")
             elif "audit-scripts" not in just_summary.stdout.split():
                 issues.append("justfile summary does not expose audit-scripts")
-
-    readme_path = SCRIPTS_ROOT / "README.md"
-    if readme_path.is_file():
-        try:
-            readme_text = readme_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            issues.append(f"scripts/README.md is unreadable: {error}")
-        else:
-            if "audit-scripts" not in readme_text:
-                issues.append("scripts/README.md does not document audit-scripts")
 
     unittest_targets = set(python_unittest_targets())
     for source, modules in SCRIPT_TEST_MODULES.items():

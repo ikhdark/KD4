@@ -47,6 +47,8 @@ use codex_rollout::state_db;
 use codex_tools::CanonicalByteRange;
 use codex_tools::CanonicalJsonPointer;
 use codex_tools::CanonicalToolResult;
+use codex_tools::ToolFailureClass;
+use codex_tools::ToolFailureDiagnostic;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
@@ -784,7 +786,15 @@ impl ToolRegistry {
                     &base_tool_result_tags,
                     /*extra_trace_fields*/ &[],
                 );
-                let err = FunctionCallError::RespondToModel(message);
+                let err = FunctionCallError::Diagnostic(
+                    ToolFailureDiagnostic::model_visible(
+                        ToolFailureClass::UnsupportedTool,
+                        format!("registry.unsupported_tool:{tool_name_flat}"),
+                        message,
+                    )
+                    .with_owner_hint("tool registry lookup")
+                    .with_next_action("search for the intended tool or correct the tool name"),
+                );
                 dispatch_trace.record_failed(&err);
                 return Err(err);
             }
@@ -815,7 +825,17 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::Fatal(message);
+            let err = FunctionCallError::Diagnostic(
+                ToolFailureDiagnostic::fatal(
+                    ToolFailureClass::InvalidPayload,
+                    format!("registry.incompatible_payload:{tool_name_flat}"),
+                    message,
+                )
+                .with_owner_hint("tool payload conversion")
+                .with_next_action(
+                    "inspect the payload converter for this tool; do not retry unchanged input",
+                ),
+            );
             dispatch_trace.record_failed(&err);
             return Err(err);
         }
@@ -967,7 +987,17 @@ impl ToolRegistry {
             Ok(_) => {
                 let mut guard = response_cell.lock().await;
                 let mut result = guard.take().ok_or_else(|| {
-                    FunctionCallError::Fatal("tool produced no output".to_string())
+                    FunctionCallError::Diagnostic(
+                        ToolFailureDiagnostic::fatal(
+                            ToolFailureClass::MissingOutput,
+                            format!("registry.missing_output:{tool_name_flat}"),
+                            "tool produced no output",
+                        )
+                        .with_owner_hint("tool handler response publication")
+                        .with_next_action(
+                            "inspect the handler path that completed without publishing a response",
+                        ),
+                    )
                 })?;
                 if let Some(outcome) = post_tool_use_outcome {
                     if outcome.should_block {
@@ -1006,32 +1036,37 @@ impl ToolRegistry {
                     None => None,
                 };
                 if canonical_artifact_required && model_projection.is_none() {
-                    let err = FunctionCallError::Fatal(format!(
-                        "failed to preserve the fully received result for {} as a canonical artifact",
-                        flat_tool_name(&invocation.tool_name)
-                    ));
+                    let err = FunctionCallError::Diagnostic(
+                        ToolFailureDiagnostic::fatal(
+                            ToolFailureClass::ArtifactRetention,
+                            format!("registry.canonical_artifact:{tool_name_flat}"),
+                            format!(
+                                "failed to preserve the fully received result for {} as a canonical artifact",
+                                flat_tool_name(&invocation.tool_name)
+                            ),
+                        )
+                        .with_owner_hint("canonical tool-output retention")
+                        .with_next_action(
+                            "inspect the retained-output artifact creation diagnostic before retrying",
+                        ),
+                    );
                     dispatch_trace.record_failed(&err);
                     return Err(err);
                 }
                 let provider_visible = projection_is_provider_visible(&invocation.source);
-                if provider_visible && let Some(projection) = &model_projection {
-                    invocation
-                        .turn
-                        .turn_timing_state
-                        .record_tool_output_projection(projection.projected_tokens);
-                    invocation
-                        .turn
-                        .turn_timing_state
-                        .record_tool_output_projection_facts(
-                            projection.canonical_bytes,
-                            projection.canonical_tokens,
-                            projection.model_bytes,
-                            projection.projected_tokens,
-                            projection.artifact_created,
-                            projection.projection_truncated,
-                            projection.omitted_sections,
-                        );
-                    if let Some(candidate) = &projection.candidate {
+                if let Some(projection) = &model_projection {
+                    record_projection_timing(
+                        invocation.turn.turn_timing_state.as_ref(),
+                        provider_visible,
+                        projection.canonical_bytes,
+                        projection.canonical_tokens,
+                        projection.model_bytes,
+                        projection.projected_tokens,
+                        projection.artifact_created,
+                        projection.projection_truncated,
+                        projection.omitted_sections,
+                    );
+                    if provider_visible && let Some(candidate) = &projection.candidate {
                         invocation
                             .session
                             .register_tool_history_candidate(
@@ -1060,6 +1095,34 @@ impl ToolRegistry {
 
 fn projection_is_provider_visible(source: &ToolCallSource) -> bool {
     matches!(source, ToolCallSource::Direct)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_projection_timing(
+    turn_timing_state: &crate::turn_timing::TurnTimingState,
+    provider_visible: bool,
+    canonical_bytes: u64,
+    canonical_tokens: u64,
+    model_bytes: u64,
+    projected_tokens: u64,
+    artifact_created: bool,
+    projection_truncated: bool,
+    omitted_sections: u64,
+) {
+    // Nested code-mode output is not sent to the provider as a separate result, but it still
+    // consumed projection/truncation/artifact work that belongs in the enclosing turn's facts.
+    if provider_visible {
+        turn_timing_state.record_tool_output_projection(projected_tokens);
+    }
+    turn_timing_state.record_tool_output_projection_facts(
+        canonical_bytes,
+        canonical_tokens,
+        model_bytes,
+        projected_tokens,
+        artifact_created,
+        projection_truncated,
+        omitted_sections,
+    );
 }
 
 async fn notify_tool_finish_if_unclaimed(

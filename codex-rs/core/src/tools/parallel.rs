@@ -296,16 +296,20 @@ impl ToolCallRuntime {
                     }
                     Ok(response)
                 }
-                Err(FunctionCallError::Fatal(message)) => {
+                Err(error) if error.is_fatal() => {
                     let mutation_advanced = if let Some(before) = mutation_revision_before {
                         mutation_tracker.lock().await.current_mutation_revision() > before
                     } else {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure_with_mutation(ordinal, mutation_advanced);
+                        collector.record_failure_with_mutation(
+                            ordinal,
+                            error.fingerprint().map(str::to_owned),
+                            mutation_advanced,
+                        );
                     }
-                    Err(CodexErr::Fatal(message))
+                    Err(CodexErr::Fatal(error.into_fatal_message()))
                 }
                 Err(other) => {
                     let mutation_advanced = if let Some(before) = mutation_revision_before {
@@ -314,7 +318,11 @@ impl ToolCallRuntime {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure_with_mutation(ordinal, mutation_advanced);
+                        collector.record_failure_with_mutation(
+                            ordinal,
+                            other.fingerprint().map(str::to_owned),
+                            mutation_advanced,
+                        );
                     }
                     Ok(Self::failure_response(error_call, other))
                 }

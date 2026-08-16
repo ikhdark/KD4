@@ -12,6 +12,10 @@ use crate::session::turn_context::TurnContext;
 use crate::stable_context::StableContextManifest;
 use crate::stable_context::StableContextTarget;
 use crate::stable_context::project_stable_context;
+use crate::task_history::TaskHistoryCheckpoint;
+use crate::task_history::TaskHistoryReplacement;
+use crate::task_history::items_sha256;
+use crate::task_history::project_task_history;
 use crate::tool_history::ModelGenerationId;
 use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryState;
@@ -70,6 +74,10 @@ pub(crate) struct PreparedPromptInput {
     fallback_tool_history_substitutions: Arc<[ToolHistorySubstitution]>,
     stable_context_manifest: StableContextManifest,
     prompt_provenance: PromptProvenanceSidecar,
+    source_history_sha256: String,
+    projected_history_sha256: String,
+    task_checkpoint_sha256: Option<String>,
+    task_history_replacements: Arc<[TaskHistoryReplacement]>,
     fingerprint: Option<[u8; 32]>,
     policy: PreparedHistoryPolicy,
 }
@@ -109,6 +117,39 @@ impl PreparedPromptInput {
 
     pub(crate) fn prompt_provenance(&self) -> &PromptProvenanceSidecar {
         &self.prompt_provenance
+    }
+
+    pub(crate) fn source_history_sha256(&self) -> &str {
+        &self.source_history_sha256
+    }
+
+    pub(crate) fn projected_history_sha256(&self) -> &str {
+        &self.projected_history_sha256
+    }
+
+    pub(crate) fn task_checkpoint_sha256(&self) -> Option<&str> {
+        self.task_checkpoint_sha256.as_deref()
+    }
+
+    pub(crate) fn task_history_replacements(&self) -> &[TaskHistoryReplacement] {
+        &self.task_history_replacements
+    }
+
+    fn apply_task_checkpoint(&mut self, checkpoint: Option<&TaskHistoryCheckpoint>) {
+        let projection = project_task_history(Arc::clone(&self.items), checkpoint);
+        let fallback_projection =
+            project_task_history(Arc::clone(&self.fallback_items), checkpoint);
+        self.items = projection.items;
+        self.fallback_items = fallback_projection.items;
+        self.unreplaced_items = Arc::clone(&self.items);
+        self.unreplaced_fallback_items = Arc::clone(&self.fallback_items);
+        self.projected_history_sha256 = items_sha256(&self.items);
+        self.task_checkpoint_sha256 = projection.checkpoint_sha256;
+        self.task_history_replacements = projection.replacements;
+        self.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
+            &self.items,
+            &self.stable_context_manifest,
+        );
     }
 
     #[cfg(test)]
@@ -277,6 +318,7 @@ impl ContextManager {
     /// Sampling-only preparation entrypoint. Callers must select the target
     /// explicitly so generic and compaction preparation cannot accidentally
     /// enable logical projection.
+    #[cfg(test)]
     pub(crate) fn prepare_for_sampling_prompt(
         self,
         input_modalities: &[InputModality],
@@ -324,6 +366,8 @@ impl ContextManager {
         let normalized_items: Arc<[ResponseItem]> = Arc::from(Arc::unwrap_or_clone(self.items));
         let projection = project_stable_context(normalized_items, stable_context_target);
         let items = projection.items;
+        let source_history_sha256 = items_sha256(&projection.fallback_items);
+        let projected_history_sha256 = items_sha256(&items);
         let prompt_provenance =
             PromptProvenanceSidecar::from_assembled_items(&items, &projection.manifest);
         let fingerprint = crate::latency_switches::history_identity_enabled()
@@ -338,6 +382,10 @@ impl ContextManager {
             fallback_tool_history_substitutions: Arc::from([]),
             stable_context_manifest: projection.manifest,
             prompt_provenance,
+            source_history_sha256,
+            projected_history_sha256,
+            task_checkpoint_sha256: None,
+            task_history_replacements: Arc::from([]),
             fingerprint,
             policy,
         };
@@ -355,30 +403,28 @@ impl ContextManager {
         prepared
     }
 
-    pub(crate) fn prepare_for_sampling_prompt_with_completed_tool_projection(
+    pub(crate) fn prepare_for_sampling_prompt_with_checkpoint(
         self,
         input_modalities: &[InputModality],
         target: StableContextTarget,
+        checkpoint: Option<&TaskHistoryCheckpoint>,
+        completed_tool_projection: bool,
     ) -> PreparedPromptInput {
         debug_assert_eq!(target, StableContextTarget::Sampling);
-        self.prepare_for_prompt_with_completed_tool_projection_target(input_modalities, target)
-    }
-
-    fn prepare_for_prompt_with_completed_tool_projection_target(
-        self,
-        input_modalities: &[InputModality],
-        target: StableContextTarget,
-    ) -> PreparedPromptInput {
         let tool_history = Arc::clone(&self.tool_history);
         let mut prepared = self.prepare_for_prompt_target(input_modalities, target);
-        let projection = tool_history.project(Arc::clone(&prepared.items));
-        let fallback_projection = tool_history.project(Arc::clone(&prepared.fallback_items));
-        prepared.items = projection.items;
-        prepared.unreplaced_items = projection.unreplaced_items;
-        prepared.tool_history_substitutions = projection.substitutions;
-        prepared.fallback_items = fallback_projection.items;
-        prepared.unreplaced_fallback_items = fallback_projection.unreplaced_items;
-        prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
+        prepared.apply_task_checkpoint(checkpoint);
+        if completed_tool_projection {
+            let projection = tool_history.project(Arc::clone(&prepared.items));
+            let fallback_projection = tool_history.project(Arc::clone(&prepared.fallback_items));
+            prepared.items = projection.items;
+            prepared.unreplaced_items = projection.unreplaced_items;
+            prepared.tool_history_substitutions = projection.substitutions;
+            prepared.fallback_items = fallback_projection.items;
+            prepared.unreplaced_fallback_items = fallback_projection.unreplaced_items;
+            prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
+        }
+        prepared.projected_history_sha256 = items_sha256(&prepared.items);
         prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
             &prepared.items,
             &prepared.stable_context_manifest,
@@ -852,6 +898,8 @@ impl ContextManager {
             &items,
             &entry.prepared.stable_context_manifest,
         );
+        let source_history_sha256 = items_sha256(&fallback_items);
+        let projected_history_sha256 = items_sha256(&items);
         *cache = Some(PreparedHistoryCacheEntry {
             source_items: Arc::clone(&self.items),
             projection_revision: self.projection_revision,
@@ -866,6 +914,10 @@ impl ContextManager {
                     .fallback_tool_history_substitutions,
                 stable_context_manifest: entry.prepared.stable_context_manifest,
                 prompt_provenance,
+                source_history_sha256,
+                projected_history_sha256,
+                task_checkpoint_sha256: entry.prepared.task_checkpoint_sha256,
+                task_history_replacements: entry.prepared.task_history_replacements,
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
             },

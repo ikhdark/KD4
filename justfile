@@ -571,12 +571,25 @@ source-map-check:
     {{ python }} "{{ justfile_directory() }}/scripts/source_map_check.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" --require-markers "{{ justfile_directory() }}/SOURCEMAP.md"
+    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" check
 
 source-owners-generate:
     {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" generate
 
 source-owners-check:
     {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" check
+    {{ python }} "{{ justfile_directory() }}/scripts/test_source_owners.py"
+    {{ python }} "{{ justfile_directory() }}/scripts/test_architecture_comprehension_eval.py"
+    {{ python }} "{{ justfile_directory() }}/scripts/architecture_comprehension_eval.py"
+
+source-owners-slice owner:
+    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" slice --owner "{{ owner }}" --max-relationships 32
+
+source-owners-slice-focused owner focus:
+    {{ python }} "{{ justfile_directory() }}/scripts/source_owners.py" slice --owner "{{ owner }}" --focus "{{ focus }}" --max-relationships 32
+
+architecture-comprehension-check:
+    {{ python }} "{{ justfile_directory() }}/scripts/architecture_comprehension_eval.py"
 
 tui-large-widget-check:
     cargo nextest run -p codex-tui -E 'test(footer_collapse_snapshots) | test(handle_paste_large_uses_placeholder_and_replaces_on_submit) | test(resume_picker)'

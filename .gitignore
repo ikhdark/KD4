@@ -75,6 +75,7 @@ coverage/
 personal/
 /kd-ui/
 /task-evidence/
+/WORKTREE_REVIEW.txt
 .codex/harness/runs/
 .codex/evals/investigation/
 .codex/locks/

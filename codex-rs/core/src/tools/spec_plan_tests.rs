@@ -38,6 +38,7 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::exposure::AgentSurfaceStage;
+use crate::tools::exposure::TaskToolPhase;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
@@ -610,6 +611,32 @@ async fn wait_is_registered_only_while_a_code_mode_cell_is_waitable() {
 }
 
 #[tokio::test]
+async fn write_stdin_is_registered_only_while_unified_exec_is_resumable() {
+    for unified_exec_resume_available in [false, true] {
+        let identity = ToolExposureIdentity {
+            unified_exec_resume_available,
+            ..ToolExposureIdentity::default()
+        };
+        let plan = probe_with(
+            |turn| set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]),
+            ToolPlanInputs {
+                exposure_identity: identity,
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        plan.assert_visible_contains(&["exec_command"]);
+        if unified_exec_resume_available {
+            plan.assert_visible_contains(&["write_stdin"]);
+            plan.assert_registered_contains(&["write_stdin"]);
+        } else {
+            plan.assert_visible_lacks(&["write_stdin"]);
+            plan.assert_registered_lacks(&["write_stdin"]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn request_user_input_stays_direct_in_code_mode_only() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
@@ -995,7 +1022,9 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
         turn.model_info.supports_search_tool = true;
     })
     .await;
-    missing_deferred_tools.assert_visible_lacks(&["tool_search"]);
+    // Phase-gated built-ins remain searchable even when no deferred MCP tools
+    // were supplied.
+    missing_deferred_tools.assert_visible_contains(&["tool_search"]);
     missing_deferred_tools.assert_visible_lacks(&[
         "list_mcp_resources",
         "list_mcp_resource_templates",
@@ -1501,11 +1530,7 @@ async fn excluded_deferred_namespaces_do_not_enable_nested_tool_guidance() {
     let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
         panic!("expected code mode exec tool");
     };
-    assert!(
-        !exec
-            .description
-            .contains("Some deferred nested tools may be omitted")
-    );
+    assert!(!exec.description.contains("excluded_lookup(args:"));
     plan.assert_registered_contains(&[
         &ToolName::namespaced("excluded", "lookup").to_string(),
         "tool_search",
@@ -1764,6 +1789,105 @@ async fn multi_agent_v2_surface_changes_only_at_the_four_coarse_stages() {
                 "expected `{tool_name}` for {stage:?}, got {actual:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn task_phase_projects_specialist_schemas_without_removing_capabilities() {
+    const SPECIALISTS: [&str; 5] = [
+        "load_skill",
+        "architecture_slice",
+        "read_source_batch",
+        "cargo_test",
+        "lint_tool_calls",
+    ];
+    let cases = [
+        (
+            TaskToolPhase::Discovery,
+            vec!["load_skill", "architecture_slice", "read_source_batch"],
+            vec!["cargo_test", "lint_tool_calls"],
+        ),
+        (
+            TaskToolPhase::Implementation,
+            vec!["architecture_slice", "read_source_batch", "cargo_test"],
+            vec!["load_skill", "lint_tool_calls"],
+        ),
+        (
+            TaskToolPhase::Validation,
+            vec!["read_source_batch", "cargo_test", "lint_tool_calls"],
+            vec!["load_skill", "architecture_slice"],
+        ),
+        (
+            TaskToolPhase::Completion,
+            vec!["lint_tool_calls"],
+            vec![
+                "load_skill",
+                "architecture_slice",
+                "read_source_batch",
+                "cargo_test",
+            ],
+        ),
+    ];
+
+    for (phase, direct, deferred) in cases {
+        let plan = probe_with(
+            |turn| turn.model_info.supports_search_tool = true,
+            ToolPlanInputs {
+                exposure_identity: ToolExposureIdentity {
+                    task_tool_phase: phase,
+                    ..ToolExposureIdentity::default()
+                },
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+
+        plan.assert_registered_contains(&SPECIALISTS);
+        plan.assert_visible_contains(&direct);
+        plan.assert_visible_lacks(&deferred);
+        for tool_name in direct {
+            assert_eq!(
+                plan.exposure(tool_name),
+                ToolExposure::Direct,
+                "expected `{tool_name}` to be direct during {phase:?}"
+            );
+        }
+        for tool_name in deferred {
+            assert_eq!(
+                plan.exposure(tool_name),
+                ToolExposure::Deferred,
+                "expected `{tool_name}` to be deferred during {phase:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_lifecycle_omits_spawn_when_policy_denies_it() {
+    let identity = ToolExposureIdentity {
+        agent_surface_stage: AgentSurfaceStage::Lifecycle,
+        agent_spawn_available: false,
+        ..ToolExposureIdentity::default()
+    };
+    let plan = probe_with(
+        |turn| set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true),
+        ToolPlanInputs {
+            exposure_identity: identity,
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let actual = plan.namespace_function_names(MULTI_AGENT_V2_NAMESPACE);
+    assert!(!actual.iter().any(|name| name == "spawn_agent"));
+    for expected in [
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "interrupt_agent",
+        "list_agents",
+    ] {
+        assert!(actual.iter().any(|name| name == expected));
     }
 }
 

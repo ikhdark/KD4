@@ -85,12 +85,15 @@ fn user_message(text: &str) -> ResponseItem {
 }
 
 fn compacted_user_message(text: &str) -> CompactedUserMessage {
+    let source = user_message(text);
     CompactedUserMessage {
         content: vec![UserInput::Text {
             text: text.to_string(),
             text_elements: Vec::new(),
         }],
         internal_chat_message_metadata_passthrough: None,
+        turn_id: None,
+        source_sha256: response_item_sha256(&source),
     }
 }
 
@@ -150,8 +153,10 @@ fn collect_user_messages_extracts_user_text_only() {
     ];
 
     let collected = collect_user_messages(&items);
+    let mut expected = compacted_user_message("first");
+    expected.source_sha256 = response_item_sha256(&items[1]);
 
-    assert_eq!(vec![compacted_user_message("first")], collected);
+    assert_eq!(vec![expected], collected);
 }
 
 #[test]
@@ -347,7 +352,8 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
         }
         other => panic!("unexpected item in history: {other:?}"),
     };
-    assert_eq!(summary_text, "SUMMARY");
+    assert!(summary_text.starts_with("SUMMARY"));
+    assert!(summary_text.contains("<retained_user_turns version=\"1\">"));
 }
 
 #[test]
@@ -393,6 +399,8 @@ fn text_truncation_keeps_images_in_their_original_order() {
             },
         ],
         internal_chat_message_metadata_passthrough: None,
+        turn_id: None,
+        source_sha256: "source-image-order".to_string(),
     };
 
     let history = super::build_compacted_history_with_limit(Vec::new(), &[message], "SUMMARY", 8);
@@ -421,6 +429,8 @@ fn image_limits_emit_a_stable_compaction_omission_marker() {
     let message = CompactedUserMessage {
         content: images,
         internal_chat_message_metadata_passthrough: None,
+        turn_id: None,
+        source_sha256: "source-images".to_string(),
     };
 
     let history =
@@ -462,7 +472,38 @@ fn build_token_limited_compacted_history_appends_summary_message() {
         }
         other => panic!("expected summary message, found {other:?}"),
     };
-    assert_eq!(summary, summary_text);
+    assert!(summary.starts_with(summary_text));
+    assert!(summary.contains("<retained_user_turns version=\"1\">"));
+}
+
+#[test]
+fn compacted_summary_references_retained_turn_instead_of_repeating_its_text() {
+    let retained_text = "preserve this exact user requirement";
+    let message = CompactedUserMessage {
+        content: vec![UserInput::Text {
+            text: retained_text.to_string(),
+            text_elements: Vec::new(),
+        }],
+        internal_chat_message_metadata_passthrough: None,
+        turn_id: Some("turn-42".to_string()),
+        source_sha256: "0123456789abcdef0123456789abcdef".to_string(),
+    };
+    let history = build_compacted_history(
+        Vec::new(),
+        &[message],
+        &format!("Current requirement: {retained_text}"),
+    );
+    let summary = match history.last() {
+        Some(ResponseItem::Message { content, .. }) => {
+            content_items_to_text(content).unwrap_or_default()
+        }
+        other => panic!("expected summary message, found {other:?}"),
+    };
+
+    assert!(!summary.contains(retained_text));
+    assert!(summary.contains("<retained_user_turn_ref source_sha256=\"0123456789abcdef\" />"));
+    assert!(summary.contains("\"turn_id\":\"turn-42\""));
+    assert!(summary.contains("\"source_sha256\":\"0123456789abcdef0123456789abcdef\""));
 }
 
 #[test]
@@ -479,6 +520,8 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
                     turn_id: Some("turn-1".to_string()),
                 },
             ),
+            turn_id: Some("turn-1".to_string()),
+            source_sha256: "source-turn-1".to_string(),
         }],
         "summary text",
     );
@@ -975,4 +1018,26 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
         },
     ];
     assert_eq!(refreshed, expected);
+}
+
+#[test]
+fn evidence_contract_compaction_never_truncates_decision_ledger() {
+    let summary = "summary ".repeat(COMPACT_TASK_STATE_MAX_TOKENS);
+    let ledger = format!(
+        "{{\"state\":\"current\",\"proofContracts\":{{\"implement\":{{\"acceptanceCriteria\":[\"{}full-contract-tail\"]}}}}}}",
+        "proof ".repeat(1_500)
+    );
+
+    let bounded = bounded_task_state_summary_with_ledger(&summary, Some(&ledger));
+
+    assert!(approx_token_count(&bounded) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    assert!(bounded.contains("<kd4_decision_ledger_v1>"));
+    assert!(bounded.contains("\"state\":\"current\""));
+    assert!(bounded.contains("full-contract-tail"));
+    let payload = bounded
+        .split_once("<kd4_decision_ledger_v1>\n")
+        .and_then(|(_, tail)| tail.split_once("\n</kd4_decision_ledger_v1>"))
+        .map(|(payload, _)| payload)
+        .expect("complete retained ledger envelope");
+    serde_json::from_str::<serde_json::Value>(payload).expect("complete retained ledger JSON");
 }

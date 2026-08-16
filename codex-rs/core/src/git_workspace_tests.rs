@@ -79,6 +79,23 @@ async fn create_clean_git_repo() -> (TempDir, AbsolutePathBuf) {
     (temp_dir, repo)
 }
 
+#[test]
+fn candidate_diff_parser_splits_raw_paths_from_patch() {
+    let capture =
+        b":100644 100644 aaaaaaa bbbbbbb M\0old.txt\0\0diff --git a/old.txt b/old.txt\npatch\n";
+    let (diff, paths) = candidate_diff_and_paths(capture).expect("parse capture");
+    assert_eq!(paths, vec!["old.txt"]);
+    assert_eq!(diff, b"diff --git a/old.txt b/old.txt\npatch\n");
+}
+
+#[test]
+fn candidate_diff_parser_uses_rename_destination() {
+    let capture = b":100644 100644 aaaaaaa bbbbbbb R100\0old.txt\0new.txt\0\0diff --git a/old.txt b/new.txt\n";
+    let (diff, paths) = candidate_diff_and_paths(capture).expect("parse capture");
+    assert_eq!(paths, vec!["new.txt"]);
+    assert_eq!(diff, b"diff --git a/old.txt b/new.txt\n");
+}
+
 #[tokio::test]
 async fn environment_generation_advances_only_when_selection_changes() {
     let manager = local_environment_manager().await;
@@ -120,10 +137,12 @@ async fn root_snapshot_invalidates_git_marker_creation_and_removal() {
     assert_eq!(before.primary_is_git(), Some(false));
 
     std::fs::create_dir(cwd.join(".git")).expect("create git marker");
+    cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
     let created = cache.snapshot(&environments).await;
     assert_eq!(created.primary_is_git(), Some(true));
 
     std::fs::remove_dir_all(cwd.join(".git")).expect("remove git marker");
+    cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
     let removed = cache.snapshot(&environments).await;
     assert_eq!(removed.primary_is_git(), Some(false));
 }
@@ -153,6 +172,10 @@ async fn stable_metadata_dependencies_refresh_head_but_dirty_is_always_fresh() {
         &["commit", "--allow-empty", "-q", "-m", "next"],
     )
     .await;
+    source
+        .cache
+        .watcher_generation
+        .fetch_add(1, Ordering::AcqRel);
 
     let changed = source.metadata().await;
     assert_ne!(
@@ -192,6 +215,10 @@ async fn stable_metadata_dependencies_refresh_remotes() {
         &["remote", "set-url", "origin", "https://example.com/new.git"],
     )
     .await;
+    source
+        .cache
+        .watcher_generation
+        .fetch_add(1, Ordering::AcqRel);
 
     let changed = source.metadata().await;
     assert_eq!(

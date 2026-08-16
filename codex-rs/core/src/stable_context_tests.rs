@@ -260,7 +260,7 @@ fn generic_preparation_target_retains_all_recognized_history() {
 }
 
 #[test]
-fn mixed_registered_message_fails_open_without_partial_rewrite() {
+fn registered_fragment_projects_independently_from_unregistered_sibling() {
     let old = repository("old");
     let current = repository("current");
     let mixed = ResponseItem::Message {
@@ -277,11 +277,55 @@ fn mixed_registered_message_fails_open_without_partial_rewrite() {
     };
     let items: Arc<[ResponseItem]> = vec![mixed, text_message("user", &current)].into();
 
-    let projection = project_stable_context(Arc::clone(&items), StableContextTarget::Sampling);
+    let projection = project_stable_context(items, StableContextTarget::Sampling);
+    let rendered = serde_json::to_string(&projection.items).unwrap();
 
-    assert_eq!(projection.items.as_ref(), items.as_ref());
-    assert!(!projection.manifest.projection_enabled());
-    assert!(projection.manifest.fail_open());
+    assert!(projection.manifest.projection_enabled());
+    assert!(!projection.manifest.fail_open());
+    assert!(!rendered.contains("old"));
+    assert!(rendered.contains("unregistered material"));
+    assert!(rendered.contains("current"));
+}
+
+#[test]
+fn newly_registered_context_classes_replace_only_their_own_slot() {
+    let old_app = "<app-context>old app</app-context>";
+    let current_app = "<app-context>current app</app-context>";
+    let apps = "<apps_instructions>connector rules</apps_instructions>";
+    let environment = "<environment_context>workspace</environment_context>";
+    let plugins = "<recommended_plugins>catalog</recommended_plugins>";
+    let projection = project_stable_context(
+        vec![
+            text_message("developer", old_app),
+            text_message("developer", apps),
+            text_message("user", environment),
+            text_message("user", plugins),
+            text_message("developer", current_app),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+    let rendered = serde_json::to_string(&projection.items).unwrap();
+
+    assert!(!rendered.contains("old app"));
+    assert!(rendered.contains("current app"));
+    assert!(rendered.contains("connector rules"));
+    assert!(rendered.contains("workspace"));
+    assert!(rendered.contains("catalog"));
+    for kind in [
+        StableContextKind::AppContext,
+        StableContextKind::DesktopApp,
+        StableContextKind::Environment,
+        StableContextKind::RecommendedPlugins,
+    ] {
+        assert!(
+            projection
+                .manifest
+                .components()
+                .iter()
+                .any(|component| component.kind == kind)
+        );
+    }
 }
 
 #[test]

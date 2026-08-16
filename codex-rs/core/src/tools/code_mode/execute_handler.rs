@@ -178,9 +178,28 @@ impl CodeModeExecuteHandler {
                 .finish_cell_dispatch(&cell_id);
         }
         exec.session.services.elicitations.wait_until_clear().await;
-        let output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
+        let terminal_success = match &response {
+            codex_code_mode::RuntimeResponse::Yielded { .. } => None,
+            codex_code_mode::RuntimeResponse::Terminated { .. } => Some(false),
+            codex_code_mode::RuntimeResponse::Result { error_text, .. } => {
+                Some(error_text.is_none())
+            }
+        };
+        let completion_feedback = exec
+            .session
+            .services
+            .code_mode_service
+            .take_cell_completion_feedback(exec.turn.sub_id.as_str(), &cell_id, terminal_success);
+        let output = handle_runtime_response(
+            &exec,
+            response,
+            args.max_output_tokens,
+            &args.recovery_queries,
+            completion_feedback,
+            started_at,
+        )
+        .await
+        .map_err(FunctionCallError::RespondToModel)?;
         Ok(attach_drained_wait_evidence(
             &exec,
             output,

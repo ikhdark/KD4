@@ -292,24 +292,28 @@ impl ShellCommandHandler {
         })?;
         let command_invocation = preflight.invocation;
         let repair_notice = preflight.repair_notice;
-        let repository = get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf());
-        let repository_key = repository.to_string_lossy();
         let bound_auto_validation = session
             .services
             .command_execution
             .auto_validation_leaf(&call_id)
             .await;
+        let repository = if let Some(binding) = bound_auto_validation.as_ref() {
+            if cwd.as_path() != binding.repository {
+                return Err(FunctionCallError::RespondToModel(
+                    "bound auto-validation cwd is no longer repository-confined".to_string(),
+                ));
+            }
+            binding.repository.clone()
+        } else {
+            get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf())
+        };
+        let repository_key = repository.to_string_lossy();
         if let Some(binding) = bound_auto_validation.as_ref() {
             let Some(leaf) = binding.leaf() else {
                 return Err(FunctionCallError::RespondToModel(
                     "bound auto-validation leaf no longer exists".to_string(),
                 ));
             };
-            if repository != binding.repository {
-                return Err(FunctionCallError::RespondToModel(
-                    "bound auto-validation cwd is no longer repository-confined".to_string(),
-                ));
-            }
             let leaf_matches = matches!(
                 &command_invocation,
                 CommandInvocation::Argv { program, args }
@@ -359,6 +363,7 @@ impl ShellCommandHandler {
                 invocation: command_invocation.clone(),
                 authorization_revision,
                 observation: Some(observation),
+                command_proof_key: None,
                 proof_key: None,
                 structured_route: None,
                 validation_call_id: None,
@@ -419,6 +424,14 @@ impl ShellCommandHandler {
             let toolchain = super::child_env_value(&exec_params.env, "RUSTUP_TOOLCHAIN")
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let command_identity = validation_identity(
+                repository_key.as_bytes(),
+                exec_params.cwd.to_string_lossy(),
+                &command_invocation,
+                environment.clone(),
+                toolchain.clone(),
+                repository_epoch,
+            );
             let identity = if let Some(binding) = bound_auto_validation.as_ref() {
                 let Some(leaf) = binding.leaf() else {
                     return Err(FunctionCallError::RespondToModel(
@@ -446,14 +459,7 @@ impl ShellCommandHandler {
                     &leaf.covered_contracts,
                 )
             } else {
-                validation_identity(
-                    repository_key.as_bytes(),
-                    exec_params.cwd.to_string_lossy(),
-                    &command_invocation,
-                    environment,
-                    toolchain,
-                    repository_epoch,
-                )
+                command_identity.clone()
             };
             if bound_auto_validation.is_some()
                 && !params.force_fresh.unwrap_or(false)
@@ -467,6 +473,33 @@ impl ShellCommandHandler {
                     serde_json::json!({
                         "success": true,
                         "admission_disposition": "reused",
+                        "validation_result": result,
+                    }),
+                )));
+            }
+            if let Some(launch) = validation_launch.as_mut() {
+                launch.command_proof_key = Some(command_identity.clone());
+            }
+            if let Some(binding) = bound_auto_validation.as_ref()
+                && !params.force_fresh.unwrap_or(false)
+                && let Some(leaf) = binding.leaf()
+                && !leaf.semantic_timeout
+                && let Some(route) = binding.leaf_route()
+                && let Some(result) = session
+                    .services
+                    .command_execution
+                    .promote_reusable_command_validation(
+                        &command_identity,
+                        identity.clone(),
+                        route,
+                        call_id.clone(),
+                    )
+                    .await
+            {
+                return Ok(boxed_tool_output(validation_structured_output(
+                    serde_json::json!({
+                        "success": true,
+                        "admission_disposition": "reused_predeclared",
                         "validation_result": result,
                     }),
                 )));
@@ -526,6 +559,7 @@ impl ShellCommandHandler {
             validation_launch,
             validation_leader,
             validation_waiter,
+            repository,
         };
         if let Some(leader) = run_args.validation_leader.as_ref() {
             run_args.cancellation_token = leader.cancellation_token();

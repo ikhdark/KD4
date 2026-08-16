@@ -12,6 +12,36 @@ fn nested_code_mode_projection_is_not_provider_visible() {
 }
 
 #[test]
+fn nested_code_mode_projection_still_records_turn_facts() {
+    let state = crate::turn_timing::TurnTimingState::default();
+
+    record_projection_timing(
+        &state,
+        projection_is_provider_visible(&ToolCallSource::CodeMode {
+            cell_id: "cell".to_string(),
+            runtime_tool_call_id: "nested".to_string(),
+        }),
+        1_000,
+        250,
+        400,
+        100,
+        true,
+        true,
+        3,
+    );
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_output_projected_token_count, 0);
+    assert_eq!(counters.tool_output_canonical_byte_count, 1_000);
+    assert_eq!(counters.tool_output_canonical_token_count, 250);
+    assert_eq!(counters.tool_output_model_byte_count, 400);
+    assert_eq!(counters.tool_output_model_token_count, 100);
+    assert_eq!(counters.tool_output_artifact_creation_count, 1);
+    assert_eq!(counters.tool_output_projection_truncation_count, 1);
+    assert_eq!(counters.tool_output_omitted_section_count, 3);
+}
+
+#[test]
 fn optimization_priority_owner_continuations_form_a_full_packet_before_trimming() {
     assert_eq!(projection_packet_token_limit(false, 4_000, 10_000), 4_000);
     assert_eq!(projection_packet_token_limit(true, 4_000, 10_000), 10_000);

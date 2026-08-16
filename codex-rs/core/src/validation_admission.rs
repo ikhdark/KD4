@@ -683,6 +683,10 @@ pub(crate) struct ValidationLaunchPlan {
     pub(crate) invocation: CommandInvocation,
     pub(crate) authorization_revision: u64,
     pub(crate) observation: Option<ValidationObservationPlan>,
+    /// Exact command identity at the repository-wide mutation epoch. This lets
+    /// a successful focused validation be promoted into a route proof only
+    /// when no repository mutation occurred between execution and declaration.
+    pub(crate) command_proof_key: Option<codex_protocol::validation::ValidationProofKey>,
     /// Filled only after the launch-boundary admission has rechecked the
     /// current implementation, environment, configuration, and coverage.
     pub(crate) proof_key: Option<codex_protocol::validation::ValidationProofKey>,

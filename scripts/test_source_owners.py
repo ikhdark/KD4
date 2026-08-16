@@ -1,9 +1,15 @@
 from pathlib import Path
 from unittest import mock
+import json
+import sys
 import tempfile
 import unittest
 
-from scripts import source_owners
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts import source_owners  # noqa: E402
 
 
 class SourceOwnersTest(unittest.TestCase):
@@ -15,7 +21,7 @@ class SourceOwnersTest(unittest.TestCase):
             (root / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
             manifest_path = root / "source_owners.toml"
             manifest_path.write_text(
-                """schema_version = 1
+                """schema_version = 2
 
 [[owners]]
 id = "alpha"
@@ -34,6 +40,20 @@ tests = ["src/lib.rs"]
 path = "src/lib.rs"
 symbol = "locate"
 
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:src/lib.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "src/lib.rs", symbol = "locate" }]
+
+[[owners.invariants]]
+id = "locator-contract"
+kind = "semantic"
+statement = "The locator remains the runtime entrypoint."
+evidence = [{ path = "src/lib.rs", symbol = "locate" }]
+tests = ["src/lib.rs"]
+
 [[owners.validation]]
 id = "focused"
 cwd = "."
@@ -50,8 +70,10 @@ role = "focused_tests"
 
             self.assertEqual(first, second)
             self.assertTrue(first.startswith("manual prose\n"))
-            self.assertIn("schema=1", block)
+            self.assertIn("schema=2", block)
             self.assertIn("`alpha`", block)
+            self.assertIn("`control_flow:calls`", block)
+            self.assertIn("`semantic:locator-contract`", block)
 
     def test_alias_collision_requires_explicit_ambiguity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -83,7 +105,7 @@ symbol = "{owner_id}_entry"
                 )
             manifest_path = root / "source_owners.toml"
             manifest_path.write_text(
-                "schema_version = 1\n" + "".join(owners), encoding="utf-8"
+                "schema_version = 2\n" + "".join(owners), encoding="utf-8"
             )
 
             with self.assertRaisesRegex(ValueError, "collision"):
@@ -95,7 +117,7 @@ symbol = "{owner_id}_entry"
             (root / "src").mkdir()
             manifest_path = root / "source_owners.toml"
             manifest_path.write_text(
-                """schema_version = 1
+                """schema_version = 2
 [[owners]]
 id = "alpha"
 roots = ["src"]
@@ -111,7 +133,7 @@ roots = ["src"]
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "source_owners.toml"
             manifest_path.write_text(
-                'schema_version = 1\nowners = ["not-a-table"]\n',
+                'schema_version = 2\nowners = ["not-a-table"]\n',
                 encoding="utf-8",
             )
 
@@ -129,6 +151,226 @@ roots = ["src"]
 
             self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_query_is_bounded_revision_keyed_and_includes_incoming_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
+[[owners]]
+id = "alpha"
+roots = ["src"]
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "src/lib.rs" }]
+[[owners.invariants]]
+id = "stable"
+kind = "compatibility"
+statement = "Stable."
+evidence = [{ path = "src/lib.rs" }]
+tests = []
+
+[[owners]]
+id = "beta"
+roots = ["src"]
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "calls"
+target = "owner:alpha"
+confidence = "compiler_resolved"
+evidence = [{ path = "src/lib.rs", symbol = "locate" }]
+""",
+                encoding="utf-8",
+            )
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
+
+            with mock.patch.object(
+                source_owners, "repository_revision", return_value="revision-1"
+            ):
+                bounded = source_owners.query_graph(
+                    manifest, digest, root, ["alpha"], max_relationships=1
+                )
+                result = source_owners.query_graph(
+                    manifest, digest, root, ["alpha"], max_relationships=2
+                )
+
+            self.assertEqual(result["repository_revision"], "revision-1")
+            self.assertEqual(bounded["status"], "partial")
+            self.assertEqual(bounded["omitted"]["relationships"], 1)
+            self.assertTrue(
+                any(item["source"] == "owner:beta" for item in result["relationships"])
+            )
+            self.assertEqual(result["owners"][0]["invariants"][0]["id"], "stable")
+
+    def test_architecture_slice_distinguishes_unknowns_from_bounded_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
+[[owners]]
+id = "alpha"
+roots = ["src"]
+primary_entries = [{ path = "src/lib.rs", symbol = "locate" }]
+tests = ["src/lib.rs"]
+[owners.facet_exclusions]
+callers_and_consumers = "No external consumer in this fixture."
+configuration_and_gates = "No configuration in this fixture."
+generated_artifacts = "No generated output in this fixture."
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:src/lib.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "src/lib.rs", symbol = "locate" }]
+[[owners.invariants]]
+id = "stable"
+kind = "semantic"
+statement = "Stable."
+evidence = [{ path = "src/lib.rs", symbol = "locate" }]
+tests = ["src/lib.rs"]
+""",
+                encoding="utf-8",
+            )
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
+
+            slice_ = source_owners.architecture_slice(manifest, digest, root, ["alpha"])
+
+            self.assertEqual(slice_["material_unknowns"], [])
+            self.assertFalse(slice_["truncated"])
+            self.assertEqual(slice_["omitted_relationships"], 0)
+            self.assertEqual(
+                slice_["configuration_and_gates"]["status"], "not_applicable"
+            )
+            self.assertEqual(
+                slice_["control_and_data_flow"]["relationships"][0]["provenance"],
+                "exact",
+            )
+            first_snapshot = slice_["snapshot"]
+            (root / "src" / "lib.rs").write_text(
+                'fn locate() { println!("changed"); }\n', encoding="utf-8"
+            )
+            second_snapshot = source_owners.architecture_slice(
+                manifest, digest, root, ["alpha"]
+            )["snapshot"]
+            self.assertNotEqual(first_snapshot, second_snapshot)
+
+    def test_architecture_slice_ranks_task_relevant_edges_within_each_facet(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            for name in ("lib.rs", "critical_cache.rs", "secondary.rs"):
+                (root / "src" / name).write_text("fn item() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
+[[owners]]
+id = "alpha"
+roots = ["src"]
+primary_entries = [{ path = "src/lib.rs", symbol = "item" }]
+tests = ["src/lib.rs"]
+[owners.facet_exclusions]
+callers_and_consumers = "No consumers in this fixture."
+generated_artifacts = "No generated output in this fixture."
+invariants = "No invariant in this fixture."
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:src/secondary.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "src/secondary.rs", symbol = "item" }]
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:src/critical_cache.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "src/critical_cache.rs", symbol = "item" }]
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:settings"
+confidence = "declared"
+evidence = [{ path = "src/lib.rs", symbol = "item" }]
+""",
+                encoding="utf-8",
+            )
+            manifest, digest = source_owners.load_and_validate(manifest_path, root)
+
+            slice_ = source_owners.architecture_slice(
+                manifest, digest, root, ["alpha"], focus="repair critical cache"
+            )
+
+            ranked = slice_["control_and_data_flow"]["relationships"]
+            self.assertIn("critical_cache.rs", ranked[0]["target"])
+            self.assertIn("secondary.rs", ranked[1]["target"])
+
+            bounded = source_owners.architecture_slice(
+                manifest,
+                digest,
+                root,
+                ["alpha"],
+                max_relationships=2,
+                focus="repair critical cache",
+            )
+            self.assertEqual(len(bounded["control_and_data_flow"]["relationships"]), 1)
+            self.assertEqual(
+                len(bounded["configuration_and_gates"]["relationships"]), 1
+            )
+            self.assertGreater(bounded["omitted_relationships"], 0)
+
+    def test_architecture_index_is_revision_keyed_and_deterministic(self) -> None:
+        manifest, digest = source_owners.load_and_validate(
+            source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
+        )
+
+        with mock.patch.object(
+            source_owners, "repository_revision", return_value="revision-1"
+        ):
+            first = source_owners.expected_architecture_index(
+                manifest, digest, source_owners.REPO_ROOT
+            )
+            second = source_owners.expected_architecture_index(
+                manifest, digest, source_owners.REPO_ROOT
+            )
+
+        self.assertEqual(first, second)
+        index = json.loads(first)
+        self.assertEqual(index["repository_revision"], "revision-1")
+        self.assertTrue(all("facet_exclusions" in owner for owner in index["owners"]))
+
+    def test_unknown_relationship_category_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
+            manifest_path = root / "source_owners.toml"
+            manifest_path.write_text(
+                """schema_version = 2
+[[owners]]
+id = "alpha"
+roots = ["src"]
+[[owners.relationships]]
+category = "surprising"
+kind = "calls"
+target = "path:src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "src/lib.rs" }]
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "unknown relationship category"):
+                source_owners.load_and_validate(manifest_path, root)
 
 
 if __name__ == "__main__":

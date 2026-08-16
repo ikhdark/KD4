@@ -6051,6 +6051,73 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "architectureBytesRead": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureFilesRead": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureInvariantCount": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureLateRelationshipDiscoveryCount": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureMaterialUnknownCount": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureMissingRequirementCount": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureRelationshipCount": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureSliceAttemptCount": {
+          "default": 0,
+          "description": "Aggregate-only architecture-comprehension telemetry. These counters do not contain repository paths, symbols, relationship text, or evidence.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureSliceCompleteCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureStaleSnapshotCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "architectureToolCallCount": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "attemptsByKind": {
           "allOf": [
             {
@@ -6962,6 +7029,17 @@
             "null"
           ]
         },
+        "requestTokenCategories": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnTimingRequestTokenCategories"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Aggregate-only, locally estimated request composition. No prompt text, repository paths, tool arguments, or hashes are persisted here."
+        },
         "tokenUsage": {
           "anyOf": [
             {
@@ -7106,6 +7184,66 @@
         "totalTokens",
         "visibleOutputTokens"
       ],
+      "type": "object"
+    },
+    "TurnTimingRequestTokenCategories": {
+      "properties": {
+        "baseInstructions": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "conversationHistory": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "currentInput": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "logicalTotal": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "otherInjectedContext": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "repeatedUnchangedContext": {
+          "default": 0,
+          "description": "Tokens in categories whose exact hash matched the prior model request.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "repositoryContext": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "skills": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolSchemas": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "TurnTimingTerminalization": {

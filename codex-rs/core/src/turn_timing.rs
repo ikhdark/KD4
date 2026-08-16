@@ -34,6 +34,7 @@ use codex_protocol::protocol::TurnTimingModelRequest;
 use codex_protocol::protocol::TurnTimingPreFirstModelOutput;
 use codex_protocol::protocol::TurnTimingProgressKind;
 use codex_protocol::protocol::TurnTimingProviderTokenUsage;
+use codex_protocol::protocol::TurnTimingRequestTokenCategories;
 use codex_protocol::protocol::TurnTimingTerminalization;
 use codex_protocol::protocol::TurnTimingUnions;
 
@@ -42,7 +43,7 @@ use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 11;
+const TIMING_SCHEMA_VERSION: u16 = 13;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,6 +317,7 @@ impl TurnTimingSnapshot {
                 output_tokens: request.output_tokens,
                 reasoning_output_tokens: request.reasoning_output_tokens,
                 token_usage: request.token_usage.clone(),
+                request_token_categories: request.request_token_categories.clone(),
                 dispatch_ms: request
                     .dispatch_ns
                     .map(|value| public_ms(value, &mut saturation_count)),
@@ -357,6 +359,23 @@ impl TurnTimingSnapshot {
             exact_repeated_wait_count,
             planning_generation_count: profile.counters.planning_generation_count,
             plan_revision_generation_count: profile.counters.plan_revision_generation_count,
+            architecture_slice_attempt_count: profile.counters.architecture_slice_attempt_count,
+            architecture_slice_complete_count: profile.counters.architecture_slice_complete_count,
+            architecture_relationship_count: profile.counters.architecture_relationship_count,
+            architecture_invariant_count: profile.counters.architecture_invariant_count,
+            architecture_missing_requirement_count: profile
+                .counters
+                .architecture_missing_requirement_count,
+            architecture_material_unknown_count: profile
+                .counters
+                .architecture_material_unknown_count,
+            architecture_stale_snapshot_count: profile.counters.architecture_stale_snapshot_count,
+            architecture_tool_call_count: profile.counters.architecture_tool_call_count,
+            architecture_files_read: profile.counters.architecture_files_read,
+            architecture_bytes_read: profile.counters.architecture_bytes_read,
+            architecture_late_relationship_discovery_count: profile
+                .counters
+                .architecture_late_relationship_discovery_count,
             planning_fixed_point_iteration_count: profile
                 .counters
                 .planning_fixed_point_iteration_count,
@@ -474,6 +493,7 @@ pub(crate) struct ModelRequestTiming {
     output_tokens: u64,
     reasoning_output_tokens: u64,
     token_usage: Option<TurnTimingProviderTokenUsage>,
+    request_token_categories: Option<TurnTimingRequestTokenCategories>,
     dispatch_ns: Option<u128>,
     first_model_output_ns: Option<u128>,
     completed_ns: Option<u128>,
@@ -593,6 +613,17 @@ pub(crate) struct TimingCounters {
     pub(crate) exact_repeated_wait_count: u32,
     pub(crate) planning_generation_count: u32,
     pub(crate) plan_revision_generation_count: u32,
+    pub(crate) architecture_slice_attempt_count: u32,
+    pub(crate) architecture_slice_complete_count: u32,
+    pub(crate) architecture_relationship_count: u64,
+    pub(crate) architecture_invariant_count: u64,
+    pub(crate) architecture_missing_requirement_count: u64,
+    pub(crate) architecture_material_unknown_count: u64,
+    pub(crate) architecture_stale_snapshot_count: u32,
+    pub(crate) architecture_tool_call_count: u64,
+    pub(crate) architecture_files_read: u64,
+    pub(crate) architecture_bytes_read: u64,
+    pub(crate) architecture_late_relationship_discovery_count: u64,
     pub(crate) planning_fixed_point_iteration_count: u32,
     pub(crate) planning_invalidation_count: u32,
     pub(crate) planning_semantic_effect_count: u32,
@@ -958,6 +989,54 @@ impl TurnTimingState {
             .counters
             .plan_revision_generation_count
             .saturating_add(1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_architecture_slice_evaluation(
+        &self,
+        complete: bool,
+        relationships: u64,
+        invariants: u64,
+        missing_requirements: u64,
+        material_unknowns: u64,
+        stale_snapshot: bool,
+        tool_calls: u64,
+        files_read: u64,
+        bytes_read: u64,
+        late_relationship_discoveries: u64,
+    ) {
+        let mut state = self.state();
+        let counters = &mut state.counters;
+        counters.architecture_slice_attempt_count =
+            counters.architecture_slice_attempt_count.saturating_add(1);
+        counters.architecture_slice_complete_count = counters
+            .architecture_slice_complete_count
+            .saturating_add(u32::from(complete));
+        counters.architecture_relationship_count = counters
+            .architecture_relationship_count
+            .saturating_add(relationships);
+        counters.architecture_invariant_count = counters
+            .architecture_invariant_count
+            .saturating_add(invariants);
+        counters.architecture_missing_requirement_count = counters
+            .architecture_missing_requirement_count
+            .saturating_add(missing_requirements);
+        counters.architecture_material_unknown_count = counters
+            .architecture_material_unknown_count
+            .saturating_add(material_unknowns);
+        counters.architecture_stale_snapshot_count = counters
+            .architecture_stale_snapshot_count
+            .saturating_add(u32::from(stale_snapshot));
+        counters.architecture_tool_call_count = counters
+            .architecture_tool_call_count
+            .saturating_add(tool_calls);
+        counters.architecture_files_read =
+            counters.architecture_files_read.saturating_add(files_read);
+        counters.architecture_bytes_read =
+            counters.architecture_bytes_read.saturating_add(bytes_read);
+        counters.architecture_late_relationship_discovery_count = counters
+            .architecture_late_relationship_discovery_count
+            .saturating_add(late_relationship_discoveries);
     }
 
     pub(crate) fn record_planning_fixed_point_iteration(&self) {
@@ -1430,6 +1509,15 @@ impl TurnTimingState {
         }
     }
 
+    pub(crate) fn record_model_request_token_categories(
+        &self,
+        categories: TurnTimingRequestTokenCategories,
+    ) {
+        if let Some(request) = self.state().model_requests.last_mut() {
+            request.request_token_categories = Some(categories);
+        }
+    }
+
     pub(crate) fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration> {
         if !matches!(item, TurnItem::AgentMessage(_)) {
             return None;
@@ -1737,6 +1825,13 @@ impl TurnTimingStateInner {
                 elapsed_ns,
                 &mut self.counters.saturation_count,
             );
+            if let Some(request) = self.model_requests.last_mut() {
+                add_saturating(
+                    &mut request.model_stream_wait_ns,
+                    elapsed_ns,
+                    &mut self.counters.saturation_count,
+                );
+            }
         }
         if self.activity.model_stream_wait > 0 {
             add_saturating(

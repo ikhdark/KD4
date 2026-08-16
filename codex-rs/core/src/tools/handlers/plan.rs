@@ -1,7 +1,14 @@
 use crate::function_tool::FunctionCallError;
+use crate::task_evidence::ArchitectureEvidenceFacetInput;
+use crate::task_evidence::ArchitectureEvidenceProvenance;
+use crate::task_evidence::ArchitectureEvidenceStatus;
+use crate::task_evidence::ArchitectureExplorationMetricsInput;
+use crate::task_evidence::ArchitectureSliceInput;
+use crate::task_evidence::PlanStepEvidenceInput;
 use crate::task_evidence::PlanUpdateEffect;
 use crate::task_evidence::PlanningTier;
 use crate::task_evidence::PlanningUpdateInput;
+use crate::task_evidence::ValidationDisposition;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -15,6 +22,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::plan_tool::ValidationRoute;
 use codex_protocol::plan_tool::ValidationRouteLeaf;
 use codex_protocol::plan_tool::ValidationRouteOrdering;
 use codex_protocol::protocol::EventMsg;
@@ -22,9 +30,13 @@ use codex_protocol::validation::ValidationTerminalStatus;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::shell_command_backend_for_features;
+use serde::Serialize;
 use serde_json::Value as JsonValue;
+use sha2::Digest;
+use sha2::Sha256;
 #[cfg(test)]
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::LazyLock;
@@ -38,31 +50,58 @@ pub struct PlanHandler;
 pub struct PlanToolOutput {
     normalized_plan: Option<UpdatePlanArgs>,
     governor_plan: Option<UpdatePlanArgs>,
+    effect: PlanUpdateEffect,
     unfinished_mutation_obligation: Option<bool>,
+    source_closure_established: bool,
+    source_closure_receipt: Option<SourceClosureReceipt>,
     validation_results: Vec<JsonValue>,
+    finalization_requested: bool,
+    finalized: bool,
+    missing_evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct SourceClosureReceipt {
+    established: bool,
+    snapshot: Option<String>,
+    expected_snapshot: Option<String>,
+    stale_snapshot: bool,
+    missing_requirements: Vec<String>,
+    exact_relationships: u64,
+    declared_relationships: u64,
+    heuristic_relationships: u64,
+    total_relationships: u64,
+    invariant_relationships: u64,
+    relationship_kinds: Vec<crate::task_evidence::ArchitectureRelationshipKind>,
+    truncated: bool,
+    omitted_relationships: u64,
+    material_unknowns: Vec<String>,
+    limitations: Vec<String>,
+    metrics: ArchitectureExplorationMetricsInput,
 }
 
 const PLAN_UPDATED_MESSAGE: &str = "Plan updated";
 
 impl PlanToolOutput {
-    fn normalized_result(&self) -> Option<JsonValue> {
-        self.normalized_plan
-            .as_ref()
-            .map(|normalized_plan| {
-                serde_json::json!({
-                    "message": PLAN_UPDATED_MESSAGE,
-                    "normalized_plan": normalized_plan,
-                    "validation_results": self.validation_results,
-                })
-            })
-            .or_else(|| {
-                (!self.validation_results.is_empty()).then(|| {
-                    serde_json::json!({
-                        "message": PLAN_UPDATED_MESSAGE,
-                        "validation_results": self.validation_results,
-                    })
-                })
-            })
+    fn normalized_result(&self) -> JsonValue {
+        let mut result = serde_json::json!({
+            "message": PLAN_UPDATED_MESSAGE,
+            "effect": self.effect.as_str(),
+            "no_op": self.effect == PlanUpdateEffect::NoOp,
+            "validation_results": self.validation_results,
+            "finalization": {
+                "requested": self.finalization_requested,
+                "finalized": self.finalized,
+                "missing_evidence": self.missing_evidence,
+            },
+        });
+        if let Some(normalized_plan) = &self.normalized_plan {
+            result["normalized_plan"] = serde_json::json!(normalized_plan);
+        }
+        if let Some(receipt) = &self.source_closure_receipt {
+            result["source_closure"] = serde_json::json!(receipt);
+        }
+        result
     }
 }
 
@@ -123,18 +162,24 @@ impl ToolOutput for PlanToolOutput {
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
+        let source_closure = self.source_closure_receipt.as_ref().map(|receipt| {
+            serde_json::json!({
+                "missing_requirements": receipt.missing_requirements,
+                "relationship_kinds": receipt.relationship_kinds,
+                "total_relationships": receipt.total_relationships,
+            })
+        });
         Some(serde_json::json!({
             "kind": "plan_update",
             "plan": self.governor_plan,
             "unfinished_mutation_obligation": self.unfinished_mutation_obligation,
+            "source_closure_established": self.source_closure_established,
+            "source_closure": source_closure,
         }))
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
-        let text = self.normalized_result().map_or_else(
-            || PLAN_UPDATED_MESSAGE.to_string(),
-            |result| result.to_string(),
-        );
+        let text = self.normalized_result().to_string();
         let mut output = FunctionCallOutputPayload::from_text(text);
         output.success = Some(true);
 
@@ -146,7 +191,6 @@ impl ToolOutput for PlanToolOutput {
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         self.normalized_result()
-            .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()))
     }
 }
 
@@ -197,25 +241,10 @@ impl PlanHandler {
         }
 
         let requested_input = parse_update_plan_arguments(&arguments)?;
+        let finalization_requested = requested_input.finalize;
         let repository = codex_git_utils::get_git_repo_root(turn.config.cwd.as_path())
             .unwrap_or_else(|| turn.config.cwd.to_path_buf());
-        let routes = requested_input.validation_route.iter().chain(
-            requested_input
-                .plan
-                .iter()
-                .filter_map(|item| item.validation_route.as_ref()),
-        );
-        for route in routes {
-            for leaf in &route.leaves {
-                super::shell::validate_structured_validation_leaf(leaf, &repository).map_err(
-                    |reason| {
-                        FunctionCallError::RespondToModel(format!(
-                            "structured validation route could not be bound: {reason}"
-                        ))
-                    },
-                )?;
-            }
-        }
+        validate_requested_validation_routes(&requested_input, &repository)?;
         if cancellation_token.is_cancelled() {
             return Err(FunctionCallError::RespondToModel(
                 "update_plan was cancelled before the plan update began".to_string(),
@@ -228,6 +257,38 @@ impl PlanHandler {
             .task_evidence
             .record_planning_update(requested_input.clone())
             .await;
+        let mut closure_input = requested_input.clone();
+        session
+            .services
+            .task_evidence
+            .hydrate_planning_source_evidence(&mut closure_input)
+            .await;
+        let expected_snapshot = codex_git_utils::get_head_commit_hash(&repository)
+            .await
+            .map(|sha| sha.0);
+        let (source_closure_established, source_closure_receipt, closure_surfaces) =
+            planning_update_source_closure(&closure_input, expected_snapshot.as_deref());
+        if source_closure_established {
+            session
+                .services
+                .task_evidence
+                .capture_source_closure_snapshot(&closure_surfaces)
+                .await;
+        }
+        if let Some(receipt) = source_closure_receipt.as_ref() {
+            turn.turn_timing_state.record_architecture_slice_evaluation(
+                receipt.established,
+                receipt.total_relationships,
+                receipt.invariant_relationships,
+                receipt.missing_requirements.len() as u64,
+                receipt.material_unknowns.len() as u64,
+                receipt.stale_snapshot,
+                receipt.metrics.tool_calls,
+                receipt.metrics.files_read,
+                receipt.metrics.bytes_read,
+                receipt.metrics.late_relationship_discoveries,
+            );
+        }
         match outcome.effect {
             PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
             PlanUpdateEffect::StructuralRevision => {
@@ -240,38 +301,411 @@ impl PlanHandler {
             explanation: requested_input.explanation,
             plan: requested_input.plan,
         };
-        let normalized_plan = (args != requested_args).then(|| args.clone());
         session
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args.clone()))
             .await;
 
-        let validation_results = if let Some(candidate) = session
-            .services
-            .task_evidence
-            .auto_validation_candidate()
-            .await
-        {
-            run_bound_validation_route(
+        let mut validation_results = Vec::new();
+        let max_validation_rounds = if finalization_requested {
+            args.plan.len().saturating_add(1)
+        } else {
+            1
+        };
+        let mut previous_candidate = None;
+        for round in 0..max_validation_rounds {
+            let Some(candidate) = session
+                .services
+                .task_evidence
+                .auto_validation_candidate()
+                .await
+            else {
+                break;
+            };
+            let candidate_identity = (
+                candidate.step_id.clone(),
+                candidate.implementation_identity.clone(),
+            );
+            if previous_candidate.as_ref() == Some(&candidate_identity) {
+                break;
+            }
+            previous_candidate = Some(candidate_identity);
+            let round_results = run_bound_validation_route(
                 session.clone(),
                 turn.clone(),
-                step_context,
-                tracker,
+                step_context.clone(),
+                tracker.clone(),
                 cancellation_token.clone(),
-                source,
+                source.clone(),
                 &_call_id,
                 candidate,
+                repository.clone(),
             )
+            .await;
+            let successful = validation_round_succeeded(&round_results);
+            validation_results.extend(round_results);
+            if !finalization_requested || !successful || cancellation_token.is_cancelled() {
+                break;
+            }
+            tracing::debug!(round, "update_plan finalization consumed validation round");
+        }
+
+        let mut final_plan = session
+            .services
+            .task_evidence
+            .current_plan_update()
             .await
-        } else {
-            Vec::new()
-        };
+            .unwrap_or_else(|| args.clone());
+        final_plan.explanation.clone_from(&args.explanation);
+        if final_plan != args {
+            session
+                .send_event(turn.as_ref(), EventMsg::PlanUpdate(final_plan.clone()))
+                .await;
+        }
+        let missing_evidence = finalization_missing_evidence(&final_plan);
+        let finalized = finalization_requested && missing_evidence.is_empty();
+        let normalized_plan = (final_plan != requested_args).then(|| final_plan.clone());
 
         Ok(boxed_tool_output(PlanToolOutput {
             normalized_plan,
-            governor_plan: outcome.effect.requests_generation().then_some(args),
+            governor_plan: outcome.effect.requests_generation().then_some(final_plan),
+            effect: outcome.effect,
             unfinished_mutation_obligation: outcome.unfinished_mutation_obligation,
+            source_closure_established,
+            source_closure_receipt,
             validation_results,
+            finalization_requested,
+            finalized,
+            missing_evidence,
         }))
+    }
+}
+
+fn validate_requested_validation_routes(
+    requested_input: &PlanningUpdateInput,
+    repository: &std::path::Path,
+) -> Result<(), FunctionCallError> {
+    if let Some(route) = requested_input.validation_route.as_ref() {
+        validate_requested_validation_route(route, repository, "focused validation route")?;
+    }
+    for (step_index, item) in requested_input.plan.iter().enumerate() {
+        let Some(route) = item.validation_route.as_ref() else {
+            continue;
+        };
+        let owner = item.id.as_deref().map_or_else(
+            || format!("plan step #{}", step_index + 1),
+            |id| format!("plan step `{id}`"),
+        );
+        validate_requested_validation_route(route, repository, &owner)?;
+    }
+    Ok(())
+}
+
+fn validate_requested_validation_route(
+    route: &ValidationRoute,
+    repository: &std::path::Path,
+    owner: &str,
+) -> Result<(), FunctionCallError> {
+    for (leaf_index, leaf) in route.leaves.iter().enumerate() {
+        super::shell::validate_structured_validation_leaf(leaf, repository).map_err(|reason| {
+            FunctionCallError::RespondToModel(format!(
+                "{owner} leaf {} could not be bound: {reason}",
+                leaf_index + 1
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validation_round_succeeded(results: &[JsonValue]) -> bool {
+    results.iter().rev().find_map(|result| {
+        result
+            .get("aggregate")
+            .and_then(JsonValue::as_bool)
+            .filter(|aggregate| *aggregate)
+            .map(|_| result.get("success").and_then(JsonValue::as_bool) == Some(true))
+    }) == Some(true)
+}
+
+fn finalization_missing_evidence(plan: &UpdatePlanArgs) -> Vec<String> {
+    plan.plan
+        .iter()
+        .filter_map(|item| {
+            let id = item.id.as_deref().unwrap_or("unnamed");
+            match &item.status {
+                codex_protocol::plan_tool::StepStatus::Passed
+                | codex_protocol::plan_tool::StepStatus::Skipped
+                | codex_protocol::plan_tool::StepStatus::Completed => None,
+                codex_protocol::plan_tool::StepStatus::Implemented
+                    if item.validation_route.is_some() =>
+                {
+                    Some(format!(
+                        "step {id}: missing fresh successful validation evidence"
+                    ))
+                }
+                codex_protocol::plan_tool::StepStatus::Blocked => {
+                    Some(format!("step {id}: blocked"))
+                }
+                status => Some(format!("step {id}: unfinished ({status:?})")),
+            }
+        })
+        .collect()
+}
+
+const MAX_ARCHITECTURE_RELATIONSHIPS: u64 = 32;
+
+fn planning_update_source_closure(
+    input: &PlanningUpdateInput,
+    expected_snapshot: Option<&str>,
+) -> (bool, Option<SourceClosureReceipt>, Vec<String>) {
+    if input.tier == Some(PlanningTier::Focused) || input.plan.is_empty() {
+        let receipt = source_evidence_receipt(
+            input.source_owner.as_deref(),
+            &input.implementation_surfaces,
+            input.validation_disposition,
+            input.validation_route.is_some() || input.external_validation_route.is_some(),
+            input.architecture_slice.as_ref(),
+            expected_snapshot,
+        );
+        let report = input.source_owner.is_some()
+            || !input.implementation_surfaces.is_empty()
+            || input.architecture_slice.is_some();
+        return (
+            receipt.established,
+            report.then_some(receipt),
+            input.implementation_surfaces.clone(),
+        );
+    }
+
+    let dependency_is_finished = |dependency: &str| {
+        input.plan.iter().any(|item| {
+            item.id.as_deref() == Some(dependency)
+                && matches!(
+                    item.status,
+                    codex_protocol::plan_tool::StepStatus::Passed
+                        | codex_protocol::plan_tool::StepStatus::Skipped
+                        | codex_protocol::plan_tool::StepStatus::Completed
+                )
+        })
+    };
+    let mut fallback = None;
+    for item in input.plan.iter().filter(|item| {
+        matches!(
+            item.status,
+            codex_protocol::plan_tool::StepStatus::Pending
+                | codex_protocol::plan_tool::StepStatus::InProgress
+        ) && item
+            .depends_on
+            .iter()
+            .all(|dependency| dependency_is_finished(dependency))
+    }) {
+        let Some(evidence) = input
+            .step_evidence
+            .iter()
+            .find(|evidence| item.id.as_deref() == Some(evidence.step_id.as_str()))
+        else {
+            continue;
+        };
+        let receipt = step_source_evidence_receipt(
+            evidence,
+            item.validation_route.is_some(),
+            expected_snapshot,
+        );
+        if receipt.established {
+            return (
+                true,
+                Some(receipt),
+                evidence.implementation_surfaces.clone(),
+            );
+        }
+        fallback.get_or_insert((receipt, evidence.implementation_surfaces.clone()));
+    }
+    fallback.map_or_else(
+        || (false, None, Vec::new()),
+        |(receipt, surfaces)| (false, Some(receipt), surfaces),
+    )
+}
+
+fn step_source_evidence_receipt(
+    evidence: &PlanStepEvidenceInput,
+    has_inline_validation_route: bool,
+    expected_snapshot: Option<&str>,
+) -> SourceClosureReceipt {
+    source_evidence_receipt(
+        evidence.source_owner.as_deref(),
+        &evidence.implementation_surfaces,
+        evidence.validation_disposition,
+        has_inline_validation_route || evidence.external_validation_route.is_some(),
+        evidence.architecture_slice.as_ref(),
+        expected_snapshot,
+    )
+}
+
+fn source_evidence_receipt(
+    source_owner: Option<&str>,
+    implementation_surfaces: &[String],
+    validation_disposition: Option<ValidationDisposition>,
+    has_validation_route: bool,
+    architecture_slice: Option<&ArchitectureSliceInput>,
+    expected_snapshot: Option<&str>,
+) -> SourceClosureReceipt {
+    let mut receipt = architecture_slice.map_or_else(SourceClosureReceipt::default, |slice| {
+        architecture_slice_receipt(slice, expected_snapshot)
+    });
+    if source_owner.is_none_or(|owner| owner.trim().is_empty()) {
+        receipt
+            .missing_requirements
+            .push("source_owner".to_string());
+    }
+    if implementation_surfaces.is_empty()
+        || implementation_surfaces
+            .iter()
+            .any(|surface| surface.trim().is_empty())
+    {
+        receipt
+            .missing_requirements
+            .push("implementation_surfaces".to_string());
+    }
+    match validation_disposition {
+        Some(ValidationDisposition::Executable) if !has_validation_route => receipt
+            .missing_requirements
+            .push("validation_route".to_string()),
+        Some(ValidationDisposition::NotRequired | ValidationDisposition::UnavailableBlocked) => {}
+        Some(ValidationDisposition::Executable) => {}
+        Some(ValidationDisposition::UnresolvedDiscoverable) | None => receipt
+            .missing_requirements
+            .push("resolved_validation_disposition".to_string()),
+    }
+    if architecture_slice.is_none() {
+        receipt
+            .missing_requirements
+            .push("architecture_slice".to_string());
+    }
+    receipt.missing_requirements.sort();
+    receipt.missing_requirements.dedup();
+    receipt.established = receipt.missing_requirements.is_empty();
+    receipt
+}
+
+fn architecture_slice_receipt(
+    slice: &ArchitectureSliceInput,
+    expected_snapshot: Option<&str>,
+) -> SourceClosureReceipt {
+    let facets = [
+        ("control_and_data_flow", &slice.control_and_data_flow),
+        ("callers_and_consumers", &slice.callers_and_consumers),
+        ("configuration_and_gates", &slice.configuration_and_gates),
+        (
+            "registration_and_entrypoints",
+            &slice.registration_and_entrypoints,
+        ),
+        ("tests_and_contracts", &slice.tests_and_contracts),
+        ("generated_artifacts", &slice.generated_artifacts),
+        ("invariants", &slice.invariants),
+    ];
+    let mut receipt = SourceClosureReceipt {
+        snapshot: (!slice.snapshot.trim().is_empty()).then(|| slice.snapshot.clone()),
+        expected_snapshot: expected_snapshot.map(str::to_string),
+        stale_snapshot: expected_snapshot
+            .is_some_and(|expected| architecture_snapshot_revision(&slice.snapshot) != expected),
+        truncated: slice.truncated,
+        omitted_relationships: slice.omitted_relationships,
+        material_unknowns: slice.material_unknowns.clone(),
+        limitations: slice.limitations.clone(),
+        metrics: slice.metrics.clone(),
+        ..Default::default()
+    };
+    if receipt.snapshot.is_none() {
+        receipt
+            .missing_requirements
+            .push("architecture_slice.snapshot".to_string());
+    }
+    if receipt.stale_snapshot {
+        receipt
+            .missing_requirements
+            .push("architecture_slice.current_snapshot".to_string());
+    }
+    if slice.truncated {
+        receipt
+            .missing_requirements
+            .push("architecture_slice.not_truncated".to_string());
+    }
+    if slice.omitted_relationships != 0 {
+        receipt
+            .missing_requirements
+            .push("architecture_slice.zero_omissions".to_string());
+    }
+    if !slice.material_unknowns.is_empty() {
+        receipt
+            .missing_requirements
+            .push("architecture_slice.zero_material_unknowns".to_string());
+    }
+    for (name, facet) in facets {
+        count_relationship_provenance(&mut receipt, facet);
+        if name == "invariants" {
+            receipt.invariant_relationships = facet.relationships.len() as u64;
+        }
+        if !architecture_facet_is_closed(facet) {
+            receipt
+                .missing_requirements
+                .push(format!("architecture_slice.{name}"));
+        }
+    }
+    if receipt.total_relationships > MAX_ARCHITECTURE_RELATIONSHIPS {
+        receipt
+            .missing_requirements
+            .push("architecture_slice.relationship_budget".to_string());
+    }
+    receipt.relationship_kinds.sort();
+    receipt.relationship_kinds.dedup();
+    receipt.established = receipt.missing_requirements.is_empty();
+    receipt
+}
+
+fn architecture_snapshot_revision(snapshot: &str) -> &str {
+    snapshot
+        .split_once(':')
+        .map_or(snapshot, |(revision, _)| revision)
+}
+
+fn architecture_facet_is_closed(facet: &ArchitectureEvidenceFacetInput) -> bool {
+    match facet.status {
+        ArchitectureEvidenceStatus::Established => {
+            !facet.relationships.is_empty()
+                && facet.relationships.iter().all(|relationship| {
+                    !relationship.source.trim().is_empty()
+                        && !relationship.target.trim().is_empty()
+                        && !relationship.evidence.trim().is_empty()
+                })
+                && facet.relationships.iter().any(|relationship| {
+                    matches!(
+                        relationship.provenance,
+                        ArchitectureEvidenceProvenance::Exact
+                            | ArchitectureEvidenceProvenance::Declared
+                    )
+                })
+        }
+        ArchitectureEvidenceStatus::NotApplicable => {
+            facet.relationships.is_empty()
+                && facet
+                    .not_applicable_reason
+                    .as_deref()
+                    .is_some_and(|reason| !reason.trim().is_empty())
+        }
+    }
+}
+
+fn count_relationship_provenance(
+    receipt: &mut SourceClosureReceipt,
+    facet: &ArchitectureEvidenceFacetInput,
+) {
+    for relationship in &facet.relationships {
+        receipt.total_relationships += 1;
+        receipt.relationship_kinds.push(relationship.kind);
+        match relationship.provenance {
+            ArchitectureEvidenceProvenance::Exact => receipt.exact_relationships += 1,
+            ArchitectureEvidenceProvenance::Declared => receipt.declared_relationships += 1,
+            ArchitectureEvidenceProvenance::Heuristic => receipt.heuristic_relationships += 1,
+        }
     }
 }
 
@@ -285,11 +719,10 @@ async fn run_bound_validation_route(
     source: ToolCallSource,
     parent_call_id: &str,
     candidate: crate::task_evidence::AutoValidationCandidate,
+    repository: PathBuf,
 ) -> Vec<JsonValue> {
-    let repository = turn.config.cwd.to_path_buf();
-    let repository = codex_git_utils::get_git_repo_root(&repository).unwrap_or(repository);
-
     let mut results = Vec::with_capacity(candidate.route.leaves.len());
+    let route_id = stable_validation_route_id(&candidate.route);
     let route_started_at = std::time::Instant::now();
     if candidate.route.ordering == ValidationRouteOrdering::RunAll {
         let executions = candidate
@@ -362,6 +795,7 @@ async fn run_bound_validation_route(
         let completed_leaf_count = results.len();
         results.push(serde_json::json!({
             "step_id": candidate.step_id,
+            "route_id": route_id,
             "aggregate": true,
             "ordering": candidate.route.ordering,
             "declared_leaf_count": candidate.route.leaves.len(),
@@ -373,6 +807,12 @@ async fn run_bound_validation_route(
         }));
     }
     results
+}
+
+fn stable_validation_route_id(route: &ValidationRoute) -> String {
+    let encoded = serde_json::to_vec(route).unwrap_or_else(|error| error.to_string().into_bytes());
+    let digest = Sha256::digest(encoded);
+    format!("validation-route-v1:{digest:x}")
 }
 
 #[allow(clippy::too_many_arguments)]

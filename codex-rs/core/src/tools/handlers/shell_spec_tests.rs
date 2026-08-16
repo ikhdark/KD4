@@ -100,6 +100,13 @@ fn exec_command_tool_matches_expected_spec() {
                 )),
         ),
         (
+            "until_exit_ms".to_string(),
+            JsonSchema::number(Some(
+                "For empty input, wait until the process exits or this bounded deadline elapses. The response still carries a session_id when the deadline expires; this replaces repeated status polls."
+                    .to_string(),
+            )),
+        ),
+        (
             "max_output_tokens".to_string(),
             JsonSchema::number(Some(format!(
                 "Output token budget. {}; larger requests may be capped by policy.",

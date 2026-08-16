@@ -21,6 +21,7 @@ use crate::context::ApprovalPromptContext;
 use crate::context::ContextualUserFragment;
 use crate::context::PermissionsInstructions;
 use crate::context::PromptContextCategory;
+use crate::context::SourceClosureReuseContext;
 use crate::context_manager::ContextManager;
 use crate::context_manager::PreparedPromptInput;
 use crate::feedback_tags;
@@ -83,6 +84,8 @@ use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
+use crate::stream_events_utils::should_defer_agent_message_event;
+use crate::task_history::TaskHistoryCheckpoint;
 use crate::tasks::TurnTaskResult;
 use crate::tasks::completion_review::CompletionReviewTurnEvidence;
 use crate::tasks::emit_compact_metric;
@@ -144,6 +147,8 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryProjectionManifest;
+use codex_protocol::protocol::HistoryProjectionReplacement;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::PlanDeltaEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
@@ -152,7 +157,9 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::protocol::SamplingBoundaryItem;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::StableContextProjectionRecord;
 use codex_protocol::protocol::SurfacedToolResult;
+use codex_protocol::protocol::ToolReceiptProjectionRecord;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::WarningEvent;
@@ -160,6 +167,7 @@ use codex_protocol::user_input::UserInput;
 use codex_tools::ToolName;
 use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_tools::request_user_input_available_modes;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use codex_utils_stream_parser::AssistantTextChunk;
 use codex_utils_stream_parser::AssistantTextStreamParser;
@@ -218,18 +226,14 @@ fn prepare_sampling_prompt_for_client(
     history: ContextManager,
     turn_context: &TurnContext,
     _client_session: &ModelClientSession,
+    task_checkpoint: Option<&TaskHistoryCheckpoint>,
 ) -> PreparedPromptInput {
-    if turn_context.config.completed_tool_history_projection {
-        history.prepare_for_sampling_prompt_with_completed_tool_projection(
-            &turn_context.model_info.input_modalities,
-            StableContextTarget::Sampling,
-        )
-    } else {
-        history.prepare_for_sampling_prompt(
-            &turn_context.model_info.input_modalities,
-            StableContextTarget::Sampling,
-        )
-    }
+    history.prepare_for_sampling_prompt_with_checkpoint(
+        &turn_context.model_info.input_modalities,
+        StableContextTarget::Sampling,
+        task_checkpoint,
+        turn_context.config.completed_tool_history_projection,
+    )
 }
 
 pub(crate) async fn run_turn(
@@ -322,6 +326,11 @@ pub(crate) async fn run_turn(
     if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
         return Ok(TurnTaskResult::default());
     }
+    let mut source_closure_reuse_active = sess
+        .services
+        .task_evidence
+        .has_fresh_source_closure_snapshot()
+        .await;
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
         .await;
@@ -361,6 +370,9 @@ pub(crate) async fn run_turn(
         turn_context.config.reasoning_phase_efforts.as_ref(),
         Arc::clone(&turn_context.turn_timing_state),
     );
+    if source_closure_reuse_active {
+        reasoning_governor.reuse_source_closure();
+    }
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -384,6 +396,7 @@ pub(crate) async fn run_turn(
         let recorded_input =
             run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await;
         if recorded_input.accepted_user_input {
+            source_closure_reuse_active = false;
             reasoning_governor.accepted_user_input();
         }
         if recorded_input.should_stop {
@@ -458,8 +471,21 @@ pub(crate) async fn run_turn(
                 let history_snapshot_guard = turn_context
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::HistorySnapshot);
-                let history = sess.clone_history().await;
+                let mut history = sess.clone_history().await;
+                if source_closure_reuse_active {
+                    let reuse_context: ResponseItem =
+                        ContextualUserFragment::into(SourceClosureReuseContext);
+                    history.record_items([&reuse_context], TruncationPolicy::Bytes(usize::MAX));
+                }
                 drop(history_snapshot_guard);
+                let current_plan = sess.services.task_evidence.current_plan_update().await;
+                let decision_ledger = sess
+                    .services
+                    .task_evidence
+                    .retained_decision_ledger_payload()
+                    .await;
+                let task_checkpoint =
+                    TaskHistoryCheckpoint::new(current_plan.as_ref(), decision_ledger.as_deref());
                 let normalization_guard = turn_context
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::Normalization);
@@ -467,6 +493,7 @@ pub(crate) async fn run_turn(
                     history,
                     turn_context.as_ref(),
                     &client_session,
+                    task_checkpoint.as_ref(),
                 );
                 drop(normalization_guard);
                 prepared
@@ -919,9 +946,11 @@ pub(crate) async fn run_turn(
                             .record_proven_loop_activation();
                     }
                     if let Some(directive) = decision.directive {
-                        turn_context
-                            .turn_timing_state
-                            .record_no_progress_directive();
+                        if decision.no_progress_directive {
+                            turn_context
+                                .turn_timing_state
+                                .record_no_progress_directive();
+                        }
                         let directive_item = ResponseItem::Message {
                             id: None,
                             role: "developer".to_string(),
@@ -2248,6 +2277,7 @@ pub(crate) fn build_prompt(
         stable_context_fallback_tool_history_substitutions: Arc::from([]),
         stable_context_manifest: Default::default(),
         prompt_provenance: Default::default(),
+        history_projection_manifest: None,
         tools: router.model_visible_specs(),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
@@ -2381,6 +2411,52 @@ fn build_projected_prompt(
             PromptContextCategory::AppDesktop,
         );
     }
+    let history_projection_manifest = HistoryProjectionManifest {
+        version: 1,
+        source_history_sha256: prepared.source_history_sha256().to_string(),
+        projected_history_sha256: prepared.projected_history_sha256().to_string(),
+        stable_projection_enabled: manifest.projection_enabled(),
+        stable_fail_open: manifest.fail_open(),
+        stable_fallback_used: false,
+        stable_context: manifest
+            .components()
+            .iter()
+            .map(|component| StableContextProjectionRecord {
+                kind: component.kind.as_str().to_string(),
+                contract_version: component.identity.contract_version,
+                semantic_id: component.identity.semantic_id.clone(),
+                content_sha256: component
+                    .identity
+                    .content_hash
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                disposition: component.disposition.as_str().to_string(),
+                active: component.active,
+            })
+            .collect(),
+        task_checkpoint_sha256: prepared.task_checkpoint_sha256().map(str::to_string),
+        task_replacements: prepared
+            .task_history_replacements()
+            .iter()
+            .map(|replacement| HistoryProjectionReplacement {
+                source_item_index: u64::try_from(replacement.item_index).unwrap_or(u64::MAX),
+                source_sha256: replacement.source_sha256.clone(),
+                replacement_class: replacement.class.to_string(),
+            })
+            .collect(),
+        tool_receipts: prepared
+            .tool_history_substitutions()
+            .iter()
+            .map(|substitution| ToolReceiptProjectionRecord {
+                source_item_index: u64::try_from(substitution.item_index).unwrap_or(u64::MAX),
+                call_id: substitution.call_id.clone(),
+                receipt_id: substitution.receipt_id.clone(),
+                source_output_sha256: substitution.bounded_output_sha256.clone(),
+                substituted_output_sha256: substitution.substituted_output_sha256.clone(),
+            })
+            .collect(),
+    };
     Prompt {
         input,
         stable_context_fallback_input: fallback_input,
@@ -2391,6 +2467,7 @@ fn build_projected_prompt(
             .fallback_tool_history_substitutions(),
         stable_context_manifest: manifest,
         prompt_provenance,
+        history_projection_manifest: Some(history_projection_manifest),
         tools,
         parallel_tool_calls: step_context.turn.model_info.supports_parallel_tool_calls,
         base_instructions,
@@ -2566,8 +2643,20 @@ async fn run_sampling_request(
         turn_context.turn_timing_state.record_sampling_retry();
         if !crate::latency_switches::shared_prompt_input_enabled() {
             let history = sess.clone_history().await;
-            let retry_input =
-                prepare_sampling_prompt_for_client(history, turn_context.as_ref(), client_session);
+            let current_plan = sess.services.task_evidence.current_plan_update().await;
+            let decision_ledger = sess
+                .services
+                .task_evidence
+                .retained_decision_ledger_payload()
+                .await;
+            let task_checkpoint =
+                TaskHistoryCheckpoint::new(current_plan.as_ref(), decision_ledger.as_deref());
+            let retry_input = prepare_sampling_prompt_for_client(
+                history,
+                turn_context.as_ref(),
+                client_session,
+                task_checkpoint.as_ref(),
+            );
             prompt = build_projected_prompt(
                 sess.as_ref(),
                 &retry_input,
@@ -2801,8 +2890,21 @@ async fn derive_tool_exposure_identity(
         all_mcp_tools,
     )
     .direct_entrypoints;
-    let agent_surface_stage = agent_surface_stage(sess, turn_context);
+    let agent_spawn_available = agent_spawn_available(turn_context);
+    let agent_surface_stage = agent_surface_stage(sess, agent_spawn_available);
+    let task_tool_phase = task_tool_phase(
+        sess.services
+            .task_evidence
+            .current_plan_update()
+            .await
+            .as_ref(),
+    );
     let wait_available = sess.services.code_mode_service.has_waitable_cells();
+    let unified_exec_resume_available = sess
+        .services
+        .unified_exec_manager
+        .has_live_processes()
+        .await;
     let goal_surface_state = goal_surface_state(extension_tool_executors);
     let mcp_resources_available = step_context
         .mcp
@@ -2818,45 +2920,82 @@ async fn derive_tool_exposure_identity(
     ToolExposureIdentity {
         selected_skill_direct_mcp_entrypoints,
         agent_surface_stage,
+        task_tool_phase,
+        agent_spawn_available,
         wait_available,
+        unified_exec_resume_available,
         goal_surface_state,
         mcp_resources_available,
         request_user_input_eligible,
     }
 }
 
-fn agent_surface_stage(sess: &Session, turn_context: &TurnContext) -> AgentSurfaceStage {
-    let eligible = match turn_context.multi_agent_version {
+fn task_tool_phase(
+    plan: Option<&codex_protocol::plan_tool::UpdatePlanArgs>,
+) -> crate::tools::exposure::TaskToolPhase {
+    use crate::tools::exposure::TaskToolPhase;
+    use codex_protocol::plan_tool::StepStatus;
+
+    let Some(plan) = plan.filter(|plan| !plan.plan.is_empty()) else {
+        return TaskToolPhase::Discovery;
+    };
+    if plan
+        .plan
+        .iter()
+        .any(|step| step.status == StepStatus::InProgress)
+    {
+        TaskToolPhase::Implementation
+    } else if plan
+        .plan
+        .iter()
+        .any(|step| step.status == StepStatus::Implemented)
+    {
+        TaskToolPhase::Validation
+    } else if plan.plan.iter().all(|step| {
+        matches!(
+            step.status,
+            StepStatus::Passed | StepStatus::Skipped | StepStatus::Completed
+        )
+    }) {
+        TaskToolPhase::Completion
+    } else {
+        TaskToolPhase::Implementation
+    }
+}
+
+fn agent_spawn_available(turn_context: &TurnContext) -> bool {
+    match turn_context.multi_agent_version {
         MultiAgentVersion::Disabled => false,
         MultiAgentVersion::V1 => !crate::agent::exceeds_thread_spawn_depth_limit(
             crate::agent::next_thread_spawn_depth(&turn_context.session_source),
             turn_context.config.agent_max_depth,
         ),
-        MultiAgentVersion::V2 => {
-            crate::session::multi_agents::effective_multi_agent_mode(turn_context).is_some()
-        }
-    };
+        MultiAgentVersion::V2 => crate::session::multi_agents::spawn_is_authorized(turn_context),
+    }
+}
+
+fn agent_surface_stage(sess: &Session, spawn_available: bool) -> AgentSurfaceStage {
     let control = &sess.services.agent_control;
     agent_surface_stage_from_snapshot(
-        eligible,
+        spawn_available,
         control.has_live_agents(),
         control.task_coordinator().has_bindings(),
     )
 }
 
 fn agent_surface_stage_from_snapshot(
-    eligible: bool,
+    spawn_available: bool,
     child_graph_nonempty: bool,
     typed_bindings_present: bool,
 ) -> AgentSurfaceStage {
-    if !eligible {
-        AgentSurfaceStage::Prohibited
-    } else if typed_bindings_present {
+    if typed_bindings_present {
         AgentSurfaceStage::TypedAdministration
     } else if child_graph_nonempty {
         AgentSurfaceStage::Lifecycle
-    } else {
+    } else if spawn_available {
         AgentSurfaceStage::SpawnOnly
+    } else {
+        AgentSurfaceStage::Prohibited
     }
 }
 
@@ -3668,54 +3807,79 @@ async fn try_run_sampling_request(
     }
     let boundary_session = Arc::clone(&sess);
     let boundary_turn_id = turn_context.sub_id.clone();
-    let attempt_prepared: AttemptPreparedCallback = Arc::new(move |identity| {
-        let sess = Arc::clone(&boundary_session);
-        let turn_id = boundary_turn_id.clone();
-        Box::pin(async move {
-            let terminal = sess
-                .active_turn
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|active| active.terminal.clone());
-            let sampling_admission = if let Some(terminal) = terminal.as_ref() {
-                let Some(admission) = terminal.acquire_sampling_admission().await else {
-                    terminal.wait_for_interrupt_resolution().await;
-                    return if terminal.interrupt_persistence_failed() {
-                        Err(CodexErr::Fatal(
-                            "interrupted request_user_input output was not durably persisted"
-                                .to_string(),
-                        ))
-                    } else {
-                        Err(CodexErr::TurnAborted)
-                    };
-                };
-                Some(admission)
-            } else {
-                None
-            };
-            sess.persist_rollout_items_durable(&[RolloutItem::SamplingBoundary(
-                SamplingBoundaryItem {
-                    sampling_request_id: identity.sampling_request_id.clone(),
-                    physical_attempt_id: identity.physical_attempt_id.clone(),
-                    turn_id: Some(turn_id),
-                    unresolved_context: true,
-                },
-            )])
-            .await
-            .map_err(|err| {
-                CodexErr::Fatal(format!(
-                    "failed to persist sampling boundary before provider dispatch: {err}"
-                ))
-            })?;
-            sess.bind_context_baseline_candidate(
-                &identity.sampling_request_id,
-                &identity.physical_attempt_id,
-            )
-            .await;
-            Ok(sampling_admission)
+    let boundary_projection_manifest = prompt.history_projection_manifest.clone();
+    let boundary_stable_fallback_sha256 =
+        crate::task_history::items_sha256(&prompt.stable_context_fallback_input);
+    let boundary_stable_fallback_tool_receipts = prompt
+        .stable_context_fallback_tool_history_substitutions
+        .iter()
+        .map(|substitution| ToolReceiptProjectionRecord {
+            source_item_index: u64::try_from(substitution.item_index).unwrap_or(u64::MAX),
+            call_id: substitution.call_id.clone(),
+            receipt_id: substitution.receipt_id.clone(),
+            source_output_sha256: substitution.bounded_output_sha256.clone(),
+            substituted_output_sha256: substitution.substituted_output_sha256.clone(),
         })
-    });
+        .collect::<Vec<_>>();
+    let attempt_prepared: AttemptPreparedCallback =
+        Arc::new(move |identity, stable_fallback_used| {
+            let sess = Arc::clone(&boundary_session);
+            let turn_id = boundary_turn_id.clone();
+            let projection_manifest = boundary_projection_manifest.clone().map(|mut manifest| {
+                if stable_fallback_used {
+                    manifest.projected_history_sha256 = boundary_stable_fallback_sha256.clone();
+                    manifest.stable_projection_enabled = false;
+                    manifest.stable_fallback_used = true;
+                    manifest.tool_receipts = boundary_stable_fallback_tool_receipts.clone();
+                }
+                manifest
+            });
+            Box::pin(async move {
+                let terminal = sess
+                    .active_turn
+                    .lock()
+                    .await
+                    .as_ref()
+                    .and_then(|active| active.terminal.clone());
+                let sampling_admission = if let Some(terminal) = terminal.as_ref() {
+                    let Some(admission) = terminal.acquire_sampling_admission().await else {
+                        terminal.wait_for_interrupt_resolution().await;
+                        return if terminal.interrupt_persistence_failed() {
+                            Err(CodexErr::Fatal(
+                                "interrupted request_user_input output was not durably persisted"
+                                    .to_string(),
+                            ))
+                        } else {
+                            Err(CodexErr::TurnAborted)
+                        };
+                    };
+                    Some(admission)
+                } else {
+                    None
+                };
+                sess.persist_rollout_items_durable(&[RolloutItem::SamplingBoundary(
+                    SamplingBoundaryItem {
+                        sampling_request_id: identity.sampling_request_id.clone(),
+                        physical_attempt_id: identity.physical_attempt_id.clone(),
+                        turn_id: Some(turn_id),
+                        unresolved_context: true,
+                        projection_manifest,
+                    },
+                )])
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to persist sampling boundary before provider dispatch: {err}"
+                    ))
+                })?;
+                sess.bind_context_baseline_candidate(
+                    &identity.sampling_request_id,
+                    &identity.physical_attempt_id,
+                )
+                .await;
+                Ok(sampling_admission)
+            })
+        });
     let stream_result = client_session
         .stream_with_attempt_prepared(
             prompt,
@@ -3888,12 +4052,16 @@ async fn try_run_sampling_request(
                     continue;
                 }
 
+                let defer_final_agent_message_events =
+                    !turn_context.session_source.is_non_root_agent()
+                        && sess.services.task_evidence.allows_kd4_completion();
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
                     turn_context: turn_context.clone(),
                     turn_store: Arc::clone(&turn_store),
                     tool_runtime: tool_runtime.clone(),
                     cancellation_token: cancellation_token.child_token(),
+                    defer_final_agent_message_events,
                 };
 
                 let output_result = match handle_output_item_done(
@@ -3948,7 +4116,14 @@ async fn try_run_sampling_request(
                 .await
                 {
                     let mut turn_item = turn_item;
-                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
+                    let defer_final_agent_message_events =
+                        !turn_context.session_source.is_non_root_agent()
+                            && sess.services.task_evidence.allows_kd4_completion();
+                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors
+                        && !should_defer_agent_message_event(
+                            &turn_item,
+                            defer_final_agent_message_events,
+                        );
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
                     if stream_item_to_client

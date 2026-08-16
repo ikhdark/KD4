@@ -40,8 +40,14 @@ pub(crate) enum StableContextKind {
     SkillCatalog,
     SelectedSkill,
     DesktopApp,
+    AppContext,
     Plugins,
+    RecommendedPlugins,
+    Environment,
     EnvironmentPermissions,
+    ModelSwitch,
+    Personality,
+    Realtime,
     RootCoordinator,
     MultiAgent,
     ToolSchemas,
@@ -60,8 +66,14 @@ impl StableContextKind {
             Self::SkillCatalog => "skill_catalog",
             Self::SelectedSkill => "selected_skill",
             Self::DesktopApp => "desktop_app",
+            Self::AppContext => "app_context",
             Self::Plugins => "plugins",
+            Self::RecommendedPlugins => "recommended_plugins",
+            Self::Environment => "environment",
             Self::EnvironmentPermissions => "environment_permissions",
+            Self::ModelSwitch => "model_switch",
+            Self::Personality => "personality",
+            Self::Realtime => "realtime",
             Self::RootCoordinator => "root_coordinator",
             Self::MultiAgent => "multi_agent",
             Self::ToolSchemas => "tool_schemas",
@@ -275,8 +287,14 @@ enum StableContextSlot {
     SkillCatalog,
     SelectedSkill,
     Apps,
+    AppContext,
     Plugins,
+    RecommendedPlugins,
+    Environment,
     Permissions,
+    ModelSwitch,
+    Personality,
+    Realtime,
     MultiAgent,
     RootCoordinator,
 }
@@ -290,8 +308,14 @@ impl StableContextSlot {
             Self::SkillCatalog => StableContextKind::SkillCatalog,
             Self::SelectedSkill => StableContextKind::SelectedSkill,
             Self::Apps => StableContextKind::DesktopApp,
+            Self::AppContext => StableContextKind::AppContext,
             Self::Plugins => StableContextKind::Plugins,
+            Self::RecommendedPlugins => StableContextKind::RecommendedPlugins,
+            Self::Environment => StableContextKind::Environment,
             Self::Permissions => StableContextKind::EnvironmentPermissions,
+            Self::ModelSwitch => StableContextKind::ModelSwitch,
+            Self::Personality => StableContextKind::Personality,
+            Self::Realtime => StableContextKind::Realtime,
             Self::MultiAgent => StableContextKind::MultiAgent,
             Self::RootCoordinator => StableContextKind::RootCoordinator,
         }
@@ -305,8 +329,14 @@ impl StableContextSlot {
             Self::SkillCatalog => "skill_catalog",
             Self::SelectedSkill => "selected_skill",
             Self::Apps => "apps",
+            Self::AppContext => "app_context",
             Self::Plugins => "plugins",
+            Self::RecommendedPlugins => "recommended_plugins",
+            Self::Environment => "environment",
             Self::Permissions => "environment_permissions",
+            Self::ModelSwitch => "model_switch",
+            Self::Personality => "personality",
+            Self::Realtime => "realtime",
             Self::MultiAgent => "multi_agent",
             Self::RootCoordinator => "root_coordinator",
         }
@@ -347,11 +377,10 @@ pub(crate) fn project_stable_context(
             continue;
         };
         let mut contains_stable = false;
-        let mut contains_unrecognized = false;
         for (content_index, content_item) in content.iter().enumerate() {
-            let ContentItem::InputText { text } = content_item else {
-                contains_unrecognized = true;
-                continue;
+            let text = match content_item {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => text,
+                _ => continue,
             };
             if let Some(slot) = classify_stable_text(role, text) {
                 contains_stable = true;
@@ -364,18 +393,11 @@ pub(crate) fn project_stable_context(
                 });
             } else if contains_known_open_marker(text) {
                 ambiguous = true;
-            } else {
-                contains_unrecognized = true;
             }
         }
-        // Projection is intentionally fragment-granular only for producer-
-        // owned, single-fragment messages. A mixed message could contain
-        // unregistered semantics whose ordering or scope depends on the marked
-        // fragment, so retain the complete request instead of partially
-        // rewriting it.
-        if contains_stable && (contains_unrecognized || content.len() != 1) {
-            ambiguous = true;
-        }
+        // Recognized fragments are independent projection units even when a
+        // producer coalesces them into one message. Unrecognized siblings are
+        // retained in place. Malformed known markers still fail open above.
         if role == "user" && !contains_stable {
             latest_real_user = Some((item_index, item.turn_id().map(str::to_string)));
         }
@@ -597,6 +619,12 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
     if role == "user" && marked(text, SKILL_OPEN_TAG, "</skill>") {
         return Some(StableContextSlot::SelectedSkill);
     }
+    if role == "user" && marked(text, "<environment_context>", "</environment_context>") {
+        return Some(StableContextSlot::Environment);
+    }
+    if role == "user" && marked(text, "<recommended_plugins>", "</recommended_plugins>") {
+        return Some(StableContextSlot::RecommendedPlugins);
+    }
     if role != "developer" {
         return None;
     }
@@ -639,6 +667,26 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
             "</multi_agent_mode>",
             StableContextSlot::MultiAgent,
         ),
+        (
+            "<app-context>",
+            "</app-context>",
+            StableContextSlot::AppContext,
+        ),
+        (
+            "<model_switch>",
+            "</model_switch>",
+            StableContextSlot::ModelSwitch,
+        ),
+        (
+            "<personality_spec>",
+            "</personality_spec>",
+            StableContextSlot::Personality,
+        ),
+        (
+            "<realtime_conversation>",
+            "</realtime_conversation>",
+            StableContextSlot::Realtime,
+        ),
     ]
     .into_iter()
     .find_map(|(open, close, slot)| marked(text, open, close).then_some(slot))
@@ -651,10 +699,16 @@ fn contains_known_open_marker(text: &str) -> bool {
         SKILLS_USAGE_OPEN_TAG,
         SKILLS_INSTRUCTIONS_OPEN_TAG,
         SKILL_OPEN_TAG,
+        "<environment_context>",
+        "<recommended_plugins>",
         APPS_INSTRUCTIONS_OPEN_TAG,
+        "<app-context>",
         PLUGINS_INSTRUCTIONS_OPEN_TAG,
         "<permissions instructions>",
         MULTI_AGENT_MODE_OPEN_TAG,
+        "<model_switch>",
+        "<personality_spec>",
+        "<realtime_conversation>",
     ]
     .iter()
     .any(|marker| text.trim_start().starts_with(marker))

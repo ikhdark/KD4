@@ -12,9 +12,8 @@ a behavior crosses packages or languages, or a source change must be traced to
 an SDK, schema, package, installed binary, or Codex Desktop.
 
 - Product documentation: [OpenAI Codex documentation](https://developers.openai.com/codex)
-- Local installation and build guidance: [`docs/install.md`](docs/install.md)
-- Contribution guidance: [`docs/contributing.md`](docs/contributing.md)
-- Configuration guidance: [`docs/config.md`](docs/config.md)
+- Local build and publish policy: [`scripts/AGENTS.md`](scripts/AGENTS.md)
+- Standalone installation guidance: [`scripts/install/README.md`](scripts/install/README.md)
 - License: [`LICENSE`](LICENSE)
 
 <!-- Begin ToC -->
@@ -26,6 +25,10 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 - [Instruction scopes](#instruction-scopes)
 - [Runtime and executable entrypoints](#runtime-and-executable-entrypoints)
 - [Rust package inventory](#rust-package-inventory)
+- [Rust edit and upstream synchronization boundaries](#rust-edit-and-upstream-synchronization-boundaries)
+  - [Protected source: exact upstream mirrors](#protected-source-exact-upstream-mirrors)
+  - [Mixed areas: editable parents and workflow-managed children](#mixed-areas-editable-parents-and-workflowmanaged-children)
+  - [Workflow-managed remainder](#workflowmanaged-remainder)
 - [Non-Rust project inventory](#nonrust-project-inventory)
 - [Core runtime routing](#core-runtime-routing)
 - [Extension boundary](#extension-boundary)
@@ -72,15 +75,38 @@ entrypoint, contract, and validation descriptions so the map remains useful.
 ## How to use this map
 
 1. Read the root and nearest scoped `AGENTS.md`.
-2. Start from the user-visible entrypoint or the package inventory.
-3. Follow the relevant runtime, contract, state, and generated-output owners.
-4. Use the cross-cutting route to identify consumers outside the first package.
-5. Return to the applicable policy file for its exact validation and completion
-   gate.
+2. Query the smallest named owner slice before reading the broad map. Prefer the
+   runtime `architecture_slice` tool when it is available; otherwise run
+   `python scripts/source_owners.py slice --owner <owner-id>
+   --focus "<task description>" --max-relationships 32`.
+3. Confirm that the slice is untruncated, has zero omitted relationships and
+   material unknowns, and covers control/data flow, callers/consumers,
+   configuration/gates, registration/entrypoints, tests/contracts, generated
+   artifacts, and invariants. A facet may be explicitly `not_applicable` with a
+   reason; an absent facet is insufficient evidence.
+4. Read the exact evidence locations for the relationships you will change.
+   Relationships are ranked within each facet by structural role, task-focus
+   overlap, provenance, and directness; start with the first relationship in
+   each applicable facet before expanding.
+   Treat `exact` and `declared` provenance as grounded; heuristic evidence may
+   guide discovery but cannot close it.
+5. Stop broad discovery once this bounded source closure is established. Reopen
+   it if the repository snapshot changes or implementation contradicts a
+   declared relationship.
+6. Use this broad map only when no owner matches, the slice reports an unknown,
+   or a new cross-cutting boundary must be placed. Return to the applicable
+   policy file for its exact validation and completion gate.
 
 For a clear crate-local or script-local task, use the closest owner instructions
 directly. Use this map when the route crosses boundaries or when a new boundary
 must be placed.
+
+`architecture_index.json` is the machine-readable, revision-keyed relationship
+graph generated from `source_owners.toml`. `just source-owners-check` rejects a
+stale graph or managed map block and runs representative architectural recall
+cases. Its evaluator reports insufficient evidence separately from bounded but
+potentially noisy evidence, plus ranked-noise reduction, reading-volume, and
+late-relationship metrics.
 
 ## Runtime architecture
 
@@ -120,8 +146,7 @@ below.
 | `.vscode/` | Checked-in editor and workspace defaults |
 | `codex-cli/` | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs |
 | `codex-rs/` | Primary Rust workspace and nearly all CLI, runtime, app-server, TUI, tool, protocol, state, plugin, extension, and sandbox behavior |
-| `docs/` | User, contributor, configuration, authentication, sandbox, execution-policy, command, and skill documentation |
-| `scripts/` | Build lanes, local publish, package assembly, installers, schema helpers, repository checks, and maintenance tooling |
+| `scripts/` | Build lanes, local publish, package assembly, installers, generated-schema freshness, source-owner generation, workflow preflight, architecture/investigation evaluation, KD4 audit and measurement, runtime binary proof, repository checks, and maintenance tooling |
 | `sdk/` | TypeScript SDK, Python SDK, and Python runtime package |
 | `third_party/` | Checked-in integration or vendored inputs updated only through their owning workflow |
 | `tools/` | Repository tooling outside the main Rust workspace |
@@ -129,8 +154,7 @@ below.
 | `.gitattributes`, `.gitignore` | Git content and ignore behavior |
 | `.markdownlint-cli2.yaml`, `.prettierignore`, `.prettierrc.toml` | Markdown and Prettier formatting policy |
 | `.npmrc` | npm and pnpm behavior used by the JavaScript workspace |
-| `AGENTS.md`, `SOURCEMAP.md` | Repository-wide editing policy and this cross-cutting ownership contract |
-| `do-not-code.md` | Complete `codex-rs` protected/editable/mixed classification, exact upstream-mirror boundary, and generator-managed exceptions |
+| `AGENTS.md`, `SOURCEMAP.md` | Repository-wide editing policy and this cross-cutting ownership contract, including the complete `codex-rs` edit and upstream-sync classification |
 | `WORKTREE_REVIEW.txt` | Historical, frozen whole-worktree review evidence; not a current-checkout verdict |
 | `CHANGELOG.md`, `LICENSE`, `NOTICE` | Release history and legal notices |
 | `flake.nix`, `flake.lock` | Nix development/build environment and its locked inputs |
@@ -200,6 +224,61 @@ below.
 | Telemetry, feedback, and diagnostics | `codex-rs/analytics`, `codex-rs/feedback`, `codex-rs/otel`, `codex-rs/response-debug-context` |
 | Support crates, samples, and narrow binaries | `codex-rs/ansi-escape`, `codex-rs/async-utils`, `codex-rs/codex-experimental-api-macros`, `codex-rs/git-utils`, `codex-rs/stdio-to-uds`, `codex-rs/test-binary-support`, `codex-rs/thread-manager-sample`, `codex-rs/uds`, `codex-rs/v8-poc` |
 | Shared utility crates | `codex-rs/utils/absolute-path`, `codex-rs/utils/approval-presets`, `codex-rs/utils/cache`, `codex-rs/utils/cargo-bin`, `codex-rs/utils/cli`, `codex-rs/utils/elapsed`, `codex-rs/utils/fuzzy-match`, `codex-rs/utils/home-dir`, `codex-rs/utils/image`, `codex-rs/utils/json-to-toml`, `codex-rs/utils/oss`, `codex-rs/utils/output-truncation`, `codex-rs/utils/path-uri`, `codex-rs/utils/path-utils`, `codex-rs/utils/plugins`, `codex-rs/utils/pty`, `codex-rs/utils/readiness`, `codex-rs/utils/rustls-provider`, `codex-rs/utils/sandbox-summary`, `codex-rs/utils/sleep-inhibitor`, `codex-rs/utils/stream-parser`, `codex-rs/utils/string`, `codex-rs/utils/template` |
+
+## Rust edit and upstream synchronization boundaries
+
+Protect a path only when fork-local edits have no credible harness or
+daily-development upside; runtime importance and risk alone are insufficient.
+The classifications are:
+
+- **Upstream mirror:** replace the complete path from the pinned upstream tree;
+  repair compatibility in editable callers.
+- **Workflow managed:** change only through Cargo or the owning generator.
+- **Mixed:** the parent is editable, but its named child is workflow managed.
+- **Editable:** every other checked-in `codex-rs` path.
+
+The audited upstream baseline is OpenAI Codex `main`
+[`646f7c0a91b8e327d263335da68ae8ef212895ce`](https://github.com/openai/codex/tree/646f7c0a91b8e327d263335da68ae8ef212895ce/codex-rs)
+(2026-08-12). Confirm the intended baseline again before a later sync.
+
+### Protected source: exact upstream mirrors
+
+These four paths, and only these four paths, are exact mirrors:
+
+| Path | Why it is protected |
+| --- | --- |
+| `codex-rs/backend-client/` | Backend HTTP plumbing, not model-request or harness behavior |
+| `codex-rs/codex-backend-openapi-models/` | Upstream-generated models and wrapper consumed by `backend-client` |
+| `codex-rs/login/` | Stable authentication acquisition, refresh, storage, and callback boundary |
+| `codex-rs/vendor/` | Third-party Bubblewrap source and its Codex build metadata |
+
+### Mixed areas: editable parents and workflow-managed children
+
+Regenerate each named child from its editable parent; never copy it from
+upstream independently.
+
+| Editable parent | Workflow-managed child | Owning route |
+| --- | --- | --- |
+| `codex-rs/app-server-protocol/` | `schema/` | `just app-server-schema-check`; intentional regeneration uses `just app-server-schema-regenerate <owner>` |
+| `codex-rs/cli/` | Checked-in `*.snap` test snapshots | Regenerate through the owning snapshot test and review the resulting diff |
+| `codex-rs/config/` | `src/thread_config/proto/codex.thread_config.v1.rs` | `just generate-config-proto-check`; intentional regeneration uses `just generate-config-proto` |
+| `codex-rs/core/` | `config.schema.json` and checked-in `*.snap` test snapshots | Use `just config-schema-check` or the owning snapshot test; intentional schema regeneration uses `just config-schema-regenerate <owner>` |
+| `codex-rs/exec-server/` | `src/proto/codex.exec_server.relay.v1.rs` | No recipe is checked in; first restore a reproducible generator and check |
+| `codex-rs/hooks/` | `schema/generated/` | Run focused hook tests; intentional regeneration uses `just write-hooks-schema` |
+| `codex-rs/tui/` | Checked-in `*.snap` test snapshots | Regenerate through the owning snapshot test and review the resulting UI diff |
+
+### Workflow-managed remainder
+
+- Cargo owns `codex-rs/Cargo.lock`; update it through dependency workflows and
+  never replace it wholesale from upstream.
+- `codex-rs/target/` and `codex-rs/target-*/` are local outputs; do not edit or
+  sync them, or delete them while Rust jobs may be active.
+- The Rust package inventory above defines the editable remainder. Shared and
+  security-sensitive owners remain editable but require proportional proof.
+
+The 2026-08-12 sync verified the four mirror trees against the pinned baseline
+and kept compatibility repairs in editable callers. That receipt is historical;
+revalidate tree equality, generated outputs, and affected callers on every sync.
 
 ## Non-Rust project inventory
 
@@ -305,6 +384,11 @@ owner must trace every reader and writer before completion.
 | Nix environment | `flake.nix`, `flake.lock` | Nix evaluation/build appropriate to the changed input |
 | Windows local publish | `scripts/publish-local-codex.ps1`, `just publish-local-codex-final` | dry-run argument proof, release build, doctor, backup/rollback guards, installed hash/version |
 | Desktop-visible completion | local publish output plus app-server/CLI runtime | publish final, restart Desktop, prove process path and binary hash/version, inspect initialize/model metadata, capture visible evidence |
+| Source-owner and architecture index refresh | `source_owners.toml`, `scripts/source_owners.py`, `scripts/architecture_comprehension_eval.py` | regenerate `architecture_index.json` and the marked `SOURCEMAP.md` block through the owner workflow; run source-owner freshness and architecture-recall checks |
+| Generated schema freshness | `scripts/config_schema_check.py`, `scripts/app_server_schema_runtime_check.py`, `scripts/generated_output_lock.py` | use the owning check/regeneration command under the shared generated-output lock; never hand-edit generated schemas |
+| Shared-worktree workflow preflight | `scripts/workflow_preflight.py` | preserve manifest/lease, path and contract claims, dependencies, generated-output ownership, validation ownership, Cargo-lane routing, and machine-readable diagnostics |
+| KD4 audits, evaluation, and measurement | `scripts/kd4_sync_audit.py`, `scripts/kd4_model_attempt_analysis.py`, `scripts/kd4_perf_snapshot.py`, `scripts/architecture_comprehension_eval.py`, `scripts/investigation_evidence_smoke.py`, `scripts/investigation_eval` | matching fixture/unit test; keep audits non-mutating and distinguish measured subprocess wall time from startup-only timing, test duration, estimates, and stale binaries |
+| Runtime binary selection proof | `scripts/vscode_runtime_proof.py` | read-only path, version, and environment evidence; binary replacement remains owned by the explicit publish/update flow |
 
 The expected installed target is
 `C:\Users\kuh\Desktop\LOCAL-KD\codex.exe`. Source edits do not hot-apply to the
@@ -317,7 +401,10 @@ remain required.
 | Changed surface | Smallest owning proof |
 | --- | --- |
 | Source map or structural inventory | `python -m unittest scripts.test_source_map_check` and `just source-map-check` |
+| Source-owner manifest or architecture index | `python -m unittest scripts.test_source_owners scripts.test_architecture_comprehension_eval` and `just source-owners-check` |
 | Root or Python maintenance scripts | closest `python -m unittest scripts.test_<name>` plus syntax/lint appropriate to the script |
+| Shared-worktree workflow preflight | `python -m unittest scripts.test_workflow_preflight` |
+| KD4 audit, evaluation, or measurement script | closest matching `python -m unittest scripts.test_<name>` plus only the fixture/freshness check owned by the changed surface |
 | Focused Rust crate | `just test-fast -p <crate>` or the nearest focused recipe/filter |
 | App-server protocol/schema | focused crate tests plus `just app-server-schema-check` |
 | Config schema | focused config/core tests plus `just config-schema-check` |
@@ -330,7 +417,8 @@ remain required.
 | Installed provider external-evidence path | `python scripts/investigation_evidence_smoke.py --run`; uses staged local KDS and Repo Atlas plugins, disposable Git repositories and Codex homes, and a loopback model endpoint |
 
 Green tooling alone does not prove runtime behavior. Use the focused failing
-test or approved runtime gate for the behavior being changed.
+test or approved runtime gate for the behavior being changed, and confirm that
+an exact test filter selected at least one relevant test.
 
 ## Rust workflow reference
 
@@ -357,14 +445,12 @@ install tools or add dependencies solely to follow this reference.
 | Repository source routing and material-change inventory | `SOURCEMAP.md`; validate with `just source-map-check` |
 | Repository-wide editing policy | `AGENTS.md` |
 | Rust workspace policy | `codex-rs/AGENTS.md` |
-| Script ownership and validation | `scripts/AGENTS.md`, then `scripts/README.md` |
-| Repo-local Codex setup and durable harness | `.codex/AGENTS.md`, `.codex/README.md`, `.codex/harness/README.md` |
-| Installation and local build | `docs/install.md` |
-| Getting started and execution | `docs/getting-started.md`, `docs/exec.md`, `docs/slash_commands.md` |
-| Configuration | `docs/config.md`, `docs/example-config.md` |
-| Authentication | `docs/authentication.md` |
-| Sandbox and execution policy | `docs/sandbox.md`, `docs/execpolicy.md` |
-| Skills and agent guidance | `docs/skills.md`, `docs/agents_md.md` |
+| Script ownership and validation | `scripts/AGENTS.md`, then owner script help or the closest checked-in README |
+| Repo-local Codex setup and durable harness | `.codex/AGENTS.md`, `.codex/harness/README.md` |
+| Local build and Desktop publish | `scripts/AGENTS.md`, `scripts/publish-local-codex.ps1`, and the build/publish section above |
+| Standalone installation | `scripts/install/AGENTS.md`, `scripts/install/README.md` |
+| Product usage, configuration, authentication, and sandbox guidance | [OpenAI Codex documentation](https://developers.openai.com/codex) |
+| Fork-local skills and agent guidance | `.codex/AGENTS.md`, `.codex/skills`, and the nearest scoped `AGENTS.md` |
 | Package-specific implementation background | nearest crate/package `README.md` |
 
 Operational rules belong in the closest `AGENTS.md`. Package architecture,
@@ -375,34 +461,39 @@ This map owns cross-cutting navigation and structural inventory.
 
 | Change | Trace this path |
 | --- | --- |
-| CLI command or flag | `codex-rs/cli` -> command owner -> core/protocol/config when shared -> docs/completions/tests -> npm wrapper only if launch behavior changes |
+| CLI command or flag | `codex-rs/cli` -> command owner -> core/protocol/config when shared -> command help/completions/tests -> npm wrapper only if launch behavior changes |
 | TUI behavior | `codex-rs/tui` -> core and protocol contracts -> app-server bridge when used -> snapshots/focused TUI tests |
 | Headless exec behavior | `codex-rs/exec` -> core/protocol -> JSONL/event compatibility -> focused exec tests |
 | Desktop-visible behavior | app-server/core/protocol -> schema if the wire contract changes -> local release build -> publish -> Desktop restart/runtime proof |
 | App-server API | app-server request processor -> app-server-protocol types/mappers -> generated schema -> SDK/Desktop consumers -> focused schema/runtime checks |
-| Config field or default | config/features -> core consumer -> CLI/TUI/app-server exposure -> config schema/protobuf if applicable -> docs/tests |
-| Tool or dynamic-tool behavior | core tool plan/router -> `codex-rs/tools` or extension/MCP owner -> lifecycle/approval/output mapping -> protocol/UI consumers |
+| Config field or default | config/features -> core consumer -> CLI/TUI/app-server exposure -> config schema/protobuf and command help if applicable -> focused tests |
+| Tool or dynamic-tool behavior | core tool plan/router, including direct and nested/code-mode payload routes -> `codex-rs/tools` or extension/MCP owner -> lifecycle/approval/output mapping -> protocol/UI consumers |
 | Shell, approval, or sandbox behavior | core exec/exec-policy -> shell-command/execpolicy/sandboxing -> platform sandbox helper -> security tests and user-facing policy |
 | Model/provider behavior | model-provider/model catalogs/backend clients -> core request/retry path -> auth/telemetry -> diagnostics/tests |
 | Prompt or model-visible context | prompts/context/context-manager/context-fragments -> plugin/skill/app/extension contributors -> compaction/history -> snapshots/tests |
 | Plugin, skill, MCP, connector, or extension behavior | manifest/discovery owner -> core-plugins/core-skills/registry -> core session/tool/context dispatch -> CLI/TUI/app-server presentation |
 | Hook behavior | config declaration -> hooks registry/engine/event type -> core lifecycle call site -> generated hook schema -> focused tests |
-| Stored thread/session behavior | core session state -> state/thread-store/rollout/history/memories -> migrations/serialization -> app-server/TUI/CLI resume consumers |
+| Stored thread/session behavior | core session state -> state/thread-store/rollout/history/memories -> all direct constructors plus readers/writers -> migrations/serialization -> legacy missing-field and new-shape round-trip proof -> app-server/TUI/CLI resume consumers |
 | Multi-agent behavior | core agent coordinator -> identity/task/graph stores -> protocol/app-server status -> TUI/client presentation and persistence |
 | npm packaging or install behavior | codex-cli -> stage script/codex_package -> platform package/archive -> installer/release workflow |
 | SDK/API surface | app-server protocol/schema -> TypeScript and/or Python SDK -> generated models/types -> focused SDK tests |
 | Dependency or build-system change | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof |
 | New top-level area, package, or instruction scope | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check` |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=1 manifest_sha256=fbb6047276e0a78728d2bda0cf851e4c34e853cad4eb739537efdaf42f11e160 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=5afae3040bdfcba31820ededc1b503feffe89839bad8a573b28b435f7c2829c3 -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.
 
-| Owner ID | Owning roots | Primary entries | Focused validation |
-| --- | --- | --- | --- |
-| `app-server-runtime` | `codex-rs/app-server` | `codex-rs/app-server/src/lib.rs::run_main` | `app-server-focused` |
-| `cli-entrypoints` | `codex-rs/cli` | `codex-rs/cli/src/main.rs::main` | `cli-focused` |
-| `core-agent-runtime` | `codex-rs/core/src` | `codex-rs/core/src/session/mod.rs::Codex` | `core-focused` |
-| `feature-registry` | `codex-rs/features` | `codex-rs/features/src/lib.rs::Feature` | `features-focused` |
+| Owner ID | Owning roots | Primary entries | Relationships | Invariants | Focused validation |
+| --- | --- | --- | --- | --- | --- |
+| `app-server-protocol-contracts` | `codex-rs/app-server-protocol` | `codex-rs/app-server-protocol/src/bin/write_schema_fixtures.rs::main` | `control_flow:calls` -> `path:codex-rs/app-server-protocol/src/schema_fixtures.rs`<br>`callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:justfile`<br>+2 more | `compatibility:schema-source-parity` | `app-server-schema-focused` |
+| `app-server-runtime` | `codex-rs/app-server` | `codex-rs/app-server/src/lib.rs::run_main` | `callers_consumers:calls` -> `owner:core-agent-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/app-server/src/lib.rs`<br>`tests_contracts:validated_by` -> `path:codex-rs/app-server/tests` | `compatibility:transport-dispatch-contract` | `app-server-focused` |
+| `cli-entrypoints` | `codex-rs/cli` | `codex-rs/cli/src/main.rs::main` | `control_flow:calls` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/cli/src/main.rs` | `semantic:subcommand-dispatch` | `cli-focused` |
+| `core-agent-runtime` | `codex-rs/core/src` | `codex-rs/core/src/session/mod.rs::Codex` | `callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`configuration:gated_by` -> `owner:feature-registry`<br>`tests_contracts:validated_by` -> `path:codex-rs/core/tests` | `semantic:registered-tool-routing` | `core-focused` |
+| `feature-registry` | `codex-rs/features` | `codex-rs/features/src/lib.rs::Feature` | `configuration:reads_config` -> `config:kd4_features.toml`<br>`callers_consumers:consumed_by` -> `owner:core-agent-runtime` | `compatibility:feature-key-compatibility` | `features-focused` |
+| `planning-architecture-runtime` | `codex-rs/core/src/tools/handlers`<br>`codex-rs/core/src/session`<br>`codex-rs/core/src/task_evidence.rs` | `codex-rs/core/src/tools/handlers/plan.rs::PlanHandler`<br>`codex-rs/core/src/tools/handlers/source_tools.rs::ArchitectureSliceHandler` | `control_flow:calls` -> `path:codex-rs/core/src/task_evidence.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/reasoning_governor.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>+1 more | `semantic:complete-source-closure` | `planning-closure-focused` |
+| `repository-context-discovery` | `codex-rs/core/src/git_workspace.rs`<br>`codex-rs/core/src/agents_md.rs` | `codex-rs/core/src/git_workspace.rs::GitWorkspaceCache`<br>`codex-rs/core/src/agents_md.rs::load_project_instructions` | `control_flow:calls` -> `path:codex-rs/core/src/agents_md.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/mod.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/core/src/git_workspace.rs`<br>+1 more | `semantic:snapshot-scoped-discovery` | `repository-context-focused` |
+| `source-owner-index` | `scripts/source_owners.py`<br>`source_owners.toml` | `scripts/source_owners.py::main` | `control_flow:generates` -> `generated:architecture_index.json`<br>`callers_consumers:consumed_by` -> `path:SOURCEMAP.md`<br>`configuration:reads_config` -> `config:source_owners.toml`<br>+3 more | `compatibility:fresh-index` | `source-owner-focused` |
+| `tool-output-recovery` | `codex-rs/core/src/tools/command_output_artifact.rs`<br>`codex-rs/core/src/tools/handlers/read_tool_output.rs` | `codex-rs/core/src/tools/handlers/read_tool_output.rs::ReadToolOutputHandler` | `control_flow:calls` -> `path:codex-rs/core/src/tools/command_output_artifact.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/context_manager/history.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>+1 more | `compatibility:exact-bounded-recovery` | `tool-output-focused` |
 <!-- END KD4 SOURCE OWNERS -->

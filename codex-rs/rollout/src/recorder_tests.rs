@@ -18,8 +18,12 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::ToolManifestItem;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::TurnTiming;
+use codex_protocol::protocol::TurnTimingModelRequest;
+use codex_protocol::protocol::TurnTimingRequestTokenCategories;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
 use std::fs;
@@ -109,6 +113,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             cwd: home.path().to_path_buf(),
             originator: "test".to_string(),
             cli_version: "test".to_string(),
+            build_info: None,
             source: SessionSource::Cli,
             thread_source: None,
             agent_path: None,
@@ -498,6 +503,16 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     };
     assert_eq!(session_meta.meta.session_id, session_id);
     assert_eq!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated);
+    let build_info = session_meta
+        .meta
+        .build_info
+        .as_ref()
+        .expect("recorder should persist build provenance");
+    assert!(!build_info.binary.is_empty());
+    assert!(!build_info.commit.is_empty());
+    assert!(!build_info.dirty.is_empty());
+    assert!(!build_info.profile.is_empty());
+    assert!(!build_info.built.is_empty());
     assert_eq!(
         session_meta
             .meta
@@ -519,6 +534,79 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     assert_eq!(text_after_second_persist, text);
 
     recorder.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorder_persists_aggregate_request_token_categories_without_prompt_content()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let recorder = RolloutRecorder::new(
+        &test_config(home.path()),
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            None,
+            None,
+            SessionSource::Exec,
+            None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+    let expected = TurnTimingRequestTokenCategories {
+        base_instructions: 101,
+        tool_schemas: 202,
+        conversation_history: 303,
+        current_input: 11,
+        repository_context: 404,
+        skills: 55,
+        other_injected_context: 66,
+        logical_total: 1_142,
+        repeated_unchanged_context: 707,
+    };
+    let timing = TurnTiming {
+        schema_version: 13,
+        model_requests: vec![TurnTimingModelRequest {
+            request_token_categories: Some(expected.clone()),
+            ..TurnTimingModelRequest::default()
+        }],
+        ..TurnTiming::default()
+    };
+
+    recorder
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::TurnComplete(
+            TurnCompleteEvent {
+                turn_id: "turn-aggregate-token-categories".to_string(),
+                last_agent_message: None,
+                surfaced_result: None,
+                error: None,
+                completion: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: Some(timing),
+            },
+        ))])
+        .await?;
+    recorder.flush().await?;
+
+    let text = fs::read_to_string(recorder.rollout_path())?;
+    let persisted = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .find_map(|line| match line.item {
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => event
+                .timing
+                .and_then(|timing| timing.model_requests.into_iter().next())
+                .and_then(|request| request.request_token_categories),
+            _ => None,
+        })
+        .expect("persisted aggregate request token categories");
+    assert_eq!(persisted, expected);
+    assert!(!text.contains("prompt text must not be persisted"));
+
     Ok(())
 }
 
@@ -597,6 +685,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         /*known_repository_context*/ None,
         rollout_path.clone(),
         Default::default(),
+        Default::default(),
     );
     state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
         AgentMessageEvent {
@@ -627,6 +716,7 @@ fn writer_state_deduplicates_manifests_and_coalesces_token_counts() {
         /*known_repository_context*/ None,
         rollout_path,
         HashSet::from(["already-persisted".to_string()]),
+        HashSet::new(),
     );
     let manifest = |hash: &str| {
         RolloutItem::ToolManifest(ToolManifestItem {
@@ -673,6 +763,57 @@ fn writer_state_deduplicates_manifests_and_coalesces_token_counts() {
     assert!(state.pending_token_count.is_none());
 }
 
+#[test]
+fn writer_state_omits_only_exact_canonical_continuity_replays() {
+    let home = TempDir::new().expect("temp dir");
+    let capsule = |generation: &str, epoch: u64| {
+        format!(
+            "<kd4_continuity_capsule_v1>{{\"schema\":\"kd4_continuity_capsule_v1\",\"checkpoint_generation\":\"{generation}\",\"core_semantic_hash\":\"{}\",\"capsule\":{{\"schema_version\":1,\"continuity_epoch\":{epoch}}}}}</kd4_continuity_capsule_v1>",
+            "a".repeat(64)
+        )
+    };
+    let message = |text: String| {
+        RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText { text }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })
+    };
+    let first = capsule("root:1", 1);
+    let changed = capsule("root:1", 2);
+    let mut state = RolloutWriterState::new(
+        None,
+        None,
+        None,
+        home.path().to_path_buf(),
+        None,
+        home.path().join("rollout.jsonl"),
+        HashSet::new(),
+        HashSet::from([first.clone()]),
+    );
+
+    state.add_items(vec![
+        message(first),
+        message(changed.clone()),
+        message(changed),
+        message("ordinary developer context".to_string()),
+    ]);
+
+    assert_eq!(state.pending_items.len(), 2);
+    assert!(matches!(
+        &state.pending_items[0],
+        RolloutItem::ResponseItem(ResponseItem::Message { content, .. })
+            if matches!(&content[..], [ContentItem::InputText { text }] if text.contains("\"continuity_epoch\":2"))
+    ));
+    assert!(matches!(
+        &state.pending_items[1],
+        RolloutItem::ResponseItem(ResponseItem::Message { content, .. })
+            if matches!(&content[..], [ContentItem::InputText { text }] if text == "ordinary developer context")
+    ));
+}
+
 #[tokio::test]
 async fn deferred_writer_reuses_existing_session_metadata_and_manifests() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
@@ -705,6 +846,7 @@ async fn deferred_writer_reuses_existing_session_metadata_and_manifests() -> std
         home.path().to_path_buf(),
         /*known_repository_context*/ None,
         rollout_path.clone(),
+        HashSet::new(),
         HashSet::new(),
     );
     let manifest = |hash: &str| {
@@ -777,6 +919,7 @@ async fn assert_failed_append_is_written_once(
         home.path().to_path_buf(),
         /*known_repository_context*/ None,
         rollout_path.clone(),
+        Default::default(),
         Default::default(),
     );
     state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(

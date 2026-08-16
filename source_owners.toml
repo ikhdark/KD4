@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 
 [[owners]]
 id = "app-server-runtime"
@@ -13,6 +13,39 @@ contracts = []
 generated_mirrors = []
 tests = ["codex-rs/app-server/tests"]
 
+[owners.facet_exclusions]
+control_and_data_flow = "This owner is a runtime boundary; request-to-core control flow is declared by its caller and consumer relationships."
+configuration_and_gates = "Transport configuration is resolved before this shared runtime entrypoint is invoked."
+generated_artifacts = "Protocol generation is owned separately by app-server-protocol-contracts."
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "calls"
+target = "owner:core-agent-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/app-server/src/lib.rs", symbol = "run_main_with_transport_options" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/app-server/src/lib.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/cli/src/main.rs", symbol = "Subcommand::AppServer" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/app-server/tests"
+confidence = "declared"
+evidence = [{ path = "codex-rs/app-server/tests", symbol = "integration suites" }]
+
+[[owners.invariants]]
+id = "transport-dispatch-contract"
+kind = "compatibility"
+statement = "Every enabled app-server transport enters the shared runtime and preserves protocol-compatible request dispatch."
+evidence = [{ path = "codex-rs/app-server/src/lib.rs", symbol = "run_main_with_transport_options" }]
+tests = ["codex-rs/app-server/tests"]
+
 [[owners.validation]]
 id = "app-server-focused"
 cwd = "."
@@ -25,11 +58,37 @@ concern_ids = ["cli", "command-routing"]
 aliases = ["codex cli", "command line entrypoint"]
 phrases = ["cli command routing"]
 roots = ["codex-rs/cli"]
-primary_entries = [{ path = "codex-rs/cli/src/main.rs", symbol = "main" }]
+primary_entries = [{ path = "codex-rs/cli/src/main.rs", symbol = "main", ambiguous = true }]
 instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
 consumers = []
 contracts = []
 generated_mirrors = []
+tests = ["codex-rs/cli/tests"]
+
+[owners.facet_exclusions]
+callers_and_consumers = "The installed launcher boundary is documented in SOURCEMAP.md; this slice starts at the Rust main entrypoint."
+configuration_and_gates = "Top-level subcommand dispatch is selected by parsed CLI input rather than a repository feature gate."
+generated_artifacts = "The CLI dispatch owner does not generate a checked-in contract."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "owner:app-server-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/cli/src/main.rs", symbol = "Subcommand::AppServer" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/cli/src/main.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/cli/src/main.rs", symbol = "main" }]
+
+[[owners.invariants]]
+id = "subcommand-dispatch"
+kind = "semantic"
+statement = "A parsed top-level subcommand is dispatched to exactly one owning runtime entrypoint."
+evidence = [{ path = "codex-rs/cli/src/main.rs", symbol = "main" }]
 tests = ["codex-rs/cli/tests"]
 
 [[owners.validation]]
@@ -51,6 +110,38 @@ contracts = []
 generated_mirrors = []
 tests = ["codex-rs/core/tests"]
 
+[owners.facet_exclusions]
+control_and_data_flow = "Core contains many task-specific flows; select a narrower owner such as planning-architecture-runtime or tool-output-recovery before mutation."
+generated_artifacts = "Generated contracts consumed by core are owned by their protocol or configuration generators."
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "owner:app-server-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/session/mod.rs", symbol = "Codex" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "gated_by"
+target = "owner:feature-registry"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/config/managed_features.rs", symbol = "ManagedFeatures" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/core/tests"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/tests", symbol = "integration suites" }]
+
+[[owners.invariants]]
+id = "registered-tool-routing"
+kind = "semantic"
+statement = "Model tool calls are dispatched through the registry/router contract rather than invoking handlers directly."
+evidence = [{ path = "codex-rs/core/src/tools/registry.rs", symbol = "ToolRegistry" }, { path = "codex-rs/core/src/tools/router.rs", symbol = "ToolRouter" }]
+tests = ["codex-rs/core/src/tools/router_tests.rs", "codex-rs/core/src/tools/registry_tests.rs"]
+
 [[owners.validation]]
 id = "core-focused"
 cwd = "."
@@ -70,8 +161,342 @@ contracts = ["kd4_features.toml"]
 generated_mirrors = []
 tests = ["codex-rs/features/src/tests.rs"]
 
+[owners.facet_exclusions]
+control_and_data_flow = "This owner defines feature identity and defaults; runtime behavior is controlled by consuming owners."
+generated_artifacts = "The feature registry is source-backed and has no checked-in generated mirror."
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:kd4_features.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "codex-rs/features/src/lib.rs", symbol = "Feature" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "owner:core-agent-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/config/managed_features.rs", symbol = "ManagedFeatures" }]
+
+[[owners.invariants]]
+id = "feature-key-compatibility"
+kind = "compatibility"
+statement = "Persisted feature identifiers remain stable and unknown or retired identifiers fail safely."
+evidence = [{ path = "codex-rs/features/src/lib.rs", symbol = "Feature" }]
+tests = ["codex-rs/features/src/tests.rs"]
+
 [[owners.validation]]
 id = "features-focused"
 cwd = "."
 argv = ["just", "test-fast", "-p", "codex-features"]
 role = "focused_tests"
+
+[[owners]]
+id = "planning-architecture-runtime"
+concern_ids = ["planning", "source-closure", "architecture-evidence"]
+aliases = ["update plan runtime", "source closure"]
+phrases = ["architecture evidence before implementation"]
+roots = ["codex-rs/core/src/tools/handlers", "codex-rs/core/src/session", "codex-rs/core/src/task_evidence.rs"]
+primary_entries = [
+    { path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "PlanHandler" },
+    { path = "codex-rs/core/src/tools/handlers/source_tools.rs", symbol = "ArchitectureSliceHandler" },
+]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md", "codex-rs/core/AGENTS.md"]
+consumers = ["codex-rs/core/src/session/reasoning_governor.rs"]
+contracts = ["codex-rs/core/src/task_evidence.rs"]
+generated_mirrors = []
+tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Planning tier and closure behavior are runtime state, not a repository or feature configuration gate."
+generated_artifacts = "The update_plan schema is constructed at runtime and has no checked-in generated mirror."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/core/src/task_evidence.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "PlanHandler::handle_call" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/session/reasoning_governor.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/session/reasoning_governor.rs", symbol = "SamplingReasoningGovernor" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/core/src/tools/spec_plan.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/tools/spec_plan.rs", symbol = "build_spec_plan" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/core/src/tools/handlers/plan_tests.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/tools/handlers/plan_tests.rs", symbol = "source_closure_requires_complete_architecture_and_resolved_validation" }]
+
+[[owners.invariants]]
+id = "complete-source-closure"
+kind = "semantic"
+statement = "Implementation readiness requires an untruncated, bounded architecture slice with every facet established or explicitly not applicable."
+evidence = [{ path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "architecture_slice_receipt" }]
+tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
+
+[[owners.validation]]
+id = "planning-closure-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-core", "tools::handlers::plan_tests"]
+role = "focused_tests"
+
+[[owners]]
+id = "source-owner-index"
+concern_ids = ["repository-map", "relationship-index", "architecture-slice"]
+aliases = ["source owner registry", "architecture index"]
+phrases = ["bounded repository relationship graph"]
+roots = ["scripts/source_owners.py", "source_owners.toml"]
+primary_entries = [{ path = "scripts/source_owners.py", symbol = "main", ambiguous = true }]
+instructions = ["AGENTS.md", "scripts/AGENTS.md"]
+consumers = ["SOURCEMAP.md", "architecture_index.json"]
+contracts = ["source_owners.toml"]
+generated_mirrors = ["SOURCEMAP.md", "architecture_index.json"]
+tests = ["scripts/test_source_owners.py", "scripts/test_architecture_comprehension_eval.py"]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "generates"
+target = "generated:architecture_index.json"
+confidence = "generated"
+evidence = [{ path = "scripts/source_owners.py", symbol = "expected_architecture_index" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:SOURCEMAP.md"
+confidence = "declared"
+evidence = [{ path = "SOURCEMAP.md", symbol = "Managed KD4 source-owner index" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:source_owners.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "scripts/source_owners.py", symbol = "load_and_validate" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "source-owners-check" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_source_owners.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_source_owners.py", symbol = "SourceOwnersTest" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:SOURCEMAP.md"
+confidence = "generated"
+evidence = [{ path = "scripts/source_owners.py", symbol = "render_block" }]
+
+[[owners.invariants]]
+id = "fresh-index"
+kind = "compatibility"
+statement = "SOURCEMAP.md and architecture_index.json are deterministic mirrors of the same validated manifest digest."
+evidence = [{ path = "scripts/source_owners.py", symbol = "main" }]
+tests = ["scripts/test_source_owners.py"]
+
+[[owners.validation]]
+id = "source-owner-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_source_owners", "scripts.test_architecture_comprehension_eval"]
+role = "focused_tests"
+
+[[owners]]
+id = "repository-context-discovery"
+concern_ids = ["repository-identity", "instruction-loading", "nested-repository"]
+aliases = ["workspace discovery", "agents md loading"]
+phrases = ["nested repository identity and instruction cache"]
+roots = ["codex-rs/core/src/git_workspace.rs", "codex-rs/core/src/agents_md.rs"]
+primary_entries = [{ path = "codex-rs/core/src/git_workspace.rs", symbol = "GitWorkspaceCache" }, { path = "codex-rs/core/src/agents_md.rs", symbol = "load_project_instructions" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md", "codex-rs/core/AGENTS.md"]
+consumers = ["codex-rs/core/src/session/mod.rs"]
+contracts = ["AGENTS.md"]
+generated_mirrors = []
+tests = ["codex-rs/core/src/git_workspace_tests.rs", "codex-rs/core/src/agents_md_tests.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Discovery is driven by the active cwd and filesystem snapshot rather than a feature gate."
+generated_artifacts = "Repository metadata and instruction results are runtime cache entries, not checked-in generated artifacts."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/core/src/agents_md.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/session/mod.rs", symbol = "Codex::spawn" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/session/mod.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/session/mod.rs", symbol = "Codex::spawn" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "constructs"
+target = "path:codex-rs/core/src/git_workspace.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/session/mod.rs", symbol = "GitWorkspaceCache::new" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/core/src/git_workspace_tests.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/git_workspace_tests.rs", symbol = "nested repositories" }]
+
+[[owners.invariants]]
+id = "snapshot-scoped-discovery"
+kind = "semantic"
+statement = "Repository identity and AGENTS.md results are keyed by the relevant workspace snapshot so nested roots and prior read failures cannot silently reuse unrelated evidence."
+evidence = [{ path = "codex-rs/core/src/git_workspace.rs", symbol = "GitWorkspaceCache" }, { path = "codex-rs/core/src/agents_md.rs", symbol = "ProjectInstructionsLoad" }]
+tests = ["codex-rs/core/src/git_workspace_tests.rs", "codex-rs/core/src/agents_md_tests.rs"]
+
+[[owners.validation]]
+id = "repository-context-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-core", "git_workspace"]
+role = "focused_tests"
+
+[[owners]]
+id = "tool-output-recovery"
+concern_ids = ["tool-output-artifact", "bounded-recovery", "exact-context"]
+aliases = ["read tool output", "output artifact recovery"]
+phrases = ["recover exact omitted tool output"]
+roots = ["codex-rs/core/src/tools/command_output_artifact.rs", "codex-rs/core/src/tools/handlers/read_tool_output.rs"]
+primary_entries = [{ path = "codex-rs/core/src/tools/handlers/read_tool_output.rs", symbol = "ReadToolOutputHandler" }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md", "codex-rs/core/AGENTS.md"]
+consumers = ["codex-rs/core/src/context_manager/history.rs"]
+contracts = ["codex-rs/core/src/tools/handlers/read_tool_output_spec.rs"]
+generated_mirrors = []
+tests = ["codex-rs/core/src/tools/command_output_artifact_tests.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Recovery limits are tool-schema and call arguments, not repository configuration or a feature gate."
+generated_artifacts = "Output artifacts are immutable runtime state and are not checked-in generated files."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/core/src/tools/command_output_artifact.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/tools/handlers/read_tool_output.rs", symbol = "handle_read_tool_output" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/context_manager/history.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/context_manager/history.rs", symbol = "read_tool_output" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/core/src/tools/spec_plan.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/tools/spec_plan.rs", symbol = "ReadToolOutputHandler" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/tools/command_output_artifact_tests.rs", symbol = "read_tool_output_selectors" }]
+
+[[owners.invariants]]
+id = "exact-bounded-recovery"
+kind = "compatibility"
+statement = "An artifact selector either returns exact requested content or an explicit deterministic subdivision or omission receipt; it never silently clips exact values."
+evidence = [{ path = "codex-rs/core/src/tools/command_output_artifact.rs", symbol = "read_tool_output_selectors" }]
+tests = ["codex-rs/core/src/tools/command_output_artifact_tests.rs"]
+
+[[owners.validation]]
+id = "tool-output-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-core", "command_output_artifact_tests"]
+role = "focused_tests"
+
+[[owners]]
+id = "app-server-protocol-contracts"
+concern_ids = ["app-server-protocol", "schema-generation", "desktop-contract"]
+aliases = ["app server schema", "protocol fixtures"]
+phrases = ["generated desktop protocol contract"]
+roots = ["codex-rs/app-server-protocol"]
+primary_entries = [{ path = "codex-rs/app-server-protocol/src/bin/write_schema_fixtures.rs", symbol = "main", ambiguous = true }]
+instructions = ["AGENTS.md", "codex-rs/AGENTS.md"]
+consumers = ["codex-rs/app-server/src"]
+contracts = ["codex-rs/app-server-protocol/src/protocol"]
+generated_mirrors = ["codex-rs/app-server-protocol/schema"]
+tests = ["codex-rs/app-server-protocol/src/schema_fixtures.rs"]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Experimental schema selection is an explicit generator argument, not an ambient repository feature gate."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/app-server-protocol/src/schema_fixtures.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/app-server-protocol/src/bin/write_schema_fixtures.rs", symbol = "main" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "owner:app-server-runtime"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/app-server/src/message_processor.rs", symbol = "codex_app_server_protocol" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "app-server-schema-check" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/app-server-protocol/src/schema_fixtures.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/app-server-protocol/src/schema_fixtures.rs", symbol = "write_schema_fixtures_with_options" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:codex-rs/app-server-protocol/schema"
+confidence = "generated"
+evidence = [{ path = "scripts/app_server_schema_runtime_check.py", symbol = "GENERATED_OUTPUTS" }]
+
+[[owners.invariants]]
+id = "schema-source-parity"
+kind = "compatibility"
+statement = "Checked-in JSON Schema and TypeScript fixtures must match the protocol source generator consumed by the app server and Desktop clients."
+evidence = [{ path = "codex-rs/app-server-protocol/src/schema_fixtures.rs", symbol = "write_schema_fixtures_with_options" }]
+tests = ["codex-rs/app-server-protocol/src/schema_fixtures.rs"]
+
+[[owners.validation]]
+id = "app-server-schema-focused"
+cwd = "."
+argv = ["python", "scripts/app_server_schema_runtime_check.py", "--mode", "check"]
+role = "generated_contract_check"

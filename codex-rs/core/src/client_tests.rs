@@ -518,6 +518,11 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
     };
     assert!(category("base_system").unchanged_from_previous_request);
     assert!(!category("task_input").unchanged_from_previous_request);
+    let categories = second.request_token_categories();
+    assert!(categories.base_instructions > 0);
+    assert!(categories.current_input > 0);
+    assert!(categories.logical_total >= categories.current_input);
+    assert!(categories.repeated_unchanged_context >= categories.base_instructions);
 
     let mut changed_tools = second_request;
     changed_tools.tools = Some(vec![json!({"type": "function", "name": "changed"})]);

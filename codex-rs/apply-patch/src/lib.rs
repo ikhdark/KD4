@@ -14,6 +14,7 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileMetadata;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::RemoveOptions;
 use codex_utils_path_uri::PathUri;
@@ -162,6 +163,8 @@ pub enum ApplyPatchFileChange {
     Update {
         unified_diff: String,
         move_path: Option<PathUri>,
+        /// Source content observed while the patch was verified.
+        old_content: String,
         /// new_content that will result after the unified_diff is applied.
         new_content: String,
     },
@@ -187,6 +190,8 @@ pub enum MaybeApplyPatchVerified {
 #[derive(Debug, PartialEq)]
 pub struct ApplyPatchAction {
     changes: HashMap<PathUri, ApplyPatchFileChange>,
+    hunks: Vec<Hunk>,
+    source_preconditions: HashMap<PathUri, FileMetadata>,
 
     /// The raw patch argument that can be used to apply the patch. i.e., if the
     /// original arg was parsed in "lenient" mode with a
@@ -223,6 +228,8 @@ impl ApplyPatchAction {
         #[expect(clippy::expect_used)]
         Self {
             changes,
+            hunks: Vec::new(),
+            source_preconditions: HashMap::new(),
             cwd: path.parent().expect("path should have parent"),
             patch,
         }
@@ -371,7 +378,105 @@ pub async fn apply_hunks(
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
     let mut delta = AppliedPatchDelta::empty();
-    match apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta).await {
+    match apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta, None).await {
+        Ok(affected_paths) => {
+            print_summary(&affected_paths, stdout).map_err(|error| {
+                ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
+            })?;
+            Ok(delta)
+        }
+        Err(error) => {
+            let msg = error.to_string();
+            writeln!(stderr, "{msg}").map_err(|error| {
+                ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
+            })?;
+            let error = match error.downcast::<ApplyPatchError>() {
+                Ok(error) => error,
+                Err(error) => match error.downcast::<std::io::Error>() {
+                    Ok(io) => ApplyPatchError::from(io),
+                    Err(error) => ApplyPatchError::IoError(IoError {
+                        context: msg,
+                        source: std::io::Error::other(error),
+                    }),
+                },
+            };
+            Err(ApplyPatchFailure::new(error, delta))
+        }
+    }
+}
+
+/// Applies an already parsed and verified action. When the source metadata and contents still
+/// match the snapshot used during verification, the prepared contents are reused instead of
+/// parsing the patch again. A changed or unavailable snapshot falls back to applying the parsed
+/// hunks against the current filesystem so stale approvals retain the usual context check.
+pub async fn apply_verified_action(
+    action: &ApplyPatchAction,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
+    let mut sources_unchanged = !action.hunks.is_empty();
+    for hunk in &action.hunks {
+        if matches!(hunk, Hunk::AddFile { .. }) {
+            continue;
+        }
+        let path = match hunk.resolve_path(&action.cwd) {
+            Ok(path) => path,
+            Err(error) => {
+                return Err(ApplyPatchFailure::without_delta(error.into()));
+            }
+        };
+        let Some(expected) = action.source_preconditions.get(&path) else {
+            sources_unchanged = false;
+            break;
+        };
+        if !fs
+            .get_metadata(&path, sandbox)
+            .await
+            .is_ok_and(|current| current == *expected)
+        {
+            sources_unchanged = false;
+            break;
+        }
+        let expected_content = match action.changes.get(&path) {
+            Some(ApplyPatchFileChange::Delete { content }) => Some(content),
+            Some(ApplyPatchFileChange::Update { old_content, .. }) => Some(old_content),
+            _ => None,
+        };
+        let content_matches = if let Some(expected_content) = expected_content {
+            fs.read_file_text(&path, sandbox)
+                .await
+                .is_ok_and(|current| current == *expected_content)
+        } else {
+            false
+        };
+        if !content_matches {
+            sources_unchanged = false;
+            break;
+        }
+    }
+
+    if !sources_unchanged {
+        writeln!(
+            stderr,
+            "Warning: one or more patch targets changed after verification; rechecking the patch against current contents."
+        )
+        .map_err(|error| ApplyPatchFailure::without_delta(ApplyPatchError::from(error)))?;
+        return apply_hunks(&action.hunks, &action.cwd, stdout, stderr, fs, sandbox).await;
+    }
+
+    let mut delta = AppliedPatchDelta::empty();
+    match apply_hunks_to_files(
+        &action.hunks,
+        &action.cwd,
+        fs,
+        sandbox,
+        &mut delta,
+        Some(&action.changes),
+    )
+    .await
+    {
         Ok(affected_paths) => {
             print_summary(&affected_paths, stdout).map_err(|error| {
                 ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
@@ -416,6 +521,7 @@ async fn apply_hunks_to_files(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
     delta: &mut AppliedPatchDelta,
+    prepared_changes: Option<&HashMap<PathUri, ApplyPatchFileChange>>,
 ) -> anyhow::Result<AffectedPaths> {
     if hunks.is_empty() {
         anyhow::bail!("No files were modified.");
@@ -468,7 +574,11 @@ async fn apply_hunks_to_files(
             }
             Hunk::DeleteFile { .. } => {
                 note_existing_path_delta_support(&path_uri, fs, sandbox, &mut delta.exact).await;
-                let deleted_content = fs.read_file_text(&path_uri, sandbox).await.ok();
+                let deleted_content =
+                    match prepared_changes.and_then(|changes| changes.get(&path_uri)) {
+                        Some(ApplyPatchFileChange::Delete { content }) => Some(content.clone()),
+                        _ => fs.read_file_text(&path_uri, sandbox).await.ok(),
+                    };
                 if deleted_content.is_none() {
                     delta.exact = false;
                 }
@@ -521,14 +631,26 @@ async fn apply_hunks_to_files(
                 let AppliedPatch {
                     original_contents,
                     new_contents,
-                } = derive_new_contents_from_chunks(
-                    &path_uri,
-                    chunks,
-                    Some(hunk_index + 1),
-                    fs,
-                    sandbox,
-                )
-                .await?;
+                } = match prepared_changes.and_then(|changes| changes.get(&path_uri)) {
+                    Some(ApplyPatchFileChange::Update {
+                        old_content,
+                        new_content,
+                        ..
+                    }) => AppliedPatch {
+                        original_contents: old_content.clone(),
+                        new_contents: new_content.clone(),
+                    },
+                    _ => {
+                        derive_new_contents_from_chunks(
+                            &path_uri,
+                            chunks,
+                            Some(hunk_index + 1),
+                            fs,
+                            sandbox,
+                        )
+                        .await?
+                    }
+                };
                 if let Some(dest) = move_path {
                     let dest_uri = cwd.join(&dest.to_string_lossy())?;
                     let overwritten_move_content =
@@ -1157,6 +1279,67 @@ mod tests {
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
+    }
+
+    #[tokio::test]
+    async fn verified_action_warns_when_target_changed_before_apply() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let path = dir.path().join("sample.txt");
+        fs::write(&path, "old\n").unwrap();
+        let patch = wrap_patch("*** Update File: sample.txt\n@@\n-old\n+new");
+        let argv = vec!["apply_patch".to_string(), patch];
+        let MaybeApplyPatchVerified::Body(action) =
+            maybe_parse_apply_patch_verified(&argv, &cwd, LOCAL_FS.as_ref(), None).await
+        else {
+            panic!("expected verified patch action");
+        };
+
+        fs::write(&path, "prefix\nold\n").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_verified_action(&action, &mut stdout, &mut stderr, LOCAL_FS.as_ref(), None)
+            .await
+            .expect("current contents should still accept the patch");
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "prefix\nnew\n");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("changed after verification"), "{stderr}");
+    }
+
+    #[tokio::test]
+    async fn verified_action_rechecks_contents_even_when_metadata_matches() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let native_path = dir.path().join("sample.txt");
+        let path = PathUri::from_host_native_path(&native_path).expect("absolute test path");
+        fs::write(&native_path, "old\n").unwrap();
+        let patch = wrap_patch("*** Update File: sample.txt\n@@\n-old\n+new");
+        let argv = vec!["apply_patch".to_string(), patch];
+        let MaybeApplyPatchVerified::Body(mut action) =
+            maybe_parse_apply_patch_verified(&argv, &cwd, LOCAL_FS.as_ref(), None).await
+        else {
+            panic!("expected verified patch action");
+        };
+
+        fs::write(&native_path, "bad\n").unwrap();
+        let current_metadata = LOCAL_FS
+            .get_metadata(&path, None)
+            .await
+            .expect("current metadata");
+        action
+            .source_preconditions
+            .insert(path.clone(), current_metadata);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_verified_action(&action, &mut stdout, &mut stderr, LOCAL_FS.as_ref(), None)
+            .await
+            .expect_err("current contents no longer satisfy the patch");
+
+        assert_eq!(fs::read_to_string(&native_path).unwrap(), "bad\n");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("changed after verification"), "{stderr}");
     }
 
     #[tokio::test]

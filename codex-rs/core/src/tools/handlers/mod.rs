@@ -30,6 +30,7 @@ pub(crate) mod request_user_input_spec;
 mod shell;
 pub(crate) mod shell_spec;
 mod sleep;
+mod source_tools;
 mod test_sync;
 pub(crate) mod test_sync_spec;
 mod tool_search;
@@ -75,6 +76,11 @@ pub use request_user_input::RequestUserInputHandler;
 pub use shell::ShellCommandHandler;
 pub(crate) use shell::ShellCommandHandlerOptions;
 pub use sleep::SleepHandler;
+pub use source_tools::ArchitectureSliceHandler;
+pub use source_tools::CargoTestHandler;
+pub use source_tools::LoadSkillHandler;
+pub use source_tools::OrchestrationLintHandler;
+pub use source_tools::ReadSourceBatchHandler;
 pub use test_sync::TestSyncHandler;
 pub(crate) use tool_search::ToolSearchHandlerCache;
 pub use unified_exec::ExecCommandHandler;
@@ -184,7 +190,7 @@ fn resolve_workdir_base_path(
         .map_or_else(|| default_cwd.clone(), |workdir| default_cwd.join(workdir)))
 }
 
-fn resolve_tool_environment<'a>(
+pub(crate) fn resolve_tool_environment<'a>(
     environments: &'a TurnEnvironmentSnapshot,
     environment_id: Option<&str>,
 ) -> Result<Option<&'a TurnEnvironment>, FunctionCallError> {

@@ -27,6 +27,8 @@ struct WriteStdinArgs {
     #[serde(default = "super::default_write_stdin_yield_time_ms")]
     yield_time_ms: u64,
     #[serde(default)]
+    until_exit_ms: Option<u64>,
+    #[serde(default)]
     max_output_tokens: Option<usize>,
 }
 
@@ -72,6 +74,12 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        if args.until_exit_ms.is_some() && !args.chars.is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "write_stdin `until_exit_ms` is only valid for an empty-input completion wait"
+                    .to_string(),
+            ));
+        }
         validate_independent_review_stdin(&turn.session_source, &args.chars)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         let mut response = session
@@ -80,7 +88,10 @@ impl WriteStdinHandler {
             .write_stdin(WriteStdinRequest {
                 process_id: args.session_id,
                 input: &args.chars,
-                yield_time_ms: args.yield_time_ms,
+                // The process manager already implements wait-until-exit-or-deadline
+                // semantics for empty input. Expose that ownership directly so the
+                // caller does not need to manufacture repeated polling generations.
+                yield_time_ms: args.until_exit_ms.unwrap_or(args.yield_time_ms),
                 max_output_tokens: args.max_output_tokens,
                 truncation_policy: turn.model_info.truncation_policy.into(),
             })

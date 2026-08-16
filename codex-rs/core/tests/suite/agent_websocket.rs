@@ -29,6 +29,7 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
         vec![ev_response_created("resp-1"), ev_completed("resp-1")],
         vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+        vec![ev_response_created("resp-3"), ev_completed("resp-3")],
     ]])
     .await;
 
@@ -59,10 +60,29 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "second lite turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: ThreadSettingsOverrides {
+                model: Some("gpt-5.4".to_string()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
-    assert_eq!(connection.len(), 3);
+    assert_eq!(connection.len(), 4);
     let non_lite_turn = connection
         .get(1)
         .expect("missing non-lite turn request")
@@ -70,6 +90,10 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
     let lite_turn = connection
         .get(2)
         .expect("missing lite turn request")
+        .body_json();
+    let inherited_lite_turn = connection
+        .get(3)
+        .expect("missing inherited lite turn request")
         .body_json();
 
     assert_eq!(non_lite_turn["model"].as_str(), Some("gpt-5.2"));
@@ -92,6 +116,19 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
         .and_then(Value::as_array)
         .expect("lite turn should start with an additional_tools item");
     assert!(!additional_tools.is_empty());
+    assert_eq!(
+        inherited_lite_turn["previous_response_id"].as_str(),
+        Some("resp-2")
+    );
+    assert_eq!(inherited_lite_turn.get("tools"), None);
+    assert!(
+        inherited_lite_turn
+            .get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|input| input.iter().all(|item| {
+                item.get("type").and_then(Value::as_str) != Some("additional_tools")
+            }))
+    );
 
     server.shutdown().await;
     Ok(())

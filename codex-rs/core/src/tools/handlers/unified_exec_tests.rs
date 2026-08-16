@@ -658,7 +658,48 @@ async fn mutating_preflight_rejection_does_not_reserve_process_id() {
 }
 
 #[tokio::test]
-async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_failure() {
+async fn file_valued_workdir_is_rejected_before_process_launch() {
+    let fixture = tempfile::NamedTempFile::new().expect("create file-valued workdir fixture");
+    let invocation = invocation_for_payload_without_sandbox(
+        "exec_command",
+        "file-workdir",
+        ToolPayload::Function {
+            arguments: serde_json::json!({
+                "kind": "argv",
+                "program": "echo",
+                "args": ["must-not-launch"],
+                "workdir": fixture.path(),
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    let session = Arc::clone(&invocation.session);
+
+    let error = match ExecCommandHandler::default().handle(invocation).await {
+        Ok(_) => panic!("a file cannot be used as exec_command workdir"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("must resolve to a directory"),
+        "unexpected error: {error}"
+    );
+
+    let process_id = session
+        .services
+        .unified_exec_manager
+        .allocate_process_id()
+        .await;
+    assert_eq!(process_id, 1000, "preflight must not reserve a process id");
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+}
+
+#[tokio::test]
+async fn intercepted_apply_patch_failure_releases_process_id_and_remains_retryable() {
     let patch = "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch";
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -715,7 +756,7 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_fa
         })
         .to_string(),
     };
-    let blocked = match handler
+    let third_failure = match handler
         .handle(ToolInvocation {
             session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -729,10 +770,26 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_fa
         })
         .await
     {
-        Ok(_) => panic!("third identical failure must be blocked"),
+        Ok(_) => panic!("third identical intercepted patch must fail"),
         Err(err) => err,
     };
-    assert!(blocked.to_string().contains("Command blocked"));
+    assert!(
+        third_failure
+            .to_string()
+            .contains("apply_patch verification failed"),
+        "unexpected third failure: {third_failure}"
+    );
+    let process_id = session
+        .services
+        .unified_exec_manager
+        .allocate_process_id()
+        .await;
+    assert_eq!(process_id, 1000);
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
 
     let artifact_directory = turn
         .config

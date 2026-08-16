@@ -65,7 +65,10 @@ pub(crate) enum ToolEventStage<'a> {
 }
 
 pub(crate) enum ToolEventFailure<'a> {
-    Output(ExecToolCallOutput),
+    Output {
+        output: ExecToolCallOutput,
+        applied_patch_delta: Option<&'a AppliedPatchDelta>,
+    },
     Message(String),
     Denied {
         message: String,
@@ -345,8 +348,15 @@ impl ToolEmitter {
                 .await;
             }
             (
-                Self::ApplyPatch { changes, .. },
-                ToolEventStage::Failure(ToolEventFailure::Output(output)),
+                Self::ApplyPatch {
+                    changes,
+                    environment_id,
+                    ..
+                },
+                ToolEventStage::Failure(ToolEventFailure::Output {
+                    output,
+                    applied_patch_delta,
+                }),
             ) => {
                 emit_patch_end(
                     ctx,
@@ -358,7 +368,11 @@ impl ToolEmitter {
                     } else {
                         PatchApplyStatus::Failed
                     },
-                    TurnDiffTrackerUpdate::Invalidate,
+                    applied_patch_delta
+                        .map(|delta| {
+                            tracker_update_for_known_delta(environment_id.as_deref(), delta)
+                        })
+                        .unwrap_or(TurnDiffTrackerUpdate::Invalidate),
                 )
                 .await;
             }
@@ -468,9 +482,16 @@ impl ToolEmitter {
             Ok(output) => {
                 let content = self.format_exec_output_for_model(&output, ctx);
                 let exit_code = output.exit_code;
-                let event = ToolEventStage::Success {
-                    output,
-                    applied_patch_delta,
+                let event = if exit_code == 0 {
+                    ToolEventStage::Success {
+                        output,
+                        applied_patch_delta,
+                    }
+                } else {
+                    ToolEventStage::Failure(ToolEventFailure::Output {
+                        output,
+                        applied_patch_delta,
+                    })
                 };
                 let result = if exit_code == 0 {
                     Ok(content)
@@ -481,22 +502,19 @@ impl ToolEmitter {
             }
             Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output }))) => {
                 let response = self.format_exec_output_for_model(&output, ctx);
-                let event = ToolEventStage::Failure(ToolEventFailure::Output(*output));
+                let event = ToolEventStage::Failure(ToolEventFailure::Output {
+                    output: *output,
+                    applied_patch_delta: None,
+                });
                 let result = Err(FunctionCallError::RespondToModel(response));
                 (event, result)
             }
             Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
                 let response = self.format_exec_output_for_model(&output, ctx);
-                // apply_patch can be denied after it has already committed a
-                // known prefix. Reuse the output-bearing path so the visible
-                // item still fails while the turn diff consumes that prefix.
-                let event = match (self, applied_patch_delta) {
-                    (Self::ApplyPatch { .. }, Some(delta)) => ToolEventStage::Success {
-                        output: *output,
-                        applied_patch_delta: Some(delta),
-                    },
-                    _ => ToolEventStage::Failure(ToolEventFailure::Output(*output)),
-                };
+                let event = ToolEventStage::Failure(ToolEventFailure::Output {
+                    output: *output,
+                    applied_patch_delta,
+                });
                 let result = Err(FunctionCallError::RespondToModel(response));
                 (event, result)
             }
@@ -616,7 +634,7 @@ async fn emit_exec_stage(
             .await;
         }
         ToolEventStage::Success { output, .. }
-        | ToolEventStage::Failure(ToolEventFailure::Output(output)) => {
+        | ToolEventStage::Failure(ToolEventFailure::Output { output, .. }) => {
             let exec_result = ExecCommandResult {
                 stdout: output.stdout.text.clone(),
                 stderr: output.stderr.text.clone(),
@@ -991,6 +1009,16 @@ mod tests {
             PatchApplyStatus::Failed,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn nonzero_apply_patch_output_uses_failure_stage_and_tracks_committed_delta() {
+        let output = ExecToolCallOutput {
+            exit_code: 1,
+            ..Default::default()
+        };
+        assert_failed_apply_patch_tracks_committed_delta(Ok(output), PatchApplyStatus::Failed)
+            .await;
     }
 
     #[tokio::test]

@@ -2519,6 +2519,7 @@ stream_max_retries = 0
         cwd: repo_path.clone(),
         originator: "codex".to_string(),
         cli_version: "0.0.0".to_string(),
+        build_info: None,
         source: RolloutSessionSource::Cli,
         thread_source: None,
         agent_path: None,

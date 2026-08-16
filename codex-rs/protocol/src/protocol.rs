@@ -2188,6 +2188,31 @@ pub struct TurnTerminalizationCompleteEvent {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct TurnTimingRequestTokenCategories {
+    #[serde(default)]
+    pub base_instructions: u64,
+    #[serde(default)]
+    pub tool_schemas: u64,
+    #[serde(default)]
+    pub conversation_history: u64,
+    #[serde(default)]
+    pub current_input: u64,
+    #[serde(default)]
+    pub repository_context: u64,
+    #[serde(default)]
+    pub skills: u64,
+    #[serde(default)]
+    pub other_injected_context: u64,
+    #[serde(default)]
+    pub logical_total: u64,
+    /// Tokens in categories whose exact hash matched the prior model request.
+    #[serde(default)]
+    pub repeated_unchanged_context: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct TurnTimingModelRequest {
     /// Zero-based logical generation owning this physical provider attempt.
     #[serde(default)]
@@ -2229,14 +2254,19 @@ pub struct TurnTimingModelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub token_usage: Option<TurnTimingProviderTokenUsage>,
+    /// Aggregate-only, locally estimated request composition. No prompt text,
+    /// repository paths, tool arguments, or hashes are persisted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[ts(optional)]
+    pub request_token_categories: Option<TurnTimingRequestTokenCategories>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number", optional)]
     pub dispatch_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[ts(type = "number", optional)]
     pub first_model_output_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | null", optional)]
+    #[ts(type = "number", optional)]
     pub completed_ms: Option<u64>,
 }
 
@@ -2785,6 +2815,30 @@ pub struct TurnTimingCounters {
     pub planning_generation_count: u32,
     #[serde(default)]
     pub plan_revision_generation_count: u32,
+    /// Aggregate-only architecture-comprehension telemetry. These counters do
+    /// not contain repository paths, symbols, relationship text, or evidence.
+    #[serde(default)]
+    pub architecture_slice_attempt_count: u32,
+    #[serde(default)]
+    pub architecture_slice_complete_count: u32,
+    #[serde(default)]
+    pub architecture_relationship_count: u64,
+    #[serde(default)]
+    pub architecture_invariant_count: u64,
+    #[serde(default)]
+    pub architecture_missing_requirement_count: u64,
+    #[serde(default)]
+    pub architecture_material_unknown_count: u64,
+    #[serde(default)]
+    pub architecture_stale_snapshot_count: u32,
+    #[serde(default)]
+    pub architecture_tool_call_count: u64,
+    #[serde(default)]
+    pub architecture_files_read: u64,
+    #[serde(default)]
+    pub architecture_bytes_read: u64,
+    #[serde(default)]
+    pub architecture_late_relationship_discovery_count: u64,
     #[serde(default)]
     pub planning_fixed_point_iteration_count: u32,
     #[serde(default)]
@@ -4000,6 +4054,16 @@ pub struct SessionContextWindow {
     pub window_id: String,
 }
 
+/// Build identity of the executable that created a rollout.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SessionBuildInfo {
+    pub binary: String,
+    pub commit: String,
+    pub dirty: String,
+    pub profile: String,
+    pub built: String,
+}
+
 impl SessionContextWindow {
     pub fn new(window_id: String) -> Self {
         Self { window_id }
@@ -4023,6 +4087,8 @@ pub struct SessionMeta {
     pub cwd: PathBuf,
     pub originator: String,
     pub cli_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_info: Option<SessionBuildInfo>,
     #[serde(default)]
     pub source: SessionSource,
     /// Optional analytics source classification for this thread.
@@ -4074,6 +4140,7 @@ impl Default for SessionMeta {
             cwd: PathBuf::new(),
             originator: String::new(),
             cli_version: String::new(),
+            build_info: None,
             source: SessionSource::default(),
             thread_source: None,
             agent_nickname: None,
@@ -4156,6 +4223,53 @@ pub enum RolloutItem {
 /// position in the rollout is the history prefix transmitted by that attempt.
 /// An unresolved marker makes reconstructed context provenance conservative.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct HistoryProjectionManifest {
+    pub version: u16,
+    pub source_history_sha256: String,
+    pub projected_history_sha256: String,
+    #[serde(default)]
+    pub stable_projection_enabled: bool,
+    #[serde(default)]
+    pub stable_fail_open: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stable_fallback_used: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stable_context: Vec<StableContextProjectionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_checkpoint_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_replacements: Vec<HistoryProjectionReplacement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_receipts: Vec<ToolReceiptProjectionRecord>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct StableContextProjectionRecord {
+    pub kind: String,
+    pub contract_version: u16,
+    pub semantic_id: String,
+    pub content_sha256: String,
+    pub disposition: String,
+    pub active: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct HistoryProjectionReplacement {
+    pub source_item_index: u64,
+    pub source_sha256: String,
+    pub replacement_class: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct ToolReceiptProjectionRecord {
+    pub source_item_index: u64,
+    pub call_id: String,
+    pub receipt_id: String,
+    pub source_output_sha256: String,
+    pub substituted_output_sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
 pub struct SamplingBoundaryItem {
     pub sampling_request_id: String,
     pub physical_attempt_id: String,
@@ -4163,6 +4277,8 @@ pub struct SamplingBoundaryItem {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub unresolved_context: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_manifest: Option<HistoryProjectionManifest>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -6993,11 +7109,91 @@ mod tests {
         }))?;
 
         assert_eq!(session_meta.history_mode, ThreadHistoryMode::Legacy);
+        assert_eq!(session_meta.build_info, None);
         let serialized = serde_json::to_value(&session_meta)?;
         assert_eq!(serialized["history_mode"], json!("legacy"));
         let mut unknown = serialized;
         unknown["history_mode"] = json!("future");
         assert!(serde_json::from_value::<SessionMeta>(unknown).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_boundary_defaults_projection_manifest_for_legacy_payload() -> Result<()> {
+        let boundary: SamplingBoundaryItem = serde_json::from_value(json!({
+            "sampling_request_id": "request",
+            "physical_attempt_id": "attempt",
+            "unresolved_context": true
+        }))?;
+
+        assert_eq!(boundary.projection_manifest, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_boundary_round_trips_projection_manifest() -> Result<()> {
+        let boundary = SamplingBoundaryItem {
+            sampling_request_id: "request".to_string(),
+            physical_attempt_id: "attempt".to_string(),
+            turn_id: Some("turn".to_string()),
+            unresolved_context: true,
+            projection_manifest: Some(HistoryProjectionManifest {
+                version: 1,
+                source_history_sha256: "source".to_string(),
+                projected_history_sha256: "projected".to_string(),
+                stable_projection_enabled: false,
+                stable_fail_open: false,
+                stable_fallback_used: true,
+                stable_context: vec![StableContextProjectionRecord {
+                    kind: "repository".to_string(),
+                    contract_version: 1,
+                    semantic_id: "semantic".to_string(),
+                    content_sha256: "content".to_string(),
+                    disposition: "replaced".to_string(),
+                    active: true,
+                }],
+                task_checkpoint_sha256: Some("checkpoint".to_string()),
+                task_replacements: vec![HistoryProjectionReplacement {
+                    source_item_index: 3,
+                    source_sha256: "item".to_string(),
+                    replacement_class: "plan_output".to_string(),
+                }],
+                tool_receipts: vec![ToolReceiptProjectionRecord {
+                    source_item_index: 5,
+                    call_id: "call".to_string(),
+                    receipt_id: "receipt".to_string(),
+                    source_output_sha256: "raw".to_string(),
+                    substituted_output_sha256: "substituted".to_string(),
+                }],
+            }),
+        };
+
+        let encoded = serde_json::to_value(&boundary)?;
+        assert_eq!(
+            serde_json::from_value::<SamplingBoundaryItem>(encoded)?,
+            boundary
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_meta_round_trips_build_info() -> Result<()> {
+        let session_meta = SessionMeta {
+            build_info: Some(SessionBuildInfo {
+                binary: "codex.exe".to_string(),
+                commit: "0123456789ab".to_string(),
+                dirty: "true".to_string(),
+                profile: "release".to_string(),
+                built: "2026-08-15T18:17:42Z".to_string(),
+            }),
+            ..SessionMeta::default()
+        };
+
+        let serialized = serde_json::to_value(&session_meta)?;
+        assert_eq!(serialized["build_info"]["binary"], "codex.exe");
+        assert_eq!(serialized["build_info"]["commit"], "0123456789ab");
+        let deserialized: SessionMeta = serde_json::from_value(serialized)?;
+        assert_eq!(deserialized.build_info, session_meta.build_info);
         Ok(())
     }
 
@@ -7603,6 +7799,32 @@ mod tests {
                 .get("ownerProvedPredeterminedContinuation")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn model_request_token_categories_are_additive_and_round_trip() {
+        let historical: TurnTimingModelRequest = serde_json::from_value(serde_json::json!({
+            "isContinuation": false
+        }))
+        .expect("historical request timing");
+        assert!(historical.request_token_categories.is_none());
+
+        let current = TurnTimingModelRequest {
+            request_token_categories: Some(TurnTimingRequestTokenCategories {
+                base_instructions: 10,
+                tool_schemas: 20,
+                conversation_history: 30,
+                logical_total: 60,
+                repeated_unchanged_context: 30,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&current).expect("serialize request timing");
+        assert_eq!(value["requestTokenCategories"]["toolSchemas"], 20);
+        let decoded: TurnTimingModelRequest =
+            serde_json::from_value(value).expect("deserialize request timing");
+        assert_eq!(decoded, current);
     }
 
     #[test]

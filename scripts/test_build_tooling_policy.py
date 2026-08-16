@@ -121,7 +121,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
     def test_retired_repo_local_harness_skill_has_no_registration(self) -> None:
         features = load_toml(REPO_ROOT / "kd4_features.toml")["features"]
         feature_ids = {feature["id"] for feature in features}
-        workspace_readme = (REPO_ROOT / ".codex" / "README.md").read_text(
+        workspace_policy = (REPO_ROOT / ".codex" / "AGENTS.md").read_text(
             encoding="utf-8"
         )
         harness_workflow = (REPO_ROOT / ".codex" / "harness" / "workflow.md").read_text(
@@ -130,7 +130,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertNotIn("kd4-harness", feature_ids)
         self.assertFalse((REPO_ROOT / ".codex" / "skills" / "kd4-harness").exists())
-        self.assertNotIn("skills/kd4-harness", workspace_readme)
+        self.assertNotIn("skills/kd4-harness", workspace_policy)
         self.assertNotIn("kd4-harness", harness_workflow)
 
     def test_repo_local_skill_frontmatter_names_match_folders(self) -> None:
@@ -177,7 +177,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         first_lines = " ".join(" ".join(text.splitlines()[:40]).split())
 
-        self.assertIn("Treat the active repository root as the checkout location", first_lines)
+        self.assertIn(
+            "Treat the active repository root as the checkout location", first_lines
+        )
         self.assertNotIn(r"C:\Users\kuh\Desktop\kd4", text)
         self.assertNotIn(r"C:\Users\kuh\Desktop\codexKD`", text)
 
@@ -621,6 +623,13 @@ class BuildToolingPolicyTest(unittest.TestCase):
         errors, _advisories = root_maintenance.script_audit_findings()
 
         self.assertEqual(errors, [])
+
+    def test_root_maintenance_script_audit_context_matches_current_routes(
+        self,
+    ) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        self.assertEqual(root_maintenance.script_audit_context_issues(), [])
 
     def test_root_maintenance_script_audit_skips_native_sh_tests_on_windows(
         self,

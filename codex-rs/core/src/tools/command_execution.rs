@@ -11,11 +11,17 @@ use codex_protocol::validation::ValidationFreshness;
 use codex_protocol::validation::ValidationProofKey;
 use codex_protocol::validation::ValidationResult;
 use codex_protocol::validation::ValidationTerminalStatus;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::validation_admission::ValidationClassification;
+use crate::validation_admission::ValidationEcosystem;
 use crate::validation_admission::ValidationLaunchPlan;
+use crate::validation_admission::ValidationOperation;
+use crate::validation_admission::classify_validation;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
 const MAX_COMPLETED_VALIDATION_PROOFS: usize = 128;
@@ -243,6 +249,13 @@ struct CompletedValidationProof {
     artifact: RawOutputArtifact,
 }
 
+#[derive(Debug, Clone)]
+struct CompletedCommandValidation {
+    duration_ms: u64,
+    artifact: RawOutputArtifact,
+    selected_test_count: Option<u64>,
+}
+
 #[derive(Default)]
 struct CommandExecutionState {
     attempts: HashMap<CommandAttemptKey, AttemptEntry>,
@@ -251,6 +264,8 @@ struct CommandExecutionState {
     running_order: VecDeque<i32>,
     repository_epoch: u64,
     observed_turn_mutation_revisions: HashMap<String, u64>,
+    completed_command_validations: HashMap<ValidationProofKey, CompletedCommandValidation>,
+    completed_command_validation_order: VecDeque<ValidationProofKey>,
     completed_validations: HashMap<ValidationProofKey, CompletedValidationProof>,
     completed_validation_order: VecDeque<ValidationProofKey>,
     validation_results_by_call: HashMap<String, ValidationResult>,
@@ -323,6 +338,59 @@ impl CommandExecutionLedger {
         }
         let mut result = proof.result;
         result.freshness = ValidationFreshness::Reused;
+        Some(result)
+    }
+
+    pub(crate) async fn promote_reusable_command_validation(
+        &self,
+        command_key: &ValidationProofKey,
+        proof_key: ValidationProofKey,
+        route: ValidationRoute,
+        call_id: String,
+    ) -> Option<ValidationResult> {
+        let completed = self
+            .state
+            .lock()
+            .await
+            .completed_command_validations
+            .get(command_key)
+            .cloned()?;
+        let Some((artifact_ref, artifact_sha256)) = completed.artifact.validation_integrity().await
+        else {
+            let mut state = self.state.lock().await;
+            state.completed_command_validations.remove(command_key);
+            state
+                .completed_command_validation_order
+                .retain(|entry| entry != command_key);
+            return None;
+        };
+        let result = ValidationResult {
+            proof_key: proof_key.clone(),
+            route,
+            call_id: call_id.clone(),
+            process_id: None,
+            status: ValidationTerminalStatus::Succeeded,
+            duration_ms: completed.duration_ms,
+            summary: Some(
+                "reused exact focused validation completed before route declaration".to_string(),
+            ),
+            failure_excerpt: None,
+            failure_signature: None,
+            selected_test_count: completed.selected_test_count,
+            raw_artifact_ref: Some(artifact_ref),
+            raw_artifact_sha256: Some(artifact_sha256),
+            freshness: ValidationFreshness::Reused,
+        };
+        let mut state = self.state.lock().await;
+        insert_validation_result_locked(&mut state, call_id, result.clone());
+        insert_completed_validation_locked(
+            &mut state,
+            proof_key,
+            CompletedValidationProof {
+                result: result.clone(),
+                artifact: completed.artifact,
+            },
+        );
         Some(result)
     }
 
@@ -579,30 +647,19 @@ impl CommandExecutionLedger {
             let Some(exit_code) = running.completed_exit_code else {
                 return;
             };
-            let Some(launch) = running.validation_launch.as_ref() else {
-                return;
-            };
-            let (Some(proof_key), Some(route), Some(call_id)) = (
-                launch.proof_key.clone(),
-                launch.structured_route.clone(),
-                launch.validation_call_id.clone(),
-            ) else {
+            let Some(launch) = running.validation_launch.clone() else {
                 return;
             };
             (
-                proof_key,
-                route,
-                call_id,
+                launch,
                 running.artifact.clone(),
                 running.started_at,
                 exit_code,
             )
         };
-        let (proof_key, route, call_id, artifact, started_at, exit_code) = candidate;
+        let (launch, artifact, started_at, exit_code) = candidate;
         self.publish_completed_validation(
-            proof_key,
-            route,
-            call_id,
+            &launch,
             artifact,
             started_at,
             exit_code,
@@ -618,34 +675,55 @@ impl CommandExecutionLedger {
         started_at: Instant,
         exit_code: i32,
     ) -> bool {
-        let (Some(proof_key), Some(route), Some(call_id)) = (
-            launch.proof_key.clone(),
-            launch.structured_route.clone(),
-            launch.validation_call_id.clone(),
-        ) else {
-            return false;
-        };
-        self.publish_completed_validation(
-            proof_key, route, call_id, artifact, started_at, exit_code, None,
-        )
-        .await
+        self.publish_completed_validation(launch, artifact, started_at, exit_code, None)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn publish_completed_validation(
         &self,
-        proof_key: ValidationProofKey,
-        route: ValidationRoute,
-        call_id: String,
+        launch: &ValidationLaunchPlan,
         artifact: RawOutputArtifact,
         started_at: Instant,
         exit_code: i32,
         process_id: Option<String>,
     ) -> bool {
-        let Some((artifact_ref, artifact_sha256)) = artifact.validation_integrity().await else {
+        let Some((artifact_ref, artifact_sha256, output)) = artifact.validation_evidence().await
+        else {
             return false;
         };
-        let succeeded = exit_code == 0;
+        let selected_test_count = rust_test_validation(&launch.invocation)
+            .then(|| executed_rust_test_count(&output))
+            .flatten();
+        let zero_tests_selected = exit_code == 0 && selected_test_count == Some(0);
+        let succeeded = exit_code == 0 && !zero_tests_selected;
+        let failure_signature =
+            normalized_validation_failure_signature(exit_code, zero_tests_selected, &output);
+        let duration_ms = u64::try_from(
+            Instant::now()
+                .saturating_duration_since(started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let mut state = self.state.lock().await;
+        if succeeded && let Some(command_key) = launch.command_proof_key.clone() {
+            insert_completed_command_validation_locked(
+                &mut state,
+                command_key,
+                CompletedCommandValidation {
+                    duration_ms,
+                    artifact: artifact.clone(),
+                    selected_test_count,
+                },
+            );
+        }
+        let (Some(proof_key), Some(route), Some(call_id)) = (
+            launch.proof_key.clone(),
+            launch.structured_route.clone(),
+            launch.validation_call_id.clone(),
+        ) else {
+            return true;
+        };
         let result = ValidationResult {
             proof_key: proof_key.clone(),
             route,
@@ -656,57 +734,41 @@ impl CommandExecutionLedger {
             } else {
                 ValidationTerminalStatus::Failed
             },
-            duration_ms: u64::try_from(
-                Instant::now()
-                    .saturating_duration_since(started_at)
-                    .as_millis(),
-            )
-            .unwrap_or(u64::MAX),
-            summary: Some(if succeeded {
+            duration_ms,
+            summary: Some(if zero_tests_selected {
+                "validation command exited successfully but selected zero Rust tests".to_string()
+            } else if succeeded {
                 "focused validation succeeded".to_string()
             } else {
                 format!("focused validation exited with code {exit_code}")
             }),
             failure_excerpt: (!succeeded).then(|| {
-                format!(
+                if zero_tests_selected {
+                    "zero executed tests do not cover the declared behavioral contract".to_string()
+                } else {
+                    format!(
                     "validation exited with code {exit_code}; exact output is retained in the immutable artifact"
-                )
+                    )
+                }
             }),
+            failure_signature,
+            selected_test_count,
             raw_artifact_ref: Some(artifact_ref),
             raw_artifact_sha256: Some(artifact_sha256),
             freshness: ValidationFreshness::Executed,
         };
-        let mut state = self.state.lock().await;
         if state.validation_results_by_call.contains_key(&call_id) {
             return true;
         }
-        while state.validation_results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-            let Some(oldest) = state.validation_result_call_order.pop_front() else {
-                break;
-            };
-            state.validation_results_by_call.remove(&oldest);
-        }
-        state
-            .validation_result_call_order
-            .push_back(call_id.clone());
-        state
-            .validation_results_by_call
-            .insert(call_id, result.clone());
+        insert_validation_result_locked(&mut state, call_id, result.clone());
         if !succeeded || state.completed_validations.contains_key(&proof_key) {
             return true;
         }
-        while state.completed_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-            let Some(oldest) = state.completed_validation_order.pop_front() else {
-                break;
-            };
-            state.completed_validations.remove(&oldest);
-        }
-        state
-            .completed_validation_order
-            .push_back(proof_key.clone());
-        state
-            .completed_validations
-            .insert(proof_key, CompletedValidationProof { result, artifact });
+        insert_completed_validation_locked(
+            &mut state,
+            proof_key,
+            CompletedValidationProof { result, artifact },
+        );
         true
     }
 
@@ -746,6 +808,179 @@ impl CommandExecutionLedger {
             .await
             .map_or(0, |entry| entry.consecutive_failures)
     }
+}
+
+fn insert_validation_result_locked(
+    state: &mut CommandExecutionState,
+    call_id: String,
+    result: ValidationResult,
+) {
+    if state.validation_results_by_call.contains_key(&call_id) {
+        state
+            .validation_result_call_order
+            .retain(|entry| entry != &call_id);
+    }
+    while state.validation_results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+        let Some(oldest) = state.validation_result_call_order.pop_front() else {
+            break;
+        };
+        state.validation_results_by_call.remove(&oldest);
+    }
+    state
+        .validation_result_call_order
+        .push_back(call_id.clone());
+    state.validation_results_by_call.insert(call_id, result);
+}
+
+fn insert_completed_validation_locked(
+    state: &mut CommandExecutionState,
+    proof_key: ValidationProofKey,
+    proof: CompletedValidationProof,
+) {
+    if state.completed_validations.contains_key(&proof_key) {
+        state
+            .completed_validation_order
+            .retain(|entry| entry != &proof_key);
+    }
+    while state.completed_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+        let Some(oldest) = state.completed_validation_order.pop_front() else {
+            break;
+        };
+        state.completed_validations.remove(&oldest);
+    }
+    state
+        .completed_validation_order
+        .push_back(proof_key.clone());
+    state.completed_validations.insert(proof_key, proof);
+}
+
+fn insert_completed_command_validation_locked(
+    state: &mut CommandExecutionState,
+    proof_key: ValidationProofKey,
+    proof: CompletedCommandValidation,
+) {
+    if state.completed_command_validations.contains_key(&proof_key) {
+        state
+            .completed_command_validation_order
+            .retain(|entry| entry != &proof_key);
+    }
+    while state.completed_command_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+        let Some(oldest) = state.completed_command_validation_order.pop_front() else {
+            break;
+        };
+        state.completed_command_validations.remove(&oldest);
+    }
+    state
+        .completed_command_validation_order
+        .push_back(proof_key.clone());
+    state.completed_command_validations.insert(proof_key, proof);
+}
+
+fn rust_test_validation(
+    invocation: &crate::tools::handlers::command_shape::CommandInvocation,
+) -> bool {
+    matches!(
+        classify_validation(invocation),
+        ValidationClassification::Validation { leaves, .. }
+            if leaves.iter().any(|leaf| {
+                leaf.operation == ValidationOperation::Test
+                    && leaf.ecosystem == ValidationEcosystem::Rust
+            })
+    )
+}
+
+fn executed_rust_test_count(output: &[u8]) -> Option<u64> {
+    let output = String::from_utf8_lossy(output);
+    let running_count = output
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next()?.eq_ignore_ascii_case("running"))
+                .then(|| words.next()?.parse::<u64>().ok())
+                .flatten()
+        })
+        .fold(None, |total, count| {
+            Some(total.unwrap_or(0_u64).saturating_add(count))
+        });
+    if running_count.is_some() {
+        return running_count;
+    }
+    let mut count = 0_u64;
+    let mut found_summary = false;
+    for line in output.lines() {
+        let normalized = line.to_ascii_lowercase();
+        if !normalized.contains("test result:") {
+            continue;
+        }
+        let words = normalized.split_whitespace().collect::<Vec<_>>();
+        let Some(passed_index) = words.iter().position(|word| word.starts_with("passed")) else {
+            continue;
+        };
+        let Some(value) = passed_index
+            .checked_sub(1)
+            .and_then(|index| words.get(index))
+            .and_then(|value| {
+                value
+                    .trim_matches(|character: char| !character.is_ascii_digit())
+                    .parse::<u64>()
+                    .ok()
+            })
+        else {
+            continue;
+        };
+        found_summary = true;
+        count = count.saturating_add(value);
+    }
+    found_summary.then_some(count)
+}
+
+pub(crate) fn normalized_validation_failure_signature(
+    exit_code: i32,
+    zero_tests_selected: bool,
+    output: &[u8],
+) -> Option<String> {
+    if exit_code == 0 && !zero_tests_selected {
+        return None;
+    }
+    if zero_tests_selected {
+        return Some("validation-failure-v1:zero-tests-selected".to_string());
+    }
+    let mut normalized = String::new();
+    let mut in_digits = false;
+    let mut in_whitespace = false;
+    for character in String::from_utf8_lossy(output)
+        .chars()
+        .flat_map(char::to_lowercase)
+    {
+        let character = if character == '\\' { '/' } else { character };
+        if character.is_ascii_digit() {
+            if !in_digits {
+                normalized.push('#');
+            }
+            in_digits = true;
+            in_whitespace = false;
+        } else if character.is_whitespace() {
+            if !in_whitespace {
+                normalized.push(' ');
+            }
+            in_digits = false;
+            in_whitespace = true;
+        } else {
+            normalized.push(character);
+            in_digits = false;
+            in_whitespace = false;
+        }
+    }
+    let bounded = normalized
+        .char_indices()
+        .rev()
+        .nth(4096)
+        .map_or(normalized.as_str(), |(index, _)| &normalized[index..]);
+    let digest = format!("{:x}", Sha256::digest(bounded.as_bytes()));
+    Some(format!(
+        "validation-failure-v1:exit-{exit_code}:{}",
+        &digest[..24]
+    ))
 }
 
 fn record_running_exit_locked(
@@ -810,6 +1045,9 @@ fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttempt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::plan_tool::ValidationRouteLeaf;
+    use codex_protocol::plan_tool::ValidationRouteOrdering;
+
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
     }
@@ -833,10 +1071,154 @@ mod tests {
             },
             authorization_revision: 1,
             observation: None,
+            command_proof_key: None,
             proof_key: None,
             structured_route: None,
             validation_call_id: None,
         }
+    }
+
+    fn validation_route() -> ValidationRoute {
+        ValidationRoute {
+            leaves: vec![ValidationRouteLeaf {
+                argv: vec!["cargo".to_string(), "test".to_string()],
+                covered_paths: vec!["core/src/tools/command_execution.rs".to_string()],
+                covered_contracts: vec!["validation evidence reuse".to_string()],
+                timeout_ms: 30_000,
+                semantic_timeout: false,
+            }],
+            ordering: ValidationRouteOrdering::StopOnFailure,
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_efficiency_promotes_exact_predeclared_proof_without_rerun() {
+        let ledger = CommandExecutionLedger::default();
+        let mut launch = validation_launch();
+        let command_key = crate::validation_admission::validation_identity(
+            b"C:/repo",
+            "C:/repo",
+            &launch.invocation,
+            "env",
+            "stable",
+            7,
+        );
+        launch.command_proof_key = Some(command_key.clone());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            tempdir.path(),
+            "thread",
+            b"running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored\n",
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_inline_validation(&launch, artifact, Instant::now(), 0)
+                .await
+        );
+
+        let route = validation_route();
+        let scoped_key = crate::validation_admission::validation_identity_with_scope(
+            b"C:/repo",
+            "C:/repo",
+            &launch.invocation,
+            "env",
+            "stable",
+            "features=[];semantic_timeout=nonsemantic",
+            "implementation-v1",
+            &route.leaves[0].covered_paths,
+            &route.leaves[0].covered_contracts,
+        );
+        let promoted = ledger
+            .promote_reusable_command_validation(
+                &command_key,
+                scoped_key.clone(),
+                route,
+                "validation-call".to_string(),
+            )
+            .await
+            .expect("fresh exact command should be promoted");
+        assert_eq!(promoted.status, ValidationTerminalStatus::Succeeded);
+        assert_eq!(promoted.freshness, ValidationFreshness::Reused);
+        assert_eq!(promoted.selected_test_count, Some(1));
+        assert_eq!(promoted.failure_signature, None);
+        assert!(ledger.reusable_validation(&scoped_key).await.is_some());
+        assert!(
+            ledger
+                .validation_result_for_call("validation-call")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_contract_validation_reports_selected_tests_and_failure_signature() {
+        let output = b"test result: ok. 2 passed; 0 failed; 1 ignored\n\
+test result: ok. 0 passed; 0 failed; 0 ignored\n";
+        assert_eq!(executed_rust_test_count(output), Some(2));
+        assert_eq!(executed_rust_test_count(b"Finished test profile\n"), None);
+
+        let ledger = CommandExecutionLedger::default();
+        let mut launch = validation_launch();
+        let command_key = crate::validation_admission::validation_identity(
+            b"C:/repo",
+            "C:/repo",
+            &launch.invocation,
+            "env",
+            "stable",
+            7,
+        );
+        launch.command_proof_key = Some(command_key.clone());
+        launch.proof_key = Some(command_key.clone());
+        launch.structured_route = Some(validation_route());
+        launch.validation_call_id = Some("zero-test-call".to_string());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            tempdir.path(),
+            "thread",
+            b"running 0 tests\ntest result: ok. 0 passed; 0 failed; 3 ignored\n",
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_inline_validation(&launch, artifact, Instant::now(), 0)
+                .await
+        );
+
+        let result = ledger
+            .validation_result_for_call("zero-test-call")
+            .await
+            .expect("typed zero-test result");
+        assert_eq!(result.status, ValidationTerminalStatus::Failed);
+        assert_eq!(result.selected_test_count, Some(0));
+        assert_eq!(
+            result.failure_signature.as_deref(),
+            Some("validation-failure-v1:zero-tests-selected")
+        );
+        assert!(ledger.reusable_validation(&command_key).await.is_none());
+        assert!(
+            ledger
+                .promote_reusable_command_validation(
+                    &command_key,
+                    command_key.clone(),
+                    validation_route(),
+                    "later-call".to_string(),
+                )
+                .await
+                .is_none()
+        );
+
+        let first = normalized_validation_failure_signature(
+            101,
+            false,
+            b"error at C:\\repo\\src\\owner.rs:42 after 1.2s",
+        );
+        let repeated = normalized_validation_failure_signature(
+            101,
+            false,
+            b"ERROR at C:/repo/src/owner.rs:99 after 8.7s",
+        );
+        assert_eq!(first, repeated);
     }
 
     #[tokio::test]

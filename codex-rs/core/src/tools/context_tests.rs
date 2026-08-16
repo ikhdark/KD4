@@ -4,6 +4,8 @@ use codex_protocol::models::SearchToolCallParams;
 use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 
 #[test]
 fn custom_tool_calls_should_roundtrip_as_custom_outputs() {
@@ -814,6 +816,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
             path: artifact_path.clone(),
             bytes: raw_output.len() as u64,
             truncated: false,
+            hasher: Sha256::new_with_prefix(raw_output.as_bytes()),
             handle: std::sync::Arc::new(tempfile::tempfile().expect("artifact handle")),
         }),
         repair_notice: Some("Command preflight applied one repair".to_string()),
@@ -836,6 +839,11 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     });
     assert_eq!(code_mode["raw_output_artifact_id"], artifact_id.to_string());
     assert_eq!(code_mode["raw_output_artifact_bytes"], raw_output.len());
+    assert_eq!(
+        code_mode["raw_output_artifact_sha256"],
+        format!("{:x}", Sha256::digest(raw_output.as_bytes()))
+    );
+    assert_eq!(code_mode["raw_output_artifact_complete"], true);
     assert!(
         code_mode["output"]
             .as_str()
@@ -875,6 +883,7 @@ fn artifact_backed_exec_output(
                 path: artifact_path.clone(),
                 bytes: raw_output.len() as u64,
                 truncated: false,
+                hasher: Sha256::new_with_prefix(raw_output),
                 handle: std::sync::Arc::new(
                     std::fs::OpenOptions::new()
                         .read(true)
