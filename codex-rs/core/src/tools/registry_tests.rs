@@ -12,6 +12,26 @@ fn nested_code_mode_projection_is_not_provider_visible() {
 }
 
 #[test]
+fn direct_recovery_is_exempt_from_recursive_generic_projection() {
+    assert!(generic_projection_is_exempt(
+        &ToolName::plain("read_tool_output"),
+        false,
+    ));
+    assert!(generic_projection_is_exempt(
+        &ToolName::plain("read_tool_output"),
+        true,
+    ));
+    assert!(generic_projection_is_exempt(
+        &ToolName::new(Some("functions".to_string()), "exec"),
+        false,
+    ));
+    assert!(!generic_projection_is_exempt(
+        &ToolName::new(Some("functions".to_string()), "exec"),
+        true,
+    ));
+}
+
+#[test]
 fn typed_preflight_enforces_code_mode_registered_schema() {
     let spec = ToolSpec::Function(codex_tools::ResponsesApiTool {
         name: "typed_helper".to_string(),
@@ -1066,6 +1086,132 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
     );
 }
 
+#[tokio::test]
+async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier() {
+    let codex_home = tempfile::tempdir().expect("isolated temporary Codex home");
+    let thread_id = "fresh-recovery-corpus";
+    let text = (0..128)
+        .map(|index| format!("fresh-{index:03}-{}\n", "abcdefghij".repeat(5)))
+        .collect::<String>();
+    let canonical = CanonicalToolResult::text(text.clone());
+    let artifact = create_canonical_output_artifact(codex_home.path(), thread_id, &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("fresh corpus artifact ID");
+    let selector_manifest = vec![
+        ToolOutputSelector::Lines {
+            start: 65,
+            end: 128,
+        },
+        ToolOutputSelector::Lines { start: 1, end: 64 },
+        ToolOutputSelector::Lines { start: 63, end: 66 },
+        ToolOutputSelector::Lines { start: 1, end: 64 },
+    ];
+
+    let (recovered, reused) = crate::tools::handlers::execute_recovery_transaction(
+        codex_home.path(),
+        thread_id,
+        &artifact_id,
+        selector_manifest,
+        true,
+    )
+    .await
+    .expect("fresh corpus handler transaction");
+    assert!(!reused);
+    assert!(recovered.complete);
+    assert_eq!(recovered.results.len(), 1);
+    assert_eq!(recovered.results[0].status, ToolOutputSelectorStatus::Ok);
+    assert_eq!(recovered.results[0].text.as_deref(), Some(text.as_str()));
+    assert!(recovered.results[0].subdivision_plan.is_some());
+
+    let outer_text = "fresh corpus functions.exec carrier".to_string();
+    let outer_canonical = CanonicalToolResult::text(outer_text.clone());
+    let mut outer_projection = project_model_output(ModelProjectionInput {
+        spillable_text: outer_text.clone(),
+        outcome: ToolOutputOutcome::Success,
+        essential_inline: serde_json::json!({}),
+        origin_call_id: "fresh-functions-exec".to_string(),
+        selection_facts: ProjectionSelectionFacts {
+            mode: "inline_continuation_carrier",
+            available_fragments: 0,
+            selected_fragments: 0,
+            exact_duplicates_removed: 0,
+            selected_ids: Vec::new(),
+            omitted_inline_ids: Vec::new(),
+            partial_ids: Vec::new(),
+        },
+        applied_token_limit: 1_000,
+        projected_text: outer_text.clone(),
+        preserved_content: Vec::new(),
+        codex_home: codex_home.path().to_path_buf(),
+        thread_id: thread_id.to_string(),
+        tool_name: "exec".to_string(),
+        canonical: outer_canonical.clone(),
+        original_output_sha256: outer_canonical.sha256.clone(),
+        original_output_tokens: outer_canonical.approximate_tokens,
+        semantic_class: "tool_output".to_string(),
+        projection_eligible: true,
+        projection_truncated: false,
+        predetermined_ranges: Vec::new(),
+        predetermined_json_pointers: Vec::new(),
+        original_response: ResponseInputItem::CustomToolCallOutput {
+            call_id: "fresh-functions-exec".to_string(),
+            name: Some("exec".to_string()),
+            output: FunctionCallOutputPayload::from_text(outer_text),
+        },
+        materialization: ProjectionMaterialization::InlineCarrier,
+    })
+    .await
+    .expect("fresh functions.exec projection");
+    let receipt = TurnTimingDeterministicContinuationReceipt {
+        class: DeterministicContinuationClass::ArtifactRange,
+        wire_identity: String::new(),
+        resource_identity_hash: crate::tool_history::sha256(artifact_id.as_bytes()),
+        state_revision: recovered.canonical_sha256.clone(),
+        host_action: DeterministicContinuationHostAction::DrainArtifactRanges,
+        action_bounds_hash: crate::tool_history::sha256(b"fresh-selector-manifest-v1"),
+        suppressed_continuation_count: 1,
+    };
+    let accepted =
+        outer_projection.merge_owner_drained_continuations(vec![PendingOwnerDrainedContinuation {
+            preserved_content: vec![
+                serde_json::to_value(&recovered).expect("serialize exact recovery"),
+            ],
+            receipt: receipt.clone(),
+        }]);
+    assert_eq!(accepted, vec![receipt]);
+    assert!(!outer_projection.artifact_created);
+    let rendered = outer_projection.bounded.value().to_string();
+    assert!(rendered.contains(&text));
+
+    let log_count = std::fs::read_dir(codex_home.path().join("tool-output").join(thread_id))
+        .expect("fresh corpus artifact directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "log")
+        })
+        .count();
+    let report = serde_json::json!({
+        "schema": "fresh_tool_output_recovery_corpus_v1",
+        "producer_artifacts": 1,
+        "selector_manifest_entries": 4,
+        "normalized_results": recovered.results.len(),
+        "logical_recovery_transactions": 1,
+        "silent_truncations": 0,
+        "false_success_results": 0,
+        "recursive_spills": log_count.saturating_sub(1),
+        "secondary_model_boundaries": 0,
+        "expected_secondary_model_boundaries": 0,
+        "maximum_secondary_model_boundaries": 2,
+    });
+    println!("FRESH_CORPUS_REPORT={report}");
+    assert_eq!(report["silent_truncations"], 0);
+    assert_eq!(report["false_success_results"], 0);
+    assert_eq!(report["recursive_spills"], 0);
+    assert_eq!(report["secondary_model_boundaries"], 0);
+}
+
 #[test]
 fn predetermined_source_ranges_are_intersected_with_omitted_sections_before_bounds() {
     let mut ranges = (0..6)
@@ -1140,7 +1286,7 @@ fn metadata_free_new_tool_result_has_no_owner_drained_continuation() {
 }
 
 #[tokio::test]
-async fn missing_stale_and_oversized_predetermined_artifacts_fail_open() {
+async fn missing_stale_and_oversized_artifacts_never_report_partial_owner_success() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
     let range = ToolOutputProjectionRange {
         id: "source-chunk".to_string(),
@@ -1690,6 +1836,13 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
         model_projection: None,
     };
 
+    assert_eq!(
+        result
+            .result
+            .canonical_result(&result.payload)
+            .and_then(|canonical| canonical.value),
+        Some(serde_json::json!({ "typed": true }))
+    );
     assert_eq!(
         result.code_mode_result(),
         serde_json::json!({ "typed": true })

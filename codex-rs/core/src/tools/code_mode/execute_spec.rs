@@ -9,6 +9,7 @@ pub(crate) fn create_code_mode_tool(
     deferred_tools: &[CodeModeToolDefinition],
     namespace_descriptions: &BTreeMap<String, codex_code_mode::ToolNamespaceDescription>,
     code_mode_only: bool,
+    direct_only_tool_names: &[String],
 ) -> ToolSpec {
     const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
 start: pragma_source | plain_source
@@ -22,11 +23,12 @@ SOURCE: /[\s\S]+/
 
     ToolSpec::Freeform(FreeformTool {
         name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-        description: codex_code_mode::build_exec_tool_description(
+        description: codex_code_mode::build_exec_tool_description_with_direct_only_tools(
             enabled_tools,
             deferred_tools,
             namespace_descriptions,
             code_mode_only,
+            direct_only_tool_names,
         ),
         format: FreeformToolFormat {
             r#type: "grammar".to_string(),
@@ -60,14 +62,16 @@ mod tests {
                 &[],
                 &BTreeMap::new(),
                 /*code_mode_only*/ true,
+                &["read_source_batch".to_string()],
             ),
             ToolSpec::Freeform(FreeformTool {
                 name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-                description: codex_code_mode::build_exec_tool_description(
+                description: codex_code_mode::build_exec_tool_description_with_direct_only_tools(
                     &enabled_tools,
                     &[],
                     &BTreeMap::new(),
                     /*code_mode_only*/ true,
+                    &["read_source_batch".to_string()],
                 ),
                 format: FreeformToolFormat {
                     r#type: "grammar".to_string(),

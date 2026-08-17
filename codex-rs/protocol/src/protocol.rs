@@ -1915,6 +1915,9 @@ pub struct AgentMessageContentDeltaEvent {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub memory_citation: Option<crate::memory_citation::MemoryCitation>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -1923,6 +1926,9 @@ pub struct PlanDeltaEvent {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub memory_citation: Option<crate::memory_citation::MemoryCitation>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -2360,6 +2366,7 @@ pub enum DeterministicContinuationClass {
     UnchangedWait,
     #[serde(alias = "source_bundle", alias = "source_coverage")]
     ArtifactRange,
+    SourceProjection,
     AgentEventWait,
 }
 
@@ -2375,6 +2382,7 @@ pub enum DeterministicContinuationHostAction {
         alias = "read_missing_ranges"
     )]
     DrainArtifactRanges,
+    ReuseSourceCoverage,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
@@ -2458,6 +2466,7 @@ fn derive_continuation_wire_identity(
         match class {
             DeterministicContinuationClass::UnchangedWait => "unchanged_wait",
             DeterministicContinuationClass::ArtifactRange => "artifact_range",
+            DeterministicContinuationClass::SourceProjection => "source_projection",
             DeterministicContinuationClass::AgentEventWait => "agent_event_wait",
         }
     }
@@ -2465,6 +2474,7 @@ fn derive_continuation_wire_identity(
         match action {
             DeterministicContinuationHostAction::AwaitStateChange => "await_state_change",
             DeterministicContinuationHostAction::DrainArtifactRanges => "drain_artifact_ranges",
+            DeterministicContinuationHostAction::ReuseSourceCoverage => "reuse_source_coverage",
         }
     }
     format!(
@@ -2836,6 +2846,49 @@ pub struct TurnTimingCounters {
     /// independent of `generations_by_disposition`.
     #[serde(default)]
     pub suppressed_deterministic_continuation_count: u32,
+    /// Residual deterministic generation requests proved by the reasoning
+    /// governor, including requests elided before provider dispatch.
+    #[serde(default)]
+    pub residual_deterministic_generation_count: u32,
+    /// Continuations drained and recorded by their code-mode owner.
+    #[serde(default)]
+    pub owner_drained_continuation_count: u32,
+    /// Exact source projections acknowledged without replaying source text.
+    #[serde(default)]
+    pub source_exact_projection_reuse_count: u32,
+    /// Physical source reads whose automatically or explicitly supplied
+    /// conditional identity proved unchanged.
+    #[serde(default)]
+    pub source_conditional_unchanged_count: u32,
+    /// Coherent overlapping source intervals removed from model-visible text.
+    #[serde(default)]
+    pub source_overlap_range_elimination_count: u64,
+    /// Requested source ranges that did not require an independent physical
+    /// read because exact or same-operation coverage was reused.
+    #[serde(default)]
+    pub source_physical_range_avoided_count: u64,
+    /// Source-specific deterministic continuations drained by the owner.
+    #[serde(default)]
+    pub source_host_drained_continuation_count: u32,
+    /// New source evidence fragments actually exposed to a started model
+    /// generation.
+    #[serde(default)]
+    pub source_model_visible_new_evidence_count: u64,
+    /// Validation results served from the authoritative validation ledger.
+    #[serde(default)]
+    pub reused_validation_count: u32,
+    /// Validation tool outputs intentionally suppressed by admission policy.
+    #[serde(default)]
+    pub suppressed_validation_output_count: u32,
+    /// Ready startup prewarms observed by the first model request.
+    #[serde(default)]
+    pub ready_startup_prewarm_count: u32,
+    /// Completion-review coordinators that observed the ready phase.
+    #[serde(default)]
+    pub completion_review_ready_phase_count: u32,
+    /// Completion-review coordinators that observed the terminal phase.
+    #[serde(default)]
+    pub completion_review_terminal_phase_count: u32,
     /// Bounded to the stable purpose enum's cardinality.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub purpose_aggregates: Vec<TurnTimingGenerationPurposeAggregate>,
@@ -5636,6 +5689,13 @@ mod tests {
             "architectureLateRelationshipDiscoveryCount",
             "waitOnlyGenerationCount",
             "internallyDrainedWaitCount",
+            "residualDeterministicGenerationCount",
+            "ownerDrainedContinuationCount",
+            "reusedValidationCount",
+            "suppressedValidationOutputCount",
+            "readyStartupPrewarmCount",
+            "completionReviewReadyPhaseCount",
+            "completionReviewTerminalPhaseCount",
             "noProgressDirectiveCount",
             "provenLoopActivationCount",
             "toolOutputTruncationCount",
@@ -5686,6 +5746,13 @@ mod tests {
         );
         assert_eq!(decoded.counters.wait_only_generation_count, 0);
         assert_eq!(decoded.counters.internally_drained_wait_count, 0);
+        assert_eq!(decoded.counters.residual_deterministic_generation_count, 0);
+        assert_eq!(decoded.counters.owner_drained_continuation_count, 0);
+        assert_eq!(decoded.counters.reused_validation_count, 0);
+        assert_eq!(decoded.counters.suppressed_validation_output_count, 0);
+        assert_eq!(decoded.counters.ready_startup_prewarm_count, 0);
+        assert_eq!(decoded.counters.completion_review_ready_phase_count, 0);
+        assert_eq!(decoded.counters.completion_review_terminal_phase_count, 0);
         assert_eq!(decoded.counters.no_progress_directive_count, 0);
         assert_eq!(decoded.counters.proven_loop_activation_count, 0);
         assert_eq!(decoded.counters.architecture_slice_attempt_count, 0);
@@ -7910,6 +7977,27 @@ mod tests {
             serde_json::from_value::<TurnTimingDeterministicContinuationReceipt>(tampered_fields)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn source_projection_receipt_has_a_distinct_compatible_wire_contract() {
+        let receipt = TurnTimingDeterministicContinuationReceipt::new(
+            DeterministicContinuationClass::SourceProjection,
+            "source-resource".to_string(),
+            "source-revision".to_string(),
+            DeterministicContinuationHostAction::ReuseSourceCoverage,
+            "requested-ranges".to_string(),
+            2,
+        );
+        let serialized = serde_json::to_value(&receipt).expect("source receipt serialization");
+
+        assert_eq!(serialized["class"], serde_json::json!("source_projection"));
+        assert_eq!(
+            serialized["hostAction"],
+            serde_json::json!("reuse_source_coverage")
+        );
+        assert_eq!(serialized["suppressedContinuationCount"], 2);
+        assert!(receipt.runtime_identity().is_some());
     }
 
     #[test]

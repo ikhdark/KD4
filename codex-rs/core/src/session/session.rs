@@ -50,6 +50,8 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     /// Correlated pre-turn startup phases, frozen at the first model send.
     pub(crate) startup_timing: Arc<StartupTimingState>,
+    /// One-shot startup-prepared router handoff to the first pending-turn plan.
+    pub(crate) startup_prepared_router: crate::session_startup_prewarm::StartupPreparedRouterCache,
     /// Owns terminal coordinators so request cancellation cannot strand a claimed turn.
     pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
     /// Process-local acknowledgement registry for at-least-once terminal delivery. The durable
@@ -77,6 +79,7 @@ pub(crate) struct TerminalDeliveryRegistryEntry {
     pub(crate) fingerprint: String,
     pub(crate) acknowledged: bool,
     pub(crate) redelivery_scheduled: bool,
+    pub(crate) recovery_notified: bool,
 }
 
 #[derive(Clone)]
@@ -1245,6 +1248,7 @@ impl Session {
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
                 git_workspace,
+                source_reads: Default::default(),
             };
             let sess = Arc::new(Session {
                 thread_id,
@@ -1260,6 +1264,7 @@ impl Session {
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),
+                startup_prepared_router: Default::default(),
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
                 terminal_delivery_registry: Mutex::new(TerminalDeliveryRegistry::default()),
                 terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),

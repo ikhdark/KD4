@@ -10,6 +10,7 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
+use crate::config::Config;
 use crate::guardian::routes_approval_to_guardian;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
@@ -21,11 +22,13 @@ use crate::session::turn::build_prompt;
 use crate::session::turn::built_tools;
 use crate::startup_timing::StartupPhase;
 use crate::startup_timing::StartupTimingState;
+use crate::tools::router::ToolRouter;
 use codex_otel::STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC;
 use codex_otel::STARTUP_PREWARM_DURATION_METRIC;
 use codex_otel::SessionTelemetry;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
 
 /// Gives an already-running startup prewarm a brief chance to hand its prepared
@@ -40,6 +43,51 @@ pub(crate) struct SessionStartupPrewarmHandle {
 
 pub(crate) struct SessionStartupTransportHandle {
     task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
+}
+
+pub(crate) struct PreparedStartupRouter {
+    pub(crate) planning_generation: u64,
+    pub(crate) config: Arc<Config>,
+    pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
+    pub(crate) router: Arc<ToolRouter>,
+}
+
+enum StartupPreparedRouterState {
+    Open(Option<PreparedStartupRouter>),
+    Closed,
+}
+
+/// One-shot handoff from speculative startup preparation to the first real turn.
+///
+/// The first plan attempt closes the handoff even when startup lost the race, so
+/// a late speculative result can never leak into a later turn.
+pub(crate) struct StartupPreparedRouterCache {
+    state: tokio::sync::Mutex<StartupPreparedRouterState>,
+}
+
+impl Default for StartupPreparedRouterCache {
+    fn default() -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(StartupPreparedRouterState::Open(None)),
+        }
+    }
+}
+
+impl StartupPreparedRouterCache {
+    pub(crate) async fn publish(&self, prepared: PreparedStartupRouter) {
+        let mut state = self.state.lock().await;
+        if let StartupPreparedRouterState::Open(slot) = &mut *state {
+            *slot = Some(prepared);
+        }
+    }
+
+    pub(crate) async fn take_for_first_turn(&self) -> Option<PreparedStartupRouter> {
+        let mut state = self.state.lock().await;
+        match std::mem::replace(&mut *state, StartupPreparedRouterState::Closed) {
+            StartupPreparedRouterState::Open(prepared) => prepared,
+            StartupPreparedRouterState::Closed => None,
+        }
+    }
 }
 
 enum SessionStartupTransportResolution {
@@ -373,6 +421,7 @@ async fn schedule_startup_prewarm_inner(
         }));
     }
     let startup_cancellation_token = CancellationToken::new();
+    let planning_generation = session.services.planning_generation();
     let built_tools_started_at = Instant::now();
     // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
     let step_context = session
@@ -390,6 +439,17 @@ async fn schedule_startup_prewarm_inner(
         built_tools_started_at.elapsed(),
         /*status*/ None,
     );
+    if session.services.planning_generation() == planning_generation {
+        session
+            .startup_prepared_router
+            .publish(PreparedStartupRouter {
+                planning_generation,
+                config: Arc::clone(&startup_turn_context.config),
+                dynamic_tools: startup_turn_context.dynamic_tools.clone(),
+                router: Arc::clone(&startup_router),
+            })
+            .await;
+    }
     let build_prompt_started_at = Instant::now();
     let startup_prompt = build_prompt(
         Vec::new(),

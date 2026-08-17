@@ -727,9 +727,7 @@ impl Session {
             validation_authorization: Arc::new(tokio::sync::RwLock::new(
                 crate::validation_admission::ValidationAuthorization::default(),
             )),
-            validation_singleflight: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            validation_singleflight: crate::validation_admission::process_validation_singleflight(),
             turn_metadata_state,
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),

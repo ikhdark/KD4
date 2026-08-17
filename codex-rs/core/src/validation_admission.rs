@@ -110,7 +110,8 @@ impl ValidationAuthorization {
         let mut latest_grant = None;
         let mut latest_deny = None;
         for rule in self.rules.iter().filter(|rule| {
-            rule.operation == operation
+            rule.policy_version == VALIDATION_POLICY_VERSION
+                && rule.operation == operation
                 && rule
                     .ecosystem
                     .is_none_or(|candidate| candidate == ecosystem)
@@ -604,6 +605,18 @@ impl ValidationLeaderOwnership {
 
 pub(crate) type SharedValidationSingleflight =
     Arc<tokio::sync::Mutex<HashMap<InFlightValidationKey, Arc<ValidationFlight>>>>;
+
+/// Process-wide validation admission, partitioned by the complete proof key.
+///
+/// Keeping the registry process-scoped lets concurrent sessions in the same
+/// workspace share an in-flight Cargo validation. Repository, source,
+/// toolchain, environment, configuration, and contract changes remain isolated
+/// by [`InFlightValidationKey`]. Completed results are still never cached.
+pub(crate) fn process_validation_singleflight() -> SharedValidationSingleflight {
+    static REGISTRY: std::sync::OnceLock<SharedValidationSingleflight> =
+        std::sync::OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new()))))
+}
 
 #[derive(Debug)]
 pub(crate) enum ValidationRegistration {
@@ -1361,6 +1374,32 @@ mod tests {
     }
 
     #[test]
+    fn validation_authorization_ignores_foreign_policy_versions() {
+        let mut authorization = ValidationAuthorization::default();
+        assert!(authorization.update_from_user_input("Run focused tests."));
+        assert_eq!(
+            authorization.decision_for(
+                ValidationOperation::Test,
+                ValidationEcosystem::Rust,
+                ValidationBreadth::Selector,
+                Some("selected_test"),
+            ),
+            ValidationAuthorizationMatch::Authorized
+        );
+        authorization.rules[0].policy_version = VALIDATION_POLICY_VERSION + 1;
+
+        assert_eq!(
+            authorization.decision_for(
+                ValidationOperation::Test,
+                ValidationEcosystem::Rust,
+                ValidationBreadth::Selector,
+                Some("selected_test"),
+            ),
+            ValidationAuthorizationMatch::Unspecified
+        );
+    }
+
+    #[test]
     fn quoted_and_interrogative_text_do_not_authorize() {
         let mut authorization = ValidationAuthorization::default();
         assert!(!authorization.update_from_user_input(
@@ -1606,6 +1645,54 @@ mod tests {
             }
         };
         later.abandon().await;
+    }
+
+    #[tokio::test]
+    async fn process_singleflight_registry_is_shared_across_turns() {
+        let first_turn = process_validation_singleflight();
+        let second_turn = process_validation_singleflight();
+        assert!(Arc::ptr_eq(&first_turn, &second_turn));
+
+        let task_cancellation = CancellationToken::new();
+        let invocation = CommandInvocation::Script(
+            "cargo test -p codex-core process_singleflight_registry_is_shared_across_turns"
+                .into(),
+        );
+        let key = validation_identity(
+            b"process-registry-test-repo",
+            "codex-rs",
+            &invocation,
+            "rust-env",
+            "stable",
+            7,
+        );
+        let execution = match register_if_absent(
+            &first_turn,
+            key.clone(),
+            "first-turn-call",
+            &task_cancellation,
+        )
+        .await
+        {
+            ValidationRegistration::Leader { execution, .. } => execution,
+            ValidationRegistration::Follower(_) => panic!("first turn must lead"),
+        };
+        match register_if_absent(
+            &second_turn,
+            key,
+            "second-turn-call",
+            &task_cancellation,
+        )
+        .await
+        {
+            ValidationRegistration::Follower(follower) => {
+                assert_eq!(follower.shared_from_call_id(), "first-turn-call");
+            }
+            ValidationRegistration::Leader { .. } => {
+                panic!("second turn must join the process-scoped flight")
+            }
+        }
+        execution.abandon().await;
     }
 
     #[tokio::test]

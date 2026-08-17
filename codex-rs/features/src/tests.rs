@@ -148,6 +148,7 @@ not_a_real_field = 1
 #[test]
 fn code_mode_only_requires_code_mode() {
     let mut features = Features::with_defaults();
+    features.disable(Feature::CodeMode);
     features.enable(Feature::CodeModeOnly);
     features.normalize_dependencies();
 
@@ -174,21 +175,20 @@ fn guardian_approval_is_stable_and_enabled_by_default() {
 }
 
 #[test]
-fn request_permissions_is_under_development() {
-    assert_eq!(
-        Feature::ExecPermissionApprovals.stage(),
-        Stage::UnderDevelopment
-    );
-    assert_eq!(Feature::ExecPermissionApprovals.default_enabled(), false);
-}
-
-#[test]
-fn request_permissions_tool_is_under_development() {
-    assert_eq!(
-        Feature::RequestPermissionsTool.stage(),
-        Stage::UnderDevelopment
-    );
-    assert_eq!(Feature::RequestPermissionsTool.default_enabled(), false);
+fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
+    for feature in [
+        Feature::DeferredExecutor,
+        Feature::CodeMode,
+        Feature::LocalThreadStoreCompression,
+        Feature::ApplyPatchStreamingEvents,
+        Feature::ExecPermissionApprovals,
+        Feature::RequestPermissionsTool,
+        Feature::MultiAgentV2,
+        Feature::TaskCompletionReviewer,
+    ] {
+        assert_eq!(feature.stage(), Stage::Stable, "{feature:?}");
+        assert_eq!(feature.default_enabled(), true, "{feature:?}");
+    }
 }
 
 #[test]
@@ -819,15 +819,12 @@ fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config(
 #[test]
 fn unstable_warning_event_only_mentions_enabled_under_development_features() {
     let mut configured_features = Table::new();
-    configured_features.insert(
-        "apply_patch_streaming_events".to_string(),
-        TomlValue::Boolean(true),
-    );
+    configured_features.insert("enable_fanout".to_string(), TomlValue::Boolean(true));
     configured_features.insert("personality".to_string(), TomlValue::Boolean(true));
     configured_features.insert("unknown".to_string(), TomlValue::Boolean(true));
 
     let mut features = Features::with_defaults();
-    features.enable(Feature::ApplyPatchStreamingEvents);
+    features.enable(Feature::SpawnCsv);
 
     let warning = unstable_features_warning_event(
         Some(&configured_features),
@@ -840,7 +837,7 @@ fn unstable_warning_event_only_mentions_enabled_under_development_features() {
     let EventMsg::Warning(WarningEvent { message }) = warning.msg else {
         panic!("expected warning event");
     };
-    assert!(message.contains("apply_patch_streaming_events"));
+    assert!(message.contains("enable_fanout"));
     assert!(!message.contains("personality"));
     assert!(message.contains("/tmp/config.toml"));
 }
@@ -849,15 +846,15 @@ fn unstable_warning_event_only_mentions_enabled_under_development_features() {
 fn unstable_warning_event_mentions_enabled_structured_under_development_feature() {
     let configured_features: Table = toml::from_str(
         r#"
-multi_agent_v2 = { enabled = true, tool_namespace = "agents" }
-code_mode = true
+current_time_reminder = { enabled = true }
+enable_fanout = true
 "#,
     )
     .expect("features table should deserialize");
 
     let mut features = Features::with_defaults();
-    features.enable(Feature::MultiAgentV2);
-    features.enable(Feature::CodeMode);
+    features.enable(Feature::CurrentTimeReminder);
+    features.enable(Feature::SpawnCsv);
 
     let warning = unstable_features_warning_event(
         Some(&configured_features),
@@ -871,17 +868,14 @@ code_mode = true
         panic!("expected warning event");
     };
     assert_eq!(
-        "Under-development features enabled: code_mode, multi_agent_v2. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/config.toml.".to_string(),
+        "Under-development features enabled: current_time_reminder, enable_fanout. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/config.toml.".to_string(),
         message
     );
 }
 
 #[test]
 fn unstable_warning_event_resolves_legacy_aliases_to_canonical_keys() {
-    for (alias, feature) in [
-        ("request_permissions", Feature::ExecPermissionApprovals),
-        ("telepathy", Feature::Chronicle),
-    ] {
+    for (alias, feature) in [("telepathy", Feature::Chronicle)] {
         let mut configured_features = Table::new();
         configured_features.insert(alias.to_string(), TomlValue::Boolean(true));
 

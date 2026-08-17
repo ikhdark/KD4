@@ -590,6 +590,14 @@ pub(super) async fn ensure_listener_task_running(
                                 .track_current_turn_event(&event.id, &event.msg);
                         }
                     }
+                    if matches!(
+                        &event.msg,
+                        EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+                    ) {
+                        thread_state_manager
+                            .release_in_flight_task(conversation_id, &event.id)
+                            .await;
+                    }
                     let raw_events_enabled = thread_state.lock().await.experimental_raw_events;
                     if matches!(&event.msg, EventMsg::RawResponseItem(_)) && !raw_events_enabled {
                         continue;

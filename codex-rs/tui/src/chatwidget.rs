@@ -2009,12 +2009,6 @@ fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
         || summary.responses_api_engine_service_tbt_ms > 0
 }
 
-impl Drop for ChatWidget {
-    fn drop(&mut self) {
-        self.stop_rate_limit_poller();
-    }
-}
-
 const PLACEHOLDERS: [&str; 8] = [
     "Explain this codebase",
     "Summarize recent commits",

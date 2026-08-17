@@ -139,6 +139,24 @@ async fn service_tier_commands_lowercase_catalog_names() {
 }
 
 #[tokio::test]
+async fn legacy_fast_metadata_exposes_fast_command() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let mut preset = get_available_model(&chat, "gpt-5.4");
+    preset.service_tiers.clear();
+    preset.additional_speed_tiers = vec![ServiceTier::Fast.request_value().to_string()];
+    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![preset]));
+
+    assert_eq!(
+        chat.current_model_service_tier_commands(),
+        vec![ServiceTierCommand {
+            id: ServiceTier::Fast.request_value().to_string(),
+            name: "fast".to_string(),
+            description: "Fastest inference with increased plan usage".to_string(),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

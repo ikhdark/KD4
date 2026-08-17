@@ -11,6 +11,7 @@ use codex_analytics::TurnProfile;
 use codex_otel::TURN_TTFM_DURATION_METRIC;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
@@ -43,7 +44,7 @@ use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 14;
+const TIMING_SCHEMA_VERSION: u16 = 15;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,6 +369,35 @@ impl TurnTimingSnapshot {
             suppressed_deterministic_continuation_count: profile
                 .counters
                 .suppressed_deterministic_continuation_count,
+            residual_deterministic_generation_count: profile
+                .counters
+                .residual_deterministic_generation_count,
+            owner_drained_continuation_count: profile.counters.owner_drained_continuation_count,
+            source_exact_projection_reuse_count: profile
+                .counters
+                .source_exact_projection_reuse_count,
+            source_conditional_unchanged_count: profile.counters.source_conditional_unchanged_count,
+            source_overlap_range_elimination_count: profile
+                .counters
+                .source_overlap_range_elimination_count,
+            source_physical_range_avoided_count: profile
+                .counters
+                .source_physical_range_avoided_count,
+            source_host_drained_continuation_count: profile
+                .counters
+                .source_host_drained_continuation_count,
+            source_model_visible_new_evidence_count: profile
+                .counters
+                .source_model_visible_new_evidence_count,
+            reused_validation_count: profile.counters.reused_validation_count,
+            suppressed_validation_output_count: profile.counters.suppressed_validation_output_count,
+            ready_startup_prewarm_count: profile.counters.ready_startup_prewarm_count,
+            completion_review_ready_phase_count: profile
+                .counters
+                .completion_review_ready_phase_count,
+            completion_review_terminal_phase_count: profile
+                .counters
+                .completion_review_terminal_phase_count,
             purpose_aggregates,
             same_purpose_continuation_count: profile.counters.same_purpose_continuation_count,
             exact_repeated_wait_count,
@@ -623,6 +653,19 @@ pub(crate) struct TimingCounters {
     pub(crate) generations_by_purpose: TurnTimingGenerationPurposeCounts,
     pub(crate) generations_by_disposition: TurnTimingGenerationDispositionCounts,
     pub(crate) suppressed_deterministic_continuation_count: u32,
+    pub(crate) residual_deterministic_generation_count: u32,
+    pub(crate) owner_drained_continuation_count: u32,
+    pub(crate) source_exact_projection_reuse_count: u32,
+    pub(crate) source_conditional_unchanged_count: u32,
+    pub(crate) source_overlap_range_elimination_count: u64,
+    pub(crate) source_physical_range_avoided_count: u64,
+    pub(crate) source_host_drained_continuation_count: u32,
+    pub(crate) source_model_visible_new_evidence_count: u64,
+    pub(crate) reused_validation_count: u32,
+    pub(crate) suppressed_validation_output_count: u32,
+    pub(crate) ready_startup_prewarm_count: u32,
+    pub(crate) completion_review_ready_phase_count: u32,
+    pub(crate) completion_review_terminal_phase_count: u32,
     pub(crate) same_purpose_continuation_count: u32,
     pub(crate) exact_repeated_wait_count: u32,
     pub(crate) planning_generation_count: u32,
@@ -1027,6 +1070,37 @@ impl TurnTimingState {
             .saturating_add(bytes_read);
     }
 
+    pub(crate) fn record_source_projection_result(
+        &self,
+        exact_reuse_count: u32,
+        conditional_unchanged_count: u32,
+        overlap_removed_count: u64,
+        physical_range_avoided_count: u64,
+    ) {
+        let mut state = self.state();
+        let counters = &mut state.counters;
+        counters.source_exact_projection_reuse_count = counters
+            .source_exact_projection_reuse_count
+            .saturating_add(exact_reuse_count);
+        counters.source_conditional_unchanged_count = counters
+            .source_conditional_unchanged_count
+            .saturating_add(conditional_unchanged_count);
+        counters.source_overlap_range_elimination_count = counters
+            .source_overlap_range_elimination_count
+            .saturating_add(overlap_removed_count);
+        counters.source_physical_range_avoided_count = counters
+            .source_physical_range_avoided_count
+            .saturating_add(physical_range_avoided_count);
+    }
+
+    pub(crate) fn record_source_model_visible_new_evidence(&self, evidence_count: u64) {
+        let mut state = self.state();
+        state.counters.source_model_visible_new_evidence_count = state
+            .counters
+            .source_model_visible_new_evidence_count
+            .saturating_add(evidence_count);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_architecture_slice_result(
         &self,
@@ -1108,6 +1182,58 @@ impl TurnTimingState {
             .saturating_add(count);
     }
 
+    pub(crate) fn record_residual_deterministic_generation(&self) {
+        let mut state = self.state();
+        state.counters.residual_deterministic_generation_count = state
+            .counters
+            .residual_deterministic_generation_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_owner_drained_continuation(&self) {
+        let mut state = self.state();
+        state.counters.owner_drained_continuation_count = state
+            .counters
+            .owner_drained_continuation_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_reused_validation(&self) {
+        let mut state = self.state();
+        state.counters.reused_validation_count =
+            state.counters.reused_validation_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_suppressed_validation_output(&self) {
+        let mut state = self.state();
+        state.counters.suppressed_validation_output_count = state
+            .counters
+            .suppressed_validation_output_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_ready_startup_prewarm(&self) {
+        let mut state = self.state();
+        state.counters.ready_startup_prewarm_count =
+            state.counters.ready_startup_prewarm_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_completion_review_ready_phase(&self) {
+        let mut state = self.state();
+        state.counters.completion_review_ready_phase_count = state
+            .counters
+            .completion_review_ready_phase_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_completion_review_terminal_phase(&self) {
+        let mut state = self.state();
+        state.counters.completion_review_terminal_phase_count = state
+            .counters
+            .completion_review_terminal_phase_count
+            .saturating_add(1);
+    }
+
     pub(crate) fn record_generation_outcome(
         &self,
         progress_kinds: Vec<TurnTimingProgressKind>,
@@ -1184,6 +1310,12 @@ impl TurnTimingState {
                 .counters
                 .suppressed_deterministic_continuation_count
                 .saturating_add(receipt.suppressed_continuation_count);
+            if receipt.class == DeterministicContinuationClass::SourceProjection {
+                state.counters.source_host_drained_continuation_count = state
+                    .counters
+                    .source_host_drained_continuation_count
+                    .saturating_add(receipt.suppressed_continuation_count);
+            }
             let Some(identity) = receipt.runtime_identity() else {
                 continue;
             };
@@ -1821,7 +1953,18 @@ impl TurnTimingStateInner {
         self.add_local_unions(elapsed_ns);
         self.add_client_critical_phase_unions(elapsed_ns);
         if self.dispatch_ready_snapshot.is_none()
-            && (self.activity.history_snapshot > 0
+            // The named client-critical phases are the wire/request detail,
+            // while local phases own the rest of pending-turn preparation.
+            // Attribute their union here so nested work is counted once and
+            // pre-dispatch orchestration does not fall into "unattributed".
+            && (self.activity.preparation > 0
+                || self.activity.planning > 0
+                || self.activity.compaction > 0
+                || self.activity.persistence > 0
+                || self.activity.router_build > 0
+                || self.activity.startup_prewarm_wait > 0
+                || self.activity.executor_readiness_wait > 0
+                || self.activity.history_snapshot > 0
                 || self.activity.normalization > 0
                 || self.activity.prompt_construction > 0
                 || self.activity.request_transformation > 0

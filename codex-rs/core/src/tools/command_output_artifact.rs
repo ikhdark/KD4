@@ -55,6 +55,9 @@ const MAX_RETENTION_INDEX_RECORDS: usize = 8_192;
 const RETENTION_RECONCILIATION_INTERVAL: u64 = 128;
 const RETENTION_BYTE_GUARD_BAND: u64 = MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
 pub(crate) const RECOVERY_AGGREGATE_TOKEN_CEILING: usize = 10_000;
+const RECOVERY_FRAGMENT_TOKEN_CEILING: usize = 1_000;
+const MAX_AUTOMATIC_SUBDIVISIONS: u64 = 64;
+const MAX_AUTOMATIC_SUBDIVISION_BYTES: u64 = 64 * 1_024;
 pub(crate) const ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS: usize = 20;
 pub(crate) const ARTIFACT_SEARCH_MAX_RESULTS: usize = 100;
 pub(crate) const ARTIFACT_SEARCH_MAX_CONTEXT_LINES: usize = 20;
@@ -3016,6 +3019,75 @@ fn read_logical_range(
     Ok(output)
 }
 
+fn load_validated_logical_snapshot(
+    path: &Path,
+    metadata: &LogicalArtifactMetadata,
+) -> Result<Vec<u8>, ReadToolOutputError> {
+    if !metadata.complete
+        || metadata.retained_bytes != metadata.canonical_bytes
+        || !metadata.unavailable_ranges.is_empty()
+    {
+        return Err(ReadToolOutputError::Io(
+            "artifact snapshot is incomplete; exact recovery identity cannot be verified"
+                .to_string(),
+        ));
+    }
+    for segment in &metadata.segments {
+        let segment_path = logical_segment_path(path, segment.index);
+        let (_, actual_bytes) = open_regular_artifact(&segment_path)?;
+        if actual_bytes != segment.range.len() {
+            return Err(ReadToolOutputError::Io(
+                "artifact segment size does not match metadata".to_string(),
+            ));
+        }
+    }
+    let snapshot = read_logical_range(
+        path,
+        metadata,
+        CanonicalByteRange::new(0, metadata.retained_bytes),
+    )?;
+    if format!("{:x}", Sha256::digest(&snapshot)) != metadata.canonical_sha256 {
+        return Err(ReadToolOutputError::Io(
+            "artifact SHA identity does not match metadata".to_string(),
+        ));
+    }
+    if canonical_line_starts(&snapshot) != metadata.line_starts {
+        return Err(ReadToolOutputError::Io(
+            "artifact line index does not match its validated snapshot".to_string(),
+        ));
+    }
+    let ranges_are_valid = metadata
+        .json_pointers
+        .values()
+        .all(|entry| entry.range.end <= metadata.retained_bytes)
+        && metadata.sections.iter().all(|section| {
+            section
+                .canonical_range
+                .is_none_or(|range| range.end <= metadata.retained_bytes)
+        });
+    if !ranges_are_valid {
+        return Err(ReadToolOutputError::Io(
+            "artifact selector index is outside the validated snapshot".to_string(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn validated_snapshot_range<'a>(
+    snapshot: &'a [u8],
+    range: CanonicalByteRange,
+) -> Result<&'a [u8], ReadToolOutputError> {
+    let start = usize::try_from(range.start)
+        .map_err(|_| ReadToolOutputError::InvalidRange("byte range is too large".to_string()))?;
+    let end = usize::try_from(range.end)
+        .map_err(|_| ReadToolOutputError::InvalidRange("byte range is too large".to_string()))?;
+    snapshot.get(start..end).ok_or_else(|| {
+        ReadToolOutputError::InvalidRange(
+            "byte range is outside the validated artifact snapshot".to_string(),
+        )
+    })
+}
+
 type SelectorRangeAndChildren = (
     Option<CanonicalByteRange>,
     Vec<ToolOutputSelector>,
@@ -3097,6 +3169,96 @@ fn selector_range_and_children(
     }
 }
 
+fn normalized_selector_order_key(
+    selector: &ToolOutputSelector,
+    metadata: &LogicalArtifactMetadata,
+) -> (u64, u64, u8, String) {
+    let serialized = serde_json::to_string(selector).unwrap_or_default();
+    if let ToolOutputSelector::Search { start_byte, .. } = selector {
+        return (*start_byte, *start_byte, 4, serialized);
+    }
+    match selector_range_and_children(selector, metadata) {
+        Ok((Some(range), _, _)) => {
+            let kind = match selector {
+                ToolOutputSelector::Bytes { .. } => 0,
+                ToolOutputSelector::Lines { .. } => 1,
+                ToolOutputSelector::Section { .. } => 2,
+                ToolOutputSelector::JsonPointer { .. } => 3,
+                ToolOutputSelector::Search { .. } => unreachable!(),
+            };
+            (range.start, range.end, kind, serialized)
+        }
+        Ok((None, _, _)) => (u64::MAX - 1, u64::MAX - 1, 2, serialized),
+        Err(_) => (u64::MAX, u64::MAX, u8::MAX, serialized),
+    }
+}
+
+fn normalize_tool_output_selectors(
+    selectors: Vec<ToolOutputSelector>,
+    metadata: &LogicalArtifactMetadata,
+) -> Vec<ToolOutputSelector> {
+    let mut byte_ranges = Vec::<(u64, u64)>::new();
+    let mut line_ranges = Vec::<(usize, usize)>::new();
+    let mut others = Vec::<ToolOutputSelector>::new();
+    for selector in selectors {
+        match selector {
+            ToolOutputSelector::Bytes { start, end }
+                if start <= end && end <= metadata.retained_bytes =>
+            {
+                byte_ranges.push((start, end));
+            }
+            ToolOutputSelector::Lines { start, end }
+                if selector_range_and_children(
+                    &ToolOutputSelector::Lines { start, end },
+                    metadata,
+                )
+                .is_ok() =>
+            {
+                line_ranges.push((start, end));
+            }
+            selector if !others.contains(&selector) => others.push(selector),
+            _ => {}
+        }
+    }
+
+    byte_ranges.sort_unstable();
+    let mut merged_bytes = Vec::<(u64, u64)>::new();
+    for (start, end) in byte_ranges {
+        match merged_bytes.last_mut() {
+            Some((_, previous_end)) if start <= *previous_end => {
+                *previous_end = (*previous_end).max(end);
+            }
+            _ => merged_bytes.push((start, end)),
+        }
+    }
+    line_ranges.sort_unstable();
+    let mut merged_lines = Vec::<(usize, usize)>::new();
+    for (start, end) in line_ranges {
+        match merged_lines.last_mut() {
+            Some((_, previous_end)) if start <= previous_end.saturating_add(1) => {
+                *previous_end = (*previous_end).max(end);
+            }
+            _ => merged_lines.push((start, end)),
+        }
+    }
+
+    let mut normalized = merged_bytes
+        .into_iter()
+        .map(|(start, end)| ToolOutputSelector::Bytes { start, end })
+        .chain(
+            merged_lines
+                .into_iter()
+                .map(|(start, end)| ToolOutputSelector::Lines { start, end }),
+        )
+        .chain(others)
+        .collect::<Vec<_>>();
+    normalized.sort_by(|left, right| {
+        normalized_selector_order_key(left, metadata)
+            .cmp(&normalized_selector_order_key(right, metadata))
+    });
+    normalized
+}
+
 fn invalid_selector_result(
     selector: ToolOutputSelector,
     message: impl Into<String>,
@@ -3107,8 +3269,8 @@ fn invalid_selector_result(
 }
 
 fn search_logical_artifact(
-    path: &Path,
     metadata: &LogicalArtifactMetadata,
+    snapshot: &[u8],
     selector: ToolOutputSelector,
     token_ceiling: usize,
 ) -> ToolOutputSelectorResult {
@@ -3148,21 +3310,9 @@ fn search_logical_artifact(
             ),
         );
     }
-    // Search and exact hydration share one physical artifact read. Retaining
-    // the prefix is necessary when a continued search match asks for context
-    // lines that begin before `start_byte`.
-    let bytes = match read_logical_range(
-        path,
-        metadata,
-        CanonicalByteRange::new(0, metadata.retained_bytes),
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) => return invalid_selector_result(selector, err.for_model()),
-    };
-
     let query_bytes = query.as_bytes();
     let search_offset = usize::try_from(start_byte).unwrap_or(usize::MAX);
-    let search_bytes = bytes.get(search_offset..).unwrap_or_default();
+    let search_bytes = snapshot.get(search_offset..).unwrap_or_default();
     let mut cursor = 0_usize;
     let mut total_matches = 0_usize;
     let mut indexed_matches = Vec::with_capacity(max_results);
@@ -3236,7 +3386,7 @@ fn search_logical_artifact(
                 let range = range?;
                 let start = usize::try_from(range.start).ok()?;
                 let end = usize::try_from(range.end).ok()?;
-                let exact = bytes.get(start..end)?;
+                let exact = snapshot.get(start..end)?;
                 let mut hydrated = serde_json::json!({
                     "selector": child,
                     "canonical_range": range,
@@ -3252,11 +3402,11 @@ fn search_logical_artifact(
             .collect::<Vec<_>>();
         let mut result =
             ToolOutputSelectorResult::state(selector.clone(), ToolOutputSelectorStatus::Ok);
-        result.complete = metadata.complete && continuation.is_none();
+        result.complete = continuation.is_none();
         result.value = Some(serde_json::json!({
             "query": query,
             "start_byte": start_byte,
-            "coverage_complete": metadata.complete,
+            "coverage_complete": true,
             "total_matches": total_matches,
             "matches_returned": matches_returned,
             "remaining_match_count": remaining_match_count,
@@ -3265,20 +3415,12 @@ fn search_logical_artifact(
         }));
         result.child_selectors = child_selectors;
         result.continuation = continuation;
-        result.message = match (!metadata.complete, remaining_match_count > 0) {
-            (true, true) => Some(
-                "more retained matches are available; the canonical artifact also has unavailable ranges"
-                    .to_string(),
-            ),
-            (true, false) => Some(
-                "search covered all retained bytes, but the canonical artifact has unavailable ranges"
-                    .to_string(),
-            ),
-            (false, true) => Some(
+        result.message = match remaining_match_count > 0 {
+            true => Some(
                 "more matches are available; exact context for this page is already hydrated and continuation advances to the next page"
                     .to_string(),
             ),
-            (false, false) => None,
+            false => None,
         };
         result
     };
@@ -3341,7 +3483,10 @@ fn too_large_result(
         }),
         child_selectors: children,
         continuation: None,
-        message: None,
+        message: Some(
+            "exact selector exceeds the bounded response; retry only with continuation or child_selectors, never the parent selector"
+                .to_string(),
+        ),
     };
     result.continuation = result.child_selectors.first().cloned();
     while !response_fits_recovery_token_ceiling(
@@ -3362,15 +3507,44 @@ fn too_large_result(
     result
 }
 
-fn select_logical_artifact(
-    path: &Path,
-    metadata: &LogicalArtifactMetadata,
+fn successful_exact_selector_result(
     selector: ToolOutputSelector,
-    token_ceiling: usize,
+    range: CanonicalByteRange,
+    children: Vec<ToolOutputSelector>,
+    bytes: &[u8],
 ) -> ToolOutputSelectorResult {
-    if matches!(&selector, ToolOutputSelector::Search { .. }) {
-        return search_logical_artifact(path, metadata, selector, token_ceiling);
+    if matches!(selector, ToolOutputSelector::Bytes { .. }) {
+        return successful_byte_selector_result(range, bytes);
     }
+    let mut result =
+        ToolOutputSelectorResult::state(selector.clone(), ToolOutputSelectorStatus::Ok);
+    result.complete = true;
+    result.exact_bytes = Some(range.len());
+    result.canonical_range = Some(range);
+    result.child_selectors = children;
+    match &selector {
+        ToolOutputSelector::JsonPointer { .. } => {
+            result.value = serde_json::from_slice(bytes).ok();
+            if result.value.is_none() {
+                result.data_base64 = Some(BASE64_STANDARD.encode(bytes));
+            }
+        }
+        ToolOutputSelector::Lines { .. } | ToolOutputSelector::Section { .. } => {
+            match std::str::from_utf8(bytes) {
+                Ok(text) => result.text = Some(text.to_string()),
+                Err(_) => result.data_base64 = Some(BASE64_STANDARD.encode(bytes)),
+            }
+        }
+        ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Search { .. } => unreachable!(),
+    }
+    result
+}
+
+fn exact_selector_result(
+    metadata: &LogicalArtifactMetadata,
+    snapshot: &[u8],
+    selector: ToolOutputSelector,
+) -> ToolOutputSelectorResult {
     let (range, children, directory_value) = match selector_range_and_children(&selector, metadata)
     {
         Ok(result) => result,
@@ -3390,7 +3564,7 @@ fn select_logical_artifact(
         result.child_selectors = children;
         return result;
     };
-    let bytes = match read_logical_range(path, metadata, range) {
+    let bytes = match validated_snapshot_range(snapshot, range) {
         Ok(bytes) => bytes,
         Err(err) => {
             let mut result =
@@ -3401,43 +3575,82 @@ fn select_logical_artifact(
             return result;
         }
     };
-    let mut result = if matches!(selector, ToolOutputSelector::Bytes { .. }) {
-        successful_byte_selector_result(range, &bytes)
-    } else {
-        let mut result =
-            ToolOutputSelectorResult::state(selector.clone(), ToolOutputSelectorStatus::Ok);
-        result.complete = true;
-        result.exact_bytes = Some(range.len());
-        result.canonical_range = Some(range);
-        result.child_selectors = children.clone();
-        match &selector {
-            ToolOutputSelector::JsonPointer { .. } => {
-                result.value = serde_json::from_slice(&bytes).ok();
-                if result.value.is_none() {
-                    result.data_base64 = Some(BASE64_STANDARD.encode(&bytes));
-                }
-            }
-            ToolOutputSelector::Lines { .. } | ToolOutputSelector::Section { .. } => {
-                match String::from_utf8(bytes.clone()) {
-                    Ok(text) => result.text = Some(text),
-                    Err(_) => result.data_base64 = Some(BASE64_STANDARD.encode(&bytes)),
-                }
-            }
-            ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Search { .. } => unreachable!(),
+    successful_exact_selector_result(selector, range, children, bytes)
+}
+
+fn internally_drain_exact_subdivisions(
+    metadata: &LogicalArtifactMetadata,
+    snapshot: &[u8],
+    original: &ToolOutputSelectorResult,
+) -> Option<ToolOutputSelectorResult> {
+    let plan = original.subdivision_plan.clone()?;
+    if plan.selector_kind != "bytes"
+        || plan.chunk_bytes == 0
+        || plan.chunk_count == 0
+        || plan.chunk_count > MAX_AUTOMATIC_SUBDIVISIONS
+        || plan.range.len() > MAX_AUTOMATIC_SUBDIVISION_BYTES
+        || plan.range.len().div_ceil(plan.chunk_bytes) != plan.chunk_count
+    {
+        return None;
+    }
+    let (range, children, _) = selector_range_and_children(&original.selector, metadata).ok()?;
+    if range != Some(plan.range) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(plan.range.len()).ok()?);
+    let mut chunk_count = 0_u64;
+    let mut start = plan.range.start;
+    while start < plan.range.end {
+        let end = start.saturating_add(plan.chunk_bytes).min(plan.range.end);
+        if end <= start {
+            return None;
         }
-        result
-    };
+        bytes.extend_from_slice(
+            validated_snapshot_range(snapshot, CanonicalByteRange::new(start, end)).ok()?,
+        );
+        start = end;
+        chunk_count = chunk_count.saturating_add(1);
+    }
+    if chunk_count != plan.chunk_count || u64::try_from(bytes.len()).ok()? != plan.range.len() {
+        return None;
+    }
+    let mut completed =
+        successful_exact_selector_result(original.selector.clone(), plan.range, children, &bytes);
+    completed.subdivision_plan = Some(plan.clone());
+    completed.message = Some(format!(
+        "internally drained all {} deterministic byte subdivisions",
+        plan.chunk_count
+    ));
+    Some(completed)
+}
+
+fn select_logical_artifact(
+    metadata: &LogicalArtifactMetadata,
+    snapshot: &[u8],
+    selector: ToolOutputSelector,
+    fragment_token_ceiling: usize,
+    final_token_ceiling: usize,
+) -> ToolOutputSelectorResult {
+    if matches!(&selector, ToolOutputSelector::Search { .. }) {
+        return search_logical_artifact(metadata, snapshot, selector, final_token_ceiling);
+    }
+    let mut result = exact_selector_result(metadata, snapshot, selector.clone());
+    let range = result.canonical_range;
+    let children = result.child_selectors.clone();
     let individual = ReadToolOutputResult {
         artifact_id: metadata.artifact_id.clone(),
         canonical_sha256: metadata.canonical_sha256.clone(),
         canonical_bytes: metadata.canonical_bytes,
         retained_bytes: metadata.retained_bytes,
-        complete: metadata.complete,
-        unavailable_ranges: metadata.unavailable_ranges.clone(),
+        complete: result.status == ToolOutputSelectorStatus::Ok && result.complete,
+        unavailable_ranges: Vec::new(),
         results: vec![result.clone()],
     };
-    if !response_fits_recovery_token_ceiling(&individual, token_ceiling) {
-        result = too_large_result(selector, range, children, metadata, token_ceiling);
+    if result.status == ToolOutputSelectorStatus::Ok
+        && !response_fits_recovery_token_ceiling(&individual, fragment_token_ceiling)
+        && let Some(range) = range
+    {
+        result = too_large_result(selector, range, children, metadata, fragment_token_ceiling);
     }
     result
 }
@@ -3502,35 +3715,59 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     if id.to_string() != artifact_id {
         return Err(ReadToolOutputError::InvalidArtifactId);
     }
-    let cache_key = deterministic_recovery_cache_key(
+    let request_cache_key = deterministic_recovery_cache_key(
         codex_home,
         thread_id,
         artifact_id,
         &selectors,
         token_ceiling,
     );
-    if let Some(result) = deterministic_recovery_cache_get(&cache_key) {
+    if let Some(result) = deterministic_recovery_cache_get(&request_cache_key) {
         return Ok((result, true));
     }
     let path = codex_home
         .join("tool-output")
         .join(thread_id)
         .join(format!("{id}.log"));
-    let result = tokio::task::spawn_blocking(move || {
+    let (result, normalized_selectors) = tokio::task::spawn_blocking(move || {
         open_regular_artifact(&path)?;
         let metadata = load_logical_metadata(&path, id)?;
+        let snapshot = load_validated_logical_snapshot(&path, &metadata)?;
+        let selectors = normalize_tool_output_selectors(selectors, &metadata);
         let mut response = ReadToolOutputResult {
             artifact_id: id.to_string(),
             canonical_sha256: metadata.canonical_sha256.clone(),
             canonical_bytes: metadata.canonical_bytes,
             retained_bytes: metadata.retained_bytes,
-            complete: metadata.complete,
-            unavailable_ranges: metadata.unavailable_ranges.clone(),
+            complete: false,
+            unavailable_ranges: Vec::new(),
             results: Vec::with_capacity(selectors.len()),
         };
-        for selector in selectors {
-            let selected = select_logical_artifact(&path, &metadata, selector, token_ceiling);
+        for selector in &selectors {
+            let mut selected = select_logical_artifact(
+                &metadata,
+                &snapshot,
+                selector.clone(),
+                token_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
+                token_ceiling,
+            );
+            if selected.status == ToolOutputSelectorStatus::SelectorTooLarge
+                && let Some(completed) =
+                    internally_drain_exact_subdivisions(&metadata, &snapshot, &selected)
+            {
+                let mut candidate = response.clone();
+                candidate.results.push(completed.clone());
+                candidate.complete = candidate.results.iter().all(|result| {
+                    result.status == ToolOutputSelectorStatus::Ok && result.complete
+                });
+                if response_fits_recovery_token_ceiling(&candidate, token_ceiling) {
+                    selected = completed;
+                }
+            }
             response.results.push(selected);
+            response.complete = response.results.iter().all(|result| {
+                result.status == ToolOutputSelectorStatus::Ok && result.complete
+            });
             if response_fits_recovery_token_ceiling(&response, token_ceiling) {
                 continue;
             }
@@ -3538,23 +3775,64 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
                 unreachable!("the selected result was just appended");
             };
             if selected.status == ToolOutputSelectorStatus::Ok {
-                let selector = selected.selector.clone();
-                let mut omitted = ToolOutputSelectorResult::state(
-                    selector,
-                    ToolOutputSelectorStatus::AggregateOmitted,
-                );
+                let previous = selected.clone();
+                let mut omitted = previous
+                    .canonical_range
+                    .map(|range| {
+                        too_large_result(
+                            previous.selector.clone(),
+                            range,
+                            previous.child_selectors.clone(),
+                            &metadata,
+                            token_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        let mut omitted = ToolOutputSelectorResult::state(
+                            previous.selector.clone(),
+                            ToolOutputSelectorStatus::AggregateOmitted,
+                        );
+                        omitted.child_selectors = previous.child_selectors.clone();
+                        omitted
+                    });
+                omitted.status = ToolOutputSelectorStatus::AggregateOmitted;
+                omitted.exact_bytes = previous.exact_bytes;
+                omitted.canonical_range = previous.canonical_range;
+                omitted.continuation = previous
+                    .continuation
+                    .or_else(|| omitted.child_selectors.first().cloned())
+                    .or_else(|| Some(previous.selector.clone()));
                 omitted.message = Some(
-                    "exact value omitted from this aggregate; resume with continuation".to_string(),
+                    "exact value cannot fit this final transaction; retry only with the advertised continuation or deterministic child selectors"
+                        .to_string(),
                 );
                 *selected = omitted;
             }
+            response.complete = false;
+            if !response_fits_recovery_token_ceiling(&response, token_ceiling) {
+                return Err(ReadToolOutputError::InvalidRange(
+                    "normalized selector manifest cannot fit a bounded typed-overflow response; use fewer selectors"
+                        .to_string(),
+                ));
+            }
         }
-        Ok(response)
+        response.complete = response.results.iter().all(|result| {
+            result.status == ToolOutputSelectorStatus::Ok && result.complete
+        });
+        Ok((response, selectors))
     })
     .await
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
     if deterministic_recovery_result_is_reusable(&result) {
-        deterministic_recovery_cache_insert(cache_key, result.clone());
+        let normalized_cache_key = deterministic_recovery_cache_key(
+            codex_home,
+            thread_id,
+            artifact_id,
+            &normalized_selectors,
+            token_ceiling,
+        );
+        deterministic_recovery_cache_insert(normalized_cache_key, result.clone());
+        deterministic_recovery_cache_insert(request_cache_key, result.clone());
     }
     Ok((result, false))
 }

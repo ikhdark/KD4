@@ -383,6 +383,14 @@ fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
         AgentSurfaceStage::SpawnOnly
     );
     assert_eq!(
+        agent_surface_stage_from_snapshot(false, true, false),
+        AgentSurfaceStage::Lifecycle
+    );
+    assert_eq!(
+        agent_surface_stage_from_snapshot(false, false, true),
+        AgentSurfaceStage::TypedAdministration
+    );
+    assert_eq!(
         agent_surface_stage_from_snapshot(true, true, false),
         AgentSurfaceStage::Lifecycle
     );
@@ -1733,6 +1741,7 @@ fn synthetic_tool_result(call_id: &str) -> ResponseInputItem {
         status: "completed".to_string(),
         execution: "client".to_string(),
         tools: Vec::new(),
+        omitted_result_count: None,
     }
 }
 
@@ -2002,5 +2011,24 @@ fn projected_prompt_pressure_does_not_add_stable_tools_to_server_usage_twice() {
             /*pending_token_estimate*/ 450,
         ),
         1_200
+    );
+}
+
+#[test]
+fn plan_mode_memory_citations_are_parsed_once_for_live_events() {
+    let mut state = PlanModeStreamState::new("turn-1");
+    let raw = "<citation_entries>\nMEMORY.md:1-2|note=[x]\n</citation_entries>\n<rollout_ids>\n019cc2ea-1dff-7902-8d40-c8f6e5d83cc4\n</rollout_ids>";
+
+    let citation =
+        take_new_memory_citation(&mut state, vec![raw.to_string()]).expect("valid memory citation");
+    assert_eq!(citation.entries.len(), 1);
+    assert_eq!(citation.entries[0].path, "MEMORY.md");
+    assert_eq!(
+        citation.rollout_ids,
+        vec!["019cc2ea-1dff-7902-8d40-c8f6e5d83cc4"]
+    );
+    assert_eq!(
+        take_new_memory_citation(&mut state, vec![raw.to_string()]),
+        None
     );
 }

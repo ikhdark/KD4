@@ -388,6 +388,31 @@ fn incremental_compaction_preserves_the_previous_summary_prefix() {
 }
 
 #[test]
+fn summary_can_be_reused_when_only_new_user_input_follows_it() {
+    let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!("{SUMMARY_PREFIX}\nsettled state"),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "next request".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    assert!(history_after_latest_summary_is_user_only(&items));
+}
+
+#[test]
 fn at_start_injection_preserves_cacheable_prefix_order() {
     let prefix = vec![user_message("stable prefix")];
     let compacted_history = vec![user_message("retained history"), user_message("summary")];

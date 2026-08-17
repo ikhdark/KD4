@@ -17,11 +17,11 @@ impl ContextualUserFragment for SourceClosureReuseContext {
 
     fn body(&self) -> String {
         concat!(
-            "The prior turn's source closure is still current: its planning material revision ",
-            "and every exact implementation-file hash match. Reuse the established owner, ",
+            "The preceding architecture slice established a complete, non-stale source closure ",
+            "for this continuation. Reuse the established owner, ",
             "dependency closure, implementation surfaces, and validation route instead of ",
-            "rediscovering them. Reopen discovery if the current user request conflicts with ",
-            "that closure or execution produces contrary evidence."
+            "rediscovering them. Reopen discovery if execution produces contrary evidence or ",
+            "the request changes."
         )
         .to_string()
     }
@@ -42,7 +42,7 @@ mod tests {
     fn renders_hash_guarded_reuse_directive() {
         let rendered = SourceClosureReuseContext.render();
         assert!(rendered.starts_with(SOURCE_CLOSURE_REUSE_OPEN_TAG));
-        assert!(rendered.contains("every exact implementation-file hash match"));
+        assert!(rendered.contains("complete, non-stale source closure"));
         assert!(rendered.ends_with(SOURCE_CLOSURE_REUSE_CLOSE_TAG));
     }
 }

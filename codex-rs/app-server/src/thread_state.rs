@@ -35,6 +35,19 @@ use tracing::error;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
 const MAX_TRACKED_TURN_ORIGINS: usize = 256;
+const MAX_TRACKED_IN_FLIGHT_TASKS: usize = 1_024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InFlightTaskReference {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) turn_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InFlightTaskClaim {
+    Claimed,
+    Existing(InFlightTaskReference),
+}
 
 #[derive(Default)]
 struct TurnOriginState {
@@ -593,6 +606,50 @@ mod tests {
         assert_eq!(tracker.take("turn-1"), None);
     }
 
+    #[tokio::test]
+    async fn in_flight_task_coalescing_claims_and_releases() {
+        let manager = ThreadStateManager::new();
+        let first_thread = ThreadId::new();
+        let second_thread = ThreadId::new();
+
+        assert_eq!(
+            manager
+                .claim_in_flight_task(
+                    "fingerprint".to_string(),
+                    first_thread,
+                    "turn-1".to_string(),
+                )
+                .await,
+            InFlightTaskClaim::Claimed
+        );
+        assert_eq!(
+            manager
+                .claim_in_flight_task(
+                    "fingerprint".to_string(),
+                    second_thread,
+                    "turn-2".to_string(),
+                )
+                .await,
+            InFlightTaskClaim::Existing(InFlightTaskReference {
+                thread_id: first_thread,
+                turn_id: "turn-1".to_string(),
+            })
+        );
+
+        manager.release_in_flight_task(first_thread, "turn-1").await;
+        assert!(manager.state.lock().await.in_flight_task_order.is_empty());
+        assert_eq!(
+            manager
+                .claim_in_flight_task(
+                    "fingerprint".to_string(),
+                    second_thread,
+                    "turn-2".to_string(),
+                )
+                .await,
+            InFlightTaskClaim::Claimed
+        );
+    }
+
     #[test]
     fn identical_terminal_replay_retries_only_pending_notification_targets() {
         let mut state = ThreadState::default();
@@ -769,6 +826,8 @@ struct ThreadStateManagerInner {
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
     out_of_band_elicitation_leases:
         HashMap<ThreadId, HashMap<OutOfBandElicitationLeaseKey, Weak<CodexThread>>>,
+    in_flight_tasks: HashMap<String, InFlightTaskReference>,
+    in_flight_task_order: VecDeque<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -858,6 +917,52 @@ fn release_all_out_of_band_elicitation_leases_for_connection(
 impl ThreadStateManager {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) async fn claim_in_flight_task(
+        &self,
+        fingerprint: String,
+        thread_id: ThreadId,
+        turn_id: String,
+    ) -> InFlightTaskClaim {
+        let mut state = self.state.lock().await;
+        if let Some(existing) = state.in_flight_tasks.get(&fingerprint) {
+            return InFlightTaskClaim::Existing(existing.clone());
+        }
+
+        state.in_flight_tasks.insert(
+            fingerprint.clone(),
+            InFlightTaskReference {
+                thread_id,
+                turn_id: turn_id.clone(),
+            },
+        );
+        state.in_flight_task_order.push_back((fingerprint, turn_id));
+        while state.in_flight_tasks.len() > MAX_TRACKED_IN_FLIGHT_TASKS {
+            let Some((expired_fingerprint, expired_turn_id)) =
+                state.in_flight_task_order.pop_front()
+            else {
+                break;
+            };
+            if state
+                .in_flight_tasks
+                .get(&expired_fingerprint)
+                .is_some_and(|entry| entry.turn_id == expired_turn_id)
+            {
+                state.in_flight_tasks.remove(&expired_fingerprint);
+            }
+        }
+        InFlightTaskClaim::Claimed
+    }
+
+    pub(crate) async fn release_in_flight_task(&self, thread_id: ThreadId, turn_id: &str) {
+        let mut state = self.state.lock().await;
+        state
+            .in_flight_tasks
+            .retain(|_, entry| entry.thread_id != thread_id || entry.turn_id.as_str() != turn_id);
+        state
+            .in_flight_task_order
+            .retain(|(_, queued_turn_id)| queued_turn_id.as_str() != turn_id);
     }
 
     pub(crate) async fn connection_initialized(

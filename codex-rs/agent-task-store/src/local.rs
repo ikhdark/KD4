@@ -2805,6 +2805,11 @@ impl LocalAgentTaskStore {
             });
         }
         if existing.is_none() {
+            let start_epoch =
+                assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?;
+            let start_epoch = i64::try_from(start_epoch).map_err(|_| {
+                StoreError::CorruptData("workspace epoch exceeds SQLite integer range".to_string())
+            })?;
             let absolute = absolute_repo_path(&repository.canonical_root, &normalized);
             let snapshot_name = snapshot_name(
                 assignment.assignment_id,
@@ -2824,7 +2829,7 @@ impl LocalAgentTaskStore {
                 snapshot_started,
                 None,
             );
-            sqlx::query("INSERT INTO mutation_files (attempt_id, assignment_id, path, pre_write_hash, pre_write_existed, attribution_confidence, snapshot_name, snapshot_retained, first_observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)")
+            sqlx::query("INSERT INTO mutation_files (attempt_id, assignment_id, path, pre_write_hash, pre_write_existed, attribution_confidence, snapshot_name, snapshot_retained, first_observed_at, start_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
                 .bind(attempt_id.to_string())
                 .bind(assignment.assignment_id.to_string())
                 .bind(&normalized)
@@ -2833,6 +2838,7 @@ impl LocalAgentTaskStore {
                 .bind(encode(&confidence)?)
                 .bind(snapshot_name)
                 .bind(encode(&Utc::now())?)
+                .bind(start_epoch)
                 .execute(&mut *transaction)
                 .await?;
         } else if confidence == AttributionConfidence::Definitive {
@@ -2965,11 +2971,16 @@ impl LocalAgentTaskStore {
             None,
         );
         let finalized_at = Utc::now();
-        let updated = sqlx::query("UPDATE mutation_files SET final_hash = ?, final_write_existed = ?, final_snapshot_name = ?, finalized_at = ? WHERE attempt_id = ? AND path = ? AND finalized_at IS NULL")
+        let end_epoch = assignment_epoch_tx(&mut transaction, assignment.assignment_id).await?;
+        let end_epoch = i64::try_from(end_epoch).map_err(|_| {
+            StoreError::CorruptData("workspace epoch exceeds SQLite integer range".to_string())
+        })?;
+        let updated = sqlx::query("UPDATE mutation_files SET final_hash = ?, final_write_existed = ?, final_snapshot_name = ?, finalized_at = ?, end_epoch = ? WHERE attempt_id = ? AND path = ? AND finalized_at IS NULL")
             .bind(&final_write.hash)
             .bind(i64::from(final_write.existed))
             .bind(final_snapshot_name)
             .bind(encode(&finalized_at)?)
+            .bind(end_epoch)
             .bind(attempt_id.to_string())
             .bind(&normalized)
             .execute(&mut *transaction)
@@ -6273,7 +6284,7 @@ async fn load_mutation_evidence_tx(
     attempt_id: AttemptId,
     path: &str,
 ) -> StoreResult<MutationEvidence> {
-    let row = sqlx::query("SELECT assignment_id, pre_write_hash, pre_write_existed, final_hash, final_write_existed, attribution_confidence, snapshot_retained, first_observed_at, finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?")
+    let row = sqlx::query("SELECT assignment_id, pre_write_hash, pre_write_existed, final_hash, final_write_existed, attribution_confidence, snapshot_retained, first_observed_at, finalized_at, start_epoch, end_epoch FROM mutation_files WHERE attempt_id = ? AND path = ?")
         .bind(attempt_id.to_string())
         .bind(path)
         .fetch_optional(&mut **transaction)
@@ -6301,6 +6312,15 @@ async fn load_mutation_evidence_tx(
             .map(|value| value != 0)
             .unwrap_or_else(|| final_hash.is_some())
     });
+    let start_epoch = u64::try_from(row.get::<i64, _>("start_epoch"))
+        .map_err(|_| StoreError::CorruptData("mutation start epoch is negative".to_string()))?;
+    let end_epoch = row
+        .get::<Option<i64>, _>("end_epoch")
+        .map(|epoch| {
+            u64::try_from(epoch)
+                .map_err(|_| StoreError::CorruptData("mutation end epoch is negative".to_string()))
+        })
+        .transpose()?;
     Ok(MutationEvidence {
         assignment_id: AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?,
         attempt_id,
@@ -6314,8 +6334,8 @@ async fn load_mutation_evidence_tx(
         snapshot_retained: row.get::<i64, _>("snapshot_retained") != 0,
         first_observed_at: decode(row.get::<String, _>("first_observed_at").as_str())?,
         finalized_at,
-        start_epoch: 0,
-        end_epoch: None,
+        start_epoch,
+        end_epoch,
     })
 }
 

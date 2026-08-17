@@ -10,6 +10,8 @@ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::SPEED_TIER_FAST;
 
+const FAST_MODE_DESCRIPTION: &str = "Fastest inference with increased plan usage";
+
 impl ChatWidget {
     pub(crate) fn set_service_tier(&mut self, service_tier: Option<String>) {
         self.config.service_tier = service_tier;
@@ -89,7 +91,8 @@ impl ChatWidget {
                     .into_iter()
                     .find(|preset| preset.model == model)
                     .map(|preset| {
-                        preset
+                        let supports_fast_mode = preset.supports_fast_mode();
+                        let mut commands = preset
                             .service_tiers
                             .into_iter()
                             .map(|tier| ServiceTierCommand {
@@ -97,7 +100,19 @@ impl ChatWidget {
                                 name: tier.name.to_lowercase(),
                                 description: tier.description,
                             })
-                            .collect()
+                            .collect::<Vec<_>>();
+                        if supports_fast_mode
+                            && !commands
+                                .iter()
+                                .any(|command| command.id == ServiceTier::Fast.request_value())
+                        {
+                            commands.push(ServiceTierCommand {
+                                id: ServiceTier::Fast.request_value().to_string(),
+                                name: SPEED_TIER_FAST.to_string(),
+                                description: FAST_MODE_DESCRIPTION.to_string(),
+                            });
+                        }
+                        commands
                     })
             })
             .unwrap_or_default()
@@ -133,10 +148,7 @@ impl ChatWidget {
                     .into_iter()
                     .find(|preset| preset.model == model)
                     .map(|preset| {
-                        preset
-                            .service_tiers
-                            .iter()
-                            .any(|tier| tier.id == service_tier)
+                        service_tier_resolution::model_supports_service_tier(&preset, service_tier)
                     })
             })
             .unwrap_or(false)
@@ -145,7 +157,7 @@ impl ChatWidget {
     fn current_model_fast_service_tier(&self) -> Option<ServiceTierCommand> {
         self.current_model_service_tier_commands()
             .into_iter()
-            .find(|tier| tier.name.eq_ignore_ascii_case(SPEED_TIER_FAST))
+            .find(|tier| tier.id == ServiceTier::Fast.request_value())
     }
 
     pub(super) fn refresh_effective_service_tier(&mut self) {

@@ -3,9 +3,6 @@ approval_policy = "never"
 sandbox_mode = "danger-full-access"
 allow_login_shell = false
 
-[features]
-task_completion_reviewer = true
-
 [agents]
 max_depth = 1
 
@@ -13,3 +10,12 @@ max_depth = 1
 [features.multi_agent_v2]
 enabled = true
 max_concurrent_threads_per_session = 2
+
+[reasoning_phase_efforts]
+orient = "high"
+inspect = "medium"
+implement = "high"
+diagnose = "high"
+verify = "low"
+finalize = "low"
+deterministic_continuation = "low"

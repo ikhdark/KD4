@@ -188,7 +188,14 @@ async fn run_compact_task_inner(
     let pre_compact_outcome = run_pre_compact_hooks(&sess, &turn_context, trigger).await;
     match pre_compact_outcome {
         PreCompactHookOutcome::Continue => {}
-        PreCompactHookOutcome::Stopped => {
+        PreCompactHookOutcome::Stopped { reason } => {
+            crate::hook_runtime::emit_hook_stop_reason(
+                &sess,
+                &turn_context,
+                "PreCompact",
+                reason.as_deref(),
+            )
+            .await;
             let error = CodexErr::TurnAborted;
             attempt
                 .track(
@@ -213,7 +220,14 @@ async fn run_compact_task_inner(
     let codex_error = result.as_ref().err();
     if result.is_ok() {
         let post_compact_outcome = run_post_compact_hooks(&sess, &turn_context, trigger).await;
-        if let PostCompactHookOutcome::Stopped = post_compact_outcome {
+        if let PostCompactHookOutcome::Stopped { reason } = post_compact_outcome {
+            crate::hook_runtime::emit_hook_stop_reason(
+                &sess,
+                &turn_context,
+                "PostCompact",
+                reason.as_deref(),
+            )
+            .await;
             attempt
                 .track(
                     sess.as_ref(),
@@ -248,7 +262,9 @@ async fn run_compact_task_inner_impl(
         .await;
     let mut history = sess.clone_history().await;
     let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
-    if previous_summary.is_some() {
+    let reuse_previous_summary = previous_summary.is_some()
+        && history_after_latest_summary_is_user_only(history.raw_items());
+    if previous_summary.is_some() && !reuse_previous_summary {
         input.push(UserInput::Text {
             text: INCREMENTAL_SUMMARIZATION_PROMPT.to_string(),
             text_elements: Vec::new(),
@@ -277,70 +293,80 @@ async fn run_compact_task_inner_impl(
 
     let turn_input = history
         .clone()
-        .for_prompt(&turn_context.model_info.input_modalities);
+        .for_compaction_prompt_with_completed_tool_projection(
+            &turn_context.model_info.input_modalities,
+        );
     let turn_input = strip_compaction_startup_envelopes(turn_input);
     let prompt = Prompt {
         input: turn_input.into(),
         base_instructions: base_instructions.clone(),
         ..Default::default()
     };
-    turn_context.turn_timing_state.begin_compaction_generation();
-    let mut retries = 0;
-    loop {
-        let attempt_result = drain_to_completed(
-            &sess,
-            turn_context.as_ref(),
-            &mut client_session,
-            &responses_metadata,
-            &prompt,
-        )
-        .await;
+    if !reuse_previous_summary {
+        turn_context.turn_timing_state.begin_compaction_generation();
+        let mut retries = 0;
+        loop {
+            let attempt_result = drain_to_completed(
+                &sess,
+                turn_context.as_ref(),
+                &mut client_session,
+                &responses_metadata,
+                &prompt,
+            )
+            .await;
 
-        match attempt_result {
-            Ok(()) => {
-                break;
-            }
-            Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
-                return Err(err);
-            }
-            Err(e @ CodexErr::ContextWindowExceeded) => {
-                sess.set_total_tokens_full(turn_context.as_ref()).await;
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
-                return Err(e);
-            }
-            Err(e) if !e.is_retryable() => {
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
-                return Err(e);
-            }
-            Err(e) => {
-                if let Err(e) = handle_retryable_response_stream_error(
-                    &mut retries,
-                    max_retries,
-                    e,
-                    &mut client_session,
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    ResponsesStreamRequest::LocalCompaction,
-                )
-                .await
-                {
+            match attempt_result {
+                Ok(()) => {
+                    break;
+                }
+                Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
+                    return Err(err);
+                }
+                Err(e @ CodexErr::ContextWindowExceeded) => {
+                    sess.set_total_tokens_full(turn_context.as_ref()).await;
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                     sess.send_event(&turn_context, event).await;
                     return Err(e);
                 }
-                turn_context.turn_timing_state.record_model_retry();
+                Err(e) if !e.is_retryable() => {
+                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&turn_context, event).await;
+                    return Err(e);
+                }
+                Err(e) => {
+                    if let Err(e) = handle_retryable_response_stream_error(
+                        &mut retries,
+                        max_retries,
+                        e,
+                        &mut client_session,
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        ResponsesStreamRequest::LocalCompaction,
+                    )
+                    .await
+                    {
+                        sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                        let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                        sess.send_event(&turn_context, event).await;
+                        return Err(e);
+                    }
+                    turn_context.turn_timing_state.record_model_retry();
+                }
             }
         }
     }
 
-    let history_snapshot = sess.clone_history().await;
+    let history_snapshot = if reuse_previous_summary {
+        history
+    } else {
+        sess.clone_history().await
+    };
     let history_items = history_snapshot.raw_items();
-    let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
+    let summary_suffix = reuse_previous_summary
+        .then_some(String::new())
+        .unwrap_or_else(|| get_last_assistant_message_from_turn(history_items).unwrap_or_default());
     let summary_text = bounded_task_state_summary(previous_summary.as_deref(), &summary_suffix);
     let compactable_history = strip_compaction_startup_envelopes(history_items.to_vec());
     let user_messages = collect_user_messages(&compactable_history);
@@ -608,6 +634,20 @@ fn latest_summary_message(items: &[ResponseItem]) -> Option<&str> {
         }
         _ => None,
     })
+}
+
+fn history_after_latest_summary_is_user_only(items: &[ResponseItem]) -> bool {
+    let Some(summary_index) = items.iter().rposition(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "user" => content.iter().any(
+            |content| matches!(content, ContentItem::InputText { text } if is_summary_message(text)),
+        ),
+        _ => false,
+    }) else {
+        return false;
+    };
+    items[summary_index + 1..]
+        .iter()
+        .all(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
 }
 
 pub(crate) fn insert_compaction_initial_context(

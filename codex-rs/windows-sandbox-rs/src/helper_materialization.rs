@@ -44,6 +44,13 @@ enum CopyOutcome {
     ReCopied,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelperMaterializationStatus {
+    Reused,
+    ReCopied,
+    SourceFallback,
+}
+
 static HELPER_PATH_CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
 pub(crate) fn helper_bin_dir(codex_home: &Path) -> PathBuf {
@@ -92,20 +99,43 @@ pub(crate) fn resolve_helper_for_launch(
 }
 
 pub fn resolve_current_exe_for_launch(codex_home: &Path, fallback_executable: &str) -> PathBuf {
+    resolve_current_exe_for_launch_with_status(codex_home, fallback_executable).0
+}
+
+pub fn resolve_current_exe_for_launch_with_status(
+    codex_home: &Path,
+    fallback_executable: &str,
+) -> (PathBuf, HelperMaterializationStatus) {
     let source = match std::env::current_exe() {
         Ok(path) => path,
-        Err(_) => return PathBuf::from(fallback_executable),
+        Err(_) => {
+            return (
+                PathBuf::from(fallback_executable),
+                HelperMaterializationStatus::SourceFallback,
+            );
+        }
     };
-    resolve_exe_for_launch(&source, codex_home)
+    resolve_exe_for_launch_with_status(&source, codex_home)
 }
 
 pub fn resolve_exe_for_launch(source: &Path, codex_home: &Path) -> PathBuf {
+    resolve_exe_for_launch_with_status(source, codex_home).0
+}
+
+pub fn resolve_exe_for_launch_with_status(
+    source: &Path,
+    codex_home: &Path,
+) -> (PathBuf, HelperMaterializationStatus) {
     let Some(file_name) = source.file_name() else {
-        return source.to_path_buf();
+        return (
+            source.to_path_buf(),
+            HelperMaterializationStatus::SourceFallback,
+        );
     };
     let destination = helper_bin_dir(codex_home).join(file_name);
     match copy_from_source_if_needed(source, &destination) {
-        Ok(_) => destination,
+        Ok(CopyOutcome::Reused) => (destination, HelperMaterializationStatus::Reused),
+        Ok(CopyOutcome::ReCopied) => (destination, HelperMaterializationStatus::ReCopied),
         Err(err) => {
             let sandbox_log_dir = crate::sandbox_dir(codex_home);
             log_note(
@@ -115,7 +145,10 @@ pub fn resolve_exe_for_launch(source: &Path, codex_home: &Path) -> PathBuf {
                 ),
                 Some(&sandbox_log_dir),
             );
-            source.to_path_buf()
+            (
+                source.to_path_buf(),
+                HelperMaterializationStatus::SourceFallback,
+            )
         }
     }
 }
@@ -364,6 +397,7 @@ mod tests {
     use super::CopyOutcome;
     use super::DEV_BUILD_VERSION_SENTINEL;
     use super::HelperExecutable;
+    use super::HelperMaterializationStatus;
     use super::RESOURCES_DIRNAME;
     use super::bundled_executable_path_for_exe;
     use super::copy_from_source_if_needed;
@@ -372,6 +406,7 @@ mod tests {
     use super::helper_bin_dir;
     use super::helper_version_suffix;
     use super::materialized_file_name;
+    use super::resolve_exe_for_launch_with_status;
     use pretty_assertions::assert_eq;
     use std::fs;
     use std::path::Path;
@@ -426,6 +461,21 @@ mod tests {
             b"runner-v1".as_slice(),
             fs::read(&destination).expect("read destination")
         );
+    }
+
+    #[test]
+    fn public_resolution_reports_reused_materialization() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        let codex_home = tmp.path().join("codex-home");
+        fs::write(&source, b"runner-v1").expect("write source");
+
+        let (first_path, first_status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+        let (second_path, second_status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+
+        assert_eq!(first_path, second_path);
+        assert_eq!(HelperMaterializationStatus::ReCopied, first_status);
+        assert_eq!(HelperMaterializationStatus::Reused, second_status);
     }
 
     #[test]

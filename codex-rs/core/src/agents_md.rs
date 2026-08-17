@@ -846,6 +846,11 @@ impl LoadedAgentsMd {
         }
     }
 
+    pub(crate) fn stable_context_metadata(&self, active_cwd: &PathUri) -> ([u8; 32], bool, bool) {
+        let bundle = self.stable_context_bundle(active_cwd);
+        (bundle.identity, bundle.reused, bundle.semantic_replacement)
+    }
+
     #[cfg(test)]
     fn stable_context_identity_for_rendered(
         &self,
@@ -975,7 +980,15 @@ impl LoadedAgentsMd {
         output
     }
 
+    #[cfg(test)]
     pub(crate) fn contextual_user_fragment(&self) -> ContextUserInstructions {
+        self.contextual_user_fragment_with_text(self.text())
+    }
+
+    pub(crate) fn contextual_user_fragment_with_text(
+        &self,
+        text: String,
+    ) -> ContextUserInstructions {
         // One contributing project environment retains the legacy cwd wrapper. With two or more,
         // the body labels every contributing environment itself, so the outer cwd is omitted.
         let directory = if self.has_multiple_project_environments() {
@@ -984,10 +997,7 @@ impl LoadedAgentsMd {
             self.single_project_cwd()
                 .map(PathUri::inferred_native_path_string)
         };
-        ContextUserInstructions {
-            directory,
-            text: self.text(),
-        }
+        ContextUserInstructions { directory, text }
     }
 
     /// Returns the AGENTS.md files that supplied instruction entries.

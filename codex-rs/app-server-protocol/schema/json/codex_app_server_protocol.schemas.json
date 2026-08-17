@@ -6577,6 +6577,16 @@
           "itemId": {
             "type": "string"
           },
+          "memoryCitation": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/MemoryCitation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "threadId": {
             "type": "string"
           },
@@ -9582,6 +9592,7 @@
         "enum": [
           "unchanged_wait",
           "artifact_range",
+          "source_projection",
           "agent_event_wait"
         ],
         "type": "string"
@@ -9589,7 +9600,8 @@
       "DeterministicContinuationHostAction": {
         "enum": [
           "await_state_change",
-          "drain_artifact_ranges"
+          "drain_artifact_ranges",
+          "reuse_source_coverage"
         ],
         "type": "string"
       },
@@ -14024,6 +14036,16 @@
           "itemId": {
             "type": "string"
           },
+          "memoryCitation": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/MemoryCitation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "threadId": {
             "type": "string"
           },
@@ -16654,6 +16676,14 @@
                   {
                     "type": "null"
                   }
+                ]
+              },
+              "omitted_result_count": {
+                "format": "uint",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
                 ]
               },
               "status": {
@@ -21436,6 +21466,13 @@
             ],
             "description": "Override the personality for this turn and subsequent turns."
           },
+          "runIndependently": {
+            "description": "Bypass identical in-flight task coalescing. Intended for intentional independent runs such as A/B tests.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "sandboxPolicy": {
             "anyOf": [
               {
@@ -21912,6 +21949,20 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "completionReviewReadyPhaseCount": {
+            "default": 0,
+            "description": "Completion-review coordinators that observed the ready phase.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "completionReviewTerminalPhaseCount": {
+            "default": 0,
+            "description": "Completion-review coordinators that observed the terminal phase.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "exactRepeatedWaitCount": {
             "default": 0,
             "format": "uint32",
@@ -22021,6 +22072,13 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "ownerDrainedContinuationCount": {
+            "default": 0,
+            "description": "Continuations drained and recorded by their code-mode owner.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "permissionWaitCount": {
             "format": "uint32",
             "minimum": 0.0,
@@ -22075,6 +22133,27 @@
             },
             "type": "array"
           },
+          "readyStartupPrewarmCount": {
+            "default": 0,
+            "description": "Ready startup prewarms observed by the first model request.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "residualDeterministicGenerationCount": {
+            "default": 0,
+            "description": "Residual deterministic generation requests proved by the reasoning governor, including requests elided before provider dispatch.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reusedValidationCount": {
+            "default": 0,
+            "description": "Validation results served from the authoritative validation ledger.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "samePurposeContinuationCount": {
             "default": 0,
             "format": "uint32",
@@ -22086,9 +22165,58 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "sourceConditionalUnchangedCount": {
+            "default": 0,
+            "description": "Physical source reads whose automatically or explicitly supplied conditional identity proved unchanged.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceExactProjectionReuseCount": {
+            "default": 0,
+            "description": "Exact source projections acknowledged without replaying source text.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceHostDrainedContinuationCount": {
+            "default": 0,
+            "description": "Source-specific deterministic continuations drained by the owner.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceModelVisibleNewEvidenceCount": {
+            "default": 0,
+            "description": "New source evidence fragments actually exposed to a started model generation.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceOverlapRangeEliminationCount": {
+            "default": 0,
+            "description": "Coherent overlapping source intervals removed from model-visible text.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourcePhysicalRangeAvoidedCount": {
+            "default": 0,
+            "description": "Requested source ranges that did not require an independent physical read because exact or same-operation coverage was reused.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "suppressedDeterministicContinuationCount": {
             "default": 0,
             "description": "Authoritative number of model boundaries suppressed by accepted deterministic-continuation receipts. A receipt whose `suppressed_continuation_count` is N contributes N, not one. Invalid, rejected, and zero-count receipts contribute nothing. This counter is independent of `generations_by_disposition`.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "suppressedValidationOutputCount": {
+            "default": 0,
+            "description": "Validation tool outputs intentionally suppressed by admission policy.",
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"

@@ -7,8 +7,52 @@ use super::*;
 use codex_utils_path_uri::LegacyAppPathString;
 
 impl ChatWidget {
-    pub(super) fn on_patch_apply_begin(&mut self, changes: HashMap<PathBuf, FileChange>) {
+    pub(super) fn on_patch_apply_updated(
+        &mut self,
+        item_id: String,
+        changes: HashMap<PathBuf, FileChange>,
+    ) {
         self.record_visible_turn_activity();
+        self.flush_answer_stream_with_separator();
+
+        if let Some(cell) = self.transcript.active_cell.as_mut().and_then(|cell| {
+            cell.as_any_mut()
+                .downcast_mut::<history_cell::PatchHistoryCell>()
+        }) && cell.is_streaming_item(&item_id)
+        {
+            cell.update_changes(changes);
+            self.bump_active_cell_revision();
+            self.request_redraw();
+            return;
+        }
+
+        self.flush_active_cell();
+        let mut cell = history_cell::new_streaming_patch_event(item_id, &self.config.cwd);
+        cell.update_changes(changes);
+        self.transcript.active_cell = Some(Box::new(cell));
+        self.bump_active_cell_revision();
+        self.request_redraw();
+    }
+
+    pub(super) fn on_patch_apply_begin(
+        &mut self,
+        item_id: String,
+        changes: HashMap<PathBuf, FileChange>,
+    ) {
+        self.record_visible_turn_activity();
+        let replaces_streaming_cell = self
+            .transcript
+            .active_cell
+            .as_ref()
+            .and_then(|cell| {
+                cell.as_any()
+                    .downcast_ref::<history_cell::PatchHistoryCell>()
+            })
+            .is_some_and(|cell| cell.is_streaming_item(&item_id));
+        if replaces_streaming_cell {
+            self.transcript.active_cell = None;
+            self.bump_active_cell_revision();
+        }
         self.add_to_history(history_cell::new_patch_event(changes, &self.config.cwd));
     }
 

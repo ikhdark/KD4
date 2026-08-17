@@ -61,8 +61,6 @@ impl ChatWidget {
         self.on_list_skills(response);
     }
 
-    pub(super) fn on_patch_apply_output_delta(&mut self, _item_id: String, _delta: String) {}
-
     pub(super) fn on_guardian_review_notification(
         &mut self,
         id: String,

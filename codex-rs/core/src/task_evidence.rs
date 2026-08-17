@@ -860,6 +860,14 @@ struct TerminalizationReceipt {
     updated_at: String,
 }
 
+impl TerminalizationReceipt {
+    fn validated_authoritative_event(&self) -> Option<&AuthoritativeTerminalEventV1> {
+        self.authoritative_event.as_ref().filter(|event| {
+            event.is_self_consistent() && self.durable_outcome == event.semantic_outcome
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalDecisionClaim {
     pub(crate) authoritative_event: AuthoritativeTerminalEventV1,
@@ -884,6 +892,17 @@ pub(crate) struct TerminalInteractionUpdate {
     pub(crate) recovery_state: TerminalRecoveryState,
     pub(crate) phase_timings_ns: BTreeMap<String, u64>,
     pub(crate) terminalization: Option<TurnTimingTerminalization>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalizationReceiptSnapshot {
+    pub(crate) terminal_identity: String,
+    pub(crate) terminalization: TurnTimingTerminalization,
+    pub(crate) delivery_state: TerminalDeliveryState,
+    pub(crate) active_turn_detached: bool,
+    pub(crate) terminal_interaction_released: bool,
+    pub(crate) recovery_state: TerminalRecoveryState,
+    pub(crate) deadline_exhausted_phase: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3311,14 +3330,13 @@ impl TaskEvidenceLedger {
                                 && receipt.delivery_state.is_authoritative_claim()
                         })
                     {
-                        return match receipt.authoritative_event.clone() {
+                        return match receipt.validated_authoritative_event().cloned() {
                             Some(authoritative)
-                                if authoritative.is_self_consistent()
-                                    && authoritative.fingerprint == candidate_fingerprint =>
+                                if authoritative.fingerprint == candidate_fingerprint =>
                             {
                                 TerminalClaimMutation::Existing(authoritative)
                             }
-                            Some(authoritative) if authoritative.is_self_consistent() => {
+                            Some(authoritative) => {
                                 TerminalClaimMutation::Conflict(Some(authoritative))
                             }
                             _ => TerminalClaimMutation::Conflict(None),
@@ -3402,19 +3420,14 @@ impl TaskEvidenceLedger {
             receipt.terminal_identity == candidate.terminal_identity
                 && receipt.delivery_state.is_authoritative_claim()
         })?;
-        let result = match receipt.authoritative_event.clone() {
-            Some(authoritative)
-                if authoritative.is_self_consistent()
-                    && authoritative.fingerprint == candidate.fingerprint =>
-            {
+        let result = match receipt.validated_authoritative_event().cloned() {
+            Some(authoritative) if authoritative.fingerprint == candidate.fingerprint => {
                 TerminalClaimResult::AlreadyClaimed(authoritative)
             }
-            Some(authoritative) if authoritative.is_self_consistent() => {
-                TerminalClaimResult::Conflict {
-                    authoritative: Some(authoritative),
-                    candidate_fingerprint: candidate.fingerprint.clone(),
-                }
-            }
+            Some(authoritative) => TerminalClaimResult::Conflict {
+                authoritative: Some(authoritative),
+                candidate_fingerprint: candidate.fingerprint.clone(),
+            },
             _ => TerminalClaimResult::Conflict {
                 authoritative: None,
                 candidate_fingerprint: candidate.fingerprint.clone(),
@@ -3473,7 +3486,12 @@ impl TaskEvidenceLedger {
                     receipt.active_turn_detached |= candidate_update.active_turn_detached;
                     receipt.terminal_interaction_released |=
                         candidate_update.terminal_interaction_released;
-                    receipt.recovery_state = candidate_update.recovery_state;
+                    // Once recovery has completed, unrelated late cleanup updates must not
+                    // erase that fact. A subsequent process reload can still mark an
+                    // incomplete receipt Pending before replay begins.
+                    if receipt.recovery_state != TerminalRecoveryState::Recovered {
+                        receipt.recovery_state = candidate_update.recovery_state;
+                    }
                     for (phase, duration) in candidate_update.phase_timings_ns {
                         receipt.phase_timings_ns.insert(phase, duration);
                     }
@@ -3505,8 +3523,7 @@ impl TaskEvidenceLedger {
             .terminalization_receipts
             .iter()
             .find(|receipt| receipt.terminal_identity == terminal_identity)
-            .and_then(|receipt| receipt.authoritative_event.clone())
-            .filter(AuthoritativeTerminalEventV1::is_self_consistent)
+            .and_then(|receipt| receipt.validated_authoritative_event().cloned())
     }
 
     pub(crate) async fn pending_authoritative_terminal_events(
@@ -3530,8 +3547,7 @@ impl TaskEvidenceLedger {
                                 || !receipt.active_turn_detached
                                 || !receipt.terminal_interaction_released)
                     })
-                    .filter_map(|receipt| receipt.authoritative_event.clone())
-                    .filter(AuthoritativeTerminalEventV1::is_self_consistent)
+                    .filter_map(|receipt| receipt.validated_authoritative_event().cloned())
                     .collect()
             })
             .unwrap_or_default()
@@ -3560,12 +3576,10 @@ impl TaskEvidenceLedger {
                     else {
                         return false;
                     };
-                    let Some(authoritative) = receipt.authoritative_event.as_ref() else {
+                    let Some(authoritative) = receipt.validated_authoritative_event() else {
                         return false;
                     };
-                    if !authoritative.is_self_consistent()
-                        || authoritative.fingerprint != fingerprint
-                    {
+                    if authoritative.fingerprint != fingerprint {
                         return false;
                     }
                     receipt.app_server_acknowledged = true;
@@ -3581,6 +3595,30 @@ impl TaskEvidenceLedger {
             }
         }
         false
+    }
+
+    pub(crate) async fn terminalization_receipt_snapshot(
+        &self,
+        terminal_identity: &str,
+    ) -> Option<TerminalizationReceiptSnapshot> {
+        self.document
+            .lock()
+            .await
+            .as_ref()?
+            .terminalization_receipts
+            .iter()
+            .find(|receipt| receipt.terminal_identity == terminal_identity)
+            .and_then(|receipt| {
+                Some(TerminalizationReceiptSnapshot {
+                    terminal_identity: receipt.terminal_identity.clone(),
+                    terminalization: receipt.terminalization.clone()?,
+                    delivery_state: receipt.delivery_state,
+                    active_turn_detached: receipt.active_turn_detached,
+                    terminal_interaction_released: receipt.terminal_interaction_released,
+                    recovery_state: receipt.recovery_state,
+                    deadline_exhausted_phase: receipt.deadline_exhausted_phase.clone(),
+                })
+            })
     }
 
     #[cfg(test)]
@@ -4805,11 +4843,26 @@ impl TaskEvidenceLedger {
             return None;
         }
         let desktop_activation = self.desktop_activation_runtime_snapshot();
-        let gate = {
+        let (gate, latest_review_audit) = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
             task_is_tracked(document).then(|| {
-                derive_completion_gate(document, self.evidence_path.as_deref(), &desktop_activation)
+                let gate = derive_completion_gate(
+                    document,
+                    self.evidence_path.as_deref(),
+                    &desktop_activation,
+                );
+                let latest_review_audit = document
+                    .completion_review_receipts
+                    .iter()
+                    .rev()
+                    .find(|receipt| {
+                        receipt.evidence_epoch == document.evidence_epoch
+                            && (receipt.failure_category.is_some()
+                                || !receipt.finding_summary.is_empty())
+                    })
+                    .cloned();
+                (gate, latest_review_audit)
             })?
         };
         if gate.status == TaskCompletionStatus::Passed {
@@ -4827,8 +4880,30 @@ impl TaskEvidenceLedger {
         } else {
             format!("; and {remaining} more")
         };
+        let review_audit = latest_review_audit
+            .map(|receipt| {
+                let category = receipt
+                    .failure_category
+                    .as_deref()
+                    .unwrap_or("unclassified");
+                let findings = receipt
+                    .finding_summary
+                    .iter()
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if findings.is_empty() {
+                    format!(" Latest completion-review audit: {category}.")
+                } else {
+                    format!(
+                        " Latest completion-review audit: {category}: {}.",
+                        findings.join("; ")
+                    )
+                }
+            })
+            .unwrap_or_default();
         Some(format!(
-            "KD4 task evidence is {status}: {reason_summary}{remaining}.",
+            "KD4 task evidence is {status}: {reason_summary}{remaining}.{review_audit}",
             status = completion_status_name(gate.status),
         ))
     }
@@ -6794,16 +6869,6 @@ impl TaskEvidenceLedger {
         .await
     }
 
-    pub(crate) async fn completion_review_has_lineage(&self) -> bool {
-        self.document
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|document| document.completion_review_v2.as_ref())
-            .and_then(|ledger| ledger.active_review_cycle.as_ref())
-            .is_some_and(|cycle| cycle.phase != CompletionReviewCyclePhase::Closed)
-    }
-
     /// Returns the correctness identities owned by task evidence for the final
     /// proof boundary. The caller adds host-owned workspace, environment, diff,
     /// and reviewer identities only after terminal quiescence is established.
@@ -6930,6 +6995,7 @@ impl TaskEvidenceLedger {
                     &candidate,
                     &validation_plan,
                     &proof_observations,
+                    document.evidence_epoch,
                 );
                 let mut structured_reasons = document.final_proof.reasons.clone();
                 for obligation_id in &missing_or_failed {
@@ -8768,7 +8834,9 @@ fn current_final_proof_observations(
         .proof_observations
         .iter()
         .filter(|observation| {
-            observation.candidate_id == candidate.candidate_id && observation.complete_identity
+            observation.candidate_id == candidate.candidate_id
+                && observation.evidence_revision == document.evidence_epoch
+                && observation.complete_identity
         })
         .map(|observation| (observation.plan_step_id.clone(), observation.clone()))
         .collect::<BTreeMap<_, _>>();
@@ -8838,11 +8906,13 @@ fn missing_or_failed_obligations(
     candidate: &CompletionCandidateV1,
     plan: &ValidationPlanV1,
     observations: &[FinalProofObservationV1],
+    evidence_revision: u64,
 ) -> Vec<String> {
     let successful_steps = observations
         .iter()
         .filter(|observation| {
             observation.candidate_id == candidate.candidate_id
+                && observation.evidence_revision == evidence_revision
                 && observation.complete_identity
                 && observation.successful
         })

@@ -789,6 +789,80 @@ async fn live_app_server_file_change_item_started_preserves_changes() {
 }
 
 #[tokio::test]
+async fn patch_stream_updates_active_cell_and_is_replaced_by_final_item() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let changes = vec![FileUpdateChange {
+        path: "streamed.txt".to_string(),
+        kind: PatchChangeKind::Add,
+        diff: "hello\n".to_string(),
+    }];
+
+    chat.handle_server_notification(
+        ServerNotification::FileChangePatchUpdated(
+            codex_app_server_protocol::FileChangePatchUpdatedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "patch-stream-1".to_string(),
+                changes: changes.clone(),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    let active = active_blob(&chat);
+    assert!(
+        active.contains("streamed.txt"),
+        "expected streamed patch summary, got: {active}"
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
+            item: AppServerThreadItem::FileChange {
+                id: "patch-stream-1".to_string(),
+                changes,
+                status: AppServerPatchApplyStatus::InProgress,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    assert!(chat.transcript.active_cell.is_none());
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(
+        cells.len(),
+        1,
+        "streaming cell should be replaced, not duplicated"
+    );
+    assert!(lines_to_single_string(&cells[0]).contains("streamed.txt"));
+}
+
+#[tokio::test]
+async fn model_rerouted_updates_current_model_and_renders_notice() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("requested-model")).await;
+
+    chat.handle_server_notification(
+        ServerNotification::ModelRerouted(codex_app_server_protocol::ModelReroutedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            from_model: "requested-model".to_string(),
+            to_model: "fallback-model".to_string(),
+            reason: codex_app_server_protocol::ModelRerouteReason::HighRiskCyberActivity,
+        }),
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(chat.current_model(), "fallback-model");
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let notice = lines_to_single_string(&cells[0]);
+    assert!(notice.contains("requested-model"));
+    assert!(notice.contains("fallback-model"));
+}
+
+#[tokio::test]
 async fn live_app_server_command_execution_strips_shell_wrapper() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let script = r#"python3 -c 'print("Hello, world!")'"#;
@@ -1167,6 +1241,8 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
                 turn_id: "turn-1".to_string(),
                 item_id: "item-1".to_string(),
                 delta: "hello".to_string(),
+                memory_citation: None,
+                memory_citation: None,
             },
         ),
         /*replay_kind*/ None,

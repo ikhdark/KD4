@@ -1,5 +1,63 @@
 use super::*;
 
+#[test]
+fn flush_transcript_tail_defaults_enabled_and_honors_explicit_opt_out() {
+    assert!(flush_transcript_tail_on_session_end(None));
+    assert!(flush_transcript_tail_on_session_end(Some(true)));
+    assert!(!flush_transcript_tail_on_session_end(Some(false)));
+}
+
+#[test]
+fn in_flight_task_coalescing_fingerprint_normalizes_identity() {
+    let params = |thread_id: &str, text: &str, run_independently| TurnStartParams {
+        thread_id: thread_id.to_string(),
+        client_user_message_id: Some(format!("client-{thread_id}")),
+        run_independently,
+        input: vec![V2UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    let first = params("thread-1", "fix   the\n bug", None);
+    let duplicate = params("thread-2", "fix the bug", Some(true));
+
+    let first_fingerprint = normalized_task_fingerprint(&first, "C:/repo", "model=o3");
+    assert_eq!(
+        first_fingerprint,
+        normalized_task_fingerprint(&duplicate, "C:/repo", "model=o3")
+    );
+    assert_ne!(
+        first_fingerprint,
+        normalized_task_fingerprint(&duplicate, "C:/other", "model=o3")
+    );
+    assert_ne!(
+        first_fingerprint,
+        normalized_task_fingerprint(&duplicate, "C:/repo", "model=gpt-5")
+    );
+}
+
+#[test]
+fn in_flight_task_coalescing_returns_reuse_coordinates() {
+    let thread_id = codex_protocol::ThreadId::new();
+    let existing = crate::thread_state::InFlightTaskReference {
+        thread_id,
+        turn_id: "turn-existing".to_string(),
+    };
+
+    let error = identical_task_in_flight_error(&existing);
+
+    assert_eq!(
+        error.data,
+        Some(serde_json::json!({
+            "reason": "identicalTaskInFlight",
+            "threadId": thread_id.to_string(),
+            "turnId": "turn-existing",
+            "runIndependentlyOverride": "runIndependently",
+        }))
+    );
+}
+
 fn additional_context_entry(value: impl Into<String>) -> AdditionalContextEntry {
     AdditionalContextEntry {
         value: value.into(),

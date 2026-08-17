@@ -231,18 +231,142 @@ async fn aggregate_recovery_reserves_space_for_later_ranges_and_returns_continua
             ToolOutputSelectorStatus::Ok,
             ToolOutputSelectorStatus::AggregateOmitted,
         ],
-        "complete selectors must be admitted in request order",
+        "complete selectors must be admitted in canonical source order",
     );
+    assert!(!recovered.complete);
     let omitted = &recovered.results[2];
     assert!(!omitted.complete);
-    assert_eq!(omitted.continuation.as_ref(), Some(&omitted.selector));
+    assert!(omitted.canonical_range.is_some());
+    assert!(omitted.exact_bytes.is_some());
+    assert!(omitted.subdivision_plan.is_some());
+    assert!(!omitted.child_selectors.is_empty());
+    assert_eq!(
+        omitted.continuation.as_ref(),
+        omitted.child_selectors.first(),
+        "aggregate overflow must advertise the first deterministic byte child",
+    );
     assert!(response_fits_recovery_ceiling(&recovered));
+}
+
+#[tokio::test]
+async fn exact_three_kib_section_is_complete_in_one_transaction() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let text = (0..48)
+        .map(|index| format!("section-{index:03}-{}\n", "x".repeat(51)))
+        .collect::<String>();
+    assert!((3_000..=3_300).contains(&text.len()));
+    let mut canonical = CanonicalToolResult::text(text.clone());
+    canonical.sections = vec![ToolProjectionSection {
+        id: "three-kib".to_string(),
+        value: None,
+        exact_bytes: text.len() as u64,
+        inclusion: ToolProjectionInclusion::Omitted,
+        canonical_range: Some(CanonicalByteRange::new(0, text.len() as u64)),
+        children: Vec::new(),
+        recovery_chunk_bytes: None,
+    }];
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Section {
+            id: "three-kib".to_string(),
+        }],
+    )
+    .await
+    .expect("recover three KiB section");
+
+    assert!(recovered.complete);
+    assert_eq!(recovered.results.len(), 1);
+    assert_eq!(recovered.results[0].status, ToolOutputSelectorStatus::Ok);
+    assert_eq!(recovered.results[0].text.as_deref(), Some(text.as_str()));
+}
+
+#[tokio::test]
+async fn exact_eight_kib_lines_drain_all_subdivisions_when_final_transaction_fits() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let text = (0..128)
+        .map(|index| format!("line-{index:03}-{}\n", "abcdefghij".repeat(5)))
+        .collect::<String>();
+    assert!((7_500..=9_000).contains(&text.len()));
+    let line_count = text.lines().count();
+    let canonical = CanonicalToolResult::text(text.clone());
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Lines {
+            start: 1,
+            end: line_count,
+        }],
+    )
+    .await
+    .expect("recover eight KiB line selection");
+
+    assert!(recovered.complete);
+    let selected = &recovered.results[0];
+    assert_eq!(selected.status, ToolOutputSelectorStatus::Ok);
+    assert_eq!(selected.text.as_deref(), Some(text.as_str()));
+    assert!(selected.subdivision_plan.is_some());
+    assert!(
+        selected
+            .message
+            .as_deref()
+            .is_some_and(|message| { message.contains("internally drained all") })
+    );
+    assert!(selected.continuation.is_none());
+}
+
+#[tokio::test]
+async fn exact_ranges_are_deduplicated_coalesced_and_returned_in_source_order() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let text = "0123456789".repeat(8);
+    let canonical = CanonicalToolResult::text(text.clone());
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![
+            ToolOutputSelector::Bytes { start: 40, end: 50 },
+            ToolOutputSelector::Bytes { start: 20, end: 30 },
+            ToolOutputSelector::Bytes { start: 0, end: 10 },
+            ToolOutputSelector::Bytes { start: 8, end: 20 },
+            ToolOutputSelector::Bytes { start: 20, end: 30 },
+        ],
+    )
+    .await
+    .expect("recover normalized exact ranges");
+
+    assert!(recovered.complete);
+    assert_eq!(recovered.results.len(), 2);
+    assert_eq!(
+        recovered
+            .results
+            .iter()
+            .map(|result| result.canonical_range)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(CanonicalByteRange::new(0, 30)),
+            Some(CanonicalByteRange::new(40, 50)),
+        ]
+    );
+    assert_eq!(recovered.results[0].text.as_deref(), Some(&text[0..30]));
+    assert_eq!(recovered.results[1].text.as_deref(), Some(&text[40..50]));
 }
 
 #[tokio::test]
 async fn byte_selectors_return_utf8_directly_and_non_utf8_as_base64() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let canonical = CanonicalToolResult::bytes(vec![b'h', b'i', 0xff, 0x00]);
+    let canonical = CanonicalToolResult::bytes(vec![b'h', b'i', b' ', 0xff, 0x00]);
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
 
@@ -252,7 +376,7 @@ async fn byte_selectors_return_utf8_directly_and_non_utf8_as_base64() {
         &artifact_id,
         vec![
             ToolOutputSelector::Bytes { start: 0, end: 2 },
-            ToolOutputSelector::Bytes { start: 2, end: 4 },
+            ToolOutputSelector::Bytes { start: 3, end: 5 },
         ],
     )
     .await
@@ -485,11 +609,32 @@ async fn oversized_json_pointer_exposes_exact_chunkable_canonical_range() {
     assert_eq!(selected.status, ToolOutputSelectorStatus::SelectorTooLarge);
     assert_eq!(selected.exact_bytes, Some(expected_range.len()));
     assert_eq!(selected.canonical_range, Some(expected_range));
+    assert!(
+        selected
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("never the parent selector"))
+    );
     let plan = selected
         .subdivision_plan
         .as_ref()
         .expect("bounded byte-subdivision plan");
     assert!(plan.chunk_bytes > 0);
+    let continuation = selected
+        .continuation
+        .as_ref()
+        .expect("host-directed bounded continuation");
+    assert_eq!(selected.child_selectors.first(), Some(continuation));
+    assert_eq!(
+        continuation,
+        &ToolOutputSelector::Bytes {
+            start: expected_range.start,
+            end: expected_range
+                .start
+                .saturating_add(plan.chunk_bytes)
+                .min(expected_range.end),
+        }
+    );
 
     let selectors = (expected_range.start..expected_range.end)
         .step_by(plan.chunk_bytes as usize)
@@ -559,6 +704,98 @@ async fn stall_nested_recovery_budget_returns_a_bounded_subdivision_plan() {
     assert!(selected.text.is_none());
     assert!(selected.subdivision_plan.is_some());
     assert!(selected.continuation.is_some());
+    assert!(!recovered.complete);
+}
+
+#[tokio::test]
+async fn stale_artifact_metadata_version_is_rejected_without_partial_success() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("version identity\n");
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let artifact_path = temp
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{artifact_id}.log"));
+    let metadata_path = logical_metadata_path(&artifact_path);
+    let mut metadata: Value =
+        serde_json::from_slice(&std::fs::read(&metadata_path).expect("read logical metadata"))
+            .expect("decode logical metadata");
+    metadata["version"] = serde_json::json!(LOGICAL_ARTIFACT_METADATA_VERSION + 1);
+    std::fs::write(
+        metadata_path,
+        serde_json::to_vec(&metadata).expect("encode stale metadata"),
+    )
+    .expect("write stale metadata version");
+
+    let error = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
+    )
+    .await
+    .expect_err("stale metadata version must fail the transaction");
+    assert!(matches!(
+        error,
+        ReadToolOutputError::Io(message) if message.contains("metadata version")
+    ));
+}
+
+#[tokio::test]
+async fn stale_artifact_sha_is_rejected_without_partial_success() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("sha identity\n");
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let artifact_path = temp
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{artifact_id}.log"));
+    let mut bytes = std::fs::read(&artifact_path).expect("read artifact segment");
+    bytes[0] ^= 1;
+    std::fs::write(&artifact_path, bytes).expect("replace artifact with same-sized stale bytes");
+
+    let error = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
+    )
+    .await
+    .expect_err("stale SHA must fail the transaction");
+    assert!(matches!(
+        error,
+        ReadToolOutputError::Io(message) if message.contains("SHA identity")
+    ));
+}
+
+#[tokio::test]
+async fn stale_artifact_size_is_rejected_without_partial_success() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("size identity\n");
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let artifact_path = temp
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{artifact_id}.log"));
+    let mut bytes = std::fs::read(&artifact_path).expect("read artifact segment");
+    bytes.push(b'!');
+    std::fs::write(&artifact_path, bytes).expect("replace artifact with stale size");
+
+    let error = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
+    )
+    .await
+    .expect_err("stale size must fail the transaction");
+    assert!(matches!(
+        error,
+        ReadToolOutputError::Io(message) if message.contains("segment size")
+    ));
 }
 
 #[tokio::test]

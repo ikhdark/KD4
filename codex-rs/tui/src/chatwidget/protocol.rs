@@ -96,8 +96,11 @@ impl ChatWidget {
             ServerNotification::CommandExecutionOutputDelta(notification) => {
                 self.on_exec_command_output_delta(&notification.item_id, &notification.delta);
             }
-            ServerNotification::FileChangeOutputDelta(notification) => {
-                self.on_patch_apply_output_delta(notification.item_id, notification.delta);
+            ServerNotification::FileChangePatchUpdated(notification) => {
+                self.on_patch_apply_updated(
+                    notification.item_id,
+                    file_update_changes_to_display(notification.changes),
+                );
             }
             ServerNotification::TurnDiffUpdated(notification) => {
                 self.on_turn_diff(notification.diff)
@@ -161,7 +164,14 @@ impl ChatWidget {
             ServerNotification::SkillsChanged(_) => {
                 self.refresh_skills_for_current_cwd(/*force_reload*/ true);
             }
-            ServerNotification::ModelRerouted(_) => {}
+            ServerNotification::ModelRerouted(notification) => {
+                self.set_model(&notification.to_model);
+                self.add_to_history(history_cell::new_warning_event(format!(
+                    "Model rerouted from {} to {} for this turn ({:?}).",
+                    notification.from_model, notification.to_model, notification.reason
+                )));
+                self.request_redraw();
+            }
             ServerNotification::ModelVerification(notification) => {
                 self.on_app_server_model_verification(&notification.verifications)
             }
@@ -221,7 +231,7 @@ impl ChatWidget {
             | ServerNotification::CommandExecOutputDelta(_)
             | ServerNotification::ProcessOutputDelta(_)
             | ServerNotification::ProcessExited(_)
-            | ServerNotification::FileChangePatchUpdated(_)
+            | ServerNotification::FileChangeOutputDelta(_)
             | ServerNotification::McpToolCallProgress(_)
             | ServerNotification::McpServerOauthLoginCompleted(_)
             | ServerNotification::AppListUpdated(_)
@@ -328,8 +338,8 @@ impl ChatWidget {
     ) {
         match notification.item {
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_started(item),
-            ThreadItem::FileChange { id: _, changes, .. } => {
-                self.on_patch_apply_begin(file_update_changes_to_display(changes));
+            ThreadItem::FileChange { id, changes, .. } => {
+                self.on_patch_apply_begin(id, file_update_changes_to_display(changes));
             }
             item @ ThreadItem::McpToolCall { .. } => self.on_mcp_tool_call_started(item),
             ThreadItem::WebSearch(item) => {

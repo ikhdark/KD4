@@ -136,7 +136,14 @@ async fn run_remote_compact_task_inner(
     let pre_compact_outcome = run_pre_compact_hooks(sess, turn_context, trigger).await;
     match pre_compact_outcome {
         PreCompactHookOutcome::Continue => {}
-        PreCompactHookOutcome::Stopped => {
+        PreCompactHookOutcome::Stopped { reason } => {
+            crate::hook_runtime::emit_hook_stop_reason(
+                sess,
+                turn_context,
+                "PreCompact",
+                reason.as_deref(),
+            )
+            .await;
             let error = CodexErr::TurnAborted;
             attempt
                 .track(
@@ -163,7 +170,14 @@ async fn run_remote_compact_task_inner(
     let codex_error = result.as_ref().err();
     if result.is_ok() {
         let post_compact_outcome = run_post_compact_hooks(sess, turn_context, trigger).await;
-        if let PostCompactHookOutcome::Stopped = post_compact_outcome {
+        if let PostCompactHookOutcome::Stopped { reason } = post_compact_outcome {
+            crate::hook_runtime::emit_hook_stop_reason(
+                sess,
+                turn_context,
+                "PostCompact",
+                reason.as_deref(),
+            )
+            .await;
             attempt
                 .track(sess.as_ref(), status, codex_error, analytics_details)
                 .await;
@@ -473,6 +487,7 @@ fn rewritten_output_for_context_window(item: &ResponseItem) -> Option<ResponseIt
             call_id,
             status,
             execution,
+            omitted_result_count,
             internal_chat_message_metadata_passthrough: metadata,
             ..
         } => ResponseItem::ToolSearchOutput {
@@ -481,6 +496,7 @@ fn rewritten_output_for_context_window(item: &ResponseItem) -> Option<ResponseIt
             status: status.clone(),
             execution: execution.clone(),
             tools: Vec::new(),
+            omitted_result_count: *omitted_result_count,
             internal_chat_message_metadata_passthrough: metadata.clone(),
         },
         _ => return None,

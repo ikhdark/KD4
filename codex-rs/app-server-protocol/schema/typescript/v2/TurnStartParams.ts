@@ -10,7 +10,11 @@ import type { AskForApproval } from "./AskForApproval";
 import type { SandboxPolicy } from "./SandboxPolicy";
 import type { UserInput } from "./UserInput";
 
-export type TurnStartParams = {threadId: string, clientUserMessageId?: string | null, input: Array<UserInput>, /**
+export type TurnStartParams = {threadId: string, clientUserMessageId?: string | null, /**
+ * Bypass identical in-flight task coalescing. Intended for intentional
+ * independent runs such as A/B tests.
+ */
+runIndependently?: boolean | null, input: Array<UserInput>, /**
  * Override the working directory for this turn and subsequent turns.
  */
 cwd?: string | null, /**

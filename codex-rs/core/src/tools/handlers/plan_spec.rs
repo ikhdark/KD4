@@ -203,6 +203,8 @@ Use a short evidence-first medium plan for bounded multi-surface work. Use the c
 Internal tier selection never changes collaboration mode. Complexity escalation in Default mode upgrades only this representation. Omitted facts and steps remain active; removals need reasons.
 Stop exploration once owner, call path, affected contract/scope, validation route, and material risks are established. Keep focused work checklist-free and medium plans short.
 At most one step can be in_progress at a time.
+Complete one coherent contract before starting the next: format or lint its changed surface, compile its owner, run its exact focused behavioral test, and record that at least one test was selected.
+Structured validation routes accept only direct cargo, just, python, or python3 leaves; run formatting and diff checks separately outside the route.
 Use stable ids, owners, bounded surfaces, dependencies, obligations, and acceptance criteria. Edits
 record partial obligation progress. Set a step to passed only when applicable fresh proof exists; completion
 still checks declared artifacts, Desktop activation, plan structure, and blocking risks.
@@ -323,7 +325,7 @@ fn validation_route_schema() -> JsonSchema {
                 "argv".to_string(),
                 JsonSchema::array(
                     JsonSchema::string(Some("One exact direct-argv element.".to_string())),
-                    Some("Canonical direct argv; shell compounds are not accepted.".to_string()),
+                    Some("Canonical direct argv using cargo, just, python, or python3; shell compounds and formatting or diff checks are not accepted.".to_string()),
                 ),
             ),
             (

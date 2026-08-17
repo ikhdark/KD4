@@ -2869,6 +2869,67 @@ async fn mutation_evidence_keeps_private_prewrite_snapshot() {
     ));
 }
 
+#[tokio::test]
+async fn mutation_evidence_records_workspace_epochs() {
+    let fixture = Fixture::new().await;
+    tokio::fs::create_dir_all(fixture.repo.path().join("src"))
+        .await
+        .expect("source directory");
+    tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"before")
+        .await
+        .expect("prewrite file");
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("epoch-root", "src"))
+        .await
+        .expect("worker assignment");
+    let start_revision = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["src/file.rs".to_string()])
+        .await
+        .expect("start revision captures");
+    fixture
+        .store
+        .begin_mutation(
+            attempt.attempt_id,
+            fixture.repo.path(),
+            "src/file.rs".to_string(),
+            AttributionConfidence::Definitive,
+        )
+        .await
+        .expect("mutation begins");
+    tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"after")
+        .await
+        .expect("mutated file");
+    let end_revision = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["src/file.rs".to_string()])
+        .await
+        .expect("end revision captures");
+    let evidence = fixture
+        .store
+        .finalize_mutation(
+            attempt.attempt_id,
+            fixture.repo.path(),
+            "src/file.rs".to_string(),
+        )
+        .await
+        .expect("mutation finalizes");
+    assert_eq!(evidence.start_epoch, start_revision.epoch);
+    assert_eq!(evidence.end_epoch, Some(end_revision.epoch));
+    assert!(end_revision.epoch > start_revision.epoch);
+
+    fixture.store.close().await;
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .expect("task store restarts");
+    let persisted = restarted
+        .list_mutation_evidence(attempt.attempt_id, None)
+        .await
+        .expect("persisted mutation evidence reads");
+    assert_eq!(persisted, vec![evidence]);
+}
+
 async fn finalized_snapshot_assignment(
     fixture: &Fixture,
     root_session_id: &str,
@@ -3407,6 +3468,13 @@ async fn task_capsule_attachment_is_canonical_and_one_time() {
         objective: assignment.objective.clone(),
         read_scope: assignment.read_scope.clone(),
         write_scope: assignment.write_scope.clone(),
+        stop_condition: assignment.stop_condition.clone(),
+        dependencies: assignment.dependencies.clone(),
+        risk_hints: assignment.risk_hints.clone(),
+        contract_claims: assignment.contract_claims.clone(),
+        workspace_strategy: Some(assignment.workspace_strategy),
+        relation: assignment.relation.clone(),
+        architecture_contract_ref: assignment.architecture_contract_ref.clone(),
         relevant_handles: vec![TaskCapsuleHandle::File {
             path: "src/new.rs".to_string(),
             existed: false,
@@ -3417,6 +3485,19 @@ async fn task_capsule_attachment_is_canonical_and_one_time() {
         prohibited_changes: assignment.prohibited_changes.clone(),
         required_evidence: assignment.required_evidence.clone(),
     };
+    assert_eq!(capsule.stop_condition, assignment.stop_condition);
+    assert_eq!(capsule.dependencies, assignment.dependencies);
+    assert_eq!(capsule.risk_hints, assignment.risk_hints);
+    assert_eq!(capsule.contract_claims, assignment.contract_claims);
+    assert_eq!(
+        capsule.workspace_strategy,
+        Some(assignment.workspace_strategy)
+    );
+    assert_eq!(capsule.relation, assignment.relation);
+    assert_eq!(
+        capsule.architecture_contract_ref,
+        assignment.architecture_contract_ref
+    );
     let canonical = serde_json::to_string(&capsule).expect("capsule serializes canonically");
 
     let attached = fixture
@@ -3471,12 +3552,39 @@ async fn task_capsule_attachment_rejects_noncanonical_or_mismatched_payloads() {
         objective: assignment.objective.clone(),
         read_scope: assignment.read_scope.clone(),
         write_scope: assignment.write_scope.clone(),
+        stop_condition: String::new(),
+        dependencies: Vec::new(),
+        risk_hints: Vec::new(),
+        contract_claims: Vec::new(),
+        workspace_strategy: None,
+        relation: None,
+        architecture_contract_ref: None,
         relevant_handles: Vec::new(),
         workspace_epoch: assignment.start_epoch,
         workspace_manifest_hash: "manifest-sha256".to_string(),
         prohibited_changes: assignment.prohibited_changes.clone(),
         required_evidence: assignment.required_evidence.clone(),
     };
+    let legacy_canonical = serde_json::to_string(&capsule).expect("legacy capsule serializes");
+    let legacy_value: serde_json::Value =
+        serde_json::from_str(&legacy_canonical).expect("legacy capsule JSON parses");
+    for field in [
+        "stop_condition",
+        "dependencies",
+        "risk_hints",
+        "contract_claims",
+        "workspace_strategy",
+        "relation",
+        "architecture_contract_ref",
+    ] {
+        assert!(legacy_value.get(field).is_none(), "legacy field {field}");
+    }
+    let legacy_decoded: TaskCapsuleV1 =
+        serde_json::from_str(&legacy_canonical).expect("legacy capsule decodes");
+    assert_eq!(
+        serde_json::to_string(&legacy_decoded).expect("legacy capsule reserializes"),
+        legacy_canonical
+    );
     let pretty = serde_json::to_string_pretty(&capsule).expect("capsule pretty serializes");
     assert!(matches!(
         fixture

@@ -337,3 +337,35 @@ async fn workspace_change_observation_fails_open_on_changes_or_watcher_uncertain
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
+    let root = TempDir::new().expect("source observation root");
+    let source = root.path().join("src").join("lib.rs");
+    std::fs::create_dir_all(source.parent().expect("source parent")).expect("create src");
+    std::fs::write(&source, "fn owner() {}\n").expect("write source");
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+
+    let observation = cache
+        .begin_source_path_change_observation(root.path(), &source)
+        .expect("path observation");
+    cache.note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()]);
+    assert!(cache.source_path_change_observation_is_current(&observation));
+
+    cache.note_host_workspace_mutation_paths(root.path(), &["src/lib.rs".to_string()]);
+    assert!(!cache.source_path_change_observation_is_current(&observation));
+
+    let uncertain = cache
+        .begin_source_path_change_observation(root.path(), &source)
+        .expect("refreshed path observation");
+    cache.note_host_workspace_mutation();
+    assert!(!cache.source_path_change_observation_is_current(&uncertain));
+
+    let overflowed = cache
+        .begin_source_path_change_observation(root.path(), &source)
+        .expect("overflow path observation");
+    for index in 0..=SOURCE_CHANGE_JOURNAL_CAPACITY {
+        cache.note_host_workspace_mutation_paths(root.path(), &[format!("unrelated/{index}.txt")]);
+    }
+    assert!(!cache.source_path_change_observation_is_current(&overflowed));
+}

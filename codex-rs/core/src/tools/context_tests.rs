@@ -494,10 +494,12 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
             status,
             execution,
             tools,
+            omitted_result_count,
         } => {
             assert_eq!(call_id, "search-1");
             assert_eq!(status, "completed");
             assert_eq!(execution, "client");
+            assert_eq!(omitted_result_count, Some(0));
             assert_eq!(
                 tools,
                 vec![json!({
@@ -541,9 +543,15 @@ fn partial_tool_search_outputs_are_model_visible_as_incomplete() {
     let response = output.to_response_item("search-partial", &payload);
 
     match response {
-        ResponseInputItem::ToolSearchOutput { status, tools, .. } => {
+        ResponseInputItem::ToolSearchOutput {
+            status,
+            tools,
+            omitted_result_count,
+            ..
+        } => {
             assert_eq!(status, "incomplete");
             assert!(tools.is_empty());
+            assert_eq!(omitted_result_count, Some(1));
         }
         other => panic!("expected ToolSearchOutput, got {other:?}"),
     }
@@ -577,6 +585,7 @@ fn aborted_tool_search_payloads_preserve_abort_status() {
             status: "aborted".to_string(),
             execution: "client".to_string(),
             tools: Vec::new(),
+            omitted_result_count: None,
         }
     );
 }

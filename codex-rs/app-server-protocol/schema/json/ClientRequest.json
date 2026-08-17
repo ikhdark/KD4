@@ -2886,6 +2886,14 @@
                 }
               ]
             },
+            "omitted_result_count": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "status": {
               "type": "string"
             },
@@ -4580,6 +4588,13 @@
             }
           ],
           "description": "Override the personality for this turn and subsequent turns."
+        },
+        "runIndependently": {
+          "description": "Bypass identical in-flight task coalescing. Intended for intentional independent runs such as A/B tests.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "sandboxPolicy": {
           "anyOf": [

@@ -106,7 +106,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
     );
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Search or select from one immutable tool-output artifact without rerunning its producer. A search selector returns its merged exact contexts in hydrated_ranges in the same call; child_selectors remain as exact recovery receipts and continuation advances only when another bounded page exists. Batch adjacent or independent line, byte, section, and JSON-pointer selectors instead of rereading tiny fragments. Exact values are never clipped: oversized selectors return selector_too_large with canonical ranges and deterministic byte-subdivision plans; later independently fitting selectors may be aggregate_omitted. Byte results are base64. Recovery is deterministically reused and never spills or creates a child artifact."
+        description: "Search or select from one validated immutable tool-output snapshot without rerunning its producer. Exact selectors are deduplicated; overlapping or adjacent byte and line ranges are coalesced; results use stable canonical source order. A search selector returns its merged exact contexts in hydrated_ranges in the same call; child_selectors remain exact recovery receipts and continuation advances only when another bounded page exists. Batch independent line, byte, section, and JSON-pointer selectors instead of rereading tiny fragments. Exact values are never clipped: deterministic byte subdivisions are consumed internally only when the complete transaction fits its final budget; otherwise selector_too_large or aggregate_omitted returns exact canonical ranges and deterministic child selectors. complete is true only when every normalized selector is present. After an overflow status, retry only the returned continuation or child_selectors and never broaden or repeat the parent selector. Recovery is deterministically reused, never recursively spills, and never creates a child artifact."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -118,7 +118,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                 ),
                 (
                     "selectors".to_string(),
-                    JsonSchema::array(selector_schema, Some("Preferred ordered selector list.".to_string())),
+                    JsonSchema::array(selector_schema, Some("Preferred selector list; exact duplicates and overlapping or adjacent same-kind ranges are normalized into stable canonical source order.".to_string())),
                 ),
                 ("start_line".to_string(), JsonSchema::integer(Some("Legacy first 1-based line.".to_string()))),
                 ("end_line".to_string(), JsonSchema::integer(Some("Legacy inclusive last line.".to_string()))),
@@ -199,6 +199,7 @@ mod tests {
         assert!(description.contains("hydrated_ranges"));
         assert!(description.contains("same call"));
         assert!(description.contains("instead of rereading tiny fragments"));
+        assert!(description.contains("retry only the returned continuation or child_selectors"));
         assert!(description.contains("deterministically reused"));
     }
 }

@@ -923,6 +923,14 @@
                 }
               ]
             },
+            "omitted_result_count": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "status": {
               "type": "string"
             },

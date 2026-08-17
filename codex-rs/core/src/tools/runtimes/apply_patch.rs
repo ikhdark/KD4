@@ -367,6 +367,15 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let _workspace_operation_permit = if let Ok(native_cwd) = req.action.cwd.to_abs_path() {
+            let workspace_root =
+                get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
+            Some(
+                crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await,
+            )
+        } else {
+            None
+        };
         let result = codex_apply_patch::apply_patch(
             &req.action.patch,
             &req.action.cwd,

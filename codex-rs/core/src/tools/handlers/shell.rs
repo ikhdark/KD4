@@ -2123,6 +2123,11 @@ async fn run_exec_like_with_exit_code_inner(
         None
     };
 
+    let workspace_operation_root = (focused_validation || !is_known_safe_command(&safety_command))
+        .then(|| {
+            get_git_repo_root(exec_params.cwd.as_path())
+                .unwrap_or_else(|| exec_params.cwd.to_path_buf())
+        });
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
@@ -2146,6 +2151,7 @@ async fn run_exec_like_with_exit_code_inner(
         exec_approval_requirement,
         known_delta: known_delta.clone(),
         validation_launch,
+        workspace_operation_root,
     };
     let mut orchestrator = ToolOrchestrator::new();
     let mut runtime = ShellRuntime::for_shell_command(shell_runtime_backend);

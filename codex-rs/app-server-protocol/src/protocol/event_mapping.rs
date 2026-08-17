@@ -366,13 +366,18 @@ pub fn item_event_to_server_notification(
             })
         }
         EventMsg::AgentMessageContentDelta(event) => {
-            let codex_protocol::protocol::AgentMessageContentDeltaEvent { item_id, delta, .. } =
-                event;
+            let codex_protocol::protocol::AgentMessageContentDeltaEvent {
+                item_id,
+                delta,
+                memory_citation,
+                ..
+            } = event;
             ServerNotification::AgentMessageDelta(AgentMessageDeltaNotification {
                 thread_id,
                 turn_id,
                 item_id,
                 delta,
+                memory_citation: memory_citation.map(Into::into),
             })
         }
         EventMsg::PlanDelta(event) => ServerNotification::PlanDelta(PlanDeltaNotification {
@@ -380,6 +385,7 @@ pub fn item_event_to_server_notification(
             turn_id,
             item_id: event.item_id,
             delta: event.delta,
+            memory_citation: event.memory_citation.map(Into::into),
         }),
         EventMsg::ReasoningContentDelta(event) => {
             ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
@@ -476,6 +482,7 @@ pub fn item_event_to_server_notification(
 mod tests {
     use super::*;
     use codex_protocol::ThreadId;
+    use codex_protocol::protocol::AgentMessageContentDeltaEvent;
     use codex_protocol::protocol::CollabResumeBeginEvent;
     use codex_protocol::protocol::CollabResumeEndEvent;
     use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
@@ -616,5 +623,37 @@ mod tests {
                 delta: "hello".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn agent_message_delta_preserves_memory_citation() {
+        let notification = item_event_to_server_notification(
+            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                thread_id: "ignored".to_string(),
+                turn_id: "ignored".to_string(),
+                item_id: "item-1".to_string(),
+                delta: String::new(),
+                memory_citation: Some(codex_protocol::memory_citation::MemoryCitation {
+                    entries: vec![codex_protocol::memory_citation::MemoryCitationEntry {
+                        path: "MEMORY.md".to_string(),
+                        line_start: 1,
+                        line_end: 2,
+                        note: "x".to_string(),
+                    }],
+                    rollout_ids: vec!["thread-1".to_string()],
+                }),
+            }),
+            "thread-1",
+            "turn-1",
+        );
+
+        let ServerNotification::AgentMessageDelta(notification) = notification else {
+            panic!("expected agent message delta notification");
+        };
+        let citation = notification
+            .memory_citation
+            .expect("memory citation should be mapped");
+        assert_eq!(citation.entries[0].path, "MEMORY.md");
+        assert_eq!(citation.thread_ids, vec!["thread-1"]);
     }
 }

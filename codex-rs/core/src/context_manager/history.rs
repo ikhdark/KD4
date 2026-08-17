@@ -363,6 +363,20 @@ impl ContextManager {
         self.prepare_for_prompt_with_completed_tool_projection_target(input_modalities, target)
     }
 
+    /// Compaction also benefits from settled, exactly recoverable tool receipts.
+    /// This is explicit so generic prompt preparation remains lossless.
+    pub(crate) fn for_compaction_prompt_with_completed_tool_projection(
+        self,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItem> {
+        self.prepare_for_prompt_with_completed_tool_projection_target(
+            input_modalities,
+            StableContextTarget::FailOpen,
+        )
+        .items()
+        .to_vec()
+    }
+
     fn prepare_for_prompt_with_completed_tool_projection_target(
         self,
         input_modalities: &[InputModality],

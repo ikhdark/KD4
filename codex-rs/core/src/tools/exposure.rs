@@ -33,6 +33,7 @@ pub(crate) struct ToolExposureIdentity {
     pub(crate) wait_available: bool,
     pub(crate) goal_surface_state: GoalSurfaceState,
     pub(crate) mcp_resources_available: bool,
+    pub(crate) tool_search_available: bool,
     pub(crate) request_user_input_eligible: bool,
 }
 
@@ -45,6 +46,7 @@ impl Default for ToolExposureIdentity {
             wait_available: true,
             goal_surface_state: GoalSurfaceState::Active,
             mcp_resources_available: true,
+            tool_search_available: false,
             request_user_input_eligible: true,
         }
     }
@@ -62,6 +64,7 @@ mod tests {
             wait_available: false,
             goal_surface_state: GoalSurfaceState::Disabled,
             mcp_resources_available: false,
+            tool_search_available: false,
             request_user_input_eligible: false,
         };
         assert_eq!(base, base.clone());
@@ -76,6 +79,10 @@ mod tests {
 
         let mut changed = base.clone();
         changed.mcp_resources_available = true;
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.tool_search_available = true;
         assert_ne!(base, changed);
 
         let mut changed = base.clone();

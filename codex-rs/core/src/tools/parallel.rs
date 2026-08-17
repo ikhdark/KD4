@@ -214,6 +214,30 @@ impl ToolCallRuntime {
         let signal_collector = self.sampling_request_signals.clone();
         async move {
             if let Some(registration) = signal_registration.as_ref()
+                && let Some(guard) = registration.suppressed_failure.as_ref()
+            {
+                let mut output = FunctionCallOutputPayload::from_text(
+                    serde_json::json!({
+                        "kind": "reused_failure_diagnosis",
+                        "failure_fingerprint": guard.failure_fingerprint,
+                        "reason": "this exact action already produced the same stable failure against unchanged state; the prior diagnosis remains authoritative, so change the action or relevant state",
+                    })
+                    .to_string(),
+                );
+                output.success = Some(false);
+                let response = ResponseInputItem::FunctionCallOutput {
+                    call_id: call.call_id.clone(),
+                    output,
+                };
+                if let Some(signal_collector) = signal_collector.as_ref() {
+                    signal_collector.record_suppressed_failure(
+                        registration.ordinal,
+                        &guard.failure_fingerprint,
+                    );
+                }
+                return Ok(response);
+            }
+            if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.suppressed_source_pass.as_ref()
             {
                 let mut output = FunctionCallOutputPayload::from_text(
@@ -321,6 +345,7 @@ impl ToolCallRuntime {
                     if let Some(collector) = &signal_collector {
                         collector.record_accepted_deterministic_continuation_receipts(&receipts);
                     }
+                    let canonical_artifact_required = response.requires_canonical_artifact();
                     let response = response.into_response();
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
                         collector.record_direct_wait_owner_result(
@@ -335,6 +360,7 @@ impl ToolCallRuntime {
                             outcome_context,
                             signal,
                             &response,
+                            canonical_artifact_required,
                             mutation_advanced,
                         );
                     }
@@ -518,6 +544,7 @@ impl ToolCallRuntime {
                 status: "incomplete".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
+                omitted_result_count: None,
             },
             ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
                 call_id: call.call_id,
@@ -666,6 +693,7 @@ mod tests {
                 status: "incomplete".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
+                omitted_result_count: None,
             }
         );
     }

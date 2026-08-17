@@ -22,9 +22,11 @@ use crate::context::ApprovalPromptContext;
 use crate::context::ContextualUserFragment;
 use crate::context::PermissionsInstructions;
 use crate::context::PromptContextCategory;
+use crate::context::SourceClosureReuseContext;
 use crate::context_manager::ContextManager;
 use crate::context_manager::PreparedPromptInput;
 use crate::feedback_tags;
+use crate::hook_runtime::emit_hook_stop_reason;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::record_pending_input;
@@ -125,6 +127,7 @@ use codex_core_skills::injection::PlannedSkillInjections;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
+use codex_memories_read::citations::parse_memory_citation;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
@@ -184,6 +187,7 @@ use tracing::trace_span;
 use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
+const SOURCE_CLOSURE_REUSE_COUNT_METRIC: &str = "codex.source_closure.reuse";
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -559,6 +563,14 @@ pub(crate) async fn run_turn(
                 });
                 if next_generation_request
                     .as_ref()
+                    .is_some_and(|request| request.sampling.is_residual_deterministic())
+                {
+                    turn_context
+                        .turn_timing_state
+                        .record_residual_deterministic_generation();
+                }
+                if next_generation_request
+                    .as_ref()
                     .is_some_and(
                         super::reasoning_governor::GenerationRequestDisposition::completes_protocol_turn_deterministically,
                     )
@@ -568,6 +580,22 @@ pub(crate) async fn run_turn(
                     // generation to rediscover an already-proved action.
                     needs_follow_up = false;
                     next_generation_request = None;
+                }
+                if needs_follow_up
+                    && !has_pending_input
+                    && request_signals.reusable_source_closure(&request_baselines, &settled_state)
+                {
+                    turn_context.session_telemetry.counter(
+                        SOURCE_CLOSURE_REUSE_COUNT_METRIC,
+                        /*inc*/ 1,
+                        &[],
+                    );
+                    let reuse_context = ContextualUserFragment::into(SourceClosureReuseContext);
+                    sess.record_conversation_items(
+                        &turn_context,
+                        std::slice::from_ref(&reuse_context),
+                    )
+                    .await;
                 }
                 turn_context.turn_timing_state.record_generation_outcome(
                     progress_kinds.clone(),
@@ -694,16 +722,29 @@ pub(crate) async fn run_turn(
                             pending_continuation_cause = Some(ContinuationCause::StopHook);
                             continue;
                         } else {
+                            let reason = stop_outcome
+                                .block_reason
+                                .as_deref()
+                                .filter(|reason| !reason.trim().is_empty())
+                                .map(|reason| format!(": {reason}"))
+                                .unwrap_or_default();
                             sess.send_event(
                                 &turn_context,
                                 EventMsg::Warning(WarningEvent {
-                                    message: "Stop hook requested continuation without a prompt; ignoring the block.".to_string(),
+                                    message: format!("Stop hook requested continuation without a prompt{reason}; ignoring the block."),
                                 }),
                             )
                             .await;
                         }
                     }
                     if stop_outcome.should_stop {
+                        emit_hook_stop_reason(
+                            &sess,
+                            &turn_context,
+                            "Stop",
+                            stop_outcome.stop_reason.as_deref(),
+                        )
+                        .await;
                         break;
                     }
                     let mutating_finalizer_aborted = if matches!(
@@ -761,10 +802,10 @@ pub(crate) async fn run_turn(
                         ),
                     )
                     .await?;
-                    let (_, repair_injected) =
+                    let review_report =
                         report_completion_review_outcome(&sess, &turn_context, review_outcome)
                             .await;
-                    if repair_injected {
+                    if review_report.repair_injected {
                         if mutating_finalizer_aborted {
                             return Ok(TurnTaskResult::default());
                         }
@@ -803,12 +844,7 @@ pub(crate) async fn run_turn(
                         .await;
                     } else if after_agent_outcome.workspace_changed {
                         reasoning_governor.host_mutation();
-                        let has_review_lineage = sess
-                            .services
-                            .task_evidence
-                            .completion_review_has_lineage()
-                            .await;
-                        if has_review_lineage
+                        if review_report.provisional_clean
                             && !matches!(
                                 sess.services
                                     .task_evidence
@@ -825,7 +861,7 @@ pub(crate) async fn run_turn(
                                     .to_string(),
                             )
                             .await;
-                        } else if has_review_lineage {
+                        } else if review_report.provisional_clean {
                             if after_agent_outcome.aborted {
                                 return Ok(TurnTaskResult::default());
                             }
@@ -851,22 +887,44 @@ pub(crate) async fn run_turn(
                                 );
                             }
                             let stop_outcome = observed_stop_outcome.stop;
-                            if stop_outcome.should_block
-                                && let Some(hook_prompt_message) =
+                            if stop_outcome.should_block {
+                                if let Some(hook_prompt_message) =
                                     build_hook_prompt_message(&stop_outcome.continuation_fragments)
-                            {
-                                sess.record_response_item_and_emit_turn_item(
-                                    &turn_context,
-                                    hook_prompt_message,
-                                )
-                                .await;
-                                stop_hook_active = true;
-                                reasoning_governor.host_diagnose();
-                                pending_generation_request = None;
-                                pending_continuation_cause = Some(ContinuationCause::StopHook);
-                                continue 'sampling_loop;
+                                {
+                                    sess.record_response_item_and_emit_turn_item(
+                                        &turn_context,
+                                        hook_prompt_message,
+                                    )
+                                    .await;
+                                    stop_hook_active = true;
+                                    reasoning_governor.host_diagnose();
+                                    pending_generation_request = None;
+                                    pending_continuation_cause = Some(ContinuationCause::StopHook);
+                                    continue 'sampling_loop;
+                                } else {
+                                    let reason = stop_outcome
+                                        .block_reason
+                                        .as_deref()
+                                        .filter(|reason| !reason.trim().is_empty())
+                                        .map(|reason| format!(": {reason}"))
+                                        .unwrap_or_default();
+                                    sess.send_event(
+                                        &turn_context,
+                                        EventMsg::Warning(WarningEvent {
+                                            message: format!("Stop hook requested continuation without a prompt{reason}; ignoring the block."),
+                                        }),
+                                    )
+                                    .await;
+                                }
                             }
                             if stop_outcome.should_stop {
+                                emit_hook_stop_reason(
+                                    &sess,
+                                    &turn_context,
+                                    "Stop",
+                                    stop_outcome.stop_reason.as_deref(),
+                                )
+                                .await;
                                 break 'sampling_loop;
                             }
 
@@ -893,19 +951,23 @@ pub(crate) async fn run_turn(
                                 ),
                             )
                             .await?;
-                            let (_, repair_injected) = report_completion_review_outcome(
+                            let refreshed_review_report = report_completion_review_outcome(
                                 &sess,
                                 &turn_context,
                                 refreshed_review,
                             )
                             .await;
-                            if repair_injected {
+                            if refreshed_review_report.repair_injected {
                                 reasoning_governor.host_diagnose();
                                 pending_generation_request = None;
                                 pending_continuation_cause =
                                     Some(ContinuationCause::CompletionReviewRepair);
                                 continue 'sampling_loop;
                             }
+                            trace!(
+                                provisional_clean = refreshed_review_report.provisional_clean,
+                                "refreshed completion review outcome recorded"
+                            );
                         }
                     }
                     if after_agent_outcome.aborted {
@@ -1028,7 +1090,7 @@ async fn report_completion_review_outcome(
     sess: &Session,
     turn_context: &TurnContext,
     outcome: crate::tasks::completion_review::CompletionReviewCoordinatorOutcome,
-) -> (bool, bool) {
+) -> CompletionReviewReport {
     if let Some(warning) = outcome.advisory {
         sess.send_event(
             turn_context,
@@ -1039,7 +1101,15 @@ async fn report_completion_review_outcome(
     for reason in outcome.partial_reasons {
         record_completion_review_partial_reason(sess, reason).await;
     }
-    (outcome.provisional_clean, outcome.repair_injected)
+    CompletionReviewReport {
+        provisional_clean: outcome.provisional_clean,
+        repair_injected: outcome.repair_injected,
+    }
+}
+
+struct CompletionReviewReport {
+    provisional_clean: bool,
+    repair_injected: bool,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1085,6 +1155,13 @@ async fn run_hooks_and_record_inputs_detailed(
         let hook_outcome = inspect_pending_input(sess, turn_context, input_item).await;
         if hook_outcome.should_stop {
             blocked_input = true;
+            emit_hook_stop_reason(
+                sess,
+                turn_context,
+                "UserPromptSubmit",
+                hook_outcome.stop_reason.as_deref(),
+            )
+            .await;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
             if resets_reasoning_governor(input_item) {
@@ -1152,10 +1229,11 @@ async fn build_pure_pending_turn_plan(
 
     if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
         let (first_router, context_update_items) = tokio::join!(
-            built_tools(
+            built_tools_for_pending_turn(
                 sess.as_ref(),
                 step_context.as_ref(),
                 &[],
+                planning_generation,
                 cancellation_token
             ),
             sess.estimate_context_update_items(step_context.as_ref()),
@@ -1320,10 +1398,11 @@ async fn build_pure_pending_turn_plan(
     // Final read-only DAG leaves build the router and context estimate concurrently,
     // then validate the generation before accepting either.
     let (first_router, context_update_items) = tokio::join!(
-        built_tools(
+        built_tools_for_pending_turn(
             sess.as_ref(),
             step_context.as_ref(),
             &skill_plan.invocations,
+            planning_generation,
             cancellation_token,
         ),
         sess.estimate_context_update_items(step_context.as_ref()),
@@ -2334,10 +2413,7 @@ pub(crate) fn build_projected_prompt(
     let input_bytes = serde_json::to_vec(&input).unwrap_or_default();
     let mut manifest = prepared.stable_context_manifest().with_repository_identity(
         step_context.loaded_agents_md.as_deref().map(|loaded| {
-            let bundle = loaded
-                .stable_context_bundle(&PathUri::from_abs_path(&step_context.turn.config.cwd));
-            let _cached_rendering = bundle.rendered;
-            (bundle.identity, bundle.reused, bundle.semantic_replacement)
+            loaded.stable_context_metadata(&PathUri::from_abs_path(&step_context.turn.config.cwd))
         }),
     );
     let stable_input_bytes = manifest.projected_bytes();
@@ -2652,6 +2728,54 @@ fn finalized_router_matches_exposure(
     router.exposure_identity() == current_identity
 }
 
+async fn built_tools_for_pending_turn(
+    sess: &Session,
+    step_context: &StepContext,
+    selected_skill_invocations: &[SkillInvocation],
+    planning_generation: u64,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<Arc<ToolRouter>> {
+    let prepared = sess.startup_prepared_router.take_for_first_turn().await;
+    let turn_context = step_context.turn.as_ref();
+    if selected_skill_invocations.is_empty()
+        && let Some(prepared) = prepared
+        && prepared.planning_generation == planning_generation
+        && prepared.config.as_ref() == turn_context.config.as_ref()
+        && prepared.dynamic_tools.as_slice() == turn_context.dynamic_tools.as_slice()
+    {
+        let _router_build_timing_guard = turn_context
+            .turn_timing_state
+            .begin_local_phase(TurnLocalPhase::RouterBuild);
+        let current_identity = current_tool_exposure_identity(
+            sess,
+            step_context,
+            selected_skill_invocations,
+            cancellation_token,
+        )
+        .await?;
+        if sess.services.planning_generation() == planning_generation
+            && finalized_router_matches_exposure(prepared.router.as_ref(), &current_identity)
+        {
+            turn_context.refresh_deferred_tool_capabilities(
+                prepared.router.deferred_tool_capability_revisions(),
+            );
+            trace!(
+                planning_generation,
+                "reused startup-prepared pending-turn router"
+            );
+            return Ok(prepared.router);
+        }
+    }
+
+    built_tools(
+        sess,
+        step_context,
+        selected_skill_invocations,
+        cancellation_token,
+    )
+    .await
+}
+
 #[instrument(level = "trace",
     skip_all,
     fields(
@@ -2875,6 +2999,7 @@ async fn derive_tool_exposure_identity(
         .manager()
         .has_ready_server_with_resources()
         .await;
+    let tool_search_available = search_tool_enabled(turn_context);
     let available_rui_modes =
         request_user_input_available_modes(turn_context.config.features.get());
     let request_user_input_eligible = turn_context.config.experimental_request_user_input_enabled
@@ -2887,42 +3012,41 @@ async fn derive_tool_exposure_identity(
         wait_available,
         goal_surface_state,
         mcp_resources_available,
+        tool_search_available,
         request_user_input_eligible,
     }
 }
 
 fn agent_surface_stage(sess: &Session, turn_context: &TurnContext) -> AgentSurfaceStage {
-    let eligible = match turn_context.multi_agent_version {
+    let spawn_eligible = match turn_context.multi_agent_version {
         MultiAgentVersion::Disabled => false,
         MultiAgentVersion::V1 => !crate::agent::exceeds_thread_spawn_depth_limit(
             crate::agent::next_thread_spawn_depth(&turn_context.session_source),
             turn_context.config.agent_max_depth,
         ),
-        MultiAgentVersion::V2 => {
-            crate::session::multi_agents::effective_multi_agent_mode(turn_context).is_some()
-        }
+        MultiAgentVersion::V2 => crate::session::multi_agents::spawn_is_authorized(turn_context),
     };
     let control = &sess.services.agent_control;
     agent_surface_stage_from_snapshot(
-        eligible,
+        spawn_eligible,
         control.has_live_agents(),
         control.task_coordinator().has_bindings(),
     )
 }
 
 fn agent_surface_stage_from_snapshot(
-    eligible: bool,
+    spawn_eligible: bool,
     child_graph_nonempty: bool,
     typed_bindings_present: bool,
 ) -> AgentSurfaceStage {
-    if !eligible {
-        AgentSurfaceStage::Prohibited
-    } else if typed_bindings_present {
+    if typed_bindings_present {
         AgentSurfaceStage::TypedAdministration
     } else if child_graph_nonempty {
         AgentSurfaceStage::Lifecycle
-    } else {
+    } else if spawn_eligible {
         AgentSurfaceStage::SpawnOnly
+    } else {
+        AgentSurfaceStage::Prohibited
     }
 }
 
@@ -2983,6 +3107,8 @@ struct PlanModeStreamState {
     started_agent_message_items: HashSet<String>,
     /// Leading whitespace buffered until we see non-whitespace text for an item.
     leading_whitespace_by_item: HashMap<String, String>,
+    /// Raw citation payloads already surfaced through live delta events.
+    emitted_memory_citations: HashSet<String>,
     /// Tracks plan item lifecycle while streaming plan output.
     plan_item_state: ProposedPlanItemState,
 }
@@ -2993,6 +3119,7 @@ impl PlanModeStreamState {
             pending_agent_message_items: HashMap::new(),
             started_agent_message_items: HashSet::new(),
             leading_whitespace_by_item: HashMap::new(),
+            emitted_memory_citations: HashSet::new(),
             plan_item_state: ProposedPlanItemState::new(turn_id),
         }
     }
@@ -3069,11 +3196,17 @@ impl ProposedPlanItemState {
         sess.emit_turn_item_started(turn_context, &item).await;
     }
 
-    async fn push_delta(&mut self, sess: &Session, turn_context: &TurnContext, delta: &str) {
+    async fn push_delta(
+        &mut self,
+        sess: &Session,
+        turn_context: &TurnContext,
+        delta: &str,
+        memory_citation: Option<codex_protocol::memory_citation::MemoryCitation>,
+    ) {
         if self.completed {
             return;
         }
-        if delta.is_empty() {
+        if delta.is_empty() && memory_citation.is_none() {
             return;
         }
         let event = PlanDeltaEvent {
@@ -3081,6 +3214,7 @@ impl ProposedPlanItemState {
             turn_id: turn_context.sub_id.clone(),
             item_id: self.item_id.clone(),
             delta: delta.to_string(),
+            memory_citation,
         };
         sess.send_event(turn_context, EventMsg::PlanDelta(event))
             .await;
@@ -3122,6 +3256,17 @@ async fn maybe_emit_pending_agent_message_start(
             .started_agent_message_items
             .insert(item_id.to_string());
     }
+}
+
+fn take_new_memory_citation(
+    state: &mut PlanModeStreamState,
+    citations: Vec<String>,
+) -> Option<codex_protocol::memory_citation::MemoryCitation> {
+    let citations = citations
+        .into_iter()
+        .filter(|citation| state.emitted_memory_citations.insert(citation.clone()))
+        .collect();
+    parse_memory_citation(citations)
 }
 
 /// Agent messages are text-only today; concatenate all text entries.
@@ -3263,6 +3408,7 @@ async fn handle_plan_segments(
                     turn_id: turn_context.sub_id.clone(),
                     item_id: item_id.to_string(),
                     delta,
+                    memory_citation: None,
                 };
                 sess.send_event(turn_context, EventMsg::AgentMessageContentDelta(event))
                     .await;
@@ -3279,7 +3425,7 @@ async fn handle_plan_segments(
                     }
                     state
                         .plan_item_state
-                        .push_delta(sess, turn_context, &delta)
+                        .push_delta(sess, turn_context, &delta, None)
                         .await;
                 }
             }
@@ -3298,18 +3444,26 @@ async fn emit_streamed_assistant_text_delta(
     if parsed.is_empty() {
         return;
     }
-    if !parsed.citations.is_empty() {
-        // Citation extraction is intentionally local for now; we strip citations from display text
-        // but do not yet surface them in protocol events.
-        let _citations = parsed.citations;
-    }
     if let Some(state) = plan_mode_state {
+        if let Some(memory_citation) = take_new_memory_citation(state, parsed.citations) {
+            maybe_emit_pending_agent_message_start(sess, turn_context, state, item_id).await;
+            let event = AgentMessageContentDeltaEvent {
+                thread_id: sess.thread_id.to_string(),
+                turn_id: turn_context.sub_id.clone(),
+                item_id: item_id.to_string(),
+                delta: String::new(),
+                memory_citation: Some(memory_citation),
+            };
+            sess.send_event(turn_context, EventMsg::AgentMessageContentDelta(event))
+                .await;
+        }
         if !parsed.plan_segments.is_empty() {
             handle_plan_segments(sess, turn_context, state, item_id, parsed.plan_segments).await;
         }
         return;
     }
-    if parsed.visible_text.is_empty() {
+    let memory_citation = parse_memory_citation(parsed.citations);
+    if parsed.visible_text.is_empty() && memory_citation.is_none() {
         return;
     }
     let event = AgentMessageContentDeltaEvent {
@@ -3317,6 +3471,7 @@ async fn emit_streamed_assistant_text_delta(
         turn_id: turn_context.sub_id.clone(),
         item_id: item_id.to_string(),
         delta: parsed.visible_text,
+        memory_citation,
     };
     sess.send_event(turn_context, EventMsg::AgentMessageContentDelta(event))
         .await;
@@ -3370,9 +3525,15 @@ async fn maybe_complete_plan_item_from_message(
             }
         }
         if let Some(plan_text) = extract_proposed_plan_text(&text) {
-            let (plan_text, _citations) = strip_citations(&plan_text);
+            let (plan_text, citations) = strip_citations(&plan_text);
             if !state.plan_item_state.started {
                 state.plan_item_state.start(sess, turn_context).await;
+            }
+            if let Some(memory_citation) = take_new_memory_citation(state, citations) {
+                state
+                    .plan_item_state
+                    .push_delta(sess, turn_context, "", Some(memory_citation))
+                    .await;
             }
             state
                 .plan_item_state
@@ -3672,6 +3833,9 @@ async fn try_run_sampling_request(
         let (timing_status, claim_status) = match resolution {
             SessionStartupPrewarmResolution::Cancelled => return Err(CodexErr::TurnAborted),
             SessionStartupPrewarmResolution::Ready(prewarmed_session) => {
+                turn_context
+                    .turn_timing_state
+                    .record_ready_startup_prewarm();
                 let claim = client_session
                     .claim_startup_prewarm(
                         *prewarmed_session,
@@ -4182,6 +4346,7 @@ async fn try_run_sampling_request(
                             turn_id: turn_context.sub_id.clone(),
                             item_id,
                             delta,
+                            memory_citation: None,
                         };
                         sess.send_event(&turn_context, EventMsg::AgentMessageContentDelta(event))
                             .await;

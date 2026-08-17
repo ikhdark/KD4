@@ -505,10 +505,12 @@ fn build_code_mode_executors(
     let mut deferred_code_mode_nested_tool_specs = Vec::new();
     let mut exec_prompt_tool_specs = Vec::new();
     let mut deferred_exec_prompt_tool_specs = Vec::new();
+    let mut direct_only_tool_names = Vec::new();
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
     for executor in executors {
         let exposure = executor.exposure();
         if exposure == ToolExposure::DirectModelOnly {
+            direct_only_tool_names.push(executor.tool_name().to_string());
             continue;
         }
 
@@ -540,6 +542,8 @@ fn build_code_mode_executors(
         .sort_by(|left, right| compare_code_mode_tools(left, right, &namespace_descriptions));
     let deferred_tools =
         collect_code_mode_exec_prompt_tool_definitions(deferred_exec_prompt_tool_specs.iter());
+    direct_only_tool_names.sort();
+    direct_only_tool_names.dedup();
 
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
         create_code_mode_tool(
@@ -547,6 +551,7 @@ fn build_code_mode_executors(
             &deferred_tools,
             &namespace_descriptions,
             tool_mode == ToolMode::CodeModeOnly,
+            &direct_only_tool_names,
         ),
         code_mode_nested_tool_specs,
         deferred_code_mode_nested_tool_specs,
@@ -767,9 +772,14 @@ fn unified_exec_should_include_shell_parameter(
 #[instrument(level = "trace", skip_all)]
 fn add_mcp_resource_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
     if context.mcp_tools.is_some() && context.exposure_identity.mcp_resources_available {
-        planned_tools.add(ListMcpResourcesHandler);
-        planned_tools.add(ListMcpResourceTemplatesHandler);
-        planned_tools.add(ReadMcpResourceHandler);
+        let exposure = if search_tool_enabled(context.step_context.turn.as_ref()) {
+            ToolExposure::Deferred
+        } else {
+            ToolExposure::Direct
+        };
+        planned_tools.add_with_exposure(ListMcpResourcesHandler, exposure);
+        planned_tools.add_with_exposure(ListMcpResourceTemplatesHandler, exposure);
+        planned_tools.add_with_exposure(ReadMcpResourceHandler, exposure);
     }
 }
 

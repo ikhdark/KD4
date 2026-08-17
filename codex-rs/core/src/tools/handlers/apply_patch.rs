@@ -43,6 +43,7 @@ use codex_apply_patch::ParseError;
 use codex_apply_patch::StreamingPatchParser;
 use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
+use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::protocol::EventMsg;
@@ -424,6 +425,19 @@ impl ApplyPatchHandler {
         .await
         {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+                let _workspace_operation_permit =
+                    if let Ok(native_cwd) = turn_environment.cwd().to_abs_path() {
+                        let workspace_root = get_git_repo_root(&native_cwd)
+                            .unwrap_or_else(|| native_cwd.to_path_buf());
+                        Some(
+                            crate::workspace_operation_gate::acquire_workspace_operation(
+                                &workspace_root,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
                 let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
                     effective_patch_permissions(
                         session.as_ref(),
@@ -434,9 +448,11 @@ impl ApplyPatchHandler {
                     )
                     .await
                     .unwrap_or_else(|_| patch_permissions_without_path_matching(&changes));
-                match apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
-                    .await
-                {
+                let invocation =
+                    apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
+                        .await;
+                drop(_workspace_operation_permit);
+                match invocation {
                     InternalApplyPatchInvocation::Output(item) => {
                         let content = item?;
                         Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
@@ -597,6 +613,16 @@ pub(crate) async fn intercept_apply_patch(
     .await
     {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+            let _workspace_operation_permit = if let Ok(native_cwd) = cwd.to_abs_path() {
+                let workspace_root =
+                    get_git_repo_root(&native_cwd).unwrap_or_else(|| native_cwd.to_path_buf());
+                Some(
+                    crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root)
+                        .await,
+                )
+            } else {
+                None
+            };
             let (approval_keys, effective_additional_permissions, file_system_sandbox_policy) =
                 effective_patch_permissions(
                     session.as_ref(),
@@ -607,9 +633,10 @@ pub(crate) async fn intercept_apply_patch(
                 )
                 .await
                 .unwrap_or_else(|_| patch_permissions_without_path_matching(&changes));
-            match apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
-                .await
-            {
+            let invocation =
+                apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes).await;
+            drop(_workspace_operation_permit);
+            match invocation {
                 InternalApplyPatchInvocation::Output(item) => {
                     let content = item?;
                     Ok(Some(FunctionToolOutput::from_text(content, Some(true))))

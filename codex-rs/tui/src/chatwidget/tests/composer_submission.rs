@@ -981,7 +981,7 @@ async fn patch_activity_prevents_cancelled_turn_prompt_restore() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.record_cancel_edit_candidate(UserMessage::from("revise this prompt"));
     handle_turn_started(&mut chat, "turn-1");
-    chat.on_patch_apply_begin(HashMap::new());
+    chat.on_patch_apply_begin("patch-1".to_string(), HashMap::new());
     chat.submit_op(AppCommand::interrupt_and_restore_prompt_if_no_output());
 
     handle_turn_interrupted(&mut chat, "turn-1");

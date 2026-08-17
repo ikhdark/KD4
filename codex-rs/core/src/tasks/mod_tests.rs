@@ -1,4 +1,6 @@
+use super::FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT;
 use super::TASK_COMPACT_METRIC;
+use super::TERMINAL_MUTATION_FINALIZATION_TIMEOUT;
 use super::TerminalDeadline;
 use super::TerminalWaitError;
 use super::apply_terminal_phase_timings_to_timing;
@@ -6,11 +8,16 @@ use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
 use super::merge_completion_review_partial;
+use super::pending_terminal_recovery_state;
+use super::protocol_terminalization_receipt;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
 use crate::state::SamplingAdmission;
 use crate::state::TerminalDeliveryState;
 use crate::state::TurnTerminalCoordinator;
+use crate::task_evidence::TerminalDeliveryState as DurableDeliveryState;
+use crate::task_evidence::TerminalRecoveryState;
+use crate::task_evidence::TerminalizationReceiptSnapshot;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
@@ -20,8 +27,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
+use codex_protocol::protocol::TerminalizationRecoveryState;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTiming;
+use codex_protocol::protocol::TurnTimingTerminalization;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -130,6 +139,102 @@ async fn abort_all_tasks_clears_empty_active_turn() {
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 
     assert!(session.active_turn.lock().await.is_none());
+}
+
+#[test]
+fn final_proof_candidate_seal_timeout_is_dedicated() {
+    assert_eq!(FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT, Duration::from_secs(5));
+    assert_eq!(
+        TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+        Duration::from_secs(1)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_proof_candidate_seal_can_outlive_generic_mutation_timeout() {
+    let deadline = TerminalDeadline::start();
+
+    let sealed = deadline
+        .run(
+            "final_proof_gate",
+            FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT,
+            async {
+                tokio::time::sleep(TERMINAL_MUTATION_FINALIZATION_TIMEOUT * 2).await;
+                "sealed"
+            },
+        )
+        .await;
+
+    assert_eq!(sealed, Ok("sealed"));
+}
+
+#[test]
+fn terminalization_recovery_states_project_to_public_receipts() {
+    assert_eq!(
+        pending_terminal_recovery_state(DurableDeliveryState::Delivered),
+        TerminalRecoveryState::None
+    );
+    for delivery_state in [
+        DurableDeliveryState::NotAttempted,
+        DurableDeliveryState::Claimed,
+        DurableDeliveryState::DeliveryFailed,
+    ] {
+        assert_eq!(
+            pending_terminal_recovery_state(delivery_state),
+            TerminalRecoveryState::Pending
+        );
+    }
+
+    for (recovery_state, expected) in [
+        (
+            TerminalRecoveryState::None,
+            TerminalizationRecoveryState::None,
+        ),
+        (
+            TerminalRecoveryState::Pending,
+            TerminalizationRecoveryState::Pending,
+        ),
+        (
+            TerminalRecoveryState::Recovered,
+            TerminalizationRecoveryState::Recovered,
+        ),
+    ] {
+        let receipt = protocol_terminalization_receipt(TerminalizationReceiptSnapshot {
+            terminal_identity: "thread:turn".to_string(),
+            terminalization: TurnTimingTerminalization::default(),
+            delivery_state: DurableDeliveryState::Delivered,
+            active_turn_detached: true,
+            terminal_interaction_released: true,
+            recovery_state,
+            deadline_exhausted_phase: None,
+        });
+        assert_eq!(receipt.recovery_state, expected);
+    }
+}
+
+#[tokio::test]
+async fn terminalization_recovery_notification_claim_is_one_shot() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let identity = format!("{}:turn", session.thread_id);
+    assert!(
+        session
+            .register_authoritative_terminal_delivery(
+                identity.clone(),
+                "terminal-fingerprint".to_string(),
+            )
+            .await
+    );
+
+    assert!(
+        session
+            .claim_terminal_recovery_notification(&identity)
+            .await
+    );
+    assert!(
+        !session
+            .claim_terminal_recovery_notification(&identity)
+            .await
+    );
 }
 
 #[tokio::test]

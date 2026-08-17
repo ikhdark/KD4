@@ -96,6 +96,14 @@ fn detects_recommended_plugins_fragment() {
 }
 
 #[test]
+fn detects_source_closure_reuse_fragment() {
+    let text = SourceClosureReuseContext.render();
+    assert!(is_contextual_user_fragment(&ContentItem::InputText {
+        text
+    }));
+}
+
+#[test]
 fn detects_legacy_goal_context_fragment() {
     assert!(is_contextual_user_fragment(&ContentItem::InputText {
         text: "<goal_context>\nContinue working toward the active thread goal.\n</goal_context>"

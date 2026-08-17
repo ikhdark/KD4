@@ -1128,19 +1128,11 @@ See the Codex keymap documentation for supported actions and examples."
             "tui startup initial frame scheduled"
         );
         app.refresh_startup_skills(&app_server);
-        // Kick off a non-blocking rate-limit prefetch so the first `/status`
-        // already has data and available reset credits can be surfaced, without
-        // delaying the initial frame render.
+        // Queue a non-blocking rate-limit prefetch through the same background
+        // request path used by interactive refreshes.
         if requires_openai_auth && has_chatgpt_account {
-            let reset_hint_request_id = app.chat_widget.start_rate_limit_reset_startup_check();
-            app.refresh_rate_limits(
-                &app_server,
-                RateLimitRefreshOrigin::StartupPrefetch {
-                    reset_hint_request_id,
-                },
-            );
+            app.chat_widget.prefetch_rate_limits();
         }
-
         let mut listen_for_app_server_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
 

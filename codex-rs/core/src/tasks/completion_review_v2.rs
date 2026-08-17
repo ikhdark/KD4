@@ -506,6 +506,26 @@ enum TurnReviewPhase {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CompletionReviewState {
     phase: TurnReviewPhase,
+    ready_phase_recorded: bool,
+    terminal_phase_recorded: bool,
+}
+
+impl CompletionReviewState {
+    fn record_current_phase(&mut self, timing: &crate::turn_timing::TurnTimingState) {
+        match self.phase {
+            TurnReviewPhase::Ready if !self.ready_phase_recorded => {
+                self.ready_phase_recorded = true;
+                timing.record_completion_review_ready_phase();
+            }
+            TurnReviewPhase::Terminal if !self.terminal_phase_recorded => {
+                self.terminal_phase_recorded = true;
+                timing.record_completion_review_terminal_phase();
+            }
+            TurnReviewPhase::Ready
+            | TurnReviewPhase::CorrectionInjected
+            | TurnReviewPhase::Terminal => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3400,6 +3420,28 @@ fn review_attempt_identity(
 }
 
 pub(crate) async fn coordinate_completion_review(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    cancellation_token: &CancellationToken,
+    turn_evidence: &CompletionReviewTurnEvidence,
+    candidate_completion: Option<&str>,
+    state: &mut CompletionReviewState,
+) -> CodexResult<CompletionReviewCoordinatorOutcome> {
+    state.record_current_phase(turn_context.turn_timing_state.as_ref());
+    let outcome = coordinate_completion_review_inner(
+        sess,
+        turn_context,
+        cancellation_token,
+        turn_evidence,
+        candidate_completion,
+        state,
+    )
+    .await;
+    state.record_current_phase(turn_context.turn_timing_state.as_ref());
+    outcome
+}
+
+async fn coordinate_completion_review_inner(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     cancellation_token: &CancellationToken,

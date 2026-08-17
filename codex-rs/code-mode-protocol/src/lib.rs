@@ -11,6 +11,7 @@ pub use description::ToolDefinition;
 pub use description::ToolNamespaceDescription;
 pub use description::augment_tool_definition;
 pub use description::build_exec_tool_description;
+pub use description::build_exec_tool_description_with_direct_only_tools;
 pub use description::build_wait_tool_description;
 pub use description::enabled_tool_metadata;
 pub use description::is_code_mode_nested_tool;

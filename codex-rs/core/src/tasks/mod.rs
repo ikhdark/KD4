@@ -56,6 +56,7 @@ use crate::task_evidence::TerminalDecisionClaim;
 use crate::task_evidence::TerminalDeliveryState as DurableDeliveryState;
 use crate::task_evidence::TerminalInteractionUpdate;
 use crate::task_evidence::TerminalRecoveryState;
+use crate::task_evidence::TerminalizationReceiptSnapshot;
 use crate::terminal_event_fingerprint;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
@@ -101,8 +102,44 @@ pub(crate) use user_shell::execute_user_shell_command;
 
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TERMINAL_MUTATION_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
+// Sealing is the only terminal phase that may need to collect and persist the
+// complete proof bundle. Give it a little more room without lengthening every
+// terminal cleanup operation.
+const FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINALIZATION_DEADLINE: Duration = Duration::from_secs(5);
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
+
+fn pending_terminal_recovery_state(delivery_state: DurableDeliveryState) -> TerminalRecoveryState {
+    match delivery_state {
+        DurableDeliveryState::Delivered => TerminalRecoveryState::None,
+        DurableDeliveryState::NotAttempted
+        | DurableDeliveryState::Claimed
+        | DurableDeliveryState::DeliveryFailed => TerminalRecoveryState::Pending,
+    }
+}
+
+fn protocol_terminalization_receipt(
+    snapshot: TerminalizationReceiptSnapshot,
+) -> TurnTerminalizationReceipt {
+    TurnTerminalizationReceipt {
+        terminal_identity: snapshot.terminal_identity,
+        terminalization: snapshot.terminalization,
+        delivery_state: match snapshot.delivery_state {
+            DurableDeliveryState::NotAttempted => TerminalizationDeliveryState::NotAttempted,
+            DurableDeliveryState::Claimed => TerminalizationDeliveryState::Claimed,
+            DurableDeliveryState::Delivered => TerminalizationDeliveryState::Delivered,
+            DurableDeliveryState::DeliveryFailed => TerminalizationDeliveryState::DeliveryFailed,
+        },
+        active_turn_detached: snapshot.active_turn_detached,
+        terminal_interaction_released: snapshot.terminal_interaction_released,
+        recovery_state: match snapshot.recovery_state {
+            TerminalRecoveryState::None => TerminalizationRecoveryState::None,
+            TerminalRecoveryState::Pending => TerminalizationRecoveryState::Pending,
+            TerminalRecoveryState::Recovered => TerminalizationRecoveryState::Recovered,
+        },
+        deadline_exhausted_phase: snapshot.deadline_exhausted_phase,
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TurnTaskResult {
@@ -1603,7 +1640,7 @@ impl Session {
                     let released = session
                         .release_terminal_turn_after_live_handoff(&authority.turn_id)
                         .await;
-                    let _ = session
+                    let updated = session
                         .services
                         .task_evidence
                         .update_terminal_interaction(TerminalInteractionUpdate {
@@ -1621,6 +1658,17 @@ impl Session {
                             terminalization: None,
                         })
                         .await;
+                    if updated {
+                        let turn_context = session
+                            .new_default_turn_with_sub_id(authority.turn_id.clone())
+                            .await;
+                        session
+                            .emit_terminalization_receipt(
+                                turn_context.as_ref(),
+                                &authority.terminal_identity,
+                            )
+                            .await;
+                    }
                     if !require_app_server_ack {
                         break;
                     }
@@ -1746,7 +1794,7 @@ impl Session {
             let released = self
                 .release_terminal_turn_after_live_handoff(&authority.turn_id)
                 .await;
-            let _ = self
+            let updated = self
                 .services
                 .task_evidence
                 .update_terminal_interaction(TerminalInteractionUpdate {
@@ -1768,6 +1816,13 @@ impl Session {
                     terminalization: None,
                 })
                 .await;
+            if updated {
+                self.emit_terminalization_receipt(
+                    turn_context.as_ref(),
+                    &authority.terminal_identity,
+                )
+                .await;
+            }
             if !parent_notification_completed {
                 self.schedule_parent_terminal_notification_retry(
                     Arc::clone(&turn_context),
@@ -2068,7 +2123,7 @@ impl Session {
                 authority.event.clone(),
             );
         }
-        let _ = self
+        let updated = self
             .services
             .task_evidence
             .update_terminal_interaction(TerminalInteractionUpdate {
@@ -2090,6 +2145,40 @@ impl Session {
                 terminalization: None,
             })
             .await;
+        if updated {
+            self.emit_terminalization_receipt(turn_context.as_ref(), &authority.terminal_identity)
+                .await;
+        }
+    }
+
+    async fn emit_terminalization_receipt(
+        &self,
+        turn_context: &TurnContext,
+        terminal_identity: &str,
+    ) {
+        let Some(snapshot) = self
+            .services
+            .task_evidence
+            .terminalization_receipt_snapshot(terminal_identity)
+            .await
+        else {
+            return;
+        };
+        if snapshot.recovery_state == TerminalRecoveryState::Recovered
+            && !self
+                .claim_terminal_recovery_notification(terminal_identity)
+                .await
+        {
+            return;
+        }
+        self.send_event(
+            turn_context,
+            EventMsg::TurnTerminalizationComplete(TurnTerminalizationCompleteEvent {
+                turn_id: turn_context.sub_id.clone(),
+                receipt: protocol_terminalization_receipt(snapshot),
+            }),
+        )
+        .await;
     }
 
     async fn emit_post_terminal_metrics(
@@ -2340,6 +2429,13 @@ impl Session {
                                 inspect_pending_input(self, &turn_context, &pending_input_item)
                                     .await;
                             if hook_outcome.should_stop {
+                                crate::hook_runtime::emit_hook_stop_reason(
+                                    self,
+                                    &turn_context,
+                                    "UserPromptSubmit",
+                                    hook_outcome.stop_reason.as_deref(),
+                                )
+                                .await;
                                 record_additional_contexts(
                                     self,
                                     &turn_context,
@@ -2789,7 +2885,7 @@ impl Session {
                 .deadline
                 .run(
                     "final_proof_gate",
-                    TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                    FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT,
                     seal_terminal_final_proof(
                         self,
                         &turn_context,
@@ -3248,7 +3344,6 @@ impl Session {
             };
             let phase_timings_ns = finalization.deadline.phase_timings_ns();
             let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
-            let deadline_exhausted_phase = finalization.deadline.exhausted_phase();
             let task_evidence = self.services.task_evidence.clone();
             let session = Arc::clone(self);
             let turn_context = Arc::clone(&turn_context);
@@ -3265,7 +3360,7 @@ impl Session {
                         post_terminal_cleanup_completed: true,
                         active_turn_detached: cleared_active_turn,
                         terminal_interaction_released: cleared_active_turn,
-                        recovery_state: TerminalRecoveryState::None,
+                        recovery_state: pending_terminal_recovery_state(delivery_state),
                         phase_timings_ns,
                         terminalization: final_terminalization.clone(),
                     }),
@@ -3273,41 +3368,12 @@ impl Session {
                 .await;
                 match persistence {
                     Ok(true) => {
-                        if let Some(terminalization) = final_terminalization {
-                            let receipt = TurnTerminalizationReceipt {
-                                terminal_identity,
-                                terminalization,
-                                delivery_state: match delivery_state {
-                                    DurableDeliveryState::NotAttempted => {
-                                        TerminalizationDeliveryState::NotAttempted
-                                    }
-                                    DurableDeliveryState::Claimed => {
-                                        TerminalizationDeliveryState::Claimed
-                                    }
-                                    DurableDeliveryState::Delivered => {
-                                        TerminalizationDeliveryState::Delivered
-                                    }
-                                    DurableDeliveryState::DeliveryFailed => {
-                                        TerminalizationDeliveryState::DeliveryFailed
-                                    }
-                                },
-                                active_turn_detached: cleared_active_turn,
-                                terminal_interaction_released: cleared_active_turn,
-                                recovery_state: TerminalizationRecoveryState::None,
-                                deadline_exhausted_phase,
-                            };
-                            session
-                                .send_event(
-                                    turn_context.as_ref(),
-                                    EventMsg::TurnTerminalizationComplete(
-                                        TurnTerminalizationCompleteEvent {
-                                            turn_id: turn_context.sub_id.clone(),
-                                            receipt,
-                                        },
-                                    ),
-                                )
-                                .await;
-                        }
+                        session
+                            .emit_terminalization_receipt(
+                                turn_context.as_ref(),
+                                &terminal_identity,
+                            )
+                            .await;
                     }
                     Ok(false) => {
                         warn!(turn_id = %turn_context.sub_id, "failed to persist late terminalization receipt; completed turn remains authoritative");

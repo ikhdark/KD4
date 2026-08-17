@@ -639,6 +639,10 @@ async fn typed_preflight_helpers_bypass_raw_code_mode_dispatch() {
             !exec.description.contains(&format!("tools.{helper}")),
             "typed helper `{helper}` must not require JavaScript dispatch"
         );
+        assert!(
+            exec.description.contains(&format!("`{helper}`")),
+            "direct-only guidance must be generated from the executor projection"
+        );
     }
 }
 
@@ -1067,6 +1071,7 @@ async fn mcp_resource_tools_follow_the_aggregate_ready_server_capability() {
     for mcp_resources_available in [false, true] {
         let identity = ToolExposureIdentity {
             mcp_resources_available,
+            tool_search_available: true,
             ..ToolExposureIdentity::default()
         };
         let plan = probe_with(
@@ -1084,13 +1089,38 @@ async fn mcp_resource_tools_follow_the_aggregate_ready_server_capability() {
             "read_mcp_resource",
         ];
         if mcp_resources_available {
-            plan.assert_visible_contains(&resource_tools);
+            plan.assert_visible_lacks(&resource_tools);
             plan.assert_registered_contains(&resource_tools);
+            for tool in resource_tools {
+                assert_eq!(plan.exposure(tool), ToolExposure::Deferred);
+            }
         } else {
             plan.assert_visible_lacks(&resource_tools);
             plan.assert_registered_lacks(&resource_tools);
         }
     }
+}
+
+#[tokio::test]
+async fn mcp_resource_tools_remain_direct_without_tool_search() {
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct", "lookup")]),
+            exposure_identity: ToolExposureIdentity {
+                mcp_resources_available: true,
+                tool_search_available: false,
+                ..ToolExposureIdentity::default()
+            },
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    plan.assert_visible_contains(&[
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "read_mcp_resource",
+    ]);
 }
 
 #[tokio::test]

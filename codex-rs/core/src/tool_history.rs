@@ -17,10 +17,10 @@ use crate::tools::command_output_artifact::reconcile_active_tool_history_artifac
 use crate::tools::command_output_artifact::remint_tool_history_artifact_for_thread;
 
 const RECEIPT_VERSION: u8 = 1;
-const RECEIPT_MAX_TOKENS: usize = 512;
-const RECEIPT_DIGEST_TARGET_TOKENS: usize = 240;
-const MINIMUM_RAW_TOKENS: u64 = 512;
-const MINIMUM_SAVED_TOKENS: u64 = 128;
+const RECEIPT_MAX_TOKENS: usize = 256;
+const RECEIPT_DIGEST_TARGET_TOKENS: usize = 96;
+const MINIMUM_RAW_TOKENS: u64 = 256;
+const MINIMUM_SAVED_TOKENS: u64 = 64;
 const MINIMUM_RELATIVE_SAVINGS_PERCENT: u64 = 25;
 const LEDGER_VERSION: u8 = 1;
 
@@ -168,6 +168,22 @@ pub(crate) struct ToolHistoryState {
 impl ToolHistoryState {
     pub(crate) fn register(&mut self, candidate: ToolHistoryCandidate) {
         self.candidates.insert(candidate.call_id.clone(), candidate);
+    }
+
+    pub(crate) fn consumed_outputs_for_tool(&self, tool_identity: &str) -> Vec<(String, String)> {
+        self.candidates
+            .values()
+            .filter(|candidate| {
+                candidate.tool_identity == tool_identity
+                    && candidate.consumed_by_generation.is_some()
+            })
+            .map(|candidate| {
+                (
+                    candidate.call_id.clone(),
+                    candidate.bounded_model_output.clone(),
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn mark_consumed(

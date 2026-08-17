@@ -111,6 +111,7 @@ fn external_context_pollution_items_include_web_search_and_tool_search() {
             status: "completed".to_string(),
             execution: "client".to_string(),
             tools: Vec::new(),
+            omitted_result_count: None,
             internal_chat_message_metadata_passthrough: None,
         },
     ];

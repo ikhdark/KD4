@@ -12,7 +12,9 @@ To find one, filter `ALL_TOOLS` by `name` and `description`."#;
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate tool calls in a fresh async V8 isolate.
 - Input is JavaScript source, not JSON, quotes, or a Markdown fence. Node, filesystem, network, and console APIs are unavailable.
 - Nested tools are normalized methods on `tools` (for example `await tools.exec_command(...)`); methods accept the documented string or object and return the documented object or string.
-- Treat one `exec` as the evidence packet for the current generation: call all independent tools with `Promise.all`, perform deterministic dependent calls in the same script, and emit one coherent result after the packet is complete.
+- Only tools listed in `ALL_TOOLS` are callable inside `exec`; direct-only tools stay outside.
+- In one generation's evidence packet, group 2-5 independent discovery calls with `Promise.all`; perform deterministic dependent calls in the same script; emit one result.
+- Do not retry an unchanged nested call after deterministic contract/unsupported-payload failure; emit it and change route next generation.
 - Prefer a sufficiently large complete packet over yielding for another model generation. Use `yield_control()` only when the model must make a new decision before the script can continue.
 - Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` defaults to 10000 and controls the internal observation/progress cadence; empty observations do not cause a model-visible yield or a new model generation. `max_output_tokens` bounds the outer result only after the coherent nested evidence packet is formed and defaults to 10000, subject to the model hard limit.
 - When evaluation ends, unawaited work is discarded.
@@ -248,8 +250,34 @@ pub fn build_exec_tool_description(
     namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
     code_mode_only: bool,
 ) -> String {
+    build_exec_tool_description_with_direct_only_tools(
+        enabled_tools,
+        deferred_tools,
+        namespace_descriptions,
+        code_mode_only,
+        &[],
+    )
+}
+
+pub fn build_exec_tool_description_with_direct_only_tools(
+    enabled_tools: &[ToolDefinition],
+    deferred_tools: &[ToolDefinition],
+    namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
+    code_mode_only: bool,
+    direct_only_tool_names: &[String],
+) -> String {
     let mut sections = Vec::new();
     sections.push(EXEC_DESCRIPTION_TEMPLATE.to_string());
+    if !direct_only_tool_names.is_empty() {
+        let names = direct_only_tool_names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sections.push(format!(
+            "Direct-only tools omitted from `ALL_TOOLS`: {names}. Call these through their direct model tool interface, not through `exec`."
+        ));
+    }
     if !deferred_tools.is_empty() {
         sections.push(DEFERRED_NESTED_TOOLS_GUIDANCE.to_string());
     }
@@ -906,7 +934,11 @@ bar"
         assert!(description.contains("type: \"image\""));
         assert!(description.contains("type: \"audio\""));
         assert!(description.contains("unawaited work is discarded"));
-        assert!(description.contains("call all independent tools with `Promise.all`"));
+        assert!(description.contains("group 2-5 independent discovery calls with `Promise.all`"));
+        assert!(
+            description.contains("Only tools listed in `ALL_TOOLS` are callable inside `exec`")
+        );
+        assert!(description.contains("Do not retry an unchanged nested call"));
         assert!(description.contains("deterministic dependent calls in the same script"));
         assert!(description.contains("Prefer a sufficiently large complete packet"));
         assert!(!description.contains("Shared MCP Types:"));

@@ -2275,6 +2275,7 @@ fn normalize_adds_missing_output_for_tool_search_call() {
                 status: "incomplete".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
+                omitted_result_count: None,
                 internal_chat_message_metadata_passthrough: None,
             },
         ]
@@ -2357,6 +2358,7 @@ fn normalize_removes_orphan_client_tool_search_output() {
         status: "completed".to_string(),
         execution: "client".to_string(),
         tools: Vec::new(),
+        omitted_result_count: None,
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
@@ -2376,6 +2378,7 @@ fn normalize_removes_orphan_client_tool_search_output_panics_in_debug() {
         status: "completed".to_string(),
         execution: "client".to_string(),
         tools: Vec::new(),
+        omitted_result_count: None,
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
@@ -2390,6 +2393,7 @@ fn normalize_keeps_server_tool_search_output_without_matching_call() {
         status: "completed".to_string(),
         execution: "server".to_string(),
         tools: Vec::new(),
+        omitted_result_count: None,
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
@@ -2404,6 +2408,7 @@ fn normalize_keeps_server_tool_search_output_without_matching_call() {
             status: "completed".to_string(),
             execution: "server".to_string(),
             tools: Vec::new(),
+            omitted_result_count: None,
             internal_chat_message_metadata_passthrough: None,
         }]
     );

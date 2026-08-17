@@ -406,6 +406,7 @@ pub(crate) async fn handle_output_item_done(
                 status: "incomplete".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
+                omitted_result_count: None,
             };
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
@@ -573,12 +574,14 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
             status,
             execution,
             tools,
+            omitted_result_count,
         } => Some(ResponseItem::ToolSearchOutput {
             id: None,
             call_id: Some(call_id.clone()),
             status: status.clone(),
             execution: execution.clone(),
             tools: tools.clone(),
+            omitted_result_count: *omitted_result_count,
             internal_chat_message_metadata_passthrough: None,
         }),
         _ => None,

@@ -1,4 +1,6 @@
 use crate::function_tool::FunctionCallError;
+use crate::tools::command_output_artifact::ReadToolOutputError;
+use crate::tools::command_output_artifact::ReadToolOutputResult;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 #[cfg(test)]
 use crate::tools::command_output_artifact::ToolOutputSelectorResult;
@@ -25,6 +27,7 @@ use codex_tools::ToolOutputProjectionMetadata;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::Path;
 
 const DEFAULT_MAX_BYTES: usize = 16_384;
 const DEFAULT_LINE_COUNT: usize = 200;
@@ -153,27 +156,14 @@ async fn handle_read_tool_output(
             .unwrap_or_default()
             .as_bytes(),
     );
-    let (output, reused) = match &invocation.source {
-        ToolCallSource::Direct => {
-            read_tool_output_selectors_with_reuse(
-                invocation.turn.config.codex_home.as_path(),
-                &invocation.session.thread_id.to_string(),
-                &args.artifact_id,
-                selectors,
-            )
-            .await
-        }
-        ToolCallSource::CodeMode { .. } => {
-            read_tool_output_selectors_with_ceiling_and_reuse(
-                invocation.turn.config.codex_home.as_path(),
-                &invocation.session.thread_id.to_string(),
-                &args.artifact_id,
-                selectors,
-                CODE_MODE_RECOVERY_TOKEN_CEILING,
-            )
-            .await
-        }
-    }
+    let (output, reused) = execute_recovery_transaction(
+        invocation.turn.config.codex_home.as_path(),
+        &invocation.session.thread_id.to_string(),
+        &args.artifact_id,
+        selectors,
+        code_mode_recovery,
+    )
+    .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
     if !reused {
         invocation
@@ -198,12 +188,35 @@ async fn handle_read_tool_output(
     }))
 }
 
+pub(crate) async fn execute_recovery_transaction(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    selectors: Vec<ToolOutputSelector>,
+    code_mode_recovery: bool,
+) -> Result<(ReadToolOutputResult, bool), ReadToolOutputError> {
+    if code_mode_recovery {
+        read_tool_output_selectors_with_ceiling_and_reuse(
+            codex_home,
+            thread_id,
+            artifact_id,
+            selectors,
+            CODE_MODE_RECOVERY_TOKEN_CEILING,
+        )
+        .await
+    } else {
+        read_tool_output_selectors_with_reuse(codex_home, thread_id, artifact_id, selectors).await
+    }
+}
+
 fn exact_code_mode_recovery_receipt(
     code_mode_recovery: bool,
     output: &crate::tools::command_output_artifact::ReadToolOutputResult,
     action_bounds_hash: String,
 ) -> Option<TurnTimingDeterministicContinuationReceipt> {
     (code_mode_recovery
+        && output.complete
+        && output.unavailable_ranges.is_empty()
         && !output.results.is_empty()
         && output
             .results
@@ -221,22 +234,12 @@ fn exact_code_mode_recovery_receipt(
 }
 
 fn recovery_retruncation_count(
-    output: &crate::tools::command_output_artifact::ReadToolOutputResult,
+    _output: &crate::tools::command_output_artifact::ReadToolOutputResult,
 ) -> u32 {
-    u32::try_from(
-        output
-            .results
-            .iter()
-            .filter(|result| {
-                matches!(
-                    result.status,
-                    ToolOutputSelectorStatus::SelectorTooLarge
-                        | ToolOutputSelectorStatus::AggregateOmitted
-                )
-            })
-            .count(),
-    )
-    .unwrap_or(u32::MAX)
+    // Typed overflow is a truthful transaction outcome, not loss of evidence
+    // that was already complete. Direct recovery bypasses recursive spilling,
+    // and code-mode fit is decided before the carrier is serialized.
+    0
 }
 
 fn resolved_selectors(
@@ -370,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn retruncation_count_tracks_incomplete_recovery_results() {
+    fn typed_overflow_is_not_counted_as_retruncation() {
         let output = crate::tools::command_output_artifact::ReadToolOutputResult {
             artifact_id: "artifact".to_string(),
             canonical_sha256: "digest".to_string(),
@@ -386,7 +389,7 @@ mod tests {
             ],
         };
 
-        assert_eq!(recovery_retruncation_count(&output), 2);
+        assert_eq!(recovery_retruncation_count(&output), 0);
     }
 
     #[test]

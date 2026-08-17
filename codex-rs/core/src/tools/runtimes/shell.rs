@@ -52,6 +52,7 @@ use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direc
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -80,6 +81,7 @@ pub struct ShellRequest {
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub(crate) known_delta: Option<PreparedKnownDelta>,
     pub(crate) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
+    pub(crate) workspace_operation_root: Option<PathBuf>,
 }
 
 /// Selects `ShellRuntime` behavior for different callers.
@@ -270,6 +272,12 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 ..Default::default()
             });
         }
+        let _workspace_operation_permit = match req.workspace_operation_root.as_deref() {
+            Some(root) => {
+                Some(crate::workspace_operation_gate::acquire_workspace_operation(root).await)
+            }
+            None => None,
+        };
         let session_shell = ctx.session.user_shell();
         let shell = req
             .turn_environment

@@ -4187,6 +4187,7 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
     let without_override = TurnStartParams {
         thread_id: "thread_123".to_string(),
         client_user_message_id: None,
+        run_independently: None,
         input: vec![],
         responsesapi_client_metadata: None,
         additional_context: None,
@@ -4209,6 +4210,22 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
     let serialized_without_override =
         serde_json::to_value(&without_override).expect("params should serialize");
     assert_eq!(serialized_without_override.get("serviceTier"), None);
+}
+
+#[test]
+fn turn_start_params_round_trip_run_independently() {
+    let params: TurnStartParams = serde_json::from_value(json!({
+        "threadId": "thread_123",
+        "input": [],
+        "runIndependently": true
+    }))
+    .expect("params should deserialize");
+
+    assert_eq!(params.run_independently, Some(true));
+    assert_eq!(
+        serde_json::to_value(params).expect("params should serialize")["runIndependently"],
+        json!(true)
+    );
 }
 
 #[test]

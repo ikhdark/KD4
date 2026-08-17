@@ -37,6 +37,7 @@ async fn approval_key_includes_environment_id() {
         },
         known_delta: None,
         validation_launch: None,
+        workspace_operation_root: None,
     };
     let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
     let original_key = runtime.approval_keys(&request);
@@ -88,6 +89,7 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
         },
         known_delta: None,
         validation_launch: None,
+        workspace_operation_root: None,
     };
     let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
 

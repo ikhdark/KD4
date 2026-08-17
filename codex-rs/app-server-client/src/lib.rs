@@ -1184,6 +1184,8 @@ mod tests {
                 turn_id: "turn".to_string(),
                 item_id: "item".to_string(),
                 delta: delta.to_string(),
+                memory_citation: None,
+                memory_citation: None,
             },
         )
     }
@@ -2293,6 +2295,8 @@ mod tests {
                         turn_id: "turn".to_string(),
                         item_id: "item".to_string(),
                         delta: "hello".to_string(),
+                        memory_citation: None,
+                        memory_citation: None,
                     }
                 )
             )

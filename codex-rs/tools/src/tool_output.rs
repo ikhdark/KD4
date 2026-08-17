@@ -749,6 +749,17 @@ fn is_essential_key(key: &str) -> bool {
         || normalized == "retentionlimithit"
         || normalized == "action"
         || normalized == "outcome"
+        || matches!(
+            normalized.as_str(),
+            "sha256"
+                | "content_identity"
+                | "unchanged"
+                | "selected_test_count"
+                | "matched_tests"
+                | "command_was_executed"
+                | "failure_signature"
+                | "not_exercised"
+        )
 }
 
 impl ToolOutput for JsonToolOutput {
@@ -928,12 +939,13 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
             status,
             execution,
             tools,
+            omitted_result_count,
             ..
         } => serde_json::json!({
             "status": status,
             "execution": execution,
             "tools": tools,
-            "omitted_result_count": JsonValue::Null,
+            "omitted_result_count": omitted_result_count,
         }),
         ResponseInputItem::McpToolCallOutput { output, .. } => serde_json::to_value(output)
             .unwrap_or_else(|err| {
@@ -1091,6 +1103,14 @@ mod canonical_tests {
             "omitted_result_count": 7,
             "status": "aborted",
             "retention_limit_reason": "per_artifact_safety_limit",
+            "sha256": "content-digest",
+            "content_identity": "stable-identity",
+            "unchanged": true,
+            "selected_test_count": 2,
+            "matched_tests": ["first", "second"],
+            "command_was_executed": true,
+            "failure_signature": null,
+            "not_exercised": false,
             "valid": true,
             "payload": "spillable",
             "nested": {
@@ -1112,6 +1132,20 @@ mod canonical_tests {
             metadata.essential_inline["nested"]["remaining_match_count"],
             3
         );
+        assert_eq!(metadata.essential_inline["sha256"], "content-digest");
+        assert_eq!(
+            metadata.essential_inline["content_identity"],
+            "stable-identity"
+        );
+        assert_eq!(metadata.essential_inline["unchanged"], true);
+        assert_eq!(metadata.essential_inline["selected_test_count"], 2);
+        assert_eq!(
+            metadata.essential_inline["matched_tests"],
+            serde_json::json!(["first", "second"])
+        );
+        assert_eq!(metadata.essential_inline["command_was_executed"], true);
+        assert!(metadata.essential_inline["failure_signature"].is_null());
+        assert_eq!(metadata.essential_inline["not_exercised"], false);
         assert!(metadata.essential_inline.get("valid").is_none());
         assert!(metadata.essential_inline.get("payload").is_none());
         assert!(metadata.essential_inline["nested"].get("items").is_none());
@@ -1155,12 +1189,13 @@ mod canonical_tests {
                 status: "incomplete".to_string(),
                 execution: "client".to_string(),
                 tools: vec![serde_json::json!({"name": "lookup"})],
+                omitted_result_count: Some(4),
             }),
             serde_json::json!({
                 "status": "incomplete",
                 "execution": "client",
                 "tools": [{"name": "lookup"}],
-                "omitted_result_count": null,
+                "omitted_result_count": 4,
             })
         );
     }

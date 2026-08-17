@@ -30,7 +30,7 @@ pub(crate) mod request_user_input_spec;
 mod shell;
 pub(crate) mod shell_spec;
 mod sleep;
-mod source_tools;
+pub(crate) mod source_tools;
 mod test_sync;
 pub(crate) mod test_sync_spec;
 mod tool_search;
@@ -70,6 +70,8 @@ pub use mcp_resource::ListMcpResourcesHandler;
 pub use mcp_resource::ReadMcpResourceHandler;
 pub use plan::PlanHandler;
 pub use read_tool_output::ReadToolOutputHandler;
+#[cfg(test)]
+pub(crate) use read_tool_output::execute_recovery_transaction;
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;

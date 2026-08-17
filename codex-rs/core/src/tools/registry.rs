@@ -558,7 +558,7 @@ impl ToolOutput for PostToolUseFeedbackOutput {
     }
 
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
-        self.model_visible.canonical_result(payload)
+        self.original.canonical_result(payload)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -566,7 +566,7 @@ impl ToolOutput for PostToolUseFeedbackOutput {
     }
 
     fn code_mode_result(&self, payload: &ToolPayload) -> Value {
-        self.model_visible.code_mode_result(payload)
+        self.original.code_mode_result(payload)
     }
 }
 
@@ -1209,9 +1209,7 @@ fn prepare_model_projection(
     // Code mode also performs its own coherent outer projection after merging
     // native nested results. Re-projecting `functions.exec` here discards the
     // nested tools' typed packet and creates a generic recovery artifact.
-    let code_mode_exec = crate::tools::code_mode::is_exec_tool_name(&invocation.tool_name);
-    if invocation.tool_name.name == "read_tool_output" || (code_mode_exec && !force_inline_carrier)
-    {
+    if generic_projection_is_exempt(&invocation.tool_name, force_inline_carrier) {
         return None;
     }
 
@@ -1361,6 +1359,11 @@ fn prepare_model_projection(
         original_response,
         materialization,
     })
+}
+
+fn generic_projection_is_exempt(tool_name: &ToolName, force_inline_carrier: bool) -> bool {
+    tool_name.name == "read_tool_output"
+        || (crate::tools::code_mode::is_exec_tool_name(tool_name) && !force_inline_carrier)
 }
 
 fn projection_packet_token_limit(
@@ -2151,12 +2154,24 @@ async fn drain_predetermined_artifact_selectors(
     {
         return (Vec::new(), None);
     }
+    let Some(ordered_results) = selectors
+        .iter()
+        .map(|selector| {
+            result
+                .results
+                .iter()
+                .find(|selected| selected.selector == *selector)
+                .cloned()
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return (Vec::new(), None);
+    };
 
-    if result.results.iter().enumerate().any(|(index, selected)| {
+    if ordered_results.iter().enumerate().any(|(index, selected)| {
         selected.status != ToolOutputSelectorStatus::Ok
             || !selected.complete
             || selected.continuation.is_some()
-            || selected.selector != selectors[index]
             || if index < ranges.len() {
                 selected.text.is_none()
             } else {
@@ -2166,11 +2181,11 @@ async fn drain_predetermined_artifact_selectors(
         return (Vec::new(), None);
     }
 
-    if !recovery_matches_section_identity(&ranges, sections, &result.results[..ranges.len()])
+    if !recovery_matches_section_identity(&ranges, sections, &ordered_results[..ranges.len()])
         || !recovery_matches_json_pointer_identity(
             &json_pointers,
             canonical_json_pointers,
-            &result.results[ranges.len()..],
+            &ordered_results[ranges.len()..],
         )
     {
         return (Vec::new(), None);

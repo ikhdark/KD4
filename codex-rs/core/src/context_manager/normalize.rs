@@ -72,6 +72,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                         status: "incomplete".to_string(),
                         execution: "client".to_string(),
                         tools: Vec::new(),
+                        omitted_result_count: None,
                         internal_chat_message_metadata_passthrough: None,
                     },
                 ));

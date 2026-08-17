@@ -2057,11 +2057,27 @@ impl Session {
                         fingerprint,
                         acknowledged: false,
                         redelivery_scheduled: false,
+                        recovery_notified: false,
                     },
                 );
                 true
             }
         }
+    }
+
+    pub(crate) async fn claim_terminal_recovery_notification(
+        &self,
+        terminal_identity: &str,
+    ) -> bool {
+        let mut registry = self.terminal_delivery_registry.lock().await;
+        let Some(entry) = registry.by_identity.get_mut(terminal_identity) else {
+            return false;
+        };
+        if entry.recovery_notified {
+            return false;
+        }
+        entry.recovery_notified = true;
+        true
     }
 
     pub(crate) async fn terminal_delivery_acknowledged(
@@ -4196,6 +4212,17 @@ impl Session {
         }
     }
 
+    pub(crate) async fn consumed_tool_outputs_for(
+        &self,
+        tool_identity: &str,
+    ) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .await
+            .tool_history_state()
+            .consumed_outputs_for_tool(tool_identity)
+    }
+
     pub(crate) async fn mark_tool_history_consumed(
         &self,
         turn_context: &TurnContext,
@@ -4210,9 +4237,22 @@ impl Session {
         };
         let snapshot = {
             let mut state = self.state.lock().await;
+            let before = crate::tools::handlers::source_tools::model_visible_source_evidence_count(
+                &state
+                    .tool_history_state()
+                    .consumed_outputs_for_tool("read_source_batch"),
+            );
             if !state.mark_tool_history_consumed(input, generation) {
                 return;
             }
+            let after = crate::tools::handlers::source_tools::model_visible_source_evidence_count(
+                &state
+                    .tool_history_state()
+                    .consumed_outputs_for_tool("read_source_batch"),
+            );
+            turn_context
+                .turn_timing_state
+                .record_source_model_visible_new_evidence(after.saturating_sub(before));
             state.tool_history_state()
         };
         if let Err(err) = crate::tool_history::persist_tool_history_state(

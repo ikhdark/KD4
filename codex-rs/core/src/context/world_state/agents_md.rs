@@ -3,6 +3,7 @@ use super::WorldStateSection;
 use crate::agents_md::LoadedAgentsMd;
 use crate::context::ContextualUserFragment;
 use crate::context::UserInstructions;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -24,9 +25,19 @@ pub(crate) struct AgentsMdSnapshot {
 }
 
 impl AgentsMdState {
+    #[cfg(test)]
     pub(crate) fn new(loaded: Option<&LoadedAgentsMd>) -> Self {
         Self {
             instructions: loaded.map(LoadedAgentsMd::contextual_user_fragment),
+        }
+    }
+
+    pub(crate) fn new_cached(loaded: Option<&LoadedAgentsMd>, active_cwd: &PathUri) -> Self {
+        Self {
+            instructions: loaded.map(|loaded| {
+                let rendered = loaded.stable_context_bundle(active_cwd).rendered;
+                loaded.contextual_user_fragment_with_text(rendered.to_string())
+            }),
         }
     }
 }

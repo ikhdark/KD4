@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -22,6 +24,8 @@ use codex_git_utils::get_git_repo_root_with_fs;
 use codex_git_utils::get_has_changes;
 use codex_git_utils::get_head_commit_hash;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use serde::Deserialize;
+use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::process::Command;
@@ -33,6 +37,8 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 
 const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
+static NEXT_WATCHER_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EnvironmentWorkspaceKey {
@@ -362,16 +368,40 @@ struct GitWorkspaceCacheState {
 
 pub(crate) struct GitWorkspaceCache {
     state: Mutex<GitWorkspaceCacheState>,
+    watcher_epoch: u64,
     watcher_generation: AtomicU64,
     host_mutation_generation: AtomicU64,
     watcher_reliable: AtomicBool,
     watcher_subscriber: Option<FileWatcherSubscriber>,
+    source_watch_registrations: StdMutex<HashMap<PathBuf, WatchRegistration>>,
+    source_change_journal: StdMutex<SourceChangeJournal>,
 }
 
 pub(crate) struct WorkspaceChangeObservation {
     watcher_generation: u64,
     host_mutation_generation: u64,
     _registration: WatchRegistration,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct SourcePathChangeObservation {
+    watcher_epoch: u64,
+    watcher_generation: u64,
+    repo_root: PathBuf,
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct SourceChangeEvent {
+    generation: u64,
+    changed_paths: Option<Vec<PathBuf>>,
+}
+
+#[derive(Default)]
+struct SourceChangeJournal {
+    retained_floor: u64,
+    latest_generation: u64,
+    events: VecDeque<SourceChangeEvent>,
 }
 
 impl GitWorkspaceCache {
@@ -402,21 +432,27 @@ impl GitWorkspaceCache {
             }
             None => (None, None),
         };
+        let watcher_epoch = (u64::from(std::process::id()) << 32)
+            | NEXT_WATCHER_EPOCH.fetch_add(1, Ordering::Relaxed);
         let cache = Arc::new(Self {
             state: Mutex::new(GitWorkspaceCacheState::default()),
+            watcher_epoch,
             watcher_generation: AtomicU64::new(0),
             host_mutation_generation: AtomicU64::new(0),
             watcher_reliable: AtomicBool::new(watcher_subscriber.is_some()),
             watcher_subscriber,
+            source_watch_registrations: StdMutex::new(HashMap::new()),
+            source_change_journal: StdMutex::new(SourceChangeJournal::default()),
         });
         if let Some(mut receiver) = receiver {
             let weak_cache = Arc::downgrade(&cache);
             tokio::spawn(async move {
-                while receiver.recv().await.is_some() {
+                while let Some(event) = receiver.recv().await {
                     let Some(cache) = weak_cache.upgrade() else {
                         return;
                     };
-                    cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
+                    let changed_paths = (!event.rescan_required).then_some(event.paths);
+                    cache.record_source_change_event(changed_paths);
                 }
                 if let Some(cache) = weak_cache.upgrade() {
                     cache.invalidate_for_watcher_failure().await;
@@ -640,6 +676,108 @@ impl GitWorkspaceCache {
             .then(|| self.watcher_generation.load(Ordering::Acquire))
     }
 
+    fn record_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) -> u64 {
+        let generation = self
+            .watcher_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let mut journal = self
+            .source_change_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        journal.latest_generation = generation;
+        journal.events.push_back(SourceChangeEvent {
+            generation,
+            changed_paths,
+        });
+        while journal.events.len() > SOURCE_CHANGE_JOURNAL_CAPACITY {
+            if let Some(removed) = journal.events.pop_front() {
+                journal.retained_floor = removed.generation;
+            }
+        }
+        generation
+    }
+
+    /// Starts a path-scoped observation backed by a retained recursive watch.
+    /// The returned token is safe to persist in model-visible tool output: it
+    /// is accepted only by this live watcher epoch and only while the bounded
+    /// journal proves that the path and its ancestors were untouched.
+    pub(crate) fn begin_source_path_change_observation(
+        &self,
+        repo_root: &Path,
+        path: &Path,
+    ) -> Option<SourcePathChangeObservation> {
+        if !self.watcher_reliable.load(Ordering::Acquire) {
+            return None;
+        }
+        let repo_root = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !path_is_same_or_descendant(&path, &repo_root) {
+            return None;
+        }
+        {
+            let mut registrations = self
+                .source_watch_registrations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !registrations.contains_key(&repo_root) {
+                let registration = self
+                    .watcher_subscriber
+                    .as_ref()?
+                    .register_paths(vec![WatchPath {
+                        path: repo_root.clone(),
+                        recursive: true,
+                    }])
+                    .ok()?;
+                registrations.insert(repo_root.clone(), registration);
+            }
+        }
+        let watcher_generation = self.reliable_watcher_generation()?;
+        Some(SourcePathChangeObservation {
+            watcher_epoch: self.watcher_epoch,
+            watcher_generation,
+            repo_root,
+            path,
+        })
+    }
+
+    pub(crate) fn source_path_change_observation_is_current(
+        &self,
+        observation: &SourcePathChangeObservation,
+    ) -> bool {
+        if observation.watcher_epoch != self.watcher_epoch {
+            return false;
+        }
+        let Some(current_generation) = self.reliable_watcher_generation() else {
+            return false;
+        };
+        if current_generation < observation.watcher_generation {
+            return false;
+        }
+        let journal = self
+            .source_change_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if (journal.retained_floor != 0 && observation.watcher_generation <= journal.retained_floor)
+            || journal.latest_generation != current_generation
+        {
+            return false;
+        }
+        journal
+            .events
+            .iter()
+            .filter(|event| event.generation > observation.watcher_generation)
+            .all(|event| {
+                event.changed_paths.as_ref().is_some_and(|paths| {
+                    paths
+                        .iter()
+                        .all(|changed| !path_is_same_or_descendant(&observation.path, changed))
+                })
+            })
+    }
+
     pub(crate) fn begin_workspace_change_observation(
         &self,
         repo_root: &Path,
@@ -677,17 +815,47 @@ impl GitWorkspaceCache {
 
     pub(crate) fn note_host_workspace_mutation(&self) {
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
-        self.watcher_generation.fetch_add(1, Ordering::AcqRel);
+        self.record_source_change_event(None);
     }
 
     pub(crate) fn note_host_workspace_mutation_paths(
         &self,
-        _repo_root: &Path,
-        _changed_paths: &[String],
+        repo_root: &Path,
+        changed_paths: &[String],
     ) {
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
-        self.watcher_generation.fetch_add(1, Ordering::AcqRel);
+        let paths = (!changed_paths.is_empty()).then(|| {
+            changed_paths
+                .iter()
+                .map(|path| {
+                    let path = Path::new(path);
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        repo_root.join(path)
+                    }
+                })
+                .collect()
+        });
+        self.record_source_change_event(paths);
     }
+}
+
+fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
+    let normalize = |path: &Path| {
+        let value = path.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) {
+            value.to_lowercase()
+        } else {
+            value
+        }
+    };
+    let path = normalize(path);
+    let ancestor = normalize(ancestor);
+    path == ancestor
+        || path
+            .strip_prefix(&ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

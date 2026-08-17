@@ -1,8 +1,17 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex as StdMutex;
+use std::sync::Weak;
 
 use crate::function_tool::FunctionCallError;
+use crate::git_workspace::SourcePathChangeObservation;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -14,12 +23,27 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_protocol::models::ResponseInputItem;
+use codex_protocol::protocol::DeterministicContinuationClass;
+use codex_protocol::protocol::DeterministicContinuationHostAction;
+use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
+use codex_tools::CanonicalToolResult;
 use codex_tools::JsonSchema;
 use codex_tools::JsonToolOutput;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
+use codex_tools::ToolOutput;
+use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputOutcomeContext;
+use codex_tools::ToolOutputProjectionFragment;
+use codex_tools::ToolOutputProjectionFragmentKind;
+use codex_tools::ToolOutputProjectionMetadata;
 use codex_tools::ToolSpec;
+use futures::Future;
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -30,6 +54,62 @@ use sha2::Sha256;
 const MAX_SOURCE_READS: usize = 32;
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_ARCHITECTURE_RELATIONSHIPS: usize = 32;
+
+type SharedSourceRead = Shared<BoxFuture<'static, Result<Arc<String>, Arc<String>>>>;
+
+#[derive(Clone)]
+struct InFlightSourceRead {
+    id: u64,
+    future: SharedSourceRead,
+}
+
+#[derive(Default)]
+pub(crate) struct SourceReadCoordinator {
+    next_id: std::sync::atomic::AtomicU64,
+    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSourceRead>>>,
+}
+
+impl SourceReadCoordinator {
+    pub(crate) async fn read<F>(&self, key: String, read: F) -> Result<Arc<String>, String>
+    where
+        F: Future<Output = Result<String, String>> + Send + 'static,
+    {
+        let operation = {
+            let mut in_flight = self.in_flight.lock().await;
+            if let Some(operation) = in_flight.get(&key) {
+                operation.clone()
+            } else {
+                let id = self
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let cleanup_key = key.clone();
+                let cleanup_map = Arc::clone(&self.in_flight);
+                let task = tokio::spawn(async move {
+                    let result = read.await.map(Arc::new).map_err(Arc::new);
+                    let mut in_flight = cleanup_map.lock().await;
+                    if in_flight
+                        .get(&cleanup_key)
+                        .is_some_and(|active| active.id == id)
+                    {
+                        in_flight.remove(&cleanup_key);
+                    }
+                    result
+                });
+                let future = async move {
+                    task.await.unwrap_or_else(|error| {
+                        Err(Arc::new(format!("source read task failed: {error}")))
+                    })
+                }
+                .boxed()
+                .shared();
+                let operation = InFlightSourceRead { id, future };
+                in_flight.insert(key.clone(), operation.clone());
+                operation
+            }
+        };
+        operation.future.await.map_err(|error| (*error).clone())
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,7 +200,7 @@ struct ReadSourceBatchArgs {
     environment_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceRead {
     path: String,
@@ -134,17 +214,224 @@ struct SourceRead {
     known_sha256: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct SourceReadResult {
     path: String,
+    start_line: usize,
+    end_line: usize,
+    #[serde(skip)]
+    requested_end_line: Option<usize>,
+    total_lines: usize,
+    sha256: String,
+    content_identity: String,
+    unchanged: bool,
+    fresh_evidence: bool,
+    source_basis: String,
+    canonical_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<SourcePathChangeObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reuse: Option<SourceReuseKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<SourceProjectionReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fragments: Vec<SourceTextFragment>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceReuseKind {
+    ExactVisible,
+    ExactBatch,
+    ConditionalUnchanged,
+    Overlap,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SourceProjectionReceipt {
+    version: u8,
+    receipt_id: String,
+    prior_call_id: String,
+    projection_fingerprint: String,
+    content_identity: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SourceTextFragment {
+    start_line: usize,
+    end_line: usize,
+    text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SourceProjectionLedgerEntry {
+    source_basis: String,
+    canonical_path: String,
+    display_path: String,
+    requested_start_line: usize,
+    requested_end_line: Option<usize>,
     start_line: usize,
     end_line: usize,
     total_lines: usize,
     sha256: String,
     content_identity: String,
-    unchanged: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
+    freshness: Option<SourcePathChangeObservation>,
+    fresh_evidence: bool,
+    receipt_id: String,
+    projection_fragment_id: String,
+    projection_fragment_sha256: String,
+    projection_fragment_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReadSourceBatchResult {
+    total_bytes: usize,
+    reads: Vec<SourceReadResult>,
+    source_projection_ledger: Vec<SourceProjectionLedgerEntry>,
+}
+
+#[derive(Clone)]
+struct VisibleSourceCoverage {
+    prior_call_id: String,
+    projection_fingerprint: String,
+    entry: SourceProjectionLedgerEntry,
+}
+
+#[derive(Clone)]
+struct PreparedSourceRead {
+    read: SourceRead,
+    path_uri: codex_utils_path_uri::PathUri,
+    source_basis: String,
+    canonical_path: String,
+    repo_root: Option<PathBuf>,
+    local_path: Option<PathBuf>,
+}
+
+struct ReadSourceBatchToolOutput {
+    inner: JsonToolOutput,
+    value: Value,
+    deterministic_receipt: Option<TurnTimingDeterministicContinuationReceipt>,
+}
+
+impl ToolOutput for ReadSourceBatchToolOutput {
+    fn log_preview(&self) -> String {
+        self.inner.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+
+    fn deterministic_continuation_receipts(
+        &self,
+    ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
+        self.deterministic_receipt.iter().cloned().collect()
+    }
+
+    fn deterministic_continuation_content(&self) -> Vec<Value> {
+        self.deterministic_receipt
+            .as_ref()
+            .map(|_| vec![self.value.clone()])
+            .unwrap_or_default()
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        let ledger = self
+            .value
+            .get("source_projection_ledger")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let compact_reads = self
+            .value
+            .get("reads")
+            .and_then(Value::as_array)
+            .map(|reads| {
+                reads
+                    .iter()
+                    .map(|read| {
+                        let mut read = read.clone();
+                        if let Value::Object(fields) = &mut read {
+                            fields.remove("text");
+                            fields.remove("fragments");
+                            fields.remove("freshness");
+                        }
+                        read
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut fragments = Vec::new();
+        if let Some(reads) = self.value.get("reads").and_then(Value::as_array) {
+            for (index, read) in reads.iter().enumerate() {
+                let path = read.get("path").and_then(Value::as_str).unwrap_or_default();
+                let start = read.get("start_line").and_then(Value::as_u64).unwrap_or(0);
+                let end = read.get("end_line").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(text) = read.get("text").and_then(Value::as_str) {
+                    let fragment_id = source_projection_fragment_id(&ledger, path, start, end)
+                        .unwrap_or_else(|| format!("source:{index}:{start}-{end}"));
+                    fragments.push(
+                        ToolOutputProjectionFragment::new(
+                            ToolOutputProjectionFragmentKind::ContextualSpillableText,
+                            format!("{path}:{start}-{end}\n{text}"),
+                        )
+                        .with_id(fragment_id),
+                    );
+                }
+                if let Some(parts) = read.get("fragments").and_then(Value::as_array) {
+                    for (part_index, part) in parts.iter().enumerate() {
+                        let part_start =
+                            part.get("start_line").and_then(Value::as_u64).unwrap_or(0);
+                        let part_end = part.get("end_line").and_then(Value::as_u64).unwrap_or(0);
+                        let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                        let fragment_id =
+                            source_projection_fragment_id(&ledger, path, part_start, part_end)
+                                .unwrap_or_else(|| {
+                                    format!("source:{index}:{part_index}:{part_start}-{part_end}")
+                                });
+                        fragments.push(
+                            ToolOutputProjectionFragment::new(
+                                ToolOutputProjectionFragmentKind::ContextualSpillableText,
+                                format!("{path}:{part_start}-{part_end}\n{text}"),
+                            )
+                            .with_id(fragment_id),
+                        );
+                    }
+                }
+            }
+        }
+        Some(ToolOutputProjectionMetadata {
+            outcome: ToolOutputOutcome::Success,
+            diagnostic_class: ToolOutputDiagnosticClass::Normal,
+            spillable_text: fragments
+                .iter()
+                .map(|fragment| fragment.text.clone())
+                .collect(),
+            fragments,
+            essential_inline: json!({
+                "success": true,
+                "total_bytes": self.value.get("total_bytes").cloned().unwrap_or(json!(0)),
+                "reads": compact_reads,
+                "source_projection_ledger": ledger,
+            }),
+            requested_limit: None,
+            predetermined_ranges: Vec::new(),
+            predetermined_json_pointers: Vec::new(),
+        })
+    }
+
+    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        self.inner.canonical_result(payload)
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        self.inner.to_response_item(call_id, payload)
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> Value {
+        self.inner.code_mode_result(payload)
+    }
 }
 
 pub struct ReadSourceBatchHandler;
@@ -190,7 +477,7 @@ impl ToolExecutor<ToolInvocation> for ReadSourceBatchHandler {
         ToolSpec::Function(ResponsesApiTool {
             name: "read_source_batch".to_string(),
             description: format!(
-                "Read up to {MAX_SOURCE_READS} source files or bounded line ranges in one filesystem operation batch. Each result includes a stable task-local content_identity and sha256 for cache reuse. Prefer this to launching Python, PowerShell, cat, sed, or repeated single-file reads. The aggregate response is capped at {MAX_SOURCE_BYTES} UTF-8 bytes."
+                "Read up to {MAX_SOURCE_READS} source files or bounded line ranges in one filesystem operation batch. Each result includes a stable task-local content_identity and sha256 for cache reuse. Group independent reads together and, when rereading an exact path/range, pass its known_sha256 so unchanged text is not replayed. Prefer this to launching Python, PowerShell, cat, sed, or repeated single-file reads. The aggregate response is capped at {MAX_SOURCE_BYTES} UTF-8 bytes."
             ),
             strict: false,
             defer_loading: None,
@@ -246,6 +533,12 @@ impl ToolExecutor<ToolInvocation> for ReadSourceBatchHandler {
             let fs = environment.environment.get_filesystem();
             let cwd = environment.cwd().clone();
             let task_identity = invocation.session.thread_id.to_string();
+            let call_id = invocation.call_id.clone();
+            let visible_outputs = invocation
+                .session
+                .consumed_tool_outputs_for("read_source_batch")
+                .await;
+            let visible_coverage = visible_source_coverage(&visible_outputs);
             // Resolve the complete batch before starting any reads. A malformed
             // path must reject the typed request atomically rather than racing
             // otherwise valid reads in the same batch.
@@ -264,40 +557,136 @@ impl ToolExecutor<ToolInvocation> for ReadSourceBatchHandler {
                             read.path
                         ))
                     })?;
-                    Ok((read, path_uri))
+                    normalize_source_read(
+                        read,
+                        path_uri,
+                        &environment.environment_id,
+                        environment.environment.is_remote(),
+                        &cwd,
+                    )
                 })
                 .collect::<Result<Vec<_>, FunctionCallError>>()?;
-            let futures = resolved_reads.into_iter().map(|(read, path_uri)| {
+            let futures = resolved_reads.into_iter().map(|mut prepared| {
                 let fs = fs.clone();
                 let sandbox = sandbox.clone();
                 let task_identity = task_identity.clone();
+                let visible_coverage = visible_coverage.clone();
+                let source_reads = &invocation.session.services.source_reads;
+                let git_workspace = &invocation.session.services.git_workspace;
+                let turn_id = invocation.turn.sub_id.clone();
                 async move {
-                    let text =
-                        fs.read_file_text(&path_uri, Some(&sandbox))
-                            .await
-                            .map_err(|err| {
-                                FunctionCallError::RespondToModel(format!(
-                                    "unable to read source `{}`: {err}",
-                                    read.path
-                                ))
-                            })?;
-                    select_lines(read, text, &task_identity)
+                    let exact = visible_coverage.iter().find(|coverage| {
+                        exact_visible_coverage_matches(&prepared, coverage)
+                            && coverage
+                                .entry
+                                .freshness
+                                .as_ref()
+                                .is_some_and(|observation| {
+                                    git_workspace
+                                        .source_path_change_observation_is_current(observation)
+                                })
+                            && prepared
+                                .read
+                                .known_sha256
+                                .as_ref()
+                                .is_none_or(|known| known == &coverage.entry.sha256)
+                    });
+                    if let Some(coverage) = exact {
+                        return Ok(source_reuse_result(&prepared, coverage));
+                    }
+
+                    let conditional = visible_coverage
+                        .iter()
+                        .find(|coverage| exact_visible_coverage_matches(&prepared, coverage))
+                        .cloned();
+                    if prepared.read.known_sha256.is_none() {
+                        prepared.read.known_sha256 = conditional
+                            .as_ref()
+                            .map(|coverage| coverage.entry.sha256.clone());
+                    }
+                    let freshness = prepared
+                        .repo_root
+                        .as_deref()
+                        .zip(prepared.local_path.as_deref())
+                        .and_then(|(root, path)| {
+                            git_workspace.begin_source_path_change_observation(root, path)
+                        });
+                    let path_uri = prepared.path_uri.clone();
+                    let display_path = prepared.read.path.clone();
+                    let physical_key = format!(
+                        "{turn_id}\0{}\0{}",
+                        prepared.source_basis, prepared.canonical_path
+                    );
+                    let text = source_reads
+                        .read(physical_key, async move {
+                            fs.read_file_text(&path_uri, Some(&sandbox))
+                                .await
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .map_err(|err| {
+                            FunctionCallError::RespondToModel(format!(
+                                "unable to read source `{display_path}`: {err}"
+                            ))
+                        })?;
+                    let freshness = freshness.filter(|observation| {
+                        git_workspace.source_path_change_observation_is_current(observation)
+                    });
+                    let mut result = select_lines(
+                        prepared.read,
+                        text.as_str(),
+                        &task_identity,
+                        &prepared.source_basis,
+                        &prepared.canonical_path,
+                        freshness,
+                    )?;
+                    if result.unchanged {
+                        result.reuse = Some(SourceReuseKind::ConditionalUnchanged);
+                        result.receipt = conditional.as_ref().map(source_projection_receipt);
+                    }
+                    Ok(result)
                 }
             });
             let results = futures::future::try_join_all(futures).await?;
-            let total_bytes = results
-                .iter()
-                .map(|result| result.text.as_deref().map_or(0, str::len))
-                .sum::<usize>();
+            let (results, source_projection_ledger, reuse_stats) = finalize_source_results(
+                results,
+                &visible_coverage,
+                &invocation.session.services.git_workspace,
+                &task_identity,
+                &call_id,
+            );
+            let total_bytes = source_result_visible_bytes(&results);
             if total_bytes > MAX_SOURCE_BYTES {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "batched source result is {total_bytes} bytes; narrow the reads below the {MAX_SOURCE_BYTES}-byte aggregate limit"
                 )));
             }
-            Ok(boxed_tool_output(JsonToolOutput::new(json!({
-                "total_bytes": total_bytes,
-                "reads": results,
-            }))))
+            invocation
+                .turn
+                .turn_timing_state
+                .record_source_projection_result(
+                    reuse_stats.exact_reuse_count,
+                    reuse_stats.conditional_unchanged_count,
+                    reuse_stats.overlap_removed_count,
+                    reuse_stats.physical_range_avoided_count,
+                );
+            let batch = ReadSourceBatchResult {
+                total_bytes,
+                reads: results,
+                source_projection_ledger,
+            };
+            let value = serde_json::to_value(batch).map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "unable to serialize source batch result: {error}"
+                ))
+            })?;
+            let deterministic_receipt =
+                source_deterministic_receipt(&invocation.source, &call_id, &value);
+            Ok(boxed_tool_output(ReadSourceBatchToolOutput {
+                inner: JsonToolOutput::new(value.clone()),
+                value,
+                deterministic_receipt,
+            }))
         })
     }
 }
@@ -323,6 +712,70 @@ const fn default_architecture_relationship_limit() -> usize {
 }
 
 pub struct ArchitectureSliceHandler;
+
+#[derive(Clone, Debug)]
+struct ArchitectureSliceToolOutput {
+    inner: JsonToolOutput,
+    source_closure: Value,
+    source_closure_established: bool,
+}
+
+impl ArchitectureSliceToolOutput {
+    fn new(source_closure: Value) -> Self {
+        let source_closure_established = architecture_slice_timing_facts(&source_closure).complete;
+        Self {
+            inner: JsonToolOutput::new(source_closure.clone()),
+            source_closure,
+            source_closure_established,
+        }
+    }
+}
+
+impl ToolOutput for ArchitectureSliceToolOutput {
+    fn log_preview(&self) -> String {
+        self.inner.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.inner.success_for_logging()
+    }
+
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        self.inner.outcome_for_logging()
+    }
+
+    fn outcome_context(&self) -> ToolOutputOutcomeContext {
+        self.inner.outcome_context()
+    }
+
+    fn sampling_request_signal(&self) -> Option<Value> {
+        Some(json!({
+            "kind": "source_closure",
+            "source_closure_established": self.source_closure_established,
+            "source_closure": self.source_closure,
+        }))
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        self.inner.projection_metadata()
+    }
+
+    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        self.inner.canonical_result(payload)
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        self.inner.to_response_item(call_id, payload)
+    }
+
+    fn post_tool_use_response(&self, call_id: &str, payload: &ToolPayload) -> Option<Value> {
+        self.inner.post_tool_use_response(call_id, payload)
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> Value {
+        self.inner.code_mode_result(payload)
+    }
+}
 
 impl ToolExecutor<ToolInvocation> for ArchitectureSliceHandler {
     fn tool_name(&self) -> ToolName {
@@ -467,7 +920,7 @@ impl ToolExecutor<ToolInvocation> for ArchitectureSliceHandler {
                 slice.insert("stale_snapshot".to_string(), Value::Bool(stale_snapshot));
             }
             record_architecture_slice_timing(invocation.turn.turn_timing_state.as_ref(), &slice);
-            Ok(boxed_tool_output(JsonToolOutput::new(slice)))
+            Ok(boxed_tool_output(ArchitectureSliceToolOutput::new(slice)))
         })
     }
 }
@@ -964,10 +1417,592 @@ fn append_owner_architecture_relationships(
     }
 }
 
+#[derive(Default)]
+struct SourceReuseStats {
+    exact_reuse_count: u32,
+    conditional_unchanged_count: u32,
+    overlap_removed_count: u64,
+    physical_range_avoided_count: u64,
+}
+
+pub(crate) fn model_visible_source_evidence_count(outputs: &[(String, String)]) -> u64 {
+    visible_source_coverage(outputs).len() as u64
+}
+
+fn visible_source_coverage(outputs: &[(String, String)]) -> Vec<VisibleSourceCoverage> {
+    let mut seen_receipts = BTreeSet::new();
+    let mut coverage = Vec::new();
+    for (call_id, output) in outputs {
+        let Ok(value) = serde_json::from_str::<Value>(output) else {
+            continue;
+        };
+        let projection_fingerprint = format!("{:x}", Sha256::digest(output.as_bytes()));
+        let Some(entries) = source_projection_ledger_value(&value) else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = serde_json::from_value::<SourceProjectionLedgerEntry>(entry.clone())
+            else {
+                continue;
+            };
+            if entry.fresh_evidence
+                && source_ledger_entry_was_model_visible(&value, &entry)
+                && seen_receipts.insert(entry.receipt_id.clone())
+            {
+                coverage.push(VisibleSourceCoverage {
+                    prior_call_id: call_id.clone(),
+                    projection_fingerprint: projection_fingerprint.clone(),
+                    entry,
+                });
+            }
+        }
+    }
+    coverage
+}
+
+fn source_projection_fragment_id(
+    ledger: &Value,
+    display_path: &str,
+    start_line: u64,
+    end_line: u64,
+) -> Option<String> {
+    ledger.as_array()?.iter().find_map(|entry| {
+        (entry.get("display_path").and_then(Value::as_str) == Some(display_path)
+            && entry.get("start_line").and_then(Value::as_u64) == Some(start_line)
+            && entry.get("end_line").and_then(Value::as_u64) == Some(end_line))
+        .then(|| {
+            entry
+                .get("projection_fragment_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+    })
+}
+
+fn source_ledger_entry_was_model_visible(
+    bounded_output: &Value,
+    entry: &SourceProjectionLedgerEntry,
+) -> bool {
+    // An unprojected native result contains the full text adjacent to its
+    // ledger. Projected history must prove that the complete typed fragment,
+    // rather than a prefix or only its essential metadata, survived the final
+    // serialization budget.
+    let Some(selected_text) = bounded_output
+        .pointer("/result/selected_text")
+        .and_then(Value::as_str)
+    else {
+        return bounded_output.get("source_projection_ledger").is_some();
+    };
+    let prefix = format!(
+        "{}:{}-{}\n",
+        entry.display_path, entry.start_line, entry.end_line
+    );
+    selected_text.match_indices(&prefix).any(|(start, _)| {
+        let end = start.saturating_add(entry.projection_fragment_bytes);
+        selected_text
+            .as_bytes()
+            .get(start..end)
+            .is_some_and(|candidate| {
+                format!("{:x}", Sha256::digest(candidate)) == entry.projection_fragment_sha256
+            })
+    })
+}
+
+fn source_projection_ledger_value(value: &Value) -> Option<&Vec<Value>> {
+    value
+        .pointer("/result/essential/source_projection_ledger")
+        .or_else(|| value.pointer("/essential/source_projection_ledger"))
+        .or_else(|| value.get("source_projection_ledger"))
+        .and_then(Value::as_array)
+}
+
+fn normalize_source_read(
+    mut read: SourceRead,
+    path_uri: codex_utils_path_uri::PathUri,
+    environment_id: &str,
+    remote: bool,
+    cwd: &codex_utils_path_uri::PathUri,
+) -> Result<PreparedSourceRead, FunctionCallError> {
+    let start = read.start_line.unwrap_or(1);
+    if start == 0 || read.end_line.is_some_and(|end| end < start) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "source read `{}` requires 1-based start_line <= end_line",
+            read.path
+        )));
+    }
+    read.start_line = Some(start);
+
+    let mut canonical_path = path_uri.to_string();
+    let mut local_path = None;
+    let mut repo_root = None;
+    if !remote && let Ok(path) = path_uri.to_abs_path() {
+        let path = path.canonicalize().unwrap_or(path).into_path_buf();
+        canonical_path = normalized_native_path(&path);
+        local_path = Some(path.clone());
+        if let Ok(cwd) = cwd.to_abs_path()
+            && let Some(root) = codex_git_utils::get_git_repo_root(cwd.as_path())
+        {
+            let root = root.canonicalize().unwrap_or(root);
+            if path_is_same_or_descendant(&path, &root) {
+                repo_root = Some(root);
+            }
+        }
+    }
+    let source_basis = repo_root.as_ref().map_or_else(
+        || format!("environment:{environment_id}|cwd:{cwd}"),
+        |root| {
+            format!(
+                "environment:{environment_id}|repository:{}",
+                normalized_native_path(root)
+            )
+        },
+    );
+    Ok(PreparedSourceRead {
+        read,
+        path_uri,
+        source_basis,
+        canonical_path,
+        repo_root,
+        local_path,
+    })
+}
+
+fn normalized_native_path(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
+    }
+}
+
+fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
+    let path = normalized_native_path(path);
+    let ancestor = normalized_native_path(ancestor);
+    path == ancestor
+        || path
+            .strip_prefix(&ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn exact_visible_coverage_matches(
+    prepared: &PreparedSourceRead,
+    coverage: &VisibleSourceCoverage,
+) -> bool {
+    coverage.entry.source_basis == prepared.source_basis
+        && coverage.entry.canonical_path == prepared.canonical_path
+        && coverage.entry.requested_start_line == prepared.read.start_line.unwrap_or(1)
+        && coverage.entry.requested_end_line == prepared.read.end_line
+}
+
+fn source_projection_receipt(coverage: &VisibleSourceCoverage) -> SourceProjectionReceipt {
+    SourceProjectionReceipt {
+        version: 1,
+        receipt_id: coverage.entry.receipt_id.clone(),
+        prior_call_id: coverage.prior_call_id.clone(),
+        projection_fingerprint: coverage.projection_fingerprint.clone(),
+        content_identity: coverage.entry.content_identity.clone(),
+    }
+}
+
+fn source_reuse_result(
+    prepared: &PreparedSourceRead,
+    coverage: &VisibleSourceCoverage,
+) -> SourceReadResult {
+    SourceReadResult {
+        path: prepared.read.path.clone(),
+        start_line: coverage.entry.start_line,
+        end_line: coverage.entry.end_line,
+        requested_end_line: prepared.read.end_line,
+        total_lines: coverage.entry.total_lines,
+        sha256: coverage.entry.sha256.clone(),
+        content_identity: coverage.entry.content_identity.clone(),
+        unchanged: true,
+        fresh_evidence: false,
+        source_basis: prepared.source_basis.clone(),
+        canonical_path: prepared.canonical_path.clone(),
+        freshness: coverage.entry.freshness.clone(),
+        reuse: Some(SourceReuseKind::ExactVisible),
+        receipt: Some(source_projection_receipt(coverage)),
+        text: None,
+        fragments: Vec::new(),
+    }
+}
+
+fn finalize_source_results(
+    mut results: Vec<SourceReadResult>,
+    visible_coverage: &[VisibleSourceCoverage],
+    git_workspace: &crate::git_workspace::GitWorkspaceCache,
+    task_identity: &str,
+    call_id: &str,
+) -> (
+    Vec<SourceReadResult>,
+    Vec<SourceProjectionLedgerEntry>,
+    SourceReuseStats,
+) {
+    let same_batch_fingerprint = stable_identity("KD4_SOURCE_BATCH_PROJECTION_V1", &[call_id]);
+    let mut delivered = visible_coverage
+        .iter()
+        .filter(|coverage| {
+            coverage
+                .entry
+                .freshness
+                .as_ref()
+                .is_some_and(|observation| {
+                    git_workspace.source_path_change_observation_is_current(observation)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut ledger = Vec::new();
+    let mut stats = SourceReuseStats::default();
+
+    for result in &mut results {
+        match result.reuse {
+            Some(SourceReuseKind::ExactVisible) => {
+                stats.exact_reuse_count = stats.exact_reuse_count.saturating_add(1);
+                stats.physical_range_avoided_count =
+                    stats.physical_range_avoided_count.saturating_add(1);
+                continue;
+            }
+            Some(SourceReuseKind::ConditionalUnchanged) => {
+                stats.conditional_unchanged_count =
+                    stats.conditional_unchanged_count.saturating_add(1);
+                continue;
+            }
+            _ => {}
+        }
+        let Some(selected) = result.text.take() else {
+            continue;
+        };
+        let requested_start = result.start_line;
+        let requested_end = result.requested_end_line;
+        if let Some(owner) = delivered.iter().find(|coverage| {
+            coverage.entry.source_basis == result.source_basis
+                && coverage.entry.canonical_path == result.canonical_path
+                && coverage.entry.requested_start_line == requested_start
+                && coverage.entry.requested_end_line == requested_end
+                && coverage.entry.content_identity == result.content_identity
+        }) {
+            result.unchanged = true;
+            result.fresh_evidence = false;
+            result.reuse = Some(SourceReuseKind::ExactBatch);
+            result.receipt = Some(source_projection_receipt(owner));
+            stats.exact_reuse_count = stats.exact_reuse_count.saturating_add(1);
+            stats.physical_range_avoided_count =
+                stats.physical_range_avoided_count.saturating_add(1);
+            continue;
+        }
+
+        let covered = merged_source_intervals(&delivered, result);
+        let missing = subtract_source_intervals(result.start_line, result.end_line, &covered);
+        let overlap = intersect_source_intervals(result.start_line, result.end_line, &covered);
+        stats.overlap_removed_count = stats
+            .overlap_removed_count
+            .saturating_add(overlap.len() as u64);
+        if !overlap.is_empty() {
+            result.reuse = Some(SourceReuseKind::Overlap);
+            result.receipt = delivered
+                .iter()
+                .find(|coverage| {
+                    coverage.entry.source_basis == result.source_basis
+                        && coverage.entry.canonical_path == result.canonical_path
+                        && overlap.iter().any(|(start, end)| {
+                            coverage.entry.start_line <= *end && coverage.entry.end_line >= *start
+                        })
+                })
+                .map(source_projection_receipt);
+        }
+
+        let delivered_ranges = if overlap.is_empty() || result.end_line < result.start_line {
+            result.text = Some(selected.clone());
+            vec![(result.start_line, result.end_line, selected)]
+        } else {
+            result.fragments = missing
+                .iter()
+                .map(|(start, end)| SourceTextFragment {
+                    start_line: *start,
+                    end_line: *end,
+                    text: source_fragment_text(&selected, result.start_line, *start, *end),
+                })
+                .collect();
+            result.unchanged = result.fragments.is_empty();
+            result.fresh_evidence = !result.fragments.is_empty();
+            result
+                .fragments
+                .iter()
+                .map(|fragment| {
+                    (
+                        fragment.start_line,
+                        fragment.end_line,
+                        fragment.text.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        for (start, end, text) in delivered_ranges {
+            let preserve_requested_bounds = result.text.is_some();
+            let entry = source_ledger_entry(
+                result,
+                if preserve_requested_bounds {
+                    requested_start
+                } else {
+                    start
+                },
+                if preserve_requested_bounds {
+                    requested_end
+                } else {
+                    Some(end)
+                },
+                start,
+                end,
+                &text,
+                task_identity,
+                call_id,
+            );
+            delivered.push(VisibleSourceCoverage {
+                prior_call_id: call_id.to_string(),
+                projection_fingerprint: same_batch_fingerprint.clone(),
+                entry: entry.clone(),
+            });
+            ledger.push(entry);
+        }
+    }
+    (results, ledger, stats)
+}
+
+fn merged_source_intervals(
+    delivered: &[VisibleSourceCoverage],
+    result: &SourceReadResult,
+) -> Vec<(usize, usize)> {
+    let mut intervals = delivered
+        .iter()
+        .filter(|coverage| {
+            coverage.entry.source_basis == result.source_basis
+                && coverage.entry.canonical_path == result.canonical_path
+                && coverage.entry.end_line >= coverage.entry.start_line
+        })
+        .map(|coverage| (coverage.entry.start_line, coverage.entry.end_line))
+        .collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in intervals {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= previous_end.saturating_add(1)
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn subtract_source_intervals(
+    start: usize,
+    end: usize,
+    covered: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    if end < start {
+        return Vec::new();
+    }
+    let mut missing = Vec::new();
+    let mut cursor = start;
+    for (covered_start, covered_end) in covered {
+        if *covered_end < cursor || *covered_start > end {
+            continue;
+        }
+        if *covered_start > cursor {
+            missing.push((cursor, covered_start.saturating_sub(1).min(end)));
+        }
+        cursor = cursor.max(covered_end.saturating_add(1));
+        if cursor > end {
+            break;
+        }
+    }
+    if cursor <= end {
+        missing.push((cursor, end));
+    }
+    missing
+}
+
+fn intersect_source_intervals(
+    start: usize,
+    end: usize,
+    covered: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    if end < start {
+        return Vec::new();
+    }
+    covered
+        .iter()
+        .filter_map(|(covered_start, covered_end)| {
+            let overlap_start = start.max(*covered_start);
+            let overlap_end = end.min(*covered_end);
+            (overlap_start <= overlap_end).then_some((overlap_start, overlap_end))
+        })
+        .collect()
+}
+
+fn source_fragment_text(selected: &str, selected_start: usize, start: usize, end: usize) -> String {
+    let lines = selected.lines().collect::<Vec<_>>();
+    let offset = start.saturating_sub(selected_start);
+    let length = end.saturating_sub(start).saturating_add(1);
+    lines
+        .get(offset..offset.saturating_add(length).min(lines.len()))
+        .unwrap_or_default()
+        .join("\n")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_ledger_entry(
+    result: &SourceReadResult,
+    requested_start_line: usize,
+    requested_end_line: Option<usize>,
+    start_line: usize,
+    end_line: usize,
+    text: &str,
+    task_identity: &str,
+    call_id: &str,
+) -> SourceProjectionLedgerEntry {
+    let preserves_projection_identity = requested_start_line == result.start_line
+        && requested_end_line == result.requested_end_line
+        && start_line == result.start_line
+        && end_line == result.end_line;
+    let sha256 = if preserves_projection_identity {
+        result.sha256.clone()
+    } else {
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    };
+    let start_identity = start_line.to_string();
+    let end_identity = end_line.to_string();
+    let total_identity = result.total_lines.to_string();
+    let content_identity = if preserves_projection_identity {
+        result.content_identity.clone()
+    } else {
+        stable_identity(
+            "KD4_TASK_LOCAL_SOURCE_READ_V1",
+            &[
+                task_identity,
+                &result.source_basis,
+                &result.canonical_path,
+                &start_identity,
+                &end_identity,
+                &total_identity,
+                &sha256,
+            ],
+        )
+    };
+    let receipt_id = stable_identity(
+        "KD4_MODEL_VISIBLE_SOURCE_RECEIPT_V1",
+        &[
+            call_id,
+            &result.source_basis,
+            &result.canonical_path,
+            &start_identity,
+            &end_identity,
+            &content_identity,
+        ],
+    );
+    let projected_fragment = format!("{}:{start_line}-{end_line}\n{text}", result.path);
+    let projection_fragment_id = format!("source:{receipt_id}");
+    let projection_fragment_sha256 = format!("{:x}", Sha256::digest(projected_fragment.as_bytes()));
+    SourceProjectionLedgerEntry {
+        source_basis: result.source_basis.clone(),
+        canonical_path: result.canonical_path.clone(),
+        display_path: result.path.clone(),
+        requested_start_line,
+        requested_end_line,
+        start_line,
+        end_line,
+        total_lines: result.total_lines,
+        sha256,
+        content_identity,
+        freshness: result.freshness.clone(),
+        fresh_evidence: true,
+        receipt_id,
+        projection_fragment_id,
+        projection_fragment_sha256,
+        projection_fragment_bytes: projected_fragment.len(),
+    }
+}
+
+fn source_result_visible_bytes(results: &[SourceReadResult]) -> usize {
+    results
+        .iter()
+        .map(|result| {
+            result.text.as_deref().map_or(0, str::len)
+                + result
+                    .fragments
+                    .iter()
+                    .map(|fragment| fragment.text.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn source_deterministic_receipt(
+    source: &ToolCallSource,
+    call_id: &str,
+    value: &Value,
+) -> Option<TurnTimingDeterministicContinuationReceipt> {
+    if !matches!(source, ToolCallSource::CodeMode { .. }) {
+        return None;
+    }
+    let reads = value.get("reads")?.as_array()?;
+    if reads.is_empty()
+        || reads.iter().any(|read| {
+            read.get("fresh_evidence").and_then(Value::as_bool) == Some(true)
+                || read.get("text").is_some()
+                || read
+                    .get("fragments")
+                    .and_then(Value::as_array)
+                    .is_some_and(|fragments| !fragments.is_empty())
+        })
+        || !reads.iter().any(|read| read.get("reuse").is_some())
+    {
+        return None;
+    }
+    let resource = reads
+        .iter()
+        .map(|read| {
+            format!(
+                "{}:{}",
+                read.get("source_basis")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                read.get("canonical_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let state = reads
+        .iter()
+        .filter_map(|read| read.get("content_identity").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bounds = serde_json::to_string(reads).ok()?;
+    Some(TurnTimingDeterministicContinuationReceipt::new(
+        DeterministicContinuationClass::SourceProjection,
+        stable_identity("KD4_SOURCE_CONTINUATION_RESOURCE_V1", &[&resource]),
+        stable_identity("KD4_SOURCE_CONTINUATION_STATE_V1", &[call_id, &state]),
+        DeterministicContinuationHostAction::ReuseSourceCoverage,
+        stable_identity("KD4_SOURCE_CONTINUATION_BOUNDS_V1", &[&bounds]),
+        1,
+    ))
+}
+
 fn select_lines(
     read: SourceRead,
-    text: String,
+    text: &str,
     task_identity: &str,
+    source_basis: &str,
+    canonical_path: &str,
+    freshness: Option<SourcePathChangeObservation>,
 ) -> Result<SourceReadResult, FunctionCallError> {
     let lines = text.lines().collect::<Vec<_>>();
     let total_lines = lines.len();
@@ -993,7 +2028,8 @@ fn select_lines(
         "KD4_TASK_LOCAL_SOURCE_READ_V1",
         &[
             task_identity,
-            &read.path,
+            source_basis,
+            canonical_path,
             &start_identity,
             &end_identity,
             &total_identity,
@@ -1005,11 +2041,19 @@ fn select_lines(
         path: read.path,
         start_line: start,
         end_line: bounded_end,
+        requested_end_line: read.end_line,
         total_lines,
         sha256,
         content_identity,
         unchanged,
+        fresh_evidence: !unchanged,
+        source_basis: source_basis.to_string(),
+        canonical_path: canonical_path.to_string(),
+        freshness,
+        reuse: None,
+        receipt: None,
         text: (!unchanged).then_some(selected),
+        fragments: Vec::new(),
     })
 }
 
@@ -1044,6 +2088,39 @@ const fn default_cargo_test_timeout_ms() -> u64 {
     300_000
 }
 
+type CargoTestLane = tokio::sync::Mutex<()>;
+
+static CARGO_TEST_LANES: LazyLock<StdMutex<HashMap<String, Weak<CargoTestLane>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn cargo_test_lane(key: &str) -> Arc<CargoTestLane> {
+    let mut lanes = CARGO_TEST_LANES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lane) = lanes.get(key).and_then(Weak::upgrade) {
+        return lane;
+    }
+    lanes.retain(|_, lane| lane.strong_count() > 0);
+    let lane = Arc::new(CargoTestLane::new(()));
+    lanes.insert(key.to_string(), Arc::downgrade(&lane));
+    lane
+}
+
+fn cargo_test_lane_key(turn_cwd: &Path, workdir: Option<&str>) -> String {
+    let requested = workdir.map(PathBuf::from);
+    let resolved = match requested {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => turn_cwd.join(path),
+        None => turn_cwd.to_path_buf(),
+    };
+    let repository =
+        codex_git_utils::get_git_repo_root(&resolved).unwrap_or_else(|| resolved.clone());
+    let mut key = repository.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    key.make_ascii_lowercase();
+    key
+}
+
 pub struct CargoTestHandler {
     shell_options: ShellCommandHandlerOptions,
 }
@@ -1062,7 +2139,7 @@ impl ToolExecutor<ToolInvocation> for CargoTestHandler {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: "cargo_test".to_string(),
-            description: "Run a focused Cargo test with explicit evidence. The tool first executes the same selection with --list, reports selected_test_count (and the matched_tests compatibility alias), and returns a normalized failure_signature for unsuccessful or zero-test validation. Prefer this to treating a successful zero-test cargo invocation as validation.".to_string(),
+            description: "Run a focused Cargo test with explicit evidence. The tool serializes its list and run phases with other cargo_test calls for the same repository, preserving one warmed Cargo lane; do not start it while shared source mutation is active. It first executes the same selection with --list, reports selected_test_count (and the matched_tests compatibility alias), and returns a normalized failure_signature for unsuccessful or zero-test validation. Prefer this to treating a successful zero-test cargo invocation as validation.".to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(
@@ -1089,6 +2166,12 @@ impl ToolExecutor<ToolInvocation> for CargoTestHandler {
                 ));
             };
             let args: CargoTestArgs = parse_arguments(arguments)?;
+            let lane_key = cargo_test_lane_key(
+                invocation.turn.config.cwd.as_path(),
+                args.workdir.as_deref(),
+            );
+            let lane = cargo_test_lane(&lane_key);
+            let _lane_guard = lane.lock().await;
             let base_args = cargo_test_args(&args, false);
             let probe_args = cargo_test_args(&args, true);
             let shell = ShellCommandHandler::new(self.shell_options);
@@ -1636,21 +2719,38 @@ fn lint_finding(
 
 #[cfg(test)]
 mod tests {
+    use crate::session::reasoning_governor::SamplingReasoningGovernor;
+    use crate::session::reasoning_governor::SamplingRequestSettledState;
+    use crate::turn_diff_tracker::ValidationFreshnessStatus;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseInputItem;
+
     use super::*;
+
+    fn select_test_lines(read: SourceRead, text: &str, task_identity: &str) -> SourceReadResult {
+        select_lines(
+            read,
+            text,
+            task_identity,
+            "environment:local|repository:test",
+            "src/test.rs",
+            None,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn line_selection_is_one_based_and_bounded() {
-        let result = select_lines(
+        let result = select_test_lines(
             SourceRead {
                 path: "x".into(),
                 start_line: Some(2),
                 end_line: Some(9),
                 known_sha256: None,
             },
-            "a\nb\nc".into(),
+            "a\nb\nc",
             "task-a",
-        )
-        .unwrap();
+        );
         assert_eq!(result.text.as_deref(), Some("b\nc"));
         assert_eq!(result.end_line, 3);
         assert!(!result.unchanged);
@@ -1658,28 +2758,26 @@ mod tests {
 
     #[test]
     fn matching_projection_hash_omits_repeated_source_text() {
-        let first = select_lines(
+        let first = select_test_lines(
             SourceRead {
                 path: "x".into(),
                 start_line: Some(2),
                 end_line: Some(3),
                 known_sha256: None,
             },
-            "a\nb\nc".into(),
+            "a\nb\nc",
             "task-a",
-        )
-        .unwrap();
-        let repeated = select_lines(
+        );
+        let repeated = select_test_lines(
             SourceRead {
                 path: "x".into(),
                 start_line: Some(2),
                 end_line: Some(3),
                 known_sha256: Some(first.sha256.clone()),
             },
-            "a\nb\nc".into(),
+            "a\nb\nc",
             "task-a",
-        )
-        .unwrap();
+        );
 
         assert!(repeated.unchanged);
         assert_eq!(repeated.sha256, first.sha256);
@@ -1695,13 +2793,132 @@ mod tests {
             end_line: Some(1),
             known_sha256: None,
         };
-        let first = select_lines(read(), "owner".into(), "task-a").unwrap();
-        let repeated = select_lines(read(), "owner".into(), "task-a").unwrap();
-        let other_task = select_lines(read(), "owner".into(), "task-b").unwrap();
+        let first = select_test_lines(read(), "owner", "task-a");
+        let repeated = select_test_lines(read(), "owner", "task-a");
+        let other_task = select_test_lines(read(), "owner", "task-b");
 
         assert_eq!(first.content_identity, repeated.content_identity);
         assert_ne!(first.content_identity, other_task.content_identity);
         assert_eq!(first.content_identity.len(), 64);
+    }
+
+    #[test]
+    fn same_batch_repeats_and_overlap_emit_only_new_source_evidence() {
+        let first = select_test_lines(
+            SourceRead {
+                path: "src/test.rs".into(),
+                start_line: Some(1),
+                end_line: Some(3),
+                known_sha256: None,
+            },
+            "a\nb\nc\nd",
+            "task-a",
+        );
+        let repeated = first.clone();
+        let overlap = select_test_lines(
+            SourceRead {
+                path: "src/test.rs".into(),
+                start_line: Some(2),
+                end_line: Some(4),
+                known_sha256: None,
+            },
+            "a\nb\nc\nd",
+            "task-a",
+        );
+        let cache = crate::git_workspace::GitWorkspaceCache::new();
+        let (results, ledger, stats) = finalize_source_results(
+            vec![first, repeated, overlap],
+            &[],
+            &cache,
+            "task-a",
+            "call-a",
+        );
+
+        assert_eq!(results[0].text.as_deref(), Some("a\nb\nc"));
+        assert_eq!(results[1].text, None);
+        assert!(matches!(
+            results[1].reuse,
+            Some(SourceReuseKind::ExactBatch)
+        ));
+        assert_eq!(results[2].text, None);
+        assert_eq!(
+            results[2].fragments,
+            vec![SourceTextFragment {
+                start_line: 4,
+                end_line: 4,
+                text: "d".into(),
+            }]
+        );
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger[1].start_line, 4);
+        assert_eq!(stats.exact_reuse_count, 1);
+        assert_eq!(stats.overlap_removed_count, 1);
+    }
+
+    #[test]
+    fn model_visible_ledger_rebuild_uses_only_fresh_surviving_evidence() {
+        let result = select_test_lines(
+            SourceRead {
+                path: "src/test.rs".into(),
+                start_line: Some(1),
+                end_line: Some(1),
+                known_sha256: None,
+            },
+            "owner",
+            "task-a",
+        );
+        let entry = source_ledger_entry(&result, 1, Some(1), 1, 1, "owner", "task-a", "call-a");
+        let selected_text = format!("[context]\n{}:1-1\nowner", entry.display_path);
+        let output = json!({
+            "result": {
+                "essential": {
+                    "source_projection_ledger": [entry.clone()]
+                },
+                "selected_text": selected_text,
+            }
+        })
+        .to_string();
+        let surviving = vec![("call-a".to_string(), output)];
+        let omitted = vec![(
+            "call-a".to_string(),
+            json!({
+                "result": {
+                    "essential": {
+                        "source_projection_ledger": [entry]
+                    },
+                    "selected_text": "[context]\n[omitted]",
+                }
+            })
+            .to_string(),
+        )];
+
+        assert_eq!(model_visible_source_evidence_count(&surviving), 1);
+        assert_eq!(model_visible_source_evidence_count(&omitted), 0);
+        assert_eq!(model_visible_source_evidence_count(&[]), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_source_reads_share_one_physical_operation() {
+        let coordinator = SourceReadCoordinator::default();
+        let physical_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_reads = Arc::clone(&physical_reads);
+        let second_reads = Arc::clone(&physical_reads);
+        let (first, second) = tokio::join!(
+            coordinator.read("owner".into(), async move {
+                first_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Ok("owner".to_string())
+            }),
+            coordinator.read("owner".into(), async move {
+                second_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok("duplicate".to_string())
+            })
+        );
+
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(physical_reads.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1739,6 +2956,16 @@ mod tests {
                 "--nocapture"
             ]
         );
+    }
+
+    #[test]
+    fn cargo_test_lane_is_shared_per_repository_key() {
+        let first = cargo_test_lane("repository-a");
+        let repeated = cargo_test_lane("repository-a");
+        let other = cargo_test_lane("repository-b");
+
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[test]
@@ -1812,6 +3039,44 @@ mod tests {
         assert!(facts.relationships >= 4);
         assert_eq!(facts.invariants, 1);
         assert_eq!(facts.missing_requirements, 0);
+        let output = ArchitectureSliceToolOutput::new(slice.clone());
+        let signal = output
+            .sampling_request_signal()
+            .expect("complete source closure should emit a sampling signal");
+        assert_eq!(signal["source_closure_established"], true);
+        assert_eq!(signal["source_closure"], slice);
+
+        let governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let collector = governor.collector(&baselines);
+        let ordinal = collector.register_tool_call();
+        collector.record_response_result_with_mutation(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(signal),
+            &ResponseInputItem::FunctionCallOutput {
+                call_id: "architecture-call".to_string(),
+                output: FunctionCallOutputPayload::from_text(slice.to_string()),
+            },
+            false,
+            false,
+        );
+        assert!(collector.reusable_source_closure(
+            &baselines,
+            &SamplingRequestSettledState {
+                mutation_revision: 0,
+                validation_status: ValidationFreshnessStatus::None,
+                validation_revision: None,
+            },
+        ));
+        assert!(!collector.reusable_source_closure(
+            &baselines,
+            &SamplingRequestSettledState {
+                mutation_revision: 1,
+                validation_status: ValidationFreshnessStatus::None,
+                validation_revision: None,
+            },
+        ));
     }
 
     #[test]
@@ -1844,6 +3109,10 @@ mod tests {
         let facts = architecture_slice_timing_facts(&slice);
         assert!(!facts.complete);
         assert!(facts.missing_requirements > 0);
+        let signal = ArchitectureSliceToolOutput::new(slice)
+            .sampling_request_signal()
+            .expect("incomplete source evidence should still reach the governor");
+        assert_eq!(signal["source_closure_established"], false);
     }
 
     #[test]

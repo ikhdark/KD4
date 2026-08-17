@@ -319,11 +319,17 @@ impl ChatWidget {
         self.refresh_status_line();
     }
 
-    pub(super) fn stop_rate_limit_poller(&mut self) {}
-
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn prefetch_rate_limits(&mut self) {
-        self.stop_rate_limit_poller();
+    pub(crate) fn prefetch_rate_limits(&mut self) {
+        if !self.should_prefetch_rate_limits() {
+            return;
+        }
+        let reset_hint_request_id = self.start_rate_limit_reset_startup_check();
+        self.app_event_tx.send(AppEvent::RefreshRateLimits {
+            origin: RateLimitRefreshOrigin::StartupPrefetch {
+                reset_hint_request_id,
+            },
+        });
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

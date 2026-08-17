@@ -277,7 +277,9 @@ struct SamplingToolOutcome {
     plan: Option<UpdatePlanArgs>,
     source_closure_established: bool,
     source_evidence: Option<Value>,
+    unfinished_mutation_obligation: bool,
     failure_fingerprint: Option<String>,
+    failure_diagnosis_reused: bool,
     canonical_artifact_required: bool,
     nested_in_code_mode: bool,
 }
@@ -297,7 +299,9 @@ impl SamplingToolOutcome {
             plan,
             source_closure_established: sampling_source_closure_established(signal),
             source_evidence: sampling_source_evidence(signal),
+            unfinished_mutation_obligation: sampling_unfinished_mutation_obligation(signal),
             failure_fingerprint: sampling_failure_fingerprint(signal),
+            failure_diagnosis_reused: false,
             canonical_artifact_required: false,
             nested_in_code_mode: false,
         }
@@ -324,6 +328,7 @@ impl SamplingToolOutcome {
             && self.plan.is_none()
             && !self.source_closure_established
             && self.source_evidence.is_none()
+            && !self.unfinished_mutation_obligation
             && !self.canonical_artifact_required
     }
 }
@@ -392,10 +397,22 @@ pub(crate) struct SuppressedSourcePassGuard {
     pub(crate) evidence_identity: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SuppressedFailureGuard {
+    pub(crate) failure_fingerprint: String,
+}
+
 #[derive(Clone, Debug)]
 struct BroadSourcePassGate {
     state_revision: String,
     evidence_by_action: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct RepeatedFailureGate {
+    state_revision: String,
+    action_identity: String,
+    failure_fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -413,6 +430,7 @@ struct StructuredActionIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeterministicCycleKind {
     Empty,
+    ToolFailure,
     NestedToolFailure,
     ResidualToolContinuation,
     BroadSourcePass,
@@ -423,6 +441,7 @@ struct DeterministicCycle {
     key: String,
     kind: DeterministicCycleKind,
     broad_source_evidence_by_action: BTreeMap<String, String>,
+    repeated_failure: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -436,6 +455,7 @@ struct WaitConvergenceHandle {
 struct DeterministicDispatchLedger {
     blocked_wait_gate: Option<BlockedWaitGate>,
     broad_source_pass_gate: Option<BroadSourcePassGate>,
+    repeated_failure_gate: Option<RepeatedFailureGate>,
     timing: Arc<TurnTimingState>,
 }
 
@@ -444,6 +464,7 @@ impl DeterministicDispatchLedger {
         Self {
             blocked_wait_gate: None,
             broad_source_pass_gate: None,
+            repeated_failure_gate: None,
             timing,
         }
     }
@@ -486,6 +507,7 @@ pub(crate) struct SamplingToolCallRegistration {
     pub(crate) ordinal: u64,
     pub(crate) blocked_wait_guard: Option<BlockedWaitGuard>,
     pub(crate) suppressed_source_pass: Option<SuppressedSourcePassGuard>,
+    pub(crate) suppressed_failure: Option<SuppressedFailureGuard>,
 }
 
 impl SamplingRequestSignalCollector {
@@ -512,7 +534,7 @@ impl SamplingRequestSignalCollector {
         let action_identity = deterministic_action_identity(tool_name, payload);
         let structured_action = structured_action_identity(tool_name, payload);
         let validation = is_validation_invocation(tool_name, payload);
-        let (blocked_wait_guard, suppressed_source_pass) = self
+        let (blocked_wait_guard, suppressed_source_pass, suppressed_failure) = self
             .dispatch_ledger
             .as_ref()
             .map(|ledger| {
@@ -536,7 +558,21 @@ impl SamplingRequestSignalCollector {
                             evidence_identity: evidence_identity.clone(),
                         })
                 });
-                (blocked_wait_guard, suppressed_source_pass)
+                let suppressed_failure = structured_action.as_ref().and_then(|action| {
+                    ledger
+                        .repeated_failure_gate
+                        .as_ref()
+                        .filter(|gate| gate.state_revision == self.request_state_revision)
+                        .filter(|gate| gate.action_identity == action.identity)
+                        .map(|gate| SuppressedFailureGuard {
+                            failure_fingerprint: gate.failure_fingerprint.clone(),
+                        })
+                });
+                (
+                    blocked_wait_guard,
+                    suppressed_source_pass,
+                    suppressed_failure,
+                )
             })
             .unwrap_or_default();
 
@@ -563,6 +599,7 @@ impl SamplingRequestSignalCollector {
             ordinal,
             blocked_wait_guard,
             suppressed_source_pass,
+            suppressed_failure,
         }
     }
 
@@ -605,6 +642,20 @@ impl SamplingRequestSignalCollector {
         state
             .evidence_items
             .insert(ordinal, evidence_identity.to_string());
+    }
+
+    pub(crate) fn record_suppressed_failure(&self, ordinal: u64, failure_fingerprint: &str) {
+        let mut outcome =
+            SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
+        outcome.failure_fingerprint = Some(failure_fingerprint.to_string());
+        outcome.failure_diagnosis_reused = true;
+        outcome.nested_in_code_mode = true;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.code_mode_nested_tool_count = state.code_mode_nested_tool_count.saturating_add(1);
+        state.outcomes.push(outcome);
     }
 
     pub(crate) fn record_accepted_deterministic_continuation_receipts(
@@ -784,20 +835,20 @@ impl SamplingRequestSignalCollector {
         outcome_context: ToolOutputOutcomeContext,
         signal: Option<Value>,
         response: &ResponseInputItem,
+        canonical_artifact_required: bool,
         _mutation_advanced: bool,
     ) {
         let plan = sampling_plan(signal.as_ref());
         let evidence_identity = response_evidence_identity(response);
+        let mut outcome =
+            SamplingToolOutcome::from_signal(ordinal, outcome_context, plan, signal.as_ref());
+        outcome.canonical_artifact_required = canonical_artifact_required;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.outcomes.push(SamplingToolOutcome::from_signal(
-            ordinal,
-            outcome_context,
-            plan,
-            signal.as_ref(),
-        ));
+        state.saw_canonical_artifact_requirement |= canonical_artifact_required;
+        state.outcomes.push(outcome);
         if let Some(evidence_identity) = evidence_identity {
             state.evidence_items.insert(ordinal, evidence_identity);
         }
@@ -817,6 +868,7 @@ impl SamplingRequestSignalCollector {
                 key: "empty".to_string(),
                 kind: DeterministicCycleKind::Empty,
                 broad_source_evidence_by_action: BTreeMap::new(),
+                repeated_failure: None,
             });
         }
         let mut outer_code_mode_outcomes = state
@@ -836,33 +888,49 @@ impl SamplingRequestSignalCollector {
             .iter()
             .filter(|outcome| !code_mode_owned || outcome.nested_in_code_mode)
             .collect::<Vec<_>>();
-        let nested_failures = outcomes
+        let failures = outcomes
             .iter()
             .copied()
-            .filter(|outcome| outcome.nested_in_code_mode && outcome.is_failure_evidence())
+            .filter(|outcome| outcome.is_failure_evidence())
             .collect::<Vec<_>>();
-        if !nested_failures.is_empty() {
-            let mut fingerprints = nested_failures
-                .into_iter()
-                .map(|outcome| {
-                    outcome
-                        .failure_fingerprint
-                        .as_ref()
-                        .map(|fingerprint| (outcome.ordinal, fingerprint.as_str()))
-                })
+        if !failures.is_empty() {
+            let nested_only = failures.iter().all(|outcome| outcome.nested_in_code_mode);
+            let mut fingerprints = failures
+                .iter()
+                .map(|outcome| outcome.failure_fingerprint.as_ref().map(String::as_str))
                 .collect::<Option<Vec<_>>>()?;
-            fingerprints.sort_by_key(|(ordinal, _)| *ordinal);
+            fingerprints.sort_unstable();
+            fingerprints.dedup();
+            let failure_fingerprint = fingerprints.into_iter().collect::<Vec<_>>().join("|");
+            let repeated_action_identity = if code_mode_owned {
+                state
+                    .outcomes
+                    .iter()
+                    .filter(|outcome| !outcome.nested_in_code_mode)
+                    .find_map(|outcome| state.structured_actions.get(&outcome.ordinal))
+                    .map(|action| action.identity.clone())
+            } else if failures.len() == 1 {
+                state
+                    .structured_actions
+                    .get(&failures[0].ordinal)
+                    .map(|action| action.identity.clone())
+            } else {
+                None
+            };
+            let (kind, key_prefix) = if nested_only {
+                (
+                    DeterministicCycleKind::NestedToolFailure,
+                    "NestedToolFailure",
+                )
+            } else {
+                (DeterministicCycleKind::ToolFailure, "ToolFailure")
+            };
             return Some(DeterministicCycle {
-                key: format!(
-                    "NestedToolFailure:{}",
-                    fingerprints
-                        .into_iter()
-                        .map(|(_, fingerprint)| fingerprint)
-                        .collect::<Vec<_>>()
-                        .join("|")
-                ),
-                kind: DeterministicCycleKind::NestedToolFailure,
+                key: format!("{key_prefix}:{failure_fingerprint}"),
+                kind,
                 broad_source_evidence_by_action: BTreeMap::new(),
+                repeated_failure: repeated_action_identity
+                    .map(|action_identity| (action_identity, failure_fingerprint)),
             });
         }
         let incomplete_code_mode_outcomes = code_mode_owned
@@ -932,6 +1000,7 @@ impl SamplingRequestSignalCollector {
             key: format!("{kind:?}:{action_evidence}:receipts:{receipts}"),
             kind,
             broad_source_evidence_by_action,
+            repeated_failure: None,
         })
     }
 
@@ -941,6 +1010,21 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.registered_count > 0 && state.wait_call_count == state.registered_count
+    }
+
+    pub(crate) fn reusable_source_closure(
+        &self,
+        baselines: &SamplingRequestBaselines,
+        settled: &SamplingRequestSettledState,
+    ) -> bool {
+        settled.mutation_revision == baselines.mutation_revision
+            && self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.source_closure_established)
     }
 
     fn generation_purpose(
@@ -958,6 +1042,10 @@ impl SamplingRequestSignalCollector {
             .outcomes
             .iter()
             .any(SamplingToolOutcome::is_failure_evidence);
+        let observed_new_failure = state
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.is_failure_evidence() && !outcome.failure_diagnosis_reused);
         let validation_failed = matches!(
             settled.validation_status,
             ValidationFreshnessStatus::FailedAfterLastMutation
@@ -979,7 +1067,7 @@ impl SamplingRequestSignalCollector {
             || settled.validation_status != baselines.validation_status
             || settled.validation_revision != baselines.validation_revision
         {
-            Some(if observed_failure || validation_failed {
+            Some(if observed_new_failure || validation_failed {
                 TurnTimingGenerationPurpose::FailureDiagnosis
             } else {
                 TurnTimingGenerationPurpose::ValidationInterpretation
@@ -996,7 +1084,7 @@ impl SamplingRequestSignalCollector {
             .any(|action| action.class == StructuredActionClass::BroadSource)
         {
             Some(TurnTimingGenerationPurpose::ArtifactContinuation)
-        } else if observed_failure || validation_failed {
+        } else if observed_new_failure || validation_failed {
             Some(TurnTimingGenerationPurpose::FailureDiagnosis)
         } else if state.registered_count > 0 {
             // Every successful tool result is new model-visible evidence even
@@ -1108,6 +1196,13 @@ fn sampling_source_evidence(signal: Option<&Value>) -> Option<Value> {
         .cloned()
 }
 
+fn sampling_unfinished_mutation_obligation(signal: Option<&Value>) -> bool {
+    signal
+        .and_then(|value| value.get("unfinished_mutation_obligation"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn sampling_failure_fingerprint(signal: Option<&Value>) -> Option<String> {
     signal
         .and_then(|value| value.get("failure"))
@@ -1173,8 +1268,9 @@ fn response_evidence_identity(response: &ResponseInputItem) -> Option<String> {
             status,
             execution,
             tools,
+            omitted_result_count,
             ..
-        } => serde_json::to_vec(&(status, execution, tools)).ok()?,
+        } => serde_json::to_vec(&(status, execution, tools, omitted_result_count)).ok()?,
     };
     Some(format!("{:x}", Sha256::digest(canonical)))
 }
@@ -1413,6 +1509,7 @@ pub(crate) struct SamplingReasoningGovernor {
     input_revision: u64,
     dispatch_ledger: Arc<Mutex<DeterministicDispatchLedger>>,
     consecutive_no_progress: u32,
+    consecutive_obligation_no_progress: u32,
     last_cycle: Option<String>,
     last_state_revision: Option<String>,
     directive_issued: bool,
@@ -1447,6 +1544,7 @@ impl SamplingReasoningGovernor {
             input_revision: 0,
             dispatch_ledger: Arc::new(Mutex::new(DeterministicDispatchLedger::new(timing))),
             consecutive_no_progress: 0,
+            consecutive_obligation_no_progress: 0,
             last_cycle: None,
             last_state_revision: None,
             directive_issued: false,
@@ -1666,6 +1764,7 @@ impl SamplingReasoningGovernor {
                 )
             );
             self.consecutive_no_progress = 0;
+            self.consecutive_obligation_no_progress = 0;
             self.last_cycle = None;
             self.last_state_revision = Some(settled_revision);
             self.directive_issued = false;
@@ -1753,6 +1852,8 @@ impl SamplingReasoningGovernor {
 
         let repeated_cycle = self.last_cycle.as_deref() == Some(cycle.key.as_str())
             && self.last_state_revision.as_deref() == Some(settled_revision.as_str());
+        self.consecutive_obligation_no_progress =
+            self.consecutive_obligation_no_progress.saturating_add(1);
         if repeated_cycle || cycle.kind == DeterministicCycleKind::Empty {
             self.consecutive_no_progress = self.consecutive_no_progress.saturating_add(1);
         } else {
@@ -1763,10 +1864,22 @@ impl SamplingReasoningGovernor {
             self.proven_loop_active = false;
         }
         let cycle_is_nonempty = cycle.kind != DeterministicCycleKind::Empty;
+        if repeated_cycle
+            && let Some((action_identity, failure_fingerprint)) = cycle.repeated_failure.as_ref()
+        {
+            self.dispatch_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .repeated_failure_gate = Some(RepeatedFailureGate {
+                state_revision: settled_revision.clone(),
+                action_identity: action_identity.clone(),
+                failure_fingerprint: failure_fingerprint.clone(),
+            });
+        }
         self.last_cycle = Some(cycle.key.clone());
         self.last_state_revision = Some(settled_revision.clone());
 
-        if self.consecutive_no_progress < 3 {
+        if self.consecutive_no_progress < 3 && self.consecutive_obligation_no_progress < 3 {
             return SamplingConvergenceDecision::default();
         }
 
@@ -1789,8 +1902,9 @@ impl SamplingReasoningGovernor {
         self.directive_issued = true;
         let directive = if cycle.kind == DeterministicCycleKind::BroadSourcePass {
             "Convergence required: the broad source pass repeated against the same obligation and returned the same evidence for the same action. An equivalent pass is now suppressed. Before another broad source pass, change the active obligation, provide a new evidence identity, or choose a materially different action; otherwise synthesize the result, begin implementation, or truthfully complete."
-        } else if self.consecutive_no_progress == 3 {
-            "Convergence required: the last three generations produced no structured state progress. Use a new hypothesis, a state-changing action, a narrower observation, or truthfully complete. Do not repeat an equivalent action against unchanged state."
+        } else if self.consecutive_no_progress == 3 || self.consecutive_obligation_no_progress == 3
+        {
+            "Convergence required: the last three generations produced no obligation-level state progress. New read identities do not reset this budget. Use a new hypothesis, a state-changing action, a narrower observation, or truthfully complete."
         } else if self.proven_loop_active {
             "Convergence escalation: an ordered deterministic action/result cycle has repeated after the convergence directive against identical state. Do not repeat it. Change the hypothesis or state, narrow the observation, or truthfully complete; existing task lifecycle rules still govern termination."
         } else {
@@ -1806,6 +1920,7 @@ impl SamplingReasoningGovernor {
 
     fn reset_convergence(&mut self) {
         self.consecutive_no_progress = 0;
+        self.consecutive_obligation_no_progress = 0;
         self.last_cycle = None;
         self.last_state_revision = None;
         self.directive_issued = false;
@@ -1917,6 +2032,16 @@ impl SamplingReasoningGovernor {
             && let Some(plan) = changed_plan.as_ref()
         {
             self.transition_to(phase_for_plan(plan), ReasoningPolicyTrigger::PlanUpdated);
+            return;
+        }
+        if outcomes.iter().any(|outcome| {
+            outcome.kind == SamplingToolOutcomeKind::Success
+                && outcome.unfinished_mutation_obligation
+        }) {
+            self.transition_to(
+                SamplingReasoningPhase::Implement,
+                ReasoningPolicyTrigger::PlanUpdated,
+            );
             return;
         }
         if outcomes.iter().any(SamplingToolOutcome::is_generic_success) {
@@ -3207,13 +3332,94 @@ mod tests {
             Some("NestedToolFailure:nested.plan.blocked")
         );
 
+        let settled_state = settled(0, ValidationFreshnessStatus::None, None);
+        governor.settle(&baseline, &collector, &settled_state);
+        assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
+        assert_eq!(governor.trigger(), ReasoningPolicyTrigger::ToolBlocked);
+
+        assert_eq!(
+            governor.evaluate_convergence(&baseline, &collector, &settled_state),
+            SamplingConvergenceDecision::default()
+        );
+        let first_retry = governor.collector(&baseline);
+        assert!(
+            first_retry
+                .register_deterministic_tool_call(
+                    &ToolName::plain("exec"),
+                    &ToolPayload::Custom {
+                        input: "try { await tools.update_plan({}); } catch {}".to_string(),
+                    },
+                    "first-retry-exec-call",
+                )
+                .suppressed_failure
+                .is_none()
+        );
+        assert_eq!(
+            governor.evaluate_convergence(&baseline, &collector, &settled_state),
+            SamplingConvergenceDecision::default()
+        );
+        let repeated = governor.collector(&baseline);
+        let repeated_registration = repeated.register_deterministic_tool_call(
+            &ToolName::plain("exec"),
+            &ToolPayload::Custom {
+                input: "try { await tools.update_plan({}); } catch {}".to_string(),
+            },
+            "repeated-exec-call",
+        );
+        let guard = repeated_registration
+            .suppressed_failure
+            .expect("unchanged failed action should reuse its stable diagnosis");
+        assert_eq!(guard.failure_fingerprint, "nested.plan.blocked");
+        repeated
+            .record_suppressed_failure(repeated_registration.ordinal, &guard.failure_fingerprint);
+        assert_eq!(
+            repeated.generation_purpose(&baseline, &settled_state, false, false),
+            Some(TurnTimingGenerationPurpose::ArtifactContinuation)
+        );
+
+        let changed_state = governor.baselines(1, ValidationFreshnessStatus::None, None);
+        let changed = governor.collector(&changed_state);
+        assert!(
+            changed
+                .register_deterministic_tool_call(
+                    &ToolName::plain("exec"),
+                    &ToolPayload::Custom {
+                        input: "try { await tools.update_plan({}); } catch {}".to_string(),
+                    },
+                    "changed-state-exec-call",
+                )
+                .suppressed_failure
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unfinished_mutation_obligation_moves_status_only_plan_update_to_implement() {
+        let config = config();
+        let mut governor = SamplingReasoningGovernor::new(Some(&config));
+        governor.phase = SamplingReasoningPhase::Finalize;
+        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let collector = governor.collector(&baseline);
+        collector.push(SamplingToolOutcome::from_signal(
+            0,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            Some(&json!({
+                "kind": "plan_update",
+                "plan": null,
+                "unfinished_mutation_obligation": true,
+            })),
+        ));
+
+        assert!(collector.snapshot()[0].unfinished_mutation_obligation);
         governor.settle(
             &baseline,
             &collector,
             &settled(0, ValidationFreshnessStatus::None, None),
         );
-        assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
-        assert_eq!(governor.trigger(), ReasoningPolicyTrigger::ToolBlocked);
+
+        assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
+        assert_eq!(governor.trigger(), ReasoningPolicyTrigger::PlanUpdated);
     }
 
     #[test]
@@ -3624,6 +3830,7 @@ mod tests {
                 None,
                 &successful_tool_response("source-call", evidence),
                 false,
+                false,
             );
         }
         (collector, registration)
@@ -3659,8 +3866,73 @@ mod tests {
             None,
             &successful_tool_response("artifact-call", evidence),
             false,
+            false,
         );
         collector
+    }
+
+    #[test]
+    fn direct_canonical_artifact_requirement_reaches_governor() {
+        let governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let settled = settled(0, ValidationFreshnessStatus::None, None);
+        let collector = governor.collector(&baselines);
+        let ordinal = collector.register_tool_call();
+
+        collector.record_response_result_with_mutation(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            &successful_tool_response("canonical-call", "artifact"),
+            true,
+            false,
+        );
+
+        let outcomes = collector.snapshot();
+        assert!(outcomes[0].canonical_artifact_required);
+        assert!(!outcomes[0].is_generic_success());
+        assert!(
+            collector
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .saw_canonical_artifact_requirement
+        );
+        assert_eq!(
+            collector.generation_purpose(&baselines, &settled, false, false),
+            Some(TurnTimingGenerationPurpose::ArtifactContinuation)
+        );
+    }
+
+    #[test]
+    fn source_closure_signal_reaches_governor() {
+        let governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let collector = governor.collector(&baselines);
+        let ordinal = collector.register_tool_call();
+        let source_closure = json!({"snapshot": "head:manifest", "truncated": false});
+
+        collector.record_response_result_with_mutation(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(json!({
+                "kind": "source_closure",
+                "source_closure_established": true,
+                "source_closure": source_closure,
+            })),
+            &successful_tool_response("architecture-call", "closure"),
+            false,
+            false,
+        );
+
+        assert!(collector.reusable_source_closure(
+            &baselines,
+            &settled(0, ValidationFreshnessStatus::None, None),
+        ));
+        let outcomes = collector.snapshot();
+        assert!(outcomes[0].source_closure_established);
+        assert_eq!(outcomes[0].source_evidence.as_ref(), Some(&source_closure));
+        assert!(!outcomes[0].is_generic_success());
     }
 
     #[test]
@@ -3699,9 +3971,11 @@ mod tests {
 
         let changed_evidence =
             residual_tool_collector(&governor, &baselines, "revision-2", "changed");
-        assert_eq!(
-            governor.evaluate_convergence(&baselines, &changed_evidence, &settled),
-            SamplingConvergenceDecision::default()
+        assert!(
+            governor
+                .evaluate_convergence(&baselines, &changed_evidence, &settled)
+                .directive
+                .is_some()
         );
         assert_eq!(
             governor
@@ -3723,12 +3997,12 @@ mod tests {
         let (baselines, settled) = unchanged_state(&governor);
         let arguments = r#"{"reads":[{"path":"src/lib.rs"}]}"#;
 
-        for generation in 1..=4 {
+        for generation in 1..=3 {
             let (collector, registration) =
                 source_pass_collector(&governor, &baselines, arguments, "same-evidence");
             assert!(registration.suppressed_source_pass.is_none());
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation == 4);
+            assert_eq!(decision.directive.is_some(), generation == 3);
             if generation > 1 {
                 assert_eq!(
                     governor
@@ -3757,6 +4031,80 @@ mod tests {
         let (_, registration) =
             source_pass_collector(&governor, &changed_baselines, arguments, "new-state");
         assert!(registration.suppressed_source_pass.is_none());
+    }
+
+    fn direct_failure_collector(
+        governor: &SamplingReasoningGovernor,
+        baselines: &SamplingRequestBaselines,
+        fingerprint: &str,
+    ) -> SamplingRequestSignalCollector {
+        let collector = governor.collector(baselines);
+        let tool_name = ToolName::plain("read_source_batch");
+        let payload = ToolPayload::Function {
+            arguments: r#"{"reads":[{"path":"src/lib.rs"}]}"#.to_string(),
+        };
+        let registration =
+            collector.register_deterministic_tool_call(&tool_name, &payload, "failure-call");
+        collector.record_response_result_with_mutation(
+            registration.ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+            Some(json!({
+                "outcome": "failure",
+                "failure": { "fingerprint": fingerprint },
+            })),
+            &successful_tool_response("failure-call", "diagnostic"),
+            false,
+            false,
+        );
+        collector
+    }
+
+    #[test]
+    fn failure_signature_convergence_activates_for_direct_failures() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+
+        for generation in 1..=3 {
+            let collector = direct_failure_collector(&governor, &baselines, "io.locked");
+            assert_eq!(
+                collector.deterministic_cycle_key().as_deref(),
+                Some("ToolFailure:io.locked")
+            );
+            let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
+            assert_eq!(decision.directive.is_some(), generation == 3);
+        }
+    }
+
+    #[test]
+    fn failure_signature_convergence_does_not_equate_changed_signatures() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+        let first = direct_failure_collector(&governor, &baselines, "io.locked");
+        assert!(
+            governor
+                .evaluate_convergence(&baselines, &first, &settled)
+                .directive
+                .is_none()
+        );
+        let changed = direct_failure_collector(&governor, &baselines, "schema.invalid");
+        let decision = governor.evaluate_convergence(&baselines, &changed, &settled);
+        assert!(decision.directive.is_none());
+        assert!(!decision.proven_loop_activated);
+    }
+
+    #[test]
+    fn changed_source_reads_do_not_reset_the_obligation_progress_budget() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+
+        for generation in 1..=3 {
+            let arguments = format!(r#"{{"reads":[{{"path":"src/file-{generation}.rs"}}]}}"#);
+            let evidence = format!("evidence-{generation}");
+            let (collector, _) =
+                source_pass_collector(&governor, &baselines, &arguments, &evidence);
+            let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
+            assert_eq!(decision.directive.is_some(), generation == 3);
+        }
     }
 
     #[test]

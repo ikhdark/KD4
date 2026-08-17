@@ -217,6 +217,7 @@ impl ToolOutput for ToolSearchOutput {
                     })
                 })
                 .collect(),
+            omitted_result_count: Some(self.omitted_result_count),
         }
     }
 
@@ -501,6 +502,7 @@ impl ToolOutput for AbortedToolOutput {
                 status: "aborted".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
+                omitted_result_count: None,
             },
             _ => function_tool_response(
                 call_id,

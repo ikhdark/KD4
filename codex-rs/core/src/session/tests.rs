@@ -552,6 +552,43 @@ async fn completed_startup_prewarm_is_reused() {
 }
 
 #[tokio::test]
+async fn startup_prepared_router_handoff_is_one_shot() {
+    let (sess, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let planning_generation = sess.services.planning_generation();
+    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
+    let router = super::turn::built_tools(
+        sess.as_ref(),
+        step_context.as_ref(),
+        &[],
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("startup router should build");
+    sess.startup_prepared_router
+        .publish(crate::session_startup_prewarm::PreparedStartupRouter {
+            planning_generation,
+            config: Arc::clone(&turn_context.config),
+            dynamic_tools: turn_context.dynamic_tools.clone(),
+            router: Arc::clone(&router),
+        })
+        .await;
+
+    let prepared = sess
+        .startup_prepared_router
+        .take_for_first_turn()
+        .await
+        .expect("first turn should claim the prepared router");
+    assert_eq!(prepared.planning_generation, planning_generation);
+    assert!(Arc::ptr_eq(&prepared.router, &router));
+    assert!(
+        sess.startup_prepared_router
+            .take_for_first_turn()
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn startup_prewarm_completing_during_handoff_is_reused() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let handle = tokio::spawn(async {
@@ -5740,6 +5777,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
         git_workspace: crate::git_workspace::GitWorkspaceCache::new(),
+        source_reads: Default::default(),
     };
 
     let plugins_input = per_turn_config.plugins_config_input();
@@ -5800,6 +5838,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
+        startup_prepared_router: Default::default(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         terminal_delivery_registry: Mutex::new(super::session::TerminalDeliveryRegistry::default()),
         terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
@@ -7889,6 +7928,7 @@ where
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
         git_workspace: crate::git_workspace::GitWorkspaceCache::new(),
+        source_reads: Default::default(),
     };
 
     let plugins_input = per_turn_config.plugins_config_input();
@@ -7949,6 +7989,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
+        startup_prepared_router: Default::default(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         terminal_delivery_registry: Mutex::new(super::session::TerminalDeliveryRegistry::default()),
         terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),

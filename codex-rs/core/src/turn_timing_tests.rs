@@ -199,6 +199,40 @@ fn pre_first_model_output_snapshot_is_atomic_and_immutable() {
 }
 
 #[test]
+fn pending_turn_preparation_is_attributed_before_first_model_output() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let preparation = state.begin_local_phase(TurnLocalPhase::Preparation);
+
+    clock.set_ms(2);
+    let planning = state.begin_local_phase(TurnLocalPhase::Planning);
+    clock.set_ms(6);
+    let router = state.begin_local_phase(TurnLocalPhase::RouterBuild);
+    clock.set_ms(8);
+    drop(router);
+    clock.set_ms(9);
+    drop(planning);
+    clock.set_ms(10);
+    drop(preparation);
+    state.mark_model_request_dispatched();
+
+    clock.set_ms(15);
+    assert_eq!(
+        state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("hi".to_string())),
+        Some(Duration::from_millis(15))
+    );
+
+    let pre_output = state
+        .complete_snapshot()
+        .profile
+        .pre_first_model_output
+        .expect("substantive model output should freeze the snapshot");
+    assert_eq!(pre_output.client_critical_path_ns, 10 * NS_PER_MS);
+    assert_eq!(pre_output.attributed_client_union_ns, 10 * NS_PER_MS);
+    assert_eq!(pre_output.unattributed_pre_output_ns, 0);
+}
+
+#[test]
 fn pre_first_model_output_snapshot_is_absent_without_model_output() {
     let (clock, state) = timing();
     state.mark_turn_started();
@@ -433,7 +467,7 @@ fn model_requests_record_dispatch_output_completion_and_continuation() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 14);
+    assert_eq!(timing.schema_version, 15);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(30));
@@ -621,6 +655,33 @@ fn accepted_batched_receipt_counts_suppressed_boundaries_without_starting_genera
     assert_eq!(counters.suppressed_deterministic_continuation_count, 7);
     assert_eq!(counters.logical_generation_count, 0);
     assert_eq!(counters.generations_by_disposition, Default::default());
+}
+
+#[test]
+fn source_receipts_and_projection_work_are_counted_without_generations() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    state.record_source_projection_result(2, 1, 3, 2);
+    state.record_source_model_visible_new_evidence(4);
+    state.record_accepted_deterministic_continuation_receipts(&[
+        TurnTimingDeterministicContinuationReceipt::new(
+            DeterministicContinuationClass::SourceProjection,
+            "source-resource".to_string(),
+            "source-revision".to_string(),
+            DeterministicContinuationHostAction::ReuseSourceCoverage,
+            "source-bounds".to_string(),
+            2,
+        ),
+    ]);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.source_exact_projection_reuse_count, 2);
+    assert_eq!(counters.source_conditional_unchanged_count, 1);
+    assert_eq!(counters.source_overlap_range_elimination_count, 3);
+    assert_eq!(counters.source_physical_range_avoided_count, 2);
+    assert_eq!(counters.source_host_drained_continuation_count, 2);
+    assert_eq!(counters.source_model_visible_new_evidence_count, 4);
+    assert_eq!(counters.logical_generation_count, 0);
 }
 
 #[test]
@@ -1075,7 +1136,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 14);
+    assert_eq!(profile.schema_version, 15);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -1148,6 +1209,13 @@ fn wait_and_tool_output_counters_are_additive() {
 
     state.record_wait_only_generation();
     state.record_internally_drained_waits(7);
+    state.record_residual_deterministic_generation();
+    state.record_owner_drained_continuation();
+    state.record_reused_validation();
+    state.record_suppressed_validation_output();
+    state.record_ready_startup_prewarm();
+    state.record_completion_review_ready_phase();
+    state.record_completion_review_terminal_phase();
     state.record_no_progress_directive();
     state.record_proven_loop_activation();
     state.record_tool_output_projection_facts(1_000, 250, 400, 100, true, true, 3, true);
@@ -1159,6 +1227,13 @@ fn wait_and_tool_output_counters_are_additive() {
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.wait_only_generation_count, 1);
     assert_eq!(counters.internally_drained_wait_count, 7);
+    assert_eq!(counters.residual_deterministic_generation_count, 1);
+    assert_eq!(counters.owner_drained_continuation_count, 1);
+    assert_eq!(counters.reused_validation_count, 1);
+    assert_eq!(counters.suppressed_validation_output_count, 1);
+    assert_eq!(counters.ready_startup_prewarm_count, 1);
+    assert_eq!(counters.completion_review_ready_phase_count, 1);
+    assert_eq!(counters.completion_review_terminal_phase_count, 1);
     assert_eq!(counters.suppressed_deterministic_continuation_count, 0);
     assert_eq!(counters.no_progress_directive_count, 1);
     assert_eq!(counters.proven_loop_activation_count, 1);

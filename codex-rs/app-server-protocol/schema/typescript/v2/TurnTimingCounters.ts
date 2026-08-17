@@ -22,6 +22,62 @@ logicalGenerationCount: number, generationsByReason: TurnTimingGenerationReasonC
  */
 suppressedDeterministicContinuationCount: number,
 /**
+ * Residual deterministic generation requests proved by the reasoning
+ * governor, including requests elided before provider dispatch.
+ */
+residualDeterministicGenerationCount: number,
+/**
+ * Continuations drained and recorded by their code-mode owner.
+ */
+ownerDrainedContinuationCount: number,
+/**
+ * Exact source projections acknowledged without replaying source text.
+ */
+sourceExactProjectionReuseCount: number,
+/**
+ * Physical source reads whose automatically or explicitly supplied
+ * conditional identity proved unchanged.
+ */
+sourceConditionalUnchangedCount: number,
+/**
+ * Coherent overlapping source intervals removed from model-visible text.
+ */
+sourceOverlapRangeEliminationCount: bigint,
+/**
+ * Requested source ranges that did not require an independent physical
+ * read because exact or same-operation coverage was reused.
+ */
+sourcePhysicalRangeAvoidedCount: bigint,
+/**
+ * Source-specific deterministic continuations drained by the owner.
+ */
+sourceHostDrainedContinuationCount: number,
+/**
+ * New source evidence fragments actually exposed to a started model
+ * generation.
+ */
+sourceModelVisibleNewEvidenceCount: bigint,
+/**
+ * Validation results served from the authoritative validation ledger.
+ */
+reusedValidationCount: number,
+/**
+ * Validation tool outputs intentionally suppressed by admission policy.
+ */
+suppressedValidationOutputCount: number,
+/**
+ * Ready startup prewarms observed by the first model request.
+ */
+readyStartupPrewarmCount: number,
+/**
+ * Completion-review coordinators that observed the ready phase.
+ */
+completionReviewReadyPhaseCount: number,
+/**
+ * Completion-review coordinators that observed the terminal phase.
+ */
+completionReviewTerminalPhaseCount: number,
+/**
  * Bounded to the stable purpose enum's cardinality.
  */
 purposeAggregates?: Array<TurnTimingGenerationPurposeAggregate>, samePurposeContinuationCount: number, exactRepeatedWaitCount: number, planningGenerationCount: number, planRevisionGenerationCount: number,

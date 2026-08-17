@@ -418,6 +418,9 @@ async fn call_nested_tool(
     let canonical_artifact_required = result.requires_canonical_artifact();
     let receipts = result.intrinsic_deterministic_continuation_receipts();
     if let Some(continuation) = result.owner_drained_continuation() {
+        exec.turn
+            .turn_timing_state
+            .record_owner_drained_continuation();
         exec.session
             .services
             .code_mode_service
@@ -474,9 +477,25 @@ fn build_nested_tool_payload(
     input: Option<JsonValue>,
 ) -> Result<ToolPayload, String> {
     match tool_kind {
+        CodeModeToolKind::Function
+            if tool_name.namespace.is_none()
+                && tool_name.name == codex_tools::TOOL_SEARCH_TOOL_NAME =>
+        {
+            build_tool_search_payload(tool_name, input)
+        }
         CodeModeToolKind::Function => build_function_tool_payload(tool_name, input),
         CodeModeToolKind::Freeform => build_freeform_tool_payload(tool_name, input),
     }
+}
+
+fn build_tool_search_payload(
+    tool_name: &ToolName,
+    input: Option<JsonValue>,
+) -> Result<ToolPayload, String> {
+    let arguments = serialize_function_tool_arguments(tool_name, input)?;
+    let arguments = serde_json::from_str(&arguments)
+        .map_err(|err| format!("failed to parse tool `{tool_name}` arguments: {err}"))?;
+    Ok(ToolPayload::ToolSearch { arguments })
 }
 
 fn build_function_tool_payload(
@@ -529,6 +548,7 @@ mod tests {
     use codex_code_mode::ExecuteRequest;
     use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
     use codex_protocol::models::FunctionCallOutputContentItem;
+    use codex_protocol::models::SearchToolCallParams;
     use codex_tools::ToolName;
     use serde_json::json;
 
@@ -547,6 +567,26 @@ mod tests {
             }
             other => panic!("expected function payload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_nested_tool_payload_uses_tool_search_kind() {
+        let payload = build_nested_tool_payload(
+            CodeModeToolKind::Function,
+            &ToolName::plain(codex_tools::TOOL_SEARCH_TOOL_NAME),
+            Some(json!({ "query": "repo atlas", "limit": 8 })),
+        )
+        .expect("tool search payload should parse");
+
+        assert_eq!(
+            payload,
+            ToolPayload::ToolSearch {
+                arguments: SearchToolCallParams {
+                    query: "repo atlas".to_string(),
+                    limit: Some(8),
+                },
+            }
+        );
     }
 
     #[test]

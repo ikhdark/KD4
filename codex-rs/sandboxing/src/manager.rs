@@ -527,7 +527,14 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
         ));
     };
     let source = std::path::PathBuf::from(&program);
-    let helper = codex_windows_sandbox::resolve_exe_for_launch(source.as_path(), codex_home);
+    let (helper, materialization_status) =
+        codex_windows_sandbox::resolve_exe_for_launch_with_status(source.as_path(), codex_home);
+    tracing::debug!(
+        helper_materialization_status = ?materialization_status,
+        helper_source = %source.display(),
+        helper_path = %helper.display(),
+        "resolved Windows sandbox helper materialization"
+    );
     *program = helper.to_string_lossy().into_owned();
 
     let inner_command = std::mem::take(&mut request.command);

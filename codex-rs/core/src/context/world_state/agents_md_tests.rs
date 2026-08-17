@@ -6,6 +6,23 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
+fn cached_state_consumes_the_stable_rendering() {
+    let loaded = LoadedAgentsMd::from_text_for_testing("cached instructions");
+    let cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(
+        std::env::current_dir().expect("current directory"),
+    )
+    .expect("absolute current directory");
+    let cwd = codex_utils_path_uri::PathUri::from_abs_path(&cwd);
+
+    let state = AgentsMdState::new_cached(Some(&loaded), &cwd);
+    assert_eq!(
+        state.snapshot().text.as_deref(),
+        Some("cached instructions")
+    );
+    assert!(loaded.stable_context_bundle(&cwd).reused);
+}
+
+#[test]
 fn renders_full_state_and_omits_unchanged_state() {
     let loaded = LoadedAgentsMd::from_text_for_testing("use the project formatter");
     let mut state = WorldState::default();

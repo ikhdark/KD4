@@ -462,18 +462,25 @@ async fn configured_pet_load_is_deferred_until_after_construction() {
 
 #[tokio::test]
 async fn prefetch_rate_limits_is_gated_on_chatgpt_auth_provider() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     assert!(!chat.should_prefetch_rate_limits());
 
     set_chatgpt_auth(&mut chat);
     assert!(chat.should_prefetch_rate_limits());
 
-    chat.config.model_provider.requires_openai_auth = false;
-    assert!(!chat.should_prefetch_rate_limits());
+    chat.prefetch_rate_limits();
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::RefreshRateLimits {
+            origin: RateLimitRefreshOrigin::StartupPrefetch { .. }
+        })
+    );
 
+    chat.config.model_provider.requires_openai_auth = false;
     chat.prefetch_rate_limits();
     assert!(!chat.should_prefetch_rate_limits());
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -1760,6 +1767,23 @@ async fn fast_status_indicator_requires_chatgpt_auth() {
     set_fast_mode_test_catalog(&mut chat);
     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
 
+    assert!(chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
+}
+
+#[tokio::test]
+async fn fast_status_indicator_supports_legacy_fast_metadata() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    set_chatgpt_auth(&mut chat);
+    let mut preset = get_available_model(&chat, "gpt-5.4");
+    preset.service_tiers.clear();
+    preset.additional_speed_tiers = vec![ServiceTier::Fast.request_value().to_string()];
+    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![preset]));
+    chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
+
+    assert_eq!(
+        chat.current_service_tier(),
+        Some(ServiceTier::Fast.request_value())
+    );
     assert!(chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
 }
 

@@ -838,6 +838,9 @@ pub enum ResponseInputItem {
         execution: String,
         #[ts(type = "unknown[]")]
         tools: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        omitted_result_count: Option<usize>,
     },
 }
 
@@ -1089,6 +1092,9 @@ pub enum ResponseItem {
         execution: String,
         #[ts(type = "unknown[]")]
         tools: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        omitted_result_count: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
@@ -1656,11 +1662,13 @@ impl From<ResponseInputItem> for ResponseItem {
                 status,
                 execution,
                 tools,
+                omitted_result_count,
             } => Self::ToolSearchOutput {
                 call_id: Some(call_id),
                 status,
                 execution,
                 tools,
+                omitted_result_count,
                 id: None,
                 internal_chat_message_metadata_passthrough: None,
             },
@@ -3465,6 +3473,7 @@ mod tests {
                     "additionalProperties": false,
                 }
             })],
+            omitted_result_count: Some(3),
         };
         assert_eq!(
             ResponseItem::from(input.clone()),
@@ -3487,6 +3496,7 @@ mod tests {
                         "additionalProperties": false,
                     }
                 })],
+                omitted_result_count: Some(3),
                 internal_chat_message_metadata_passthrough: None,
             }
         );
@@ -3498,6 +3508,7 @@ mod tests {
                 "call_id": "search-1",
                 "status": "completed",
                 "execution": "client",
+                "omitted_result_count": 3,
                 "tools": [{
                     "type": "function",
                     "name": "mcp__codex_apps__calendar_create_event",
@@ -3562,6 +3573,7 @@ mod tests {
                 status: "completed".to_string(),
                 execution: "server".to_string(),
                 tools: vec![],
+                omitted_result_count: None,
                 internal_chat_message_metadata_passthrough: None,
             }
         );

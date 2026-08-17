@@ -347,6 +347,12 @@ impl ShellCommandHandler {
         .await;
         let mut validation_launch = match validation_admission {
             ValidationAdmission::Skip(skipped) => {
+                if matches!(
+                    skipped.skip_disposition,
+                    codex_tools::ToolOutputSkipDisposition::Suppressed
+                ) {
+                    turn.turn_timing_state.record_suppressed_validation_output();
+                }
                 tracing::info!(reason = ?skipped.reason, "validation command skipped");
                 return Ok(boxed_tool_output(validation_structured_output(
                     serde_json::to_value(skipped).unwrap_or_default(),
@@ -463,6 +469,7 @@ impl ShellCommandHandler {
                     .reusable_validation(&identity)
                     .await
             {
+                turn.turn_timing_state.record_reused_validation();
                 return Ok(boxed_tool_output(validation_structured_output(
                     serde_json::json!({
                         "success": true,

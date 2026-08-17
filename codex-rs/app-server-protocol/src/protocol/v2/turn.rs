@@ -76,6 +76,10 @@ pub struct TurnStartParams {
     pub thread_id: String,
     #[ts(optional = nullable)]
     pub client_user_message_id: Option<String>,
+    /// Bypass identical in-flight task coalescing. Intended for intentional
+    /// independent runs such as A/B tests.
+    #[ts(optional = nullable)]
+    pub run_independently: Option<bool>,
     pub input: Vec<UserInput>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
     ///

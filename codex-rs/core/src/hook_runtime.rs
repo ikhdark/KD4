@@ -38,6 +38,7 @@ use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookStartedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::WarningEvent;
 use codex_thread_store::ReadThreadParams;
 use serde_json::Value;
 use tracing::instrument;
@@ -55,6 +56,7 @@ use crate::tools::sandboxing::PermissionRequestPayload;
 
 pub(crate) struct HookRuntimeOutcome {
     pub should_stop: bool,
+    pub stop_reason: Option<String>,
     pub additional_contexts: Vec<String>,
 }
 
@@ -86,13 +88,14 @@ impl From<SessionStartOutcome> for ContextInjectingHookOutcome {
         let SessionStartOutcome {
             hook_events,
             should_stop,
-            stop_reason: _,
+            stop_reason,
             additional_contexts,
         } = value;
         Self {
             hook_events,
             outcome: HookRuntimeOutcome {
                 should_stop,
+                stop_reason,
                 additional_contexts,
             },
         }
@@ -104,13 +107,14 @@ impl From<UserPromptSubmitOutcome> for ContextInjectingHookOutcome {
         let UserPromptSubmitOutcome {
             hook_events,
             should_stop,
-            stop_reason: _,
+            stop_reason,
             additional_contexts,
         } = value;
         Self {
             hook_events,
             outcome: HookRuntimeOutcome {
                 should_stop,
+                stop_reason,
                 additional_contexts,
             },
         }
@@ -163,7 +167,7 @@ pub(crate) async fn run_pending_session_start_hooks(
             hooks.run_session_start(request, Some(turn_context.sub_id.clone())),
         )
         .await
-        .record_additional_contexts(sess, turn_context)
+        .record_additional_contexts(sess, turn_context, "SessionStart")
         .await
         {
             return true;
@@ -420,7 +424,9 @@ pub(crate) async fn run_pre_compact_hooks(
     let outcome = sess.hooks().run_pre_compact(request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
     if outcome.should_stop {
-        PreCompactHookOutcome::Stopped
+        PreCompactHookOutcome::Stopped {
+            reason: outcome.stop_reason,
+        }
     } else {
         PreCompactHookOutcome::Continue
     }
@@ -428,12 +434,12 @@ pub(crate) async fn run_pre_compact_hooks(
 
 pub(crate) enum PreCompactHookOutcome {
     Continue,
-    Stopped,
+    Stopped { reason: Option<String> },
 }
 
 pub(crate) enum PostCompactHookOutcome {
     Continue,
-    Stopped,
+    Stopped { reason: Option<String> },
 }
 
 pub(crate) async fn run_post_compact_hooks(
@@ -457,7 +463,9 @@ pub(crate) async fn run_post_compact_hooks(
     let outcome = sess.hooks().run_post_compact(request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
     if outcome.should_stop {
-        PostCompactHookOutcome::Stopped
+        PostCompactHookOutcome::Stopped {
+            reason: outcome.stop_reason,
+        }
     } else {
         PostCompactHookOutcome::Continue
     }
@@ -631,10 +639,12 @@ pub(crate) async fn inspect_pending_input(
         }
         TurnInput::ResponseItem(_) => HookRuntimeOutcome {
             should_stop: false,
+            stop_reason: None,
             additional_contexts: Vec::new(),
         },
         TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome {
             should_stop: false,
+            stop_reason: None,
             additional_contexts: Vec::new(),
         },
     }
@@ -689,11 +699,34 @@ impl HookRuntimeOutcome {
         self,
         sess: &Arc<Session>,
         turn_context: &Arc<TurnContext>,
+        hook_name: &'static str,
     ) -> bool {
         record_additional_contexts(sess, turn_context, self.additional_contexts).await;
 
+        if self.should_stop {
+            emit_hook_stop_reason(sess, turn_context, hook_name, self.stop_reason.as_deref()).await;
+        }
+
         self.should_stop
     }
+}
+
+pub(crate) async fn emit_hook_stop_reason(
+    sess: &Session,
+    turn_context: &TurnContext,
+    hook_name: &str,
+    stop_reason: Option<&str>,
+) {
+    let Some(stop_reason) = stop_reason.filter(|reason| !reason.trim().is_empty()) else {
+        return;
+    };
+    sess.send_event(
+        turn_context,
+        EventMsg::Warning(WarningEvent {
+            message: format!("{hook_name} hook stopped the operation: {stop_reason}"),
+        }),
+    )
+    .await;
 }
 
 pub(crate) async fn record_additional_contexts(
@@ -916,6 +949,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::CompletionHookWorkspaceObservationState;
+    use super::ContextInjectingHookOutcome;
     use super::additional_context_messages;
     use super::finish_completion_hook_workspace_observation;
     use super::hook_run_analytics_payload;
@@ -926,6 +960,31 @@ mod tests {
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
+
+    #[test]
+    fn context_injecting_hook_outcomes_preserve_stop_reasons() {
+        let session_start = ContextInjectingHookOutcome::from(codex_hooks::SessionStartOutcome {
+            hook_events: Vec::new(),
+            should_stop: true,
+            stop_reason: Some("session blocked".to_string()),
+            additional_contexts: Vec::new(),
+        });
+        assert_eq!(
+            session_start.outcome.stop_reason.as_deref(),
+            Some("session blocked")
+        );
+
+        let user_prompt = ContextInjectingHookOutcome::from(codex_hooks::UserPromptSubmitOutcome {
+            hook_events: Vec::new(),
+            should_stop: true,
+            stop_reason: Some("prompt blocked".to_string()),
+            additional_contexts: Vec::new(),
+        });
+        assert_eq!(
+            user_prompt.outcome.stop_reason.as_deref(),
+            Some("prompt blocked")
+        );
+    }
 
     #[tokio::test]
     async fn completion_hook_workspace_observation_refreshes_on_changes_and_uncertainty() {

@@ -498,6 +498,20 @@ pub struct TaskCapsuleV1 {
     pub objective: String,
     pub read_scope: Vec<RepoScope>,
     pub write_scope: Vec<RepoScope>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stop_condition: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<AssignmentId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risk_hints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contract_claims: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_strategy: Option<WorkspaceStrategy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<AssignmentRelation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture_contract_ref: Option<ArchitectureContractRef>,
     pub relevant_handles: Vec<TaskCapsuleHandle>,
     pub workspace_epoch: u64,
     pub workspace_manifest_hash: String,

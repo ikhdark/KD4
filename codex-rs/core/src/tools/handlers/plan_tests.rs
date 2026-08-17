@@ -182,6 +182,30 @@ fn generated_artifact_schema_requires_repository_relative_paths() {
 }
 
 #[test]
+fn validation_route_schema_names_the_supported_direct_programs() {
+    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    let description = tool["description"].as_str().expect("tool description");
+    let argv_description = tool
+        .pointer("/parameters/properties/validation_route/properties/leaves/items/properties/argv/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("validation argv description");
+
+    assert!(description.contains("only direct cargo, just, python, or python3 leaves"));
+    assert!(argv_description.contains("cargo, just, python, or python3"));
+    assert!(argv_description.contains("formatting or diff checks are not accepted"));
+}
+
+#[test]
+fn plan_description_requires_one_proven_contract_at_a_time() {
+    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    let description = tool["description"].as_str().expect("tool description");
+
+    assert!(description.contains("Complete one coherent contract before starting the next"));
+    assert!(description.contains("compile its owner"));
+    assert!(description.contains("at least one test was selected"));
+}
+
+#[test]
 fn focused_plan_arguments_require_one_atomic_work_unit_and_reasoned_removals() {
     let focused = parse_update_plan_arguments(
         &serde_json::json!({

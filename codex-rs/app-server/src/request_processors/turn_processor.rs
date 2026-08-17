@@ -26,6 +26,8 @@ use futures::StreamExt;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
@@ -38,6 +40,63 @@ const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 128 * 1_024;
 // Context fragments cap each escaped value at approximately 4,000 tokens.
 const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 16 * 1_024;
 const ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES: usize = 96;
+
+fn normalize_task_fingerprint_json(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_task_fingerprint_json(value);
+            }
+        }
+        Value::Object(values) => {
+            if let Some(Value::String(text)) = values.get_mut("text") {
+                *text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+            for value in values.values_mut() {
+                normalize_task_fingerprint_json(value);
+            }
+            let mut entries = std::mem::take(values).into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            values.extend(entries);
+        }
+        _ => {}
+    }
+}
+
+fn normalized_task_fingerprint(
+    params: &TurnStartParams,
+    workspace_identity: &str,
+    settings_identity: &str,
+) -> String {
+    let mut request = serde_json::to_value(params).unwrap_or(Value::Null);
+    if let Value::Object(request) = &mut request {
+        request.remove("threadId");
+        request.remove("clientUserMessageId");
+        request.remove("runIndependently");
+    }
+    normalize_task_fingerprint_json(&mut request);
+    let identity = serde_json::json!({
+        "request": request,
+        "workspace": workspace_identity,
+        "settings": settings_identity,
+    });
+    format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
+}
+
+fn identical_task_in_flight_error(
+    existing: &crate::thread_state::InFlightTaskReference,
+) -> JSONRPCErrorError {
+    let mut error = invalid_request(
+        "an identical task is already running; attach to the existing task or set runIndependently to true",
+    );
+    error.data = Some(serde_json::json!({
+        "reason": "identicalTaskInFlight",
+        "threadId": existing.thread_id.to_string(),
+        "turnId": existing.turn_id,
+        "runIndependentlyOverride": "runIndependently",
+    }));
+    error
+}
 
 fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
     if input.iter().any(|item| {
@@ -542,6 +601,40 @@ impl TurnRequestProcessor {
         Ok(())
     }
 
+    async fn turn_task_fingerprint(params: &TurnStartParams, thread: &CodexThread) -> String {
+        let config = thread.config().await;
+        let snapshot = thread.config_snapshot().await;
+        let effective_cwd = params
+            .cwd
+            .as_ref()
+            .map(|cwd| format!("{cwd:?}"))
+            .unwrap_or_else(|| format!("{:?}", config.cwd));
+        let effective_roots = params
+            .runtime_workspace_roots
+            .as_ref()
+            .unwrap_or(&snapshot.workspace_roots);
+        let workspace_identity = format!("cwd={effective_cwd};roots={effective_roots:?}");
+        let settings_identity = serde_json::json!({
+            "model": snapshot.model,
+            "modelProviderId": snapshot.model_provider_id,
+            "serviceTier": snapshot.service_tier,
+            "approvalPolicy": format!("{:?}", snapshot.approval_policy),
+            "approvalsReviewer": format!("{:?}", snapshot.approvals_reviewer),
+            "permissionProfile": format!("{:?}", snapshot.permission_profile),
+            "activePermissionProfile": format!("{:?}", snapshot.active_permission_profile),
+            "windowsSandboxLevel": format!("{:?}", snapshot.windows_sandbox_level),
+            "environments": format!("{:?}", snapshot.environments),
+            "ephemeral": snapshot.ephemeral,
+            "reasoningEffort": format!("{:?}", snapshot.reasoning_effort),
+            "reasoningSummary": format!("{:?}", snapshot.reasoning_summary),
+            "personality": format!("{:?}", snapshot.personality),
+            "collaborationMode": format!("{:?}", snapshot.collaboration_mode),
+            "historyMode": format!("{:?}", snapshot.history_mode),
+        })
+        .to_string();
+        normalized_task_fingerprint(params, &workspace_identity, &settings_identity)
+    }
+
     async fn turn_start_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -567,6 +660,11 @@ impl TurnRequestProcessor {
             );
             return Err(error);
         }
+        let task_fingerprint = if params.run_independently.unwrap_or(false) {
+            None
+        } else {
+            Some(Self::turn_task_fingerprint(&params, thread.as_ref()).await)
+        };
         let environment_selections =
             resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
 
@@ -632,6 +730,18 @@ impl TurnRequestProcessor {
             thread_settings,
         };
         let turn_id = thread.reserve_turn_id();
+        if let Some(fingerprint) = task_fingerprint.as_ref() {
+            match self
+                .thread_state_manager
+                .claim_in_flight_task(fingerprint.clone(), thread_id, turn_id.clone())
+                .await
+            {
+                crate::thread_state::InFlightTaskClaim::Claimed => {}
+                crate::thread_state::InFlightTaskClaim::Existing(existing) => {
+                    return Err(identical_task_in_flight_error(&existing));
+                }
+            }
+        }
         let turn_origin_tracker = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
             thread_state.lock().await.turn_origin_tracker()
@@ -639,7 +749,7 @@ impl TurnRequestProcessor {
         let origin_reservation =
             turn_origin_tracker.reserve(turn_id.clone(), request_id.connection_id);
         let request_trace_context = self.request_trace_context(&request_id).await;
-        thread
+        if let Err(err) = thread
             .submit_user_input_with_reserved_turn_id(
                 turn_id.clone(),
                 turn_op,
@@ -647,11 +757,16 @@ impl TurnRequestProcessor {
                 client_user_message_id,
             )
             .await
-            .map_err(|err| {
-                let error = internal_error(format!("failed to start turn: {err}"));
-                self.track_error_response(&request_id, &error, /*error_type*/ None);
-                error
-            })?;
+        {
+            if task_fingerprint.is_some() {
+                self.thread_state_manager
+                    .release_in_flight_task(thread_id, &turn_id)
+                    .await;
+            }
+            let error = internal_error(format!("failed to start turn: {err}"));
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            return Err(error);
+        }
         origin_reservation.commit();
 
         if turn_has_input {
@@ -1120,9 +1235,9 @@ impl TurnRequestProcessor {
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
                 client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
-                flush_transcript_tail_on_session_end: params
-                    .flush_transcript_tail_on_session_end
-                    .unwrap_or(false),
+                flush_transcript_tail_on_session_end: flush_transcript_tail_on_session_end(
+                    params.flush_transcript_tail_on_session_end,
+                ),
                 codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
                 codex_response_item_prefix: params.codex_response_item_prefix,
                 codex_response_handoff_prefix: params.codex_response_handoff_prefix,
@@ -1696,6 +1811,10 @@ fn cited_fact_schema() -> Value {
             }
         }
     })
+}
+
+fn flush_transcript_tail_on_session_end(configured: Option<bool>) -> bool {
+    configured.unwrap_or(true)
 }
 
 #[cfg(test)]

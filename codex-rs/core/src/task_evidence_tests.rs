@@ -1279,6 +1279,32 @@ async fn kd4_repository_retains_completion_mode_behavior() {
     assert!(ledger.completion_gate().await.is_some());
 }
 
+#[tokio::test]
+async fn finalization_advisory_surfaces_current_review_audit_details() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item(
+            "review-audit",
+            StepStatus::InProgress,
+        )]))
+        .await;
+    assert!(
+        ledger
+            .record_completion_review_audit(
+                "turn-review-audit",
+                "failed",
+                Some("correctness_gate_failed"),
+                vec!["mutation evidence is incomplete".to_string()],
+                false,
+            )
+            .await
+    );
+
+    let advisory = ledger.finalization_advisory().await.expect("advisory");
+    assert!(advisory.contains("correctness_gate_failed"));
+    assert!(advisory.contains("mutation evidence is incomplete"));
+}
+
 fn plan_item(id: &str, status: StepStatus) -> PlanItemArg {
     PlanItemArg {
         id: Some(id.to_string()),
@@ -3687,6 +3713,71 @@ async fn terminal_decision_and_delivery_claim_are_atomic_and_one_shot() {
 }
 
 #[tokio::test]
+async fn terminalization_recovery_is_monotonic_in_task_evidence() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let identity = "thread:recovered-turn";
+    let terminalization = codex_protocol::protocol::TurnTimingTerminalization {
+        post_cleanup_ns: 17,
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        ledger
+            .commit_terminal_decision_and_claim(terminal_decision_claim(identity))
+            .await,
+        TerminalClaimResult::Claimed(_)
+    ));
+    assert!(
+        ledger
+            .update_terminal_interaction(TerminalInteractionUpdate {
+                terminal_identity: identity.to_string(),
+                delivery_state: TerminalDeliveryState::Delivered,
+                app_server_acknowledged: false,
+                runtime_status_converged: true,
+                rollout_mirrored: true,
+                parent_notification_completed: true,
+                post_terminal_cleanup_completed: true,
+                active_turn_detached: true,
+                terminal_interaction_released: true,
+                recovery_state: TerminalRecoveryState::Recovered,
+                phase_timings_ns: BTreeMap::new(),
+                terminalization: Some(terminalization.clone()),
+            })
+            .await
+    );
+
+    // A late cleanup update may add evidence, but must not erase completed recovery.
+    assert!(
+        ledger
+            .update_terminal_interaction(TerminalInteractionUpdate {
+                terminal_identity: identity.to_string(),
+                delivery_state: TerminalDeliveryState::Claimed,
+                app_server_acknowledged: true,
+                runtime_status_converged: true,
+                rollout_mirrored: true,
+                parent_notification_completed: true,
+                post_terminal_cleanup_completed: true,
+                active_turn_detached: true,
+                terminal_interaction_released: true,
+                recovery_state: TerminalRecoveryState::None,
+                phase_timings_ns: BTreeMap::new(),
+                terminalization: None,
+            })
+            .await
+    );
+
+    let snapshot = ledger
+        .terminalization_receipt_snapshot(identity)
+        .await
+        .expect("terminalization receipt snapshot");
+    assert_eq!(snapshot.delivery_state, TerminalDeliveryState::Delivered);
+    assert_eq!(snapshot.recovery_state, TerminalRecoveryState::Recovered);
+    assert_eq!(snapshot.terminalization, terminalization);
+    assert!(snapshot.active_turn_detached);
+    assert!(snapshot.terminal_interaction_released);
+}
+
+#[tokio::test]
 async fn conflicting_terminal_candidate_cannot_replace_authoritative_event() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     let identity = "thread:turn";
@@ -3721,6 +3812,47 @@ async fn conflicting_terminal_candidate_cannot_replace_authoritative_event() {
             .expect("authoritative event")
             .fingerprint,
         first_fingerprint
+    );
+}
+
+#[tokio::test]
+async fn terminal_receipt_rejects_mismatched_durable_outcome() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let identity = "thread:mismatched-outcome";
+    let claim = terminal_decision_claim(identity);
+    let fingerprint = claim.authoritative_event.fingerprint.clone();
+    assert!(matches!(
+        ledger.commit_terminal_decision_and_claim(claim).await,
+        TerminalClaimResult::Claimed(_)
+    ));
+    {
+        let mut guard = ledger.document.lock().await;
+        let receipt = guard
+            .as_mut()
+            .expect("document")
+            .terminalization_receipts
+            .iter_mut()
+            .find(|receipt| receipt.terminal_identity == identity)
+            .expect("terminal receipt");
+        receipt.durable_outcome = "contradictory".to_string();
+    }
+
+    assert!(
+        ledger
+            .authoritative_terminal_event(identity)
+            .await
+            .is_none()
+    );
+    assert!(
+        ledger
+            .pending_authoritative_terminal_events()
+            .await
+            .is_empty()
+    );
+    assert!(
+        !ledger
+            .acknowledge_terminal_event(identity, &fingerprint)
+            .await
     );
 }
 
@@ -6304,7 +6436,7 @@ fn incomplete_legacy_proof_is_not_reusable_and_failure_fingerprint_invalidates()
         complete_identity: false,
         ..FinalProofObservationV1::default()
     };
-    let missing = missing_or_failed_obligations(&candidate, &plan, &[legacy]);
+    let missing = missing_or_failed_obligations(&candidate, &plan, &[legacy], 0);
     assert_eq!(missing, vec!["obligation-a".to_string()]);
     let first = completion_failure_fingerprint(3, &candidate, &missing, &[], None);
     let evidence_changed = completion_failure_fingerprint(4, &candidate, &missing, &[], None);
@@ -6312,6 +6444,39 @@ fn incomplete_legacy_proof_is_not_reusable_and_failure_fingerprint_invalidates()
         completion_failure_fingerprint(3, &candidate, &["obligation-b".to_string()], &[], None);
     assert_ne!(first.fingerprint, evidence_changed.fingerprint);
     assert_ne!(first.fingerprint, obligation_changed.fingerprint);
+}
+
+#[test]
+fn stale_evidence_revision_proof_is_not_reusable() {
+    let basis = CompletionCandidateBasisV1 {
+        basis_id: "basis-current".to_string(),
+        ..CompletionCandidateBasisV1::default()
+    };
+    let plan = ValidationPlanV1 {
+        plan_id: "plan-current".to_string(),
+        basis_id: basis.basis_id.clone(),
+        steps: vec![ValidationPlanStepV1 {
+            step_id: "step-current".to_string(),
+            obligation_id: "obligation-current".to_string(),
+            ..ValidationPlanStepV1::default()
+        }],
+        ..ValidationPlanV1::default()
+    };
+    let candidate = completion_candidate_for(&basis, &plan);
+    let stale = FinalProofObservationV1 {
+        candidate_id: candidate.candidate_id.clone(),
+        plan_step_id: "step-current".to_string(),
+        obligation_id: "obligation-current".to_string(),
+        successful: true,
+        complete_identity: true,
+        evidence_revision: 3,
+        ..FinalProofObservationV1::default()
+    };
+
+    assert_eq!(
+        missing_or_failed_obligations(&candidate, &plan, &[stale], 4),
+        vec!["obligation-current".to_string()]
+    );
 }
 
 #[tokio::test]

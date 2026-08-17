@@ -13,6 +13,7 @@ use super::LegacyModelMismatchWarning;
 use super::LegacyUnifiedExecProcessLimitWarning;
 use super::RecommendedPluginsInstructions;
 use super::SkillInstructions;
+use super::SourceClosureReuseContext;
 use super::SubagentNotification;
 use super::TaskCapsuleFragment;
 use super::TurnAborted;
@@ -54,6 +55,8 @@ static LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION: FragmentRegistrationProxy<
 > = FragmentRegistrationProxy::new();
 static TASK_CAPSULE_REGISTRATION: FragmentRegistrationProxy<TaskCapsuleFragment> =
     FragmentRegistrationProxy::new();
+static SOURCE_CLOSURE_REUSE_REGISTRATION: FragmentRegistrationProxy<SourceClosureReuseContext> =
+    FragmentRegistrationProxy::new();
 
 static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &USER_INSTRUCTIONS_REGISTRATION,
@@ -71,6 +74,7 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &LEGACY_APPLY_PATCH_EXEC_COMMAND_WARNING_REGISTRATION,
     &LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION,
     &TASK_CAPSULE_REGISTRATION,
+    &SOURCE_CLOSURE_REUSE_REGISTRATION,
 ];
 
 static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[

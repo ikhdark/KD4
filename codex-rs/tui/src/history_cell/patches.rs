@@ -5,8 +5,19 @@ use codex_utils_path_uri::LegacyAppPathString;
 
 #[derive(Debug)]
 pub(crate) struct PatchHistoryCell {
+    item_id: Option<String>,
     changes: HashMap<PathBuf, FileChange>,
     cwd: PathBuf,
+}
+
+impl PatchHistoryCell {
+    pub(crate) fn is_streaming_item(&self, item_id: &str) -> bool {
+        self.item_id.as_deref() == Some(item_id)
+    }
+
+    pub(crate) fn update_changes(&mut self, changes: HashMap<PathBuf, FileChange>) {
+        self.changes = changes;
+    }
 }
 
 impl HistoryCell for PatchHistoryCell {
@@ -30,7 +41,16 @@ pub(crate) fn new_patch_event(
     cwd: &Path,
 ) -> PatchHistoryCell {
     PatchHistoryCell {
+        item_id: None,
         changes,
+        cwd: cwd.to_path_buf(),
+    }
+}
+
+pub(crate) fn new_streaming_patch_event(item_id: String, cwd: &Path) -> PatchHistoryCell {
+    PatchHistoryCell {
+        item_id: Some(item_id),
+        changes: HashMap::new(),
         cwd: cwd.to_path_buf(),
     }
 }
