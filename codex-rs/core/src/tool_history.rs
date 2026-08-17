@@ -10,7 +10,6 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -20,12 +19,10 @@ use crate::tools::command_output_artifact::remint_tool_history_artifact_for_thre
 const RECEIPT_VERSION: u8 = 1;
 const RECEIPT_MAX_TOKENS: usize = 512;
 const RECEIPT_DIGEST_TARGET_TOKENS: usize = 240;
+const MINIMUM_RAW_TOKENS: u64 = 512;
 const MINIMUM_SAVED_TOKENS: u64 = 128;
 const MINIMUM_RELATIVE_SAVINGS_PERCENT: u64 = 25;
 const LEDGER_VERSION: u8 = 1;
-const MAX_RECEIPT_DECISION_FIELDS: usize = 16;
-const MAX_RECEIPT_DECISION_ARRAY_ITEMS: usize = 16;
-const MAX_RECEIPT_DECISION_STRING_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ModelGenerationId {
@@ -40,8 +37,6 @@ pub(crate) struct ToolHistoryReceiptV1 {
     call_id: String,
     tool_identity: String,
     semantic_class: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    decision_fields: BTreeMap<String, Value>,
     digest: String,
     artifact: ReceiptArtifact,
     original: ReceiptOriginalSize,
@@ -99,8 +94,10 @@ impl ToolHistoryCandidate {
         }
         let bounded_tokens =
             u64::try_from(approx_token_count(&self.bounded_model_output)).unwrap_or(u64::MAX);
+        if bounded_tokens < MINIMUM_RAW_TOKENS {
+            return None;
+        }
         let receipt_id = receipt_id_for(&self.call_id, &self.artifact_sha256);
-        let decision_fields = receipt_decision_fields(&self.bounded_model_output);
         let mut digest_limit = RECEIPT_DIGEST_TARGET_TOKENS;
         loop {
             let receipt = ToolHistoryReceiptV1 {
@@ -109,7 +106,6 @@ impl ToolHistoryCandidate {
                 call_id: self.call_id.clone(),
                 tool_identity: self.tool_identity.clone(),
                 semantic_class: self.semantic_class.clone(),
-                decision_fields: decision_fields.clone(),
                 digest: truncate_text_to_token_ceiling(&self.bounded_model_output, digest_limit),
                 artifact: ReceiptArtifact {
                     artifact_id: self.artifact_id.clone(),
@@ -135,89 +131,16 @@ impl ToolHistoryCandidate {
                     .saturating_mul(100)
                     .checked_div(bounded_tokens.max(1))
                     .unwrap_or(0);
-                if saved >= MINIMUM_SAVED_TOKENS && relative >= MINIMUM_RELATIVE_SAVINGS_PERCENT {
-                    return Some((receipt_id, rendered));
+                if saved < MINIMUM_SAVED_TOKENS || relative < MINIMUM_RELATIVE_SAVINGS_PERCENT {
+                    return None;
                 }
+                return Some((receipt_id, rendered));
             }
             if digest_limit == 0 {
                 return None;
             }
             digest_limit = digest_limit.saturating_sub(32);
         }
-    }
-}
-
-fn receipt_decision_fields(text: &str) -> BTreeMap<String, Value> {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return BTreeMap::new();
-    };
-    let mut fields = BTreeMap::new();
-    collect_receipt_decision_fields(&value, "", 0, &mut fields);
-    fields
-}
-
-fn collect_receipt_decision_fields(
-    value: &Value,
-    prefix: &str,
-    depth: usize,
-    fields: &mut BTreeMap<String, Value>,
-) {
-    if depth > 3 || fields.len() >= MAX_RECEIPT_DECISION_FIELDS {
-        return;
-    }
-    let Value::Object(object) = value else {
-        return;
-    };
-    for (key, value) in object {
-        if fields.len() >= MAX_RECEIPT_DECISION_FIELDS {
-            break;
-        }
-        let path = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        if receipt_decision_key(key)
-            && let Some(value) = bounded_receipt_decision_value(value)
-        {
-            fields.insert(path.clone(), value);
-        }
-        collect_receipt_decision_fields(value, &path, depth + 1, fields);
-    }
-}
-
-fn receipt_decision_key(key: &str) -> bool {
-    matches!(
-        key,
-        "execution_outcome"
-            | "command_was_executed"
-            | "exit_code"
-            | "matched_tests"
-            | "not_exercised"
-            | "failure_signature"
-            | "status"
-            | "state"
-            | "path"
-            | "paths"
-            | "changed_paths"
-            | "unchanged"
-            | "sha256"
-            | "total_bytes"
-    )
-}
-
-fn bounded_receipt_decision_value(value: &Value) -> Option<Value> {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) => Some(value.clone()),
-        Value::String(text) if text.len() <= MAX_RECEIPT_DECISION_STRING_BYTES => {
-            Some(value.clone())
-        }
-        Value::Array(values) if values.len() <= MAX_RECEIPT_DECISION_ARRAY_ITEMS => values
-            .iter()
-            .map(bounded_receipt_decision_value)
-            .collect::<Option<Vec<_>>>()
-            .map(Value::Array),
-        _ => None,
     }
 }
 

@@ -6,7 +6,6 @@ use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
 use crate::tools::exposure::AgentSurfaceStage;
-use crate::tools::exposure::TaskToolPhase;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::ArchitectureSliceHandler;
@@ -660,9 +659,7 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
                     context.step_context,
                 ),
             }));
-            if context.exposure_identity.unified_exec_resume_available {
-                planned_tools.add(WriteStdinHandler);
-            }
+            planned_tools.add(WriteStdinHandler);
             if turn_context
                 .model_info
                 .input_modalities
@@ -722,13 +719,9 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
         allow_login_shell,
         exec_permission_approvals_enabled,
     };
-    let cargo_test_exposure = match context.exposure_identity.task_tool_phase {
-        TaskToolPhase::Implementation | TaskToolPhase::Validation => ToolExposure::Direct,
-        TaskToolPhase::Discovery | TaskToolPhase::Completion => ToolExposure::Deferred,
-    };
     planned_tools.add_with_exposure(
         CargoTestHandler::new(shell_command_options),
-        cargo_test_exposure,
+        ToolExposure::DirectModelOnly,
     );
 
     match shell_type_for_model_and_features(&turn_context.model_info, features) {
@@ -742,9 +735,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
                     context.step_context,
                 ),
             }));
-            if context.exposure_identity.unified_exec_resume_available {
-                planned_tools.add(WriteStdinHandler);
-            }
+            planned_tools.add(WriteStdinHandler);
 
             // Keep the legacy shell tool registered while unified exec is
             // model-visible.
@@ -788,46 +779,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add(ReadToolOutputHandler);
-    let task_tool_phase = context.exposure_identity.task_tool_phase;
-    planned_tools.add_with_exposure(
-        LoadSkillHandler,
-        if task_tool_phase == TaskToolPhase::Discovery {
-            ToolExposure::Direct
-        } else {
-            ToolExposure::Deferred
-        },
-    );
-    planned_tools.add_with_exposure(
-        OrchestrationLintHandler,
-        if matches!(
-            task_tool_phase,
-            TaskToolPhase::Validation | TaskToolPhase::Completion
-        ) {
-            ToolExposure::Direct
-        } else {
-            ToolExposure::Deferred
-        },
-    );
+    planned_tools.add_with_exposure(LoadSkillHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(OrchestrationLintHandler, ToolExposure::DirectModelOnly);
     if environment_mode.has_environment() {
-        planned_tools.add_with_exposure(
-            ArchitectureSliceHandler,
-            if matches!(
-                task_tool_phase,
-                TaskToolPhase::Discovery | TaskToolPhase::Implementation
-            ) {
-                ToolExposure::Direct
-            } else {
-                ToolExposure::Deferred
-            },
-        );
-        planned_tools.add_with_exposure(
-            ReadSourceBatchHandler,
-            if task_tool_phase == TaskToolPhase::Completion {
-                ToolExposure::Deferred
-            } else {
-                ToolExposure::Direct
-            },
-        );
+        planned_tools.add_with_exposure(ArchitectureSliceHandler, ToolExposure::DirectModelOnly);
+        planned_tools.add_with_exposure(ReadSourceBatchHandler, ToolExposure::DirectModelOnly);
     }
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
@@ -922,9 +878,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
     let turn_context = context.step_context.turn.as_ref();
     if agent_jobs_tools_enabled(turn_context) {
-        if context.exposure_identity.agent_spawn_available {
-            planned_tools.add(SpawnAgentsOnCsvHandler);
-        }
+        planned_tools.add(SpawnAgentsOnCsvHandler);
         if agent_jobs_worker_tools_enabled(turn_context) {
             planned_tools.add(ReportAgentJobResultHandler);
         }
@@ -942,27 +896,21 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 .flatten();
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);
-            if context.exposure_identity.agent_spawn_available {
-                planned_tools.add_arc(override_tool_exposure(
-                    multi_agent_v2_handler(
-                        SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
-                            available_models: turn_context.available_models.clone(),
-                            agent_type_description,
-                            hide_agent_type_model_reasoning: turn_context
-                                .config
-                                .multi_agent_v2
-                                .hide_spawn_agent_metadata,
-                            usage_hint_text: turn_context
-                                .config
-                                .multi_agent_v2
-                                .usage_hint_text
-                                .clone(),
-                        }),
-                        tool_namespace,
-                    ),
-                    exposure,
-                ));
-            }
+            planned_tools.add_arc(override_tool_exposure(
+                multi_agent_v2_handler(
+                    SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
+                        available_models: turn_context.available_models.clone(),
+                        agent_type_description,
+                        hide_agent_type_model_reasoning: turn_context
+                            .config
+                            .multi_agent_v2
+                            .hide_spawn_agent_metadata,
+                        usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                    }),
+                    tool_namespace,
+                ),
+                exposure,
+            ));
             if agent_surface_stage == AgentSurfaceStage::SpawnOnly {
                 return;
             }
@@ -1027,17 +975,15 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             } else {
                 ToolExposure::Direct
             };
-            if context.exposure_identity.agent_spawn_available {
-                planned_tools.add_with_exposure(
-                    SpawnAgentHandler::new(SpawnAgentToolOptions {
-                        available_models: turn_context.available_models.clone(),
-                        agent_type_description,
-                        hide_agent_type_model_reasoning: false,
-                        usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
-                    }),
-                    exposure,
-                );
-            }
+            planned_tools.add_with_exposure(
+                SpawnAgentHandler::new(SpawnAgentToolOptions {
+                    available_models: turn_context.available_models.clone(),
+                    agent_type_description,
+                    hide_agent_type_model_reasoning: false,
+                    usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                }),
+                exposure,
+            );
             if agent_surface_stage == AgentSurfaceStage::SpawnOnly {
                 return;
             }

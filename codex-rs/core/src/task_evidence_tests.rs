@@ -523,7 +523,6 @@ fn evidence_result(producer: &str, text: &str, provider_fields: Value) -> CallTo
             "schemaVersion": 1,
             "producer": producer,
             "operation": "inspect",
-            "semanticConclusion": "inspection established the requested diagnostic facts",
             "evidenceBearing": true,
             "payloadCompleteness": "complete",
             "truncated": false,
@@ -554,7 +553,7 @@ async fn record_fixture_evidence(
 }
 
 #[tokio::test]
-async fn evidence_contract_external_receipt_carries_semantic_conclusion() {
+async fn external_evidence_extracts_generic_v1_envelope() {
     let (_temp, ledger) = record_fixture_evidence(&evidence_result(
         "diagnostic-provider",
         "diagnostic",
@@ -571,29 +570,6 @@ async fn evidence_contract_external_receipt_carries_semantic_conclusion() {
     assert_eq!(receipt.server_name, "server");
     assert_eq!(receipt.tool_name, "raw-tool");
     assert_eq!(receipt.provider_snapshot.as_deref(), Some("snapshot-1"));
-    assert_eq!(
-        receipt.semantic_conclusion,
-        "inspection established the requested diagnostic facts"
-    );
-}
-
-#[tokio::test]
-async fn evidence_contract_external_receipt_synthesizes_legacy_conclusion() {
-    let mut result = evidence_result("diagnostic-provider", "diagnostic", serde_json::json!({}));
-    result.structured_content.as_mut().expect("structured")["evidenceMeta"]
-        .as_object_mut()
-        .expect("evidence metadata")
-        .remove("semanticConclusion");
-    let (_temp, ledger) = record_fixture_evidence(&result).await;
-    let guard = ledger.document.lock().await;
-    let receipt = guard
-        .as_ref()
-        .and_then(|document| document.external_evidence.last())
-        .expect("receipt");
-    assert_eq!(
-        receipt.semantic_conclusion,
-        "inspect established complete provider evidence"
-    );
 }
 
 #[tokio::test]
@@ -765,7 +741,6 @@ async fn persisted_external_evidence_from_before_strict_ingress_still_loads() {
         .expect("external evidence receipt");
     receipt.insert("provider_snapshot".to_string(), Value::Null);
     receipt.insert("truncated".to_string(), Value::Bool(true));
-    receipt.remove("semantic_conclusion");
     tokio::fs::write(
         &evidence_path,
         serde_json::to_vec_pretty(&persisted).expect("serialize legacy evidence"),
@@ -785,7 +760,6 @@ async fn persisted_external_evidence_from_before_strict_ingress_still_loads() {
         .and_then(|document| document.external_evidence.last())
         .expect("reloaded external evidence receipt");
     assert_eq!(receipt.provider_snapshot, None);
-    assert_eq!(receipt.semantic_conclusion, "");
     assert_eq!(receipt.payload_completeness, EvidenceCompleteness::Complete);
     assert!(receipt.truncated);
 }
@@ -1516,118 +1490,6 @@ async fn stable_planning_patches_preserve_omissions_and_audit_reasoned_removals(
 }
 
 #[tokio::test]
-async fn evidence_contract_retained_ledger_preserves_full_contract_until_hash_delta() {
-    let (_temp, repo, ledger) = ledger_fixture().await;
-    tokio::fs::create_dir_all(repo.join("src"))
-        .await
-        .expect("source directory");
-    tokio::fs::write(repo.join("src/owner.rs"), "before")
-        .await
-        .expect("source fixture");
-    ledger
-        .record_planning_update(PlanningUpdateInput {
-            tier: Some(PlanningTier::Medium),
-            step_evidence: vec![PlanStepEvidenceInput {
-                step_id: "implement".to_string(),
-                source_owner: Some("codex-core".to_string()),
-                implementation_surfaces: vec!["src/owner.rs".to_string()],
-                mutation_obligations: vec![MutationObligationInput {
-                    id: "owner-edit".to_string(),
-                    description: "edit the owner".to_string(),
-                    paths: vec!["src/owner.rs".to_string()],
-                }],
-                validation_disposition: Some(ValidationDisposition::Executable),
-                external_validation_route: None,
-                architecture_slice: None,
-            }],
-            plan: vec![
-                PlanItemArg {
-                    validation_route: Some(focused_validation_route(vec![
-                        "src/owner.rs".to_string(),
-                    ])),
-                    risks: vec!["schema compatibility".to_string()],
-                    ..plan_item("implement", StepStatus::InProgress)
-                },
-                plan_item("review", StepStatus::Pending),
-            ],
-            ..PlanningUpdateInput::default()
-        })
-        .await;
-    ledger
-        .record_edit_intent("owner-edit", &repo, &[PathBuf::from("src/owner.rs")])
-        .await;
-    tokio::fs::write(repo.join("src/owner.rs"), "implemented")
-        .await
-        .expect("implementation edit");
-    ledger.record_edit_result("owner-edit", "completed").await;
-
-    let current: serde_json::Value = serde_json::from_str(
-        &ledger
-            .retained_decision_ledger_payload()
-            .await
-            .expect("retained decision ledger"),
-    )
-    .expect("valid retained ledger JSON");
-    assert_eq!(current["state"], "current");
-    assert_eq!(current["version"], 2);
-    assert_eq!(current["sourceOwner"], "codex-core");
-    assert_eq!(current["nextAction"]["id"], "implement");
-    assert_eq!(
-        current["implementationHandoff"]["implementationSurfaces"],
-        serde_json::json!(["src/owner.rs"])
-    );
-    assert_eq!(
-        current["implementationHandoff"]["mutationObligations"][0]["id"],
-        "owner-edit"
-    );
-    assert_eq!(
-        current["implementationHandoff"]["validationDisposition"],
-        "executable"
-    );
-    assert_eq!(
-        current["mutationContracts"]["implement"]["mutationObligations"][0]["id"],
-        "owner-edit"
-    );
-    assert_eq!(
-        current["proofContracts"]["implement"]["acceptanceCriteria"],
-        serde_json::json!(["focused validation passes"])
-    );
-    assert_eq!(
-        current["proofContracts"]["implement"]["validationRoute"]["leaves"][0]["argv"][0],
-        "cargo"
-    );
-    assert_eq!(
-        current["proofContracts"]["implement"]["risks"],
-        serde_json::json!(["schema compatibility"])
-    );
-    assert_eq!(
-        current["proofContracts"]["review"]["acceptanceCriteria"],
-        serde_json::json!(["focused validation passes"])
-    );
-
-    tokio::fs::write(repo.join("src/owner.rs"), "concurrent delta")
-        .await
-        .expect("concurrent edit");
-    let invalidated: serde_json::Value = serde_json::from_str(
-        &ledger
-            .retained_decision_ledger_payload()
-            .await
-            .expect("invalidated retained decision ledger"),
-    )
-    .expect("valid invalidated ledger JSON");
-    assert_eq!(invalidated["state"], "invalidated_by_hash_delta");
-    assert!(invalidated["sourceOwner"].is_null());
-    assert!(invalidated["nextAction"].is_null());
-    assert!(invalidated["implementationHandoff"].is_null());
-    assert_eq!(invalidated["mutationContracts"], serde_json::json!({}));
-    assert_eq!(invalidated["proofContracts"], serde_json::json!({}));
-    assert_eq!(
-        invalidated["stalePaths"],
-        serde_json::json!(["src/owner.rs"])
-    );
-}
-
-#[tokio::test]
 async fn multi_obligation_step_requires_all_matching_edits() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     tokio::fs::create_dir_all(repo.join("src"))
@@ -1659,7 +1521,6 @@ async fn multi_obligation_step_requires_all_matching_edits() {
                 ],
                 validation_disposition: Some(ValidationDisposition::NotRequired),
                 external_validation_route: None,
-                architecture_slice: None,
             }],
             plan: vec![plan_item("implement", StepStatus::InProgress)],
             ..PlanningUpdateInput::default()
@@ -2143,7 +2004,6 @@ async fn migration_repairs_duplicate_command_receipts_without_reopening_current_
         validation_disposition: ValidationDisposition::NotRequired,
         source_owner: None,
         implementation_surfaces: Vec::new(),
-        architecture_slice: None,
         mutation_obligations: Vec::new(),
         validation_receipt_id: None,
         edit_paths: BTreeSet::from(["src/step.rs".to_string()]),
@@ -2186,7 +2046,6 @@ async fn migration_drops_unattributed_legacy_file_hashes() {
         validation_disposition: ValidationDisposition::NotRequired,
         source_owner: None,
         implementation_surfaces: Vec::new(),
-        architecture_slice: None,
         mutation_obligations: Vec::new(),
         validation_receipt_id: None,
         edit_paths: BTreeSet::from(["src/owned.rs".to_string()]),

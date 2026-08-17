@@ -45,19 +45,6 @@ This file applies inside `codex-rs/core` and inherits `codex-rs/AGENTS.md`.
 - Trace core changes through app-server APIs, CLI parameters, configuration, and
   rollout/session resume compatibility before declaring them non-breaking.
 
-## First-pass closure for tools and caches
-
-- For a tool with a non-generic payload, trace the direct router, nested or
-  code-mode dispatch, registry and exposure, lifecycle and projection mapping,
-  handler, and output consumer. Function-shaped routes must share the existing
-  payload conversion owner; cover valid and malformed payloads on both direct
-  and nested routes instead of duplicating conversion logic.
-- For cache changes, enumerate the applicable states before editing: stable hit,
-  dependency drift, missing input, read failure and retry, exact identity
-  mismatch, and rename, copy, or multi-path effects. Add focused proof for each
-  applicable state, but do not introduce a generalized cache abstraction solely
-  to satisfy this checklist.
-
 ## Core validation delta
 
 - Agent-logic changes require focused integration coverage for major behavior.

@@ -1,5 +1,4 @@
 use crate::agents_md::LoadedAgentsMd;
-use crate::agents_md::ProjectInstructionsDependency;
 use crate::agents_md::effective_project_root_markers;
 use crate::agents_md::load_project_instructions;
 use crate::config::Config;
@@ -24,8 +23,6 @@ pub(crate) struct AgentsMdManager {
 struct AgentsMdCache {
     key: Option<AgentsMdCacheKey>,
     loaded: Option<Arc<LoadedAgentsMd>>,
-    dependencies: Vec<ProjectInstructionsDependency>,
-    complete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,21 +117,6 @@ impl AgentsMdManager {
         environments: &TurnEnvironmentSnapshot,
     ) -> Option<Arc<LoadedAgentsMd>> {
         let key = AgentsMdCacheKey::capture(config, environments);
-        let cached = {
-            let cache = self.cache.lock().await;
-            (
-                cache.key.clone(),
-                cache.loaded.clone(),
-                cache.dependencies.clone(),
-                cache.complete,
-            )
-        };
-        if cached.3
-            && cached.0.as_ref() == Some(&key)
-            && dependencies_still_current(&cached.2, environments).await
-        {
-            return cached.1;
-        }
         let load =
             load_project_instructions(config, self.user_instructions.clone(), environments).await;
         let mut cache = self.cache.lock().await;
@@ -149,11 +131,9 @@ impl AgentsMdManager {
                 _ => false,
             };
         if !semantically_unchanged {
+            cache.key = Some(key);
             cache.loaded = loaded.map(Arc::new);
         }
-        cache.key = Some(key);
-        cache.dependencies = load.dependencies;
-        cache.complete = load.complete;
         cache.loaded.clone()
     }
 
@@ -164,34 +144,6 @@ impl AgentsMdManager {
     pub(crate) fn user_instructions(&self) -> Option<UserInstructions> {
         self.user_instructions.clone()
     }
-}
-
-async fn dependencies_still_current(
-    dependencies: &[ProjectInstructionsDependency],
-    environments: &TurnEnvironmentSnapshot,
-) -> bool {
-    for dependency in dependencies {
-        let Some(turn_environment) = environments
-            .turn_environments
-            .iter()
-            .find(|environment| environment.environment_id == dependency.environment_id)
-        else {
-            return false;
-        };
-        let filesystem = turn_environment.environment.get_filesystem();
-        let observed = match filesystem
-            .get_metadata(&dependency.path, /*sandbox*/ None)
-            .await
-        {
-            Ok(metadata) => Some(metadata),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return false,
-        };
-        if observed != dependency.metadata {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]

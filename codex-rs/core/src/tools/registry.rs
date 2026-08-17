@@ -47,8 +47,7 @@ use codex_rollout::state_db;
 use codex_tools::CanonicalByteRange;
 use codex_tools::CanonicalJsonPointer;
 use codex_tools::CanonicalToolResult;
-use codex_tools::ToolFailureClass;
-use codex_tools::ToolFailureDiagnostic;
+use codex_tools::CanonicalToolResultKind;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
@@ -279,6 +278,15 @@ impl BoundedModelProjection {
             }
         }
     }
+
+    fn into_value(self) -> Value {
+        match self {
+            Self::Envelope { envelope, .. } => {
+                serde_json::to_value(envelope).unwrap_or(Value::Null)
+            }
+            Self::Fallback { value, .. } => value,
+        }
+    }
 }
 
 impl AnyToolResult {
@@ -296,6 +304,10 @@ impl AnyToolResult {
 
     pub(crate) fn sampling_request_signal(&self) -> Option<serde_json::Value> {
         self.result.sampling_request_signal()
+    }
+
+    pub(crate) fn requires_canonical_artifact(&self) -> bool {
+        self.result.requires_canonical_artifact()
     }
 
     pub(crate) fn deterministic_continuation_receipts(
@@ -386,9 +398,15 @@ impl AnyToolResult {
 
     pub(crate) fn code_mode_result(self) -> serde_json::Value {
         let Self {
-            payload, result, ..
+            payload,
+            result,
+            model_projection,
+            ..
         } = self;
-        result.code_mode_result(&payload)
+        match model_projection {
+            Some(projection) => projection.into_code_mode_result(),
+            None => result.code_mode_result(&payload),
+        }
     }
 }
 
@@ -403,6 +421,10 @@ impl ModelToolProjection {
 
     fn into_response(self) -> ResponseInputItem {
         projected_response_item(self.original_response, self.bounded.into_rendered())
+    }
+
+    fn into_code_mode_result(self) -> Value {
+        self.bounded.into_value()
     }
 
     fn merge_owner_drained_continuations(
@@ -439,19 +461,24 @@ impl ModelToolProjection {
             let preserved_start = preserved.len();
             preserved.extend(continuation.preserved_content.iter().cloned());
             candidate.result["preserved_content"] = Value::Array(preserved);
-            let candidate_bounded = serialize_projection_with_limit(
-                candidate,
-                &projected_text,
-                self.applied_token_limit,
-            );
-            if let Some(candidate_bounded) = candidate_bounded
-                && let Some(accepted_envelope) = candidate_bounded.envelope().cloned()
-                && drained_content_survived(
-                    &accepted_envelope,
-                    preserved_start,
-                    &continuation.preserved_content,
-                )
-            {
+            let accepted_candidate =
+                [projected_text.as_str(), ""]
+                    .into_iter()
+                    .find_map(|selected_text| {
+                        let candidate_bounded = serialize_projection_with_limit(
+                            candidate.clone(),
+                            selected_text,
+                            self.applied_token_limit,
+                        )?;
+                        let accepted_envelope = candidate_bounded.envelope().cloned()?;
+                        drained_content_survived(
+                            &accepted_envelope,
+                            preserved_start,
+                            &continuation.preserved_content,
+                        )
+                        .then_some((candidate_bounded, accepted_envelope))
+                    });
+            if let Some((candidate_bounded, accepted_envelope)) = accepted_candidate {
                 envelope = accepted_envelope;
                 bounded = candidate_bounded;
                 accepted.push(continuation.receipt);
@@ -518,8 +545,16 @@ impl ToolOutput for PostToolUseFeedbackOutput {
         self.original.deterministic_continuation_owner_key()
     }
 
+    fn deterministic_continuation_content(&self) -> Vec<Value> {
+        self.original.deterministic_continuation_content()
+    }
+
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
-        self.model_visible.projection_metadata()
+        let mut metadata = self.model_visible.projection_metadata()?;
+        if let Some(original) = self.original.projection_metadata() {
+            metadata.merge_essential_fields(original.essential_inline);
+        }
+        Some(metadata)
     }
 
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
@@ -786,15 +821,7 @@ impl ToolRegistry {
                     &base_tool_result_tags,
                     /*extra_trace_fields*/ &[],
                 );
-                let err = FunctionCallError::Diagnostic(
-                    ToolFailureDiagnostic::model_visible(
-                        ToolFailureClass::UnsupportedTool,
-                        format!("registry.unsupported_tool:{tool_name_flat}"),
-                        message,
-                    )
-                    .with_owner_hint("tool registry lookup")
-                    .with_next_action("search for the intended tool or correct the tool name"),
-                );
+                let err = FunctionCallError::RespondToModel(message);
                 dispatch_trace.record_failed(&err);
                 return Err(err);
             }
@@ -825,17 +852,27 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::Diagnostic(
-                ToolFailureDiagnostic::fatal(
-                    ToolFailureClass::InvalidPayload,
-                    format!("registry.incompatible_payload:{tool_name_flat}"),
-                    message,
-                )
-                .with_owner_hint("tool payload conversion")
-                .with_next_action(
-                    "inspect the payload converter for this tool; do not retry unchanged input",
-                ),
+            let err = FunctionCallError::Fatal(message);
+            dispatch_trace.record_failed(&err);
+            return Err(err);
+        }
+
+        if matches!(invocation.source, ToolCallSource::CodeMode { .. })
+            && let Err(message) =
+                preflight_code_mode_arguments(&tool_name, &tool.spec(), &invocation.payload)
+        {
+            let log_payload = invocation.payload.log_payload();
+            otel.tool_result_with_tags(
+                tool_name_flat.as_ref(),
+                &call_id_owned,
+                log_payload.as_ref(),
+                Duration::ZERO,
+                /*success*/ false,
+                &message,
+                &tool_result_tags,
+                &extra_trace_fields,
             );
+            let err = FunctionCallError::RespondToModel(message);
             dispatch_trace.record_failed(&err);
             return Err(err);
         }
@@ -987,17 +1024,7 @@ impl ToolRegistry {
             Ok(_) => {
                 let mut guard = response_cell.lock().await;
                 let mut result = guard.take().ok_or_else(|| {
-                    FunctionCallError::Diagnostic(
-                        ToolFailureDiagnostic::fatal(
-                            ToolFailureClass::MissingOutput,
-                            format!("registry.missing_output:{tool_name_flat}"),
-                            "tool produced no output",
-                        )
-                        .with_owner_hint("tool handler response publication")
-                        .with_next_action(
-                            "inspect the handler path that completed without publishing a response",
-                        ),
-                    )
+                    FunctionCallError::Fatal("tool produced no output".to_string())
                 })?;
                 if let Some(outcome) = post_tool_use_outcome {
                     if outcome.should_block {
@@ -1036,36 +1063,28 @@ impl ToolRegistry {
                     None => None,
                 };
                 if canonical_artifact_required && model_projection.is_none() {
-                    let err = FunctionCallError::Diagnostic(
-                        ToolFailureDiagnostic::fatal(
-                            ToolFailureClass::ArtifactRetention,
-                            format!("registry.canonical_artifact:{tool_name_flat}"),
-                            format!(
-                                "failed to preserve the fully received result for {} as a canonical artifact",
-                                flat_tool_name(&invocation.tool_name)
-                            ),
-                        )
-                        .with_owner_hint("canonical tool-output retention")
-                        .with_next_action(
-                            "inspect the retained-output artifact creation diagnostic before retrying",
-                        ),
-                    );
+                    let err = FunctionCallError::Fatal(format!(
+                        "failed to preserve the fully received result for {} as a canonical artifact",
+                        flat_tool_name(&invocation.tool_name)
+                    ));
                     dispatch_trace.record_failed(&err);
                     return Err(err);
                 }
                 let provider_visible = projection_is_provider_visible(&invocation.source);
                 if let Some(projection) = &model_projection {
-                    record_projection_timing(
-                        invocation.turn.turn_timing_state.as_ref(),
-                        provider_visible,
-                        projection.canonical_bytes,
-                        projection.canonical_tokens,
-                        projection.model_bytes,
-                        projection.projected_tokens,
-                        projection.artifact_created,
-                        projection.projection_truncated,
-                        projection.omitted_sections,
-                    );
+                    invocation
+                        .turn
+                        .turn_timing_state
+                        .record_tool_output_projection_facts(
+                            projection.canonical_bytes,
+                            projection.canonical_tokens,
+                            projection.model_bytes,
+                            projection.projected_tokens,
+                            projection.artifact_created,
+                            projection.projection_truncated,
+                            projection.omitted_sections,
+                            provider_visible,
+                        );
                     if provider_visible && let Some(candidate) = &projection.candidate {
                         invocation
                             .session
@@ -1095,34 +1114,6 @@ impl ToolRegistry {
 
 fn projection_is_provider_visible(source: &ToolCallSource) -> bool {
     matches!(source, ToolCallSource::Direct)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_projection_timing(
-    turn_timing_state: &crate::turn_timing::TurnTimingState,
-    provider_visible: bool,
-    canonical_bytes: u64,
-    canonical_tokens: u64,
-    model_bytes: u64,
-    projected_tokens: u64,
-    artifact_created: bool,
-    projection_truncated: bool,
-    omitted_sections: u64,
-) {
-    // Nested code-mode output is not sent to the provider as a separate result, but it still
-    // consumed projection/truncation/artifact work that belongs in the enclosing turn's facts.
-    if provider_visible {
-        turn_timing_state.record_tool_output_projection(projected_tokens);
-    }
-    turn_timing_state.record_tool_output_projection_facts(
-        canonical_bytes,
-        canonical_tokens,
-        model_bytes,
-        projected_tokens,
-        artifact_created,
-        projection_truncated,
-        omitted_sections,
-    );
 }
 
 async fn notify_tool_finish_if_unclaimed(
@@ -1329,7 +1320,13 @@ fn prepare_model_projection(
     canonical.sections = if materialization == ProjectionMaterialization::InlineCarrier {
         Vec::new()
     } else {
-        canonical_projection_sections(&canonical, &metadata.fragments, &selection_facts)
+        canonical_projection_sections(
+            &canonical,
+            &metadata.fragments,
+            &selection_facts,
+            &metadata.predetermined_ranges,
+            &metadata.predetermined_json_pointers,
+        )
     };
     let validation_material = metadata.fragments.iter().any(|fragment| {
         fragment.kind == ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
@@ -1382,45 +1379,49 @@ fn canonical_projection_sections(
     canonical: &CanonicalToolResult,
     fragments: &[ToolOutputProjectionFragment],
     selection: &ProjectionSelectionFacts,
+    predetermined_ranges: &[ToolOutputProjectionRange],
+    predetermined_json_pointers: &[ToolOutputProjectionJsonPointer],
 ) -> Vec<ToolProjectionSection> {
-    if fragments.is_empty() {
-        return vec![ToolProjectionSection {
-            id: "result".to_string(),
-            // The canonical value already lives in the artifact. Repeating it in
-            // the section directory would make metadata grow with the omitted
-            // payload and could force the projection to collapse to a bare ID.
-            value: None,
-            exact_bytes: canonical.exact_bytes,
-            inclusion: ToolProjectionInclusion::Omitted,
-            canonical_range: Some(CanonicalByteRange::new(0, canonical.exact_bytes)),
-            // JSON pointer children use a different selector namespace. They
-            // are advertised by pointer selection, not as section IDs.
-            children: Vec::new(),
-            recovery_chunk_bytes: None,
-        }];
-    }
     let selected = selection.selected_ids.iter().collect::<HashSet<_>>();
     let partial = selection.partial_ids.iter().collect::<HashSet<_>>();
+    let declared_ranges = predetermined_ranges
+        .iter()
+        .filter_map(|range| {
+            canonical_line_range(canonical, range.start_line, range.end_line)
+                .map(|canonical_range| (range.id.as_str(), canonical_range))
+        })
+        .chain(predetermined_json_pointers.iter().filter_map(|selector| {
+            canonical
+                .json_pointers
+                .get(&selector.pointer)
+                .map(|pointer| (selector.id.as_str(), pointer.range))
+        }))
+        .collect::<HashMap<_, _>>();
     let mut cursor = 0_usize;
-    fragments
+    let mut sections = fragments
         .iter()
         .enumerate()
-        .map(|(index, fragment)| {
+        .filter_map(|(index, fragment)| {
             let id = fragment
                 .id
                 .clone()
                 .unwrap_or_else(|| format!("fragment:{index}"));
-            let range = canonical.bytes[cursor..]
-                .windows(fragment.text.len())
-                .position(|window| window == fragment.text.as_bytes())
-                .map(|offset| {
-                    let start = cursor + offset;
-                    let end = start + fragment.text.len();
-                    cursor = end;
-                    CanonicalByteRange::new(start as u64, end as u64)
-                });
-            ToolProjectionSection {
-                exact_bytes: range.map_or(fragment.text.len() as u64, CanonicalByteRange::len),
+            let range = declared_ranges.get(id.as_str()).copied().or_else(|| {
+                if fragment.text.is_empty() {
+                    return None;
+                }
+                canonical.bytes[cursor..]
+                    .windows(fragment.text.len())
+                    .position(|window| window == fragment.text.as_bytes())
+                    .map(|offset| {
+                        let start = cursor + offset;
+                        let end = start + fragment.text.len();
+                        cursor = end;
+                        CanonicalByteRange::new(start as u64, end as u64)
+                    })
+            })?;
+            Some(ToolProjectionSection {
+                exact_bytes: range.len(),
                 inclusion: if selected.contains(&id) && !partial.contains(&id) {
                     ToolProjectionInclusion::Included
                 } else {
@@ -1429,13 +1430,105 @@ fn canonical_projection_sections(
                 // `selected_text` is the sole inline copy. Section metadata is
                 // an address directory, never a second payload copy.
                 value: None,
-                canonical_range: range,
+                canonical_range: Some(range),
                 children: Vec::new(),
                 recovery_chunk_bytes: None,
                 id,
-            }
+            })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let mut section_ids = sections
+        .iter()
+        .map(|section| section.id.clone())
+        .collect::<HashSet<_>>();
+    for range in predetermined_ranges {
+        if section_ids.insert(range.id.clone())
+            && let Some(canonical_range) =
+                canonical_line_range(canonical, range.start_line, range.end_line)
+        {
+            sections.push(omitted_projection_section(
+                range.id.clone(),
+                canonical_range,
+            ));
+        }
+    }
+    for selector in predetermined_json_pointers {
+        if section_ids.insert(selector.id.clone())
+            && let Some(pointer) = canonical.json_pointers.get(&selector.pointer)
+        {
+            sections.push(omitted_projection_section(
+                selector.id.clone(),
+                pointer.range,
+            ));
+        }
+    }
+
+    if canonical.kind == CanonicalToolResultKind::Json {
+        const MAX_TOP_LEVEL_JSON_SECTIONS: usize = 64;
+        if let Some(root) = canonical.json_pointers.get("") {
+            for pointer in root
+                .direct_children
+                .iter()
+                .take(MAX_TOP_LEVEL_JSON_SECTIONS)
+            {
+                let id = format!("json:{pointer}");
+                if section_ids.insert(id.clone())
+                    && let Some(entry) = canonical.json_pointers.get(pointer)
+                {
+                    sections.push(omitted_projection_section(id, entry.range));
+                }
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        sections.push(omitted_projection_section(
+            "result".to_string(),
+            CanonicalByteRange::new(0, canonical.exact_bytes),
+        ));
+    }
+    sections
+}
+
+fn canonical_line_range(
+    canonical: &CanonicalToolResult,
+    start_line: usize,
+    end_line: usize,
+) -> Option<CanonicalByteRange> {
+    if start_line == 0 || end_line < start_line {
+        return None;
+    }
+    let mut line_starts = vec![0_u64];
+    line_starts.extend(
+        canonical
+            .bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index as u64 + 1))
+            .filter(|offset| *offset < canonical.exact_bytes),
+    );
+    let start = *line_starts.get(start_line - 1)?;
+    let end = line_starts
+        .get(end_line)
+        .copied()
+        .unwrap_or(canonical.exact_bytes);
+    Some(CanonicalByteRange::new(start, end))
+}
+
+fn omitted_projection_section(
+    id: String,
+    canonical_range: CanonicalByteRange,
+) -> ToolProjectionSection {
+    ToolProjectionSection {
+        id,
+        value: None,
+        exact_bytes: canonical_range.len(),
+        inclusion: ToolProjectionInclusion::Omitted,
+        canonical_range: Some(canonical_range),
+        children: Vec::new(),
+        recovery_chunk_bytes: None,
+    }
 }
 
 const PROJECTION_FRAGMENT_KIND_ORDER: [ToolOutputProjectionFragmentKind; 4] = [
@@ -1707,7 +1800,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
     let omitted_sections = canonical
         .sections
         .iter()
-        .filter(|section| section.inclusion != ToolProjectionInclusion::Included)
+        .filter(|section| section.inclusion == ToolProjectionInclusion::Omitted)
         .map(|section| section.id.clone())
         .collect::<Vec<_>>();
     let omitted_section_count = omitted_sections.len() as u64;
@@ -2298,6 +2391,70 @@ fn function_hook_tool_name(invocation: &ToolInvocation) -> HookToolName {
     }
 
     HookToolName::new(flat_tool_name(&invocation.tool_name).into_owned())
+}
+
+fn preflight_code_mode_arguments(
+    tool_name: &ToolName,
+    spec: &ToolSpec,
+    payload: &ToolPayload,
+) -> Result<(), String> {
+    let ToolPayload::Function { arguments } = payload else {
+        return Ok(());
+    };
+    let value: Value = serde_json::from_str(arguments)
+        .map_err(|err| format!("tool `{tool_name}` arguments are not valid JSON: {err}"))?;
+    if !value.is_object() {
+        return Err(format!(
+            "tool `{tool_name}` expects a JSON object for arguments"
+        ));
+    }
+
+    let parameters = match spec {
+        ToolSpec::Function(tool) => Some(&tool.parameters),
+        ToolSpec::Namespace(namespace) => namespace.tools.iter().find_map(|nested| match nested {
+            codex_tools::ResponsesApiNamespaceTool::Function(tool)
+                if tool.name == tool_name.name =>
+            {
+                Some(&tool.parameters)
+            }
+            codex_tools::ResponsesApiNamespaceTool::Function(_) => None,
+        }),
+        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => None,
+    };
+    let Some(parameters) = parameters else {
+        return Ok(());
+    };
+    let schema = serde_json::to_value(parameters)
+        .map_err(|err| format!("tool `{tool_name}` argument schema is invalid: {err}"))?;
+    let validator = jsonschema::validator_for(&schema).map_err(|err| {
+        format!("tool `{tool_name}` argument schema could not be compiled: {err}")
+    })?;
+    let mut errors = validator.iter_errors(&value);
+    let messages = errors
+        .by_ref()
+        .take(4)
+        .map(|error| {
+            let pointer = error.instance_path().as_str();
+            let path = if pointer.is_empty() {
+                "$".to_string()
+            } else {
+                format!("${pointer}")
+            };
+            format!("{path}: {error}")
+        })
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let suffix = errors
+        .next()
+        .is_some()
+        .then_some("; additional errors omitted");
+    Err(format!(
+        "tool `{tool_name}` argument preflight failed: {}{}",
+        messages.join("; "),
+        suffix.unwrap_or_default()
+    ))
 }
 
 fn function_hook_tool_input(arguments: &str) -> Value {

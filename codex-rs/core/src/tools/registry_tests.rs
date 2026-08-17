@@ -12,33 +12,41 @@ fn nested_code_mode_projection_is_not_provider_visible() {
 }
 
 #[test]
-fn nested_code_mode_projection_still_records_turn_facts() {
-    let state = crate::turn_timing::TurnTimingState::default();
+fn typed_preflight_enforces_code_mode_registered_schema() {
+    let spec = ToolSpec::Function(codex_tools::ResponsesApiTool {
+        name: "typed_helper".to_string(),
+        description: "test helper".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: codex_tools::JsonSchema::object(
+            BTreeMap::from([("path".to_string(), codex_tools::JsonSchema::string(None))]),
+            Some(vec!["path".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    });
+    let name = ToolName::plain("typed_helper");
 
-    record_projection_timing(
-        &state,
-        projection_is_provider_visible(&ToolCallSource::CodeMode {
-            cell_id: "cell".to_string(),
-            runtime_tool_call_id: "nested".to_string(),
-        }),
-        1_000,
-        250,
-        400,
-        100,
-        true,
-        true,
-        3,
+    assert_eq!(
+        preflight_code_mode_arguments(
+            &name,
+            &spec,
+            &ToolPayload::Function {
+                arguments: serde_json::json!({ "path": "src/lib.rs" }).to_string(),
+            },
+        ),
+        Ok(())
     );
-
-    let counters = state.complete_snapshot().protocol_timing().counters;
-    assert_eq!(counters.tool_output_projected_token_count, 0);
-    assert_eq!(counters.tool_output_canonical_byte_count, 1_000);
-    assert_eq!(counters.tool_output_canonical_token_count, 250);
-    assert_eq!(counters.tool_output_model_byte_count, 400);
-    assert_eq!(counters.tool_output_model_token_count, 100);
-    assert_eq!(counters.tool_output_artifact_creation_count, 1);
-    assert_eq!(counters.tool_output_projection_truncation_count, 1);
-    assert_eq!(counters.tool_output_omitted_section_count, 3);
+    let error = preflight_code_mode_arguments(
+        &name,
+        &spec,
+        &ToolPayload::Function {
+            arguments: serde_json::json!({ "path": 7, "extra": true }).to_string(),
+        },
+    )
+    .expect_err("invalid typed arguments must be rejected before dispatch");
+    assert!(error.contains("argument preflight failed"));
+    assert!(error.contains("/path") || error.contains("additional"));
 }
 
 #[test]
@@ -971,10 +979,10 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         preserved_content: vec![serde_json::json!({ "exact": "x".repeat(8_000) })],
         receipt: oversized_receipt,
     };
-    assert_eq!(
-        nested.code_mode_result(),
-        Value::String("native nested value".to_string())
-    );
+    let nested_code_mode = nested.code_mode_result();
+    assert_eq!(nested_code_mode["version"], 1);
+    assert!(nested_code_mode["artifact_id"].is_string());
+    assert_eq!(nested_code_mode["canonical_sha256"], inner_canonical.sha256);
 
     let outer_text = "outer code-mode output ".repeat(200);
     let outer_canonical = CanonicalToolResult::text(outer_text.clone());
@@ -1235,6 +1243,85 @@ fn json_projection_metadata_keeps_generic_fallback_by_default() {
 
     assert!(metadata.fragments.is_empty());
     assert_eq!(metadata.spillable_text, vec![r#"{"text":"x"}"#.to_string()]);
+}
+
+#[test]
+fn post_tool_feedback_wrapper_preserves_original_control_metadata() {
+    let wrapped = PostToolUseFeedbackOutput {
+        original: Box::new(codex_tools::JsonToolOutput::new(serde_json::json!({
+            "status": "aborted",
+            "nextCursor": "opaque-cursor",
+            "omitted_result_count": 5,
+            "payload": "must remain spillable",
+        }))),
+        model_visible: FunctionToolOutput::from_text("hook feedback".to_string(), Some(false)),
+    };
+
+    let metadata = wrapped.projection_metadata().expect("wrapper metadata");
+
+    assert_eq!(metadata.essential_inline["status"], "aborted");
+    assert_eq!(metadata.essential_inline["nextCursor"], "opaque-cursor");
+    assert_eq!(metadata.essential_inline["omitted_result_count"], 5);
+    assert!(metadata.essential_inline.get("payload").is_none());
+    assert_eq!(metadata.spillable_text, vec!["hook feedback"]);
+}
+
+#[test]
+fn semantic_sections_use_declared_canonical_ranges_and_stable_json_handles() {
+    let text = CanonicalToolResult::text("alpha\nbeta\ngamma\n");
+    let fragments = vec![
+        ToolOutputProjectionFragment::new(
+            ToolOutputProjectionFragmentKind::ContextualSpillableText,
+            "rendered text that is not present in the canonical bytes",
+        )
+        .with_id("symbol:beta"),
+    ];
+    let selection = ProjectionSelectionFacts {
+        mode: "typed_fragments",
+        available_fragments: 1,
+        selected_fragments: 0,
+        exact_duplicates_removed: 0,
+        selected_ids: Vec::new(),
+        omitted_inline_ids: vec!["symbol:beta".to_string()],
+        partial_ids: Vec::new(),
+    };
+
+    let sections = canonical_projection_sections(
+        &text,
+        &fragments,
+        &selection,
+        &[ToolOutputProjectionRange {
+            id: "symbol:beta".to_string(),
+            start_line: 2,
+            end_line: 2,
+        }],
+        &[],
+    );
+
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].id, "symbol:beta");
+    assert_eq!(
+        sections[0].canonical_range,
+        Some(CanonicalByteRange::new(6, 11))
+    );
+
+    let json = CanonicalToolResult::json(serde_json::json!({
+        "cursor": "opaque",
+        "items": [1, 2, 3],
+    }));
+    let json_sections = canonical_projection_sections(&json, &[], &selection, &[], &[]);
+    assert_eq!(
+        json_sections
+            .iter()
+            .map(|section| section.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["json:/cursor", "json:/items"]
+    );
+    assert!(
+        json_sections
+            .iter()
+            .all(|section| section.canonical_range.is_some())
+    );
 }
 
 struct TestHandler {

@@ -25,11 +25,6 @@ small type helpers.
   downstream CLI, TUI, app-server, and app-server-protocol consumers.
 - Keep dependencies minimal; do not add runtime-heavy dependencies for behavior
   that belongs in a consuming crate.
-- Before changing a serializable struct or enum, close its data shape: find all
-  direct constructors and destructuring sites, readers and writers, stored
-  fixtures, and generated schema or SDK representations. Additive persisted
-  fields must define the intended missing-field behavior and include both a
-  legacy payload test and a new-shape round-trip test.
 
 ## Validation
 

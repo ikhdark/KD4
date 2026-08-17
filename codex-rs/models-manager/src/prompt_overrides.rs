@@ -82,4 +82,59 @@ mod tests {
             "the local GPT-5.6 prompt should remain compact"
         );
     }
+
+    #[test]
+    fn gpt_5_6_prompt_bounds_counted_audits() {
+        let response = crate::bundled_models_response().expect("bundled models should parse");
+
+        for slug in GPT_5_6_SLUGS {
+            let prompt = &response
+                .models
+                .iter()
+                .find(|model| model.slug == *slug)
+                .unwrap_or_else(|| panic!("bundled models should contain {slug}"))
+                .base_instructions;
+
+            for rule in [
+                "request a specific finding count",
+                "responsible producer",
+                "reachable consumer or user-visible effect",
+                "stop broad searches",
+                "explicitly exhaustive scope",
+            ] {
+                assert!(
+                    prompt.contains(rule),
+                    "{slug} should include bounded audit convergence rule {rule:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_prompt_preflights_source_read_paths() {
+        let response = crate::bundled_models_response().expect("bundled models should parse");
+
+        for slug in GPT_5_6_SLUGS {
+            let prompt = &response
+                .models
+                .iter()
+                .find(|model| model.slug == *slug)
+                .unwrap_or_else(|| panic!("bundled models should contain {slug}"))
+                .base_instructions;
+
+            for rule in [
+                "Before grouped or batch source reads",
+                "rg --files",
+                "Repo Atlas",
+                "repository source map",
+                "task-local negative-path cache",
+                "workspace snapshot changes",
+            ] {
+                assert!(
+                    prompt.contains(rule),
+                    "{slug} should include source-read preflight rule {rule:?}"
+                );
+            }
+        }
+    }
 }

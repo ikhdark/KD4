@@ -37,7 +37,7 @@ toolCallCount: number, outputTokens: bigint, reasoningOutputTokens: bigint,
  */
 tokenUsage?: TurnTimingProviderTokenUsage,
 /**
- * Aggregate-only, locally estimated request composition. No prompt text,
+ * Aggregate-only full logical prompt accounting. No prompt text,
  * repository paths, tool arguments, or hashes are persisted here.
  */
-requestTokenCategories?: TurnTimingRequestTokenCategories, dispatchMs?: number, firstModelOutputMs?: number, completedMs?: number, };
+requestTokenCategories?: TurnTimingRequestTokenCategories, dispatchMs?: number | null, firstModelOutputMs?: number | null, completedMs?: number | null, };

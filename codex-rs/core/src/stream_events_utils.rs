@@ -235,18 +235,6 @@ pub(crate) struct HandleOutputCtx {
     pub turn_store: Arc<ExtensionData>,
     pub tool_runtime: ToolCallRuntime,
     pub cancellation_token: CancellationToken,
-    /// Keep an explicit final answer private until terminal completion has
-    /// replaced or approved it using the authoritative completion gate.
-    pub defer_final_agent_message_events: bool,
-}
-
-pub(crate) fn should_defer_agent_message_event(item: &TurnItem, enabled: bool) -> bool {
-    enabled
-        && matches!(
-            item,
-            TurnItem::AgentMessage(agent_message)
-                if agent_message.phase == Some(codex_protocol::models::MessagePhase::FinalAnswer)
-        )
 }
 
 pub(crate) async fn apply_turn_item_contributors(
@@ -391,21 +379,15 @@ pub(crate) async fn handle_output_item_done(
                 .as_ref()
                 .map(|finalized| finalized.facts.clone());
             if let Some(finalized_turn_item) = finalized_turn_item {
-                let defer_event = should_defer_agent_message_event(
-                    &finalized_turn_item.turn_item,
-                    ctx.defer_final_agent_message_events,
-                );
-                if !defer_event && previously_active_item.is_none() {
+                if previously_active_item.is_none() {
                     ctx.sess
                         .emit_turn_item_started(&ctx.turn_context, &finalized_turn_item.turn_item)
                         .await;
                 }
 
-                if !defer_event {
-                    ctx.sess
-                        .emit_turn_item_completed(&ctx.turn_context, finalized_turn_item.turn_item)
-                        .await;
-                }
+                ctx.sess
+                    .emit_turn_item_completed(&ctx.turn_context, finalized_turn_item.turn_item)
+                    .await;
             }
             record_completed_response_item_with_finalized_facts(
                 ctx.sess.as_ref(),

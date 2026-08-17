@@ -7,8 +7,6 @@ use std::collections::BTreeMap;
 use crate::PUBLIC_TOOL_NAME;
 
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
-const MAX_RECOVERY_QUERY_COUNT: usize = 8;
-const MAX_RECOVERY_QUERY_BYTES: usize = 256;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
 To find one, filter `ALL_TOOLS` by `name` and `description`."#;
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate tool calls in a fresh async V8 isolate.
@@ -16,7 +14,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate too
 - Nested tools are normalized methods on `tools` (for example `await tools.exec_command(...)`); methods accept the documented string or object and return the documented object or string.
 - Treat one `exec` as the evidence packet for the current generation: call all independent tools with `Promise.all`, perform deterministic dependent calls in the same script, and emit one coherent result after the packet is complete.
 - Prefer a sufficiently large complete packet over yielding for another model generation. Use `yield_control()` only when the model must make a new decision before the script can continue.
-- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000, "recovery_queries": ["needle"]}`. `yield_time_ms` defaults to 10000 and controls the internal observation/progress cadence; empty observations do not cause a model-visible yield or a new model generation. `max_output_tokens` bounds the outer result only after the coherent nested evidence packet is formed and defaults to 10000, subject to the model hard limit. `recovery_queries` declares fixed strings whose exact line contexts should be retained from the complete packet when truncation would otherwise require another read.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` defaults to 10000 and controls the internal observation/progress cadence; empty observations do not cause a model-visible yield or a new model generation. `max_output_tokens` bounds the outer result only after the coherent nested evidence packet is formed and defaults to 10000, subject to the model hard limit.
 - When evaluation ends, unawaited work is discarded.
 
 Global helpers:
@@ -147,8 +145,6 @@ struct CodeModeExecPragma {
     yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
-    #[serde(default)]
-    recovery_queries: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -156,8 +152,6 @@ pub struct ParsedExecSource {
     pub code: String,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
-    /// Fixed-string targets to hydrate from the complete pre-truncation text.
-    pub recovery_queries: Vec<String>,
 }
 
 pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
@@ -171,7 +165,6 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
         code: input.to_string(),
         yield_time_ms: None,
         max_output_tokens: None,
-        recovery_queries: Vec::new(),
     };
 
     let mut lines = input.splitn(2, '\n');
@@ -191,33 +184,36 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
     let directive = pragma.trim();
     if directive.is_empty() {
         return Err(
-            "exec pragma must be a JSON object with supported fields `yield_time_ms`, `max_output_tokens`, and `recovery_queries`"
+            "exec pragma must be a JSON object with supported fields `yield_time_ms` and `max_output_tokens`"
                 .to_string(),
         );
     }
 
     let value: serde_json::Value = serde_json::from_str(directive).map_err(|err| {
         format!(
-            "exec pragma must be valid JSON with supported fields `yield_time_ms`, `max_output_tokens`, and `recovery_queries`: {err}"
+            "exec pragma must be valid JSON with supported fields `yield_time_ms` and `max_output_tokens`: {err}"
         )
     })?;
     let object = value.as_object().ok_or_else(|| {
-        "exec pragma must be a JSON object with supported fields `yield_time_ms`, `max_output_tokens`, and `recovery_queries`"
+        "exec pragma must be a JSON object with supported fields `yield_time_ms` and `max_output_tokens`"
             .to_string()
     })?;
     for key in object.keys() {
         match key.as_str() {
-            "yield_time_ms" | "max_output_tokens" | "recovery_queries" => {}
+            "yield_time_ms" | "max_output_tokens" => {}
             _ => {
                 return Err(format!(
-                    "exec pragma only supports `yield_time_ms`, `max_output_tokens`, and `recovery_queries`; got `{key}`"
+                    "exec pragma only supports `yield_time_ms` and `max_output_tokens`; got `{key}`"
                 ));
             }
         }
     }
 
-    let pragma: CodeModeExecPragma = serde_json::from_value(value)
-        .map_err(|err| format!("exec pragma fields are invalid: {err}"))?;
+    let pragma: CodeModeExecPragma = serde_json::from_value(value).map_err(|err| {
+        format!(
+            "exec pragma fields `yield_time_ms` and `max_output_tokens` must be non-negative safe integers: {err}"
+        )
+    })?;
     if pragma
         .yield_time_ms
         .is_some_and(|yield_time_ms| yield_time_ms > MAX_JS_SAFE_INTEGER)
@@ -236,25 +232,9 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
         );
     }
 
-    if pragma.recovery_queries.len() > MAX_RECOVERY_QUERY_COUNT {
-        return Err(format!(
-            "exec pragma field `recovery_queries` accepts at most {MAX_RECOVERY_QUERY_COUNT} fixed strings"
-        ));
-    }
-    if pragma
-        .recovery_queries
-        .iter()
-        .any(|query| query.trim().is_empty() || query.len() > MAX_RECOVERY_QUERY_BYTES)
-    {
-        return Err(format!(
-            "exec pragma recovery queries must be non-empty and at most {MAX_RECOVERY_QUERY_BYTES} bytes"
-        ));
-    }
-
     args.code = rest.to_string();
     args.yield_time_ms = pragma.yield_time_ms;
     args.max_output_tokens = pragma.max_output_tokens;
-    args.recovery_queries = pragma.recovery_queries;
     Ok(args)
 }
 
@@ -738,7 +718,6 @@ fn render_json_schema_literal(value: &JsonValue) -> String {
 mod tests {
     use super::CodeModeToolKind;
     use super::EXEC_DESCRIPTION_TEMPLATE;
-    use super::MAX_RECOVERY_QUERY_COUNT;
     use super::ParsedExecSource;
     use super::ToolDefinition;
     use super::ToolNamespaceDescription;
@@ -780,7 +759,6 @@ mod tests {
                 code: "text('hi')".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
-                recovery_queries: Vec::new(),
             }
         );
     }
@@ -788,27 +766,13 @@ mod tests {
     #[test]
     fn parse_exec_source_with_pragma() {
         assert_eq!(
-            parse_exec_source(
-                "// @exec: {\"yield_time_ms\": 10, \"recovery_queries\": [\"needle\"]}\ntext('hi')"
-            )
-            .unwrap(),
+            parse_exec_source("// @exec: {\"yield_time_ms\": 10}\ntext('hi')").unwrap(),
             ParsedExecSource {
                 code: "text('hi')".to_string(),
                 yield_time_ms: Some(10),
                 max_output_tokens: None,
-                recovery_queries: vec!["needle".to_string()],
             }
         );
-    }
-
-    #[test]
-    fn parse_exec_source_rejects_unbounded_recovery_queries() {
-        let queries = vec!["x"; MAX_RECOVERY_QUERY_COUNT + 1];
-        let input = format!(
-            "// @exec: {{\"recovery_queries\": {}}}\ntext('hi')",
-            serde_json::to_string(&queries).unwrap()
-        );
-        assert!(parse_exec_source(&input).unwrap_err().contains("at most"));
     }
 
     #[test]

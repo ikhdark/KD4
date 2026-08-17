@@ -2,10 +2,10 @@ use chrono::Utc;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
 use codex_features::Feature;
+use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
-use codex_protocol::validation::ValidationTerminalStatus;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -14,7 +14,6 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -172,7 +171,6 @@ pub(super) struct RunExecLikeArgs {
     pub(super) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
     pub(super) validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
     pub(super) validation_waiter: Option<crate::validation_admission::ValidationLeader>,
-    pub(super) repository: PathBuf,
 }
 
 pub(super) struct RunExecLikeResult {
@@ -401,8 +399,8 @@ pub(super) async fn run_exec_like(
     let call_id = args.call_id.clone();
     let validation_output_owned = args.validation_launch.is_some();
     let result = run_exec_like_with_exit_code(args).await?;
-    let validation_failure = validation_output_owned
-        && result.validation_execution_outcome() == ValidationExecutionOutcome::ExecutedFailure;
+    let validation_failure =
+        validation_output_owned && result.exit_code.is_some_and(|code| code != 0);
     Ok(LegacyShellToolOutput {
         inner: result.output,
         canonical_output: result.canonical_output,
@@ -487,13 +485,15 @@ pub(super) async fn run_exec_like_with_exit_code(
             )));
         }
     }
+    let repo_root = get_git_repo_root(args.exec_params.cwd.as_path())
+        .unwrap_or_else(|| args.exec_params.cwd.to_path_buf());
     let focused_validation_admission = (!inspection_command).then(|| {
         focused_validation_command_summary(
             &args.safety_command,
             &args.hook_command,
             args.shell_type.is_none() && !args.is_powershell_script,
             args.exec_params.cwd.as_path(),
-            args.repository.as_path(),
+            repo_root.as_path(),
             &args.exec_params.expiration,
             args.exec_params
                 .sandbox_permissions
@@ -511,7 +511,7 @@ pub(super) async fn run_exec_like_with_exit_code(
                     &args.safety_command,
                     &args.exec_params.env,
                     args.exec_params.cwd.as_path(),
-                    args.repository.as_path(),
+                    repo_root.as_path(),
                 )
                 .ok()
                 .map(|resolved_executable| (command_summary, resolved_executable))
@@ -857,7 +857,7 @@ pub(super) async fn run_exec_like_with_exit_code(
         );
     }
     let validation_leader = args.validation_leader.take();
-    let mut result = run_exec_like_with_exit_code_inner(args, focused_validation.is_some()).await;
+    let result = run_exec_like_with_exit_code_inner(args, focused_validation.is_some()).await;
     if let Some(operation) = owned_operation.as_mut() {
         operation.record_progress();
     }
@@ -866,15 +866,6 @@ pub(super) async fn run_exec_like_with_exit_code(
         .command_execution
         .validation_result_for_call(&call_id)
         .await;
-    if terminal_validation_result
-        .as_ref()
-        .is_some_and(|result| result.status == ValidationTerminalStatus::Failed)
-        && let Ok(result) = &mut result
-    {
-        result.validation_execution_outcome = ValidationExecutionOutcome::ExecutedFailure;
-        result.output.success = Some(false);
-        result.output.outcome = Some(codex_tools::ToolOutputOutcome::Failure);
-    }
     if let Some(leader) = validation_leader {
         match &result {
             Ok(result) => {
@@ -1882,7 +1873,6 @@ async fn run_exec_like_with_exit_code_inner(
         validation_launch,
         validation_leader: _,
         validation_waiter: _,
-        repository: _,
     } = args;
 
     let fs = turn_environment.environment.get_filesystem();

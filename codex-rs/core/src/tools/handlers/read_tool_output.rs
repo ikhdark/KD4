@@ -13,10 +13,18 @@ use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME;
 use crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_protocol::models::ResponseInputItem;
+use codex_protocol::protocol::DeterministicContinuationClass;
+use codex_protocol::protocol::DeterministicContinuationHostAction;
+use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
+use codex_tools::CanonicalToolResult;
 use codex_tools::JsonToolOutput;
 use codex_tools::ToolName;
+use codex_tools::ToolOutput;
+use codex_tools::ToolOutputProjectionMetadata;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
+use serde_json::Value;
 
 const DEFAULT_MAX_BYTES: usize = 16_384;
 const DEFAULT_LINE_COUNT: usize = 200;
@@ -55,6 +63,53 @@ struct ReadToolOutputRangeArgs {
 
 pub struct ReadToolOutputHandler;
 
+struct ReadToolOutputToolOutput {
+    inner: JsonToolOutput,
+    exact_recovery: Option<(TurnTimingDeterministicContinuationReceipt, Value)>,
+}
+
+impl ToolOutput for ReadToolOutputToolOutput {
+    fn log_preview(&self) -> String {
+        self.inner.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.inner.success_for_logging()
+    }
+
+    fn deterministic_continuation_receipts(
+        &self,
+    ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
+        self.exact_recovery
+            .as_ref()
+            .map(|(receipt, _)| vec![receipt.clone()])
+            .unwrap_or_default()
+    }
+
+    fn deterministic_continuation_content(&self) -> Vec<Value> {
+        self.exact_recovery
+            .as_ref()
+            .map(|(_, value)| vec![value.clone()])
+            .unwrap_or_default()
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        self.inner.projection_metadata()
+    }
+
+    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        self.inner.canonical_result(payload)
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        self.inner.to_response_item(call_id, payload)
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> Value {
+        self.inner.code_mode_result(payload)
+    }
+}
+
 impl ToolExecutor<ToolInvocation> for ReadToolOutputHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME)
@@ -92,6 +147,12 @@ async fn handle_read_tool_output(
     // clip a selected value. The selector engine owns its exact response fit.
     let _legacy_max_bytes = resolved_max_bytes(args.max_bytes)?;
     let selectors = resolved_selectors(&args)?;
+    let code_mode_recovery = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
+    let action_bounds_hash = crate::tool_history::sha256(
+        serde_json::to_string(&selectors)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     let (output, reused) = match &invocation.source {
         ToolCallSource::Direct => {
             read_tool_output_selectors_with_reuse(
@@ -125,10 +186,38 @@ async fn handle_read_tool_output(
         .turn_timing_state
         .record_tool_output_recovery(recovery_retruncation_count(&output));
 
+    let exact_recovery_receipt =
+        exact_code_mode_recovery_receipt(code_mode_recovery, &output, action_bounds_hash);
     let output = serde_json::to_value(output).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
-    Ok(boxed_tool_output(JsonToolOutput::new(output)))
+    let exact_recovery = exact_recovery_receipt.map(|receipt| (receipt, output.clone()));
+    Ok(boxed_tool_output(ReadToolOutputToolOutput {
+        inner: JsonToolOutput::new(output),
+        exact_recovery,
+    }))
+}
+
+fn exact_code_mode_recovery_receipt(
+    code_mode_recovery: bool,
+    output: &crate::tools::command_output_artifact::ReadToolOutputResult,
+    action_bounds_hash: String,
+) -> Option<TurnTimingDeterministicContinuationReceipt> {
+    (code_mode_recovery
+        && !output.results.is_empty()
+        && output
+            .results
+            .iter()
+            .all(|result| result.status == ToolOutputSelectorStatus::Ok && result.complete))
+    .then(|| TurnTimingDeterministicContinuationReceipt {
+        class: DeterministicContinuationClass::ArtifactRange,
+        wire_identity: String::new(),
+        resource_identity_hash: crate::tool_history::sha256(output.artifact_id.as_bytes()),
+        state_revision: output.canonical_sha256.clone(),
+        host_action: DeterministicContinuationHostAction::DrainArtifactRanges,
+        action_bounds_hash,
+        suppressed_continuation_count: 1,
+    })
 }
 
 fn recovery_retruncation_count(
@@ -298,6 +387,40 @@ mod tests {
         };
 
         assert_eq!(recovery_retruncation_count(&output), 2);
+    }
+
+    #[test]
+    fn exact_code_mode_recovery_is_carried_by_owner_receipt() {
+        let output = crate::tools::command_output_artifact::ReadToolOutputResult {
+            artifact_id: "01900000-0000-7000-8000-000000000000".to_string(),
+            canonical_sha256: "canonical-revision".to_string(),
+            canonical_bytes: 5,
+            retained_bytes: 5,
+            complete: true,
+            unavailable_ranges: Vec::new(),
+            results: vec![selector_result(ToolOutputSelectorStatus::Ok)],
+        };
+
+        let receipt =
+            exact_code_mode_recovery_receipt(true, &output, "selector-bounds".to_string())
+                .expect("exact nested recovery receipt");
+
+        assert_eq!(receipt.state_revision, "canonical-revision");
+        assert_eq!(receipt.action_bounds_hash, "selector-bounds");
+        assert_eq!(receipt.suppressed_continuation_count, 1);
+        assert!(
+            exact_code_mode_recovery_receipt(false, &output, "selector-bounds".to_string(),)
+                .is_none()
+        );
+
+        let incomplete = crate::tools::command_output_artifact::ReadToolOutputResult {
+            results: vec![selector_result(ToolOutputSelectorStatus::SelectorTooLarge)],
+            ..output
+        };
+        assert!(
+            exact_code_mode_recovery_receipt(true, &incomplete, "selector-bounds".to_string(),)
+                .is_none()
+        );
     }
 
     #[test]

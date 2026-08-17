@@ -6,7 +6,6 @@ use crate::tasks::SessionTaskContext;
 use crate::tasks::SessionTaskResult;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::GoalSurfaceState;
-use crate::tools::exposure::TaskToolPhase;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolRouter;
@@ -349,56 +348,6 @@ fn finalized_router_reuse_requires_identical_coarse_exposure_identity() {
 }
 
 #[test]
-fn durable_plan_status_derives_coarse_task_tool_phase() {
-    use codex_protocol::plan_tool::PlanItemArg;
-    use codex_protocol::plan_tool::StepStatus;
-    use codex_protocol::plan_tool::UpdatePlanArgs;
-
-    let plan_with = |statuses: &[StepStatus]| UpdatePlanArgs {
-        explanation: None,
-        plan: statuses
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, status)| PlanItemArg {
-                id: Some(format!("step-{index}")),
-                step: format!("step {index}"),
-                status,
-                ..PlanItemArg::default()
-            })
-            .collect(),
-    };
-
-    assert_eq!(task_tool_phase(None), TaskToolPhase::Discovery);
-    assert_eq!(
-        task_tool_phase(Some(&plan_with(&[]))),
-        TaskToolPhase::Discovery
-    );
-    assert_eq!(
-        task_tool_phase(Some(&plan_with(&[
-            StepStatus::Pending,
-            StepStatus::InProgress,
-        ]))),
-        TaskToolPhase::Implementation
-    );
-    assert_eq!(
-        task_tool_phase(Some(&plan_with(&[
-            StepStatus::Passed,
-            StepStatus::Implemented,
-        ]))),
-        TaskToolPhase::Validation
-    );
-    assert_eq!(
-        task_tool_phase(Some(&plan_with(&[
-            StepStatus::Passed,
-            StepStatus::Skipped,
-            StepStatus::Completed,
-        ]))),
-        TaskToolPhase::Completion
-    );
-}
-
-#[test]
 fn goal_surface_state_has_disabled_inactive_and_active_transitions() {
     let tool = |name, exposure| {
         Arc::new(ExposureOnlyTool { name, exposure })
@@ -424,7 +373,7 @@ fn goal_surface_state_has_disabled_inactive_and_active_transitions() {
 }
 
 #[test]
-fn agent_surface_stage_preserves_lifecycle_without_spawn_authorization() {
+fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
     assert_eq!(
         agent_surface_stage_from_snapshot(false, false, false),
         AgentSurfaceStage::Prohibited
@@ -438,19 +387,11 @@ fn agent_surface_stage_preserves_lifecycle_without_spawn_authorization() {
         AgentSurfaceStage::Lifecycle
     );
     assert_eq!(
-        agent_surface_stage_from_snapshot(false, true, false),
-        AgentSurfaceStage::Lifecycle
-    );
-    assert_eq!(
         agent_surface_stage_from_snapshot(true, false, true),
         AgentSurfaceStage::TypedAdministration
     );
     assert_eq!(
         agent_surface_stage_from_snapshot(true, true, true),
-        AgentSurfaceStage::TypedAdministration
-    );
-    assert_eq!(
-        agent_surface_stage_from_snapshot(false, false, true),
         AgentSurfaceStage::TypedAdministration
     );
 
@@ -1163,8 +1104,15 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() ->
         panic!("stable test inputs should produce a ready pending-turn plan");
     };
     assert!(
-        plan.pending_token_estimate
-            > estimate_pending_tokens(&input, &[], &[], plan.first_router.as_ref()),
+        plan.projected_prompt_pressure.total_tokens
+            > estimate_pending_tokens(
+                &input,
+                &[],
+                &[],
+                plan.first_router.as_ref(),
+                /*initial_context*/ true,
+            )
+            .total_tokens,
         "first-turn planning must account for full context before compaction"
     );
     assert!(plan.step_context.turn.apps_enabled());
@@ -1460,12 +1408,23 @@ fn pending_token_estimate_includes_model_visible_tool_schemas() {
         )],
     );
 
-    let baseline = estimate_pending_tokens(&[], &[], &[], &empty_router);
-    let with_schema = estimate_pending_tokens(&[], &[], &[], &schema_router);
+    let baseline =
+        estimate_pending_tokens(&[], &[], &[], &empty_router, /*initial_context*/ false);
+    let with_schema = estimate_pending_tokens(
+        &[],
+        &[],
+        &[],
+        &schema_router,
+        /*initial_context*/ false,
+    );
 
     assert!(
-        with_schema > baseline + 3_000,
+        with_schema.total_tokens > baseline.total_tokens + 3_000,
         "model-visible schema bytes must materially increase pre-turn context estimation"
+    );
+    assert_eq!(
+        with_schema.body_growth_tokens, baseline.body_growth_tokens,
+        "stable tool schemas must not count as body-after-prefix growth"
     );
 }
 
@@ -2026,4 +1985,22 @@ fn terminal_surface_preserves_owner_canonical_message_exactly() {
 
     let surfaced = authoritative_wait_terminal_surface(&decision).expect("typed surface");
     assert_eq!(surfaced.canonical_message.as_deref(), Some(canonical));
+}
+
+#[test]
+fn projected_prompt_pressure_does_not_add_stable_tools_to_server_usage_twice() {
+    assert_eq!(
+        projected_prompt_tokens_from_estimates(
+            /*active_context_tokens*/ 900, /*committed_history_tokens*/ 500,
+            /*pending_token_estimate*/ 450,
+        ),
+        950
+    );
+    assert_eq!(
+        projected_prompt_tokens_from_estimates(
+            /*active_context_tokens*/ 1_200, /*committed_history_tokens*/ 500,
+            /*pending_token_estimate*/ 450,
+        ),
+        1_200
+    );
 }

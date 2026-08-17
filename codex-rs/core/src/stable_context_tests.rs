@@ -12,6 +12,18 @@ fn text_message(role: &str, text: &str) -> ResponseItem {
     }
 }
 
+fn output_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
 fn visible_text(items: &[ResponseItem]) -> Vec<&str> {
     items
         .iter()
@@ -20,7 +32,9 @@ fn visible_text(items: &[ResponseItem]) -> Vec<&str> {
             _ => None,
         })
         .filter_map(|content| match content {
-            ContentItem::InputText { text } => Some(text.as_str()),
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect()
@@ -260,7 +274,7 @@ fn generic_preparation_target_retains_all_recognized_history() {
 }
 
 #[test]
-fn registered_fragment_projects_independently_from_unregistered_sibling() {
+fn mixed_registered_message_is_split_into_canonical_prefix_and_dynamic_history() {
     let old = repository("old");
     let current = repository("current");
     let mixed = ResponseItem::Message {
@@ -278,54 +292,49 @@ fn registered_fragment_projects_independently_from_unregistered_sibling() {
     let items: Arc<[ResponseItem]> = vec![mixed, text_message("user", &current)].into();
 
     let projection = project_stable_context(items, StableContextTarget::Sampling);
-    let rendered = serde_json::to_string(&projection.items).unwrap();
 
+    assert_eq!(
+        visible_text(&projection.items),
+        vec![current.as_str(), "unregistered material"]
+    );
     assert!(projection.manifest.projection_enabled());
     assert!(!projection.manifest.fail_open());
-    assert!(!rendered.contains("old"));
-    assert!(rendered.contains("unregistered material"));
-    assert!(rendered.contains("current"));
 }
 
 #[test]
-fn newly_registered_context_classes_replace_only_their_own_slot() {
-    let old_app = "<app-context>old app</app-context>";
-    let current_app = "<app-context>current app</app-context>";
-    let apps = "<apps_instructions>connector rules</apps_instructions>";
-    let environment = "<environment_context>workspace</environment_context>";
-    let plugins = "<recommended_plugins>catalog</recommended_plugins>";
+fn canonical_projection_places_volatile_context_after_reusable_history_prefix() {
+    let repository = repository("stable repository");
+    let collaboration = collaboration("stable collaboration");
+    let environment = "<environment_context>volatile environment</environment_context>";
+    let plugins = "<recommended_plugins>volatile catalog</recommended_plugins>";
     let projection = project_stable_context(
         vec![
-            text_message("developer", old_app),
-            text_message("developer", apps),
+            text_message("user", "prior user"),
+            output_message("prior answer"),
             text_message("user", environment),
+            text_message("developer", &collaboration),
             text_message("user", plugins),
-            text_message("developer", current_app),
+            text_message("user", &repository),
+            text_message("user", "current task"),
+            output_message("current tail"),
         ]
         .into(),
         StableContextTarget::Sampling,
     );
-    let rendered = serde_json::to_string(&projection.items).unwrap();
 
-    assert!(!rendered.contains("old app"));
-    assert!(rendered.contains("current app"));
-    assert!(rendered.contains("connector rules"));
-    assert!(rendered.contains("workspace"));
-    assert!(rendered.contains("catalog"));
-    for kind in [
-        StableContextKind::AppContext,
-        StableContextKind::DesktopApp,
-        StableContextKind::Environment,
-        StableContextKind::RecommendedPlugins,
-    ] {
-        assert!(
-            projection
-                .manifest
-                .components()
-                .iter()
-                .any(|component| component.kind == kind)
-        );
-    }
+    assert_eq!(
+        visible_text(&projection.items),
+        vec![
+            repository.as_str(),
+            collaboration.as_str(),
+            "prior user",
+            "prior answer",
+            environment,
+            plugins,
+            "current task",
+            "current tail",
+        ]
+    );
 }
 
 #[test]
@@ -393,4 +402,54 @@ fn repository_reconstruction_keeps_only_current_canonical_variant() {
     assert!(!visible.contains(&repository_a.as_str()));
     assert!(visible.contains(&repository_b.as_str()));
     assert!(visible.contains(&"dynamic history survives"));
+}
+
+#[test]
+fn runtime_context_variants_are_stable_and_replace_by_semantic_slot() {
+    let fragments = [
+        ("user", "<environment_context>old</environment_context>"),
+        ("user", "<recommended_plugins>old</recommended_plugins>"),
+        ("developer", "<app-context>old</app-context>"),
+        ("developer", "<model_switch>old</model_switch>"),
+        ("developer", "<personality_spec>old</personality_spec>"),
+        (
+            "developer",
+            "<realtime_conversation>old</realtime_conversation>",
+        ),
+        ("user", "<environment_context>current</environment_context>"),
+        ("user", "<recommended_plugins>current</recommended_plugins>"),
+        ("developer", "<app-context>current</app-context>"),
+        ("developer", "<model_switch>current</model_switch>"),
+        ("developer", "<personality_spec>current</personality_spec>"),
+        (
+            "developer",
+            "<realtime_conversation>current</realtime_conversation>",
+        ),
+    ];
+    let items = fragments
+        .into_iter()
+        .map(|(role, text)| text_message(role, text))
+        .collect::<Vec<_>>();
+
+    let first = project_stable_context(items.clone().into(), StableContextTarget::Sampling);
+    let second = project_stable_context(items.into(), StableContextTarget::Sampling);
+
+    assert_eq!(first.manifest.fingerprint(), second.manifest.fingerprint());
+    let visible = visible_text(&first.items);
+    assert!(visible.iter().all(|text| !text.contains("old")));
+    assert_eq!(visible.len(), 6);
+    for kind in [
+        StableContextKind::Environment,
+        StableContextKind::RecommendedPlugins,
+        StableContextKind::AppContext,
+        StableContextKind::ModelSwitch,
+        StableContextKind::Personality,
+        StableContextKind::Realtime,
+    ] {
+        assert!(first.manifest.components().iter().any(|component| {
+            component.kind == kind
+                && component.active
+                && component.disposition == StableContextDisposition::Replaced
+        }));
+    }
 }

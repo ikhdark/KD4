@@ -8,6 +8,8 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
+use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
@@ -72,6 +74,16 @@ impl ToolExecutor<ToolInvocation> for LoadSkillHandler {
                 ));
             };
             let args: LoadSkillArgs = parse_arguments(arguments)?;
+            if !args
+                .locator
+                .starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
+                || args.locator.len() == codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX.len()
+            {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "skill locator must use the advertised `{}` form",
+                    codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX
+                )));
+            }
             let snapshot = &invocation.turn.turn_skills.snapshot;
             let skill = snapshot
                 .resolve_catalog_locator(&args.locator)
@@ -234,18 +246,32 @@ impl ToolExecutor<ToolInvocation> for ReadSourceBatchHandler {
             let fs = environment.environment.get_filesystem();
             let cwd = environment.cwd().clone();
             let task_identity = invocation.session.thread_id.to_string();
-            let futures = args.reads.into_iter().map(|read| {
-                let fs = fs.clone();
-                let sandbox = sandbox.clone();
-                let cwd = cwd.clone();
-                let task_identity = task_identity.clone();
-                async move {
+            // Resolve the complete batch before starting any reads. A malformed
+            // path must reject the typed request atomically rather than racing
+            // otherwise valid reads in the same batch.
+            let resolved_reads = args
+                .reads
+                .into_iter()
+                .map(|read| {
+                    if read.path.trim().is_empty() {
+                        return Err(FunctionCallError::RespondToModel(
+                            "source read path must contain non-whitespace text".to_string(),
+                        ));
+                    }
                     let path_uri = cwd.join(&read.path).map_err(|err| {
                         FunctionCallError::RespondToModel(format!(
                             "unable to resolve source path `{}`: {err}",
                             read.path
                         ))
                     })?;
+                    Ok((read, path_uri))
+                })
+                .collect::<Result<Vec<_>, FunctionCallError>>()?;
+            let futures = resolved_reads.into_iter().map(|(read, path_uri)| {
+                let fs = fs.clone();
+                let sandbox = sandbox.clone();
+                let task_identity = task_identity.clone();
+                async move {
                     let text =
                         fs.read_file_text(&path_uri, Some(&sandbox))
                             .await
@@ -374,6 +400,10 @@ impl ToolExecutor<ToolInvocation> for ArchitectureSliceHandler {
                     "max_relationships must be between 1 and {MAX_ARCHITECTURE_RELATIONSHIPS}"
                 )));
             }
+            invocation
+                .turn
+                .turn_timing_state
+                .record_architecture_slice_attempt();
             let Some(environment) = resolve_tool_environment(
                 &invocation.step_context.environments,
                 args.environment_id.as_deref(),
@@ -406,12 +436,26 @@ impl ToolExecutor<ToolInvocation> for ArchitectureSliceHandler {
                         "unable to read architecture index `{index_path}`: {err}"
                     ))
                 })?;
+            invocation
+                .turn
+                .turn_timing_state
+                .record_architecture_source_read(u64::try_from(text.len()).unwrap_or(u64::MAX));
             let index: Value = serde_json::from_str(&text).map_err(|err| {
                 FunctionCallError::RespondToModel(format!(
                     "architecture index `{index_path}` is not valid JSON: {err}"
                 ))
             })?;
-            let slice = architecture_slice_from_index(
+            let current_revision =
+                codex_git_utils::get_head_commit_hash(&environment.cwd().to_path_buf())
+                    .await
+                    .map(|sha| sha.0);
+            let stale_snapshot = current_revision.as_deref().is_some_and(|current| {
+                index
+                    .get("repository_revision")
+                    .and_then(Value::as_str)
+                    .is_some_and(|indexed| indexed != current)
+            });
+            let mut slice = architecture_slice_from_index(
                 &index,
                 &args.owners,
                 args.max_relationships,
@@ -419,6 +463,10 @@ impl ToolExecutor<ToolInvocation> for ArchitectureSliceHandler {
                 text.len(),
             )
             .map_err(FunctionCallError::RespondToModel)?;
+            if let Value::Object(slice) = &mut slice {
+                slice.insert("stale_snapshot".to_string(), Value::Bool(stale_snapshot));
+            }
+            record_architecture_slice_timing(invocation.turn.turn_timing_state.as_ref(), &slice);
             Ok(boxed_tool_output(JsonToolOutput::new(slice)))
         })
     }
@@ -647,6 +695,77 @@ fn architecture_slice_from_index(
         }),
     );
     Ok(Value::Object(output))
+}
+
+fn record_architecture_slice_timing(timing: &crate::turn_timing::TurnTimingState, slice: &Value) {
+    let facts = architecture_slice_timing_facts(slice);
+    timing.record_architecture_slice_result(
+        facts.complete,
+        facts.relationships,
+        facts.invariants,
+        facts.missing_requirements,
+        facts.material_unknowns,
+        facts.stale_snapshot,
+        facts.late_relationship_discoveries,
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArchitectureSliceTimingFacts {
+    complete: bool,
+    relationships: u64,
+    invariants: u64,
+    missing_requirements: u64,
+    material_unknowns: u64,
+    stale_snapshot: bool,
+    late_relationship_discoveries: u64,
+}
+
+fn architecture_slice_timing_facts(slice: &Value) -> ArchitectureSliceTimingFacts {
+    let relationships = ARCHITECTURE_FACETS
+        .iter()
+        .filter_map(|facet| slice.get(*facet))
+        .filter_map(|facet| facet.get("relationships"))
+        .filter_map(Value::as_array)
+        .fold(0_u64, |total, relationships| {
+            total.saturating_add(u64::try_from(relationships.len()).unwrap_or(u64::MAX))
+        });
+    let invariants = slice
+        .pointer("/invariants/relationships")
+        .and_then(Value::as_array)
+        .map_or(0, |relationships| {
+            u64::try_from(relationships.len()).unwrap_or(u64::MAX)
+        });
+    let material_unknowns = slice
+        .get("material_unknowns")
+        .and_then(Value::as_array)
+        .map_or(0, |unknowns| {
+            u64::try_from(unknowns.len()).unwrap_or(u64::MAX)
+        });
+    let truncated = slice
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let stale_snapshot = slice
+        .get("stale_snapshot")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let missing_requirements = material_unknowns
+        .saturating_add(u64::from(truncated))
+        .saturating_add(u64::from(stale_snapshot));
+    let late_relationship_discoveries = slice
+        .pointer("/metrics/late_relationship_discoveries")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    ArchitectureSliceTimingFacts {
+        complete: !truncated && material_unknowns == 0 && !stale_snapshot,
+        relationships,
+        invariants,
+        missing_requirements,
+        material_unknowns,
+        stale_snapshot,
+        late_relationship_discoveries,
+    }
 }
 
 fn architecture_ranking_tokens(value: Option<&str>) -> BTreeSet<String> {
@@ -1037,13 +1156,17 @@ impl ToolExecutor<ToolInvocation> for CargoTestHandler {
 }
 
 fn normalized_tool_validation_failure(output: &Value, zero_tests_selected: bool) -> String {
+    if zero_tests_selected {
+        return "validation-failure-v1:zero-tests-selected".to_string();
+    }
     let serialized = serde_json::to_vec(output).unwrap_or_default();
-    crate::tools::command_execution::normalized_validation_failure_signature(
-        1,
-        zero_tests_selected,
-        &serialized,
-    )
-    .unwrap_or_default()
+    let normalized = String::from_utf8_lossy(&serialized)
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| if character == '\\' { '/' } else { character })
+        .collect::<String>();
+    let digest = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+    format!("validation-failure-v1:exit-1:{}", &digest[..24])
 }
 
 impl CoreToolRuntime for CargoTestHandler {}
@@ -1154,7 +1277,7 @@ impl ToolExecutor<ToolInvocation> for OrchestrationLintHandler {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: "lint_tool_calls".to_string(),
-            description: "Lint a proposed engineering tool-call sequence before execution. Every finding carries a stable finding id, durable source symbol handles, a semantic conclusion, and executable validation commands. Reports duplicate calls, avoidable shell wrapping, unscoped searches, serial polling, and reads that should be batched. Optional stable ids and depends_on edges produce dependency-safe execution waves for functions.exec Promise.all batching.".to_string(),
+            description: "Preflight a proposed engineering tool-call sequence before execution. Every finding carries a stable finding id, durable source symbol handles, a semantic conclusion, and executable validation commands. Reports duplicate calls, avoidable shell wrapping, unscoped searches, serial polling, and reads that should be batched. Optional stable ids and depends_on edges produce dependency-safe execution waves for typed follow-up calls.".to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(
@@ -1309,6 +1432,59 @@ fn lint_calls(
                 validation_commands,
             ));
         }
+        if let Some(locator) = call
+            .arguments
+            .get("locator")
+            .and_then(Value::as_str)
+            .filter(|_| call.tool == "load_skill")
+            && (!locator.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
+                || locator.len() == codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX.len())
+        {
+            findings.push(lint_finding(
+                "invalid_skill_locator",
+                Some(index),
+                None,
+                "Use the opaque skill: locator advertised in the active skill catalog.",
+                symbol_handles,
+                validation_commands,
+            ));
+        }
+        if call.tool == "read_source_batch"
+            && call
+                .arguments
+                .get("reads")
+                .and_then(Value::as_array)
+                .is_none_or(|reads| {
+                    reads.is_empty()
+                        || reads.iter().any(|read| {
+                            read.get("path")
+                                .and_then(Value::as_str)
+                                .is_none_or(|path| path.trim().is_empty() || path.contains('\0'))
+                        })
+                })
+        {
+            findings.push(lint_finding(
+                "invalid_source_path",
+                Some(index),
+                None,
+                "Every source read requires a non-empty path without NUL bytes.",
+                symbol_handles,
+                validation_commands,
+            ));
+        }
+        if matches!(call.tool.as_str(), "exec_command" | "shell_command") {
+            match lint_command_policy(call) {
+                Ok(()) => {}
+                Err(message) => findings.push(lint_finding(
+                    "command_policy_rejection",
+                    Some(index),
+                    None,
+                    &message,
+                    symbol_handles,
+                    validation_commands,
+                )),
+            }
+        }
         if call.tool == "exec_command"
             && call.arguments.get("kind").and_then(Value::as_str) != Some("argv")
             && (call.arguments.get("program").is_some()
@@ -1379,6 +1555,55 @@ fn lint_calls(
         ));
     }
     findings
+}
+
+fn lint_command_policy(call: &LintCall) -> Result<(), String> {
+    let command_field = if call.tool == "shell_command" {
+        "command"
+    } else {
+        "cmd"
+    };
+    let invocation = CommandInvocation::from_parts(
+        &call.tool,
+        command_field,
+        call.arguments.get(command_field).and_then(Value::as_str),
+        call.arguments.get("kind").and_then(Value::as_str),
+        call.arguments.get("program").and_then(Value::as_str),
+        call.arguments
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .map(|arg| {
+                        arg.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| "command args must contain only strings".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .as_deref(),
+        call.arguments.get("script_body").and_then(Value::as_str),
+    )
+    .map_err(|err| err.to_string())?;
+    let (command, shell_type) = match &invocation {
+        CommandInvocation::Argv { .. } => (
+            invocation
+                .to_direct_argv()
+                .ok_or_else(|| "structured command must include a program".to_string())?,
+            None,
+        ),
+        CommandInvocation::PowerShellScript(script) => (
+            vec![
+                "powershell".to_string(),
+                "-Command".to_string(),
+                script.clone(),
+            ],
+            Some(crate::shell::ShellType::PowerShell),
+        ),
+        CommandInvocation::Script(_) => return Ok(()),
+    };
+    preflight_invocation_with_equivalent_repair(&invocation, &command, shell_type).map(|_| ())
 }
 
 fn lint_finding(
@@ -1582,6 +1807,11 @@ mod tests {
         assert_eq!(slice["configuration_and_gates"]["status"], "not_applicable");
         assert_eq!(slice["material_unknowns"], json!([]));
         assert_eq!(slice["truncated"], false);
+        let facts = architecture_slice_timing_facts(&slice);
+        assert!(facts.complete);
+        assert!(facts.relationships >= 4);
+        assert_eq!(facts.invariants, 1);
+        assert_eq!(facts.missing_requirements, 0);
     }
 
     #[test]
@@ -1611,6 +1841,9 @@ mod tests {
             .expect("bounded architecture slice");
         assert_eq!(slice["omitted_relationships"], 1);
         assert_eq!(slice["truncated"], true);
+        let facts = architecture_slice_timing_facts(&slice);
+        assert!(!facts.complete);
+        assert!(facts.missing_requirements > 0);
     }
 
     #[test]
@@ -1767,5 +2000,50 @@ mod tests {
                 vec!["validate".to_string()]
             ]
         );
+    }
+
+    #[test]
+    fn typed_preflight_checks_paths_skill_locators_and_command_policy() {
+        let calls = vec![
+            LintCall {
+                id: None,
+                tool: "load_skill".into(),
+                arguments: json!({"locator":"C:/skills/example/SKILL.md"}),
+                depends_on: Vec::new(),
+            },
+            LintCall {
+                id: None,
+                tool: "read_source_batch".into(),
+                arguments: json!({"reads":[{"path":"   "}]}),
+                depends_on: Vec::new(),
+            },
+            LintCall {
+                id: None,
+                tool: "exec_command".into(),
+                arguments: json!({
+                    "kind":"argv",
+                    "program":"Get-Content",
+                    "args":["-LiteralPath", "src/lib.rs"]
+                }),
+                depends_on: Vec::new(),
+            },
+        ];
+        let symbol_handles = vec![AuditSymbolHandle {
+            path: "src/tools.rs".into(),
+            symbol: "ToolRouter::dispatch".into(),
+        }];
+        let validation_commands = vec![vec!["cargo".into(), "test".into(), "focused".into()]];
+        let findings = lint_calls(&calls, &symbol_handles, &validation_commands);
+
+        for kind in [
+            "invalid_skill_locator",
+            "invalid_source_path",
+            "command_policy_rejection",
+        ] {
+            assert!(
+                findings.iter().any(|finding| finding["kind"] == kind),
+                "missing {kind}: {findings:?}"
+            );
+        }
     }
 }

@@ -641,6 +641,27 @@ fn serialize_function_output_bounds_large_read_inside_text_field() {
 }
 
 #[test]
+fn mcp_resource_wrapper_keeps_canonical_cursor_in_projection_metadata() {
+    let canonical = serde_json::json!({
+        "server": "hosted",
+        "resources": [{"uri": "resource://one"}],
+        "nextCursor": "opaque-provider-cursor",
+    });
+    let output = McpResourceToolOutput {
+        visible: FunctionToolOutput::from_text("bounded page".to_string(), Some(true)),
+        canonical,
+    };
+
+    let metadata = output.projection_metadata().expect("projection metadata");
+
+    assert_eq!(
+        metadata.essential_inline["nextCursor"],
+        "opaque-provider-cursor"
+    );
+    assert!(metadata.essential_inline.get("resources").is_none());
+}
+
+#[test]
 fn oversized_blob_is_replaced_by_explicit_bounded_metadata() {
     let truncation_policy = TruncationPolicy::Bytes(512);
     let payload = ReadResourcePayload::new(

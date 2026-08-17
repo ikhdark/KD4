@@ -117,14 +117,7 @@ impl ApplyPatchRuntime {
                 return Ok(());
             }
         };
-        let repo_root = ctx
-            .turn
-            .turn_metadata_state
-            .git_metadata_source()
-            .filter(|source| cwd.as_path() == source.cwd().as_path())
-            .map(|source| source.repo_root().to_path_buf())
-            .or_else(|| get_git_repo_root(&cwd))
-            .unwrap_or(cwd);
+        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
         let repo_paths = req
             .file_paths
             .iter()
@@ -374,8 +367,9 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let result = codex_apply_patch::apply_verified_action(
-            &req.action,
+        let result = codex_apply_patch::apply_patch(
+            &req.action.patch,
+            &req.action.cwd,
             &mut stdout,
             &mut stderr,
             fs.as_ref(),

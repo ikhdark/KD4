@@ -167,10 +167,11 @@ pub enum ModelAttemptTransport {
     ResponsesWebsocket,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ModelAttemptProviderBaseline {
     ExactPrefixInherited,
     FreshFullReplay,
+    #[default]
     StatelessFull,
     FailOpenStaleRetained,
 }
@@ -234,6 +235,7 @@ pub struct ModelAttemptTelemetry {
     pub outcome: ModelAttemptOutcome,
     pub request_kind: ModelAttemptRequestKind,
     pub transport: ModelAttemptTransport,
+    pub connection_reused: Option<bool>,
     pub baseline_generation: Option<u64>,
     pub provider_baseline: ModelAttemptProviderBaseline,
     pub previous_response_id_present: bool,
@@ -256,18 +258,35 @@ pub struct ModelAttemptTelemetry {
     pub envelope_overhead_bytes: u64,
     pub reconciliation_residual_bytes: i64,
     pub prompt_context_categories: Vec<ModelPromptContextCategoryTelemetry>,
+    pub full_prompt_estimated_tokens: u64,
     pub fixed_prefix_reuse_eligible: bool,
     pub logical_context_tokens: i64,
     pub active_component_bytes: u64,
     pub local_constructed_bytes: u64,
     pub local_reused_bytes: u64,
     pub local_component_reuse_count: u64,
+    pub request_construction_us: u64,
+    pub queue_us: u64,
+    pub connection_setup_us: u64,
+    pub transport_us: Option<u64>,
     pub dispatch_ready_us: u64,
     pub stream_established_us: Option<u64>,
     pub first_provider_event_us: Option<u64>,
     pub first_model_output_us: Option<u64>,
     pub first_visible_output_us: Option<u64>,
     pub completed_us: u64,
+}
+
+fn signed_u64_difference(lhs: u64, rhs: u64) -> i64 {
+    i128::from(lhs)
+        .saturating_sub(i128::from(rhs))
+        .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn signed_i64_u64_difference(lhs: i64, rhs: u64) -> i64 {
+    i128::from(lhs)
+        .saturating_sub(i128::from(rhs))
+        .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// Accept only short normalized telemetry identifiers. URL/path delimiters and whitespace are
@@ -1127,6 +1146,19 @@ impl SessionTelemetry {
     pub fn model_attempt_completed(&self, record: &ModelAttemptTelemetry) {
         let prompt_context_categories = serde_json::to_string(&record.prompt_context_categories)
             .unwrap_or_else(|_| "[]".to_string());
+        let prompt_category_estimated_tokens = record
+            .prompt_context_categories
+            .iter()
+            .fold(0_u64, |total, category| {
+                total.saturating_add(category.approx_tokens)
+            });
+        let local_prompt_reconciliation_residual = signed_u64_difference(
+            record.full_prompt_estimated_tokens,
+            prompt_category_estimated_tokens,
+        );
+        let provider_prompt_reconciliation_residual = record.input_tokens.map(|input_tokens| {
+            signed_i64_u64_difference(input_tokens, prompt_category_estimated_tokens)
+        });
         let provider = self
             .metadata
             .service_name
@@ -1149,6 +1181,7 @@ impl SessionTelemetry {
                 outcome = record.outcome.as_str(),
                 request_kind = record.request_kind.as_str(),
                 transport = record.transport.as_str(),
+                connection_reused = record.connection_reused,
                 baseline_generation = record.baseline_generation,
                 provider_baseline = record.provider_baseline.as_str(),
                 previous_response_id_present = record.previous_response_id_present,
@@ -1173,13 +1206,22 @@ impl SessionTelemetry {
                 other_injected_context_bytes = record.other_injected_context_bytes,
                 envelope_overhead_bytes = record.envelope_overhead_bytes,
                 reconciliation_residual_bytes = record.reconciliation_residual_bytes,
+                prompt_token_accounting_basis = "full_logical_prompt",
                 prompt_context_categories = %prompt_context_categories,
+                prompt_category_estimated_tokens = prompt_category_estimated_tokens,
+                full_prompt_estimated_tokens = record.full_prompt_estimated_tokens,
+                local_prompt_reconciliation_residual = local_prompt_reconciliation_residual,
+                provider_prompt_reconciliation_residual = provider_prompt_reconciliation_residual,
                 fixed_prefix_reuse_eligible = record.fixed_prefix_reuse_eligible,
                 logical_context_tokens = record.logical_context_tokens,
                 active_component_bytes = record.active_component_bytes,
                 local_constructed_bytes = record.local_constructed_bytes,
                 local_reused_bytes = record.local_reused_bytes,
                 local_component_reuse_count = record.local_component_reuse_count,
+                request_construction_us = record.request_construction_us,
+                queue_us = record.queue_us,
+                connection_setup_us = record.connection_setup_us,
+                transport_us = record.transport_us,
                 dispatch_ready_us = record.dispatch_ready_us,
                 stream_established_us = record.stream_established_us,
                 first_provider_event_us = record.first_provider_event_us,

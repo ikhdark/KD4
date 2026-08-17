@@ -49,36 +49,33 @@ use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::prelude::*;
-use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
 
 use codex_model_provider_info::ModelProviderInfo;
 
 pub use codex_prompts::COMPACTION_BASE_INSTRUCTIONS;
+pub use codex_prompts::INCREMENTAL_SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 4_000;
 const COMPACT_TASK_STATE_MAX_TOKENS: usize = 4_000;
+const COMPACT_INCREMENTAL_UPDATE_MAX_TOKENS: usize = 1_000;
 pub(crate) const MAX_RETAINED_USER_IMAGES: usize = 8;
 pub(crate) const MAX_RETAINED_USER_IMAGE_BYTES: usize =
     MAX_PROMPT_IMAGE_SOURCE_BYTES / 3 * 4 + 4096;
 pub(crate) const COMPACT_IMAGE_OMISSION_MARKER: &str =
     "[codex-local-compaction omitted user images: limits exceeded]";
-const RETAINED_USER_TURN_PROVENANCE_MAX_RECORDS: usize = 24;
-const RETAINED_USER_TURN_PROVENANCE_MAX_TOKENS: usize = 750;
 
 /// Controls whether compaction replacement history must include initial context.
 ///
-/// Pre-turn/manual compaction variants use `DoNotInject`: they replace history with a summary and
-/// clear `reference_context_item`, so the next regular turn will fully reinject initial context
-/// after compaction.
+/// Pre-turn/manual compaction variants use `AtStart` so the next request retains the same
+/// cacheable initial-context prefix instead of appending a fresh copy after the summary.
 ///
-/// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
-/// compaction summary as the last item in history after mid-turn compaction; we therefore inject
-/// initial context into the replacement history just above the last real user message.
+/// `BeforeLastUserMessage` remains available for compatibility with replacement histories whose
+/// ordering contract requires it. `AtStart` also keeps the summary or compaction item last while
+/// preserving the stable prompt prefix.
 #[derive(Debug)]
 pub(crate) enum InitialContextInjection {
+    AtStart(Arc<WorldState>),
     BeforeLastUserMessage(Arc<WorldState>),
     DoNotInject,
 }
@@ -90,7 +87,8 @@ pub(crate) async fn build_compaction_initial_context(
 ) -> (Vec<ResponseItem>, Option<WorldStateSnapshot>) {
     // Return the rendered state with its items so history and its baseline stay identical.
     match initial_context_injection {
-        InitialContextInjection::BeforeLastUserMessage(world_state) => {
+        InitialContextInjection::AtStart(world_state)
+        | InitialContextInjection::BeforeLastUserMessage(world_state) => {
             let (items, delivered_snapshot) = sess
                 .build_initial_context_with_world_state_and_snapshot(
                     turn_context,
@@ -152,11 +150,13 @@ pub(crate) async fn run_compact_task(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, start_event).await;
+    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
+    let world_state = Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await);
     run_compact_task_inner(
         sess.clone(),
         turn_context,
         input,
-        InitialContextInjection::DoNotInject,
+        InitialContextInjection::AtStart(world_state),
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
@@ -239,16 +239,22 @@ async fn run_compact_task_inner(
 async fn run_compact_task_inner_impl(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-    input: Vec<UserInput>,
+    mut input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
-    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
-
     let mut history = sess.clone_history().await;
+    let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
+    if previous_summary.is_some() {
+        input.push(UserInput::Text {
+            text: INCREMENTAL_SUMMARIZATION_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        });
+    }
+    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.model_info.truncation_policy.into(),
@@ -335,13 +341,7 @@ async fn run_compact_task_inner_impl(
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.raw_items();
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
-    let decision_ledger = sess
-        .services
-        .task_evidence
-        .retained_decision_ledger_payload()
-        .await;
-    let summary_text =
-        bounded_task_state_summary_with_ledger(&summary_suffix, decision_ledger.as_deref());
+    let summary_text = bounded_task_state_summary(previous_summary.as_deref(), &summary_suffix);
     let compactable_history = strip_compaction_startup_envelopes(history_items.to_vec());
     let user_messages = collect_user_messages(&compactable_history);
 
@@ -360,12 +360,15 @@ async fn run_compact_task_inner_impl(
     )
     .await;
     if !initial_context.is_empty() {
-        new_history =
-            insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
+        new_history = insert_compaction_initial_context(
+            new_history,
+            initial_context,
+            &initial_context_injection,
+        );
     }
-    let reference_context_item = match initial_context_injection {
+    let reference_context_item = match &initial_context_injection {
         InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::BeforeLastUserMessage(_) => {
+        InitialContextInjection::AtStart(_) | InitialContextInjection::BeforeLastUserMessage(_) => {
             Some(turn_context.to_turn_context_item())
         }
     };
@@ -421,35 +424,26 @@ pub(crate) fn strip_compaction_startup_envelopes(items: Vec<ResponseItem>) -> Ve
         .collect()
 }
 
-#[cfg(test)]
-fn bounded_task_state_summary(summary_suffix: &str) -> String {
-    bounded_task_state_summary_with_ledger(summary_suffix, None)
-}
-
-fn bounded_task_state_summary_with_ledger(
-    summary_suffix: &str,
-    decision_ledger: Option<&str>,
-) -> String {
-    let ledger = decision_ledger
-        .map(|ledger| format!("\n<kd4_decision_ledger_v1>\n{ledger}\n</kd4_decision_ledger_v1>"));
-    let summary_budget = COMPACT_TASK_STATE_MAX_TOKENS.saturating_sub(
-        ledger
-            .as_deref()
-            .map(approx_token_count)
-            .unwrap_or_default(),
-    );
-    let summary = truncate_text_to_token_ceiling(
-        &format!("{SUMMARY_PREFIX}\n{summary_suffix}"),
-        summary_budget,
-    );
-    let Some(ledger) = ledger else {
-        return summary;
+fn bounded_task_state_summary(previous_summary: Option<&str>, summary_suffix: &str) -> String {
+    let summary_suffix = summary_suffix.trim();
+    let summary = match (previous_summary, summary_suffix.is_empty()) {
+        (Some(previous_summary), true) => previous_summary.to_string(),
+        (Some(previous_summary), false) => {
+            let update = truncate_text_to_token_ceiling(
+                &format!("\n\nIncremental update:\n{summary_suffix}"),
+                COMPACT_INCREMENTAL_UPDATE_MAX_TOKENS,
+            );
+            let previous_budget =
+                COMPACT_TASK_STATE_MAX_TOKENS.saturating_sub(approx_token_count(&update));
+            format!(
+                "{}{}",
+                truncate_text_to_token_ceiling(previous_summary, previous_budget),
+                update
+            )
+        }
+        (None, _) => format!("{SUMMARY_PREFIX}\n{summary_suffix}"),
     };
-    // The structured ledger is the durable mutation/proof contract. Narrative yields its budget
-    // first; raw text truncation here could otherwise leave invalid JSON and silently drop the
-    // tail of a proof contract. An unusually large ledger may exceed the narrative budget, but it
-    // remains complete and can still be parsed after compaction.
-    format!("{summary}{ledger}")
+    truncate_text_to_token_ceiling(&summary, COMPACT_TASK_STATE_MAX_TOKENS)
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
@@ -570,8 +564,6 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
 pub(crate) struct CompactedUserMessage {
     content: Vec<UserInput>,
     internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
-    turn_id: Option<String>,
-    source_sha256: String,
 }
 
 pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUserMessage> {
@@ -595,8 +587,6 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
                     content,
                     internal_chat_message_metadata_passthrough:
                         internal_chat_message_metadata_passthrough.clone(),
-                    turn_id: item.turn_id().map(str::to_string),
-                    source_sha256: response_item_sha256(item),
                 })
             }
             _ => None,
@@ -606,6 +596,38 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
+}
+
+fn latest_summary_message(items: &[ResponseItem]) -> Option<&str> {
+    items.iter().rev().find_map(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "user" => {
+            content.iter().find_map(|item| match item {
+                ContentItem::InputText { text } if is_summary_message(text) => Some(text.as_str()),
+                _ => None,
+            })
+        }
+        _ => None,
+    })
+}
+
+pub(crate) fn insert_compaction_initial_context(
+    compacted_history: Vec<ResponseItem>,
+    mut initial_context: Vec<ResponseItem>,
+    initial_context_injection: &InitialContextInjection,
+) -> Vec<ResponseItem> {
+    match initial_context_injection {
+        InitialContextInjection::AtStart(_) => {
+            initial_context.extend(compacted_history);
+            initial_context
+        }
+        InitialContextInjection::BeforeLastUserMessage(_) => {
+            insert_initial_context_before_last_real_user_or_summary(
+                compacted_history,
+                initial_context,
+            )
+        }
+        InitialContextInjection::DoNotInject => compacted_history,
+    }
 }
 
 /// Inserts canonical initial context into compacted replacement history at the
@@ -752,8 +774,6 @@ fn build_compacted_history_with_limits(
                 internal_chat_message_metadata_passthrough: message
                     .internal_chat_message_metadata_passthrough
                     .clone(),
-                turn_id: message.turn_id.clone(),
-                source_sha256: message.source_sha256.clone(),
             });
         }
     }
@@ -788,17 +808,10 @@ fn build_compacted_history_with_limits(
     } else {
         summary_text.to_string()
     };
-    remove_retained_user_overlap(&mut summary_text, &selected_messages);
-    let mut summary_suffix = String::new();
     if omitted_images {
-        summary_suffix.push_str("\n\n");
-        summary_suffix.push_str(COMPACT_IMAGE_OMISSION_MARKER);
+        summary_text.push_str("\n\n");
+        summary_text.push_str(COMPACT_IMAGE_OMISSION_MARKER);
     }
-    if let Some(provenance) = retained_user_turn_provenance(&selected_messages) {
-        summary_suffix.push_str("\n\n");
-        summary_suffix.push_str(&provenance);
-    }
-    summary_text = bounded_compaction_summary_with_suffix(summary_text, &summary_suffix);
 
     history.push(ResponseItem::Message {
         id: None,
@@ -809,99 +822,6 @@ fn build_compacted_history_with_limits(
     });
 
     history
-}
-
-#[derive(Serialize)]
-struct RetainedUserTurnRecord<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    turn_id: Option<&'a str>,
-    source_sha256: &'a str,
-}
-
-fn response_item_sha256(item: &ResponseItem) -> String {
-    let bytes = serde_json::to_vec(item).unwrap_or_default();
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn remove_retained_user_overlap(summary_text: &mut String, retained: &[CompactedUserMessage]) {
-    let ledger_start = summary_text.find("\n<kd4_decision_ledger_v1>");
-    let mut narrative = ledger_start
-        .map(|index| summary_text[..index].to_string())
-        .unwrap_or_else(|| summary_text.clone());
-    for message in retained {
-        for text in message.content.iter().filter_map(|item| match item {
-            UserInput::Text { text, .. } if !text.is_empty() => Some(text),
-            _ => None,
-        }) {
-            if narrative.contains(text) {
-                let short_hash = message
-                    .source_sha256
-                    .get(..16)
-                    .unwrap_or(&message.source_sha256);
-                narrative = narrative.replace(
-                    text,
-                    &format!("<retained_user_turn_ref source_sha256=\"{short_hash}\" />"),
-                );
-            }
-        }
-    }
-    if let Some(index) = ledger_start {
-        narrative.push_str(&summary_text[index..]);
-    }
-    *summary_text = narrative;
-}
-
-fn retained_user_turn_provenance(retained: &[CompactedUserMessage]) -> Option<String> {
-    if retained.is_empty() {
-        return None;
-    }
-    let first_start = retained
-        .len()
-        .saturating_sub(RETAINED_USER_TURN_PROVENANCE_MAX_RECORDS);
-    for start in first_start..retained.len() {
-        let records = retained[start..]
-            .iter()
-            .map(|message| RetainedUserTurnRecord {
-                turn_id: message.turn_id.as_deref(),
-                source_sha256: &message.source_sha256,
-            })
-            .collect::<Vec<_>>();
-        let payload = serde_json::to_string(&records).ok()?;
-        let rendered =
-            format!("<retained_user_turns version=\"1\">{payload}</retained_user_turns>");
-        if approx_token_count(&rendered) <= RETAINED_USER_TURN_PROVENANCE_MAX_TOKENS {
-            return Some(rendered);
-        }
-    }
-    let latest = retained.last()?;
-    let payload = serde_json::to_string(&[RetainedUserTurnRecord {
-        turn_id: None,
-        source_sha256: &latest.source_sha256,
-    }])
-    .ok()?;
-    Some(format!(
-        "<retained_user_turns version=\"1\">{payload}</retained_user_turns>"
-    ))
-}
-
-fn bounded_compaction_summary_with_suffix(summary: String, suffix: &str) -> String {
-    let suffix_tokens = approx_token_count(suffix);
-    let summary_budget = COMPACT_TASK_STATE_MAX_TOKENS.saturating_sub(suffix_tokens);
-    let Some(ledger_start) = summary.find("\n<kd4_decision_ledger_v1>") else {
-        return format!(
-            "{}{}",
-            truncate_text_to_token_ceiling(&summary, summary_budget),
-            suffix
-        );
-    };
-    let ledger = &summary[ledger_start..];
-    let narrative_budget = summary_budget.saturating_sub(approx_token_count(ledger));
-    format!(
-        "{}{}{}",
-        truncate_text_to_token_ceiling(&summary[..ledger_start], narrative_budget),
-        ledger,
-        suffix
-    )
 }
 
 async fn drain_to_completed(

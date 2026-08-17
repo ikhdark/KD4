@@ -214,11 +214,7 @@ async fn stable_refresh_reuses_loaded_arc_and_semantic_digest() {
     let root = tempfile::tempdir().expect("workspace");
     fs::write(root.path().join("AGENTS.md"), "stable instructions").expect("write AGENTS.md");
     let config = config_for(&root).await;
-    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
-    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
-        filesystem.clone(),
-    ));
-    let environments = environment_snapshot_with_environment(&config.cwd, 3, environment);
+    let environments = environment_snapshot(&config.cwd, 3);
     let manager = AgentsMdManager::new(/*user_instructions*/ None);
 
     manager.refresh(&config, &environments).await;
@@ -227,7 +223,6 @@ async fn stable_refresh_reuses_loaded_arc_and_semantic_digest() {
     let second = manager.get_loaded().await.expect("cached load");
 
     assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(filesystem.target_stream_calls(), 1);
     let expected_digest: [u8; 32] = Sha256::digest(first.text().as_bytes()).into();
     assert_eq!(first.semantic_digest(), expected_digest);
 }
@@ -366,19 +361,17 @@ async fn same_key_read_failure_retains_last_successful_instructions_and_recovers
 
     manager.refresh(&config, &environments).await;
     let first = manager.get_loaded().await.expect("first load");
-    fs::write(&agents_path, "version that cannot be read")
-        .expect("write unreadable AGENTS.md version");
     filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
     manager.refresh(&config, &environments).await;
     let retained = manager.get_loaded().await.expect("retained load");
     assert!(Arc::ptr_eq(&first, &retained));
     assert_eq!(retained.text(), "version one");
 
-    fs::write(&agents_path, "version two recovered").expect("write recovered AGENTS.md");
+    fs::write(&agents_path, "version two").expect("write recovered AGENTS.md");
     manager.refresh(&config, &environments).await;
     let recovered = manager.get_loaded().await.expect("recovered load");
     assert!(!Arc::ptr_eq(&retained, &recovered));
-    assert_eq!(recovered.text(), "version two recovered");
+    assert_eq!(recovered.text(), "version two");
 }
 
 #[tokio::test]
@@ -393,11 +386,11 @@ async fn content_and_missing_higher_precedence_file_invalidate_cache() {
 
     manager.refresh(&config, &environments).await;
     let first = manager.get_loaded().await.expect("first load");
-    fs::write(&agents, "version two expanded").expect("replace contents");
+    fs::write(&agents, "version two").expect("replace same-size contents");
     manager.refresh(&config, &environments).await;
     let changed = manager.get_loaded().await.expect("changed load");
     assert!(!Arc::ptr_eq(&first, &changed));
-    assert_eq!(changed.text(), "version two expanded");
+    assert_eq!(changed.text(), "version two");
     assert_ne!(first.semantic_digest(), changed.semantic_digest());
 
     fs::write(&override_path, "local override").expect("create override");

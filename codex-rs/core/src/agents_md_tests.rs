@@ -323,7 +323,7 @@ async fn agents_md_paths(config: &TestConfig) -> std::io::Result<Vec<PathUri>> {
         LOCAL_FS.as_ref(),
     )
     .await?;
-    Ok(project_doc_paths(candidates.candidates))
+    Ok(project_doc_paths(candidates))
 }
 
 fn project_doc_paths(candidates: Vec<ProjectDocCandidate>) -> Vec<PathUri> {
@@ -1043,7 +1043,7 @@ async fn marker_search_does_not_wait_for_a_higher_ancestor() {
     .await
     .expect("nearest marker should complete")
     .expect("AGENTS.md discovery");
-    let paths = project_doc_paths(paths.candidates);
+    let paths = project_doc_paths(paths);
 
     assert_eq!(
         paths,
@@ -1111,7 +1111,7 @@ async fn project_root_marker_search_pipelines_bounded_window_and_continues() {
         .expect("marker search should complete")
         .expect("marker search task")
         .expect("AGENTS.md discovery");
-    let paths = project_doc_paths(paths.candidates);
+    let paths = project_doc_paths(paths);
 
     assert_eq!(
         paths,
@@ -1148,7 +1148,7 @@ async fn empty_project_root_markers_only_probe_cwd_candidates() {
     let paths = super::agents_md_paths(&config.config, &cwd, &fs)
         .await
         .expect("AGENTS.md discovery");
-    let paths = project_doc_paths(paths.candidates);
+    let paths = project_doc_paths(paths);
 
     let override_path = cwd.join(LOCAL_AGENTS_MD_FILENAME).expect("override path");
     let agents_path = cwd.join(DEFAULT_AGENTS_MD_FILENAME).expect("agents path");
@@ -1450,9 +1450,15 @@ async fn project_doc_byte_limit_is_shared_across_environments() {
     let secondary_notice = project_doc_truncation_notice(
         &PathUri::from_abs_path(&secondary_doc_path.abs()),
         secondary_doc.len() as u64,
-        /*retained_bytes*/ 3,
+        /*retained_bytes*/ 0,
     );
-    let limit = primary_doc.len() + 3;
+    let secondary_budget = secondary_notice.len() + 16;
+    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
+    let secondary_label = format!(
+        "\n\nfor `secondary` with root {}\n\n",
+        secondary.path().display()
+    );
+    let limit = primary_label.len() + primary_doc.len() + secondary_label.len() + secondary_budget;
     let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
@@ -1466,11 +1472,13 @@ async fn project_doc_byte_limit_is_shared_across_environments() {
         .expect("instructions expected");
     assert_eq!(loaded.entries.len(), 2);
     assert_eq!(loaded.entries[0].contents, primary_doc);
-    assert_eq!(
-        loaded.entries[1].contents,
-        format!("VVV\n\n{secondary_notice}")
+    assert!(loaded.entries[1].contents.len() <= secondary_budget);
+    assert!(
+        loaded.entries[1]
+            .contents
+            .contains("Project documentation truncation notice")
     );
-    assert!(loaded.text().len() > limit);
+    assert!(loaded.text().len() <= limit);
 }
 
 #[tokio::test]
@@ -1481,7 +1489,8 @@ async fn aggregate_project_doc_limit_prefers_environment_selection_order() {
     let secondary_doc = "S".repeat(32);
     fs::write(primary.path().join("AGENTS.md"), &primary_doc).unwrap();
     fs::write(secondary.path().join("AGENTS.md"), &secondary_doc).unwrap();
-    let limit = primary_doc.len();
+    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
+    let limit = primary_label.len() + primary_doc.len();
     let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
@@ -1496,14 +1505,10 @@ async fn aggregate_project_doc_limit_prefers_environment_selection_order() {
     .await
     .loaded
     .expect("instructions expected");
-    assert_eq!(loaded.entries.len(), 2);
+    assert_eq!(loaded.entries.len(), 1);
     assert_eq!(loaded.entries[0].contents, primary_doc);
     assert!(!loaded.text().contains(&secondary_doc));
-    assert!(
-        loaded.entries[1]
-            .contents
-            .contains("retained byte count: 0; omitted byte count: 32")
-    );
+    assert!(loaded.text().len() <= limit);
 }
 
 #[tokio::test]
@@ -1518,9 +1523,15 @@ async fn aggregate_budget_keeps_a_truncated_secondary_doc_utf8_valid() {
     let secondary_notice = project_doc_truncation_notice(
         &PathUri::from_abs_path(&secondary_doc_path.abs()),
         secondary_doc.len() as u64,
-        /*retained_bytes*/ 4,
+        /*retained_bytes*/ 0,
     );
-    let limit = primary_doc.len() + 5;
+    let secondary_budget = secondary_notice.len() + 16;
+    let primary_label = format!("for `primary` with root {}\n\n", primary.path().display());
+    let secondary_label = format!(
+        "\n\nfor `secondary` with root {}\n\n",
+        secondary.path().display()
+    );
+    let limit = primary_label.len() + primary_doc.len() + secondary_label.len() + secondary_budget;
     let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
@@ -1537,12 +1548,14 @@ async fn aggregate_budget_keeps_a_truncated_secondary_doc_utf8_valid() {
     .expect("instructions expected");
     assert_eq!(loaded.entries.len(), 2);
     assert_eq!(loaded.entries[0].contents, primary_doc);
-    assert_eq!(
-        loaded.entries[1].contents,
-        format!("🦀\n\n{secondary_notice}")
+    assert!(loaded.entries[1].contents.len() <= secondary_budget);
+    assert!(
+        loaded.entries[1]
+            .contents
+            .contains("Project documentation truncation notice")
     );
     assert!(!loaded.entries[1].contents.contains('\u{FFFD}'));
-    assert!(loaded.text().len() > limit);
+    assert!(loaded.text().len() <= limit);
 }
 
 #[tokio::test]

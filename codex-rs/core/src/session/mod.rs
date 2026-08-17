@@ -1553,6 +1553,7 @@ impl Session {
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,
+            tool_manifests: _tool_manifests,
             window_number,
             first_window_id,
             previous_window_id,

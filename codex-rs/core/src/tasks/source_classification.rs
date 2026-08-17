@@ -1545,7 +1545,6 @@ mod tests {
     fn source(material: &str) -> UserSourceRecord {
         UserSourceRecord {
             source_id: "source-1".to_string(),
-            origin_source_id: "source-1".to_string(),
             message_id: "message-1".to_string(),
             content_hash: "hash".to_string(),
             source_kind: UserSourceKind::Text,

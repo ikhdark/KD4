@@ -5,13 +5,14 @@ use super::run_remote_compaction_request_v2;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
-use crate::compact::strip_compaction_startup_envelopes;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use crate::session::turn::build_projected_prompt;
 use crate::session::turn::built_tools;
+use crate::session::turn::prepare_sampling_prompt_for_client;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
@@ -24,6 +25,7 @@ pub(super) struct RemoteCompactV2Attempt {
     pub(super) prompt_input: Vec<ResponseItem>,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
+    pub(super) stable_context_fingerprint: [u8; 32],
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
     pub(super) owned_client_session: Option<ModelClientSession>,
 }
@@ -67,8 +69,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let trace_input_history = compaction_trace
         .is_enabled()
         .then(|| history.raw_items().to_vec());
-    let mut input = history.for_prompt(&turn_context.model_info.input_modalities);
-    input = strip_compaction_startup_envelopes(input);
     let tool_router = built_tools(
         sess.as_ref(),
         step_context.as_ref(),
@@ -76,23 +76,23 @@ pub(super) async fn run_remote_compact_v2_attempt(
         &CancellationToken::new(),
     )
     .await?;
-    input.push(ResponseItem::CompactionTrigger {});
-    let prompt = Prompt {
-        input: input.into(),
-        stable_context_fallback_input: Arc::from([]),
-        tool_history_fallback_input: Arc::from([]),
-        stable_context_tool_history_fallback_input: Arc::from([]),
-        tool_history_substitutions: Arc::from([]),
-        stable_context_fallback_tool_history_substitutions: Arc::from([]),
-        stable_context_manifest: Default::default(),
-        prompt_provenance: Default::default(),
-        history_projection_manifest: None,
-        tools: tool_router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
-        base_instructions,
-        output_schema: None,
-        output_schema_strict: true,
+    let mut owned_client_session = None;
+    let client_session = match client_session {
+        Some(client_session) => client_session,
+        None => owned_client_session.insert(sess.services.model_client.new_session()),
     };
+    let prepared = prepare_sampling_prompt_for_client(history, turn_context, client_session);
+    let mut prompt = build_projected_prompt(
+        sess.as_ref(),
+        &prepared,
+        &tool_router,
+        step_context.as_ref(),
+        base_instructions,
+    );
+    prompt.output_schema = None;
+    prompt.output_schema_strict = true;
+    append_compaction_trigger(&mut prompt);
+    let stable_context_fingerprint = prompt.stable_context_manifest.fingerprint();
 
     let window_id = sess.current_window_id().await;
     let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
@@ -100,11 +100,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    let mut owned_client_session = None;
-    let client_session = match client_session {
-        Some(client_session) => client_session,
-        None => owned_client_session.insert(sess.services.model_client.new_session()),
-    };
     let compaction_output_result = run_remote_compaction_request_v2(
         sess,
         turn_context.as_ref(),
@@ -127,6 +122,20 @@ pub(super) async fn run_remote_compact_v2_attempt(
         prompt_input,
         compaction_output,
         token_usage,
+        stable_context_fingerprint,
         owned_client_session,
     })
+}
+
+fn append_compaction_trigger(prompt: &mut Prompt) {
+    for input in [
+        &mut prompt.input,
+        &mut prompt.stable_context_fallback_input,
+        &mut prompt.tool_history_fallback_input,
+        &mut prompt.stable_context_tool_history_fallback_input,
+    ] {
+        let mut items = input.to_vec();
+        items.push(ResponseItem::CompactionTrigger {});
+        *input = items.into();
+    }
 }

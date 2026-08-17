@@ -66,7 +66,9 @@ impl ToolOutput for McpResourceToolOutput {
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
-        self.visible.projection_metadata()
+        let mut metadata = self.visible.projection_metadata()?;
+        metadata.merge_essential_from_json(&self.canonical);
+        Some(metadata)
     }
 
     fn requires_canonical_artifact(&self) -> bool {

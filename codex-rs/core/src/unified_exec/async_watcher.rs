@@ -665,10 +665,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     emitter
         .emit(
             event_ctx,
-            ToolEventStage::Failure(ToolEventFailure::Output {
-                output,
-                applied_patch_delta: None,
-            }),
+            ToolEventStage::Failure(ToolEventFailure::Output(output)),
         )
         .await;
 }

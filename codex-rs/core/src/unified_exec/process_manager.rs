@@ -2162,15 +2162,6 @@ impl UnifiedExecProcessManager {
             .collect()
     }
 
-    pub(crate) async fn has_live_processes(&self) -> bool {
-        self.process_store
-            .lock()
-            .await
-            .processes
-            .values()
-            .any(|entry| !entry.process.has_exited())
-    }
-
     pub(crate) async fn terminate_process(&self, process_id: i32) -> bool {
         let (process, already_exited) = {
             let store = self.process_store.lock().await;

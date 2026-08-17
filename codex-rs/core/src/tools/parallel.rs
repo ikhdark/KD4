@@ -79,15 +79,36 @@ impl ToolCallRuntime {
         &self,
         tool_name: &codex_tools::ToolName,
         payload: &ToolPayload,
+        outcome_context: codex_tools::ToolOutputOutcomeContext,
         signal: Option<&serde_json::Value>,
         result: serde_json::Value,
+        canonical_artifact_required: bool,
         receipts: &[codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt],
     ) {
         let Some(collector) = &self.sampling_request_signals else {
             return;
         };
-        collector.record_code_mode_result(tool_name, payload, signal, result);
+        collector.record_code_mode_result(
+            tool_name,
+            payload,
+            outcome_context,
+            signal,
+            result,
+            canonical_artifact_required,
+        );
         collector.record_accepted_deterministic_continuation_receipts(receipts);
+    }
+
+    pub(crate) fn record_code_mode_failure(
+        &self,
+        tool_name: &codex_tools::ToolName,
+        payload: Option<&ToolPayload>,
+        failure_fingerprint: String,
+    ) {
+        let Some(collector) = &self.sampling_request_signals else {
+            return;
+        };
+        collector.record_code_mode_failure(tool_name, payload, failure_fingerprint);
     }
 
     pub(crate) fn create_diff_consumer(
@@ -193,6 +214,29 @@ impl ToolCallRuntime {
         let signal_collector = self.sampling_request_signals.clone();
         async move {
             if let Some(registration) = signal_registration.as_ref()
+                && let Some(guard) = registration.suppressed_source_pass.as_ref()
+            {
+                let mut output = FunctionCallOutputPayload::from_text(
+                    serde_json::json!({
+                        "kind": "unchanged_source_pass_suppression",
+                        "reason": "the same broad source action is blocked because the active obligation, evidence identity, and action are unchanged; change one of them before another broad source pass",
+                    })
+                    .to_string(),
+                );
+                output.success = Some(true);
+                let response = ResponseInputItem::FunctionCallOutput {
+                    call_id: call.call_id.clone(),
+                    output,
+                };
+                if let Some(signal_collector) = signal_collector.as_ref() {
+                    signal_collector.record_suppressed_source_pass(
+                        registration.ordinal,
+                        &guard.evidence_identity,
+                    );
+                }
+                return Ok(response);
+            }
+            if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.blocked_wait_guard.as_ref()
                 && let Some(snapshot) = crate::tools::handlers::multi_agents_v2::wait::inspect_authoritative_wait_snapshot(
                         self.session.as_ref(),
@@ -296,20 +340,16 @@ impl ToolCallRuntime {
                     }
                     Ok(response)
                 }
-                Err(error) if error.is_fatal() => {
+                Err(FunctionCallError::Fatal(message)) => {
                     let mutation_advanced = if let Some(before) = mutation_revision_before {
                         mutation_tracker.lock().await.current_mutation_revision() > before
                     } else {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure_with_mutation(
-                            ordinal,
-                            error.fingerprint().map(str::to_owned),
-                            mutation_advanced,
-                        );
+                        collector.record_failure_with_mutation(ordinal, mutation_advanced);
                     }
-                    Err(CodexErr::Fatal(error.into_fatal_message()))
+                    Err(CodexErr::Fatal(message))
                 }
                 Err(other) => {
                     let mutation_advanced = if let Some(before) = mutation_revision_before {
@@ -318,11 +358,7 @@ impl ToolCallRuntime {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure_with_mutation(
-                            ordinal,
-                            other.fingerprint().map(str::to_owned),
-                            mutation_advanced,
-                        );
+                        collector.record_failure_with_mutation(ordinal, mutation_advanced);
                     }
                     Ok(Self::failure_response(error_call, other))
                 }

@@ -21,101 +21,18 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 #[test]
-fn validation_route_ids_are_stable_and_contract_sensitive() {
-    let route = ValidationRoute {
-        leaves: vec![ValidationRouteLeaf {
-            argv: vec![
-                "cargo".into(),
-                "test".into(),
-                "-p".into(),
-                "codex-core".into(),
-            ],
-            covered_paths: vec!["core/src/tools".into()],
-            covered_contracts: vec!["tool routing".into()],
-            timeout_ms: 60_000,
-            semantic_timeout: false,
-        }],
-        ordering: ValidationRouteOrdering::StopOnFailure,
-    };
-    let first = stable_validation_route_id(&route);
-    assert_eq!(first, stable_validation_route_id(&route));
-
-    let mut changed = route;
-    changed.leaves[0].covered_contracts.push("output".into());
-    assert_ne!(first, stable_validation_route_id(&changed));
-}
-
-#[test]
-fn validation_route_binding_errors_identify_owner_and_leaf() {
-    let repository = tempfile::tempdir().expect("repository fixture");
-    let invalid_route = ValidationRoute {
-        leaves: vec![ValidationRouteLeaf {
-            argv: Vec::new(),
-            covered_paths: Vec::new(),
-            covered_contracts: vec!["plan validation admission".to_string()],
-            timeout_ms: 1_000,
-            semantic_timeout: false,
-        }],
-        ordering: ValidationRouteOrdering::StopOnFailure,
-    };
-
-    let focused = PlanningUpdateInput {
-        validation_route: Some(invalid_route.clone()),
-        ..Default::default()
-    };
-    let FunctionCallError::RespondToModel(focused_error) =
-        validate_requested_validation_routes(&focused, repository.path())
-            .expect_err("empty focused argv should be rejected")
-    else {
-        panic!("expected model-visible focused route error");
-    };
-    assert_eq!(
-        focused_error,
-        "focused validation route leaf 1 could not be bound: the validation route argv cannot be empty"
-    );
-
-    let step = PlanningUpdateInput {
-        plan: vec![PlanItemArg {
-            id: Some("validate-adapter".to_string()),
-            step: "Validate the adapter".to_string(),
-            validation_route: Some(invalid_route),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let FunctionCallError::RespondToModel(step_error) =
-        validate_requested_validation_routes(&step, repository.path())
-            .expect_err("empty step argv should be rejected")
-    else {
-        panic!("expected model-visible step route error");
-    };
-    assert_eq!(
-        step_error,
-        "plan step `validate-adapter` leaf 1 could not be bound: the validation route argv cannot be empty"
-    );
-}
-
-#[test]
 fn plan_output_always_signals_mutation_obligation_state() {
     let output = PlanToolOutput {
         normalized_plan: None,
         governor_plan: None,
-        effect: PlanUpdateEffect::NoOp,
         unfinished_mutation_obligation: None,
-        source_closure_established: false,
-        source_closure_receipt: None,
         validation_results: Vec::new(),
-        finalization_requested: false,
-        finalized: false,
-        missing_evidence: Vec::new(),
     };
     let signal = output
         .sampling_request_signal()
         .expect("successful status-only and no-op plan updates must emit obligation state");
     assert_eq!(signal["kind"], "plan_update");
     assert!(signal["unfinished_mutation_obligation"].is_null());
-    assert_eq!(signal["source_closure_established"], false);
-    assert!(signal["source_closure"].is_null());
 }
 
 async fn enable_task_evidence(
@@ -224,14 +141,8 @@ fn unchanged_plan_output_remains_compact() {
             explanation: None,
             plan: Vec::new(),
         }),
-        effect: PlanUpdateEffect::NoOp,
         unfinished_mutation_obligation: Some(false),
-        source_closure_established: false,
-        source_closure_receipt: None,
         validation_results: Vec::new(),
-        finalization_requested: false,
-        finalized: false,
-        missing_evidence: Vec::new(),
     };
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -243,70 +154,11 @@ fn unchanged_plan_output_remains_compact() {
         panic!("plan update should return function output");
     };
 
-    let result: serde_json::Value = serde_json::from_str(
-        response
-            .body
-            .to_text()
-            .as_deref()
-            .expect("plan result text"),
-    )
-    .expect("structured plan result");
-    assert_eq!(result, output.code_mode_result(&payload));
-    assert_eq!(result["effect"], "no_op");
-    assert_eq!(result["no_op"], true);
-    assert_eq!(result["finalization"]["requested"], false);
-}
-
-#[test]
-fn finalization_reports_terminal_state_and_missing_evidence() {
-    let terminal = UpdatePlanArgs {
-        explanation: None,
-        plan: vec![PlanItemArg {
-            id: Some("done".to_string()),
-            step: "Validated".to_string(),
-            status: StepStatus::Passed,
-            ..Default::default()
-        }],
-    };
-    assert!(finalization_missing_evidence(&terminal).is_empty());
-
-    let incomplete = UpdatePlanArgs {
-        explanation: None,
-        plan: vec![PlanItemArg {
-            id: Some("needs-proof".to_string()),
-            step: "Validate".to_string(),
-            status: StepStatus::Implemented,
-            validation_route: Some(ValidationRoute {
-                ordering: ValidationRouteOrdering::StopOnFailure,
-                leaves: vec![ValidationRouteLeaf {
-                    argv: vec!["cargo".to_string(), "test".to_string()],
-                    covered_paths: Vec::new(),
-                    covered_contracts: vec!["plan finalization".to_string()],
-                    timeout_ms: 60_000,
-                    semantic_timeout: false,
-                }],
-            }),
-            ..Default::default()
-        }],
-    };
     assert_eq!(
-        finalization_missing_evidence(&incomplete),
-        vec!["step needs-proof: missing fresh successful validation evidence"]
+        response.body.to_text().as_deref(),
+        Some(PLAN_UPDATED_MESSAGE)
     );
-}
-
-#[test]
-fn update_plan_schema_exposes_transactional_finalization() {
-    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
-    let finalize = tool
-        .pointer("/parameters/properties/finalize")
-        .expect("finalize schema");
-    assert_eq!(finalize["type"], "boolean");
-    assert!(
-        finalize["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("newly admissible"))
-    );
+    assert_eq!(output.code_mode_result(&payload), serde_json::json!({}));
 }
 
 #[test]
@@ -327,183 +179,6 @@ fn generated_artifact_schema_requires_repository_relative_paths() {
     assert!(description.contains("Repository-relative"));
     assert!(description.contains("remain inside the repository"));
     assert!(item_description.contains("repository-relative"));
-}
-
-fn closed_architecture_slice() -> ArchitectureSliceInput {
-    let not_applicable = ArchitectureEvidenceFacetInput {
-        status: ArchitectureEvidenceStatus::NotApplicable,
-        relationships: Vec::new(),
-        not_applicable_reason: Some("The focused fixture has no such relationship.".to_string()),
-    };
-    ArchitectureSliceInput {
-        snapshot: "fixture-snapshot".to_string(),
-        control_and_data_flow: ArchitectureEvidenceFacetInput {
-            status: ArchitectureEvidenceStatus::Established,
-            relationships: vec![crate::task_evidence::ArchitectureRelationshipInput {
-                kind: crate::task_evidence::ArchitectureRelationshipKind::ControlFlow,
-                source: "owner".to_string(),
-                target: "runtime".to_string(),
-                evidence: "core/src/runtime.rs#run".to_string(),
-                provenance: ArchitectureEvidenceProvenance::Exact,
-            }],
-            not_applicable_reason: None,
-        },
-        callers_and_consumers: not_applicable.clone(),
-        configuration_and_gates: not_applicable.clone(),
-        registration_and_entrypoints: not_applicable.clone(),
-        tests_and_contracts: not_applicable.clone(),
-        generated_artifacts: not_applicable.clone(),
-        invariants: not_applicable,
-        truncated: false,
-        omitted_relationships: 0,
-        material_unknowns: Vec::new(),
-        limitations: Vec::new(),
-        metrics: ArchitectureExplorationMetricsInput::default(),
-    }
-}
-
-#[test]
-fn source_closure_requires_complete_architecture_and_resolved_validation() {
-    let mut focused = PlanningUpdateInput {
-        tier: Some(PlanningTier::Focused),
-        source_owner: Some("core/src/owner.rs".to_string()),
-        implementation_surfaces: vec!["core/src/runtime.rs".to_string()],
-        validation_disposition: Some(ValidationDisposition::Executable),
-        ..Default::default()
-    };
-    assert!(!planning_update_source_closure(&focused, None).0);
-
-    focused.validation_route = Some(codex_protocol::plan_tool::ValidationRoute {
-        ordering: ValidationRouteOrdering::StopOnFailure,
-        leaves: vec![ValidationRouteLeaf {
-            argv: vec!["cargo".to_string(), "test".to_string()],
-            covered_contracts: vec!["source closure".to_string()],
-            covered_paths: vec!["core/src/runtime.rs".to_string()],
-            timeout_ms: 1_000,
-            semantic_timeout: false,
-        }],
-    });
-    let (closed, receipt, _) = planning_update_source_closure(&focused, None);
-    assert!(!closed);
-    assert_eq!(
-        receipt
-            .expect("attempted closure receipt")
-            .missing_requirements,
-        vec!["architecture_slice"]
-    );
-
-    focused.architecture_slice = Some(closed_architecture_slice());
-    let (closed, receipt, _) = planning_update_source_closure(&focused, None);
-    assert!(closed);
-    assert!(receipt.expect("complete closure receipt").established);
-
-    focused.validation_disposition = Some(ValidationDisposition::UnresolvedDiscoverable);
-    assert!(!planning_update_source_closure(&focused, None).0);
-}
-
-#[test]
-fn source_closure_signal_reports_compact_wiring_evidence() {
-    let mut slice = closed_architecture_slice();
-    slice.callers_and_consumers = ArchitectureEvidenceFacetInput {
-        status: ArchitectureEvidenceStatus::Established,
-        relationships: vec![crate::task_evidence::ArchitectureRelationshipInput {
-            kind: crate::task_evidence::ArchitectureRelationshipKind::DirectBuilder,
-            source: "builder".to_string(),
-            target: "owner".to_string(),
-            evidence: "core/src/builder.rs#build".to_string(),
-            provenance: ArchitectureEvidenceProvenance::Exact,
-        }],
-        not_applicable_reason: None,
-    };
-    let receipt = architecture_slice_receipt(&slice, None);
-    let output = PlanToolOutput {
-        normalized_plan: None,
-        governor_plan: None,
-        effect: PlanUpdateEffect::StatusOnly,
-        unfinished_mutation_obligation: None,
-        source_closure_established: true,
-        source_closure_receipt: Some(receipt),
-        validation_results: Vec::new(),
-        finalization_requested: false,
-        finalized: false,
-        missing_evidence: Vec::new(),
-    };
-
-    let signal = output.sampling_request_signal().expect("plan signal");
-    assert_eq!(signal["source_closure"]["total_relationships"], 2);
-    assert_eq!(
-        signal["source_closure"]["relationship_kinds"],
-        serde_json::json!(["control_flow", "direct_builder"])
-    );
-    assert_eq!(
-        signal["source_closure"]["missing_requirements"],
-        serde_json::json!([])
-    );
-}
-
-#[test]
-fn architecture_closure_rejects_heuristics_truncation_and_unknowns() {
-    let mut slice = closed_architecture_slice();
-    slice.control_and_data_flow.relationships[0].provenance =
-        ArchitectureEvidenceProvenance::Heuristic;
-    let receipt = architecture_slice_receipt(&slice, None);
-    assert!(!receipt.established);
-    assert!(
-        receipt
-            .missing_requirements
-            .contains(&"architecture_slice.control_and_data_flow".to_string())
-    );
-
-    slice.control_and_data_flow.relationships[0].provenance =
-        ArchitectureEvidenceProvenance::Declared;
-    slice.truncated = true;
-    slice.omitted_relationships = 2;
-    slice.material_unknowns = vec!["runtime registration".to_string()];
-    let receipt = architecture_slice_receipt(&slice, None);
-    assert!(!receipt.established);
-    assert!(
-        receipt
-            .missing_requirements
-            .iter()
-            .any(|item| item.ends_with("not_truncated"))
-    );
-    assert!(
-        receipt
-            .missing_requirements
-            .iter()
-            .any(|item| item.ends_with("zero_omissions"))
-    );
-    assert!(
-        receipt
-            .missing_requirements
-            .iter()
-            .any(|item| item.ends_with("zero_material_unknowns"))
-    );
-}
-
-#[test]
-fn architecture_closure_rejects_a_stale_repository_snapshot() {
-    let slice = closed_architecture_slice();
-    let receipt = architecture_slice_receipt(&slice, Some("new-head"));
-
-    assert!(!receipt.established);
-    assert!(receipt.stale_snapshot);
-    assert_eq!(receipt.expected_snapshot.as_deref(), Some("new-head"));
-    assert!(
-        receipt
-            .missing_requirements
-            .contains(&"architecture_slice.current_snapshot".to_string())
-    );
-}
-
-#[test]
-fn architecture_closure_accepts_a_current_composite_snapshot() {
-    let mut slice = closed_architecture_slice();
-    slice.snapshot = "current-head:manifest-digest:source-digest".to_string();
-    let receipt = architecture_slice_receipt(&slice, Some("current-head"));
-
-    assert!(receipt.established);
-    assert!(!receipt.stale_snapshot);
 }
 
 #[test]

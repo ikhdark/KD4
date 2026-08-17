@@ -14,6 +14,7 @@ pub(super) struct RolloutReconstruction {
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
+    pub(super) tool_manifests: codex_rollout::ToolManifestDictionary,
     pub(super) window_number: u64,
     pub(super) first_window_id: Option<Uuid>,
     pub(super) previous_window_id: Option<Uuid>,
@@ -172,6 +173,18 @@ impl Session {
                 .and_then(reconstructed_window_from_session_context_window),
             _ => None,
         });
+        // Tool manifests are rollout metadata, not Responses API history. Replay
+        // the complete metadata stream separately so compaction and the bounded
+        // history scan cannot discard definitions required by later references.
+        let mut tool_manifests = codex_rollout::ToolManifestDictionary::default();
+        for item in rollout_items {
+            let RolloutItem::ToolManifest(manifest) = item else {
+                continue;
+            };
+            if let Err(err) = tool_manifests.apply(manifest) {
+                tracing::warn!(%err, "failed to reconstruct rollout tool manifest");
+            }
+        }
         let mut base_replacement_history: Option<&[ResponseItem]> = None;
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
@@ -552,6 +565,7 @@ impl Session {
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,
+            tool_manifests,
             window_number: window.number,
             first_window_id: window.first_id,
             previous_window_id: window.previous_id,

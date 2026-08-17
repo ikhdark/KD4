@@ -720,7 +720,6 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
             cwd: parent.to_path_buf(),
             originator: "test".to_string(),
             cli_version: "test".to_string(),
-            build_info: None,
             source: SessionSource::Cli,
             thread_source: None,
             agent_path: None,

@@ -652,21 +652,34 @@ impl ToolOutputProjectionMetadata {
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             fragments: Vec::new(),
             spillable_text: vec![value.to_string()],
-            essential_inline: essential_json_fields(value),
+            essential_inline: essential_projection_fields(value),
             requested_limit,
             predetermined_ranges: Vec::new(),
             predetermined_json_pointers: Vec::new(),
         }
     }
+
+    /// Merges control-plane fields from a canonical JSON result into the
+    /// bounded inline projection without copying its spillable payload.
+    pub fn merge_essential_from_json(&mut self, value: &JsonValue) {
+        self.merge_essential_fields(essential_projection_fields(value));
+    }
+
+    pub fn merge_essential_fields(&mut self, fields: JsonValue) {
+        merge_projection_values(&mut self.essential_inline, fields);
+    }
 }
 
-fn essential_json_fields(value: &JsonValue) -> JsonValue {
+/// Returns the small control-plane subset that must survive model projection
+/// and wrapper conversion. Payload arrays and text remain spillable unless the
+/// producer gives them one of these explicit semantic identities.
+pub fn essential_projection_fields(value: &JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(object) => JsonValue::Object(
             object
                 .iter()
                 .filter_map(|(key, value)| {
-                    let nested = essential_json_fields(value);
+                    let nested = essential_projection_fields(value);
                     (is_essential_key(key) || !is_empty_projection(&nested)).then(|| {
                         (
                             key.clone(),
@@ -683,11 +696,28 @@ fn essential_json_fields(value: &JsonValue) -> JsonValue {
         JsonValue::Array(values) => JsonValue::Array(
             values
                 .iter()
-                .map(essential_json_fields)
+                .map(essential_projection_fields)
                 .filter(|value| !is_empty_projection(value))
                 .collect(),
         ),
         _ => JsonValue::Null,
+    }
+}
+
+fn merge_projection_values(target: &mut JsonValue, incoming: JsonValue) {
+    match (target, incoming) {
+        (JsonValue::Object(target), JsonValue::Object(incoming)) => {
+            for (key, value) in incoming {
+                match target.get_mut(&key) {
+                    Some(existing) => merge_projection_values(existing, value),
+                    None => {
+                        target.insert(key, value);
+                    }
+                }
+            }
+        }
+        (target, incoming) if is_empty_projection(target) => *target = incoming,
+        _ => {}
     }
 }
 
@@ -698,18 +728,27 @@ fn is_empty_projection(value: &JsonValue) -> bool {
 }
 
 fn is_essential_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
+    let normalized = key.to_ascii_lowercase();
     key == "id"
         || key.ends_with("_id")
-        || key.ends_with("id")
-        || key.contains("cursor")
-        || key.contains("status")
-        || key.contains("state")
-        || key.contains("gate")
-        || key.contains("next_action")
-        || key.contains("nextrequiredaction")
-        || key == "action"
-        || key == "outcome"
+        || key.ends_with("Id")
+        || normalized.contains("cursor")
+        || normalized.contains("status")
+        || normalized.contains("state")
+        || normalized.contains("gate")
+        || normalized.contains("next_action")
+        || normalized.contains("nextrequiredaction")
+        || normalized == "aborted"
+        || normalized == "abort_reason"
+        || normalized == "abortreason"
+        || (normalized.contains("omitted") && normalized.contains("count"))
+        || (normalized.contains("truncated") && normalized.contains("count"))
+        || (normalized.contains("remaining") && normalized.contains("count"))
+        || (normalized.contains("retention") && normalized.contains("reason"))
+        || normalized == "retention_limit_hit"
+        || normalized == "retentionlimithit"
+        || normalized == "action"
+        || normalized == "outcome"
 }
 
 impl ToolOutput for JsonToolOutput {
@@ -823,12 +862,16 @@ impl ToolOutput for codex_protocol::mcp::CallToolResult {
             },
             fragments,
             spillable_text: vec![serialized],
-            essential_inline: serde_json::json!({
+            essential_inline: {
+                let mut essential = serde_json::json!({
                 "is_error": self.is_error,
                 "content_items": self.content.len(),
                 "has_structured_content": self.structured_content.is_some(),
                 "has_meta": self.meta.is_some(),
-            }),
+                });
+                merge_projection_values(&mut essential, essential_projection_fields(&value));
+                essential
+            },
             requested_limit: None,
             predetermined_ranges: Vec::new(),
             predetermined_json_pointers: Vec::new(),
@@ -1039,6 +1082,69 @@ mod canonical_tests {
         assert!(metadata.predetermined_ranges.is_empty());
         assert!(metadata.predetermined_json_pointers.is_empty());
         assert_eq!(metadata.spillable_text, vec![value.to_string()]);
+    }
+
+    #[test]
+    fn essential_projection_preserves_control_state_without_payloads() {
+        let value = serde_json::json!({
+            "nextCursor": "opaque-cursor",
+            "omitted_result_count": 7,
+            "status": "aborted",
+            "retention_limit_reason": "per_artifact_safety_limit",
+            "valid": true,
+            "payload": "spillable",
+            "nested": {
+                "remaining_match_count": 3,
+                "items": ["large", "payload"],
+            },
+        });
+
+        let metadata = ToolOutputProjectionMetadata::from_json(&value, false, None);
+
+        assert_eq!(metadata.essential_inline["nextCursor"], "opaque-cursor");
+        assert_eq!(metadata.essential_inline["omitted_result_count"], 7);
+        assert_eq!(metadata.essential_inline["status"], "aborted");
+        assert_eq!(
+            metadata.essential_inline["retention_limit_reason"],
+            "per_artifact_safety_limit"
+        );
+        assert_eq!(
+            metadata.essential_inline["nested"]["remaining_match_count"],
+            3
+        );
+        assert!(metadata.essential_inline.get("valid").is_none());
+        assert!(metadata.essential_inline.get("payload").is_none());
+        assert!(metadata.essential_inline["nested"].get("items").is_none());
+    }
+
+    #[test]
+    fn mcp_projection_preserves_nested_cursors_and_omission_counts() {
+        let result = codex_protocol::mcp::CallToolResult {
+            content: vec![serde_json::json!({"type": "text", "text": "page"})],
+            structured_content: Some(serde_json::json!({
+                "nextCursor": "provider-cursor",
+                "omittedResultCount": 4,
+                "items": ["spillable"],
+            })),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        let metadata = result.projection_metadata().expect("MCP metadata");
+
+        assert_eq!(
+            metadata.essential_inline["structuredContent"]["nextCursor"],
+            "provider-cursor"
+        );
+        assert_eq!(
+            metadata.essential_inline["structuredContent"]["omittedResultCount"],
+            4
+        );
+        assert!(
+            metadata.essential_inline["structuredContent"]
+                .get("items")
+                .is_none()
+        );
     }
 
     #[test]

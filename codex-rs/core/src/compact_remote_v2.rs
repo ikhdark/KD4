@@ -104,12 +104,13 @@ pub(crate) async fn run_remote_compact_task(
         CompactionImplementation::ResponsesCompactionV2,
         CompactionPhase::StandaloneTurn,
     );
+    let world_state = Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await);
     run_remote_compact_task_inner(
         &sess,
         &step_context,
         /*fallback_step_context*/ None,
         /*client_session*/ None,
-        InitialContextInjection::DoNotInject,
+        InitialContextInjection::AtStart(world_state),
         compaction_metadata,
     )
     .await
@@ -246,7 +247,7 @@ async fn run_remote_compact_task_inner_impl(
             let fallback_result = run_remote_compact_v2_attempt(
                 sess,
                 fallback_step_context,
-                client_session,
+                client_session.as_deref_mut(),
                 &fallback_compaction_trace,
                 compaction_metadata,
                 analytics_details,
@@ -275,6 +276,7 @@ async fn run_remote_compact_task_inner_impl(
         prompt_input,
         compaction_output,
         token_usage,
+        stable_context_fingerprint,
         owned_client_session: _owned_client_session,
     } = attempt;
     if let Some(token_usage) = token_usage {
@@ -294,12 +296,15 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await;
 
-    let reference_context_item = match initial_context_injection {
+    let reference_context_item = match &initial_context_injection {
         InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::BeforeLastUserMessage(_) => {
+        InitialContextInjection::AtStart(_) | InitialContextInjection::BeforeLastUserMessage(_) => {
             Some(compaction_turn_context.to_turn_context_item())
         }
     };
+    let compacted_request_prefix = new_history
+        .split_last()
+        .map_or_else(Vec::new, |(_, prefix)| prefix.to_vec());
     let compacted_item = CompactedItem {
         message: String::new(),
         replacement_history: None,
@@ -322,6 +327,12 @@ async fn run_remote_compact_task_inner_impl(
         compacted_item,
     )
     .await;
+    if let Some(client_session) = client_session.as_deref_mut() {
+        client_session.rebase_remote_compaction_history(
+            &compacted_request_prefix,
+            stable_context_fingerprint,
+        );
+    }
     sess.recompute_token_usage(compaction_turn_context).await;
 
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)

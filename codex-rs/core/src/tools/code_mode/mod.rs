@@ -5,9 +5,7 @@ mod response_adapter;
 mod wait_handler;
 pub(crate) mod wait_spec;
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -38,10 +36,7 @@ use crate::tools::effective_tool_mode;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
-use crate::tools::router::build_function_tool_payload;
 use codex_protocol::openai_models::ToolMode;
-use codex_tools::ToolFailureClass;
-use codex_tools::ToolFailureDiagnostic;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -75,45 +70,6 @@ pub(crate) struct CodeModeService {
     session_provider: Arc<dyn CodeModeSessionProvider>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     shutting_down: AtomicBool,
-    cell_batch_observations: Mutex<HashMap<CellId, CellBatchObservation>>,
-    read_only_singleton_streaks: Mutex<HashMap<String, u8>>,
-}
-
-#[derive(Debug)]
-struct CellBatchObservation {
-    call_count: usize,
-    all_read_only: bool,
-    all_successful: bool,
-    failures: Vec<AggregatedNestedFailure>,
-    omitted_failure_count: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct AggregatedNestedFailure {
-    #[serde(flatten)]
-    diagnostic: ToolFailureDiagnostic,
-    occurrences: usize,
-}
-
-#[derive(Debug, Default)]
-struct CellCompletionFeedback {
-    batching_feedback: Option<String>,
-    failures: Vec<AggregatedNestedFailure>,
-    omitted_failure_count: usize,
-}
-
-const MAX_NESTED_FAILURE_DIAGNOSTICS: usize = 8;
-
-impl Default for CellBatchObservation {
-    fn default() -> Self {
-        Self {
-            call_count: 0,
-            all_read_only: true,
-            all_successful: true,
-            failures: Vec::new(),
-            omitted_failure_count: 0,
-        }
-    }
 }
 
 impl CodeModeService {
@@ -124,8 +80,6 @@ impl CodeModeService {
             session_provider,
             dispatch_broker,
             shutting_down: AtomicBool::new(false),
-            cell_batch_observations: Mutex::new(HashMap::new()),
-            read_only_singleton_streaks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -181,86 +135,6 @@ impl CodeModeService {
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
-    }
-
-    fn record_nested_tool_observation(
-        &self,
-        cell_id: &CellId,
-        tool_name: &ToolName,
-        payload: &ToolPayload,
-        successful: bool,
-        failure: Option<ToolFailureDiagnostic>,
-    ) {
-        let mut observations = self
-            .cell_batch_observations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let observation = observations.entry(cell_id.clone()).or_default();
-        observation.call_count = observation.call_count.saturating_add(1);
-        observation.all_read_only &= nested_call_is_known_read_only(tool_name, payload);
-        observation.all_successful &= successful;
-        if let Some(failure) = failure {
-            if let Some(existing) = observation
-                .failures
-                .iter_mut()
-                .find(|existing| existing.diagnostic.fingerprint == failure.fingerprint)
-            {
-                existing.occurrences = existing.occurrences.saturating_add(1);
-            } else if observation.failures.len() < MAX_NESTED_FAILURE_DIAGNOSTICS {
-                observation.failures.push(AggregatedNestedFailure {
-                    diagnostic: failure,
-                    occurrences: 1,
-                });
-            } else {
-                observation.omitted_failure_count =
-                    observation.omitted_failure_count.saturating_add(1);
-            }
-        }
-    }
-
-    fn take_cell_completion_feedback(
-        &self,
-        turn_id: &str,
-        cell_id: &CellId,
-        terminal_success: Option<bool>,
-    ) -> CellCompletionFeedback {
-        let Some(terminal_success) = terminal_success else {
-            return CellCompletionFeedback::default();
-        };
-        let observation = self
-            .cell_batch_observations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(cell_id)
-            .unwrap_or_default();
-        let singleton_read = terminal_success
-            && observation.call_count == 1
-            && observation.all_read_only
-            && observation.all_successful;
-        let mut streaks = self
-            .read_only_singleton_streaks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let streak = streaks.entry(turn_id.to_string()).or_default();
-        *streak = if singleton_read {
-            (*streak).saturating_add(1)
-        } else {
-            0
-        };
-        let batching_feedback = if *streak < 2 {
-            None
-        } else {
-            *streak = 0;
-            Some(
-                "Batching hint: the last two successful code-mode packets each performed one known read-only call. If the next reads are independent, issue them together with Promise.all in one exec packet."
-                    .to_string(),
-            )
-        };
-        CellCompletionFeedback {
-            batching_feedback,
-            failures: observation.failures,
-            omitted_failure_count: observation.omitted_failure_count,
-        }
     }
 
     pub(crate) fn record_owner_drained_continuation(
@@ -336,12 +210,10 @@ impl CodeModeService {
     }
 }
 
-async fn handle_runtime_response(
+pub(super) async fn handle_runtime_response(
     exec: &ExecContext,
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
-    recovery_queries: &[String],
-    completion_feedback: CellCompletionFeedback,
     started_at: std::time::Instant,
 ) -> Result<FunctionToolOutput, String> {
     // Nested tool results have already crossed their owning tool boundary. Keep
@@ -354,8 +226,6 @@ async fn handle_runtime_response(
     Ok(format_runtime_response(
         response,
         max_output_tokens,
-        recovery_queries,
-        completion_feedback,
         hard_limit,
         original_image_detail_supported,
         started_at,
@@ -365,8 +235,6 @@ async fn handle_runtime_response(
 fn format_runtime_response(
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
-    recovery_queries: &[String],
-    completion_feedback: CellCompletionFeedback,
     hard_limit: usize,
     original_image_detail_supported: bool,
     started_at: std::time::Instant,
@@ -408,33 +276,8 @@ fn format_runtime_response(
     };
 
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
-    if let Some(recovery) = targeted_recovery_contexts(&content_items, recovery_queries) {
-        content_items.push(FunctionCallOutputContentItem::InputText { text: recovery });
-    }
     let mut content_items =
         truncate_code_mode_result(content_items, max_output_tokens, outcome, hard_limit);
-    if !completion_feedback.failures.is_empty() || completion_feedback.omitted_failure_count != 0 {
-        let total_occurrences = completion_feedback
-            .failures
-            .iter()
-            .map(|failure| failure.occurrences)
-            .sum::<usize>()
-            .saturating_add(completion_feedback.omitted_failure_count);
-        let summary = serde_json::json!({
-            "nested_tool_failures": {
-                "total_occurrences": total_occurrences,
-                "distinct_retained": completion_feedback.failures.len(),
-                "omitted_occurrences": completion_feedback.omitted_failure_count,
-                "failures": completion_feedback.failures,
-            }
-        });
-        content_items.push(FunctionCallOutputContentItem::InputText {
-            text: format!("Nested tool failure summary:\n{summary}"),
-        });
-    }
-    if let Some(feedback) = completion_feedback.batching_feedback {
-        content_items.push(FunctionCallOutputContentItem::InputText { text: feedback });
-    }
     prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
     let typed_outcome = match outcome {
         OutputOutcome::Success => codex_tools::ToolOutputOutcome::Success,
@@ -533,7 +376,14 @@ async fn call_nested_tool(
 
     let payload = match build_nested_tool_payload(tool_kind, &tool_name, input) {
         Ok(payload) => payload,
-        Err(error) => return Err(FunctionCallError::RespondToModel(error)),
+        Err(error) => {
+            tool_runtime.record_code_mode_failure(
+                &tool_name,
+                None,
+                nested_failure_fingerprint(&tool_name, &error),
+            );
+            return Err(FunctionCallError::RespondToModel(error));
+        }
     };
 
     let call = ToolCall {
@@ -555,26 +405,17 @@ async fn call_nested_tool(
     let result = match result {
         Ok(result) => result,
         Err(error) => {
-            let failure = nested_failure_from_error(&tool_name, &error.to_string());
-            exec.session
-                .services
-                .code_mode_service
-                .record_nested_tool_observation(
-                    &cell_id,
-                    &tool_name,
-                    &payload,
-                    false,
-                    Some(failure),
-                );
+            tool_runtime.record_code_mode_failure(
+                &tool_name,
+                Some(&payload),
+                nested_failure_fingerprint(&tool_name, &error.to_string()),
+            );
             return Err(error);
         }
     };
+    let outcome_context = result.outcome_context();
     let signal = result.sampling_request_signal();
-    let failure = nested_failure_from_signal(signal.as_ref());
-    exec.session
-        .services
-        .code_mode_service
-        .record_nested_tool_observation(&cell_id, &tool_name, &payload, failure.is_none(), failure);
+    let canonical_artifact_required = result.requires_canonical_artifact();
     let receipts = result.intrinsic_deterministic_continuation_receipts();
     if let Some(continuation) = result.owner_drained_continuation() {
         exec.session
@@ -586,24 +427,29 @@ async fn call_nested_tool(
     tool_runtime.record_code_mode_result(
         &tool_name,
         &payload,
+        outcome_context,
         signal.as_ref(),
         result_value.clone(),
+        canonical_artifact_required,
         &receipts,
     );
     Ok(result_value)
 }
 
-fn nested_failure_from_signal(signal: Option<&JsonValue>) -> Option<ToolFailureDiagnostic> {
-    signal
-        .and_then(|signal| signal.get("failure"))
-        .and_then(|failure| serde_json::from_value(failure.clone()).ok())
-}
-
-fn nested_failure_from_error(tool_name: &ToolName, error: &str) -> ToolFailureDiagnostic {
+fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
     if let Some(json_start) = error.find('{')
-        && let Ok(diagnostic) = serde_json::from_str(&error[json_start..])
+        && let Ok(value) = serde_json::from_str::<JsonValue>(&error[json_start..])
+        && let Some(fingerprint) = value
+            .get("fingerprint")
+            .or_else(|| {
+                value
+                    .get("failure")
+                    .and_then(|failure| failure.get("fingerprint"))
+            })
+            .and_then(JsonValue::as_str)
+            .filter(|fingerprint| !fingerprint.is_empty())
     {
-        return diagnostic;
+        return fingerprint.to_string();
     }
     let normalized = error
         .split_whitespace()
@@ -616,111 +462,29 @@ fn nested_failure_from_error(tool_name: &ToolName, error: &str) -> ToolFailureDi
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let fingerprint = format!(
+    format!(
         "code_mode.nested_tool.{:x}",
         Sha256::digest(format!("{tool_name}\0{normalized}").as_bytes())
-    );
-    ToolFailureDiagnostic::model_visible(
-        ToolFailureClass::ToolExecution,
-        fingerprint,
-        format!("nested `{tool_name}` call failed"),
     )
-    .with_owner_hint(tool_name.to_string())
-    .with_next_action("inspect the retained nested failure before changing strategy")
 }
 
-pub(super) fn build_nested_tool_payload(
+fn build_nested_tool_payload(
     tool_kind: CodeModeToolKind,
     tool_name: &ToolName,
     input: Option<JsonValue>,
 ) -> Result<ToolPayload, String> {
     match tool_kind {
-        CodeModeToolKind::Function => {
-            let arguments = serialize_function_tool_arguments(tool_name, input)?;
-            build_function_tool_payload(tool_name, arguments)
-        }
+        CodeModeToolKind::Function => build_function_tool_payload(tool_name, input),
         CodeModeToolKind::Freeform => build_freeform_tool_payload(tool_name, input),
     }
 }
 
-fn targeted_recovery_contexts(
-    items: &[FunctionCallOutputContentItem],
-    queries: &[String],
-) -> Option<String> {
-    if queries.is_empty() {
-        return None;
-    }
-    let text = code_mode_text_content(items);
-    let lines = text.lines().collect::<Vec<_>>();
-    let mut selected = std::collections::BTreeSet::new();
-    for query in queries {
-        for (index, _) in lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.contains(query))
-            .take(4)
-        {
-            let start = index.saturating_sub(1);
-            let end = (index + 1).min(lines.len().saturating_sub(1));
-            selected.extend(start..=end);
-        }
-    }
-    if selected.is_empty() {
-        return Some("Targeted recovery contexts: no declared query matched.".to_string());
-    }
-    let mut output = String::from("Targeted recovery contexts (exact pre-truncation lines):\n");
-    for index in selected {
-        let rendered = format!("{}: {}\n", index + 1, lines[index]);
-        if output.len().saturating_add(rendered.len()) > 12_000 {
-            output.push_str("[recovery contexts bounded at 12000 bytes]\n");
-            break;
-        }
-        output.push_str(&rendered);
-    }
-    Some(output)
-}
-
-fn nested_call_is_known_read_only(tool_name: &ToolName, payload: &ToolPayload) -> bool {
-    if tool_name.namespace.is_some() {
-        return false;
-    }
-    match tool_name.name.as_str() {
-        "read_tool_output"
-        | "tool_search"
-        | "view_image"
-        | "list_mcp_resources"
-        | "list_mcp_resource_templates"
-        | "read_mcp_resource" => true,
-        "exec_command" => exec_command_is_known_read_only(payload),
-        _ => false,
-    }
-}
-
-fn exec_command_is_known_read_only(payload: &ToolPayload) -> bool {
-    let ToolPayload::Function { arguments } = payload else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<JsonValue>(arguments) else {
-        return false;
-    };
-    let Some(program) = value.get("program").and_then(JsonValue::as_str) else {
-        return false;
-    };
-    match program.to_ascii_lowercase().as_str() {
-        "rg" | "cat" | "head" | "tail" => true,
-        "git" => value
-            .get("args")
-            .and_then(JsonValue::as_array)
-            .and_then(|args| args.first())
-            .and_then(JsonValue::as_str)
-            .is_some_and(|subcommand| {
-                matches!(
-                    subcommand,
-                    "status" | "diff" | "log" | "show" | "grep" | "ls-files" | "rev-parse"
-                )
-            }),
-        _ => false,
-    }
+fn build_function_tool_payload(
+    tool_name: &ToolName,
+    input: Option<JsonValue>,
+) -> Result<ToolPayload, String> {
+    let arguments = serialize_function_tool_arguments(tool_name, input)?;
+    Ok(ToolPayload::Function { arguments })
 }
 
 fn serialize_function_tool_arguments(
@@ -758,8 +522,7 @@ mod tests {
     use super::CodeModeService;
     use super::OutputOutcome;
     use super::build_nested_tool_payload;
-    use super::nested_call_is_known_read_only;
-    use super::targeted_recovery_contexts;
+    use super::nested_failure_fingerprint;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
     use codex_code_mode::CodeModeToolKind;
@@ -787,36 +550,6 @@ mod tests {
     }
 
     #[test]
-    fn build_nested_tool_payload_uses_native_tool_search_payload() {
-        let payload = build_nested_tool_payload(
-            CodeModeToolKind::Function,
-            &ToolName::plain("tool_search"),
-            Some(json!({ "query": "repo atlas", "limit": 4 })),
-        )
-        .expect("tool_search payload should deserialize");
-
-        match payload {
-            ToolPayload::ToolSearch { arguments } => {
-                assert_eq!(arguments.query, "repo atlas");
-                assert_eq!(arguments.limit, Some(4));
-            }
-            other => panic!("expected tool_search payload, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_nested_tool_payload_rejects_malformed_tool_search_payload() {
-        let error = build_nested_tool_payload(
-            CodeModeToolKind::Function,
-            &ToolName::plain("tool_search"),
-            Some(json!({ "query": 42 })),
-        )
-        .expect_err("malformed nested tool_search should fail to build");
-
-        assert!(error.starts_with("failed to parse tool_search arguments:"));
-    }
-
-    #[test]
     fn build_nested_tool_payload_uses_freeform_kind() {
         let payload = build_nested_tool_payload(
             CodeModeToolKind::Freeform,
@@ -831,6 +564,26 @@ mod tests {
             }
             other => panic!("expected freeform payload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nested_failure_fingerprint_normalizes_numeric_noise() {
+        let tool_name = ToolName::plain("example");
+        assert_eq!(
+            nested_failure_fingerprint(
+                &tool_name,
+                r#"tool failed: {"fingerprint":"owner.stable.failure"}"#,
+            ),
+            "owner.stable.failure"
+        );
+        assert_eq!(
+            nested_failure_fingerprint(&tool_name, "request 17 failed after 2 attempts"),
+            nested_failure_fingerprint(&tool_name, "request 91 failed after 8 attempts")
+        );
+        assert_ne!(
+            nested_failure_fingerprint(&tool_name, "request 17 failed"),
+            nested_failure_fingerprint(&ToolName::plain("other"), "request 17 failed")
+        );
     }
 
     #[test]
@@ -883,70 +636,6 @@ mod tests {
         assert_eq!(
             codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
             codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-        );
-    }
-
-    #[test]
-    fn targeted_recovery_selects_exact_pre_truncation_context() {
-        let items = vec![FunctionCallOutputContentItem::InputText {
-            text: "first\nowner: task_evidence\nvalidation: focused\nlast".to_string(),
-        }];
-
-        let recovery = targeted_recovery_contexts(&items, &["owner:".to_string()])
-            .expect("declared recovery query should produce context");
-
-        assert!(recovery.contains("1: first"));
-        assert!(recovery.contains("2: owner: task_evidence"));
-        assert!(recovery.contains("3: validation: focused"));
-        assert!(!recovery.contains("4: last"));
-    }
-
-    #[test]
-    fn adaptive_batching_feedback_requires_two_successful_singleton_reads() {
-        let service = CodeModeService::new(Arc::new(
-            ProcessOwnedCodeModeSessionProvider::with_host_program("unused".into()),
-        ));
-        let payload = ToolPayload::Function {
-            arguments: serde_json::to_string(&json!({
-                "kind": "argv",
-                "program": "rg",
-                "args": ["needle", "src"]
-            }))
-            .expect("serialize exec arguments"),
-        };
-        assert!(nested_call_is_known_read_only(
-            &ToolName::plain("exec_command"),
-            &payload
-        ));
-
-        let first = codex_code_mode::CellId::new("cell-first".to_string());
-        service.record_nested_tool_observation(
-            &first,
-            &ToolName::plain("exec_command"),
-            &payload,
-            true,
-            None,
-        );
-        assert!(
-            service
-                .take_cell_completion_feedback("turn-a", &first, Some(true))
-                .batching_feedback
-                .is_none()
-        );
-
-        let second = codex_code_mode::CellId::new("cell-second".to_string());
-        service.record_nested_tool_observation(
-            &second,
-            &ToolName::plain("exec_command"),
-            &payload,
-            true,
-            None,
-        );
-        assert!(
-            service
-                .take_cell_completion_feedback("turn-a", &second, Some(true))
-                .batching_feedback
-                .is_some()
         );
     }
 

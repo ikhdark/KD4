@@ -22,7 +22,10 @@ use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
 use super::attempt_offsets_are_nondecreasing;
+use super::cache_coverage_below_matched_task_baseline;
+use super::model_attempt_phase_durations;
 use super::new_attempt_id;
+use super::new_attempt_identity;
 use super::new_sampling_request_id;
 use crate::AttestationContext;
 use crate::AttestationProvider;
@@ -394,25 +397,28 @@ fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
     let measurements = ModelRequestMeasurements::for_responses_request(
         &request,
         &history_test_provenance(&request),
+        &request.instructions,
     )
     .expect("measure request");
     let mut first = ModelAttemptGuard::new(
         test_session_telemetry(),
-        &sampling_request_id,
+        new_attempt_identity(&sampling_request_id),
         0,
         ModelAttemptRetryReason::None,
         ModelAttemptRequestKind::Initial,
         ModelAttemptTransport::ResponsesHttp,
+        None,
         measurements.clone(),
         super::ModelAttemptClock::new(),
     );
     let mut retry = ModelAttemptGuard::new(
         test_session_telemetry(),
-        &sampling_request_id,
+        new_attempt_identity(&sampling_request_id),
         1,
         ModelAttemptRetryReason::Unauthorized,
         ModelAttemptRequestKind::Initial,
         ModelAttemptTransport::ResponsesHttp,
+        None,
         measurements,
         super::ModelAttemptClock::new(),
     );
@@ -436,11 +442,13 @@ fn model_request_measurements_count_serialized_tools_independently() {
     let baseline = ModelRequestMeasurements::for_responses_request(
         &without_tools,
         &history_test_provenance(&without_tools),
+        &without_tools.instructions,
     )
     .expect("measure request without tools");
     let measured = ModelRequestMeasurements::for_responses_request(
         &with_tools,
         &history_test_provenance(&with_tools),
+        &with_tools.instructions,
     )
     .expect("measure request with tools");
     let serialized_tools = serde_json::to_string(with_tools.tools.as_ref().unwrap()).unwrap();
@@ -455,11 +463,64 @@ fn model_request_measurements_count_serialized_tools_independently() {
 }
 
 #[test]
+fn responses_lite_prompt_categories_measure_embedded_base_and_tools() {
+    let base_instructions = "base instruction content ".repeat(64);
+    let embedded_tools = vec![json!({
+        "type": "function",
+        "name": "lookup",
+        "description": "embedded Responses Lite tool schema",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+    })];
+    let mut request = history_test_request(Vec::new());
+    request.instructions.clear();
+    request.tools = None;
+    request.input = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: base_instructions.clone(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::AdditionalTools {
+            id: None,
+            role: "developer".to_string(),
+            tools: embedded_tools,
+        },
+        history_test_item(&base_instructions, Some("turn-1")),
+    ]
+    .into();
+
+    let measured = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &history_test_provenance(&request),
+        &base_instructions,
+    )
+    .expect("measure Responses Lite request");
+    let categories = measured.request_token_categories();
+
+    assert_eq!(
+        categories.accounting_basis,
+        codex_protocol::protocol::TurnTimingTokenCategoryBasis::FullLogicalPrompt
+    );
+    assert!(categories.base_instructions > 100);
+    assert!(categories.tool_schemas > 0);
+    assert!(categories.current_input > 100);
+    assert_eq!(
+        categories.local_reconciliation_residual,
+        super::signed_difference(categories.local_input_estimate, categories.logical_total)
+    );
+}
+
+#[test]
 fn model_request_measurements_reconcile_and_match_serialized_wire_payload() {
     let request = history_test_request(vec![history_test_item(r#"input with escaping: \""#, None)]);
     let measured = ModelRequestMeasurements::for_responses_request(
         &request,
         &history_test_provenance(&request),
+        &request.instructions,
     )
     .expect("measure request");
     let final_payload = serde_json::to_vec(&request).expect("serialize final request");
@@ -490,24 +551,37 @@ fn model_request_measurements_reconcile_and_match_serialized_wire_payload() {
 
 #[test]
 fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
-    let first_request = history_test_request(vec![history_test_item("first task", Some("turn-1"))]);
+    let stable_history = history_test_tool_output("call-1", "unchanged result");
+    let first_request = history_test_request(vec![
+        stable_history.clone(),
+        history_test_item("first task", Some("turn-1")),
+    ]);
     let mut first = ModelRequestMeasurements::for_responses_request(
         &first_request,
         &history_test_provenance(&first_request),
+        &first_request.instructions,
     )
     .expect("measure first request");
     let mut baseline = None;
-    first.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"));
+    let stable_digests = crate::client_common::PromptDigests {
+        instructions: Some([1; 32]),
+        tools: Some([2; 32]),
+        history: Some([3; 32]),
+    };
+    first.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
     assert!(!first.fixed_prefix_reuse_eligible);
 
-    let second_request =
-        history_test_request(vec![history_test_item("different task", Some("turn-2"))]);
+    let second_request = history_test_request(vec![
+        stable_history,
+        history_test_item("different task", Some("turn-2")),
+    ]);
     let mut second = ModelRequestMeasurements::for_responses_request(
         &second_request,
         &history_test_provenance(&second_request),
+        &second_request.instructions,
     )
     .expect("measure second request");
-    second.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"));
+    second.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), stable_digests);
     assert!(second.fixed_prefix_reuse_eligible);
     let category = |name| {
         second
@@ -517,21 +591,25 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
             .expect("category measurement")
     };
     assert!(category("base_system").unchanged_from_previous_request);
+    assert!(category("history").unchanged_from_previous_request);
     assert!(!category("task_input").unchanged_from_previous_request);
-    let categories = second.request_token_categories();
-    assert!(categories.base_instructions > 0);
-    assert!(categories.current_input > 0);
-    assert!(categories.logical_total >= categories.current_input);
-    assert!(categories.repeated_unchanged_context >= categories.base_instructions);
 
     let mut changed_tools = second_request;
     changed_tools.tools = Some(vec![json!({"type": "function", "name": "changed"})]);
     let mut third = ModelRequestMeasurements::for_responses_request(
         &changed_tools,
         &history_test_provenance(&changed_tools),
+        &changed_tools.instructions,
     )
     .expect("measure changed fixed prefix");
-    third.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"));
+    third.compare_and_remember_prompt_context(
+        &mut baseline,
+        Some("cache-key"),
+        crate::client_common::PromptDigests {
+            tools: Some([4; 32]),
+            ..stable_digests
+        },
+    );
     assert!(!third.fixed_prefix_reuse_eligible);
     assert!(
         !third
@@ -549,6 +627,10 @@ fn model_attempt_offsets_require_monotonic_elapsed_values_and_allow_nulls() {
     assert!(attempt_offsets_are_nondecreasing(&minimal, 1));
 
     let ordered = ModelAttemptOffsets {
+        queue_started_us: None,
+        queue_us: 4,
+        connection_setup_started_us: None,
+        connection_setup_us: 0,
         dispatch_ready_us: 10,
         stream_established_us: Some(20),
         first_provider_event_us: Some(30),
@@ -556,6 +638,7 @@ fn model_attempt_offsets_require_monotonic_elapsed_values_and_allow_nulls() {
         first_visible_output_us: Some(50),
     };
     assert!(attempt_offsets_are_nondecreasing(&ordered, 60));
+    assert_eq!(model_attempt_phase_durations(&ordered), (6, 4, Some(10)));
 
     let out_of_order = ModelAttemptOffsets {
         first_model_output_us: Some(9),
@@ -672,6 +755,73 @@ fn websocket_exact_stable_prefix_inherits_existing_response_id() {
         Some("response-old")
     );
     assert_eq!(prepared.input.as_ref(), &[delta]);
+}
+
+#[test]
+fn remote_compaction_rebase_preserves_response_lineage_for_next_tail() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let compaction_request = history_test_request(vec![history_test_item("pre-compact", None)]);
+    session.websocket_session.last_request = Some(compaction_request.clone());
+    session.remember_request_history(&compaction_request, [9; 32]);
+    let compacted = history_test_item("compacted", Some("compaction-turn"));
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(LastResponse {
+            response_id: "response-compact".to_string(),
+            items_added: vec![compacted.clone()],
+        })
+        .expect("response receiver open");
+    session.websocket_session.last_response_rx = Some(receiver);
+    let stable_prefix = history_test_item("stable prefix", Some("original-turn"));
+    session.rebase_remote_compaction_history(std::slice::from_ref(&stable_prefix), [9; 32]);
+    let delta = history_test_item("next tool result", None);
+    let current = history_test_request(vec![stable_prefix, compacted, delta.clone()]);
+
+    let (prepared, _) = session.prepare_websocket_request(
+        ResponseCreateWsRequest::from(&current),
+        &current,
+        [9; 32],
+        &[],
+    );
+    let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
+
+    assert_eq!(
+        prepared.previous_response_id.as_deref(),
+        Some("response-compact")
+    );
+    assert_eq!(prepared.input.as_ref(), &[delta]);
+}
+
+#[test]
+fn matched_task_cache_coverage_alert_uses_a_strict_eighty_five_percent_baseline() {
+    assert_eq!(
+        cache_coverage_below_matched_task_baseline(
+            true,
+            codex_otel::ModelAttemptOutcome::Success,
+            Some(10_000),
+            Some(8_499),
+        ),
+        Some(8_499)
+    );
+    assert_eq!(
+        cache_coverage_below_matched_task_baseline(
+            true,
+            codex_otel::ModelAttemptOutcome::Success,
+            Some(10_000),
+            Some(8_500),
+        ),
+        None
+    );
+    assert_eq!(
+        cache_coverage_below_matched_task_baseline(
+            false,
+            codex_otel::ModelAttemptOutcome::Success,
+            Some(10_000),
+            Some(0),
+        ),
+        None
+    );
 }
 
 #[test]
@@ -941,6 +1091,88 @@ fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
     assert_eq!(cache.hits, 1);
     assert_eq!(cache.misses, 2);
     assert_eq!(cache.entries.len(), 2);
+}
+
+#[test]
+fn request_schema_cache_reuses_precomputed_tool_digest() {
+    let client = test_model_client(SessionSource::Cli);
+    let prompt = Prompt {
+        digests: crate::client_common::PromptDigests {
+            tools: Some([7; 32]),
+            ..Default::default()
+        },
+        ..Prompt::default()
+    };
+
+    client
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
+        .expect("first serialization should succeed");
+    client
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
+        .expect("digest-identical serialization should hit");
+    let changed = Prompt {
+        digests: crate::client_common::PromptDigests {
+            tools: Some([8; 32]),
+            ..Default::default()
+        },
+        ..prompt
+    };
+    client
+        .request_schema_components(&changed, None, /*use_responses_lite*/ false)
+        .expect("changed digest should miss");
+
+    let cache = client
+        .state
+        .request_schema_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!((cache.hits, cache.misses, cache.entries.len()), (1, 2, 2));
+}
+
+#[tokio::test]
+async fn responses_lite_orders_base_and_tools_before_history() {
+    let client = test_model_client(SessionSource::Cli);
+    let prompt = Prompt {
+        input: vec![history_test_item("task", Some("turn-1"))].into(),
+        base_instructions: BaseInstructions {
+            text: "stable base".to_string(),
+        },
+        ..Prompt::default()
+    };
+    let mut model_info = test_model_info();
+    model_info.use_responses_lite = true;
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /* turn_id */ None,
+        format!("{}:0", client.state.thread_id),
+        /* parent_thread_id */ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let setup = client
+        .current_client_setup()
+        .await
+        .expect("client setup should resolve");
+
+    let request = client
+        .build_responses_request(
+            &setup.api_provider,
+            &prompt,
+            &model_info,
+            /* effort */ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /* service_tier */ None,
+            &responses_metadata,
+        )
+        .expect("Responses Lite request should build");
+
+    assert!(
+        matches!(request.input.first(), Some(ResponseItem::Message { role, .. }) if role == "developer")
+    );
+    assert!(matches!(
+        request.input.get(1),
+        Some(ResponseItem::AdditionalTools { .. })
+    ));
+    assert_eq!(request.input.last(), prompt.input.last());
 }
 
 #[tokio::test]

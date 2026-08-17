@@ -7,7 +7,6 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::HistoryProjectionManifest;
 use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
@@ -17,6 +16,16 @@ use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Stable identities of the three model-visible prompt domains that dominate
+/// request-prefix comparison. They are computed by their owning assembly
+/// stages and carried alongside the prompt; they never enter the wire payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PromptDigests {
+    pub(crate) instructions: Option<[u8; 32]>,
+    pub(crate) tools: Option<[u8; 32]>,
+    pub(crate) history: Option<[u8; 32]>,
+}
 
 /// API request payload for a single model turn
 #[derive(Debug, Clone)]
@@ -50,9 +59,9 @@ pub struct Prompt {
     /// Measurement-only response-item provenance. It is never serialized.
     pub(crate) prompt_provenance: PromptProvenanceSidecar,
 
-    /// Hash-only projection provenance persisted with the sampling boundary.
-    /// It is never serialized into a provider request.
-    pub(crate) history_projection_manifest: Option<HistoryProjectionManifest>,
+    /// Precomputed model-visible identities reused by request serialization,
+    /// prefix comparisons, and telemetry baselines.
+    pub(crate) digests: PromptDigests,
 
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
@@ -81,7 +90,7 @@ impl Default for Prompt {
             stable_context_fallback_tool_history_substitutions: Arc::from([]),
             stable_context_manifest: StableContextManifest::default(),
             prompt_provenance: PromptProvenanceSidecar::default(),
-            history_projection_manifest: None,
+            digests: PromptDigests::default(),
             tools: Vec::new(),
             parallel_tool_calls: false,
             base_instructions: BaseInstructions::default(),

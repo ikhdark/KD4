@@ -24,8 +24,9 @@ use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
 use codex_exec_server::ExecutorFileSystem;
-use codex_exec_server::FileMetadata;
 use codex_extension_api::UserInstructions;
+use codex_file_system::FindUpErrorPolicy;
+use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
@@ -75,14 +76,6 @@ fn stable_context_identity_from_structure(
 pub(crate) struct ProjectInstructionsLoad {
     pub(crate) loaded: Option<LoadedAgentsMd>,
     pub(crate) complete: bool,
-    pub(crate) dependencies: Vec<ProjectInstructionsDependency>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectInstructionsDependency {
-    pub(crate) environment_id: String,
-    pub(crate) path: PathUri,
-    pub(crate) metadata: Option<FileMetadata>,
 }
 
 struct EnvironmentProjectInstructions {
@@ -99,11 +92,6 @@ struct LoadedProjectDoc {
 struct ProjectDocCandidate {
     path: PathUri,
     size: u64,
-}
-
-struct ProjectDocDiscovery {
-    candidates: Vec<ProjectDocCandidate>,
-    dependencies: Vec<(PathUri, Option<FileMetadata>)>,
 }
 
 struct ProjectDocRead {
@@ -133,40 +121,52 @@ pub(crate) async fn load_project_instructions(
         return ProjectInstructionsLoad {
             loaded: (!loaded.is_empty()).then_some(loaded),
             complete,
-            dependencies: Vec::new(),
         };
     }
 
     let mut discoveries = Vec::with_capacity(environments.turn_environments.len());
-    let mut dependencies = Vec::new();
     for turn_environment in &environments.turn_environments {
         let environment_id = turn_environment.environment_id.clone();
         let environment = turn_environment.environment.clone();
         let cwd = turn_environment.cwd().clone();
         let filesystem = environment.get_filesystem();
         let result = agents_md_paths(config, &cwd, filesystem.as_ref()).await;
-        if let Ok(discovery) = &result {
-            dependencies.extend(
-                discovery
-                    .dependencies
-                    .iter()
-                    .cloned()
-                    .map(|(path, metadata)| ProjectInstructionsDependency {
-                        environment_id: environment_id.clone(),
-                        path,
-                        metadata,
-                    }),
-            );
-        }
         discoveries.push((environment_id, cwd, filesystem, result));
     }
 
+    let contributing_environments = discoveries
+        .iter()
+        .filter(|(_, _, _, result)| matches!(result, Ok(paths) if !paths.is_empty()))
+        .count();
+    let mut first_project_environment = true;
     for (environment_id, cwd, filesystem, result) in discoveries {
         match result {
-            Ok(discovery) if !discovery.candidates.is_empty() => {
+            Ok(candidates) if !candidates.is_empty() => {
+                let mut generated_overhead = 0usize;
+                if first_project_environment && loaded.user_instructions.is_some() {
+                    generated_overhead += AGENTS_MD_SEPARATOR.len();
+                }
+                if contributing_environments > 1 {
+                    if !first_project_environment {
+                        generated_overhead += 2;
+                    }
+                    generated_overhead += format!(
+                        "for `{}` with root {}\n\n",
+                        environment_id,
+                        cwd.inferred_native_path_string()
+                    )
+                    .len();
+                }
+                if generated_overhead >= remaining {
+                    remaining = 0;
+                    first_project_environment = false;
+                    continue;
+                }
+                remaining -= generated_overhead;
+
                 let project_docs = match read_discovered_project_docs(
                     filesystem.as_ref(),
-                    discovery.candidates,
+                    candidates,
                     remaining,
                     /*prefetch_utf8_boundary_slack*/ false,
                 )
@@ -188,6 +188,7 @@ pub(crate) async fn load_project_instructions(
                 if let Some(docs) = environment_load.loaded {
                     loaded.entries.extend(docs.entries);
                 }
+                first_project_environment = false;
             }
             Ok(_) => {}
             Err(err) => {
@@ -203,7 +204,6 @@ pub(crate) async fn load_project_instructions(
     ProjectInstructionsLoad {
         loaded: (!loaded.is_empty()).then_some(loaded),
         complete,
-        dependencies,
     }
 }
 
@@ -226,7 +226,7 @@ async fn read_agents_md(
         return Ok(None);
     }
 
-    let paths = agents_md_paths(config, cwd, fs).await?.candidates;
+    let paths = agents_md_paths(config, cwd, fs).await?;
     Ok(
         read_discovered_agents_md(fs, environment_id, cwd, paths, max_total)
             .await?
@@ -315,9 +315,12 @@ fn render_project_docs(
         mut read,
     } in project_docs.into_iter().rev()
     {
-        let Some((text, retained_bytes)) =
-            render_project_doc_to_budget(&mut read, &candidate.path, remaining)
-        else {
+        let separator_bytes = usize::from(!entries.is_empty()) * 2;
+        let Some((text, retained_bytes)) = render_project_doc_to_budget(
+            &mut read,
+            &candidate.path,
+            remaining.saturating_sub(separator_bytes),
+        ) else {
             continue;
         };
         let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
@@ -331,6 +334,7 @@ fn render_project_docs(
             );
         }
 
+        let rendered_bytes = text.len();
         entries.push(InstructionEntry {
             contents: text,
             provenance: InstructionProvenance::Project {
@@ -339,7 +343,7 @@ fn render_project_docs(
                 cwd: cwd.clone(),
             },
         });
-        remaining = remaining.saturating_sub(retained_bytes);
+        remaining = remaining.saturating_sub(rendered_bytes + separator_bytes);
     }
     entries.reverse();
     loaded.entries.extend(entries);
@@ -356,20 +360,29 @@ fn render_project_doc_to_budget(
     max_bytes: usize,
 ) -> Option<(String, usize)> {
     truncate_project_doc_to_budget(read, max_bytes);
-    let retained_bytes = read.retained_data.len();
-    let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
-    let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
-    if omitted_bytes > 0 {
-        if !text.is_empty() {
-            text.push_str("\n\n");
+    loop {
+        let retained_bytes = read.retained_data.len();
+        let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
+        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
+        if omitted_bytes > 0 {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&project_doc_truncation_notice(
+                path,
+                read.original_bytes,
+                retained_bytes,
+            ));
         }
-        text.push_str(&project_doc_truncation_notice(
-            path,
-            read.original_bytes,
-            retained_bytes,
-        ));
+        if text.len() <= max_bytes {
+            return Some((text, retained_bytes));
+        }
+        if retained_bytes == 0 {
+            return None;
+        }
+        let excess = text.len().saturating_sub(max_bytes).max(1);
+        truncate_project_doc_to_budget(read, retained_bytes.saturating_sub(excess));
     }
-    (!text.is_empty()).then_some((text, retained_bytes))
 }
 
 fn truncate_project_doc_to_budget(project_doc: &mut ProjectDocRead, max_bytes: usize) {
@@ -586,53 +599,24 @@ async fn agents_md_paths(
     config: &Config,
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
-) -> io::Result<ProjectDocDiscovery> {
+) -> io::Result<Vec<ProjectDocCandidate>> {
     let dir = cwd.clone();
+
     let project_root_markers = effective_project_root_markers(config);
-    let marker_searches =
-        std::iter::successors(Some(dir.clone()), PathUri::parent).map(|ancestor| {
-            let project_root_markers = &project_root_markers;
-            async move {
-                let mut probed = Vec::new();
-                for marker in project_root_markers {
-                    let path = ancestor
-                        .join(marker)
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-                    match fs.get_metadata(&path, /*sandbox*/ None).await {
-                        Ok(metadata) => {
-                            probed.push((path, Some(metadata)));
-                            return Ok((Some(ancestor), probed));
-                        }
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                            probed.push((path, None));
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-                Ok((None, probed))
-            }
-        });
-    // Ancestors are ordered nearest-first. Keep a bounded pipeline, but stop consuming as soon as
-    // the nearest marker-bearing ancestor is known so irrelevant higher probes are cancelled.
-    let mut marker_searches =
-        futures::stream::iter(marker_searches).buffered(MAX_CONCURRENT_DIRECTORY_SEARCHES);
-    let mut project_root = None;
-    let mut dependencies = Vec::new();
-    while let Some(result) = marker_searches.next().await {
-        let (found, probed) = result?;
-        dependencies.extend(probed);
-        if found.is_some() {
-            project_root = found;
-            break;
-        }
-    }
-    drop(marker_searches);
-    let search_dirs = if let Some(ref root) = project_root {
+    let project_root = find_nearest_ancestor_with_markers(
+        fs,
+        &dir,
+        project_root_markers,
+        FindUpErrorPolicy::Propagate,
+        /*sandbox*/ None,
+    )
+    .await?;
+    let search_dirs = if let Some(root) = project_root {
         let mut dirs = Vec::new();
         let mut cursor = dir.clone();
         loop {
             dirs.push(cursor.clone());
-            if &cursor == root {
+            if cursor == root {
                 break;
             }
             let Some(parent) = cursor.parent() else {
@@ -649,31 +633,23 @@ async fn agents_md_paths(
     let directory_searches = search_dirs.into_iter().map(|directory| {
         let candidate_filenames = &candidate_filenames;
         async move {
-            let mut probed = Vec::new();
             for name in candidate_filenames {
                 let candidate = directory
                     .join(name)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
                 match fs.get_metadata(&candidate, /*sandbox*/ None).await {
                     Ok(metadata) if metadata.is_file => {
-                        let size = metadata.size;
-                        probed.push((candidate.clone(), Some(metadata)));
-                        return Ok((
-                            Some(ProjectDocCandidate {
-                                path: candidate,
-                                size,
-                            }),
-                            probed,
-                        ));
+                        return Ok(Some(ProjectDocCandidate {
+                            path: candidate,
+                            size: metadata.size,
+                        }));
                     }
-                    Ok(metadata) => probed.push((candidate, Some(metadata))),
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                        probed.push((candidate, None));
-                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(err),
                 }
             }
-            Ok((None, probed))
+            Ok(None)
         }
     });
     // Directories can be probed independently. `buffered` keeps results in root-to-cwd order,
@@ -681,17 +657,12 @@ async fn agents_md_paths(
     let mut directory_searches =
         futures::stream::iter(directory_searches).buffered(MAX_CONCURRENT_DIRECTORY_SEARCHES);
     let mut found = Vec::new();
-    while let Some(result) = directory_searches.next().await {
-        let (path, probed) = result?;
-        dependencies.extend(probed);
-        if let Some(path) = path {
+    while let Some(path) = directory_searches.next().await {
+        if let Some(path) = path? {
             found.push(path);
         }
     }
-    Ok(ProjectDocDiscovery {
-        candidates: found,
-        dependencies,
-    })
+    Ok(found)
 }
 
 pub(crate) fn effective_project_root_markers(config: &Config) -> Vec<String> {

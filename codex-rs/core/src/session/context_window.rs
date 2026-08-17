@@ -9,7 +9,6 @@ pub(crate) struct ContextWindowTokenStatus {
     pub(crate) auto_compact_scope_tokens: i64,
     pub(crate) auto_compact_scope_limit: Option<i64>,
     pub(crate) full_context_window_limit: Option<i64>,
-    pub(crate) tokens_until_compaction: Option<i64>,
     pub(crate) auto_compact_window_prefill_tokens: Option<i64>,
     pub(crate) full_context_window_limit_reached: bool,
     pub(crate) token_limit_reached: bool,
@@ -25,10 +24,44 @@ pub(crate) async fn context_window_token_status(
     turn_context: &TurnContext,
 ) -> ContextWindowTokenStatus {
     let active_context_tokens = sess.get_total_token_usage().await;
+    context_window_token_status_for_pressure(
+        sess,
+        turn_context,
+        active_context_tokens,
+        active_context_tokens,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn projected_context_window_token_status(
+    sess: &Session,
+    turn_context: &TurnContext,
+    projected_context_tokens: i64,
+    projected_auto_compact_scope_tokens: i64,
+) -> ContextWindowTokenStatus {
+    let active_context_tokens = sess.get_total_token_usage().await;
+    context_window_token_status_for_pressure(
+        sess,
+        turn_context,
+        active_context_tokens,
+        projected_context_tokens.max(0),
+        Some(projected_auto_compact_scope_tokens.max(0)),
+    )
+    .await
+}
+
+async fn context_window_token_status_for_pressure(
+    sess: &Session,
+    turn_context: &TurnContext,
+    active_context_tokens: i64,
+    pressure_context_tokens: i64,
+    projected_auto_compact_scope_tokens: Option<i64>,
+) -> ContextWindowTokenStatus {
     let (auto_compact_scope_tokens, auto_compact_scope_limit, body_window) =
         match turn_context.config.model_auto_compact_token_limit_scope {
             AutoCompactTokenLimitScope::Total => (
-                active_context_tokens,
+                projected_auto_compact_scope_tokens.unwrap_or(pressure_context_tokens),
                 turn_context
                     .config
                     .model_auto_compact_token_limit
@@ -46,7 +79,8 @@ pub(crate) async fn context_window_token_status(
                 let full_context_window_limit = turn_context.model_context_window();
 
                 (
-                    active_context_tokens.saturating_sub(baseline),
+                    projected_auto_compact_scope_tokens
+                        .unwrap_or_else(|| pressure_context_tokens.saturating_sub(baseline)),
                     scope_limit,
                     Some(BodyAfterPrefixWindowStatus {
                         full_context_window_limit,
@@ -62,26 +96,16 @@ pub(crate) async fn context_window_token_status(
         .as_ref()
         .and_then(|window| window.auto_compact_window_prefill_tokens);
     let full_context_window_limit_reached =
-        full_context_window_limit.is_some_and(|limit| active_context_tokens >= limit);
+        full_context_window_limit.is_some_and(|limit| pressure_context_tokens >= limit);
     let soft_limit_reached =
         auto_compact_scope_limit.is_some_and(|limit| auto_compact_scope_tokens >= limit);
     let token_limit_reached = soft_limit_reached || full_context_window_limit_reached;
-
-    let auto_compact_scope_remaining = auto_compact_scope_limit
-        .map(|limit| limit.saturating_sub(auto_compact_scope_tokens).max(0));
-    let full_context_remaining =
-        full_context_window_limit.map(|limit| limit.saturating_sub(active_context_tokens).max(0));
-    let tokens_until_compaction = [auto_compact_scope_remaining, full_context_remaining]
-        .into_iter()
-        .flatten()
-        .min();
 
     ContextWindowTokenStatus {
         active_context_tokens,
         auto_compact_scope_tokens,
         auto_compact_scope_limit,
         full_context_window_limit,
-        tokens_until_compaction,
         auto_compact_window_prefill_tokens,
         full_context_window_limit_reached,
         token_limit_reached,

@@ -98,34 +98,6 @@ fn completed_tool_history_receipt_lifecycle_keeps_canonical_history_unchanged() 
 }
 
 #[test]
-fn completed_tool_history_receipt_projects_profitable_sub_512_token_output() {
-    let call_id = "call-sub-512";
-    let bounded = "repeated-evidence\n".repeat(100);
-    let bounded_tokens = approx_token_count(&bounded);
-    assert!(
-        bounded_tokens < 512,
-        "fixture must exercise the removed floor"
-    );
-    let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, bounded));
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let projection = state.project(canonical);
-
-    assert_eq!(projection.substitutions.len(), 1);
-    assert!(response_item_has_valid_tool_history_receipt(
-        &projection.items[0]
-    ));
-}
-
-#[test]
 fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
     let call_id = "call-1";
     let bounded = bounded_output();
@@ -158,48 +130,6 @@ fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
         },
     ));
     assert!(state.project(canonical).substitutions.is_empty());
-}
-
-#[test]
-fn completed_receipt_retains_bounded_decision_fields_without_raw_payload() {
-    let bounded = serde_json::json!({
-        "execution_outcome": "success",
-        "command_was_executed": true,
-        "result": {
-            "exit_code": 0,
-            "matched_tests": 3,
-            "changed_paths": ["src/owner.rs"],
-        },
-        "raw_output": "not decision material ".repeat(2_000),
-    })
-    .to_string();
-    let mut candidate = candidate("call-decision", bounded);
-    candidate.consumed_by_generation = Some(ModelGenerationId {
-        turn_id: "turn-1".to_string(),
-        ordinal: 1,
-    });
-
-    let (_, rendered) = candidate.receipt().expect("projected receipt");
-    let receipt: ToolHistoryReceiptV1 = serde_json::from_str(&rendered).expect("receipt JSON");
-
-    assert_eq!(
-        receipt.decision_fields["execution_outcome"],
-        serde_json::json!("success")
-    );
-    assert_eq!(
-        receipt.decision_fields["command_was_executed"],
-        serde_json::json!(true)
-    );
-    assert_eq!(
-        receipt.decision_fields["result.exit_code"],
-        serde_json::json!(0)
-    );
-    assert_eq!(
-        receipt.decision_fields["result.matched_tests"],
-        serde_json::json!(3)
-    );
-    assert!(!receipt.decision_fields.contains_key("raw_output"));
-    assert!(approx_token_count(&rendered) <= RECEIPT_MAX_TOKENS);
 }
 
 #[test]

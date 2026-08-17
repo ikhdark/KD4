@@ -1,6 +1,7 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_core::compact::COMPACTION_BASE_INSTRUCTIONS;
+use codex_core::compact::INCREMENTAL_SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
@@ -3697,8 +3698,11 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     let second_user_message = "second manual turn";
     let final_user_message = "post compact follow-up";
     let first_summary = "FIRST_MANUAL_SUMMARY";
-    let second_summary = "SECOND_MANUAL_SUMMARY";
-    let expected_second_summary = summary_with_prefix(second_summary);
+    let second_summary = "SECOND_MANUAL_UPDATE";
+    let expected_second_summary = format!(
+        "{}\n\nIncremental update:\n{second_summary}",
+        summary_with_prefix(first_summary)
+    );
 
     let server = start_mock_server().await;
 
@@ -3902,6 +3906,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         first_compact_has_prompt, second_compact_has_prompt,
         "compact requests should consistently include or omit the summarization prompt"
     );
+    assert!(
+        contains_user_text(&requests[3], INCREMENTAL_SUMMARIZATION_PROMPT),
+        "second compaction should request only an incremental summary update"
+    );
 
     let first_request_user_texts = requests[0].message_input_texts("user");
     let first_turn_user_index = first_request_user_texts
@@ -3922,22 +3930,16 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         !initial_seeded_user_prefix.is_empty(),
         "first turn should include seeded user prefix before the submitted user message"
     );
-    let (final_request_last_user_text, final_request_before_last_user) = final_request_user_texts
-        .split_last()
-        .expect("final turn request missing user messages");
-    assert_eq!(
-        final_request_last_user_text, final_user_message,
-        "final turn request should end with the submitted user message"
-    );
-    let history_before_seeded_prefix = final_request_before_last_user
-        .strip_suffix(initial_seeded_user_prefix)
-        .expect("final request should end with the seeded user prefix from the first request");
+    let history_after_seeded_prefix = final_request_user_texts
+        .strip_prefix(initial_seeded_user_prefix)
+        .expect("final request should retain the seeded user prefix from the first request");
     let expected_history = vec![
         first_user_message.to_string(),
         second_user_message.to_string(),
         expected_second_summary,
+        final_user_message.to_string(),
     ];
-    assert_eq!(history_before_seeded_prefix, expected_history.as_slice());
+    assert_eq!(history_after_seeded_prefix, expected_history.as_slice());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

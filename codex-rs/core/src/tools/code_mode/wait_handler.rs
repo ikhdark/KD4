@@ -172,16 +172,6 @@ impl CodeModeWaitHandler {
                 .map_err(FunctionCallError::RespondToModel)?;
                 let authoritative_wait_signal =
                     terminal_wait_owner_signal(&wait_response, &cell_id);
-                let terminal_success = match &wait_response {
-                    codex_code_mode::WaitOutcome::LiveCell(response)
-                    | codex_code_mode::WaitOutcome::MissingCell(response) => match response {
-                        codex_code_mode::RuntimeResponse::Yielded { .. } => None,
-                        codex_code_mode::RuntimeResponse::Terminated { .. } => Some(false),
-                        codex_code_mode::RuntimeResponse::Result { error_text, .. } => {
-                            Some(error_text.is_none())
-                        }
-                    },
-                };
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response
                     && !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. })
                 {
@@ -207,21 +197,10 @@ impl CodeModeWaitHandler {
                         .finish_cell_dispatch(runtime_cell_id);
                 }
                 exec.session.services.elicitations.wait_until_clear().await;
-                let completion_feedback = exec
-                    .session
-                    .services
-                    .code_mode_service
-                    .take_cell_completion_feedback(
-                        exec.turn.sub_id.as_str(),
-                        &cell_id,
-                        terminal_success,
-                    );
                 let mut output = handle_runtime_response(
                     &exec,
                     wait_response.into(),
                     args.max_tokens,
-                    &[],
-                    completion_feedback,
                     started_at,
                 )
                 .await

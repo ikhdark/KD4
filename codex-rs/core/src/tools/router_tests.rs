@@ -231,73 +231,6 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
     Ok(())
 }
 
-#[test]
-fn function_shaped_tool_search_call_uses_native_payload() -> anyhow::Result<()> {
-    let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
-        id: None,
-        name: "tool_search".to_string(),
-        namespace: None,
-        arguments: json!({"query": "repo atlas", "limit": 4}).to_string(),
-        call_id: "nested-search".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    })?
-    .expect("function-shaped tool_search should produce a tool call");
-
-    assert_eq!(call.tool_name, ToolName::plain("tool_search"));
-    assert_eq!(call.call_id, "nested-search");
-    match call.payload {
-        ToolPayload::ToolSearch { arguments } => {
-            assert_eq!(arguments.query, "repo atlas");
-            assert_eq!(arguments.limit, Some(4));
-        }
-        other => panic!("expected tool_search payload, got {other:?}"),
-    }
-
-    Ok(())
-}
-
-#[test]
-fn malformed_function_shaped_tool_search_retains_output_correlation() {
-    let error = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
-        id: None,
-        name: "tool_search".to_string(),
-        namespace: None,
-        arguments: json!({"query": 42}).to_string(),
-        call_id: "nested-search-malformed".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    })
-    .expect_err("malformed function-shaped tool_search should fail to build");
-
-    let ToolCallBuildError::ToolSearchArguments { call_id, message } = error;
-    assert_eq!(call_id, "nested-search-malformed");
-    assert!(message.starts_with("failed to parse tool_search arguments:"));
-}
-
-#[test]
-fn client_tool_search_call_uses_native_payload() -> anyhow::Result<()> {
-    let call = ToolRouter::build_tool_call(ResponseItem::ToolSearchCall {
-        id: None,
-        call_id: Some("search-native".to_string()),
-        status: None,
-        execution: "client".to_string(),
-        arguments: json!({"query": "repo atlas", "limit": 4}),
-        internal_chat_message_metadata_passthrough: None,
-    })?
-    .expect("client tool_search should produce a tool call");
-
-    assert_eq!(call.tool_name, ToolName::plain("tool_search"));
-    assert_eq!(call.call_id, "search-native");
-    match call.payload {
-        ToolPayload::ToolSearch { arguments } => {
-            assert_eq!(arguments.query, "repo atlas");
-            assert_eq!(arguments.limit, Some(4));
-        }
-        other => panic!("expected tool_search payload, got {other:?}"),
-    }
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()> {
     let tool_name = "exec".to_string();
@@ -480,7 +413,10 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
         namespace_function_names(&router.model_visible_specs(), "codex_app"),
         vec![visible_tool.to_string()]
     );
-    let manifest = router.tool_manifest(turn.as_ref()).manifest;
+    let manifest = router
+        .tool_manifest(turn.as_ref())
+        .manifest
+        .expect("runtime router emits a full manifest snapshot");
     let registered = manifest["registered"]
         .as_array()
         .expect("registered tool manifest entries");

@@ -43,7 +43,7 @@ use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 13;
+const TIMING_SCHEMA_VERSION: u16 = 14;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,35 +298,49 @@ impl TurnTimingSnapshot {
         let model_requests = profile
             .model_requests
             .iter()
-            .map(|request| TurnTimingModelRequest {
-                generation_index: request.generation_index,
-                generation_reason: request.generation_reason,
-                generation_purpose: request.generation_purpose,
-                disposition: request.disposition,
-                relevant_state_fingerprint: request.relevant_state_fingerprint.clone(),
-                progress_kinds: request.progress_kinds.clone(),
-                next_structured_action_changed: request.next_structured_action_changed,
-                unchanged_relevant_state: request.unchanged_relevant_state,
-                attempt_kind: request.attempt_kind,
-                is_continuation: request.is_continuation,
-                model_stream_wait_ns: public_ns(
-                    request.model_stream_wait_ns,
-                    &mut saturation_count,
-                ),
-                tool_call_count: request.tool_call_count,
-                output_tokens: request.output_tokens,
-                reasoning_output_tokens: request.reasoning_output_tokens,
-                token_usage: request.token_usage.clone(),
-                request_token_categories: request.request_token_categories.clone(),
-                dispatch_ms: request
-                    .dispatch_ns
-                    .map(|value| public_ms(value, &mut saturation_count)),
-                first_model_output_ms: request
-                    .first_model_output_ns
-                    .map(|value| public_ms(value, &mut saturation_count)),
-                completed_ms: request
-                    .completed_ns
-                    .map(|value| public_ms(value, &mut saturation_count)),
+            .map(|request| {
+                let request_token_categories =
+                    request.request_token_categories.as_ref().map(|categories| {
+                        let mut categories = categories.clone();
+                        if let Some(usage) = request.token_usage.as_ref() {
+                            categories.provider_input_tokens = Some(usage.input_tokens);
+                            categories.provider_reconciliation_residual = Some(signed_difference(
+                                usage.input_tokens,
+                                categories.logical_total,
+                            ));
+                        }
+                        categories
+                    });
+                TurnTimingModelRequest {
+                    generation_index: request.generation_index,
+                    generation_reason: request.generation_reason,
+                    generation_purpose: request.generation_purpose,
+                    disposition: request.disposition,
+                    relevant_state_fingerprint: request.relevant_state_fingerprint.clone(),
+                    progress_kinds: request.progress_kinds.clone(),
+                    next_structured_action_changed: request.next_structured_action_changed,
+                    unchanged_relevant_state: request.unchanged_relevant_state,
+                    attempt_kind: request.attempt_kind,
+                    is_continuation: request.is_continuation,
+                    model_stream_wait_ns: public_ns(
+                        request.model_stream_wait_ns,
+                        &mut saturation_count,
+                    ),
+                    tool_call_count: request.tool_call_count,
+                    output_tokens: request.output_tokens,
+                    reasoning_output_tokens: request.reasoning_output_tokens,
+                    token_usage: request.token_usage.clone(),
+                    request_token_categories,
+                    dispatch_ms: request
+                        .dispatch_ns
+                        .map(|value| public_ms(value, &mut saturation_count)),
+                    first_model_output_ms: request
+                        .first_model_output_ns
+                        .map(|value| public_ms(value, &mut saturation_count)),
+                    completed_ms: request
+                        .completed_ns
+                        .map(|value| public_ms(value, &mut saturation_count)),
+                }
             })
             .collect();
         let observational_nonprogress_tokens = diagnostic_token_aggregate(
@@ -991,8 +1005,30 @@ impl TurnTimingState {
             .saturating_add(1);
     }
 
+    pub(crate) fn record_architecture_slice_attempt(&self) {
+        let mut state = self.state();
+        state.counters.architecture_slice_attempt_count = state
+            .counters
+            .architecture_slice_attempt_count
+            .saturating_add(1);
+        state.counters.architecture_tool_call_count = state
+            .counters
+            .architecture_tool_call_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_architecture_source_read(&self, bytes_read: u64) {
+        let mut state = self.state();
+        state.counters.architecture_files_read =
+            state.counters.architecture_files_read.saturating_add(1);
+        state.counters.architecture_bytes_read = state
+            .counters
+            .architecture_bytes_read
+            .saturating_add(bytes_read);
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_architecture_slice_evaluation(
+    pub(crate) fn record_architecture_slice_result(
         &self,
         complete: bool,
         relationships: u64,
@@ -1000,15 +1036,10 @@ impl TurnTimingState {
         missing_requirements: u64,
         material_unknowns: u64,
         stale_snapshot: bool,
-        tool_calls: u64,
-        files_read: u64,
-        bytes_read: u64,
         late_relationship_discoveries: u64,
     ) {
         let mut state = self.state();
         let counters = &mut state.counters;
-        counters.architecture_slice_attempt_count =
-            counters.architecture_slice_attempt_count.saturating_add(1);
         counters.architecture_slice_complete_count = counters
             .architecture_slice_complete_count
             .saturating_add(u32::from(complete));
@@ -1027,13 +1058,6 @@ impl TurnTimingState {
         counters.architecture_stale_snapshot_count = counters
             .architecture_stale_snapshot_count
             .saturating_add(u32::from(stale_snapshot));
-        counters.architecture_tool_call_count = counters
-            .architecture_tool_call_count
-            .saturating_add(tool_calls);
-        counters.architecture_files_read =
-            counters.architecture_files_read.saturating_add(files_read);
-        counters.architecture_bytes_read =
-            counters.architecture_bytes_read.saturating_add(bytes_read);
         counters.architecture_late_relationship_discovery_count = counters
             .architecture_late_relationship_discovery_count
             .saturating_add(late_relationship_discoveries);
@@ -1134,6 +1158,15 @@ impl TurnTimingState {
         }
     }
 
+    pub(crate) fn record_model_request_token_categories(
+        &self,
+        categories: TurnTimingRequestTokenCategories,
+    ) {
+        if let Some(request) = self.state().model_requests.last_mut() {
+            request.request_token_categories = Some(categories);
+        }
+    }
+
     pub(crate) fn record_accepted_deterministic_continuation_receipts(
         &self,
         accepted_receipts: &[TurnTimingDeterministicContinuationReceipt],
@@ -1188,19 +1221,6 @@ impl TurnTimingState {
             .saturating_add(1);
     }
 
-    pub(crate) fn record_tool_output_projection(&self, projected_tokens: u64) {
-        let mut state = self.state();
-        state.counters.tool_output_truncation_count = state
-            .counters
-            .tool_output_truncation_count
-            .saturating_add(1);
-        state.counters.tool_output_projected_token_count = state
-            .counters
-            .tool_output_projected_token_count
-            .saturating_add(projected_tokens);
-        state.tool_output_projection_pending_continuation = true;
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tool_output_projection_facts(
         &self,
@@ -1211,8 +1231,17 @@ impl TurnTimingState {
         artifact_created: bool,
         projection_truncated: bool,
         omitted_sections: u64,
+        provider_visible: bool,
     ) {
         let mut state = self.state();
+        state.counters.tool_output_truncation_count = state
+            .counters
+            .tool_output_truncation_count
+            .saturating_add(u32::from(projection_truncated));
+        state.counters.tool_output_projected_token_count = state
+            .counters
+            .tool_output_projected_token_count
+            .saturating_add(model_tokens);
         state.counters.tool_output_canonical_byte_count = state
             .counters
             .tool_output_canonical_byte_count
@@ -1241,6 +1270,9 @@ impl TurnTimingState {
             .counters
             .tool_output_omitted_section_count
             .saturating_add(omitted_sections);
+        if provider_visible {
+            state.tool_output_projection_pending_continuation = true;
+        }
     }
 
     pub(crate) fn record_tool_output_recovery(&self, retruncation_count: u32) {
@@ -1506,15 +1538,6 @@ impl TurnTimingState {
             && request.dispatch_ns.is_none()
         {
             request.dispatch_ns = Some(elapsed_ns);
-        }
-    }
-
-    pub(crate) fn record_model_request_token_categories(
-        &self,
-        categories: TurnTimingRequestTokenCategories,
-    ) {
-        if let Some(request) = self.state().model_requests.last_mut() {
-            request.request_token_categories = Some(categories);
         }
     }
 
@@ -1825,13 +1848,6 @@ impl TurnTimingStateInner {
                 elapsed_ns,
                 &mut self.counters.saturation_count,
             );
-            if let Some(request) = self.model_requests.last_mut() {
-                add_saturating(
-                    &mut request.model_stream_wait_ns,
-                    elapsed_ns,
-                    &mut self.counters.saturation_count,
-                );
-            }
         }
         if self.activity.model_stream_wait > 0 {
             add_saturating(
@@ -2546,6 +2562,12 @@ fn diagnostic_token_aggregate(
 
 fn public_ms(nanos: u128, saturation_count: &mut u32) -> u64 {
     public_ns(nanos / NANOS_PER_MILLISECOND, saturation_count)
+}
+
+fn signed_difference(lhs: u64, rhs: u64) -> i64 {
+    i128::from(lhs)
+        .saturating_sub(i128::from(rhs))
+        .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 pub(crate) fn now_unix_timestamp_ms() -> i64 {

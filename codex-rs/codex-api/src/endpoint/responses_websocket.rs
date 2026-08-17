@@ -220,8 +220,15 @@ impl ResponsesWebsocketConnection {
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
-        self.stream_request_with_dispatch_ready(request, connection_reused, turn_state, || {})
-            .await
+        self.stream_request_with_dispatch_ready(
+            &request,
+            connection_reused,
+            turn_state,
+            || {},
+            || {},
+            || {},
+        )
+        .await
     }
 
     #[instrument(
@@ -232,10 +239,12 @@ impl ResponsesWebsocketConnection {
     )]
     pub async fn stream_request_with_dispatch_ready(
         &self,
-        request: ResponsesWsRequest,
+        request: &ResponsesWsRequest,
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
-        dispatch_ready: impl FnOnce(),
+        queue_started: impl FnOnce(),
+        dispatch_ready: impl FnOnce() + Send + 'static,
+        stream_established: impl FnOnce() + Send + 'static,
     ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
@@ -246,7 +255,8 @@ impl ResponsesWebsocketConnection {
         let server_model = self.server_model.clone();
         let telemetry = self.telemetry.clone();
         let request_text = serialize_websocket_request(&request)?;
-        dispatch_ready();
+        let (tx_send_complete, rx_send_complete) = oneshot::channel();
+        queue_started();
 
         let current_span = Span::current();
         tokio::spawn(
@@ -255,20 +265,10 @@ impl ResponsesWebsocketConnection {
                 reason = "the guard serializes exclusive use of the websocket stream for the lifetime of the response stream"
             )]
             async move {
-                if let Some(model) = server_model {
-                    let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
-                }
-                if let Some(etag) = models_etag {
-                    let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
-                }
-                if server_reasoning_included {
-                    let _ = tx_event
-                        .send(Ok(ResponseEvent::ServerReasoningIncluded(true)))
-                        .await;
-                }
                 let mut guard = stream.lock().await;
                 let result = {
                     let Some(ws_stream) = guard.as_mut() else {
+                        let _ = tx_send_complete.send(());
                         let _ = tx_event
                             .send(Err(ApiError::Stream(
                                 "websocket connection is closed".to_string(),
@@ -277,16 +277,44 @@ impl ResponsesWebsocketConnection {
                         return;
                     };
 
-                    run_websocket_response_stream(
+                    dispatch_ready();
+                    let send_result = send_websocket_request(
                         ws_stream,
-                        tx_event.clone(),
                         request_text,
                         idle_timeout,
-                        telemetry,
+                        telemetry.as_ref(),
                         connection_reused,
-                        turn_state.as_deref(),
                     )
-                    .await
+                    .await;
+                    let send_succeeded = send_result.is_ok();
+                    if send_succeeded {
+                        stream_established();
+                    }
+                    let _ = tx_send_complete.send(());
+                    if let Err(err) = send_result {
+                        Err(err)
+                    } else {
+                        if let Some(model) = server_model {
+                            let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+                        }
+                        if let Some(etag) = models_etag {
+                            let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
+                        }
+                        if server_reasoning_included {
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::ServerReasoningIncluded(true)))
+                                .await;
+                        }
+
+                        run_websocket_response_stream(
+                            ws_stream,
+                            tx_event.clone(),
+                            idle_timeout,
+                            telemetry,
+                            turn_state.as_deref(),
+                        )
+                        .await
+                    }
                 };
 
                 if let Err(err) = result {
@@ -300,6 +328,7 @@ impl ResponsesWebsocketConnection {
             }
             .instrument(current_span),
         );
+        let _ = rx_send_complete.await;
 
         Ok(ResponseStream {
             rx_event,
@@ -651,23 +680,12 @@ fn json_header_value(value: &Value) -> Option<HeaderValue> {
 async fn run_websocket_response_stream(
     ws_stream: &mut WsStream,
     tx_event: mpsc::Sender<std::result::Result<ResponseEvent, ApiError>>,
-    request_text: String,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
-    connection_reused: bool,
     turn_state: Option<&OnceLock<String>>,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
-    send_websocket_request(
-        ws_stream,
-        request_text,
-        idle_timeout,
-        telemetry.as_ref(),
-        connection_reused,
-    )
-    .await?;
-
     loop {
         let poll_start = Instant::now();
         let response = tokio::time::timeout(idle_timeout, ws_stream.next())
@@ -857,6 +875,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn reset_without_close_handshake_maps_to_incomplete_stream_error() {
@@ -913,6 +932,73 @@ mod tests {
         })
         .await
         .expect("websocket pump should stop");
+    }
+
+    #[tokio::test]
+    async fn dispatch_callbacks_separate_socket_queue_from_transport_send() {
+        let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+        let (tx_message, rx_message) = mpsc::unbounded_channel();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let pump_events = Arc::clone(&events);
+        let pump_task = tokio::spawn(async move {
+            if let Some(WsCommand::Send { tx_result, .. }) = rx_command.recv().await {
+                pump_events.lock().unwrap().push("sent");
+                let _ = tx_result.send(Ok(()));
+            }
+        });
+        let connection = ResponsesWebsocketConnection::new(
+            WsStream {
+                tx_command,
+                rx_message,
+                pump_task,
+            },
+            Duration::from_secs(1),
+            false,
+            None,
+            None,
+            None,
+        );
+        let request = ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+            model: "gpt-test".to_string(),
+            instructions: String::new(),
+            previous_response_id: None,
+            input: Vec::new().into(),
+            tools: None,
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: None,
+            store: false,
+            stream: true,
+            stream_options: None,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            generate: None,
+            client_metadata: None,
+        });
+        let queue_events = Arc::clone(&events);
+        let dispatch_events = Arc::clone(&events);
+        let established_events = Arc::clone(&events);
+
+        let stream = connection
+            .stream_request_with_dispatch_ready(
+                &request,
+                false,
+                None,
+                move || queue_events.lock().unwrap().push("queue"),
+                move || dispatch_events.lock().unwrap().push("dispatch"),
+                move || established_events.lock().unwrap().push("established"),
+            )
+            .await
+            .expect("request should reach the websocket pump");
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["queue", "dispatch", "sent", "established"]
+        );
+        drop(stream);
+        drop(tx_message);
     }
 
     #[test]

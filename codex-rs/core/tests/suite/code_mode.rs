@@ -1058,7 +1058,7 @@ text(output.output);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_update_plan_nested_tool_returns_structured_result() -> Result<()> {
+async fn code_mode_update_plan_nested_tool_result_is_empty_object() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1083,16 +1083,7 @@ text(JSON.stringify(result));
     );
 
     let parsed: Value = serde_json::from_str(&output)?;
-    assert_eq!(parsed["message"], "Plan updated");
-    assert_eq!(parsed["effect"], "no_op");
-    assert_eq!(parsed["no_op"], true);
-    assert_eq!(parsed["validation_results"], serde_json::json!([]));
-    assert_eq!(parsed["finalization"]["requested"], false);
-    assert_eq!(parsed["finalization"]["finalized"], false);
-    assert_eq!(
-        parsed["finalization"]["missing_evidence"],
-        serde_json::json!(["step unnamed: unfinished (InProgress)"])
-    );
+    assert_eq!(parsed, serde_json::json!({}));
 
     Ok(())
 }

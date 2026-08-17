@@ -23,8 +23,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -70,7 +68,6 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
-use codex_protocol::protocol::SessionBuildInfo;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -755,14 +752,7 @@ impl RolloutRecorder {
         params: RolloutRecorderParams,
         known_repository_context: Option<Option<RepositoryContext>>,
     ) -> std::io::Result<Self> {
-        let (
-            writer,
-            deferred_log_file_info,
-            rollout_path,
-            meta,
-            persisted_manifest_hashes,
-            persisted_continuity_capsules,
-        ) = match params {
+        let (writer, deferred_log_file_info, rollout_path, meta, tool_manifests) = match params {
             RolloutRecorderParams::Create {
                 session_id,
                 conversation_id,
@@ -800,13 +790,6 @@ impl RolloutRecorder {
                     cwd: config.cwd().to_path_buf(),
                     originator,
                     cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                    build_info: Some(SessionBuildInfo {
-                        binary: current_binary_identity(),
-                        commit: env!("CODEX_BUILD_COMMIT").to_string(),
-                        dirty: env!("CODEX_BUILD_DIRTY").to_string(),
-                        profile: env!("CODEX_BUILD_PROFILE").to_string(),
-                        built: env!("CODEX_BUILD_TIMESTAMP").to_string(),
-                    }),
                     agent_nickname: source.get_nickname(),
                     agent_role: source.get_agent_role(),
                     agent_path: source.get_agent_path().map(Into::into),
@@ -831,22 +814,13 @@ impl RolloutRecorder {
                     Some(log_file_info),
                     path,
                     Some(session_meta),
-                    HashSet::new(),
-                    HashSet::new(),
+                    crate::ToolManifestDictionary::default(),
                 )
             }
             RolloutRecorderParams::Resume { path } => {
-                let (_, persisted_manifest_hashes, persisted_continuity_capsules) =
-                    Self::existing_rollout_state(path.as_path()).await?;
+                let tool_manifests = Self::existing_tool_manifests(path.as_path()).await?;
                 let (path, writer) = open_rollout_for_append(path.as_path()).await?;
-                (
-                    Some(writer),
-                    None,
-                    path,
-                    None,
-                    persisted_manifest_hashes,
-                    persisted_continuity_capsules,
-                )
+                (Some(writer), None, path, None, tool_manifests)
             }
         };
 
@@ -872,8 +846,7 @@ impl RolloutRecorder {
                 cwd,
                 known_repository_context,
                 rollout_path_for_spawn.clone(),
-                persisted_manifest_hashes,
-                persisted_continuity_capsules,
+                tool_manifests,
             )
             .await;
             if let Err(err) = result {
@@ -1022,18 +995,18 @@ impl RolloutRecorder {
         Ok((items, thread_id, parse_errors))
     }
 
-    #[cfg(test)]
-    async fn existing_manifest_hashes(path: &Path) -> std::io::Result<HashSet<String>> {
-        let (_, hashes, _) = Self::existing_rollout_state(path).await?;
-        Ok(hashes)
+    async fn existing_tool_manifests(
+        path: &Path,
+    ) -> std::io::Result<crate::ToolManifestDictionary> {
+        let (_, manifests) = Self::existing_rollout_state(path).await?;
+        Ok(manifests)
     }
 
     async fn existing_rollout_state(
         path: &Path,
-    ) -> std::io::Result<(bool, HashSet<String>, HashSet<String>)> {
+    ) -> std::io::Result<(bool, crate::ToolManifestDictionary)> {
         let mut has_session_meta = false;
-        let mut hashes = HashSet::new();
-        let mut continuity_capsules = HashSet::new();
+        let mut manifests = crate::ToolManifestDictionary::default();
         let mut reader = compression::open_rollout_line_reader(path).await?;
         while let Some(line) = reader.next_line().await? {
             let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
@@ -1042,17 +1015,14 @@ impl RolloutRecorder {
             match rollout_line.item {
                 RolloutItem::SessionMeta(_) => has_session_meta = true,
                 RolloutItem::ToolManifest(manifest) => {
-                    hashes.insert(manifest.hash);
-                }
-                RolloutItem::ResponseItem(response_item) => {
-                    if let Some(text) = canonical_continuity_capsule_text(&response_item) {
-                        continuity_capsules.insert(text.to_string());
+                    if let Err(err) = manifests.apply(&manifest) {
+                        tracing::warn!(%err, "failed to reconstruct persisted tool manifest");
                     }
                 }
                 _ => {}
             }
         }
-        Ok((has_session_meta, hashes, continuity_capsules))
+        Ok((has_session_meta, manifests))
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
@@ -1098,17 +1068,6 @@ impl RolloutRecorder {
         };
         Ok(())
     }
-}
-
-fn current_binary_identity() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub(crate) fn reject_unknown_thread_history_mode(value: &Value) -> std::io::Result<()> {
@@ -1647,48 +1606,6 @@ fn open_log_file_with_options(
 /// Items are first appended to `pending_items`; persist/flush/shutdown remove each item from that
 /// queue only after it is written successfully. I/O failures drop the file handle but keep the
 /// unwritten suffix so the next barrier can reopen the file and retry.
-const CONTINUITY_CAPSULE_OPEN: &str = "<kd4_continuity_capsule_v1>";
-const CONTINUITY_CAPSULE_CLOSE: &str = "</kd4_continuity_capsule_v1>";
-
-fn canonical_continuity_capsule_text(item: &ResponseItem) -> Option<&str> {
-    let ResponseItem::Message { role, content, .. } = item else {
-        return None;
-    };
-    if role != "developer" || content.len() != 1 {
-        return None;
-    }
-    let ContentItem::InputText { text } = &content[0] else {
-        return None;
-    };
-    let body = text
-        .strip_prefix(CONTINUITY_CAPSULE_OPEN)?
-        .strip_suffix(CONTINUITY_CAPSULE_CLOSE)?;
-    if body.contains(CONTINUITY_CAPSULE_OPEN) || body.contains(CONTINUITY_CAPSULE_CLOSE) {
-        return None;
-    }
-    let envelope_value = serde_json::from_str::<Value>(body).ok()?;
-    let envelope = envelope_value.as_object()?;
-    let canonical_shape = envelope.get("schema").and_then(Value::as_str)
-        == Some("kd4_continuity_capsule_v1")
-        && envelope
-            .get("checkpoint_generation")
-            .and_then(Value::as_str)
-            .is_some_and(|generation| !generation.is_empty())
-        && envelope
-            .get("core_semantic_hash")
-            .and_then(Value::as_str)
-            .is_some_and(|hash| {
-                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-        && envelope
-            .get("capsule")
-            .and_then(Value::as_object)
-            .and_then(|capsule| capsule.get("schema_version"))
-            .and_then(Value::as_u64)
-            == Some(1);
-    canonical_shape.then_some(text)
-}
-
 struct RolloutWriterState {
     writer: Option<JsonlWriter>,
     deferred_log_file_info: Option<LogFileInfo>,
@@ -1699,13 +1616,11 @@ struct RolloutWriterState {
     rollout_path: PathBuf,
     last_logged_error: Option<String>,
     retry_blocked_error: Option<String>,
-    persisted_manifest_hashes: HashSet<String>,
-    persisted_continuity_capsules: HashSet<String>,
+    tool_manifests: crate::ToolManifestDictionary,
     pending_token_count: Option<RolloutItem>,
 }
 
 impl RolloutWriterState {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         writer: Option<JsonlWriter>,
         deferred_log_file_info: Option<LogFileInfo>,
@@ -1713,8 +1628,7 @@ impl RolloutWriterState {
         cwd: PathBuf,
         known_repository_context: Option<Option<RepositoryContext>>,
         rollout_path: PathBuf,
-        persisted_manifest_hashes: HashSet<String>,
-        persisted_continuity_capsules: HashSet<String>,
+        tool_manifests: crate::ToolManifestDictionary,
     ) -> Self {
         Self {
             writer,
@@ -1726,8 +1640,7 @@ impl RolloutWriterState {
             rollout_path,
             last_logged_error: None,
             retry_blocked_error: None,
-            persisted_manifest_hashes,
-            persisted_continuity_capsules,
+            tool_manifests,
             pending_token_count: None,
         }
     }
@@ -1739,18 +1652,14 @@ impl RolloutWriterState {
                 // never append another session_meta record.
                 RolloutItem::SessionMeta(_) => {}
                 RolloutItem::ToolManifest(manifest) => {
-                    if self.persisted_manifest_hashes.insert(manifest.hash.clone()) {
-                        self.pending_items.push(RolloutItem::ToolManifest(manifest));
-                    }
-                }
-                RolloutItem::ResponseItem(response_item) => {
-                    let is_new =
-                        canonical_continuity_capsule_text(&response_item).is_none_or(|text| {
-                            self.persisted_continuity_capsules.insert(text.to_string())
-                        });
-                    if is_new {
-                        self.pending_items
-                            .push(RolloutItem::ResponseItem(response_item));
+                    match self.tool_manifests.encode_item(&manifest) {
+                        Ok(manifest) => {
+                            self.pending_items.push(RolloutItem::ToolManifest(manifest))
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "failed to encode tool manifest; preserving input record");
+                            self.pending_items.push(RolloutItem::ToolManifest(manifest));
+                        }
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::TokenCount(_)) => {
@@ -1896,23 +1805,21 @@ impl RolloutWriterState {
         };
         self.writer = Some(file.into_jsonl_writer());
         self.deferred_log_file_info = None;
-        if let Some((has_session_meta, manifest_hashes, continuity_capsules)) =
-            existing_rollout_state
-        {
+        if let Some((has_session_meta, mut persisted_tool_manifests)) = existing_rollout_state {
             if has_session_meta {
                 self.meta = None;
             }
-            self.pending_items.retain(|item| match item {
-                RolloutItem::ToolManifest(manifest) => !manifest_hashes.contains(&manifest.hash),
-                RolloutItem::ResponseItem(response_item) => {
-                    canonical_continuity_capsule_text(response_item)
-                        .is_none_or(|text| !continuity_capsules.contains(text))
-                }
-                _ => true,
-            });
-            self.persisted_manifest_hashes.extend(manifest_hashes);
-            self.persisted_continuity_capsules
-                .extend(continuity_capsules);
+            let known_manifests = self.tool_manifests.clone();
+            for item in &mut self.pending_items {
+                let RolloutItem::ToolManifest(manifest) = item else {
+                    continue;
+                };
+                let Some(full) = known_manifests.manifest(&manifest.hash).cloned() else {
+                    continue;
+                };
+                *manifest = persisted_tool_manifests.encode(manifest.hash.clone(), full);
+            }
+            self.tool_manifests = persisted_tool_manifests;
         }
         Ok(())
     }
@@ -1976,8 +1883,7 @@ async fn rollout_writer(
     cwd: PathBuf,
     known_repository_context: Option<Option<RepositoryContext>>,
     rollout_path: PathBuf,
-    persisted_manifest_hashes: HashSet<String>,
-    persisted_continuity_capsules: HashSet<String>,
+    tool_manifests: crate::ToolManifestDictionary,
 ) -> std::io::Result<()> {
     let mut state = RolloutWriterState::new(
         writer,
@@ -1986,8 +1892,7 @@ async fn rollout_writer(
         cwd,
         known_repository_context,
         rollout_path,
-        persisted_manifest_hashes,
-        persisted_continuity_capsules,
+        tool_manifests,
     );
 
     // Process rollout commands

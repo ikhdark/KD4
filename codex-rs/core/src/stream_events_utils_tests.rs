@@ -6,7 +6,6 @@ use super::handle_non_tool_response_item;
 use super::handle_output_item_done;
 use super::last_assistant_message_from_item;
 use super::response_item_may_include_external_context;
-use super::should_defer_agent_message_event;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::ToolRouter;
@@ -343,7 +342,6 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
         turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
         tool_runtime,
         cancellation_token: CancellationToken::new(),
-        defer_final_agent_message_events: false,
     };
 
     let output = handle_output_item_done(
@@ -393,7 +391,6 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
         turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
         tool_runtime,
         cancellation_token: CancellationToken::new(),
-        defer_final_agent_message_events: false,
     };
 
     let output = handle_output_item_done(
@@ -462,7 +459,6 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
         turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
         tool_runtime,
         cancellation_token: CancellationToken::new(),
-        defer_final_agent_message_events: false,
     };
     let mut eager_prefix_open = true;
 
@@ -588,33 +584,5 @@ fn completed_item_keeps_mailbox_delivery_open_for_commentary_messages() {
 
     assert!(!completed_item_defers_mailbox_delivery_to_next_turn(
         &item, /*plan_mode*/ false,
-    ));
-}
-
-#[test]
-fn authoritative_terminal_output_defers_only_explicit_final_answers() {
-    let item = |phase| {
-        TurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
-            id: "message".to_string(),
-            content: vec![AgentMessageContent::Text {
-                text: "status".to_string(),
-            }],
-            phase,
-            memory_citation: None,
-        })
-    };
-
-    assert!(should_defer_agent_message_event(
-        &item(Some(MessagePhase::FinalAnswer)),
-        true,
-    ));
-    assert!(!should_defer_agent_message_event(
-        &item(Some(MessagePhase::Commentary)),
-        true,
-    ));
-    assert!(!should_defer_agent_message_event(&item(None), true));
-    assert!(!should_defer_agent_message_event(
-        &item(Some(MessagePhase::FinalAnswer)),
-        false,
     ));
 }

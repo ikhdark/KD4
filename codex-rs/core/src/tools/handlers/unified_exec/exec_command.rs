@@ -292,10 +292,6 @@ impl ExecCommandHandler {
             ));
         };
         let native_environment_cwd = turn_environment.cwd().clone();
-        let requested_workdir = environment_args
-            .workdir
-            .as_deref()
-            .filter(|workdir| !workdir.is_empty());
         let cwd = environment_args
             .workdir
             .as_deref()
@@ -307,18 +303,6 @@ impl ExecCommandHandler {
             .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
         let environment = Arc::clone(&turn_environment.environment);
         let fs = environment.get_filesystem();
-        if let Some(workdir) = requested_workdir {
-            let metadata = fs.get_metadata(&cwd, /*sandbox*/ None).await.map_err(|err| {
-                FunctionCallError::RespondToModel(format!(
-                    "workdir `{workdir}` does not resolve to an accessible directory (`{cwd}`): {err}"
-                ))
-            })?;
-            if !metadata.is_directory {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "workdir `{workdir}` must resolve to a directory, but `{cwd}` is not a directory"
-                )));
-            }
-        }
 
         // A foreign cwd cannot seed the AbsolutePathBufGuard used to resolve relative paths in the
         // permissions config below. Consult the configured platform-sandbox requirement before
@@ -429,7 +413,7 @@ impl ExecCommandHandler {
             .map(|cwd| get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf()))
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| cwd.to_string());
-        let mut validation_launch = match admit_validation(
+        let validation_launch = match admit_validation(
             &turn.validation_authorization,
             session.services.state_db.as_deref(),
             repository_key.as_bytes(),
@@ -450,7 +434,6 @@ impl ExecCommandHandler {
                 invocation: command_invocation.clone(),
                 authorization_revision,
                 observation: Some(observation),
-                command_proof_key: None,
                 proof_key: None,
                 structured_route: None,
                 validation_call_id: None,
@@ -641,11 +624,8 @@ impl ExecCommandHandler {
                 &command_invocation,
                 environment,
                 toolchain,
-                repository_epoch,
+                observed_mutation_revision,
             );
-            if let Some(launch) = validation_launch.as_mut() {
-                launch.command_proof_key = Some(identity.clone());
-            }
             loop {
                 match register_if_absent(
                     &turn.validation_singleflight,

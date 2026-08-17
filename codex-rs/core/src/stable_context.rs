@@ -160,6 +160,15 @@ impl StableContextManifest {
         self.fail_open
     }
 
+    pub(crate) fn active_content_hash(&self, kind: StableContextKind) -> Option<[u8; 32]> {
+        let mut matches = self
+            .components
+            .iter()
+            .filter(|component| component.active && component.kind == kind);
+        let hash = matches.next()?.identity.content_hash;
+        matches.next().is_none().then_some(hash)
+    }
+
     pub(crate) fn projected_bytes(&self) -> u64 {
         self.components
             .iter()
@@ -341,6 +350,45 @@ impl StableContextSlot {
             Self::RootCoordinator => "root_coordinator",
         }
     }
+
+    /// Canonical ordering for the reusable model-visible prefix. Keep this
+    /// independent from producer registration order so concurrent contributors
+    /// and reconstructed histories yield the same prompt layout.
+    fn canonical_order(self) -> u8 {
+        match self {
+            Self::Repository => 0,
+            Self::Collaboration => 1,
+            Self::RootCoordinator => 2,
+            Self::MultiAgent => 3,
+            Self::Permissions => 4,
+            Self::SkillUsage => 5,
+            Self::SkillCatalog => 6,
+            Self::Apps => 7,
+            Self::Plugins => 8,
+            Self::Personality => 9,
+            Self::SelectedSkill => 10,
+            Self::AppContext => 11,
+            Self::ModelSwitch => 12,
+            Self::Realtime => 13,
+            Self::Environment => 14,
+            Self::RecommendedPlugins => 15,
+        }
+    }
+
+    /// Turn-scoped manifests and runtime observations are deliberately kept
+    /// behind the reusable instruction prefix. They are still placed before
+    /// the current user input, so their steering semantics remain current.
+    fn is_volatile(self) -> bool {
+        matches!(
+            self,
+            Self::SelectedSkill
+                | Self::AppContext
+                | Self::ModelSwitch
+                | Self::Realtime
+                | Self::Environment
+                | Self::RecommendedPlugins
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -377,10 +425,11 @@ pub(crate) fn project_stable_context(
             continue;
         };
         let mut contains_stable = false;
+        let mut contains_unprojectable = false;
         for (content_index, content_item) in content.iter().enumerate() {
-            let text = match content_item {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => text,
-                _ => continue,
+            let ContentItem::InputText { text } = content_item else {
+                contains_unprojectable = true;
+                continue;
             };
             if let Some(slot) = classify_stable_text(role, text) {
                 contains_stable = true;
@@ -395,9 +444,12 @@ pub(crate) fn project_stable_context(
                 ambiguous = true;
             }
         }
-        // Recognized fragments are independent projection units even when a
-        // producer coalesces them into one message. Unrecognized siblings are
-        // retained in place. Malformed known markers still fail open above.
+        // Splitting a registered fragment away from images or output text
+        // would alter its model-visible structure. Ordinary assistant/image
+        // history remains eligible for projection.
+        if contains_stable && contains_unprojectable {
+            ambiguous = true;
+        }
         if role == "user" && !contains_stable {
             latest_real_user = Some((item_index, item.turn_id().map(str::to_string)));
         }
@@ -478,25 +530,58 @@ fn project_items(
             )
         })
         .collect::<HashMap<_, _>>();
-    let mut projected = Vec::with_capacity(items.len());
+    let mut reusable = Vec::<(StableContextSlot, usize, ResponseItem)>::new();
+    let mut volatile = Vec::<(StableContextSlot, usize, ResponseItem)>::new();
+    for (occurrence_index, occurrence) in occurrences.iter().enumerate() {
+        let key = (occurrence.item_index, occurrence.content_index);
+        if !keep.contains(&key) {
+            continue;
+        }
+        let Some(item) = items.get(occurrence.item_index) else {
+            continue;
+        };
+        let mut projected_item = item.clone();
+        // A mixed producer message can yield multiple canonical fragments.
+        // Do not duplicate a provider item ID across the split messages.
+        projected_item.set_id(/*new_id*/ None);
+        let content_item = replacement_catalog.get(&key).map_or_else(
+            || ContentItem::InputText {
+                text: occurrence.text.clone(),
+            },
+            |replacement| ContentItem::InputText {
+                text: replacement.clone(),
+            },
+        );
+        if let ResponseItem::Message { content, .. } = &mut projected_item {
+            *content = vec![content_item];
+        }
+        let target = if occurrence.slot.is_volatile() {
+            &mut volatile
+        } else {
+            &mut reusable
+        };
+        target.push((occurrence.slot, occurrence_index, projected_item));
+    }
+    let sort_fragments = |fragments: &mut Vec<(StableContextSlot, usize, ResponseItem)>| {
+        fragments
+            .sort_by_key(|(slot, occurrence_index, _)| (slot.canonical_order(), *occurrence_index));
+    };
+    sort_fragments(&mut reusable);
+    sort_fragments(&mut volatile);
+
+    let mut ordinary = Vec::<(usize, ResponseItem)>::with_capacity(items.len());
     for (item_index, item) in items.iter().enumerate() {
         let ResponseItem::Message { content, .. } = item else {
-            projected.push(item.clone());
+            ordinary.push((item_index, item.clone()));
             continue;
         };
         let mut next_content = Vec::with_capacity(content.len());
         for (content_index, content_item) in content.iter().enumerate() {
             let key = (item_index, content_index);
-            if occurrence_lookup.contains_key(&key) && !keep.contains(&key) {
+            if occurrence_lookup.contains_key(&key) {
                 continue;
             }
-            if let Some(replacement) = replacement_catalog.get(&key) {
-                next_content.push(ContentItem::InputText {
-                    text: replacement.clone(),
-                });
-            } else {
-                next_content.push(content_item.clone());
-            }
+            next_content.push(content_item.clone());
         }
         if next_content.is_empty() {
             continue;
@@ -505,7 +590,28 @@ fn project_items(
         if let ResponseItem::Message { content, .. } = &mut next_item {
             *content = next_content;
         }
-        projected.push(next_item);
+        ordinary.push((item_index, next_item));
+    }
+
+    let mut projected = Vec::with_capacity(items.len() + reusable.len() + volatile.len());
+    projected.extend(reusable.into_iter().map(|(_, _, item)| item));
+    let volatile_insertion_index = latest_real_user.map(|(item_index, _)| *item_index);
+    let mut volatile = Some(
+        volatile
+            .into_iter()
+            .map(|(_, _, item)| item)
+            .collect::<Vec<_>>(),
+    );
+    for (item_index, item) in ordinary {
+        if volatile_insertion_index == Some(item_index)
+            && let Some(items) = volatile.take()
+        {
+            projected.extend(items);
+        }
+        projected.push(item);
+    }
+    if let Some(items) = volatile {
+        projected.extend(items);
     }
 
     let mut components = Vec::new();

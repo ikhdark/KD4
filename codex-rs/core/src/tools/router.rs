@@ -54,19 +54,6 @@ pub(crate) enum ToolCallBuildError {
     ToolSearchArguments { call_id: String, message: String },
 }
 
-pub(crate) fn build_function_tool_payload(
-    tool_name: &ToolName,
-    arguments: String,
-) -> Result<ToolPayload, String> {
-    if tool_name == &ToolName::plain("tool_search") {
-        let arguments: SearchToolCallParams = serde_json::from_str(&arguments)
-            .map_err(|err| format!("failed to parse tool_search arguments: {err}"))?;
-        return Ok(ToolPayload::ToolSearch { arguments });
-    }
-
-    Ok(ToolPayload::Function { arguments })
-}
-
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Vec<ToolSpec>,
@@ -228,10 +215,7 @@ impl ToolRouter {
             "tool_exposure_identity": &self.exposure_identity,
         });
         let encoded = serde_json::to_vec(&fingerprint_input).unwrap_or_default();
-        let item = ToolManifestItem {
-            hash: format!("{:x}", Sha256::digest(encoded)),
-            manifest,
-        };
+        let item = ToolManifestItem::full(format!("{:x}", Sha256::digest(encoded)), manifest);
         *self
             .manifest_cache
             .lock()
@@ -287,17 +271,10 @@ impl ToolRouter {
                 ..
             } => {
                 let tool_name = ToolName::new(namespace, name);
-                let payload =
-                    build_function_tool_payload(&tool_name, arguments).map_err(|message| {
-                        ToolCallBuildError::ToolSearchArguments {
-                            call_id: call_id.clone(),
-                            message,
-                        }
-                    })?;
                 Ok(Some(ToolCall {
                     tool_name,
                     call_id,
-                    payload,
+                    payload: ToolPayload::Function { arguments },
                 }))
             }
             ResponseItem::ToolSearchCall {

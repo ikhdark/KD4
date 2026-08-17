@@ -221,6 +221,26 @@ impl PromptProvenanceSidecar {
         }
     }
 
+    /// Assigns one already-rendered response item to a category without
+    /// matching equal text in any other item.
+    pub(crate) fn with_response_item_category(
+        &self,
+        item: &ResponseItem,
+        category: PromptContextCategory,
+    ) -> Self {
+        let mut contributions_by_item = self.contributions_by_item.as_ref().clone();
+        if let ResponseItem::Message { content, .. } = item
+            && let Ok(fingerprint) = response_item_fingerprint(item)
+        {
+            contributions_by_item.insert(fingerprint, vec![Some(category); content.len()].into());
+        }
+        Self {
+            contributions_by_item: Arc::new(contributions_by_item),
+            current_turn_id: self.current_turn_id.clone(),
+            current_input_fingerprint: self.current_input_fingerprint,
+        }
+    }
+
     fn contributions(&self, item: &ResponseItem) -> Option<&[Option<PromptContextCategory>]> {
         let fingerprint = response_item_fingerprint(item).ok()?;
         self.contributions_by_item
@@ -313,6 +333,12 @@ impl PromptContextBreakdown {
             .map_or(0, |entry| entry.serialized_bytes)
     }
 
+    pub(crate) fn estimated_tokens(&self, category: PromptContextCategory) -> u64 {
+        self.categories
+            .get(&category)
+            .map_or(0, |entry| entry.estimated_tokens)
+    }
+
     pub(crate) fn total_bytes(&self) -> u64 {
         self.categories.values().fold(0_u64, |total, entry| {
             total.saturating_add(entry.serialized_bytes)
@@ -350,6 +376,10 @@ impl PromptContextBreakdown {
         serialized_item: &[u8],
         sidecar: &PromptProvenanceSidecar,
     ) -> serde_json::Result<()> {
+        if matches!(item, ResponseItem::AdditionalTools { .. }) {
+            self.record_serialized(PromptContextCategory::ToolSchemas, serialized_item);
+            return Ok(());
+        }
         let ResponseItem::Message { role, content, .. } = item else {
             self.record_serialized(PromptContextCategory::History, serialized_item);
             return Ok(());

@@ -2993,7 +2993,7 @@
               "type": "null"
             }
           ],
-          "description": "Aggregate-only, locally estimated request composition. No prompt text, repository paths, tool arguments, or hashes are persisted here."
+          "description": "Aggregate-only full logical prompt accounting. No prompt text, repository paths, tool arguments, or hashes are persisted here."
         },
         "tokenUsage": {
           "anyOf": [
@@ -3143,6 +3143,14 @@
     },
     "TurnTimingRequestTokenCategories": {
       "properties": {
+        "accountingBasis": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingTokenCategoryBasis"
+            }
+          ],
+          "default": "full_logical_prompt"
+        },
         "baseInstructions": {
           "default": 0,
           "format": "uint64",
@@ -3161,8 +3169,22 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "localInputEstimate": {
+          "default": 0,
+          "description": "One-pass local estimate over the complete serialized logical prompt.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "localReconciliationResidual": {
+          "default": 0,
+          "description": "`local_input_estimate - logical_total`. This exposes estimator and JSON envelope effects instead of silently assigning them to a category.",
+          "format": "int64",
+          "type": "integer"
+        },
         "logicalTotal": {
           "default": 0,
+          "description": "Sum of the mutually exclusive category estimates above.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -3173,9 +3195,26 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "providerInputTokens": {
+          "description": "Provider-reported full input tokens, when usage was returned.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "providerReconciliationResidual": {
+          "description": "`provider_input_tokens - logical_total`, when provider usage exists.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "repeatedUnchangedContext": {
           "default": 0,
-          "description": "Tokens in categories whose exact hash matched the prior model request.",
+          "description": "Overlapping diagnostic: logical tokens in categories whose exact hash matched the preceding request. This is not added to `logical_total`.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -3363,6 +3402,13 @@
         "validationProcessNs"
       ],
       "type": "object"
+    },
+    "TurnTimingTokenCategoryBasis": {
+      "description": "Semantic basis used by request token-category accounting.\n\nCategories describe the complete logical prompt presented to the model. They do not describe only websocket deltas, newly allocated client memory, uncached provider input, or reconciliation residuals.",
+      "enum": [
+        "full_logical_prompt"
+      ],
+      "type": "string"
     },
     "TurnTimingUnions": {
       "properties": {

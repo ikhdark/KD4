@@ -89,7 +89,6 @@ pub(crate) fn convert_apply_patch_to_protocol(
             ApplyPatchFileChange::Update {
                 unified_diff,
                 move_path,
-                old_content: _old_content,
                 new_content: _new_content,
             } => FileChange::Update {
                 unified_diff: unified_diff.clone(),

@@ -62,7 +62,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         request: ResponsesApiRequest,
         options: ResponsesOptions,
     ) -> Result<ResponseStream, ApiError> {
-        self.stream_request_with_dispatch_ready(request, options, || {})
+        self.stream_request_with_dispatch_ready(&request, options, || {})
             .await
     }
 
@@ -78,7 +78,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
     )]
     pub async fn stream_request_with_dispatch_ready(
         &self,
-        request: ResponsesApiRequest,
+        request: &ResponsesApiRequest,
         options: ResponsesOptions,
         dispatch_ready: impl FnOnce(),
     ) -> Result<ResponseStream, ApiError> {

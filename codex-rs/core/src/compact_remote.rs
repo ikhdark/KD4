@@ -6,7 +6,7 @@ use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
-use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact::insert_compaction_initial_context;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::context::world_state::WorldStateSnapshot;
@@ -94,12 +94,13 @@ pub(crate) async fn run_remote_compact_task(
         CompactionImplementation::ResponsesCompact,
         CompactionPhase::StandaloneTurn,
     );
+    let world_state = Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await);
     run_remote_compact_task_inner(
         &sess,
         &step_context,
         /*fallback_step_context*/ None,
         /*turn_state*/ None,
-        InitialContextInjection::DoNotInject,
+        InitialContextInjection::AtStart(world_state),
         compaction_metadata,
     )
     .await?;
@@ -274,9 +275,9 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await;
 
-    let reference_context_item = match initial_context_injection {
+    let reference_context_item = match &initial_context_injection {
         InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::BeforeLastUserMessage(_) => {
+        InitialContextInjection::AtStart(_) | InitialContextInjection::BeforeLastUserMessage(_) => {
             Some(compaction_turn_context.to_turn_context_item())
         }
     };
@@ -318,15 +319,18 @@ pub(crate) async fn process_compacted_history(
     mut compacted_history: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
 ) -> (Vec<ResponseItem>, Option<WorldStateSnapshot>) {
-    // Mid-turn compaction is the only path that must inject initial context above the last user
-    // message in the replacement history. Pre-turn compaction instead injects context after the
-    // compaction item, but mid-turn compaction keeps the compaction item last for model training.
+    // Preserve the caller-selected replacement ordering. The default `AtStart` path retains the
+    // cacheable prompt prefix while still leaving the summary or compaction item last.
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
 
     compacted_history.retain(should_keep_compacted_history_item);
     (
-        insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context),
+        insert_compaction_initial_context(
+            compacted_history,
+            initial_context,
+            initial_context_injection,
+        ),
         world_state_baseline,
     )
 }

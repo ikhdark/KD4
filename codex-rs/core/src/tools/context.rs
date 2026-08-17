@@ -10,7 +10,6 @@ use crate::tools::command_output_artifact::RawOutputArtifact;
 #[cfg(test)]
 use crate::tools::command_output_artifact::ToolOutputArtifactId;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
-use crate::tools::shell_output_summary::normalized_command_failure_diagnostic;
 use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_protocol::mcp::CallToolResult;
@@ -23,7 +22,6 @@ use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_tools::CanonicalToolResult;
 use codex_tools::CodeModeToolSearchStatus;
 use codex_tools::LoadableToolSpec;
-use codex_tools::ToolFailureDiagnostic;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
@@ -500,7 +498,7 @@ impl ToolOutput for AbortedToolOutput {
         match payload {
             ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {
                 call_id: call_id.to_string(),
-                status: "incomplete".to_string(),
+                status: "aborted".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
             },
@@ -520,7 +518,10 @@ impl ToolOutput for AbortedToolOutput {
             ToolPayload::ToolSearch { .. } => {
                 code_mode_tool_search_result(CodeModeToolSearchStatus::Aborted, Vec::new(), None)
             }
-            _ => JsonValue::String(self.message.clone()),
+            _ => serde_json::json!({
+                "status": "aborted",
+                "message": self.message,
+            }),
         }
     }
 }
@@ -578,12 +579,11 @@ impl ToolOutput for ExecCommandToolOutput {
             .raw_output_artifact
             .as_ref()
             .is_some_and(RawOutputArtifact::retention_limit_hit);
-        let (raw_output_artifact_sha256, raw_output_artifact_complete) = self
+        let raw_output_artifact_retention_limit_reason = self
             .raw_output_artifact
             .as_ref()
-            .map_or((None, None), RawOutputArtifact::proof_projection);
+            .and_then(RawOutputArtifact::retention_limit_reason);
         let outcome = self.outcome_for_logging();
-        let failure = self.failure_diagnostic();
         let response_text = self.response_text();
         Some(ToolOutputProjectionMetadata {
             outcome,
@@ -619,11 +619,9 @@ impl ToolOutput for ExecCommandToolOutput {
                 "original_token_count": self.original_token_count,
                 "raw_output_artifact_id": raw_output_artifact_id,
                 "raw_output_artifact_bytes": raw_output_artifact_bytes,
-                "raw_output_artifact_sha256": raw_output_artifact_sha256,
-                "raw_output_artifact_complete": raw_output_artifact_complete,
                 "raw_output_artifact_error": raw_output_artifact_error,
                 "raw_output_artifact_retention_limit_hit": raw_output_artifact_retention_limit_hit,
-                "failure": failure,
+                "raw_output_artifact_retention_limit_reason": raw_output_artifact_retention_limit_reason,
             }),
             requested_limit: self.max_output_tokens,
             predetermined_ranges: predetermined_validation_ranges(
@@ -669,14 +667,6 @@ impl ToolOutput for ExecCommandToolOutput {
         ))
     }
 
-    fn sampling_request_signal(&self) -> Option<JsonValue> {
-        let failure = self.failure_diagnostic()?;
-        Some(serde_json::json!({
-            "outcome": if self.process_id.is_some() { "timeout" } else { "failure" },
-            "failure": failure,
-        }))
-    }
-
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         #[derive(Serialize)]
         struct UnifiedExecCodeModeResult {
@@ -694,15 +684,12 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             raw_output_artifact_bytes: Option<u64>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            raw_output_artifact_sha256: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            raw_output_artifact_complete: Option<bool>,
-            #[serde(skip_serializing_if = "Option::is_none")]
             raw_output_artifact_error: Option<String>,
+            raw_output_artifact_retention_limit_hit: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            raw_output_artifact_retention_limit_reason: Option<&'static str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             repair: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            failure: Option<ToolFailureDiagnostic>,
             output: String,
         }
 
@@ -714,10 +701,6 @@ impl ToolOutput for ExecCommandToolOutput {
                 }
                 None => (None, None, None),
             };
-        let (raw_output_artifact_sha256, raw_output_artifact_complete) = self
-            .raw_output_artifact
-            .as_ref()
-            .map_or((None, None), RawOutputArtifact::proof_projection);
         let model_output = self.projected_model_output();
         let output = self.output_with_reduction_notice(model_output);
         let output = if output.is_empty() {
@@ -742,11 +725,16 @@ impl ToolOutput for ExecCommandToolOutput {
             original_token_count: self.original_token_count,
             raw_output_artifact_id,
             raw_output_artifact_bytes,
-            raw_output_artifact_sha256,
-            raw_output_artifact_complete,
             raw_output_artifact_error,
+            raw_output_artifact_retention_limit_hit: self
+                .raw_output_artifact
+                .as_ref()
+                .is_some_and(RawOutputArtifact::retention_limit_hit),
+            raw_output_artifact_retention_limit_reason: self
+                .raw_output_artifact
+                .as_ref()
+                .and_then(RawOutputArtifact::retention_limit_reason),
             repair: self.repair_notice.clone(),
-            failure: self.failure_diagnostic(),
             output,
         };
 
@@ -757,15 +745,6 @@ impl ToolOutput for ExecCommandToolOutput {
 }
 
 impl ExecCommandToolOutput {
-    fn failure_diagnostic(&self) -> Option<ToolFailureDiagnostic> {
-        normalized_command_failure_diagnostic(
-            String::from_utf8_lossy(&self.raw_output).as_ref(),
-            self.hook_command.as_deref(),
-            self.exit_code,
-            self.process_id.is_some(),
-        )
-    }
-
     fn model_output_limits(&self, raw_output: &str) -> OutputLimitResolution {
         resolve_projected_output_limits(
             self.max_output_tokens,

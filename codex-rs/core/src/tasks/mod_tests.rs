@@ -6,8 +6,6 @@ use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
 use super::merge_completion_review_partial;
-use super::terminal_final_proof_requires_sealing;
-use super::terminal_wait_failure_reason;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
 use crate::state::SamplingAdmission;
@@ -24,8 +22,6 @@ use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTiming;
-use codex_tools::ToolFailureClass;
-use codex_tools::ToolFailureDiagnostic;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -467,62 +463,4 @@ fn emit_compact_metric_records_auto_local() {
             ("type".to_string(), "local".to_string()),
         ])
     );
-}
-#[test]
-fn terminal_final_proof_sealing_is_reserved_for_mutating_tasks() {
-    assert!(!terminal_final_proof_requires_sealing(false));
-    assert!(terminal_final_proof_requires_sealing(true));
-}
-
-#[tokio::test(start_paused = true)]
-async fn terminal_remaining_wait_uses_all_unspent_shared_budget() {
-    let started = tokio::time::Instant::now();
-    let deadline = TerminalDeadline::start();
-
-    assert_eq!(
-        deadline
-            .run(
-                "setup",
-                Duration::from_secs(2),
-                std::future::pending::<()>(),
-            )
-            .await,
-        Err(TerminalWaitError::OperationTimedOut)
-    );
-    assert_eq!(
-        deadline
-            .run_remaining("final_proof_gate", std::future::pending::<()>())
-            .await,
-        Err(TerminalWaitError::DeadlineExhausted)
-    );
-    assert_eq!(
-        tokio::time::Instant::now().saturating_duration_since(started),
-        Duration::from_secs(5)
-    );
-}
-
-#[test]
-fn terminal_wait_failure_reasons_identify_phase_and_timeout_kind() {
-    let operation_timeout: ToolFailureDiagnostic = serde_json::from_str(
-        &terminal_wait_failure_reason("final_proof_gate", TerminalWaitError::OperationTimedOut),
-    )
-    .expect("operation timeout should be a structured completion diagnostic");
-    assert_eq!(operation_timeout.class, ToolFailureClass::Completion);
-    assert_eq!(
-        operation_timeout.fingerprint,
-        "completion.final_proof_gate.operation_timed_out"
-    );
-    assert!(operation_timeout.retryable);
-
-    let exhausted: ToolFailureDiagnostic = serde_json::from_str(&terminal_wait_failure_reason(
-        "final_proof_gate",
-        TerminalWaitError::DeadlineExhausted,
-    ))
-    .expect("deadline exhaustion should be a structured completion diagnostic");
-    assert_eq!(exhausted.class, ToolFailureClass::Completion);
-    assert_eq!(
-        exhausted.fingerprint,
-        "completion.final_proof_gate.deadline_exhausted"
-    );
-    assert!(!exhausted.retryable);
 }

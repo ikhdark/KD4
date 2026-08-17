@@ -76,12 +76,6 @@ pub struct ValidationResult {
     pub failure_excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub failure_signature: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub selected_test_count: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub raw_artifact_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -91,7 +85,6 @@ pub struct ValidationResult {
 
 #[cfg(test)]
 mod tests {
-    use super::ValidationResult;
     use super::ValidationTerminalStatus;
 
     #[test]
@@ -124,56 +117,5 @@ mod tests {
                 ValidationTerminalStatus::Failed
             );
         }
-    }
-
-    #[test]
-    fn evidence_contract_validation_result_preserves_legacy_and_new_fields() {
-        let mut wire = serde_json::json!({
-            "proofKey": {
-                "repository": "repo",
-                "cwd": ".",
-                "canonicalRouteHash": "route",
-                "implementationIdentity": "implementation",
-                "coverageIdentity": "coverage",
-                "environmentIdentity": "environment",
-                "toolchainIdentity": "toolchain",
-                "configurationIdentity": "configuration",
-                "validationContractVersion": 1
-            },
-            "route": {
-                "leaves": [{
-                    "argv": ["cargo", "test", "focused"],
-                    "covered_paths": ["src/owner.rs"],
-                    "covered_contracts": ["focused behavior"],
-                    "timeout_ms": 300000
-                }],
-                "ordering": "stop_on_failure"
-            },
-            "callId": "call-1",
-            "status": "failed",
-            "durationMs": 42,
-            "failureExcerpt": "failed",
-            "freshness": "executed"
-        });
-        let legacy: ValidationResult =
-            serde_json::from_value(wire.clone()).expect("legacy validation result");
-        assert_eq!(legacy.failure_signature, None);
-        assert_eq!(legacy.selected_test_count, None);
-
-        wire["failureSignature"] = serde_json::json!("validation-failure-v1:exit-1:abc");
-        wire["selectedTestCount"] = serde_json::json!(3);
-        let current: ValidationResult =
-            serde_json::from_value(wire).expect("current validation result");
-        assert_eq!(
-            current.failure_signature.as_deref(),
-            Some("validation-failure-v1:exit-1:abc")
-        );
-        assert_eq!(current.selected_test_count, Some(3));
-        let roundtrip = serde_json::to_value(current).expect("validation result roundtrip");
-        assert_eq!(
-            roundtrip["failureSignature"],
-            "validation-failure-v1:exit-1:abc"
-        );
-        assert_eq!(roundtrip["selectedTestCount"], 3);
     }
 }

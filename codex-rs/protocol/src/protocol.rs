@@ -2185,10 +2185,25 @@ pub struct TurnTerminalizationCompleteEvent {
     pub receipt: TurnTerminalizationReceipt,
 }
 
+/// Semantic basis used by request token-category accounting.
+///
+/// Categories describe the complete logical prompt presented to the model.
+/// They do not describe only websocket deltas, newly allocated client memory,
+/// uncached provider input, or reconciliation residuals.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum TurnTimingTokenCategoryBasis {
+    #[default]
+    FullLogicalPrompt,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingRequestTokenCategories {
+    #[serde(default)]
+    pub accounting_basis: TurnTimingTokenCategoryBasis,
     #[serde(default)]
     pub base_instructions: u64,
     #[serde(default)]
@@ -2203,9 +2218,26 @@ pub struct TurnTimingRequestTokenCategories {
     pub skills: u64,
     #[serde(default)]
     pub other_injected_context: u64,
+    /// Sum of the mutually exclusive category estimates above.
     #[serde(default)]
     pub logical_total: u64,
-    /// Tokens in categories whose exact hash matched the prior model request.
+    /// One-pass local estimate over the complete serialized logical prompt.
+    #[serde(default)]
+    pub local_input_estimate: u64,
+    /// `local_input_estimate - logical_total`. This exposes estimator and JSON
+    /// envelope effects instead of silently assigning them to a category.
+    #[serde(default)]
+    pub local_reconciliation_residual: i64,
+    /// Provider-reported full input tokens, when usage was returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub provider_input_tokens: Option<u64>,
+    /// `provider_input_tokens - logical_total`, when provider usage exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub provider_reconciliation_residual: Option<i64>,
+    /// Overlapping diagnostic: logical tokens in categories whose exact hash
+    /// matched the preceding request. This is not added to `logical_total`.
     #[serde(default)]
     pub repeated_unchanged_context: u64,
 }
@@ -2254,19 +2286,19 @@ pub struct TurnTimingModelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub token_usage: Option<TurnTimingProviderTokenUsage>,
-    /// Aggregate-only, locally estimated request composition. No prompt text,
+    /// Aggregate-only full logical prompt accounting. No prompt text,
     /// repository paths, tool arguments, or hashes are persisted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub request_token_categories: Option<TurnTimingRequestTokenCategories>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number", optional)]
+    #[ts(type = "number | null", optional)]
     pub dispatch_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number", optional)]
+    #[ts(type = "number | null", optional)]
     pub first_model_output_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number", optional)]
+    #[ts(type = "number | null", optional)]
     pub completed_ms: Option<u64>,
 }
 
@@ -4054,16 +4086,6 @@ pub struct SessionContextWindow {
     pub window_id: String,
 }
 
-/// Build identity of the executable that created a rollout.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
-pub struct SessionBuildInfo {
-    pub binary: String,
-    pub commit: String,
-    pub dirty: String,
-    pub profile: String,
-    pub built: String,
-}
-
 impl SessionContextWindow {
     pub fn new(window_id: String) -> Self {
         Self { window_id }
@@ -4087,8 +4109,6 @@ pub struct SessionMeta {
     pub cwd: PathBuf,
     pub originator: String,
     pub cli_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_info: Option<SessionBuildInfo>,
     #[serde(default)]
     pub source: SessionSource,
     /// Optional analytics source classification for this thread.
@@ -4140,7 +4160,6 @@ impl Default for SessionMeta {
             cwd: PathBuf::new(),
             originator: String::new(),
             cli_version: String::new(),
-            build_info: None,
             source: SessionSource::default(),
             thread_source: None,
             agent_nickname: None,
@@ -4223,53 +4242,6 @@ pub enum RolloutItem {
 /// position in the rollout is the history prefix transmitted by that attempt.
 /// An unresolved marker makes reconstructed context provenance conservative.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
-pub struct HistoryProjectionManifest {
-    pub version: u16,
-    pub source_history_sha256: String,
-    pub projected_history_sha256: String,
-    #[serde(default)]
-    pub stable_projection_enabled: bool,
-    #[serde(default)]
-    pub stable_fail_open: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stable_fallback_used: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub stable_context: Vec<StableContextProjectionRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_checkpoint_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub task_replacements: Vec<HistoryProjectionReplacement>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_receipts: Vec<ToolReceiptProjectionRecord>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
-pub struct StableContextProjectionRecord {
-    pub kind: String,
-    pub contract_version: u16,
-    pub semantic_id: String,
-    pub content_sha256: String,
-    pub disposition: String,
-    pub active: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
-pub struct HistoryProjectionReplacement {
-    pub source_item_index: u64,
-    pub source_sha256: String,
-    pub replacement_class: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
-pub struct ToolReceiptProjectionRecord {
-    pub source_item_index: u64,
-    pub call_id: String,
-    pub receipt_id: String,
-    pub source_output_sha256: String,
-    pub substituted_output_sha256: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
 pub struct SamplingBoundaryItem {
     pub sampling_request_id: String,
     pub physical_attempt_id: String,
@@ -4277,8 +4249,6 @@ pub struct SamplingBoundaryItem {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub unresolved_context: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection_manifest: Option<HistoryProjectionManifest>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -4302,12 +4272,77 @@ pub struct TurnContextProvenance {
     pub fragment_digests: Vec<ContextFragmentDigest>,
 }
 
-/// Canonical tool surface used for a model request. The hash is computed from
-/// the recursively key-sorted manifest value.
+/// Canonical tool surface used for a model request.
+///
+/// The first occurrence of a hash carries either `manifest` or a delta from
+/// `base_hash`. Later occurrences carry only `hash` and act as references.
+/// Legacy records with a required `manifest` field remain valid full entries.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
 pub struct ToolManifestItem {
     pub hash: String,
-    pub manifest: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<ToolManifestDeltaEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<ToolManifestDeltaRemoval>,
+}
+
+impl ToolManifestItem {
+    pub fn full(hash: String, manifest: Value) -> Self {
+        Self {
+            hash,
+            manifest: Some(manifest),
+            base_hash: None,
+            added: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+
+    pub fn reference(hash: String) -> Self {
+        Self {
+            hash,
+            manifest: None,
+            base_hash: None,
+            added: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+
+    pub fn delta(
+        hash: String,
+        base_hash: String,
+        added: Vec<ToolManifestDeltaEntry>,
+        removed: Vec<ToolManifestDeltaRemoval>,
+    ) -> Self {
+        Self {
+            hash,
+            manifest: None,
+            base_hash: Some(base_hash),
+            added,
+            removed,
+        }
+    }
+
+    pub fn is_reference(&self) -> bool {
+        self.manifest.is_none() && self.base_hash.is_none()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+pub struct ToolManifestDeltaEntry {
+    pub collection: String,
+    pub name: String,
+    pub index: usize,
+    pub value: Value,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, JsonSchema, TS)]
+pub struct ToolManifestDeltaRemoval {
+    pub collection: String,
+    pub name: String,
 }
 
 /// Persisted comparison state used to resume model-visible world-state diffing.
@@ -5588,6 +5623,17 @@ mod tests {
         counters.remove("suppressedDeterministicContinuationCount");
         counters.remove("attemptsByKind");
         for field in [
+            "architectureSliceAttemptCount",
+            "architectureSliceCompleteCount",
+            "architectureRelationshipCount",
+            "architectureInvariantCount",
+            "architectureMissingRequirementCount",
+            "architectureMaterialUnknownCount",
+            "architectureStaleSnapshotCount",
+            "architectureToolCallCount",
+            "architectureFilesRead",
+            "architectureBytesRead",
+            "architectureLateRelationshipDiscoveryCount",
             "waitOnlyGenerationCount",
             "internallyDrainedWaitCount",
             "noProgressDirectiveCount",
@@ -5642,6 +5688,9 @@ mod tests {
         assert_eq!(decoded.counters.internally_drained_wait_count, 0);
         assert_eq!(decoded.counters.no_progress_directive_count, 0);
         assert_eq!(decoded.counters.proven_loop_activation_count, 0);
+        assert_eq!(decoded.counters.architecture_slice_attempt_count, 0);
+        assert_eq!(decoded.counters.architecture_tool_call_count, 0);
+        assert_eq!(decoded.counters.architecture_bytes_read, 0);
         assert_eq!(decoded.counters.tool_output_truncation_count, 0);
         assert_eq!(decoded.counters.tool_output_projected_token_count, 0);
         assert_eq!(decoded.counters.tool_output_artifact_reread_count, 0);
@@ -7109,91 +7158,11 @@ mod tests {
         }))?;
 
         assert_eq!(session_meta.history_mode, ThreadHistoryMode::Legacy);
-        assert_eq!(session_meta.build_info, None);
         let serialized = serde_json::to_value(&session_meta)?;
         assert_eq!(serialized["history_mode"], json!("legacy"));
         let mut unknown = serialized;
         unknown["history_mode"] = json!("future");
         assert!(serde_json::from_value::<SessionMeta>(unknown).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn sampling_boundary_defaults_projection_manifest_for_legacy_payload() -> Result<()> {
-        let boundary: SamplingBoundaryItem = serde_json::from_value(json!({
-            "sampling_request_id": "request",
-            "physical_attempt_id": "attempt",
-            "unresolved_context": true
-        }))?;
-
-        assert_eq!(boundary.projection_manifest, None);
-        Ok(())
-    }
-
-    #[test]
-    fn sampling_boundary_round_trips_projection_manifest() -> Result<()> {
-        let boundary = SamplingBoundaryItem {
-            sampling_request_id: "request".to_string(),
-            physical_attempt_id: "attempt".to_string(),
-            turn_id: Some("turn".to_string()),
-            unresolved_context: true,
-            projection_manifest: Some(HistoryProjectionManifest {
-                version: 1,
-                source_history_sha256: "source".to_string(),
-                projected_history_sha256: "projected".to_string(),
-                stable_projection_enabled: false,
-                stable_fail_open: false,
-                stable_fallback_used: true,
-                stable_context: vec![StableContextProjectionRecord {
-                    kind: "repository".to_string(),
-                    contract_version: 1,
-                    semantic_id: "semantic".to_string(),
-                    content_sha256: "content".to_string(),
-                    disposition: "replaced".to_string(),
-                    active: true,
-                }],
-                task_checkpoint_sha256: Some("checkpoint".to_string()),
-                task_replacements: vec![HistoryProjectionReplacement {
-                    source_item_index: 3,
-                    source_sha256: "item".to_string(),
-                    replacement_class: "plan_output".to_string(),
-                }],
-                tool_receipts: vec![ToolReceiptProjectionRecord {
-                    source_item_index: 5,
-                    call_id: "call".to_string(),
-                    receipt_id: "receipt".to_string(),
-                    source_output_sha256: "raw".to_string(),
-                    substituted_output_sha256: "substituted".to_string(),
-                }],
-            }),
-        };
-
-        let encoded = serde_json::to_value(&boundary)?;
-        assert_eq!(
-            serde_json::from_value::<SamplingBoundaryItem>(encoded)?,
-            boundary
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn session_meta_round_trips_build_info() -> Result<()> {
-        let session_meta = SessionMeta {
-            build_info: Some(SessionBuildInfo {
-                binary: "codex.exe".to_string(),
-                commit: "0123456789ab".to_string(),
-                dirty: "true".to_string(),
-                profile: "release".to_string(),
-                built: "2026-08-15T18:17:42Z".to_string(),
-            }),
-            ..SessionMeta::default()
-        };
-
-        let serialized = serde_json::to_value(&session_meta)?;
-        assert_eq!(serialized["build_info"]["binary"], "codex.exe");
-        assert_eq!(serialized["build_info"]["commit"], "0123456789ab");
-        let deserialized: SessionMeta = serde_json::from_value(serialized)?;
-        assert_eq!(deserialized.build_info, session_meta.build_info);
         Ok(())
     }
 
@@ -7682,6 +7651,47 @@ mod tests {
     }
 
     #[test]
+    fn request_token_categories_define_full_prompt_basis_and_round_trip_residuals() {
+        let historical: TurnTimingModelRequest = serde_json::from_value(serde_json::json!({
+            "isContinuation": false
+        }))
+        .expect("historical request timing");
+        assert!(historical.request_token_categories.is_none());
+
+        let current = TurnTimingModelRequest {
+            request_token_categories: Some(TurnTimingRequestTokenCategories {
+                accounting_basis: TurnTimingTokenCategoryBasis::FullLogicalPrompt,
+                base_instructions: 10,
+                tool_schemas: 20,
+                conversation_history: 30,
+                logical_total: 60,
+                local_input_estimate: 62,
+                local_reconciliation_residual: 2,
+                provider_input_tokens: Some(64),
+                provider_reconciliation_residual: Some(4),
+                repeated_unchanged_context: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&current).expect("serialize request timing");
+        assert_eq!(
+            value["requestTokenCategories"]["accountingBasis"],
+            "full_logical_prompt"
+        );
+        assert_eq!(value["requestTokenCategories"]["toolSchemas"], 20);
+        assert_eq!(
+            value["requestTokenCategories"]["providerReconciliationResidual"],
+            4
+        );
+        assert_eq!(
+            serde_json::from_value::<TurnTimingModelRequest>(value)
+                .expect("deserialize request timing"),
+            current
+        );
+    }
+
+    #[test]
     fn progress_kind_wire_contract_is_exact_and_retired_spellings_remain_readable() {
         let kinds = [
             TurnTimingProgressKind::WorkspaceMutation,
@@ -7799,32 +7809,6 @@ mod tests {
                 .get("ownerProvedPredeterminedContinuation")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn model_request_token_categories_are_additive_and_round_trip() {
-        let historical: TurnTimingModelRequest = serde_json::from_value(serde_json::json!({
-            "isContinuation": false
-        }))
-        .expect("historical request timing");
-        assert!(historical.request_token_categories.is_none());
-
-        let current = TurnTimingModelRequest {
-            request_token_categories: Some(TurnTimingRequestTokenCategories {
-                base_instructions: 10,
-                tool_schemas: 20,
-                conversation_history: 30,
-                logical_total: 60,
-                repeated_unchanged_context: 30,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let value = serde_json::to_value(&current).expect("serialize request timing");
-        assert_eq!(value["requestTokenCategories"]["toolSchemas"], 20);
-        let decoded: TurnTimingModelRequest =
-            serde_json::from_value(value).expect("deserialize request timing");
-        assert_eq!(decoded, current);
     }
 
     #[test]
@@ -7955,6 +7939,29 @@ mod tests {
             serde_json::from_value::<CodexErrorInfo>(serde_json::json!("session_budget_exceeded"))
                 .expect("retired session budget error"),
             CodexErrorInfo::Other,
+        );
+    }
+
+    #[test]
+    fn legacy_full_tool_manifest_remains_readable() {
+        let value = serde_json::json!({
+            "hash": "legacy-hash",
+            "manifest": {"model_visible": [], "registered": []}
+        });
+
+        let item: ToolManifestItem =
+            serde_json::from_value(value.clone()).expect("legacy full manifest");
+
+        assert_eq!(
+            item,
+            ToolManifestItem::full(
+                "legacy-hash".to_string(),
+                serde_json::json!({"model_visible": [], "registered": []}),
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(item).expect("serialize manifest"),
+            value
         );
     }
 }

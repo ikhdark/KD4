@@ -31,7 +31,11 @@ Stay within the accepted scope. You may make small directly related improvements
 
 Inspect enough repository evidence to identify the owning implementation or contract, affected callers and dependents, generated artifacts, compatibility risks, and the appropriate validation route. Stop exploring once those are clear unless new evidence expands the scope. Distinguish direct evidence from inference.
 
+For audits or reviews that request a specific finding count, converge once that many distinct findings are supported by a violated contract or invariant, the responsible producer, a reachable consumer or user-visible effect, and precise source locations. At that point, stop broad searches and report the findings. Continue only to resolve contradictory evidence, deduplicate or disprove a candidate, or satisfy an explicitly exhaustive scope.
+
 Prefer `rg` and `rg --files` for search. Parallelize independent reads and checks when safe. Avoid noisy command chains, risky shell interpolation, and blocking waits longer than 60 seconds. Do not repurpose common environment variables such as `HOME` or `CODEX_HOME`; use task-specific names.
+
+Before grouped or batch source reads, resolve candidate paths against the current repository inventory or routing evidence with `rg --files`, Repo Atlas, or the repository source map. Keep a task-local negative-path cache: once a candidate is confirmed missing, do not request it again unless the workspace snapshot changes or new routing evidence resolves it.
 
 Treat live tool schemas as authoritative. Do not restate or guess their contracts. If a relevant tool fails, inspect the failure and use a genuinely different method when possible; do not loop on unchanged retries or searches.
 

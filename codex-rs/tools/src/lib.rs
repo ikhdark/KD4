@@ -29,8 +29,6 @@ pub use code_mode::tool_spec_to_code_mode_tool_definition;
 pub use codex_protocol::ToolName;
 pub use dynamic_tool::parse_dynamic_tool;
 pub use function_call_error::FunctionCallError;
-pub use function_call_error::ToolFailureClass;
-pub use function_call_error::ToolFailureDiagnostic;
 pub use image_detail::can_request_original_image_detail;
 pub use image_detail::normalize_output_image_detail;
 pub use image_detail::sanitize_original_image_detail;

@@ -84,6 +84,35 @@ fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
     h
 }
 
+#[test]
+fn prepared_history_fingerprint_ignores_rollout_turn_ids() {
+    let item = |turn_id: &str| ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "unchanged model-visible history".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some(turn_id.to_string()),
+        }),
+    };
+    let policy = PreparedHistoryPolicy {
+        version: PREPARED_HISTORY_POLICY_VERSION,
+        supports_images: true,
+        stable_context_target: StableContextTarget::Sampling,
+    };
+
+    let first =
+        prepared_history_fingerprint(&[item("turn-a")], &StableContextManifest::default(), policy)
+            .expect("history should hash");
+    let second =
+        prepared_history_fingerprint(&[item("turn-b")], &StableContextManifest::default(), policy)
+            .expect("history should hash");
+
+    assert_eq!(first, second);
+}
+
 struct TestWorldStateSection;
 
 impl WorldStateSection for TestWorldStateSection {

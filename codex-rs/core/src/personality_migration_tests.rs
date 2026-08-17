@@ -51,7 +51,6 @@ async fn write_rollout_with_user_event(dir: &Path, thread_id: ThreadId) -> io::R
             cwd: std::path::PathBuf::from("."),
             originator: "test_originator".to_string(),
             cli_version: "test_version".to_string(),
-            build_info: None,
             source: SessionSource::Cli,
             thread_source: None,
             agent_path: None,

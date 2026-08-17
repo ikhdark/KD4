@@ -16,8 +16,6 @@ use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
 use codex_tools::TOOL_SEARCH_DEFAULT_LIMIT;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
-use codex_tools::ToolFailureClass;
-use codex_tools::ToolFailureDiagnostic;
 use codex_tools::ToolName;
 use codex_tools::ToolSearchEntry;
 use codex_tools::ToolSearchInfo;
@@ -219,17 +217,9 @@ impl ToolSearchHandler {
         let args = match payload {
             ToolPayload::ToolSearch { arguments } => arguments,
             _ => {
-                return Err(FunctionCallError::Diagnostic(
-                    ToolFailureDiagnostic::fatal(
-                        ToolFailureClass::InvalidPayload,
-                        "tool_search.invalid_payload",
-                        format!("{TOOL_SEARCH_TOOL_NAME} handler received unsupported payload"),
-                    )
-                    .with_owner_hint("shared tool payload conversion")
-                    .with_next_action(
-                        "inspect the direct and nested payload conversion route; do not retry unchanged input",
-                    ),
-                ));
+                return Err(FunctionCallError::Fatal(format!(
+                    "{TOOL_SEARCH_TOOL_NAME} handler received unsupported payload"
+                )));
             }
         };
 
@@ -758,21 +748,11 @@ fn loadable_tool_spec_diversity_key(spec: &LoadableToolSpec) -> ToolSearchDivers
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::step_context::StepContext;
-    use crate::session::tests::make_session_and_context;
-    use crate::tools::code_mode::build_nested_tool_payload;
-    use crate::tools::context::ToolCallSource;
-    use crate::tools::context::ToolOutput;
     use crate::tools::handlers::DynamicToolHandler;
     use crate::tools::handlers::McpHandler;
-    use crate::tools::router::ToolRouter;
-    use crate::turn_diff_tracker::TurnDiffTracker;
-    use codex_code_mode::CodeModeToolKind;
     use codex_mcp::ToolInfo;
     use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
     use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
-    use codex_protocol::models::ResponseInputItem;
-    use codex_protocol::models::ResponseItem;
     use codex_tools::ResponsesApiNamespace;
     use codex_tools::ResponsesApiNamespaceTool;
     use codex_tools::ResponsesApiTool;
@@ -780,91 +760,7 @@ mod tests {
     use codex_tools::ToolSearchSourceInfo;
     use pretty_assertions::assert_eq;
     use rmcp::model::Tool;
-    use serde_json::json;
     use std::sync::Arc;
-    use tokio::sync::Mutex as AsyncMutex;
-    use tokio_util::sync::CancellationToken;
-
-    async fn handle_adapter_payload(
-        payload: ToolPayload,
-        source: ToolCallSource,
-    ) -> Box<dyn ToolOutput> {
-        let (session, turn) = make_session_and_context().await;
-        let turn = Arc::new(turn);
-        ToolSearchHandler::new(vec![search_info(
-            "calendar events",
-            None,
-            "calendar",
-            "create_event",
-        )])
-        .handle(ToolInvocation {
-            session: session.into(),
-            step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
-            cancellation_token: CancellationToken::new(),
-            tracker: Arc::new(AsyncMutex::new(TurnDiffTracker::new())),
-            call_id: "search-adapter".to_string(),
-            tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
-            source,
-            payload,
-        })
-        .await
-        .expect("adapter payload should execute through the tool_search handler")
-    }
-
-    #[tokio::test]
-    async fn direct_tool_search_adapter_executes_handler_output() {
-        let call = ToolRouter::build_tool_call(ResponseItem::ToolSearchCall {
-            id: None,
-            call_id: Some("search-direct".to_string()),
-            status: None,
-            execution: "client".to_string(),
-            arguments: json!({"query": "calendar events", "limit": 1}),
-            internal_chat_message_metadata_passthrough: None,
-        })
-        .expect("direct tool_search arguments should deserialize")
-        .expect("client tool_search should produce a call");
-        let output = handle_adapter_payload(call.payload.clone(), ToolCallSource::Direct).await;
-
-        let ResponseInputItem::ToolSearchOutput {
-            call_id,
-            status,
-            execution,
-            tools,
-        } = output.to_response_item(&call.call_id, &call.payload)
-        else {
-            panic!("direct tool_search should return ToolSearchOutput");
-        };
-        assert_eq!(call_id, "search-direct");
-        assert_eq!(status, "completed");
-        assert_eq!(execution, "client");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "mcp__calendar");
-    }
-
-    #[tokio::test]
-    async fn nested_tool_search_adapter_executes_code_mode_output() {
-        let payload = build_nested_tool_payload(
-            CodeModeToolKind::Function,
-            &ToolName::plain(TOOL_SEARCH_TOOL_NAME),
-            Some(json!({"query": "calendar events", "limit": 1})),
-        )
-        .expect("nested tool_search arguments should deserialize");
-        let output = handle_adapter_payload(
-            payload.clone(),
-            ToolCallSource::CodeMode {
-                cell_id: "cell-search".to_string(),
-                runtime_tool_call_id: "runtime-search".to_string(),
-            },
-        )
-        .await;
-
-        let result = output.code_mode_result(&payload);
-        assert_eq!(result["status"], "completed");
-        assert_eq!(result["execution"], "client");
-        assert_eq!(result["omitted_result_count"], 0);
-        assert_eq!(result["tools"][0]["name"], "mcp__calendar");
-    }
 
     #[test]
     fn cache_reuses_handler_for_identical_search_infos_and_rebuilds_for_changes() {
