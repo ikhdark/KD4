@@ -11,6 +11,13 @@ use uuid::Uuid;
 
 use super::*;
 
+#[test]
+fn editing_and_tool_calls_are_meaningful_progress() {
+    assert!(ObservationKind::Editing.is_meaningful_progress());
+    assert!(ObservationKind::ToolCall.is_meaningful_progress());
+    assert!(!ObservationKind::Starting.is_meaningful_progress());
+}
+
 struct Fixture {
     _codex_home: TempDir,
     repo: TempDir,
@@ -3717,7 +3724,7 @@ fn risk_gate_uses_canonical_concurrent_drift_reason() {
 }
 
 #[tokio::test]
-async fn relevant_drift_supersedes_validation_but_unrelated_drift_preserves_it() {
+async fn relevant_and_dependency_drift_supersede_validation() {
     let relevant = Fixture::new().await;
     std::fs::create_dir_all(relevant.repo.path().join("src")).expect("src directory");
     std::fs::write(relevant.repo.path().join("src/a.rs"), "before\n").expect("a fixture");
@@ -3782,7 +3789,7 @@ async fn relevant_drift_supersedes_validation_but_unrelated_drift_preserves_it()
         )
         .await
         .expect("unrelated assignment");
-    finish_focused_validation(
+    let unrelated_call = finish_focused_validation(
         &unrelated.store,
         start_focused_validation(
             &unrelated.store,
@@ -3793,6 +3800,19 @@ async fn relevant_drift_supersedes_validation_but_unrelated_drift_preserves_it()
         .await,
     )
     .await;
+    assert_eq!(
+        unrelated_call.evidence.dependency_manifest_hash,
+        unrelated_call
+            .evidence
+            .execution_snapshot
+            .as_ref()
+            .expect("execution snapshot")
+            .manifest_hash
+    );
+    assert_ne!(
+        unrelated_call.evidence.dependency_manifest_hash,
+        unrelated_call.evidence.covered_input_manifest_hash
+    );
     std::fs::write(unrelated.repo.path().join("src/b.rs"), "external change\n")
         .expect("unrelated external change");
     unrelated
@@ -3800,32 +3820,15 @@ async fn relevant_drift_supersedes_validation_but_unrelated_drift_preserves_it()
         .capture_workspace_revision(unrelated.repo.path(), vec!["src/b.rs".to_string()])
         .await
         .expect("unrelated drift is detected");
-    unrelated
+    let error = unrelated
         .store
         .submit_agent_receipt(
             unrelated_attempt.attempt_id,
             completed_receipt(vec!["unrelated-validation".to_string()]),
         )
         .await
-        .expect("narrow proof survives unrelated drift");
-    std::fs::write(
-        unrelated.repo.path().join("src/b.rs"),
-        "later unrelated change\n",
-    )
-    .expect("later unrelated external change");
-    unrelated
-        .store
-        .capture_workspace_revision(unrelated.repo.path(), vec!["src/b.rs".to_string()])
-        .await
-        .expect("later unrelated drift is detected");
-    assert!(
-        unrelated
-            .store
-            .check_quiescence("unrelated-root".to_string())
-            .await
-            .expect("unrelated post-receipt drift remains quiescent")
-            .quiescent
-    );
+        .expect_err("dependency drift supersedes narrow proof");
+    assert!(matches!(error, StoreError::EvidenceSuperseded { .. }));
 
     let sealed = Fixture::new().await;
     std::fs::create_dir_all(sealed.repo.path().join("src")).expect("src directory");
@@ -3875,7 +3878,7 @@ async fn relevant_drift_supersedes_validation_but_unrelated_drift_preserves_it()
 }
 
 #[tokio::test]
-async fn in_flight_validation_supersedes_only_relevant_drift() {
+async fn in_flight_validation_supersedes_repository_dependency_drift() {
     let command = "cargo test -p owner narrow";
 
     let disjoint = Fixture::new().await;
@@ -3912,7 +3915,7 @@ async fn in_flight_validation_supersedes_only_relevant_drift() {
         finish_focused_validation(&disjoint.store, disjoint_call)
             .await
             .status,
-        ValidationCallStatus::Succeeded
+        ValidationCallStatus::Superseded
     );
 
     let relevant = Fixture::new().await;
@@ -4127,7 +4130,7 @@ async fn repository_wide_capture_detects_an_external_revert_missing_from_git_ove
             .iter()
             .map(|entry| entry.path.as_str())
             .collect::<Vec<_>>(),
-        vec!["src/lib.rs"]
+        vec![REPOSITORY_WIDE_PATH, "src/lib.rs"]
     );
 
     std::fs::write(fixture.repo.path().join("src/lib.rs"), "base\n").expect("external revert");
@@ -4143,7 +4146,7 @@ async fn repository_wide_capture_detects_an_external_revert_missing_from_git_ove
             .iter()
             .map(|entry| entry.path.as_str())
             .collect::<Vec<_>>(),
-        vec!["src/lib.rs"]
+        vec![REPOSITORY_WIDE_PATH, "src/lib.rs"]
     );
     let events = fixture
         .store
@@ -4154,6 +4157,60 @@ async fn repository_wide_capture_detects_an_external_revert_missing_from_git_ove
         event.actor_kind == WorkspaceActorKind::External
             && event.attribution_confidence == AttributionConfidence::DetectionOnly
             && event.paths == vec!["src/lib.rs".to_string()]
+    }));
+}
+
+#[tokio::test]
+async fn repository_wide_capture_detects_clean_head_change() {
+    let fixture = Fixture::new().await;
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(fixture.repo.path())
+            .args(args)
+            .output()
+            .expect("git command launches")
+    };
+    assert!(git(&["init", "-q"]).status.success());
+    assert!(
+        git(&["config", "user.email", "coordination@example.invalid"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&["config", "user.name", "Coordination Test"])
+            .status
+            .success()
+    );
+    std::fs::write(fixture.repo.path().join("tracked.txt"), "first\n").expect("first revision");
+    assert!(git(&["add", "tracked.txt"]).status.success());
+    assert!(git(&["commit", "-qm", "first"]).status.success());
+
+    let first = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
+        .await
+        .expect("first head is captured");
+    std::fs::write(fixture.repo.path().join("tracked.txt"), "second\n").expect("second revision");
+    assert!(git(&["add", "tracked.txt"]).status.success());
+    assert!(git(&["commit", "-qm", "second"]).status.success());
+
+    let second = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
+        .await
+        .expect("second head is captured");
+    assert!(second.epoch > first.epoch);
+    assert_ne!(first.manifest_hash, second.manifest_hash);
+    let events = fixture
+        .store
+        .read_workspace_events(fixture.repo.path(), first.epoch)
+        .await
+        .expect("head drift event reads");
+    assert!(events.iter().any(|event| {
+        event.actor_kind == WorkspaceActorKind::External
+            && event.attribution_confidence == AttributionConfidence::DetectionOnly
+            && event.paths == vec![REPOSITORY_WIDE_PATH.to_string()]
     }));
 }
 

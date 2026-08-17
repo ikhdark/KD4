@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -275,7 +276,17 @@ impl TurnDiffTracker {
         // A command can write before failing or timing out, so known mutators
         // always invalidate exact diff/freshness state.
         if possible_mutation {
-            self.record_unknown_mutation();
+            if let Some(paths) = command_mutation_paths(command, cwd) {
+                self.record_mutation(
+                    paths
+                        .iter()
+                        .map(|path| TrackedPath::new(environment_id, path))
+                        .collect(),
+                );
+                self.invalidate();
+            } else {
+                self.record_unknown_mutation();
+            }
         }
 
         let is_post_mutation = was_post_mutation || self.has_unvalidated_mutation();
@@ -1447,6 +1458,8 @@ fn is_format_only_command(command: &[String]) -> bool {
 fn looks_like_mutating_command(command: &[String]) -> bool {
     let normalized = normalized_command_tokens(command);
     let unwrapped = unwrap_command_tokens(&normalized);
+    let format_check =
+        is_format_only_command(command) && unwrapped.iter().any(|token| token == "--check");
     let mutating_format =
         is_format_only_command(command) && !unwrapped.iter().any(|token| token == "--check");
     let mutating_just_recipe = matches!(
@@ -1458,7 +1471,32 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
     if mutating_format || mutating_just_recipe {
         return true;
     }
-    if codex_shell_command::is_safe_command::is_known_safe_command(command) {
+    if validation_command_may_mutate(unwrapped) {
+        return true;
+    }
+    if let Some(subcommand) = git_subcommand(unwrapped) {
+        if matches!(
+            subcommand,
+            "add"
+                | "apply"
+                | "checkout"
+                | "clean"
+                | "commit"
+                | "merge"
+                | "mv"
+                | "rebase"
+                | "reset"
+                | "restore"
+                | "rm"
+                | "switch"
+        ) {
+            return true;
+        }
+        if is_read_only_git_subcommand(subcommand) {
+            return false;
+        }
+    }
+    if format_check || codex_shell_command::is_safe_command::is_known_safe_command(command) {
         return false;
     }
 
@@ -1524,7 +1562,7 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
         return true;
     }
 
-    tokens.windows(2).any(|window| match window {
+    if tokens.windows(2).any(|window| match window {
         [first, second]
             if command_basename(first) == "git"
                 && matches!(
@@ -1555,11 +1593,203 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
             true
         }
         _ => false,
-    })
+    }) {
+        return true;
+    }
+
+    // Mutation freshness must fail closed. The command-safety classifier above
+    // proves known inspection commands read-only, and validation commands are
+    // separately recognized by their exact runners. Any remaining executable
+    // may be an arbitrary script or generator, so treating it as read-only can
+    // leave stale source evidence live after an edit.
+    !is_validation_command(command)
 }
 
 pub(crate) fn command_may_mutate(command: &[String]) -> bool {
     looks_like_mutating_command(command)
+}
+
+pub(crate) fn command_reads_repository_history(command: &[String]) -> bool {
+    let normalized = normalized_command_tokens(command);
+    let unwrapped = unwrap_command_tokens(&normalized);
+    matches!(git_subcommand(unwrapped), Some("log" | "show" | "shortlog"))
+        && !unwrapped
+            .iter()
+            .any(|token| matches!(token.as_str(), "-g" | "--walk-reflogs" | "--reflog"))
+}
+
+fn validation_command_may_mutate(tokens: &[String]) -> bool {
+    let tokens = if matches!(tokens, [first, second, ..] if first == "uv" && second == "run") {
+        &tokens[2..]
+    } else {
+        tokens
+    };
+    let Some(first) = tokens.first().map(|token| command_basename(token)) else {
+        return false;
+    };
+    if matches!(first, "npm" | "pnpm" | "yarn") && is_validation_tokens(tokens) {
+        // Package scripts are arbitrary programs even when their names contain
+        // `test`, `lint`, or `build`; they may update snapshots or generated files.
+        return true;
+    }
+    if first == "eslint"
+        && tokens
+            .iter()
+            .any(|token| token == "--fix" || token.starts_with("--fix="))
+    {
+        return true;
+    }
+    if first == "ruff"
+        && tokens.iter().any(|token| {
+            matches!(token.as_str(), "--fix" | "--fix-only") || token.starts_with("--fix=")
+        })
+    {
+        return true;
+    }
+    matches!(first, "jest" | "vitest" | "playwright" | "pytest")
+        && tokens.iter().any(|token| {
+            token == "-u"
+                || matches!(
+                    token.as_str(),
+                    "--update-snapshot"
+                        | "--update-snapshots"
+                        | "--updatesnapshot"
+                        | "--snapshot-update"
+                )
+                || (token.contains("snapshot") && token.contains("update"))
+        })
+}
+
+fn git_subcommand(tokens: &[String]) -> Option<&str> {
+    let git = tokens
+        .iter()
+        .position(|token| command_basename(token) == "git")?;
+    let mut index = git.saturating_add(1);
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if matches!(
+            token,
+            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+        ) {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if matches!(
+            token,
+            "--no-pager"
+                | "--paginate"
+                | "-p"
+                | "--literal-pathspecs"
+                | "--no-literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+        ) || token.starts_with("--git-dir=")
+            || token.starts_with("--work-tree=")
+            || token.starts_with("--namespace=")
+            || token.starts_with("--exec-path=")
+            || token.starts_with("--config-env=")
+        {
+            index = index.saturating_add(1);
+            continue;
+        }
+        return (!token.starts_with('-')).then_some(token);
+    }
+    None
+}
+
+fn is_read_only_git_subcommand(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "cat-file"
+            | "describe"
+            | "diff"
+            | "for-each-ref"
+            | "grep"
+            | "log"
+            | "ls-files"
+            | "ls-tree"
+            | "name-rev"
+            | "rev-parse"
+            | "shortlog"
+            | "show"
+            | "status"
+    )
+}
+
+/// Returns exact paths only for simple, direct mutators whose operands can be
+/// interpreted without shell expansion. Complex scripts deliberately fall back
+/// to unknown mutation invalidation.
+pub(crate) fn command_mutation_paths(
+    command: &[String],
+    cwd: Option<&Path>,
+) -> Option<BTreeSet<PathBuf>> {
+    if !looks_like_mutating_command(command) || command.is_empty() {
+        return None;
+    }
+    let program = command_basename(&command[0].to_ascii_lowercase()).to_string();
+    let args = &command[1..];
+    if args.iter().any(|arg| {
+        arg.contains(['*', '?', '|', '>', '<', ';', '&', '$', '`']) || arg.starts_with('@')
+    }) {
+        return None;
+    }
+
+    let operands = match program.as_str() {
+        "touch" | "truncate" | "mkdir" | "md" | "rmdir" | "rd" | "rm" | "del" | "erase" => {
+            simple_path_operands(args)?
+        }
+        "cp" | "mv" => {
+            let paths = simple_path_operands(args)?;
+            (paths.len() >= 2).then_some(paths)?
+        }
+        "chmod" | "chown" | "chgrp" => {
+            let operands = simple_path_operands(args)?;
+            (operands.len() >= 2).then(|| operands.into_iter().skip(1).collect())?
+        }
+        "rustfmt" | "prettier" if !args.iter().any(|arg| arg == "--check") => {
+            simple_path_operands(args)?
+        }
+        _ => return None,
+    };
+    let paths = operands
+        .into_iter()
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                cwd.map(|cwd| cwd.join(path))
+            }
+        })
+        .collect::<Option<BTreeSet<_>>>()?;
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn simple_path_operands(args: &[String]) -> Option<Vec<String>> {
+    let mut operands = Vec::new();
+    let mut options_ended = false;
+    for arg in args {
+        if !options_ended && arg == "--" {
+            options_ended = true;
+        } else if !options_ended && arg.starts_with('-') {
+            if !matches!(
+                arg.as_str(),
+                "-f" | "--force"
+                    | "-r"
+                    | "-R"
+                    | "--recursive"
+                    | "-p"
+                    | "--parents"
+                    | "-v"
+                    | "--verbose"
+            ) {
+                return None;
+            }
+        } else {
+            operands.push(arg.clone());
+        }
+    }
+    Some(operands)
 }
 
 fn normalized_command_tokens(command: &[String]) -> Vec<String> {

@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Audit model-side and tool execution latency in Codex rollout JSONL files."""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import json
+import os
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+
+REPORT_SCHEMA_VERSION = 1
+
+
+def _path_key(path: str | os.PathLike[str]) -> str:
+    value = os.path.normpath(os.fspath(path)).replace("\\", "/").rstrip("/")
+    if ":" in value[:3] or "\\" in os.fspath(path):
+        return value.casefold()
+    return value
+
+
+def _population(cwd: str, repo_root: str) -> str:
+    cwd_key = _path_key(cwd)
+    root_key = _path_key(repo_root)
+    if cwd_key == root_key:
+        return "repository_root"
+    if cwd_key.startswith(f"{root_key}/.codex/evals/"):
+        return "eval"
+    return "other"
+
+
+def _terminal_record(
+    file: Path, line_number: int, timestamp: Any, cwd: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "file": str(file),
+        "line": line_number,
+        "timestamp": timestamp,
+        "turn_id": payload.get("turn_id"),
+        "status": payload.get("type"),
+        "cwd": cwd,
+        "timing": payload.get("timing"),
+    }
+
+
+def _selected_requests(timing: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in timing.get("modelRequests", []) if isinstance(item, dict)]
+
+
+def _request_metric(
+    requests: Iterable[dict[str, Any]],
+    includes: Callable[[dict[str, Any]], bool],
+) -> dict[str, int]:
+    request_list = list(requests)
+    generation_ids = {
+        request["generationIndex"]
+        for request in request_list
+        if request.get("attemptKind", "primary") == "primary"
+        and request.get("generationIndex") is not None
+        and includes(request)
+    }
+    matching = [
+        request
+        for request in request_list
+        if request.get("generationIndex") in generation_ids
+    ]
+    decision_ready = [
+        request for request in matching if request.get("decisionLatencyNs") is not None
+    ]
+    return {
+        "logicalGenerations": len(generation_ids),
+        "physicalAttempts": len(matching),
+        "modelStreamWaitNs": sum(int(request.get("modelStreamWaitNs", 0)) for request in matching),
+        "decisionReadyAttempts": len(decision_ready),
+        "decisionLatencyNs": sum(int(request["decisionLatencyNs"]) for request in decision_ready),
+        "toolCalls": sum(int(request.get("toolCallCount", 0)) for request in matching),
+        "toolActiveUnionNs": sum(int(request.get("toolActiveUnionNs", 0)) for request in matching),
+    }
+
+
+def _sum_metric(target: dict[str, int], source: dict[str, Any]) -> None:
+    for key in target:
+        target[key] += int(source.get(key, 0))
+
+
+def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
+    totals = collections.Counter()
+    nonprogress = {
+        "logicalGenerations": 0,
+        "physicalAttempts": 0,
+        "modelStreamWaitNs": 0,
+        "decisionReadyAttempts": 0,
+        "decisionLatencyNs": 0,
+        "toolCalls": 0,
+        "toolActiveUnionNs": 0,
+    }
+    deterministic = dict(nonprogress)
+    decision_ready_attempts = 0
+    decision_latency_ns = 0
+    request_count = 0
+    status_counts: collections.Counter[str] = collections.Counter()
+
+    for record in records:
+        timing = record["timing"]
+        exclusive = timing.get("exclusive", {})
+        unions = timing.get("unions", {})
+        counters = timing.get("counters", {})
+        requests = _selected_requests(timing)
+        status_counts[record["status"]] += 1
+        totals["inclusiveDurationNs"] += int(timing.get("inclusiveDurationNs", 0))
+        totals["modelOnlyNs"] += int(exclusive.get("modelOnlyNs", 0))
+        totals["toolOnlyNs"] += int(exclusive.get("toolOnlyNs", 0))
+        totals["modelPlusToolNs"] += int(exclusive.get("modelPlusToolNs", 0))
+        totals["modelRequestWaitNs"] += int(unions.get("modelRequestWaitUnionNs", 0))
+        totals["modelStreamWaitNs"] += int(unions.get("modelStreamWaitUnionNs", 0))
+        totals["logicalGenerations"] += int(counters.get("logicalGenerationCount", 0))
+        totals["toolCallCount"] += int(counters.get("toolCallCount", 0))
+        totals["samePurposeContinuationCount"] += int(
+            counters.get("samePurposeContinuationCount", 0)
+        )
+        totals["suppressedDeterministicContinuationCount"] += int(
+            counters.get("suppressedDeterministicContinuationCount", 0)
+        )
+        request_count += len(requests)
+        decision_ready = [
+            request for request in requests if request.get("decisionLatencyNs") is not None
+        ]
+        decision_ready_attempts += len(decision_ready)
+        decision_latency_ns += sum(int(request["decisionLatencyNs"]) for request in decision_ready)
+
+        recorded_nonprogress = timing.get("observationalNonprogressLatency")
+        if isinstance(recorded_nonprogress, dict):
+            _sum_metric(nonprogress, recorded_nonprogress)
+        else:
+            _sum_metric(
+                nonprogress,
+                _request_metric(
+                    requests,
+                    lambda request: bool(request.get("unchangedRelevantState"))
+                    and not bool(request.get("nextStructuredActionChanged")),
+                ),
+            )
+        _sum_metric(
+            deterministic,
+            _request_metric(
+                requests,
+                lambda request: request.get("generationPurpose")
+                == "deterministic_tool_continuation",
+            ),
+        )
+
+    inclusive = totals["inclusiveDurationNs"]
+    model = totals["modelOnlyNs"]
+    tool = totals["toolOnlyNs"]
+    return {
+        "turns": len(records),
+        "statusCounts": dict(sorted(status_counts.items())),
+        **dict(totals),
+        "modelShare": model / inclusive if inclusive else None,
+        "toolShare": tool / inclusive if inclusive else None,
+        "modelToolRatio": model / tool if tool else None,
+        "modelDominatedTurns": sum(
+            int(record["timing"].get("exclusive", {}).get("modelOnlyNs", 0))
+            > int(record["timing"].get("exclusive", {}).get("toolOnlyNs", 0))
+            for record in records
+        ),
+        "modelOverFiveTimesToolTurns": sum(
+            int(record["timing"].get("exclusive", {}).get("modelOnlyNs", 0))
+            > 5 * int(record["timing"].get("exclusive", {}).get("toolOnlyNs", 0))
+            for record in records
+        ),
+        "decisionLatency": {
+            "physicalAttempts": request_count,
+            "decisionReadyAttempts": decision_ready_attempts,
+            "coverage": decision_ready_attempts / request_count if request_count else None,
+            "totalNs": decision_latency_ns,
+        },
+        "observationalNonprogressLatency": nonprogress,
+        "deterministicToolContinuationLatency": deterministic,
+    }
+
+
+def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
+    files = [source] if source.is_file() else sorted(source.rglob("*.jsonl"))
+    started_turns: set[str] = set()
+    terminal_turns: set[str] = set()
+    terminal_without_timing: set[str] = set()
+    timed_records: dict[str, dict[str, Any]] = {}
+    duplicate_timed_terminal_events = 0
+    parse_error_count = 0
+    parse_errors: list[dict[str, Any]] = []
+    status_counts: collections.Counter[str] = collections.Counter()
+    schema_versions: collections.Counter[str] = collections.Counter()
+    line_count = 0
+    byte_count = 0
+
+    for file in files:
+        byte_count += file.stat().st_size
+        cwd = ""
+        with file.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                line_count += 1
+                try:
+                    item = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    parse_error_count += 1
+                    if len(parse_errors) < 100:
+                        parse_errors.append(
+                            {"file": str(file), "line": line_number, "error": str(error)}
+                        )
+                    continue
+                payload = item.get("payload") or {}
+                if item.get("type") == "session_meta":
+                    cwd = str(payload.get("cwd") or cwd)
+                payload_type = payload.get("type")
+                turn_id = payload.get("turn_id")
+                if payload_type == "task_started" and turn_id:
+                    started_turns.add(str(turn_id))
+                if payload_type not in ("task_complete", "turn_aborted") or not turn_id:
+                    continue
+                turn_id = str(turn_id)
+                terminal_turns.add(turn_id)
+                status_counts[str(payload_type)] += 1
+                record = _terminal_record(
+                    file, line_number, item.get("timestamp"), cwd, payload
+                )
+                timing = record["timing"]
+                if not isinstance(timing, dict):
+                    terminal_without_timing.add(turn_id)
+                    continue
+                if turn_id in timed_records:
+                    duplicate_timed_terminal_events += 1
+                timed_records[turn_id] = record
+                schema_versions[str(timing.get("schemaVersion", "missing"))] += 1
+
+    records = list(timed_records.values())
+    valid = [
+        record
+        for record in records
+        if record["timing"].get("profileValid") is True
+        and record["timing"].get("classificationComplete") is True
+    ]
+    populations = {
+        name: [
+            record
+            for record in valid
+            if name == "all" or _population(record["cwd"], str(repo_root)) == name
+        ]
+        for name in ("all", "eval", "repository_root", "other")
+    }
+    invalid = [record for record in records if record not in valid]
+    coverage = {
+        "files": len(files),
+        "lines": line_count,
+        "bytes": byte_count,
+        "parseErrorCount": parse_error_count,
+        "parseErrors": parse_errors,
+        "uniqueTaskStarts": len(started_turns),
+        "uniqueTerminalTurns": len(terminal_turns),
+        "uniqueTimedTerminalTurns": len(timed_records),
+        "duplicateTimedTerminalEvents": duplicate_timed_terminal_events,
+        "validCompleteProfiles": len(valid),
+        "invalidProfiles": sum(
+            record["timing"].get("profileValid") is not True for record in records
+        ),
+        "classificationIncompleteProfiles": sum(
+            record["timing"].get("classificationComplete") is not True
+            for record in records
+        ),
+        "terminalTurnsWithoutTiming": len(terminal_without_timing - set(timed_records)),
+        "startedTurnsWithoutTerminal": len(started_turns - terminal_turns),
+        "timedTerminalTurnsWithoutStart": len(set(timed_records) - started_turns),
+        "statusCounts": dict(sorted(status_counts.items())),
+        "timingSchemaVersions": dict(sorted(schema_versions.items())),
+        "excludedInvalidOrIncompleteTurns": [
+            {
+                "turnId": record["turn_id"],
+                "file": record["file"],
+                "profileValid": record["timing"].get("profileValid"),
+                "classificationComplete": record["timing"].get(
+                    "classificationComplete"
+                ),
+            }
+            for record in invalid
+        ],
+    }
+    return {
+        "schemaVersion": REPORT_SCHEMA_VERSION,
+        "observedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source": str(source.resolve()),
+        "repoRoot": str(repo_root.resolve()),
+        "coverage": coverage,
+        "populations": {
+            name: _population_report(population_records)
+            for name, population_records in populations.items()
+        },
+    }
+
+
+def render_report(report: dict[str, Any]) -> str:
+    coverage = report["coverage"]
+    lines = [
+        f"source: {report['source']}",
+        (
+            "coverage: "
+            f"{coverage['validCompleteProfiles']} valid complete / "
+            f"{coverage['uniqueTimedTerminalTurns']} timed terminal / "
+            f"{coverage['uniqueTaskStarts']} started turns; "
+            f"{coverage['startedTurnsWithoutTerminal']} starts still non-terminal; "
+            f"{coverage['parseErrorCount']} parse errors"
+        ),
+    ]
+    for name in ("all", "eval", "repository_root", "other"):
+        population = report["populations"][name]
+        if not population["turns"]:
+            continue
+        ratio = population["modelToolRatio"]
+        nonprogress = population["observationalNonprogressLatency"]
+        decision = population["decisionLatency"]
+        ratio_text = f"{ratio:.2f}x" if ratio is not None else "n/a"
+        lines.append(
+            f"{name}: {population['turns']} turns; "
+            f"model={population['modelOnlyNs'] / 1e9:.1f}s "
+            f"tool={population['toolOnlyNs'] / 1e9:.1f}s "
+            f"ratio={ratio_text}; "
+            f"decision coverage={decision['decisionReadyAttempts']}/"
+            f"{decision['physicalAttempts']}; "
+            f"unchanged-state/action stream={nonprogress['modelStreamWaitNs'] / 1e9:.1f}s"
+        )
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path, help="Rollout JSONL file or session directory")
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path.cwd(),
+        help="Repository root used for workload population segmentation",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit the complete JSON report")
+    args = parser.parse_args()
+    if not args.source.exists():
+        parser.error(f"source does not exist: {args.source}")
+    report = analyze_session_path(args.source, args.repo_root)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(render_report(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

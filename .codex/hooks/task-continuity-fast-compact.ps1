@@ -35,6 +35,11 @@ try {
         [string]$inputObject.hook_event_name -ne $ExpectedEvent) {
         throw 'hook input did not match the handler event'
     }
+    if ($ExpectedEvent -eq 'PostCompact' -and
+        $inputObject.ContainsKey('compaction_summary') -and
+        -not [string]::IsNullOrWhiteSpace([string]$inputObject.compaction_summary)) {
+        throw 'validated compaction summary requires the canonical state updater'
+    }
 
     $sessionGuid = [Guid]::Empty
     if (-not [Guid]::TryParse([string]$inputObject.session_id, [ref]$sessionGuid)) {

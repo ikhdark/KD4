@@ -39,6 +39,7 @@ pub struct PostCompactRequest {
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub trigger: String,
+    pub compaction_summary: Option<String>,
 }
 
 #[derive(Debug)]
@@ -216,6 +217,7 @@ fn post_command_input_json(request: &PostCompactRequest) -> Result<String, serde
         hook_event_name: "PostCompact".to_string(),
         model: request.model.clone(),
         trigger: request.trigger.clone(),
+        compaction_summary: request.compaction_summary.clone(),
     })
 }
 
@@ -470,6 +472,7 @@ mod tests {
                 "hook_event_name": "PostCompact",
                 "model": "gpt-test",
                 "trigger": "manual",
+                "compaction_summary": "## Active state\nresume here",
             })
         );
     }
@@ -590,6 +593,7 @@ mod tests {
             transcript_path: None,
             model: "gpt-test".to_string(),
             trigger: "manual".to_string(),
+            compaction_summary: Some("## Active state\nresume here".to_string()),
         }
     }
 

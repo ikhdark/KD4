@@ -214,14 +214,26 @@ pub(crate) async fn immutable_git_show_identity(
     program: &str,
     args: &[String],
 ) -> Option<EvidenceIdentity> {
-    immutable_git_show_identity_with_project_namespace(cwd, program, args, None).await
+    immutable_git_show_identity_with_project_namespace(
+        cwd,
+        program,
+        args,
+        ProjectNamespaceHint::Discover,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProjectNamespaceHint<'a> {
+    Discover,
+    Resolved(Option<&'a str>),
 }
 
 pub(crate) async fn immutable_git_show_identity_with_project_namespace(
     cwd: &Path,
     program: &str,
     args: &[String],
-    known_project_namespace: Option<&str>,
+    project_namespace_hint: ProjectNamespaceHint<'_>,
 ) -> Option<EvidenceIdentity> {
     #[cfg(test)]
     test_observation::record_immutable_git_show_identity();
@@ -238,9 +250,10 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
     {
         return None;
     }
-    let project_namespace = match known_project_namespace {
-        Some(namespace) => namespace.to_owned(),
-        None => git_project_namespace(cwd).await?,
+    let project_namespace = match project_namespace_hint {
+        ProjectNamespaceHint::Resolved(Some(namespace)) => namespace.to_owned(),
+        ProjectNamespaceHint::Resolved(None) => return None,
+        ProjectNamespaceHint::Discover => git_project_namespace(cwd).await?,
     };
     let cwd_position = git_stdout(cwd, &["rev-parse", "--show-prefix"])
         .await
@@ -276,14 +289,14 @@ pub(crate) async fn prepare_immutable_git_show(
     cwd: &Path,
     program: &str,
     args: &[String],
-    known_project_namespace: Option<&str>,
+    project_namespace_hint: ProjectNamespaceHint<'_>,
     force_fresh: bool,
 ) -> Option<PreparedKnownDelta> {
     let identity = immutable_git_show_identity_with_project_namespace(
         cwd,
         program,
         args,
-        known_project_namespace,
+        project_namespace_hint,
     )
     .await?;
     let candidate = lookup(codex_home, &identity).await;
@@ -855,7 +868,7 @@ mod tests {
                 &repo,
                 "git",
                 &["show".to_string(), blob],
-                Some(&namespace),
+                ProjectNamespaceHint::Resolved(Some(&namespace)),
             )
             .await
         })
@@ -863,6 +876,28 @@ mod tests {
 
         assert!(identity.is_some());
         assert_eq!(observed.fingerprint_git_subprocesses, 2);
+    }
+
+    #[tokio::test]
+    async fn resolved_missing_namespace_does_not_probe_git_again() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo, "immutable\n");
+        let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
+
+        let (identity, observed) = test_observation::observe(async {
+            immutable_git_show_identity_with_project_namespace(
+                &repo,
+                "git",
+                &["show".to_string(), blob],
+                ProjectNamespaceHint::Resolved(None),
+            )
+            .await
+        })
+        .await;
+
+        assert!(identity.is_none());
+        assert_eq!(observed.fingerprint_git_subprocesses, 0);
     }
 
     #[tokio::test]

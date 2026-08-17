@@ -20,8 +20,10 @@ from statistics import median
 from typing import Any, Sequence
 
 try:
+    from scripts import kd4_first_useful_action_analysis
     from scripts import kd4_model_attempt_analysis
 except ImportError:  # Direct script execution places scripts/ on sys.path.
+    import kd4_first_useful_action_analysis
     import kd4_model_attempt_analysis
 
 
@@ -387,6 +389,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Write a human-readable model-attempt report.",
     )
+    parser.add_argument(
+        "--rollout-jsonl",
+        action="append",
+        type=Path,
+        help="Analyze first-useful-action latency from rollout JSONL files or directories.",
+    )
+    parser.add_argument(
+        "--first-useful-action-report",
+        type=Path,
+        help="Write a human-readable first-useful-action report.",
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -445,6 +458,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.model_attempt_report is not None:
             args.model_attempt_report.parent.mkdir(parents=True, exist_ok=True)
             args.model_attempt_report.write_text(human_report + "\n", encoding="utf-8")
+        if not args.json:
+            print(human_report)
+    if args.rollout_jsonl:
+        first_action_analysis = kd4_first_useful_action_analysis.analyze(args.rollout_jsonl)
+        payload["firstUsefulActionAnalysis"] = first_action_analysis
+        human_report = kd4_first_useful_action_analysis.render(first_action_analysis)
+        if args.first_useful_action_report is not None:
+            args.first_useful_action_report.parent.mkdir(parents=True, exist_ok=True)
+            args.first_useful_action_report.write_text(human_report + "\n", encoding="utf-8")
         if not args.json:
             print(human_report)
     if args.output is not None:

@@ -24,6 +24,7 @@
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -81,6 +82,7 @@ use codex_otel::ModelAttemptTelemetry;
 use codex_otel::ModelAttemptTransport;
 use codex_otel::ModelContextComponentTelemetry;
 use codex_otel::ModelPromptContextCategoryTelemetry;
+use codex_otel::ModelToolSchemaTelemetry;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::auth::AuthMode;
@@ -141,9 +143,11 @@ use crate::context::PromptProvenanceSidecar;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
+use crate::turn_timing::ModelAttemptGenerationMetadata;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingGuard;
 use crate::turn_timing::TurnTimingState;
+use crate::turn_timing::response_event_records_actionable_output;
 use crate::turn_timing::response_event_records_model_output;
 use crate::turn_timing::response_event_records_visible_output;
 use crate::util::emit_feedback_auth_recovery_tags;
@@ -210,6 +214,7 @@ struct ModelRequestMeasurements {
     envelope_overhead_bytes: u64,
     reconciliation_residual_bytes: i64,
     prompt_context_categories: Vec<PromptContextMeasurement>,
+    tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
     full_prompt_estimated_tokens: u64,
     fixed_prefix_reuse_eligible: bool,
     stable_context_manifest: StableContextManifest,
@@ -233,31 +238,61 @@ struct PromptContextBaseline {
 }
 
 impl ModelRequestMeasurements {
+    fn tokens(&self, category: PromptContextCategory) -> u64 {
+        self.prompt_context_categories
+            .iter()
+            .find(|measurement| measurement.category == category.as_str())
+            .map_or(0, |measurement| measurement.estimated_tokens)
+    }
+
+    fn logical_prompt_tokens(&self) -> u64 {
+        self.prompt_context_categories
+            .iter()
+            .fold(0_u64, |total, measurement| {
+                total.saturating_add(measurement.estimated_tokens)
+            })
+    }
+
+    fn producer_selected_context_tokens(&self) -> u64 {
+        PromptContextCategory::ALL
+            .into_iter()
+            .filter(|category| category.is_producer_selected_context())
+            .fold(0_u64, |total, category| {
+                total.saturating_add(self.tokens(category))
+            })
+    }
+
+    fn density_bps(&self, numerator: u64) -> u32 {
+        let logical_total = self.logical_prompt_tokens();
+        if logical_total == 0 {
+            return 0;
+        }
+        u32::try_from(
+            numerator
+                .saturating_mul(10_000)
+                .checked_div(logical_total)
+                .unwrap_or_default(),
+        )
+        .unwrap_or(10_000)
+        .min(10_000)
+    }
+
     fn request_token_categories(&self) -> TurnTimingRequestTokenCategories {
-        let tokens = |category: PromptContextCategory| {
-            self.prompt_context_categories
-                .iter()
-                .find(|measurement| measurement.category == category.as_str())
-                .map_or(0, |measurement| measurement.estimated_tokens)
-        };
         let other_injected_context = [
             PromptContextCategory::AgentRole,
             PromptContextCategory::Plugins,
+            PromptContextCategory::PluginCatalog,
             PromptContextCategory::AppDesktop,
             PromptContextCategory::Collaboration,
             PromptContextCategory::EnvironmentPermissions,
+            PromptContextCategory::Memory,
             PromptContextCategory::OtherInjected,
         ]
         .into_iter()
         .fold(0_u64, |total, category| {
-            total.saturating_add(tokens(category))
+            total.saturating_add(self.tokens(category))
         });
-        let logical_total = self
-            .prompt_context_categories
-            .iter()
-            .fold(0_u64, |total, measurement| {
-                total.saturating_add(measurement.estimated_tokens)
-            });
+        let logical_total = self.logical_prompt_tokens();
         let repeated_unchanged_context = self
             .prompt_context_categories
             .iter()
@@ -267,12 +302,14 @@ impl ModelRequestMeasurements {
             });
         TurnTimingRequestTokenCategories {
             accounting_basis: TurnTimingTokenCategoryBasis::FullLogicalPrompt,
-            base_instructions: tokens(PromptContextCategory::BaseSystem),
-            tool_schemas: tokens(PromptContextCategory::ToolSchemas),
-            conversation_history: tokens(PromptContextCategory::History),
-            current_input: tokens(PromptContextCategory::TaskInput),
-            repository_context: tokens(PromptContextCategory::Repository),
-            skills: tokens(PromptContextCategory::Skills),
+            base_instructions: self.tokens(PromptContextCategory::BaseSystem),
+            tool_schemas: self.tokens(PromptContextCategory::ToolSchemas),
+            conversation_history: self.tokens(PromptContextCategory::History),
+            current_input: self.tokens(PromptContextCategory::TaskInput),
+            repository_context: self.tokens(PromptContextCategory::Repository),
+            skills: self
+                .tokens(PromptContextCategory::Skills)
+                .saturating_add(self.tokens(PromptContextCategory::SkillCatalog)),
             other_injected_context,
             logical_total,
             local_input_estimate: self.full_prompt_estimated_tokens,
@@ -297,6 +334,17 @@ impl ModelRequestMeasurements {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let tool_schema_breakdown = request
+            .tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| measure_tool_schemas(tool, index))
+            .collect::<serde_json::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         let measurement_provenance = if base_instructions.is_empty()
             || !request.instructions.is_empty()
         {
@@ -339,11 +387,14 @@ impl ModelRequestMeasurements {
         let conversation_history_bytes = context.bytes(PromptContextCategory::History);
         let current_input_bytes = context.bytes(PromptContextCategory::TaskInput);
         let repository_context_bytes = context.bytes(PromptContextCategory::Repository);
-        let memory_bytes = 0;
-        let skills_bytes = context.bytes(PromptContextCategory::Skills);
+        let memory_bytes = context.bytes(PromptContextCategory::Memory);
+        let skills_bytes = context
+            .bytes(PromptContextCategory::Skills)
+            .saturating_add(context.bytes(PromptContextCategory::SkillCatalog));
         let other_injected_context_bytes = [
             PromptContextCategory::AgentRole,
             PromptContextCategory::Plugins,
+            PromptContextCategory::PluginCatalog,
             PromptContextCategory::AppDesktop,
             PromptContextCategory::Collaboration,
             PromptContextCategory::EnvironmentPermissions,
@@ -379,6 +430,7 @@ impl ModelRequestMeasurements {
             envelope_overhead_bytes,
             reconciliation_residual_bytes,
             prompt_context_categories: context.measurements(),
+            tool_schema_breakdown,
             full_prompt_estimated_tokens,
             fixed_prefix_reuse_eligible: false,
             stable_context_manifest: StableContextManifest::default(),
@@ -529,6 +581,91 @@ struct FullLogicalPrompt<'a> {
     input: &'a [codex_protocol::models::ResponseItem],
 }
 
+fn measure_tool_schemas(
+    tool: &serde_json::Value,
+    index: usize,
+) -> serde_json::Result<Vec<ModelToolSchemaTelemetry>> {
+    let namespace = (tool.get("type").and_then(serde_json::Value::as_str) == Some("namespace"))
+        .then(|| tool.get("name").and_then(serde_json::Value::as_str))
+        .flatten();
+    if let Some(namespace) = namespace
+        && let Some(tools) = tool.get("tools").and_then(serde_json::Value::as_array)
+    {
+        return tools
+            .iter()
+            .enumerate()
+            .map(|(nested_index, nested)| {
+                measure_leaf_tool_schema(nested, nested_index, Some(namespace))
+            })
+            .collect();
+    }
+    Ok(vec![measure_leaf_tool_schema(tool, index, None)?])
+}
+
+fn measure_leaf_tool_schema(
+    tool: &serde_json::Value,
+    index: usize,
+    namespace: Option<&str>,
+) -> serde_json::Result<ModelToolSchemaTelemetry> {
+    let serialized = serde_json::to_vec(tool)?;
+    let name = tool
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| tool.get("type").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tool_{index}"));
+    Ok(ModelToolSchemaTelemetry {
+        name,
+        namespace: namespace.map(str::to_string),
+        serialized_bytes: u64::try_from(serialized.len()).unwrap_or(u64::MAX),
+        approx_tokens: u64::try_from(approx_token_count(
+            std::str::from_utf8(&serialized).unwrap_or_default(),
+        ))
+        .unwrap_or(u64::MAX),
+        selected_by_model: false,
+    })
+}
+
+fn selected_tool_schema_breakdown(
+    schemas: &[ModelToolSchemaTelemetry],
+    output_items: &[ResponseItem],
+) -> Vec<ModelToolSchemaTelemetry> {
+    let selected = output_items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall {
+                name, namespace, ..
+            }
+            | ResponseItem::CustomToolCall {
+                name, namespace, ..
+            } => Some((namespace.clone(), name.clone())),
+            ResponseItem::LocalShellCall { .. } => Some((None, "local_shell".to_string())),
+            ResponseItem::ToolSearchCall { .. } => Some((None, "tool_search".to_string())),
+            ResponseItem::WebSearchCall { .. } => Some((None, "web_search".to_string())),
+            ResponseItem::ImageGenerationCall { .. } => {
+                Some((None, "image_generation".to_string()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    schemas
+        .iter()
+        .cloned()
+        .map(|mut schema| {
+            schema.selected_by_model = selected
+                .contains(&(schema.namespace.clone(), schema.name.clone()))
+                || (schema.namespace.is_none()
+                    && selected.iter().any(|(namespace, name)| {
+                        namespace.is_none()
+                            && ((name == "web_search" && schema.name.starts_with("web_search"))
+                                || (name == "image_generation"
+                                    && schema.name.starts_with("image_generation")))
+                    }));
+            schema
+        })
+        .collect()
+}
+
 fn estimated_full_prompt_tokens(request: &ResponsesApiRequest) -> serde_json::Result<u64> {
     let serialized = serde_json::to_vec(&FullLogicalPrompt {
         instructions: &request.instructions,
@@ -598,6 +735,7 @@ struct ModelAttemptOffsets {
     stream_established_us: Option<u64>,
     first_provider_event_us: Option<u64>,
     first_model_output_us: Option<u64>,
+    first_actionable_output_us: Option<u64>,
     first_visible_output_us: Option<u64>,
 }
 
@@ -693,6 +831,14 @@ impl ModelAttemptClock {
             .get_or_insert_with(|| self.elapsed_us());
     }
 
+    fn mark_first_actionable_output(&self) {
+        self.offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_actionable_output_us
+            .get_or_insert_with(|| self.elapsed_us());
+    }
+
     fn mark_first_visible_output(&self) {
         self.offsets
             .lock()
@@ -704,6 +850,8 @@ impl ModelAttemptClock {
 
 struct ModelAttemptGuard {
     session_telemetry: SessionTelemetry,
+    turn_id: Option<String>,
+    generation: Option<ModelAttemptGenerationMetadata>,
     sampling_request_id: String,
     attempt_id: String,
     retry_index: u32,
@@ -731,9 +879,13 @@ impl ModelAttemptGuard {
         connection_reused: Option<bool>,
         measurements: ModelRequestMeasurements,
         clock: ModelAttemptClock,
+        turn_id: Option<String>,
+        generation: Option<ModelAttemptGenerationMetadata>,
     ) -> Self {
         Self {
             session_telemetry,
+            turn_id,
+            generation,
             sampling_request_id: identity.sampling_request_id,
             attempt_id: identity.physical_attempt_id,
             retry_index,
@@ -774,6 +926,7 @@ impl ModelAttemptGuard {
         outcome: ModelAttemptOutcome,
         input_tokens: Option<i64>,
         cached_input_tokens: Option<i64>,
+        output_items: &[ResponseItem],
     ) {
         if self.emitted {
             return;
@@ -793,6 +946,18 @@ impl ModelAttemptGuard {
             outcome == ModelAttemptOutcome::Success && self.fresh_response_id_established;
         let (request_construction_us, queue_us, transport_us) =
             model_attempt_phase_durations(&offsets);
+        let producer_selected_context_tokens = self.measurements.producer_selected_context_tokens();
+        let tool_schema_breakdown =
+            selected_tool_schema_breakdown(&self.measurements.tool_schema_breakdown, output_items);
+        let observed_selected_tool_schema_tokens = tool_schema_breakdown
+            .iter()
+            .filter(|schema| schema.selected_by_model)
+            .fold(0_u64, |total, schema| {
+                total.saturating_add(schema.approx_tokens)
+            });
+        let operational_relevance_proxy_tokens = producer_selected_context_tokens
+            .saturating_add(observed_selected_tool_schema_tokens)
+            .min(self.measurements.logical_prompt_tokens());
         if let Some(cache_coverage_bps) = cache_coverage_below_matched_task_baseline(
             self.measurements.matched_task_reuse_eligible(),
             outcome,
@@ -812,6 +977,25 @@ impl ModelAttemptGuard {
         debug_assert!(attempt_offsets_are_nondecreasing(&offsets, completed_us));
         self.session_telemetry
             .model_attempt_completed(&ModelAttemptTelemetry {
+                turn_id: self.turn_id.clone(),
+                generation_index: self
+                    .generation
+                    .as_ref()
+                    .map(|metadata| metadata.generation_index),
+                generation_purpose: self
+                    .generation
+                    .as_ref()
+                    .and_then(ModelAttemptGenerationMetadata::purpose_label)
+                    .map(str::to_string),
+                generation_disposition: self
+                    .generation
+                    .as_ref()
+                    .map(ModelAttemptGenerationMetadata::disposition_label)
+                    .map(str::to_string),
+                relevant_state_fingerprint: self
+                    .generation
+                    .as_ref()
+                    .and_then(|metadata| metadata.relevant_state_fingerprint.clone()),
                 sampling_request_id: self.sampling_request_id.clone(),
                 attempt_id: self.attempt_id.clone(),
                 retry_index: self.retry_index,
@@ -854,6 +1038,16 @@ impl ModelAttemptGuard {
                             .unchanged_from_previous_request,
                     })
                     .collect(),
+                producer_selected_context_tokens,
+                producer_selected_context_density_bps: self
+                    .measurements
+                    .density_bps(producer_selected_context_tokens),
+                observed_selected_tool_schema_tokens,
+                operational_relevance_proxy_tokens,
+                operational_relevance_proxy_density_bps: self
+                    .measurements
+                    .density_bps(operational_relevance_proxy_tokens),
+                tool_schema_breakdown,
                 full_prompt_estimated_tokens: self.measurements.full_prompt_estimated_tokens,
                 fixed_prefix_reuse_eligible: self.measurements.fixed_prefix_reuse_eligible,
                 logical_context_tokens: self.measurements.logical_context_tokens,
@@ -869,6 +1063,7 @@ impl ModelAttemptGuard {
                 stream_established_us: offsets.stream_established_us,
                 first_provider_event_us: offsets.first_provider_event_us,
                 first_model_output_us: offsets.first_model_output_us,
+                first_actionable_output_us: offsets.first_actionable_output_us,
                 first_visible_output_us: offsets.first_visible_output_us,
                 completed_us,
             });
@@ -923,7 +1118,7 @@ fn model_attempt_phase_durations(offsets: &ModelAttemptOffsets) -> (u64, u64, Op
 
 impl Drop for ModelAttemptGuard {
     fn drop(&mut self) {
-        self.finish(ModelAttemptOutcome::Cancelled, None, None);
+        self.finish(ModelAttemptOutcome::Cancelled, None, None, &[]);
     }
 }
 
@@ -945,7 +1140,9 @@ fn attempt_offsets_are_nondecreasing(offsets: &ModelAttemptOffsets, completed_us
         }
         previous = offset;
     }
-    true
+    offsets
+        .first_actionable_output_us
+        .is_none_or(|offset| offset >= offsets.dispatch_ready_us && offset <= completed_us)
 }
 
 pub(crate) struct CompactConversationRequestSettings {
@@ -3104,6 +3301,12 @@ impl ModelClientSession {
             let request_session_telemetry =
                 session_telemetry_for_request(session_telemetry, &request);
             let attempt_identity = new_attempt_identity(sampling_request_id);
+            if let Some(timing) = self.turn_timing.as_ref() {
+                timing.record_model_attempt_identity(
+                    &attempt_identity.sampling_request_id,
+                    &attempt_identity.physical_attempt_id,
+                );
+            }
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
@@ -3177,6 +3380,10 @@ impl ModelClientSession {
                 None,
                 measurements,
                 attempt_clock,
+                responses_metadata.turn_id.clone(),
+                self.turn_timing
+                    .as_ref()
+                    .and_then(|timing| timing.current_model_attempt_metadata()),
             );
 
             match stream_result {
@@ -3200,7 +3407,7 @@ impl ModelClientSession {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
-                    attempt.finish(ModelAttemptOutcome::Failed, None, None);
+                    attempt.finish(ModelAttemptOutcome::Failed, None, None, &[]);
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -3222,7 +3429,7 @@ impl ModelClientSession {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
-                    attempt.finish(ModelAttemptOutcome::Failed, None, None);
+                    attempt.finish(ModelAttemptOutcome::Failed, None, None, &[]);
                     return Err(err);
                 }
             }
@@ -3490,6 +3697,14 @@ impl ModelClientSession {
             let attempt_identity = attempt_clock
                 .as_ref()
                 .map(|_| new_attempt_identity(sampling_request_id));
+            if let (Some(timing), Some(identity)) =
+                (self.turn_timing.as_ref(), attempt_identity.as_ref())
+            {
+                timing.record_model_attempt_identity(
+                    &identity.sampling_request_id,
+                    &identity.physical_attempt_id,
+                );
+            }
             if let Some(clock) = attempt_clock.as_ref() {
                 clock.mark_queue_started();
             }
@@ -3579,6 +3794,10 @@ impl ModelClientSession {
                         Some(connection_reused),
                         measurements,
                         attempt_clock,
+                        responses_metadata.turn_id.clone(),
+                        self.turn_timing
+                            .as_ref()
+                            .and_then(|timing| timing.current_model_attempt_metadata()),
                     ))
                 }
                 _ => None,
@@ -3595,7 +3814,7 @@ impl ModelClientSession {
                         /*output_items*/ &[],
                     );
                     if let Some(attempt) = attempt.as_mut() {
-                        attempt.finish(ModelAttemptOutcome::Failed, None, None);
+                        attempt.finish(ModelAttemptOutcome::Failed, None, None, &[]);
                     }
                     return Err(err);
                 }
@@ -3979,6 +4198,9 @@ where
                 if response_event_records_model_output(response_event) {
                     clock.mark_first_model_output();
                 }
+                if response_event_records_actionable_output(response_event) {
+                    clock.mark_first_actionable_output();
+                }
             }
             let records_visible_output = event
                 .as_ref()
@@ -4027,6 +4249,7 @@ where
                             ModelAttemptOutcome::Success,
                             token_usage.as_ref().map(|usage| usage.input_tokens),
                             token_usage.as_ref().map(|usage| usage.cached_input_tokens),
+                            &items_added,
                         );
                     }
                     inference_trace_attempt.record_completed(
@@ -4090,7 +4313,7 @@ where
                         logged_error = true;
                     }
                     if let Some(attempt) = attempt.as_mut() {
-                        attempt.finish(ModelAttemptOutcome::Failed, None, None);
+                        attempt.finish(ModelAttemptOutcome::Failed, None, None, &items_added);
                     }
                     if tx_event.send(Err(mapped)).await.is_err() {
                         return;
@@ -4104,7 +4327,7 @@ where
             &items_added,
         );
         if let Some(attempt) = attempt.as_mut() {
-            attempt.finish(ModelAttemptOutcome::Failed, None, None);
+            attempt.finish(ModelAttemptOutcome::Failed, None, None, &items_added);
         }
     });
 

@@ -352,7 +352,8 @@ fn plan_response(response_id: &str, call_id: &str, status: &str) -> String {
             "requires_desktop_activation": false,
             "validation_route": {
                 "leaves": [{
-                    "argv": ["cargo", "test", "--quiet"],
+                    "argv": ["cargo", "test", "-p", "codex-core", "focused_case", "--quiet"],
+                    "uncertainty": "the requested file behavior remains present",
                     "covered_paths": ["src/lib.rs"],
                     "covered_contracts": ["The requested file behavior is present"],
                     "timeout_ms": 10000

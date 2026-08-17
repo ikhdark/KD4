@@ -1862,6 +1862,11 @@ pub struct ShellCommandToolCallParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub force_fresh: Option<bool>,
+    /// Required for commands recognized as tests, checks, lints, benchmarks,
+    /// or fuzzers so the harness can scope and reuse their proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub validation: Option<crate::validation::ValidationCommandContext>,
 }
 
 /// Responses API compatible content items that can be returned by a tool call.

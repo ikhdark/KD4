@@ -102,3 +102,6 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
+
+# Local phase-effort benchmark scratch crates and Cargo outputs.
+/.codex/evals/phase-effort-benchmark/*/work/

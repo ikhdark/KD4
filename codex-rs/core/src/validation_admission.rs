@@ -613,8 +613,7 @@ pub(crate) type SharedValidationSingleflight =
 /// toolchain, environment, configuration, and contract changes remain isolated
 /// by [`InFlightValidationKey`]. Completed results are still never cached.
 pub(crate) fn process_validation_singleflight() -> SharedValidationSingleflight {
-    static REGISTRY: std::sync::OnceLock<SharedValidationSingleflight> =
-        std::sync::OnceLock::new();
+    static REGISTRY: std::sync::OnceLock<SharedValidationSingleflight> = std::sync::OnceLock::new();
     Arc::clone(REGISTRY.get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new()))))
 }
 
@@ -702,6 +701,8 @@ pub(crate) struct ValidationLaunchPlan {
     /// The exact predeclared leaf route, when this is an automatic launch.
     pub(crate) structured_route: Option<codex_protocol::plan_tool::ValidationRoute>,
     pub(crate) validation_call_id: Option<String>,
+    pub(crate) turn_timing_state: Option<Arc<crate::turn_timing::TurnTimingState>>,
+    pub(crate) force_fresh: bool,
 }
 
 pub(crate) async fn admit_validation(
@@ -1007,6 +1008,7 @@ pub(crate) fn validation_identity(
         toolchain,
         "",
         workspace_revision.to_string(),
+        "",
         &[],
         &[],
     )
@@ -1021,6 +1023,7 @@ pub(crate) fn validation_identity_with_scope(
     toolchain: impl Into<String>,
     configuration: impl Into<String>,
     implementation_identity: impl Into<String>,
+    uncertainty: &str,
     covered_paths: &[String],
     covered_contracts: &[String],
 ) -> InFlightValidationKey {
@@ -1037,7 +1040,8 @@ pub(crate) fn validation_identity_with_scope(
         // narrower identity from command text.
         "repository-wide".to_string()
     } else {
-        let encoded = serde_json::to_vec(&(paths, contracts)).unwrap_or_default();
+        let encoded =
+            serde_json::to_vec(&(uncertainty.trim(), paths, contracts)).unwrap_or_default();
         format!("{:x}", Sha256::digest(encoded))
     };
     InFlightValidationKey {
@@ -1655,8 +1659,7 @@ mod tests {
 
         let task_cancellation = CancellationToken::new();
         let invocation = CommandInvocation::Script(
-            "cargo test -p codex-core process_singleflight_registry_is_shared_across_turns"
-                .into(),
+            "cargo test -p codex-core process_singleflight_registry_is_shared_across_turns".into(),
         );
         let key = validation_identity(
             b"process-registry-test-repo",
@@ -1677,14 +1680,7 @@ mod tests {
             ValidationRegistration::Leader { execution, .. } => execution,
             ValidationRegistration::Follower(_) => panic!("first turn must lead"),
         };
-        match register_if_absent(
-            &second_turn,
-            key,
-            "second-turn-call",
-            &task_cancellation,
-        )
-        .await
-        {
+        match register_if_absent(&second_turn, key, "second-turn-call", &task_cancellation).await {
             ValidationRegistration::Follower(follower) => {
                 assert_eq!(follower.shared_from_call_id(), "first-turn-call");
             }
@@ -1844,6 +1840,7 @@ mod tests {
             "stable",
             "features-a",
             "implementation-a",
+            "core behavior remains correct",
             &["core/src/lib.rs".to_string()],
             &["core-contract".to_string()],
         );
@@ -1856,6 +1853,7 @@ mod tests {
                 "stable",
                 "features-a",
                 "implementation-a",
+                "core behavior remains correct",
                 &["core/src/lib.rs".to_string()],
                 &["core-contract".to_string()],
             ),
@@ -1867,6 +1865,7 @@ mod tests {
                 "stable",
                 "features-b",
                 "implementation-a",
+                "core behavior remains correct",
                 &["core/src/lib.rs".to_string()],
                 &["core-contract".to_string()],
             ),
@@ -1878,6 +1877,7 @@ mod tests {
                 "stable",
                 "features-a",
                 "implementation-b",
+                "core behavior remains correct",
                 &["core/src/lib.rs".to_string()],
                 &["core-contract".to_string()],
             ),
@@ -1889,6 +1889,7 @@ mod tests {
                 "stable",
                 "features-a",
                 "implementation-a",
+                "core behavior remains correct",
                 &["core/src/other.rs".to_string()],
                 &["core-contract".to_string()],
             ),

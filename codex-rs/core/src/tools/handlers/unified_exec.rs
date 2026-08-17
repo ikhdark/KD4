@@ -58,6 +58,8 @@ pub(crate) struct ExecCommandArgs {
     prefix_rule: Option<Vec<String>>,
     #[serde(default)]
     force_fresh: bool,
+    #[serde(default)]
+    validation: Option<codex_protocol::validation::ValidationCommandContext>,
 }
 
 impl ExecCommandArgs {

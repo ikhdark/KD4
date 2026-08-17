@@ -233,6 +233,10 @@ async fn handle_submit_agent_receipt(
             "{SUBMIT_AGENT_RECEIPT_TOOL}: the typed task store is unavailable"
         ))
     })?;
+    let workspace_root = get_git_repo_root(turn.config.cwd.as_path())
+        .unwrap_or_else(|| turn.config.cwd.to_path_buf());
+    let _workspace_operation_permit =
+        crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await;
     let draft = args.into_receipt_draft();
     if let Some(obligations) = store
         .replay_required_evidence_missing(binding.attempt_id, &draft)
@@ -433,13 +437,18 @@ async fn build_evaluation_context(
     )
     .await
     .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
-    let applicable_instructions = session
+    let agents_md_observation = session
         .services
         .agents_md_manager
-        .get_loaded()
-        .await
-        .map(|instructions| instructions.text())
-        .filter(|instructions| !instructions.trim().is_empty())
+        .get_cached_observation()
+        .await;
+    let agents_md_freshness = agents_md_observation.freshness.model_visible_description();
+    let applicable_instructions = agents_md_observation
+        .loaded
+        .and_then(|instructions| {
+            let text = instructions.text();
+            (!text.trim().is_empty()).then(|| format!("{agents_md_freshness}\n\n{text}"))
+        })
         .into_iter()
         .collect();
     let relevant_contracts = parse_risk_hints(&target.assignment.risk_hints).contracts;

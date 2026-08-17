@@ -29,6 +29,7 @@ use super::TimeSample;
 use super::TurnClock;
 use super::TurnLocalPhase;
 use super::TurnTimingState;
+use super::response_event_records_actionable_output;
 use super::response_item_records_model_output;
 use super::response_item_records_visible_output;
 use crate::ResponseEvent;
@@ -323,6 +324,120 @@ fn tool_calls_are_model_output_but_not_visible_output() {
 }
 
 #[test]
+fn decision_latency_excludes_reasoning_and_partial_tool_arguments() {
+    assert!(!response_event_records_actionable_output(
+        &ResponseEvent::ReasoningContentDelta {
+            delta: "thinking".to_string(),
+            content_index: 0,
+        }
+    ));
+    assert!(!response_event_records_actionable_output(
+        &ResponseEvent::ToolCallInputDelta {
+            item_id: "item-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            delta: "{\"path\":".to_string(),
+        }
+    ));
+    assert!(response_event_records_actionable_output(
+        &ResponseEvent::OutputTextDelta("answer".to_string())
+    ));
+    assert!(response_event_records_actionable_output(
+        &ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call-1".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        })
+    ));
+}
+
+#[test]
+fn first_useful_action_and_first_model_output_are_distinct_milestones() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+
+    clock.set_ms(2);
+    state.record_user_input();
+
+    clock.set_ms(5);
+    let function_call = ResponseItem::FunctionCall {
+        id: None,
+        name: "shell".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "call-1".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    assert_eq!(
+        state.record_response_event_milestones(&ResponseEvent::OutputItemAdded(function_call)),
+        None
+    );
+
+    clock.set_ms(8);
+    state.record_tool_call("update_plan");
+    clock.set_ms(9);
+    state.record_tool_gate_admitted("update_plan");
+    clock.set_ms(10);
+    state.record_tool_handler_entry("update_plan");
+    clock.set_ms(12);
+    state.record_tool_call("shell");
+    clock.set_ms(14);
+    state.record_tool_gate_admitted("shell");
+    clock.set_ms(16);
+    state.record_tool_handler_entry("shell");
+    clock.set_ms(18);
+    state.record_tool_completion("shell", true);
+    clock.set_ms(20);
+    assert_eq!(
+        state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("done".to_string())),
+        Some(Duration::from_millis(20))
+    );
+
+    let snapshot = state.complete_snapshot();
+    assert_eq!(snapshot.time_to_first_token_ms, Some(5));
+    let timing = snapshot.protocol_timing();
+    assert_eq!(timing.milestones.user_input_recorded_ms, Some(2));
+    assert_eq!(timing.milestones.first_tool_accepted_ms, Some(8));
+    assert_eq!(timing.milestones.first_tool_gate_admitted_ms, Some(9));
+    assert_eq!(timing.milestones.first_tool_handler_entry_ms, Some(10));
+    assert_eq!(timing.milestones.first_useful_tool_accepted_ms, Some(12));
+    assert_eq!(
+        timing.milestones.first_useful_tool_gate_admitted_ms,
+        Some(14)
+    );
+    assert_eq!(timing.milestones.first_model_output_ms, Some(5));
+    assert_eq!(timing.milestones.first_actionable_output_ms, Some(20));
+    assert_eq!(timing.milestones.first_useful_action_ms, Some(16));
+    assert_eq!(
+        timing.milestones.first_successful_useful_action_ms,
+        Some(18)
+    );
+    assert_eq!(timing.milestones.first_visible_output_ms, Some(20));
+    assert_eq!(timing.counters.tool_call_count, 2);
+}
+
+#[test]
+fn accepted_or_gate_admitted_tool_without_handler_entry_is_not_useful() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+
+    clock.set_ms(3);
+    state.record_tool_call("shell");
+    clock.set_ms(7);
+    state.record_tool_gate_admitted("shell");
+    clock.set_ms(9);
+    state.record_tool_completion("shell", false);
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.milestones.first_tool_accepted_ms, Some(3));
+    assert_eq!(timing.milestones.first_tool_gate_admitted_ms, Some(7));
+    assert_eq!(timing.milestones.first_useful_action_ms, None);
+    assert_eq!(timing.milestones.first_successful_useful_action_ms, None);
+}
+
+#[test]
 fn empty_and_tool_output_items_do_not_record_visible_output() {
     assert!(!response_item_records_visible_output(
         &ResponseItem::Message {
@@ -432,7 +547,7 @@ fn continuation_counters_are_consumed_once_and_retries_are_not_recounted() {
 }
 
 #[test]
-fn model_requests_record_dispatch_output_completion_and_continuation() {
+fn decision_latency_records_dispatch_actionable_output_and_completion() {
     let (clock, state) = timing();
     state.mark_turn_started();
 
@@ -441,8 +556,12 @@ fn model_requests_record_dispatch_output_completion_and_continuation() {
     clock.set_ms(20);
     state.mark_model_request_dispatched();
     clock.set_ms(25);
-    drop(initial_wait);
+    state.record_response_event_milestones(&ResponseEvent::ReasoningContentDelta {
+        delta: "thinking".to_string(),
+        content_index: 0,
+    });
     clock.set_ms(30);
+    drop(initial_wait);
     state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("first".to_string()));
     clock.set_ms(40);
     state.record_response_event_milestones(&ResponseEvent::Completed {
@@ -467,16 +586,87 @@ fn model_requests_record_dispatch_output_completion_and_continuation() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 15);
+    assert_eq!(timing.schema_version, 20);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
-    assert_eq!(timing.model_requests[0].first_model_output_ms, Some(30));
+    assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
+    assert_eq!(
+        timing.model_requests[0].first_actionable_output_ms,
+        Some(30)
+    );
+    assert_eq!(
+        timing.model_requests[0].decision_latency_ns,
+        Some(10 * NS_PER_MS as u64)
+    );
     assert_eq!(timing.model_requests[0].completed_ms, Some(40));
     assert!(!timing.model_requests[0].is_continuation);
     assert_eq!(timing.model_requests[1].dispatch_ms, Some(60));
     assert_eq!(timing.model_requests[1].first_model_output_ms, Some(70));
+    assert_eq!(
+        timing.model_requests[1].first_actionable_output_ms,
+        Some(70)
+    );
     assert_eq!(timing.model_requests[1].completed_ms, Some(80));
     assert!(timing.model_requests[1].is_continuation);
+}
+
+#[test]
+fn decision_latency_correlates_logical_and_physical_attempt_identities() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_model_request_wait());
+
+    state.record_model_attempt_identity("sampling-1", "attempt-1");
+    state.record_model_attempt_identity("sampling-1", "attempt-2");
+    state.record_model_attempt_identity("sampling-1", "attempt-2");
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(
+        timing.model_requests[0].sampling_request_id.as_deref(),
+        Some("sampling-1")
+    );
+    assert_eq!(
+        timing.model_requests[0].physical_attempt_ids,
+        vec!["attempt-1".to_string(), "attempt-2".to_string()]
+    );
+}
+
+#[test]
+fn decision_latency_unions_parallel_tool_time_per_generation() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut pending = None;
+    state.begin_model_generation_with_metadata(
+        &mut pending,
+        &SessionSource::Cli,
+        Some(TurnTimingGenerationPurpose::ImplementationDecision),
+        TurnTimingGenerationDisposition::DecisionBearing,
+        None,
+    );
+    drop(state.begin_model_request_wait());
+
+    clock.set_ms(10);
+    let first = state.begin_tool_execution();
+    clock.set_ms(20);
+    let second = state.begin_tool_execution();
+    clock.set_ms(40);
+    drop(first);
+    clock.set_ms(60);
+    drop(second);
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.unions.tool_active_union_ns, 50 * NS_PER_MS as u64);
+    assert_eq!(
+        timing.model_requests[0].tool_active_union_ns,
+        50 * NS_PER_MS as u64
+    );
+    let aggregate = timing
+        .counters
+        .purpose_aggregates
+        .iter()
+        .find(|aggregate| aggregate.purpose == TurnTimingGenerationPurpose::ImplementationDecision)
+        .expect("implementation aggregate");
+    assert_eq!(aggregate.tool_active_union_ns, 50 * NS_PER_MS as u64);
 }
 
 #[test]
@@ -515,7 +705,7 @@ fn request_categories_reconcile_full_logical_prompt_with_provider_usage() {
 
 #[test]
 fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
-    let (_clock, state) = timing();
+    let (clock, state) = timing();
     state.mark_turn_started();
     let mut pending = None;
     state.begin_model_generation_with_metadata(
@@ -525,7 +715,15 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
         TurnTimingGenerationDisposition::Deterministic,
         Some("trusted-state".to_string()),
     );
-    drop(state.begin_model_request_wait());
+    let request_wait = state.begin_model_request_wait();
+    clock.set_ms(5);
+    state.mark_model_request_dispatched();
+    drop(request_wait);
+    let stream_wait = state.begin_model_stream_wait();
+    clock.set_ms(20);
+    state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("done".to_string()));
+    clock.set_ms(25);
+    drop(stream_wait);
     state.record_generation_token_usage(Some(&TokenUsage {
         input_tokens: 100,
         cached_input_tokens: 20,
@@ -575,6 +773,30 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     );
     assert_eq!(timing.observational_nonprogress_tokens.reasoning_tokens, 4);
     assert_eq!(timing.observational_nonprogress_tokens.total_tokens, 110);
+    assert_eq!(
+        timing.observational_nonprogress_latency.logical_generations,
+        1
+    );
+    assert_eq!(
+        timing.observational_nonprogress_latency.physical_attempts,
+        1
+    );
+    assert_eq!(
+        timing
+            .observational_nonprogress_latency
+            .model_stream_wait_ns,
+        20 * NS_PER_MS as u64
+    );
+    assert_eq!(
+        timing
+            .observational_nonprogress_latency
+            .decision_ready_attempts,
+        1
+    );
+    assert_eq!(
+        timing.observational_nonprogress_latency.decision_latency_ns,
+        15 * NS_PER_MS as u64
+    );
 }
 
 #[test]
@@ -655,33 +877,6 @@ fn accepted_batched_receipt_counts_suppressed_boundaries_without_starting_genera
     assert_eq!(counters.suppressed_deterministic_continuation_count, 7);
     assert_eq!(counters.logical_generation_count, 0);
     assert_eq!(counters.generations_by_disposition, Default::default());
-}
-
-#[test]
-fn source_receipts_and_projection_work_are_counted_without_generations() {
-    let (_clock, state) = timing();
-    state.mark_turn_started();
-    state.record_source_projection_result(2, 1, 3, 2);
-    state.record_source_model_visible_new_evidence(4);
-    state.record_accepted_deterministic_continuation_receipts(&[
-        TurnTimingDeterministicContinuationReceipt::new(
-            DeterministicContinuationClass::SourceProjection,
-            "source-resource".to_string(),
-            "source-revision".to_string(),
-            DeterministicContinuationHostAction::ReuseSourceCoverage,
-            "source-bounds".to_string(),
-            2,
-        ),
-    ]);
-
-    let counters = state.complete_snapshot().protocol_timing().counters;
-    assert_eq!(counters.source_exact_projection_reuse_count, 2);
-    assert_eq!(counters.source_conditional_unchanged_count, 1);
-    assert_eq!(counters.source_overlap_range_elimination_count, 3);
-    assert_eq!(counters.source_physical_range_avoided_count, 2);
-    assert_eq!(counters.source_host_drained_continuation_count, 2);
-    assert_eq!(counters.source_model_visible_new_evidence_count, 4);
-    assert_eq!(counters.logical_generation_count, 0);
 }
 
 #[test]
@@ -989,8 +1184,8 @@ fn deterministic_primary_retry_and_fallback_attempts_reconcile_without_inflating
     let primary = state.begin_model_request_wait();
     clock.set_ms(10);
     drop(primary);
-    state.record_tool_call();
-    state.record_tool_call();
+    state.record_tool_call("shell");
+    state.record_tool_call("shell");
 
     state.record_model_retry();
     let retry = state.begin_model_request_wait();
@@ -1092,6 +1287,33 @@ fn repeated_wait_uses_exact_purpose() {
 }
 
 #[test]
+fn failure_signature_count_uses_unique_failure_identities() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+
+    for (state_fingerprint, failure_fingerprint) in [
+        ("state-a", "failure-a"),
+        ("state-b", "failure-a"),
+        ("state-b", "failure-b"),
+    ] {
+        let mut pending = Some(ContinuationCause::ToolResult);
+        state.begin_model_generation_with_failure_metadata(
+            &mut pending,
+            &SessionSource::Cli,
+            Some(TurnTimingGenerationPurpose::FailureDiagnosis),
+            TurnTimingGenerationDisposition::DecisionBearing,
+            Some(state_fingerprint.to_string()),
+            Some(failure_fingerprint.to_string()),
+        );
+        drop(state.begin_model_request_wait());
+    }
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.failure_diagnosis_count, 3);
+    assert_eq!(counters.failure_signature_count, 2);
+}
+
+#[test]
 fn zero_requests_and_cancellation_before_request_do_not_count_continuations() {
     let (_clock, state) = timing();
     let pending = Some(ContinuationCause::PendingInput);
@@ -1136,7 +1358,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 15);
+    assert_eq!(profile.schema_version, 20);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -1211,6 +1433,7 @@ fn wait_and_tool_output_counters_are_additive() {
     state.record_internally_drained_waits(7);
     state.record_residual_deterministic_generation();
     state.record_owner_drained_continuation();
+    state.record_executed_validation(125, true);
     state.record_reused_validation();
     state.record_suppressed_validation_output();
     state.record_ready_startup_prewarm();
@@ -1229,7 +1452,11 @@ fn wait_and_tool_output_counters_are_additive() {
     assert_eq!(counters.internally_drained_wait_count, 7);
     assert_eq!(counters.residual_deterministic_generation_count, 1);
     assert_eq!(counters.owner_drained_continuation_count, 1);
+    assert_eq!(counters.executed_validation_count, 1);
     assert_eq!(counters.reused_validation_count, 1);
+    assert_eq!(counters.duplicate_validation_count, 1);
+    assert_eq!(counters.forced_fresh_validation_count, 1);
+    assert_eq!(counters.executed_validation_duration_ns, 125_000_000);
     assert_eq!(counters.suppressed_validation_output_count, 1);
     assert_eq!(counters.ready_startup_prewarm_count, 1);
     assert_eq!(counters.completion_review_ready_phase_count, 1);
@@ -1251,28 +1478,6 @@ fn wait_and_tool_output_counters_are_additive() {
     assert_eq!(counters.tool_output_recovery_retruncation_count, 2);
     assert_eq!(counters.tool_output_recursive_spill_count, 0);
     assert_eq!(counters.truncation_induced_continuation_count, 1);
-}
-
-#[test]
-fn architecture_counters_record_attempt_reads_and_slice_results() {
-    let (_clock, state) = timing();
-
-    state.record_architecture_slice_attempt();
-    state.record_architecture_source_read(1_024);
-    state.record_architecture_slice_result(true, 9, 2, 0, 0, false, 1);
-
-    let counters = state.complete_snapshot().protocol_timing().counters;
-    assert_eq!(counters.architecture_slice_attempt_count, 1);
-    assert_eq!(counters.architecture_slice_complete_count, 1);
-    assert_eq!(counters.architecture_relationship_count, 9);
-    assert_eq!(counters.architecture_invariant_count, 2);
-    assert_eq!(counters.architecture_missing_requirement_count, 0);
-    assert_eq!(counters.architecture_material_unknown_count, 0);
-    assert_eq!(counters.architecture_stale_snapshot_count, 0);
-    assert_eq!(counters.architecture_tool_call_count, 1);
-    assert_eq!(counters.architecture_files_read, 1);
-    assert_eq!(counters.architecture_bytes_read, 1_024);
-    assert_eq!(counters.architecture_late_relationship_discovery_count, 1);
 }
 
 #[test]

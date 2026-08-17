@@ -524,6 +524,7 @@ export type { TurnTimingAttemptKind } from "./TurnTimingAttemptKind";
 export type { TurnTimingAttemptKindCounts } from "./TurnTimingAttemptKindCounts";
 export type { TurnTimingCounters } from "./TurnTimingCounters";
 export type { TurnTimingDeterministicContinuationReceipt } from "./TurnTimingDeterministicContinuationReceipt";
+export type { TurnTimingDiagnosticLatencyAggregate } from "./TurnTimingDiagnosticLatencyAggregate";
 export type { TurnTimingDiagnosticTokenAggregate } from "./TurnTimingDiagnosticTokenAggregate";
 export type { TurnTimingExclusive } from "./TurnTimingExclusive";
 export type { TurnTimingGenerationDisposition } from "./TurnTimingGenerationDisposition";

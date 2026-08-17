@@ -374,6 +374,9 @@ pub(crate) struct PostCompactCommandInput {
     pub model: String,
     #[schemars(schema_with = "compaction_trigger_schema")]
     pub trigger: String,
+    /// Validated local compaction checkpoint. Remote compaction remains opaque.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

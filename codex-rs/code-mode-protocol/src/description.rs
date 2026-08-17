@@ -13,10 +13,11 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate too
 - Input is JavaScript source, not JSON, quotes, or a Markdown fence. Node, filesystem, network, and console APIs are unavailable.
 - Nested tools are normalized methods on `tools` (for example `await tools.exec_command(...)`); methods accept the documented string or object and return the documented object or string.
 - Only tools listed in `ALL_TOOLS` are callable inside `exec`; direct-only tools stay outside.
-- In one generation's evidence packet, group 2-5 independent discovery calls with `Promise.all`; perform deterministic dependent calls in the same script; emit one result.
+- Choose discovery by expected uncertainty reduction. Run a precise symbol/reference query before broad inventory when it can set scope; use fallback only if unresolved, never in same batch.
+- Batch only calls whose results cannot change another call's necessity or scope; use `Promise.all` for those calls and keep deterministic dependent calls in one script.
 - Do not retry an unchanged nested call after deterministic contract/unsupported-payload failure; emit it and change route next generation.
-- Prefer a sufficiently large complete packet over yielding for another model generation. Use `yield_control()` only when the model must make a new decision before the script can continue.
-- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` defaults to 10000 and controls the internal observation/progress cadence; empty observations do not cause a model-visible yield or a new model generation. `max_output_tokens` bounds the outer result only after the coherent nested evidence packet is formed and defaults to 10000, subject to the model hard limit.
+- Prefer a complete, bounded packet that keeps useful evidence model-visible; avoid packets likely to truncate it. Use `yield_control()` only when the model must choose the next action.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` defaults to 10000 and sets observation cadence; empty observations stay internal. `max_output_tokens` bounds the formed packet, defaults to 10000, and remains subject to the model limit.
 - When evaluation ends, unawaited work is discarded.
 
 Global helpers:
@@ -923,7 +924,7 @@ bar"
     }
 
     #[test]
-    fn optimization_priority_common_exec_description_requires_generation_level_batching() {
+    fn common_exec_description_requires_information_gain_aware_batching() {
         let description =
             build_exec_tool_description(&[], &[], &BTreeMap::new(), /*code_mode_only*/ false);
 
@@ -934,20 +935,26 @@ bar"
         assert!(description.contains("type: \"image\""));
         assert!(description.contains("type: \"audio\""));
         assert!(description.contains("unawaited work is discarded"));
-        assert!(description.contains("group 2-5 independent discovery calls with `Promise.all`"));
+        assert!(description.contains("expected uncertainty reduction"));
+        assert!(description.contains("precise symbol/reference query before broad inventory"));
+        assert!(description.contains("never in same batch"));
+        assert!(description.contains("results cannot change another call's necessity or scope"));
+        assert!(description.contains("avoid packets likely to truncate it"));
+        assert!(!description.contains("including six small calls"));
+        assert!(!description.contains("group 2-5 independent discovery calls"));
         assert!(
             description.contains("Only tools listed in `ALL_TOOLS` are callable inside `exec`")
         );
         assert!(description.contains("Do not retry an unchanged nested call"));
-        assert!(description.contains("deterministic dependent calls in the same script"));
-        assert!(description.contains("Prefer a sufficiently large complete packet"));
+        assert!(description.contains("keep deterministic dependent calls in one script"));
+        assert!(description.contains("Prefer a complete, bounded packet"));
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
         const HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES: usize = 3_337;
         assert!(
             EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 85,
-            "generation-level batching guidance takes priority over marginal descriptor savings"
+            "information-gain-aware batching guidance takes priority over marginal descriptor savings"
         );
     }
 

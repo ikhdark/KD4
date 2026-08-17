@@ -32,9 +32,21 @@ fn renders_only_when_apps_become_available() {
         Vec::<String>::new()
     );
     assert_eq!(
-        render(unavailable, PreviousSectionState::Known(&true_snapshot)),
-        Vec::<String>::new()
+        render(unavailable, PreviousSectionState::Known(&true_snapshot)).len(),
+        1
     );
+}
+
+#[test]
+fn renders_revocation_when_apps_become_unavailable() {
+    let true_snapshot = true;
+    let rendered = render(
+        AppsInstructionsState::new(/*available*/ false),
+        PreviousSectionState::Known(&true_snapshot),
+    );
+
+    assert_eq!(rendered.len(), 1);
+    assert!(rendered[0].contains("Previously provided Apps guidance no longer applies"));
 }
 
 #[test]

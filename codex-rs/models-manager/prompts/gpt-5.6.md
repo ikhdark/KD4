@@ -35,7 +35,7 @@ For audits or reviews that request a specific finding count, converge once that 
 
 Prefer `rg` and `rg --files` for search. Parallelize independent reads and checks when safe. Avoid noisy command chains, risky shell interpolation, and blocking waits longer than 60 seconds. Do not repurpose common environment variables such as `HOME` or `CODEX_HOME`; use task-specific names.
 
-Before grouped or batch source reads, resolve candidate paths against the current repository inventory or routing evidence with `rg --files`, Repo Atlas, or the repository source map. Keep a task-local negative-path cache: once a candidate is confirmed missing, do not request it again unless the workspace snapshot changes or new routing evidence resolves it.
+Before reading or searching candidate paths, resolve them against the current repository inventory or routing evidence with `rg --files`, Repo Atlas, or the repository source map. Keep a task-local negative-result cache for missing files, symbols, configuration, and tests. Record the normalized lookup and the workspace snapshot that proved each miss; do not repeat it unless that snapshot changes or new routing evidence resolves it.
 
 Treat live tool schemas as authoritative. Do not restate or guess their contracts. If a relevant tool fails, inspect the failure and use a genuinely different method when possible; do not loop on unchanged retries or searches.
 

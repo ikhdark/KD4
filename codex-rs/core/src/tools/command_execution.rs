@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -11,20 +14,78 @@ use codex_protocol::validation::ValidationFreshness;
 use codex_protocol::validation::ValidationProofKey;
 use codex_protocol::validation::ValidationResult;
 use codex_protocol::validation::ValidationTerminalStatus;
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::handlers::command_preflight::RgSearchBreadth;
+use crate::tools::handlers::command_preflight::RgSearchNarrowing;
 use crate::validation_admission::ValidationLaunchPlan;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
 const MAX_COMPLETED_VALIDATION_PROOFS: usize = 128;
+const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CommandAttemptKey {
     tool_name: String,
     environment_id: String,
     cwd: String,
     command: Vec<String>,
+    search_narrowing: Option<SearchNarrowingAttempt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SearchNarrowingAttempt {
+    turn_id: String,
+    environment_id: String,
+    repository_identity: String,
+    breadth: RgSearchBreadth,
+    query_identity: String,
+    search_identity: String,
+    scope_identity: String,
+    parent_scope_identity: Option<String>,
+    can_record_miss: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct SearchMissCacheKey {
+    environment_id: String,
+    repository_identity: String,
+    search_identity: String,
+    execution_context: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SearchNarrowingScope {
+    turn_id: String,
+    environment_id: String,
+    repository_identity: String,
+    query_identity: String,
+    scope_identity: String,
+}
+
+impl SearchNarrowingAttempt {
+    fn scope(&self) -> SearchNarrowingScope {
+        SearchNarrowingScope {
+            turn_id: self.turn_id.clone(),
+            environment_id: self.environment_id.clone(),
+            repository_identity: self.repository_identity.clone(),
+            query_identity: self.query_identity.clone(),
+            scope_identity: self.scope_identity.clone(),
+        }
+    }
+
+    fn parent_scope(&self) -> Option<SearchNarrowingScope> {
+        Some(SearchNarrowingScope {
+            turn_id: self.turn_id.clone(),
+            environment_id: self.environment_id.clone(),
+            repository_identity: self.repository_identity.clone(),
+            query_identity: self.query_identity.clone(),
+            scope_identity: self.parent_scope_identity.clone()?,
+        })
+    }
 }
 
 impl CommandAttemptKey {
@@ -39,6 +100,7 @@ impl CommandAttemptKey {
             environment_id: environment_id.to_string(),
             cwd: cwd.into(),
             command: command.to_vec(),
+            search_narrowing: None,
         }
     }
 
@@ -88,6 +150,44 @@ impl CommandAttemptKey {
         self.with_context_fingerprint("repository_epoch", &epoch)
     }
 
+    pub(crate) fn with_search_narrowing(
+        mut self,
+        turn_id: &str,
+        repository_identity: &str,
+        search: Option<RgSearchNarrowing>,
+    ) -> Self {
+        self.search_narrowing = search.map(|search| SearchNarrowingAttempt {
+            turn_id: turn_id.to_string(),
+            environment_id: self.environment_id.clone(),
+            repository_identity: repository_identity.to_string(),
+            breadth: search.breadth,
+            query_identity: search.query_identity,
+            search_identity: search.search_identity,
+            scope_identity: search.scope_identity,
+            parent_scope_identity: search.parent_scope_identity,
+            can_record_miss: search.can_record_miss,
+        });
+        self
+    }
+
+    fn search_miss_cache_key(&self) -> Option<SearchMissCacheKey> {
+        let search = self.search_narrowing.as_ref()?;
+        if !search.can_record_miss {
+            return None;
+        }
+        Some(SearchMissCacheKey {
+            environment_id: search.environment_id.clone(),
+            repository_identity: search.repository_identity.clone(),
+            search_identity: search.search_identity.clone(),
+            execution_context: self
+                .command
+                .iter()
+                .filter(|argument| argument.starts_with('\0'))
+                .cloned()
+                .collect(),
+        })
+    }
+
     pub(crate) fn fingerprint(&self) -> String {
         format!("{:016x}", fingerprint_value(self))
     }
@@ -111,18 +211,30 @@ fn fingerprint_value<T: Hash + ?Sized>(value: &T) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandAttemptBlocked {
     pub(crate) fingerprint: String,
-    pub(crate) prior_failure: DeterministicFailureRecord,
+    reason: CommandAttemptBlockedReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandAttemptBlockedReason {
+    DeterministicFailure(DeterministicFailureRecord),
+    SearchMiss,
 }
 
 impl CommandAttemptBlocked {
     pub(crate) fn render_for_model(&self) -> String {
-        format!(
-            "Command failed: exact repeat of deterministic `{}` failure from the original attempt (fingerprint `{}`, exit code {}, evidence {:?}); execution was suppressed.",
-            self.prior_failure.proof.outcome_class(),
-            self.fingerprint,
-            self.prior_failure.exit_code,
-            self.prior_failure.evidence,
-        )
+        match &self.reason {
+            CommandAttemptBlockedReason::DeterministicFailure(prior_failure) => format!(
+                "Command failed: exact repeat of deterministic `{}` failure from the original attempt (fingerprint `{}`, exit code {}, evidence {:?}); execution was suppressed.",
+                prior_failure.proof.outcome_class(),
+                self.fingerprint,
+                prior_failure.exit_code,
+                prior_failure.evidence,
+            ),
+            CommandAttemptBlockedReason::SearchMiss => format!(
+                "Search returned no matches: an equivalent search already produced a negative result under the unchanged repository and execution context (fingerprint `{}`); execution was suppressed. Change the query or scope, or use `force_fresh` when external state changed.",
+                self.fingerprint,
+            ),
+        }
     }
 }
 
@@ -217,6 +329,7 @@ pub(crate) struct RunningCommand {
 #[derive(Debug, Clone)]
 pub(crate) struct BoundAutoValidationLeaf {
     pub(crate) step_id: String,
+    pub(crate) step_revision: u64,
     pub(crate) implementation_revision: u64,
     pub(crate) implementation_identity: String,
     pub(crate) repository: PathBuf,
@@ -243,6 +356,28 @@ struct CompletedValidationProof {
     artifact: RawOutputArtifact,
 }
 
+#[derive(Debug, Clone)]
+struct CommandExecutionPersistence {
+    cache_path: PathBuf,
+    codex_home: PathBuf,
+    thread_id: String,
+    cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedValidationProof {
+    result: ValidationResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommandExecutionCacheDocument {
+    schema_version: u32,
+    workspace_identity: crate::git_workspace::WorkspaceEvidenceIdentity,
+    repository_epoch: u64,
+    search_misses: Vec<SearchMissCacheKey>,
+    completed_validations: Vec<PersistedValidationProof>,
+}
+
 #[derive(Default)]
 struct CommandExecutionState {
     attempts: HashMap<CommandAttemptKey, AttemptEntry>,
@@ -255,15 +390,136 @@ struct CommandExecutionState {
     completed_validation_order: VecDeque<ValidationProofKey>,
     validation_results_by_call: HashMap<String, ValidationResult>,
     validation_result_call_order: VecDeque<String>,
+    allowed_search_expansions: HashSet<SearchNarrowingScope>,
+    search_misses: HashSet<SearchMissCacheKey>,
+    search_miss_order: VecDeque<SearchMissCacheKey>,
 }
 
-#[derive(Default)]
 pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
     bound_auto_validations: Mutex<HashMap<String, BoundAutoValidationLeaf>>,
+    persistence: Option<CommandExecutionPersistence>,
+}
+
+impl Default for CommandExecutionLedger {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(CommandExecutionState::default()),
+            bound_auto_validations: Mutex::new(HashMap::new()),
+            persistence: None,
+        }
+    }
 }
 
 impl CommandExecutionLedger {
+    pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: String, cwd: &Path) -> Self {
+        let Some(workspace_identity) =
+            crate::git_workspace::capture_workspace_evidence_identity(cwd).await
+        else {
+            return Self::default();
+        };
+        let persistence = CommandExecutionPersistence {
+            cache_path: codex_home
+                .join("command-execution-cache")
+                .join(format!("{thread_id}.json")),
+            codex_home,
+            thread_id,
+            cwd: cwd.to_path_buf(),
+        };
+        let mut ledger = Self {
+            state: Mutex::new(CommandExecutionState::default()),
+            bound_auto_validations: Mutex::new(HashMap::new()),
+            persistence: Some(persistence.clone()),
+        };
+        let Ok(bytes) = tokio::fs::read(&persistence.cache_path).await else {
+            return ledger;
+        };
+        let Ok(document) = serde_json::from_slice::<CommandExecutionCacheDocument>(&bytes) else {
+            return ledger;
+        };
+        if document.schema_version != COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
+            || document.workspace_identity != workspace_identity
+        {
+            return ledger;
+        }
+
+        let mut state = CommandExecutionState {
+            repository_epoch: document.repository_epoch,
+            ..CommandExecutionState::default()
+        };
+        for search_miss in document
+            .search_misses
+            .into_iter()
+            .take(MAX_TRACKED_COMMANDS)
+        {
+            if state.search_misses.insert(search_miss.clone()) {
+                state.search_miss_order.push_back(search_miss);
+            }
+        }
+        for persisted in document
+            .completed_validations
+            .into_iter()
+            .take(MAX_COMPLETED_VALIDATION_PROOFS)
+        {
+            let result = persisted.result;
+            if result.status != ValidationTerminalStatus::Succeeded {
+                continue;
+            }
+            let Some(artifact_ref) = result.raw_artifact_ref.as_deref() else {
+                continue;
+            };
+            let Some(artifact) = RawOutputArtifact::restore_validation(
+                &persistence.codex_home,
+                &persistence.thread_id,
+                artifact_ref,
+            ) else {
+                continue;
+            };
+            let proof_key = result.proof_key.clone();
+            state
+                .completed_validation_order
+                .push_back(proof_key.clone());
+            state.completed_validations.insert(
+                proof_key,
+                CompletedValidationProof {
+                    result: result.clone(),
+                    artifact,
+                },
+            );
+            state
+                .validation_result_call_order
+                .push_back(result.call_id.clone());
+            state
+                .validation_results_by_call
+                .insert(result.call_id.clone(), result);
+        }
+        ledger.state = Mutex::new(state);
+        ledger
+    }
+
+    pub(crate) async fn admit_search_narrowing(
+        &self,
+        key: &CommandAttemptKey,
+    ) -> Result<(), String> {
+        let Some(search) = key.search_narrowing.as_ref() else {
+            return Ok(());
+        };
+        if search.breadth == RgSearchBreadth::Broad
+            && !self
+                .state
+                .lock()
+                .await
+                .allowed_search_expansions
+                .contains(&search.scope())
+        {
+            return Err(
+                "Broad `rg` rejected before owner-scoped discovery. Consult `SOURCEMAP.md`, infer the likely owning module, and search that bounded path first. Expand one parent scope at a time; each broader scope is allowed only after an attributable `rg` miss in its immediate child scope."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) async fn bind_auto_validation_leaf(
         &self,
         call_id: String,
@@ -397,16 +653,27 @@ impl CommandExecutionLedger {
         force_fresh: bool,
     ) -> Result<(), CommandAttemptBlocked> {
         let mut state = self.state.lock().await;
-        let entry = attempt_entry_locked(&mut state, key);
-        if !repaired
-            && !force_fresh
-            && let Some(prior_failure) = entry.deterministic_failure.clone()
-        {
-            return Err(CommandAttemptBlocked {
-                fingerprint: key.fingerprint(),
-                prior_failure,
-            });
+        if !repaired && !force_fresh {
+            if let Some(prior_failure) = state
+                .attempts
+                .get(key)
+                .and_then(|entry| entry.deterministic_failure.clone())
+            {
+                return Err(CommandAttemptBlocked {
+                    fingerprint: key.fingerprint(),
+                    reason: CommandAttemptBlockedReason::DeterministicFailure(prior_failure),
+                });
+            }
+            if let Some(search_miss_key) = key.search_miss_cache_key()
+                && state.search_misses.contains(&search_miss_key)
+            {
+                return Err(CommandAttemptBlocked {
+                    fingerprint: format!("{:016x}", fingerprint_value(&search_miss_key)),
+                    reason: CommandAttemptBlockedReason::SearchMiss,
+                });
+            }
         }
+        let entry = attempt_entry_locked(&mut state, key);
         entry.attempts = entry.attempts.saturating_add(1);
         if repaired {
             entry.repairs = entry.repairs.saturating_add(1);
@@ -446,6 +713,7 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn record_exit(&self, key: &CommandAttemptKey, exit_code: i32) {
         let mut state = self.state.lock().await;
+        record_search_result_locked(&mut state, key, exit_code);
         record_exit_locked(&mut state, key, exit_code);
     }
 
@@ -512,14 +780,66 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn finish_turn(&self, turn_id: &str) {
         self.forget_turn_repository_revision(turn_id).await;
+        self.persist_cache().await;
+    }
+
+    async fn persist_cache(&self) {
+        let Some(persistence) = self.persistence.clone() else {
+            return;
+        };
+        let (repository_epoch, search_misses, completed_validations) = {
+            let state = self.state.lock().await;
+            (
+                state.repository_epoch,
+                state.search_miss_order.iter().cloned().collect::<Vec<_>>(),
+                state
+                    .completed_validation_order
+                    .iter()
+                    .filter_map(|key| state.completed_validations.get(key))
+                    .map(|proof| PersistedValidationProof {
+                        result: proof.result.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let Some(workspace_identity) =
+            crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd).await
+        else {
+            return;
+        };
+        let document = CommandExecutionCacheDocument {
+            schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
+            workspace_identity,
+            repository_epoch,
+            search_misses,
+            completed_validations,
+        };
+        let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
+            return;
+        };
+        let cache_path = persistence.cache_path;
+        let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let Some(parent) = cache_path.parent() else {
+                return Err(std::io::Error::other("command cache path has no parent"));
+            };
+            std::fs::create_dir_all(parent)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            temporary.write_all(&bytes)?;
+            temporary.as_file().sync_all()?;
+            temporary
+                .persist(&cache_path)
+                .map_err(|error| error.error)?;
+            Ok(())
+        })
+        .await;
     }
 
     async fn forget_turn_repository_revision(&self, turn_id: &str) {
-        self.state
-            .lock()
-            .await
-            .observed_turn_mutation_revisions
-            .remove(turn_id);
+        let mut state = self.state.lock().await;
+        state.observed_turn_mutation_revisions.remove(turn_id);
+        state
+            .allowed_search_expansions
+            .retain(|scope| scope.turn_id != turn_id);
     }
 
     pub(crate) async fn update_running_artifact(
@@ -596,10 +916,21 @@ impl CommandExecutionLedger {
                 running.artifact.clone(),
                 running.started_at,
                 exit_code,
+                launch.turn_timing_state.clone(),
+                launch.force_fresh,
             )
         };
-        let (proof_key, route, call_id, artifact, started_at, exit_code) = candidate;
-        self.publish_completed_validation(
+        let (
+            proof_key,
+            route,
+            call_id,
+            artifact,
+            started_at,
+            exit_code,
+            turn_timing_state,
+            force_fresh,
+        ) = candidate;
+        self.publish_completed_validation_with_context(
             proof_key,
             route,
             call_id,
@@ -607,6 +938,8 @@ impl CommandExecutionLedger {
             started_at,
             exit_code,
             Some(process_id.to_string()),
+            turn_timing_state,
+            force_fresh,
         )
         .await;
     }
@@ -625,12 +958,21 @@ impl CommandExecutionLedger {
         ) else {
             return false;
         };
-        self.publish_completed_validation(
-            proof_key, route, call_id, artifact, started_at, exit_code, None,
+        self.publish_completed_validation_with_context(
+            proof_key,
+            route,
+            call_id,
+            artifact,
+            started_at,
+            exit_code,
+            None,
+            launch.turn_timing_state.clone(),
+            launch.force_fresh,
         )
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn publish_completed_validation(
         &self,
@@ -642,10 +984,34 @@ impl CommandExecutionLedger {
         exit_code: i32,
         process_id: Option<String>,
     ) -> bool {
-        let Some((artifact_ref, artifact_sha256)) = artifact.validation_integrity().await else {
+        self.publish_completed_validation_with_context(
+            proof_key, route, call_id, artifact, started_at, exit_code, process_id, None, false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_completed_validation_with_context(
+        &self,
+        proof_key: ValidationProofKey,
+        route: ValidationRoute,
+        call_id: String,
+        artifact: RawOutputArtifact,
+        started_at: Instant,
+        exit_code: i32,
+        process_id: Option<String>,
+        turn_timing_state: Option<std::sync::Arc<crate::turn_timing::TurnTimingState>>,
+        force_fresh: bool,
+    ) -> bool {
+        let Some((artifact_ref, artifact_sha256, retained_output)) =
+            artifact.validation_integrity_with_output().await
+        else {
             return false;
         };
-        let succeeded = exit_code == 0;
+        let selected_no_cargo_tests = exit_code == 0
+            && validation_route_is_cargo_test(&route)
+            && !cargo_test_output_selected_at_least_one(&retained_output);
+        let succeeded = exit_code == 0 && !selected_no_cargo_tests;
         let result = ValidationResult {
             proof_key: proof_key.clone(),
             route,
@@ -662,51 +1028,74 @@ impl CommandExecutionLedger {
                     .as_millis(),
             )
             .unwrap_or(u64::MAX),
-            summary: Some(if succeeded {
+            summary: Some(if selected_no_cargo_tests {
+                "focused cargo validation selected zero tests".to_string()
+            } else if succeeded {
                 "focused validation succeeded".to_string()
             } else {
                 format!("focused validation exited with code {exit_code}")
             }),
             failure_excerpt: (!succeeded).then(|| {
-                format!(
-                    "validation exited with code {exit_code}; exact output is retained in the immutable artifact"
-                )
+                if selected_no_cargo_tests {
+                    "cargo validation exited successfully but selected zero tests; exact output is retained in the immutable artifact"
+                        .to_string()
+                } else {
+                    format!(
+                        "validation exited with code {exit_code}; exact output is retained in the immutable artifact"
+                    )
+                }
             }),
             raw_artifact_ref: Some(artifact_ref),
             raw_artifact_sha256: Some(artifact_sha256),
             freshness: ValidationFreshness::Executed,
         };
-        let mut state = self.state.lock().await;
-        if state.validation_results_by_call.contains_key(&call_id) {
-            return true;
+        let duration_ms = result.duration_ms;
+        {
+            let mut state = self.state.lock().await;
+            if state.validation_results_by_call.contains_key(&call_id) {
+                return true;
+            }
+            while state.validation_results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+                let Some(oldest) = state.validation_result_call_order.pop_front() else {
+                    break;
+                };
+                state.validation_results_by_call.remove(&oldest);
+            }
+            state
+                .validation_result_call_order
+                .push_back(call_id.clone());
+            state
+                .validation_results_by_call
+                .insert(call_id.clone(), result.clone());
+            if succeeded && !state.completed_validations.contains_key(&proof_key) {
+                while state.completed_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
+                    let Some(oldest) = state.completed_validation_order.pop_front() else {
+                        break;
+                    };
+                    state.completed_validations.remove(&oldest);
+                }
+                state
+                    .completed_validation_order
+                    .push_back(proof_key.clone());
+                state.completed_validations.insert(
+                    proof_key.clone(),
+                    CompletedValidationProof { result, artifact },
+                );
+            }
         }
-        while state.validation_results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-            let Some(oldest) = state.validation_result_call_order.pop_front() else {
-                break;
-            };
-            state.validation_results_by_call.remove(&oldest);
+        if let Some(turn_timing_state) = turn_timing_state {
+            turn_timing_state.record_executed_validation(duration_ms, force_fresh);
         }
-        state
-            .validation_result_call_order
-            .push_back(call_id.clone());
-        state
-            .validation_results_by_call
-            .insert(call_id, result.clone());
-        if !succeeded || state.completed_validations.contains_key(&proof_key) {
-            return true;
-        }
-        while state.completed_validations.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-            let Some(oldest) = state.completed_validation_order.pop_front() else {
-                break;
-            };
-            state.completed_validations.remove(&oldest);
-        }
-        state
-            .completed_validation_order
-            .push_back(proof_key.clone());
-        state
-            .completed_validations
-            .insert(proof_key, CompletedValidationProof { result, artifact });
+        tracing::info!(
+            disposition = "executed",
+            validation_call_id = %call_id,
+            duration_ms,
+            force_fresh,
+            coverage_identity = %proof_key.coverage_identity,
+            implementation_identity = %proof_key.implementation_identity,
+            succeeded,
+            "validation process completed"
+        );
         true
     }
 
@@ -753,7 +1142,41 @@ fn record_running_exit_locked(
     running: &RunningCommand,
     exit_code: i32,
 ) {
+    record_search_result_locked(state, &running.key, exit_code);
     record_exit_locked(state, &running.key, exit_code);
+}
+
+fn record_search_result_locked(
+    state: &mut CommandExecutionState,
+    key: &CommandAttemptKey,
+    exit_code: i32,
+) {
+    if exit_code == 1
+        && let Some(search) = key.search_narrowing.as_ref()
+        && search.can_record_miss
+        && let Some(parent_scope) = search.parent_scope()
+    {
+        state.allowed_search_expansions.insert(parent_scope);
+    }
+    if key
+        .search_narrowing
+        .as_ref()
+        .is_some_and(|search| search.can_record_miss)
+        && let Some(search_miss_key) = key.search_miss_cache_key()
+    {
+        if exit_code == 1 && state.search_misses.insert(search_miss_key.clone()) {
+            state.search_miss_order.push_back(search_miss_key);
+            while state.search_misses.len() > MAX_TRACKED_COMMANDS {
+                if let Some(oldest) = state.search_miss_order.pop_front() {
+                    state.search_misses.remove(&oldest);
+                }
+            }
+        } else if exit_code == 0 && state.search_misses.remove(&search_miss_key) {
+            state
+                .search_miss_order
+                .retain(|cached| cached != &search_miss_key);
+        }
+    }
 }
 
 fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey, exit_code: i32) {
@@ -807,9 +1230,30 @@ fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttempt
     state.running.values().any(|running| running.key == *key)
 }
 
+fn validation_route_is_cargo_test(route: &ValidationRoute) -> bool {
+    route.leaves.as_slice().first().is_some_and(|leaf| {
+        matches!(
+            leaf.argv.as_slice(),
+            [program, subcommand, ..] if program == "cargo" && subcommand == "test"
+        )
+    })
+}
+
+fn cargo_test_output_selected_at_least_one(output: &[u8]) -> bool {
+    String::from_utf8_lossy(output).lines().any(|line| {
+        line.trim()
+            .strip_prefix("running ")
+            .and_then(|summary| summary.split_whitespace().next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .is_some_and(|count| count > 0)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
     }
@@ -836,7 +1280,449 @@ mod tests {
             proof_key: None,
             structured_route: None,
             validation_call_id: None,
+            turn_timing_state: None,
+            force_fresh: false,
         }
+    }
+
+    fn focused_cargo_route() -> ValidationRoute {
+        ValidationRoute {
+            leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
+                argv: vec![
+                    "cargo".to_string(),
+                    "test".to_string(),
+                    "-p".to_string(),
+                    "codex-core".to_string(),
+                    "focused_case".to_string(),
+                ],
+                uncertainty: "the focused case still passes".to_string(),
+                covered_paths: vec!["core/src/tools/command_execution.rs".to_string()],
+                covered_contracts: vec!["nonempty-cargo-proof".to_string()],
+                timeout_ms: 30_000,
+                semantic_timeout: false,
+            }],
+            ordering: Default::default(),
+        }
+    }
+
+    fn validation_proof_key(identity: &str) -> ValidationProofKey {
+        ValidationProofKey {
+            repository: "C:/repo".to_string(),
+            cwd: "C:/repo".to_string(),
+            canonical_route_hash: format!("route-{identity}"),
+            implementation_identity: identity.to_string(),
+            coverage_identity: "focused-coverage".to_string(),
+            environment_identity: "test-environment".to_string(),
+            toolchain_identity: "test-toolchain".to_string(),
+            configuration_identity: "test-configuration".to_string(),
+            validation_contract_version: codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
+        }
+    }
+
+    fn initialize_git_repository(path: &Path) {
+        std::fs::create_dir_all(path).expect("create repository");
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(path)
+            .status()
+            .expect("launch git init");
+        assert!(status.success(), "git init failed");
+    }
+
+    #[tokio::test]
+    async fn search_misses_and_successful_validations_survive_safe_reopen() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let thread_id = "persisted-command-state";
+        let ledger = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            thread_id.to_string(),
+            &repository,
+        )
+        .await;
+        assert_eq!(ledger.observe_repository_revision("turn-a", 1).await, 1);
+        let search = RgSearchNarrowing {
+            breadth: RgSearchBreadth::Narrow,
+            query_identity: "missing".to_string(),
+            search_identity: "missing:src".to_string(),
+            scope_identity: "repo/src".to_string(),
+            parent_scope_identity: Some("repo".to_string()),
+            can_record_miss: true,
+        };
+        let missed = key("rg missing src")
+            .with_repository_epoch(1)
+            .with_search_narrowing("turn-a", "repo", Some(search.clone()));
+        ledger.record_exit(&missed, 1).await;
+
+        let proof_key = validation_proof_key("persisted");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home,
+            thread_id,
+            b"running 1 test\ntest persisted_case ... ok\n",
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_completed_validation(
+                    proof_key.clone(),
+                    focused_cargo_route(),
+                    "persisted-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+        ledger.finish_turn("turn-a").await;
+
+        let reopened = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            thread_id.to_string(),
+            &repository,
+        )
+        .await;
+        let equivalent = key("rg missing ./src")
+            .with_repository_epoch(1)
+            .with_search_narrowing("turn-b", "repo", Some(search));
+        assert!(
+            reopened
+                .begin_attempt_with_freshness(&equivalent, false, false)
+                .await
+                .is_err()
+        );
+        let reused = reopened
+            .reusable_validation(&proof_key)
+            .await
+            .expect("persisted validation proof");
+        assert_eq!(reused.freshness, ValidationFreshness::Reused);
+
+        std::fs::write(repository.join("external-change.txt"), "changed")
+            .expect("mutate repository");
+        let stale =
+            CommandExecutionLedger::load_or_new(codex_home, thread_id.to_string(), &repository)
+                .await;
+        assert!(stale.reusable_validation(&proof_key).await.is_none());
+        assert!(
+            stale
+                .begin_attempt_with_freshness(&equivalent, false, false)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_test_cargo_success_is_failed_and_not_reusable() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        let ledger = CommandExecutionLedger::default();
+        let route = focused_cargo_route();
+        let zero_key = validation_proof_key("zero");
+        let zero_artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            temp.path(),
+            "zero-test",
+            b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n",
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_completed_validation(
+                    zero_key.clone(),
+                    route.clone(),
+                    "zero-call".to_string(),
+                    zero_artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+        let zero_result = ledger
+            .validation_result_for_call("zero-call")
+            .await
+            .expect("zero-test result");
+        assert_eq!(zero_result.status, ValidationTerminalStatus::Failed);
+        assert!(ledger.reusable_validation(&zero_key).await.is_none());
+
+        let selected_key = validation_proof_key("selected");
+        let selected_artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            temp.path(),
+            "selected-test",
+            b"running 1 test\ntest focused_case ... ok\n",
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_completed_validation(
+                    selected_key.clone(),
+                    route,
+                    "selected-call".to_string(),
+                    selected_artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+        let selected_result = ledger
+            .validation_result_for_call("selected-call")
+            .await
+            .expect("selected-test result");
+        assert_eq!(selected_result.status, ValidationTerminalStatus::Succeeded);
+        assert!(ledger.reusable_validation(&selected_key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn validation_execution_telemetry_records_cost_and_force_fresh() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        let ledger = CommandExecutionLedger::default();
+        let timing = std::sync::Arc::new(crate::turn_timing::TurnTimingState::default());
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            temp.path(),
+            "telemetry-test",
+            b"running 1 test\ntest focused_case ... ok\n",
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_completed_validation_with_context(
+                    validation_proof_key("telemetry"),
+                    focused_cargo_route(),
+                    "telemetry-call".to_string(),
+                    artifact,
+                    Instant::now() - Duration::from_millis(25),
+                    0,
+                    None,
+                    Some(std::sync::Arc::clone(&timing)),
+                    true,
+                )
+                .await
+        );
+
+        let counters = timing.complete_snapshot().protocol_timing().counters;
+        assert_eq!(counters.executed_validation_count, 1);
+        assert_eq!(counters.forced_fresh_validation_count, 1);
+        assert!(counters.executed_validation_duration_ns >= 25_000_000);
+        assert_eq!(counters.reused_validation_count, 0);
+        assert_eq!(counters.duplicate_validation_count, 0);
+    }
+
+    #[tokio::test]
+    async fn broad_rg_requires_a_prior_scoped_miss_in_the_same_turn() {
+        let ledger = CommandExecutionLedger::default();
+        let search = |breadth,
+                      query_identity: &str,
+                      scope_identity: &str,
+                      parent_scope_identity: Option<&str>| RgSearchNarrowing {
+            breadth,
+            query_identity: query_identity.to_string(),
+            search_identity: format!("{query_identity}:{scope_identity}"),
+            scope_identity: scope_identity.to_string(),
+            parent_scope_identity: parent_scope_identity.map(ToString::to_string),
+            can_record_miss: true,
+        };
+        let broad = key("rg needle .").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(search(RgSearchBreadth::Broad, "needle", "repo", None)),
+        );
+        let narrow = key("rg needle core/src/tools").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(search(
+                RgSearchBreadth::Narrow,
+                "needle",
+                "repo/core/src/tools",
+                Some("repo/core/src"),
+            )),
+        );
+        let owner = key("rg needle core").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(search(
+                RgSearchBreadth::Narrow,
+                "needle",
+                "repo/core",
+                Some("repo"),
+            )),
+        );
+
+        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
+        let compound_narrow = key("rg needle src/tools; false").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(RgSearchNarrowing {
+                can_record_miss: false,
+                ..search(
+                    RgSearchBreadth::Narrow,
+                    "needle",
+                    "repo/core/src/tools",
+                    Some("repo/core/src"),
+                )
+            }),
+        );
+        ledger.record_exit(&compound_narrow, 1).await;
+        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
+        ledger.record_exit(&narrow, 0).await;
+        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
+        ledger.record_exit(&narrow, 1).await;
+        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
+        ledger.record_exit(&owner, 1).await;
+        assert!(ledger.admit_search_narrowing(&broad).await.is_ok());
+
+        let unrelated = key("rg other .").with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(search(RgSearchBreadth::Broad, "other", "repo", None)),
+        );
+        assert!(ledger.admit_search_narrowing(&unrelated).await.is_err());
+
+        let other_turn = key("rg needle .").with_search_narrowing(
+            "turn-b",
+            "repo-a",
+            Some(search(RgSearchBreadth::Broad, "needle", "repo", None)),
+        );
+        assert!(ledger.admit_search_narrowing(&other_turn).await.is_err());
+        let other_repository = key("rg needle .").with_search_narrowing(
+            "turn-a",
+            "repo-b",
+            Some(search(RgSearchBreadth::Broad, "needle", "repo", None)),
+        );
+        assert!(
+            ledger
+                .admit_search_narrowing(&other_repository)
+                .await
+                .is_err()
+        );
+        let other_environment = CommandAttemptKey::new(
+            "exec_command",
+            "environment-b",
+            ".",
+            &["rg needle .".to_string()],
+        )
+        .with_search_narrowing(
+            "turn-a",
+            "repo-a",
+            Some(search(RgSearchBreadth::Broad, "needle", "repo", None)),
+        );
+        assert!(
+            ledger
+                .admit_search_narrowing(&other_environment)
+                .await
+                .is_err()
+        );
+        ledger.finish_turn("turn-a").await;
+        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn equivalent_search_miss_is_cached_until_context_changes() {
+        let ledger = CommandExecutionLedger::default();
+        let search = |search_identity: &str| RgSearchNarrowing {
+            breadth: RgSearchBreadth::Narrow,
+            query_identity: "needle".to_string(),
+            search_identity: search_identity.to_string(),
+            scope_identity: search_identity.to_string(),
+            parent_scope_identity: Some("repo".to_string()),
+            can_record_miss: true,
+        };
+        let first = key("rg needle src")
+            .with_repository_epoch(1)
+            .with_search_narrowing("turn-a", "repo-a", Some(search("needle:src")));
+        let equivalent = key("rg needle ./src")
+            .with_repository_epoch(1)
+            .with_search_narrowing("turn-b", "repo-a", Some(search("needle:src")));
+        let compound = key("rg needle ./src; echo finished")
+            .with_repository_epoch(1)
+            .with_search_narrowing(
+                "turn-b",
+                "repo-a",
+                Some(RgSearchNarrowing {
+                    can_record_miss: false,
+                    ..search("needle:src")
+                }),
+            );
+
+        ledger
+            .begin_attempt(&first, false)
+            .await
+            .expect("first search");
+        ledger.record_exit(&first, 1).await;
+        let blocked = ledger
+            .begin_attempt(&equivalent, false)
+            .await
+            .expect_err("equivalent miss should be reused");
+        assert!(blocked.render_for_model().contains("equivalent search"));
+        ledger
+            .begin_attempt(&compound, false)
+            .await
+            .expect("an unattributable compound command must not be blocked by an rg miss");
+
+        ledger
+            .begin_attempt_with_freshness(&equivalent, false, true)
+            .await
+            .expect("force_fresh bypasses the negative cache");
+        ledger.record_exit(&equivalent, 0).await;
+        ledger
+            .begin_attempt(&equivalent, false)
+            .await
+            .expect("a fresh successful search clears the cached miss");
+
+        ledger
+            .begin_attempt(
+                &key("rg needle tests")
+                    .with_repository_epoch(1)
+                    .with_search_narrowing("turn-b", "repo-a", Some(search("needle:tests"))),
+                false,
+            )
+            .await
+            .expect("changed scope executes");
+        ledger
+            .begin_attempt(
+                &key("rg needle src")
+                    .with_repository_epoch(2)
+                    .with_search_narrowing("turn-b", "repo-a", Some(search("needle:src"))),
+                false,
+            )
+            .await
+            .expect("changed repository epoch executes");
+    }
+
+    #[tokio::test]
+    async fn background_search_miss_populates_the_same_negative_cache() {
+        let ledger = CommandExecutionLedger::default();
+        let search = RgSearchNarrowing {
+            breadth: RgSearchBreadth::Narrow,
+            query_identity: "needle".to_string(),
+            search_identity: "needle:src".to_string(),
+            scope_identity: "repo/src".to_string(),
+            parent_scope_identity: Some("repo".to_string()),
+            can_record_miss: true,
+        };
+        let first = key("rg needle src")
+            .with_repository_epoch(1)
+            .with_search_narrowing("turn-a", "repo-a", Some(search.clone()));
+        let equivalent = key("rg needle ./src")
+            .with_repository_epoch(1)
+            .with_search_narrowing("turn-b", "repo-a", Some(search));
+
+        ledger
+            .begin_attempt(&first, false)
+            .await
+            .expect("first search");
+        ledger
+            .track_running_process(
+                42,
+                first,
+                RawOutputArtifact::unavailable("background search fixture"),
+            )
+            .await;
+        assert!(ledger.mark_running_process_completed(42, 1).await);
+        ledger
+            .begin_attempt(&equivalent, false)
+            .await
+            .expect_err("background miss should be reused");
     }
 
     #[tokio::test]

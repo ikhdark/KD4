@@ -81,7 +81,13 @@ pub(super) async fn run_remote_compact_v2_attempt(
         Some(client_session) => client_session,
         None => owned_client_session.insert(sess.services.model_client.new_session()),
     };
-    let prepared = prepare_sampling_prompt_for_client(history, turn_context, client_session);
+    let prepared = prepare_sampling_prompt_for_client(
+        history,
+        turn_context,
+        client_session,
+        sess.services.git_workspace.as_ref(),
+    )
+    .await;
     let mut prompt = build_projected_prompt(
         sess.as_ref(),
         &prepared,

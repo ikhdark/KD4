@@ -8,10 +8,23 @@ pub enum PromptSlot {
     SeparateDeveloper,
 }
 
+/// Stable provenance for extension-owned prompt fragments.
+///
+/// The default remains `OtherInjected` so existing extensions keep their
+/// current behavior. Built-in extensions should select a more specific kind
+/// when the host exposes dedicated context accounting for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PromptFragmentKind {
+    #[default]
+    OtherInjected,
+    Memory,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptFragment {
     slot: PromptSlot,
     text: String,
+    kind: PromptFragmentKind,
 }
 
 impl PromptFragment {
@@ -20,6 +33,7 @@ impl PromptFragment {
         Self {
             slot,
             text: text.into(),
+            kind: PromptFragmentKind::OtherInjected,
         }
     }
 
@@ -38,6 +52,12 @@ impl PromptFragment {
         Self::new(PromptSlot::SeparateDeveloper, text)
     }
 
+    /// Assigns stable measurement provenance to this fragment.
+    pub fn with_kind(mut self, kind: PromptFragmentKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
     /// Returns the target prompt slot.
     pub fn slot(&self) -> PromptSlot {
         self.slot
@@ -46,5 +66,10 @@ impl PromptFragment {
     /// Returns the model-visible text.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Returns the measurement provenance selected by the extension.
+    pub fn kind(&self) -> PromptFragmentKind {
+        self.kind
     }
 }

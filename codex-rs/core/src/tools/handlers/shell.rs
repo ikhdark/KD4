@@ -180,6 +180,47 @@ pub(super) struct RunExecLikeResult {
     pub(super) canonical_output: Option<Vec<u8>>,
 }
 
+pub(super) fn shell_failure_sampling_signal(
+    attempt_key: Option<&CommandAttemptKey>,
+    command: &str,
+    exit_code: Option<i32>,
+) -> Option<JsonValue> {
+    if exit_code == Some(0) {
+        return None;
+    }
+    let action_fingerprint = attempt_key
+        .map(CommandAttemptKey::fingerprint)
+        .unwrap_or_else(|| format!("{:x}", Sha256::digest(command.as_bytes())));
+    let outcome_fingerprint = exit_code
+        .map(|code| format!("exit-{code}"))
+        .unwrap_or_else(|| "timeout".to_string());
+    Some(json!({
+        "outcome": "failure",
+        "failure": {
+            "fingerprint": format!(
+                "shell.{action_fingerprint}.{outcome_fingerprint}"
+            ),
+        },
+    }))
+}
+
+pub(super) fn shell_sampling_signal(
+    attempt_key: Option<&CommandAttemptKey>,
+    command: &str,
+    exit_code: Option<i32>,
+    canonical_output: Option<&[u8]>,
+) -> Option<JsonValue> {
+    shell_failure_sampling_signal(attempt_key, command, exit_code).or_else(|| {
+        (exit_code == Some(0)).then(|| {
+            crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
+                crate::tools::context::semantic_evidence_for_command_output(
+                    canonical_output.unwrap_or_default(),
+                )
+            ))
+        })
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ValidationExecutionOutcome {
     ExecutedSuccess,
@@ -288,6 +329,7 @@ impl ToolOutput for LegacyShellToolOutput {
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         let mut metadata = self.inner.projection_metadata()?;
+        let contextual_output = metadata.spillable_text.join("\n");
         metadata.fragments.insert(
             0,
             ToolOutputProjectionFragment::new(
@@ -295,6 +337,12 @@ impl ToolOutput for LegacyShellToolOutput {
                 format!("process final status: exit_code={:?}", self.exit_code),
             ),
         );
+        if !contextual_output.is_empty() {
+            metadata.fragments.push(ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ContextualSpillableText,
+                contextual_output,
+            ));
+        }
         metadata.essential_inline["exit_code"] = serde_json::json!(self.exit_code);
         metadata.essential_inline["call_id"] = serde_json::json!(&self.call_id);
         if self.validation_failure
@@ -1194,6 +1242,18 @@ pub(crate) fn validate_structured_validation_leaf(
     leaf: &ValidationRouteLeaf,
     repo_root: &Path,
 ) -> Result<String, String> {
+    if leaf.uncertainty.trim().is_empty() {
+        return Err("auto-validation must state the uncertainty this command resolves".to_string());
+    }
+    if leaf.covered_paths.is_empty() {
+        return Err("auto-validation must declare non-empty covered_paths".to_string());
+    }
+    if leaf.covered_contracts.is_empty() {
+        return Err("auto-validation must declare non-empty covered_contracts".to_string());
+    }
+    for covered_path in &leaf.covered_paths {
+        require_safe_repo_relative_path(covered_path, "auto-validation covered path", repo_root)?;
+    }
     let Some((program, args)) = leaf.argv.split_first() else {
         return Err("the validation route argv cannot be empty".to_string());
     };
@@ -1223,6 +1283,21 @@ pub(crate) fn validate_structured_validation_leaf(
     {
         return Err("auto-validation cargo routes must remain focused".to_string());
     }
+    if program == "cargo"
+        && args.first().is_some_and(|arg| arg == "test")
+        && !cargo_test_has_package_and_filter(args)
+    {
+        return Err(
+            "auto-validation cargo test routes must name both a package and a test filter"
+                .to_string(),
+        );
+    }
+    if program == "cargo"
+        && args.first().is_some_and(|arg| arg == "check")
+        && !cargo_args_have_package(args)
+    {
+        return Err("auto-validation cargo check routes must name a package".to_string());
+    }
     if program == "just"
         && matches!(
             args.first().map(String::as_str),
@@ -1231,7 +1306,144 @@ pub(crate) fn validate_structured_validation_leaf(
     {
         return Err("auto-validation just routes must name a focused lane or package".to_string());
     }
+    if program == "just" {
+        match args.first().map(String::as_str) {
+            Some("test-lane" | "test-lane-fast")
+                if !nextest_args_have_package_and_filter(&args[2..]) =>
+            {
+                return Err(
+                    "auto-validation just test lanes must name both a package and a test filter"
+                        .to_string(),
+                );
+            }
+            Some("test-lane-package") if !nextest_args_have_filter(&args[2..]) => {
+                return Err(
+                    "auto-validation just package lanes must name a test filter".to_string()
+                );
+            }
+            _ => {}
+        }
+    }
     Ok(canonical)
+}
+
+pub(crate) fn direct_validation_route(
+    context: &codex_protocol::validation::ValidationCommandContext,
+    invocation: &CommandInvocation,
+    repo_root: &Path,
+    timeout_ms: u64,
+) -> Result<codex_protocol::plan_tool::ValidationRoute, String> {
+    let CommandInvocation::Argv { program, args } = invocation else {
+        return Err(
+            "validation commands must use direct argv mode so coverage and proof identity are unambiguous"
+                .to_string(),
+        );
+    };
+    let leaf = ValidationRouteLeaf {
+        argv: std::iter::once(program.clone())
+            .chain(args.iter().cloned())
+            .collect(),
+        uncertainty: context.uncertainty.clone(),
+        covered_paths: context.covered_paths.clone(),
+        covered_contracts: context.covered_contracts.clone(),
+        timeout_ms: timeout_ms.clamp(
+            1,
+            codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS,
+        ),
+        semantic_timeout: false,
+    };
+    validate_structured_validation_leaf(&leaf, repo_root)?;
+    Ok(codex_protocol::plan_tool::ValidationRoute {
+        leaves: vec![leaf],
+        ordering: codex_protocol::plan_tool::ValidationRouteOrdering::StopOnFailure,
+    })
+}
+
+fn cargo_args_have_package(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|pair| matches!(pair[0].as_str(), "-p" | "--package") && !pair[1].starts_with('-'))
+        || args.iter().any(|arg| {
+            arg.strip_prefix("--package=")
+                .is_some_and(|value| !value.is_empty())
+        })
+}
+
+fn cargo_test_has_package_and_filter(args: &[String]) -> bool {
+    let has_package = cargo_args_have_package(args);
+    let mut has_filter = false;
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            break;
+        }
+        if matches!(arg.as_str(), "-p" | "--package") {
+            index += 2;
+            continue;
+        }
+        if cargo_option_takes_value(arg) {
+            index += 2;
+            continue;
+        }
+        if !arg.starts_with("--package=") && !arg.starts_with('-') {
+            has_filter = true;
+        }
+        index += 1;
+    }
+    has_package && has_filter
+}
+
+fn nextest_args_have_package_and_filter(args: &[String]) -> bool {
+    let has_package = args
+        .windows(2)
+        .any(|pair| matches!(pair[0].as_str(), "-p" | "--package") && !pair[1].starts_with('-'))
+        || args.iter().any(|arg| {
+            arg.strip_prefix("--package=")
+                .is_some_and(|value| !value.is_empty())
+        });
+    has_package && nextest_args_have_filter(args)
+}
+
+fn nextest_args_have_filter(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (option, inline_value) = split_option(arg);
+        match option {
+            "-E" | "--filterset" | "--filter-expr" => {
+                if inline_value.is_some_and(|value| !value.is_empty())
+                    || args.get(index + 1).is_some_and(|value| !value.is_empty())
+                {
+                    return true;
+                }
+                index += 1;
+            }
+            "-p" | "--package" | "--features" => index += usize::from(inline_value.is_none()),
+            _ if !arg.starts_with('-') => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn cargo_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--test"
+            | "--bin"
+            | "--example"
+            | "--bench"
+            | "--features"
+            | "--manifest-path"
+            | "--target"
+            | "--target-dir"
+            | "--profile"
+            | "--jobs"
+            | "-j"
+            | "--color"
+            | "--config"
+    )
 }
 
 fn collect_focused_validation_argv_violations(
@@ -1361,8 +1573,6 @@ fn validate_nextest_forwarded_args(args: &[String]) -> Result<(), String> {
             | "--tests"
             | "--benches"
             | "--all-targets"
-            | "--workspace"
-            | "--all"
             | "--no-fail-fast"
             | "--fail-fast"
             | "--no-capture"
@@ -1465,6 +1675,9 @@ fn validate_python_validation(args: &[String], repo_root: &Path) -> Result<(), S
 
 fn validate_unittest_args(args: &[String], repo_root: &Path) -> Result<(), String> {
     let discovery = args.first().is_some_and(|arg| arg == "discover");
+    let mut has_selector = false;
+    let mut has_discovery_directory = false;
+    let mut has_discovery_pattern = false;
     let mut index = if discovery { 1 } else { 0 };
     while index < args.len() {
         let arg = &args[index];
@@ -1485,9 +1698,13 @@ fn validate_unittest_args(args: &[String], repo_root: &Path) -> Result<(), Strin
             "-s" | "--start-directory" | "-t" | "--top-level-directory" if discovery => {
                 let value = take_option_value(args, &mut index, inline_value, option)?;
                 require_safe_repo_relative_path(value, option, repo_root)?;
+                if matches!(option, "-s" | "--start-directory") {
+                    has_discovery_directory = true;
+                }
             }
             "-p" | "--pattern" if discovery => {
                 require_nonempty_option_value(args, &mut index, inline_value, option)?;
+                has_discovery_pattern = true;
             }
             _ if arg.starts_with('-') => {
                 return Err(format!("unittest option is not admitted: {arg}"));
@@ -1497,15 +1714,27 @@ fn validate_unittest_args(args: &[String], repo_root: &Path) -> Result<(), Strin
                     "unittest discover positional is not admitted: {arg}"
                 ));
             }
-            _ => require_safe_unittest_selector(selector_path(arg), repo_root)?,
+            _ => {
+                require_safe_unittest_selector(selector_path(arg), repo_root)?;
+                has_selector = true;
+            }
         }
         index += 1;
+    }
+    if discovery && !(has_discovery_directory && has_discovery_pattern) {
+        return Err(
+            "unittest discovery must name both a start directory and a pattern".to_string(),
+        );
+    }
+    if !discovery && !has_selector {
+        return Err("unittest validation must name a focused test selector".to_string());
     }
     Ok(())
 }
 
 fn validate_pytest_args(args: &[String], repo_root: &Path) -> Result<(), String> {
     let mut index = 0;
+    let mut has_selector = false;
     while index < args.len() {
         let arg = &args[index];
         let (option, inline_value) = split_option(arg);
@@ -1618,9 +1847,15 @@ fn validate_pytest_args(args: &[String], repo_root: &Path) -> Result<(), String>
             _ if arg.starts_with('@') => {
                 return Err("pytest argument files are not admitted".to_string());
             }
-            _ => require_safe_repo_relative_path(selector_path(arg), "pytest selector", repo_root)?,
+            _ => {
+                require_safe_repo_relative_path(selector_path(arg), "pytest selector", repo_root)?;
+                has_selector = true;
+            }
         }
         index += 1;
+    }
+    if !has_selector {
+        return Err("pytest validation must name a focused test selector".to_string());
     }
     Ok(())
 }
@@ -1938,20 +2173,25 @@ async fn run_exec_like_with_exit_code_inner(
             &exec_params.command[0],
             &exec_params.command[1..],
         ) {
-        let project_namespace = if let Some(source) = turn.turn_metadata_state.git_metadata_source()
-            && exec_params.cwd.starts_with(source.repo_root().as_path())
-        {
-            source.project_namespace().await
-        } else {
-            None
+        let metadata_source = turn
+            .turn_metadata_state
+            .git_metadata_source()
+            .filter(|source| exec_params.cwd.starts_with(source.repo_root().as_path()));
+        let project_namespace = match &metadata_source {
+            Some(source) => source.project_namespace().await,
+            None => None,
         };
+        let project_namespace_hint = metadata_source
+            .map_or(known_delta_store::ProjectNamespaceHint::Discover, |_| {
+                known_delta_store::ProjectNamespaceHint::Resolved(project_namespace.as_deref())
+            });
         known_delta_store::prepare_immutable_git_show(
             turn.config.codex_home.as_path(),
             &session.thread_id.to_string(),
             &exec_params.cwd,
             &exec_params.command[0],
             &exec_params.command[1..],
-            project_namespace.as_deref(),
+            project_namespace_hint,
             force_fresh,
         )
         .await
@@ -2303,7 +2543,12 @@ async fn run_exec_like_with_exit_code_inner(
                 None => codex_tools::ToolOutputOutcome::TimedOut,
             }),
             post_tool_use_response,
-            sampling_request_signal: None,
+            sampling_request_signal: shell_sampling_signal(
+                attempt_key.as_ref(),
+                req.hook_command.as_str(),
+                exit_code,
+                canonical_output.as_deref(),
+            ),
             deterministic_continuation_receipts: Vec::new(),
             deterministic_continuation_owner_key: None,
             skip_disposition: None,

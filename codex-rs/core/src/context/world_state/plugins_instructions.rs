@@ -2,6 +2,7 @@ use super::PreviousSectionState;
 use super::WorldStateSection;
 use crate::context::AvailablePluginsInstructions;
 use crate::context::ContextualUserFragment;
+use crate::context::PluginsInstructionsUnavailable;
 
 /// Whether generic plugin usage guidance should be visible to the model.
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,14 +40,23 @@ impl WorldStateSection for PluginsInstructionsState {
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
     ) -> Option<Box<dyn ContextualUserFragment>> {
-        if !self.available
-            || matches!(previous, PreviousSectionState::Known(previous) if *previous)
-            || matches!(previous, PreviousSectionState::Unknown)
-        {
-            return None;
+        if self.available {
+            match previous {
+                PreviousSectionState::Absent => Some(Box::new(AvailablePluginsInstructions)),
+                PreviousSectionState::Known(previous) if !*previous => {
+                    Some(Box::new(AvailablePluginsInstructions))
+                }
+                PreviousSectionState::Known(_) | PreviousSectionState::Unknown => None,
+            }
+        } else {
+            match previous {
+                PreviousSectionState::Known(previous) if *previous => {
+                    Some(Box::new(PluginsInstructionsUnavailable))
+                }
+                PreviousSectionState::Unknown => Some(Box::new(PluginsInstructionsUnavailable)),
+                PreviousSectionState::Absent | PreviousSectionState::Known(_) => None,
+            }
         }
-
-        Some(Box::new(AvailablePluginsInstructions))
     }
 }
 

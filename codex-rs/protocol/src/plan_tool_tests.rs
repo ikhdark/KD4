@@ -118,6 +118,7 @@ fn structured_validation_route_round_trips_direct_argv_leaves() {
                 "ordering": "run_all",
                 "leaves": [{
                     "argv": ["cargo", "test", "-p", "codex-core", "focused_case"],
+                    "uncertainty": "the focused validation contract remains satisfied",
                     "covered_paths": ["core/src/validation_admission.rs"],
                     "covered_contracts": ["focused-validation-v1"],
                     "timeout_ms": 30000

@@ -65,6 +65,7 @@ const MAX_TERMINALIZATION_RECEIPTS: usize = 64;
 const MAX_PLANNING_AUDIT_ENTRIES: usize = 512;
 const MAX_OUTSIDE_PLAN_ACTIONS: usize = 256;
 const MAX_COMPLETION_CHECKPOINT_HUNK_BYTES: usize = 16 * 1024;
+const COMPACTION_TASK_STATE_MAX_TOKENS: usize = 2_400;
 const EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
 const EXTERNAL_EVIDENCE_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
 const EXTERNAL_EVIDENCE_ARTIFACT_HEADER: &str =
@@ -123,12 +124,50 @@ pub(crate) enum ValidationDisposition {
     NotRequired,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResultProvenance {
+    DirectFileRead,
+    SearchHit,
+    GeneratedSummary,
+    CachedObservation,
+    InferredRelationship,
+    TestResult,
+    /// Compatibility value for facts persisted before provenance was required.
+    #[default]
+    Unverified,
+}
+
+impl ResultProvenance {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectFileRead => "direct_file_read",
+            Self::SearchHit => "search_hit",
+            Self::GeneratedSummary => "generated_summary",
+            Self::CachedObservation => "cached_observation",
+            Self::InferredRelationship => "inferred_relationship",
+            Self::TestResult => "test_result",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PlanningFactInput {
     pub(crate) id: String,
     pub(crate) value: String,
     #[serde(default)]
+    pub(crate) provenance: ResultProvenance,
+    #[serde(default)]
     pub(crate) source: Option<String>,
+    #[serde(default)]
+    pub(crate) depends_on_paths: Vec<String>,
+    #[serde(default = "planning_fact_dependencies_current_default")]
+    pub(crate) dependencies_current: bool,
+}
+
+const fn planning_fact_dependencies_current_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +250,15 @@ pub(crate) enum PlanUpdateEffect {
 impl PlanUpdateEffect {
     pub(crate) fn requests_generation(self) -> bool {
         matches!(self, Self::Initial | Self::StructuralRevision)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::StructuralRevision => "structural_revision",
+            Self::StatusOnly => "status_only",
+            Self::NoOp => "no_op",
+        }
     }
 }
 
@@ -1994,9 +2042,11 @@ struct ImplementationBatchAcknowledgement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AutoValidationCandidate {
     pub(crate) step_id: String,
+    pub(crate) step_revision: u64,
     pub(crate) route: ValidationRoute,
     pub(crate) implementation_revision: u64,
     pub(crate) implementation_identity: String,
+    pub(crate) leaf_implementation_identities: Vec<String>,
     pub(crate) repository_wide: bool,
 }
 
@@ -2734,6 +2784,276 @@ fn new_completion_review_ledger(root_task_id: &str) -> CompletionReviewLedgerV2 
         workspace_event_history_complete: false,
         source_capture_failed: false,
         obligation: CompletionReviewObligationState::default(),
+    }
+}
+
+fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
+    let unresolved_steps = document
+        .plan
+        .iter()
+        .filter(|step| {
+            !matches!(
+                step.status,
+                StepStatus::Passed | StepStatus::Completed | StepStatus::Skipped
+            )
+        })
+        .map(|step| {
+            let active = if document.active_step_id.as_deref() == Some(step.id.as_str()) {
+                " active"
+            } else {
+                ""
+            };
+            format!(
+                "- {} [{}{}]: {}",
+                step.id,
+                step_status_name(&step.status),
+                active,
+                step.step
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut goal = document
+        .plan
+        .iter()
+        .filter(|step| {
+            !matches!(
+                step.status,
+                StepStatus::Passed | StepStatus::Completed | StepStatus::Skipped
+            )
+        })
+        .flat_map(|step| {
+            step.acceptance_criteria
+                .iter()
+                .map(move |criterion| format!("- {}: {criterion}", step.id))
+        })
+        .collect::<Vec<_>>();
+    if goal.is_empty() {
+        goal.push("- Complete the active durable task plan and user request.".to_string());
+    }
+
+    let mut current_state = unresolved_steps.clone();
+    current_state.extend(
+        document
+            .latest_file_hashes
+            .keys()
+            .map(|path| format!("- changed path: {path}")),
+    );
+
+    let completed_work = document
+        .plan
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.status,
+                StepStatus::Passed | StepStatus::Completed | StepStatus::Skipped
+            )
+        })
+        .map(|step| {
+            format!(
+                "- {} [{}]: {} (validation receipt: {})",
+                step.id,
+                step_status_name(&step.status),
+                step.step,
+                step.validation_receipt_id.as_deref().unwrap_or("none")
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut unresolved_work = unresolved_steps;
+    for step in document.plan.iter().filter(|step| {
+        !matches!(
+            step.status,
+            StepStatus::Passed | StepStatus::Completed | StepStatus::Skipped
+        )
+    }) {
+        unresolved_work.extend(
+            step.mutation_obligations
+                .iter()
+                .filter(|obligation| !obligation.satisfied)
+                .map(|obligation| {
+                    format!(
+                        "- {} obligation {}: {} (paths: {})",
+                        step.id,
+                        obligation.id,
+                        obligation.description,
+                        obligation.paths.join(", ")
+                    )
+                }),
+        );
+    }
+    let stale_facts = document
+        .planning
+        .facts
+        .values()
+        .filter(|fact| !fact.dependencies_current)
+        .collect::<Vec<_>>();
+    if !stale_facts.is_empty() {
+        unresolved_work.push("- Invalidated evidence claims (not authoritative):".to_string());
+        unresolved_work.extend(stale_facts.into_iter().map(|fact| {
+            format!(
+                "  - {}: stale after a dependency changed; re-establish `{}`",
+                fact.id, fact.value
+            )
+        }));
+    }
+    unresolved_work.extend(
+        document
+            .risks
+            .iter()
+            .filter(|risk| !risk.resolved)
+            .map(|risk| {
+                let blocking = if risk.blocking { "blocking " } else { "" };
+                format!("- {blocking}risk {}: {}", risk.id, risk.description)
+            }),
+    );
+
+    let mut evidence = vec![
+        "- Recorded facts remain evidence claims; do not treat durable storage as proof."
+            .to_string(),
+        "- Recorded evidence claims:".to_string(),
+    ];
+    evidence.extend(
+        document
+            .planning
+            .facts
+            .values()
+            .filter(|fact| fact.dependencies_current)
+            .map(|fact| {
+                let source = fact.source.as_deref().unwrap_or("not recorded");
+                let dependencies = if fact.depends_on_paths.is_empty() {
+                    "repository-wide (legacy/unspecified)".to_string()
+                } else {
+                    fact.depends_on_paths.join(", ")
+                };
+                format!(
+                    "- {}: {} (provenance: {}; source: {source}; depends on: {dependencies})",
+                    fact.id,
+                    fact.value,
+                    fact.provenance.as_str()
+                )
+            }),
+    );
+    evidence.extend(
+        document
+            .command_receipts
+            .iter()
+            .rev()
+            .take(6)
+            .map(|receipt| {
+                format!(
+                    "- command {}: exit={} timed_out={} freshness={} step={} recorded_at={}",
+                    receipt.id,
+                    receipt.exit_code,
+                    receipt.timed_out,
+                    compaction_command_freshness(document, receipt),
+                    receipt.step_id.as_deref().unwrap_or("unattributed"),
+                    receipt.recorded_at
+                )
+            }),
+    );
+
+    let next_action = document
+        .active_step_id
+        .as_deref()
+        .and_then(|id| document.plan.iter().find(|step| step.id == id))
+        .or_else(|| {
+            document.plan.iter().find(|step| {
+                !matches!(
+                    step.status,
+                    StepStatus::Passed | StepStatus::Completed | StepStatus::Skipped
+                )
+            })
+        })
+        .map(|step| vec![format!("- {}: {}", step.id, step.step)])
+        .unwrap_or_else(|| vec!["- No unresolved durable plan action.".to_string()]);
+
+    let sections = [
+        bounded_compaction_section("## Goal", goal, 250),
+        bounded_compaction_section("## Current state", current_state, 400),
+        bounded_compaction_section("## Completed work", completed_work, 300),
+        bounded_compaction_section("## Unresolved work", unresolved_work, 400),
+        bounded_compaction_section("## Evidence", evidence, 350),
+        bounded_compaction_section("## Next action", next_action, 150),
+    ];
+
+    codex_utils_output_truncation::truncate_text_to_token_ceiling(
+        &sections.join("\n\n"),
+        COMPACTION_TASK_STATE_MAX_TOKENS,
+    )
+}
+
+fn empty_compaction_task_state() -> String {
+    [
+        "## Goal\n- Continue the current user request.",
+        "## Current state\n- Resume from the retained compacted history.",
+        "## Completed work\n- None recorded in durable task evidence.",
+        "## Unresolved work\n- Reconcile the retained user tail with the opaque remote checkpoint.",
+        "## Evidence\n- Remote compaction completed and retained its checkpoint.",
+        "## Next action\n- Continue the current request from retained history.",
+    ]
+    .join("\n\n")
+}
+
+fn task_is_tracked_for_compaction(document: &TaskEvidenceDocument) -> bool {
+    !document.plan.is_empty()
+        || !document.edit_receipts.is_empty()
+        || document
+            .command_receipts
+            .iter()
+            .any(|receipt| receipt.possible_mutation)
+        || document.risks.iter().any(|risk| {
+            matches!(
+                risk.source.as_str(),
+                "task_evidence_storage" | "completion_review_recovery"
+            ) && !risk.resolved
+        })
+}
+
+fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
+    task_is_tracked_for_compaction(document)
+        || document
+            .command_receipts
+            .iter()
+            .any(|receipt| !receipt.possible_mutation)
+}
+
+fn compaction_command_freshness(
+    document: &TaskEvidenceDocument,
+    receipt: &CommandReceipt,
+) -> &'static str {
+    if command_receipt_has_current_proof_identity(document, receipt) {
+        "current"
+    } else if receipt.epoch != document.evidence_epoch
+        || receipt.host_mutation_revision != Some(document.host_mutation_revision)
+    {
+        "stale"
+    } else {
+        "unknown"
+    }
+}
+
+fn bounded_compaction_section(title: &str, lines: Vec<String>, max_tokens: usize) -> String {
+    if lines.is_empty() {
+        return format!("{title}\n- none recorded");
+    }
+    format!(
+        "{title}\n{}",
+        codex_utils_output_truncation::truncate_text_to_token_ceiling(
+            &lines.join("\n"),
+            max_tokens
+        )
+    )
+}
+
+fn step_status_name(status: &StepStatus) -> &'static str {
+    match status {
+        StepStatus::Pending => "pending",
+        StepStatus::InProgress => "in_progress",
+        StepStatus::Implemented => "implemented",
+        StepStatus::Passed | StepStatus::Completed => "passed",
+        StepStatus::Blocked => "blocked",
+        StepStatus::Skipped => "skipped",
     }
 }
 
@@ -4005,7 +4325,7 @@ impl TaskEvidenceLedger {
 
     pub(crate) async fn record_planning_update(
         &self,
-        update: PlanningUpdateInput,
+        mut update: PlanningUpdateInput,
     ) -> PlanUpdateOutcome {
         let requested_public = UpdatePlanArgs {
             explanation: update.explanation.clone(),
@@ -4017,6 +4337,23 @@ impl TaskEvidenceLedger {
                 effect: PlanUpdateEffect::NoOp,
                 unfinished_mutation_obligation: None,
             };
+        }
+        for fact in &mut update.facts {
+            let normalized = fact
+                .depends_on_paths
+                .iter()
+                .map(|path| {
+                    self.repo_root.as_ref().map_or_else(
+                        || normalize_slashes(path),
+                        |repo_root| normalize_input_path(repo_root, None, Path::new(path)),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            fact.depends_on_paths = normalized.into_iter().collect();
+            // Freshly submitted evidence is current at the plan update
+            // boundary; callers cannot revive persisted stale state by setting
+            // this implementation field directly.
+            fact.dependencies_current = true;
         }
         // Only a model-authored transition of the currently active, explicitly
         // named work unit to Implemented establishes a batch boundary. The
@@ -4384,9 +4721,21 @@ impl TaskEvidenceLedger {
             if has_relevant_pending_intent {
                 return None;
             }
+            let leaf_implementation_identities = route
+                .leaves
+                .iter()
+                .map(|leaf| {
+                    validation_leaf_implementation_identity(
+                        acknowledgement.implementation_revision,
+                        leaf,
+                        &acknowledgement.covered_manifest,
+                    )
+                })
+                .collect();
             (
                 AutoValidationCandidate {
                     step_id: step.id.clone(),
+                    step_revision: step.revision,
                     route,
                     implementation_revision: acknowledgement.implementation_revision,
                     implementation_identity: validation_implementation_identity(
@@ -4394,6 +4743,7 @@ impl TaskEvidenceLedger {
                         repository_wide,
                         &acknowledgement.covered_manifest,
                     ),
+                    leaf_implementation_identities,
                     repository_wide,
                 },
                 acknowledgement.covered_manifest.clone(),
@@ -4402,12 +4752,49 @@ impl TaskEvidenceLedger {
         if !candidate.repository_wide {
             let repo_root = self.repo_root.as_ref()?;
             for expected in &covered_manifest {
+                if expected.read_error.is_some() {
+                    return None;
+                }
                 if snapshot_file(repo_root, &expected.path).await != *expected {
                     return None;
                 }
             }
         }
         Some(candidate)
+    }
+
+    pub(crate) async fn direct_validation_implementation_identity(
+        &self,
+        covered_paths: &[String],
+    ) -> Result<String, String> {
+        if covered_paths.is_empty() {
+            return Err("direct validation must declare non-empty covered_paths".to_string());
+        }
+        let repo_root = self
+            .repo_root
+            .as_ref()
+            .ok_or_else(|| "direct validation requires a repository root".to_string())?;
+        let mut normalized = covered_paths
+            .iter()
+            .map(|path| normalize_slashes(path).trim_start_matches("./").to_string())
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+        let mut covered_manifest = Vec::with_capacity(normalized.len());
+        for path in normalized {
+            let snapshot = snapshot_file(repo_root, &path).await;
+            if let Some(read_error) = snapshot.read_error.as_deref() {
+                return Err(format!(
+                    "direct validation could not snapshot covered path `{path}`: {read_error}"
+                ));
+            }
+            covered_manifest.push(snapshot);
+        }
+        Ok(validation_implementation_identity(
+            0,
+            false,
+            &covered_manifest,
+        ))
     }
 
     #[cfg(test)]
@@ -4695,6 +5082,7 @@ impl TaskEvidenceLedger {
             timed_out,
             duration_ms,
             possible_mutation,
+            None,
             provenance,
             None,
         )
@@ -4711,6 +5099,7 @@ impl TaskEvidenceLedger {
         timed_out: bool,
         duration_ms: u64,
         possible_mutation: bool,
+        mutation_paths: Option<&BTreeSet<PathBuf>>,
         provenance: Option<&ChildEvidenceProvenance>,
         implementation_identity_hash: Option<&str>,
     ) {
@@ -4721,6 +5110,7 @@ impl TaskEvidenceLedger {
             timed_out,
             duration_ms,
             possible_mutation,
+            mutation_paths,
             provenance,
             implementation_identity_hash,
             None,
@@ -4738,6 +5128,7 @@ impl TaskEvidenceLedger {
         timed_out: bool,
         duration_ms: u64,
         possible_mutation: bool,
+        mutation_paths: Option<&BTreeSet<PathBuf>>,
         provenance: Option<&ChildEvidenceProvenance>,
         implementation_identity_hash: Option<&str>,
         validation_result: Option<ValidationResult>,
@@ -4774,21 +5165,35 @@ impl TaskEvidenceLedger {
                         current_action_attribution(document, "command", &action_id)
                     });
                 if possible_mutation {
-                    invalidate_for_mutation(document, None);
-                    let epoch = document.evidence_epoch;
-                    upsert_risk(
-                        document,
-                        EvidenceRisk {
-                            id: format!("unknown-command-mutation-{epoch}"),
-                            description:
-                                "a command may have mutated files without exact path/hash attribution"
-                                    .to_string(),
-                            source: "command".to_string(),
-                            blocking: false,
-                            resolved: false,
-                            epoch,
-                        },
-                    );
+                    let normalized_paths = mutation_paths.map(|paths| {
+                        paths
+                            .iter()
+                            .map(|path| {
+                                normalize_input_path(
+                                    Path::new(&document.start.repository_root),
+                                    None,
+                                    path,
+                                )
+                            })
+                            .collect::<BTreeSet<_>>()
+                    });
+                    invalidate_for_mutation(document, normalized_paths.as_ref());
+                    if normalized_paths.is_none() {
+                        let epoch = document.evidence_epoch;
+                        upsert_risk(
+                            document,
+                            EvidenceRisk {
+                                id: format!("unknown-command-mutation-{epoch}"),
+                                description:
+                                    "a command may have mutated files without exact path/hash attribution"
+                                        .to_string(),
+                                source: "command".to_string(),
+                                blocking: false,
+                                resolved: false,
+                                epoch,
+                            },
+                        );
+                    }
                 }
                 let receipt_id = next_receipt_id(
                     "command",
@@ -4836,6 +5241,33 @@ impl TaskEvidenceLedger {
             return;
         };
         self.persist_document(&snapshot).await;
+    }
+
+    /// Returns a bounded semantic projection of durable task state for context checkpoints.
+    /// Proof payloads and command arguments are deliberately excluded.
+    pub(crate) async fn compaction_task_state(&self) -> Option<String> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
+        self.refresh_external_file_freshness().await;
+        let guard = self.document.lock().await;
+        let document = guard.as_ref()?;
+        task_is_tracked(document).then(|| render_compaction_task_state(document))
+    }
+
+    /// Returns a complete recovery projection for compaction hooks, including a
+    /// deterministic fallback when no durable task evidence has been recorded.
+    pub(crate) async fn compaction_recovery_summary(&self) -> String {
+        if !self.allows_kd4_completion() {
+            return empty_compaction_task_state();
+        }
+        self.refresh_external_file_freshness().await;
+        let guard = self.document.lock().await;
+        guard
+            .as_ref()
+            .filter(|document| task_is_tracked(document))
+            .map(render_compaction_task_state)
+            .unwrap_or_else(empty_compaction_task_state)
     }
 
     pub(crate) async fn finalization_advisory(&self) -> Option<String> {
@@ -8825,7 +9257,7 @@ fn completion_candidate_for(
 
 fn current_final_proof_observations(
     document: &TaskEvidenceDocument,
-    basis: &CompletionCandidateBasisV1,
+    _basis: &CompletionCandidateBasisV1,
     candidate: &CompletionCandidateV1,
     plan: &ValidationPlanV1,
 ) -> (Vec<FinalProofObservationV1>, u32, u64) {
@@ -8848,15 +9280,7 @@ fn current_final_proof_observations(
                 && receipt.exit_code == 0
                 && !receipt.timed_out
                 && !receipt.possible_mutation
-                && receipt.epoch == basis.task_evidence_epoch
-                && receipt.host_mutation_revision == Some(basis.host_mutation_revision)
-                && receipt.user_source_ledger_hash.as_deref()
-                    == Some(basis.source_identity.as_str())
-                && receipt.requirement_manifest_hash.as_deref()
-                    == Some(basis.requirement_identity.as_str())
-                && (receipt.implementation_identity_hash.as_deref()
-                    == Some(basis.implementation_identity.as_str())
-                    || command_receipt_has_current_proof_identity(document, receipt))
+                && command_receipt_has_current_proof_identity(document, receipt)
         }) else {
             continue;
         };
@@ -13125,25 +13549,26 @@ fn command_receipt_has_current_proof_identity(
     document: &TaskEvidenceDocument,
     receipt: &CommandReceipt,
 ) -> bool {
-    let Some((manifest_revision, source_hash, manifest_hash)) =
-        completion_contract_hashes(document, false)
-    else {
-        return false;
-    };
     let Some(validation) = receipt.validation_result.as_ref() else {
         return false;
     };
     let Some(implementation_identity) = receipt.implementation_identity_hash.as_deref() else {
         return false;
     };
+    let has_current_global_identity = completion_contract_hashes(document, false).is_some_and(
+        |(manifest_revision, source_hash, manifest_hash)| {
+            receipt.epoch == document.evidence_epoch
+                && receipt.host_mutation_revision == Some(document.host_mutation_revision)
+                && receipt.manifest_revision == Some(manifest_revision)
+                && receipt.user_source_ledger_hash.as_deref() == Some(source_hash.as_str())
+                && receipt.requirement_manifest_hash.as_deref() == Some(manifest_hash.as_str())
+        },
+    );
     receipt.exit_code == 0
         && !receipt.timed_out
         && !receipt.possible_mutation
-        && receipt.epoch == document.evidence_epoch
-        && receipt.host_mutation_revision == Some(document.host_mutation_revision)
-        && receipt.manifest_revision == Some(manifest_revision)
-        && receipt.user_source_ledger_hash.as_deref() == Some(source_hash.as_str())
-        && receipt.requirement_manifest_hash.as_deref() == Some(manifest_hash.as_str())
+        && (has_current_global_identity
+            || command_receipt_is_retained_by_path_scoped_proof(document, receipt))
         && validation.status.is_success()
         && validation.proof_key.validation_contract_version
             == codex_protocol::validation::VALIDATION_CONTRACT_VERSION
@@ -13156,47 +13581,135 @@ fn command_receipt_has_current_proof_identity(
         && recorded_path_uri_matches(&receipt.cwd, Path::new(&document.start.repository_root))
 }
 
+fn command_receipt_is_retained_by_path_scoped_proof(
+    document: &TaskEvidenceDocument,
+    receipt: &CommandReceipt,
+) -> bool {
+    let retained_by_step = receipt
+        .step_id
+        .as_deref()
+        .zip(receipt.step_revision)
+        .is_some_and(|(step_id, revision)| {
+            document.plan.iter().any(|step| {
+                step.id == step_id
+                    && step.revision == revision
+                    && step.status == StepStatus::Passed
+                    && step.validation_receipt_id.is_some()
+                    && step.validation_route.as_ref().is_some_and(|route| {
+                        route.leaves.iter().any(|leaf| leaf.argv == receipt.command)
+                    })
+            })
+        });
+    retained_by_step
+        || receipt.work_unit_id.as_deref().is_some_and(|work_unit_id| {
+            document
+                .planning
+                .work_unit
+                .as_ref()
+                .is_some_and(|work_unit| {
+                    work_unit.id == work_unit_id
+                        && work_unit.validation_receipt_id.is_some()
+                        && work_unit.validation_route.as_ref().is_some_and(|route| {
+                            route.leaves.iter().any(|leaf| leaf.argv == receipt.command)
+                        })
+                })
+        })
+}
+
 fn accept_matching_command_proof(document: &mut TaskEvidenceDocument, receipt: &CommandReceipt) {
     if !command_receipt_has_current_proof_identity(document, receipt) {
         return;
     }
-    if let (Some(step_id), Some(step_revision)) =
-        (receipt.step_id.as_deref(), receipt.step_revision)
-        && let Some(step) = document
-            .plan
-            .iter_mut()
-            .find(|step| step.id == step_id && step.revision == step_revision)
-        && step.validation_disposition == ValidationDisposition::Executable
-        && step.validation_route.as_ref().is_some_and(|route| {
-            route.leaves.iter().any(|leaf| leaf.argv == receipt.command)
-                && receipt
-                    .validation_result
-                    .as_ref()
-                    .is_some_and(|validation| validation.route == *route)
-        })
-        && (step.mutation_obligations.is_empty()
-            || implementation_obligations_satisfied(&step.mutation_obligations))
+    let completed_step = receipt
+        .step_id
+        .as_deref()
+        .zip(receipt.step_revision)
+        .and_then(|(step_id, step_revision)| {
+            let step = document
+                .plan
+                .iter()
+                .find(|step| step.id == step_id && step.revision == step_revision)?;
+            let route = step.validation_route.as_ref()?;
+            (step.validation_disposition == ValidationDisposition::Executable
+                && (step.mutation_obligations.is_empty()
+                    || implementation_obligations_satisfied(&step.mutation_obligations))
+                && validation_route_has_current_command_proofs(
+                    document,
+                    receipt,
+                    route,
+                    Some((step_id, step_revision)),
+                    None,
+                ))
+            .then_some(step_id.to_string())
+        });
+    if let Some(step_id) = completed_step
+        && let Some(step) = document.plan.iter_mut().find(|step| step.id == step_id)
     {
         step.validation_receipt_id = Some(receipt.id.clone());
         step.status = StepStatus::Passed;
         return;
     }
-    if let Some(work_unit_id) = receipt.work_unit_id.as_deref()
+
+    let completed_work_unit = receipt.work_unit_id.as_deref().and_then(|work_unit_id| {
+        let work_unit = document.planning.work_unit.as_ref()?;
+        let route = work_unit.validation_route.as_ref()?;
+        (work_unit.id == work_unit_id
+            && work_unit.validation_disposition == ValidationDisposition::Executable
+            && (work_unit.mutation_obligations.is_empty()
+                || implementation_obligations_satisfied(&work_unit.mutation_obligations))
+            && validation_route_has_current_command_proofs(
+                document,
+                receipt,
+                route,
+                None,
+                Some(work_unit_id),
+            ))
+        .then_some(work_unit_id.to_string())
+    });
+    if let Some(work_unit_id) = completed_work_unit
         && let Some(work_unit) = document.planning.work_unit.as_mut()
         && work_unit.id == work_unit_id
-        && work_unit.validation_disposition == ValidationDisposition::Executable
-        && work_unit.validation_route.as_ref().is_some_and(|route| {
-            route.leaves.iter().any(|leaf| leaf.argv == receipt.command)
-                && receipt
-                    .validation_result
-                    .as_ref()
-                    .is_some_and(|validation| validation.route == *route)
-        })
-        && (work_unit.mutation_obligations.is_empty()
-            || implementation_obligations_satisfied(&work_unit.mutation_obligations))
     {
         work_unit.validation_receipt_id = Some(receipt.id.clone());
     }
+}
+
+fn validation_route_has_current_command_proofs(
+    document: &TaskEvidenceDocument,
+    current_receipt: &CommandReceipt,
+    route: &ValidationRoute,
+    step: Option<(&str, u64)>,
+    work_unit_id: Option<&str>,
+) -> bool {
+    route.leaves.iter().all(|leaf| {
+        let leaf_route = ValidationRoute {
+            leaves: vec![leaf.clone()],
+            ordering: route.ordering,
+        };
+        document
+            .command_receipts
+            .iter()
+            .chain(std::iter::once(current_receipt))
+            .any(|candidate| {
+                let attribution_matches = match (step, work_unit_id) {
+                    (Some((step_id, step_revision)), None) => {
+                        candidate.step_id.as_deref() == Some(step_id)
+                            && candidate.step_revision == Some(step_revision)
+                    }
+                    (None, Some(work_unit_id)) => {
+                        candidate.work_unit_id.as_deref() == Some(work_unit_id)
+                    }
+                    _ => false,
+                };
+                attribution_matches
+                    && candidate.command == leaf.argv
+                    && command_receipt_has_current_proof_identity(document, candidate)
+                    && candidate
+                        .validation_result
+                        .as_ref()
+                        .is_some_and(|validation| validation.route == leaf_route)
+            })
+    })
 }
 
 fn accept_matching_external_proof(
@@ -13280,9 +13793,37 @@ fn validation_route_covered_paths(route: &ValidationRoute) -> BTreeSet<String> {
     route
         .leaves
         .iter()
-        .flat_map(|leaf| leaf.covered_paths.iter())
+        .flat_map(validation_leaf_covered_paths)
+        .collect()
+}
+
+fn validation_leaf_covered_paths(
+    leaf: &codex_protocol::plan_tool::ValidationRouteLeaf,
+) -> BTreeSet<String> {
+    leaf.covered_paths
+        .iter()
         .map(|path| path.replace('\\', "/").trim_start_matches("./").to_string())
         .collect()
+}
+
+fn validation_leaf_implementation_identity(
+    implementation_revision: u64,
+    leaf: &codex_protocol::plan_tool::ValidationRouteLeaf,
+    covered_manifest: &[FileHashSnapshot],
+) -> String {
+    let covered_paths = validation_leaf_covered_paths(leaf);
+    let repository_wide = covered_paths.is_empty();
+    let leaf_manifest = covered_manifest
+        .iter()
+        .filter(|snapshot| {
+            let snapshot_path = snapshot.path.replace('\\', "/");
+            covered_paths
+                .iter()
+                .any(|covered| validation_paths_overlap(covered, &snapshot_path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    validation_implementation_identity(implementation_revision, repository_wide, &leaf_manifest)
 }
 
 fn validation_implementation_identity(
@@ -13894,6 +14435,22 @@ fn invalidate_for_mutation(
     document: &mut TaskEvidenceDocument,
     affected_paths: Option<&BTreeSet<String>>,
 ) {
+    for fact in document.planning.facts.values_mut() {
+        if !fact.dependencies_current {
+            continue;
+        }
+        let affected = fact.depends_on_paths.is_empty()
+            || affected_paths.is_none_or(|paths| {
+                paths.iter().any(|changed| {
+                    fact.depends_on_paths
+                        .iter()
+                        .any(|dependency| validation_paths_overlap(dependency, changed))
+                })
+            });
+        if affected {
+            fact.dependencies_current = false;
+        }
+    }
     let repair_count_by_lineage = std::mem::take(&mut document.final_proof.repair_count_by_lineage);
     document.final_proof = FinalProofStateV1 {
         repair_count_by_lineage,
@@ -13997,6 +14554,14 @@ fn mutation_can_affect_step(
     let Some(affected_paths) = affected_paths else {
         return true;
     };
+    if step.validation_route.as_ref().is_some_and(|route| {
+        route
+            .leaves
+            .iter()
+            .any(|leaf| leaf.covered_paths.is_empty())
+    }) {
+        return true;
+    }
     let mut covered = step
         .implementation_surfaces
         .iter()
@@ -14026,6 +14591,14 @@ fn mutation_can_affect_work_unit(
     let Some(affected_paths) = affected_paths else {
         return true;
     };
+    if work_unit.validation_route.as_ref().is_some_and(|route| {
+        route
+            .leaves
+            .iter()
+            .any(|leaf| leaf.covered_paths.is_empty())
+    }) {
+        return true;
+    }
     let mut covered = work_unit
         .implementation_surfaces
         .iter()
@@ -14082,21 +14655,6 @@ fn invalidate_for_plan_change(document: &mut TaskEvidenceDocument) {
         ..FinalProofStateV1::default()
     };
     document.completion = None;
-}
-
-fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
-    !document.plan.is_empty()
-        || !document.edit_receipts.is_empty()
-        || document
-            .command_receipts
-            .iter()
-            .any(|receipt| receipt.possible_mutation)
-        || document.risks.iter().any(|risk| {
-            matches!(
-                risk.source.as_str(),
-                "task_evidence_storage" | "completion_review_recovery"
-            ) && !risk.resolved
-        })
 }
 
 fn resolve_risk(document: &mut TaskEvidenceDocument, id: &str) {
@@ -14268,13 +14826,11 @@ fn normalize_slashes(path: &str) -> String {
 }
 
 async fn snapshot_file(repo_root: &Path, normalized: &str) -> FileHashSnapshot {
-    let path = Path::new(normalized);
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        repo_root.join(path)
+    let absolute = match validated_generated_artifact_path(repo_root, normalized) {
+        Ok(absolute) => absolute,
+        Err(rejected) => return rejected,
     };
-    match sha1_file(&absolute).await {
+    match sha1_path(&absolute).await {
         Ok(sha1) => FileHashSnapshot {
             path: normalize_slashes(normalized),
             sha1: Some(sha1),
@@ -14435,6 +14991,74 @@ async fn sha1_file(path: &Path) -> io::Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+async fn sha1_path(path: &Path) -> io::Result<String> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if !metadata.is_dir() {
+        return sha1_file(path).await;
+    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sha1_directory(&path))
+        .await
+        .map_err(|error| io::Error::other(format!("directory hash task failed: {error}")))?
+}
+
+fn sha1_directory(root: &Path) -> io::Result<String> {
+    use std::io::Read as _;
+
+    let mut entries = vec![root.to_path_buf()];
+    collect_directory_entries(root, &mut entries)?;
+    entries.sort();
+
+    let mut hasher = Sha1::new();
+    for path in entries {
+        let relative = path.strip_prefix(root).map_err(io::Error::other)?;
+        let relative = normalize_slashes(&relative.to_string_lossy());
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let kind = if metadata.file_type().is_symlink() {
+            b'L'
+        } else if metadata.is_dir() {
+            b'D'
+        } else if metadata.is_file() {
+            b'F'
+        } else {
+            b'O'
+        };
+        hasher.update([kind]);
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&path)?;
+            let target = target.to_string_lossy();
+            hasher.update((target.len() as u64).to_le_bytes());
+            hasher.update(target.as_bytes());
+        } else if metadata.is_file() {
+            hasher.update(metadata.len().to_le_bytes());
+            let mut file = std::fs::File::open(&path)?;
+            let mut buffer = vec![0_u8; FILE_HASH_CHUNK_SIZE];
+            loop {
+                let bytes_read = file.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..bytes_read]);
+            }
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_directory_entries(directory: &Path, entries: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        entries.push(path.clone());
+        if metadata.is_dir() {
+            collect_directory_entries(&path, entries)?;
+        }
+    }
+    Ok(())
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -14628,6 +15252,46 @@ mod tests {
                 .revision,
             revision
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_task_state_retains_active_plan_without_proof_payloads() {
+        let (_temp, ledger) = ledger_fixture().await;
+        ledger
+            .record_plan_update(&plan(StepStatus::InProgress))
+            .await;
+
+        let state = ledger
+            .compaction_task_state()
+            .await
+            .expect("compaction task state");
+
+        assert!(state.contains("implement [in_progress active]"));
+        assert!(state.contains("Implement the runtime path"));
+        assert!(state.contains("## Goal"));
+        assert!(state.contains("## Current state"));
+        assert!(state.contains("## Completed work"));
+        assert!(state.contains("## Unresolved work"));
+        assert!(state.contains("## Evidence"));
+        assert!(state.contains("## Next action"));
+        assert!(approx_token_count(&state) <= COMPACTION_TASK_STATE_MAX_TOKENS);
+    }
+
+    #[tokio::test]
+    async fn compaction_task_state_retains_completed_step_details() {
+        let (_temp, ledger) = ledger_fixture().await;
+        ledger
+            .record_plan_update(&plan(StepStatus::Completed))
+            .await;
+
+        let state = ledger
+            .compaction_task_state()
+            .await
+            .expect("compaction task state");
+
+        assert!(state.contains("## Completed work"));
+        assert!(state.contains("implement [passed]: Implement the runtime path"));
+        assert!(state.contains("validation receipt:"));
     }
 
     fn repair_finding(id: &str, requirement_ids: &[&str]) -> CompletionReviewFindingReceipt {

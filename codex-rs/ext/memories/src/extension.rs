@@ -7,6 +7,7 @@ use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::PromptFragment;
+use codex_extension_api::PromptFragmentKind;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ToolContributor;
@@ -63,7 +64,10 @@ impl ContextContributor for MemoriesExtension {
 
             build_memory_tool_developer_instructions(&config.codex_home)
                 .await
-                .map(PromptFragment::developer_policy)
+                .map(|instructions| {
+                    PromptFragment::developer_policy(instructions)
+                        .with_kind(PromptFragmentKind::Memory)
+                })
                 .into_iter()
                 .collect()
         })

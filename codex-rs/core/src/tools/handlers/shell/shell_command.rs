@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::ShellCommandToolCallParams;
 use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 
 use crate::agent::task_capabilities::is_independent_review_source;
 use crate::exec::ExecCapturePolicy;
@@ -21,6 +24,7 @@ use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::command_preflight::classify_rg_search_narrowing;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
@@ -292,7 +296,8 @@ impl ShellCommandHandler {
         })?;
         let command_invocation = preflight.invocation;
         let repair_notice = preflight.repair_notice;
-        let repository = get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf());
+        let git_repository = get_git_repo_root(cwd.as_path());
+        let repository = git_repository.clone().unwrap_or_else(|| cwd.to_path_buf());
         let repository_key = repository.to_string_lossy();
         let bound_auto_validation = session
             .services
@@ -368,7 +373,30 @@ impl ShellCommandHandler {
                 proof_key: None,
                 structured_route: None,
                 validation_call_id: None,
+                turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
+                force_fresh: params.force_fresh.unwrap_or(false),
             }),
+        };
+        let direct_validation_route = if validation_launch.is_some()
+            && bound_auto_validation.is_none()
+        {
+            let context = params.validation.as_ref().ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "validation commands require `validation` metadata stating the uncertainty, covered_paths, and covered_contracts"
+                        .to_string(),
+                )
+            })?;
+            Some(
+                super::direct_validation_route(
+                    context,
+                    &command_invocation,
+                    &repository,
+                    params.timeout_ms.unwrap_or(10_000),
+                )
+                .map_err(FunctionCallError::RespondToModel)?,
+            )
+        } else {
+            None
         };
         let hook_command = command_invocation.display_command();
         maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &hook_command, &cwd)
@@ -448,6 +476,32 @@ impl ShellCommandHandler {
                     toolchain,
                     configuration,
                     binding.implementation_identity.clone(),
+                    &leaf.uncertainty,
+                    &leaf.covered_paths,
+                    &leaf.covered_contracts,
+                )
+            } else if let Some(route) = direct_validation_route.as_ref() {
+                let Some(leaf) = route.leaves.first() else {
+                    return Err(FunctionCallError::RespondToModel(
+                        "direct validation route changed before launch".to_string(),
+                    ));
+                };
+                let implementation_identity = session
+                    .services
+                    .task_evidence
+                    .direct_validation_implementation_identity(&leaf.covered_paths)
+                    .await
+                    .map_err(FunctionCallError::RespondToModel)?;
+                let configuration = format!("features={:?}", turn.config.features.get());
+                validation_identity_with_scope(
+                    repository_key.as_bytes(),
+                    exec_params.cwd.to_string_lossy(),
+                    &command_invocation,
+                    environment,
+                    toolchain,
+                    configuration,
+                    implementation_identity,
+                    &leaf.uncertainty,
                     &leaf.covered_paths,
                     &leaf.covered_contracts,
                 )
@@ -461,14 +515,49 @@ impl ShellCommandHandler {
                     repository_epoch,
                 )
             };
-            if bound_auto_validation.is_some()
-                && !params.force_fresh.unwrap_or(false)
+            if !params.force_fresh.unwrap_or(false)
                 && let Some(result) = session
                     .services
                     .command_execution
                     .reusable_validation(&identity)
                     .await
             {
+                if let Some(binding) = bound_auto_validation.as_ref() {
+                    let Some(leaf) = binding.leaf() else {
+                        return Err(FunctionCallError::RespondToModel(
+                            "bound validation route changed before proof reuse".to_string(),
+                        ));
+                    };
+                    let cwd_uri = PathUri::from_host_native_path(&repository).map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "bound auto-validation cwd could not be recorded: {error}"
+                        ))
+                    })?;
+                    session
+                        .services
+                        .task_evidence
+                        .record_command_bound_with_validation_result(
+                            &leaf.argv,
+                            &cwd_uri,
+                            0,
+                            false,
+                            0,
+                            false,
+                            None,
+                            None,
+                            Some(&result.proof_key.implementation_identity),
+                            Some(result.clone()),
+                            Some((binding.step_id.as_str(), binding.step_revision)),
+                        )
+                        .await;
+                }
+                tracing::info!(
+                    disposition = "reused",
+                    duplicate_of_call_id = %result.call_id,
+                    coverage_identity = %result.proof_key.coverage_identity,
+                    implementation_identity = %result.proof_key.implementation_identity,
+                    "validation proof reused without process execution"
+                );
                 turn.turn_timing_state.record_reused_validation();
                 return Ok(boxed_tool_output(validation_structured_output(
                     serde_json::json!({
@@ -483,6 +572,12 @@ impl ShellCommandHandler {
             {
                 launch.proof_key = Some(identity.clone());
                 launch.structured_route = binding.leaf_route();
+                launch.validation_call_id = Some(call_id.clone());
+            } else if let (Some(launch), Some(route)) =
+                (validation_launch.as_mut(), direct_validation_route.as_ref())
+            {
+                launch.proof_key = Some(identity.clone());
+                launch.structured_route = Some(route.clone());
                 launch.validation_call_id = Some(call_id.clone());
             }
             validation_registration_roles(
@@ -510,6 +605,24 @@ impl ShellCommandHandler {
         .with_input_context(&prefix_rule)
         .with_runtime_context(&runtime_context)
         .with_repository_epoch(repository_epoch);
+        let search = classify_rg_search_narrowing(
+            &safety_command,
+            shell_type,
+            exec_params.cwd.as_path(),
+            &repository,
+        )
+        .map_err(FunctionCallError::RespondToModel)?;
+        let attempt_key = attempt_key.with_search_narrowing(
+            &turn.sub_id,
+            repository.to_string_lossy().as_ref(),
+            search,
+        );
+        session
+            .services
+            .command_execution
+            .admit_search_narrowing(&attempt_key)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
         let mut run_args = RunExecLikeArgs {
             tool_name,
             exec_params,

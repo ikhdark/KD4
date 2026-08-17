@@ -178,6 +178,13 @@ Once dependencies are already known, default to available parallel tool
 execution for independent, read-only operations when it reduces latency without
 obscuring ordering or dependencies.
 
+When `functions.exec` is available and several tool calls plus their result
+handling are already known, prefer one well-designed `functions.exec` packet
+over a sequence of tiny shell or tool calls. Run independent nested calls with
+`Promise.all`, keep deterministic dependent calls in the same script, and emit
+one coherent result. Split only when dependencies, mutation safety, approvals,
+output bounds, or a substantive decision require another model boundary.
+
 Do not return to the model merely to start another predetermined observation. In
 particular, keep yielded or running commands in the existing command wait path
 while the only possible decision is to wait again. Return when completion, new
@@ -189,6 +196,12 @@ could produce conflicting outputs.
 Keep a model boundary when the previous result determines file selection,
 diagnosis, validation choice, mutation ordering, or another substantive next
 step.
+
+During discovery, choose operations by expected uncertainty reduction rather
+than nominal cost. Run a precise symbol, reference, or owner query first when it
+can determine later scope, and run a broad inventory only if that result leaves
+the scope unresolved. Bound search and read output so relevant evidence remains
+model-visible instead of being displaced by truncation.
 
 ## Planning tools
 

@@ -186,6 +186,10 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
 
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].slot(), PromptSlot::DeveloperPolicy);
+    assert_eq!(
+        fragments[0].kind(),
+        codex_extension_api::PromptFragmentKind::Memory
+    );
     assert!(
         fragments[0]
             .text()

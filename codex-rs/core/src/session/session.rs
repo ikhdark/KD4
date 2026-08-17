@@ -1155,6 +1155,13 @@ impl Session {
                 config.features.enabled(Feature::DeferredExecutor),
             );
             drop(executor_readiness_timing_guard);
+            let command_execution =
+                crate::tools::command_execution::CommandExecutionLedger::load_or_new(
+                    config.codex_home.to_path_buf(),
+                    thread_id.to_string(),
+                    session_configuration.cwd().as_path(),
+                )
+                .await;
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via
@@ -1168,8 +1175,7 @@ impl Session {
                 mcp_projection_lock: Mutex::new(()),
                 mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
                 unified_exec_manager,
-                command_execution:
-                    crate::tools::command_execution::CommandExecutionLedger::default(),
+                command_execution,
                 task_evidence,
                 elicitations: crate::elicitation::ElicitationService::new(),
                 shell_zsh_path: config.zsh_path.clone(),
@@ -1248,7 +1254,6 @@ impl Session {
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
                 git_workspace,
-                source_reads: Default::default(),
             };
             let sess = Arc::new(Session {
                 thread_id,

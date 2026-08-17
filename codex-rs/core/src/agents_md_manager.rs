@@ -1,3 +1,4 @@
+use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
 use crate::agents_md::effective_project_root_markers;
 use crate::agents_md::load_project_instructions;
@@ -23,6 +24,12 @@ pub(crate) struct AgentsMdManager {
 struct AgentsMdCache {
     key: Option<AgentsMdCacheKey>,
     loaded: Option<Arc<LoadedAgentsMd>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentsMdObservation {
+    pub(crate) loaded: Option<Arc<LoadedAgentsMd>>,
+    pub(crate) freshness: AgentsMdFreshness,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,11 +92,22 @@ impl AgentsMdManager {
         config: &Config,
         environments: &TurnEnvironmentSnapshot,
     ) -> Option<Arc<LoadedAgentsMd>> {
+        self.refresh_and_observe(config, environments).await.loaded
+    }
+
+    pub(crate) async fn refresh_and_observe(
+        &self,
+        config: &Config,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> AgentsMdObservation {
         // Serialize key capture, filesystem loading, and publication so an older refresh cannot
         // finish after and overwrite a newer request. Clone the request's published value before
         // releasing the gate so a later refresh cannot replace it between refresh and capture.
         let Ok(_refresh_permit) = self.refresh_gate.acquire().await else {
-            return self.get_loaded().await;
+            return AgentsMdObservation {
+                loaded: self.get_loaded().await,
+                freshness: AgentsMdFreshness::CachedFallback,
+            };
         };
         self.refresh_with_gate_held(config, environments).await
     }
@@ -98,31 +116,42 @@ impl AgentsMdManager {
         &self,
         config: &Config,
         environments: &ThreadEnvironments,
-    ) -> (TurnEnvironmentSnapshot, Option<Arc<LoadedAgentsMd>>) {
+    ) -> (TurnEnvironmentSnapshot, AgentsMdObservation) {
         // Enter serialization before capturing live environments so an older snapshot cannot be
         // delayed until after a newer one publishes and then overwrite the newer cache entry.
         let Ok(_refresh_permit) = self.refresh_gate.acquire().await else {
             let environments = environments.snapshot().await;
-            let loaded = self.get_loaded().await;
-            return (environments, loaded);
+            let observation = AgentsMdObservation {
+                loaded: self.get_loaded().await,
+                freshness: AgentsMdFreshness::CachedFallback,
+            };
+            return (environments, observation);
         };
         let environments = environments.snapshot().await;
-        let loaded = self.refresh_with_gate_held(config, &environments).await;
-        (environments, loaded)
+        let observation = self.refresh_with_gate_held(config, &environments).await;
+        (environments, observation)
     }
 
     async fn refresh_with_gate_held(
         &self,
         config: &Config,
         environments: &TurnEnvironmentSnapshot,
-    ) -> Option<Arc<LoadedAgentsMd>> {
+    ) -> AgentsMdObservation {
         let key = AgentsMdCacheKey::capture(config, environments);
         let load =
             load_project_instructions(config, self.user_instructions.clone(), environments).await;
         let mut cache = self.cache.lock().await;
         if !load.complete && cache.key.as_ref() == Some(&key) {
-            return cache.loaded.clone();
+            return AgentsMdObservation {
+                loaded: cache.loaded.clone(),
+                freshness: AgentsMdFreshness::CachedFallback,
+            };
         }
+        let freshness = if load.complete {
+            AgentsMdFreshness::Refreshed
+        } else {
+            AgentsMdFreshness::IncompleteRead
+        };
         let loaded = load.loaded;
         let semantically_unchanged = cache.key.as_ref() == Some(&key)
             && match (cache.loaded.as_ref(), loaded.as_ref()) {
@@ -134,11 +163,22 @@ impl AgentsMdManager {
             cache.key = Some(key);
             cache.loaded = loaded.map(Arc::new);
         }
-        cache.loaded.clone()
+        AgentsMdObservation {
+            loaded: cache.loaded.clone(),
+            freshness,
+        }
     }
 
     pub(crate) async fn get_loaded(&self) -> Option<Arc<LoadedAgentsMd>> {
         self.cache.lock().await.loaded.clone()
+    }
+
+    /// Returns the published cache without claiming that it was refreshed for this consumer.
+    pub(crate) async fn get_cached_observation(&self) -> AgentsMdObservation {
+        AgentsMdObservation {
+            loaded: self.get_loaded().await,
+            freshness: AgentsMdFreshness::CachedFallback,
+        }
     }
 
     pub(crate) fn user_instructions(&self) -> Option<UserInstructions> {

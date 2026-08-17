@@ -562,6 +562,7 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
     assert_eq!(
         [
             TASK_DURATION_METRIC,
+            TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC,
             TASK_CRITICAL_PATH_IDLE_DURATION_METRIC,
             TASK_CRITICAL_PATH_IDLE_RATIO_METRIC,
             TASK_TOKEN_USAGE_METRIC,
@@ -580,6 +581,7 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
         ],
         [
             "codex.multi_agent.task.duration_ms",
+            "codex.multi_agent.task.first_meaningful_progress.duration_ms",
             "codex.multi_agent.task.critical_path_idle.duration_ms",
             "codex.multi_agent.task.critical_path_idle.basis_points",
             "codex.multi_agent.task.token_usage",

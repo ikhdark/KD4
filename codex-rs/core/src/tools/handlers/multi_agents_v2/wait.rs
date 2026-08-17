@@ -530,6 +530,8 @@ impl Handler {
             coordinator.record_first_meaningful_progress_once(
                 event.attempt_id,
                 event.reason,
+                &task.assignment.created_at,
+                &event.created_at,
                 &turn.session_telemetry,
             );
             if task.receipt.is_some() {

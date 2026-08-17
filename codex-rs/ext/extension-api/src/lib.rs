@@ -42,6 +42,7 @@ pub use contributors::McpServerContributionContext;
 pub use contributors::McpServerContributor;
 pub use contributors::PreviousWorldStateSection;
 pub use contributors::PromptFragment;
+pub use contributors::PromptFragmentKind;
 pub use contributors::PromptSlot;
 pub use contributors::RenderedWorldStateFragment;
 pub use contributors::ThreadIdleInput;

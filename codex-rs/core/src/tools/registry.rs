@@ -1,11 +1,3 @@
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-
 use crate::function_tool::FunctionCallError;
 use crate::hook_runtime::PreToolUseHookResult;
 use crate::hook_runtime::record_additional_contexts;
@@ -54,6 +46,7 @@ use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolOutputProjectionFragment;
 use codex_tools::ToolOutputProjectionFragmentKind;
 use codex_tools::ToolOutputProjectionJsonPointer;
+use codex_tools::ToolOutputProjectionMetadata;
 use codex_tools::ToolOutputProjectionRange;
 use codex_tools::ToolProjectionInclusion;
 use codex_tools::ToolProjectionSection;
@@ -69,9 +62,17 @@ use codex_utils_output_truncation::resolve_projected_output_limits;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::future::BoxFuture;
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tracing::instrument;
 
 pub(crate) type ToolTelemetryTags = Vec<(&'static str, String)>;
+const MIN_PROJECTION_ENVELOPE_TOKENS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ToolExecutionTiming {
@@ -217,6 +218,8 @@ pub(crate) struct AnyToolResult {
 pub(crate) struct ModelToolProjection {
     original_response: ResponseInputItem,
     bounded: BoundedModelProjection,
+    passthrough_response: bool,
+    preserve_non_text_content: bool,
     candidate: Option<crate::tool_history::ToolHistoryCandidate>,
     projected_tokens: u64,
     canonical_bytes: u64,
@@ -290,6 +293,13 @@ impl BoundedModelProjection {
 }
 
 impl AnyToolResult {
+    pub(crate) fn response(&self) -> ResponseInputItem {
+        if let Some(projection) = self.model_projection.as_ref() {
+            return projection.response();
+        }
+        self.result.to_response_item(&self.call_id, &self.payload)
+    }
+
     pub(crate) fn success_for_logging(&self) -> bool {
         self.result.success_for_logging()
     }
@@ -411,16 +421,26 @@ impl AnyToolResult {
 }
 
 impl ModelToolProjection {
-    #[cfg(test)]
     fn response(&self) -> ResponseInputItem {
+        if self.passthrough_response {
+            return self.original_response.clone();
+        }
         projected_response_item(
             self.original_response.clone(),
             self.bounded.rendered().to_string(),
+            self.preserve_non_text_content,
         )
     }
 
     fn into_response(self) -> ResponseInputItem {
-        projected_response_item(self.original_response, self.bounded.into_rendered())
+        if self.passthrough_response {
+            return self.original_response;
+        }
+        projected_response_item(
+            self.original_response,
+            self.bounded.into_rendered(),
+            self.preserve_non_text_content,
+        )
     }
 
     fn into_code_mode_result(self) -> Value {
@@ -1056,21 +1076,38 @@ impl ToolRegistry {
                             .is_empty()
                     });
                 let canonical_artifact_required = result.result.requires_canonical_artifact();
-                let projection_input =
-                    prepare_model_projection(&invocation, &result, force_inline_carrier);
+                let provider_visible = projection_is_provider_visible(&invocation.source);
+                let projection_admission_required = projection_admission_required(
+                    &invocation.source,
+                    &invocation.tool_name,
+                    force_inline_carrier,
+                );
+                let admission_tracking_enabled = admission_tracking_enabled(
+                    &invocation.source,
+                    invocation.turn.config.completed_tool_history_projection,
+                );
+                let projection_input = prepare_model_projection(
+                    &invocation,
+                    &result,
+                    force_inline_carrier,
+                    projection_admission_required,
+                );
+                let admission_tracking_required =
+                    projection_admission_required && projection_input.is_some();
                 let model_projection = match projection_input {
                     Some(input) => project_model_output(input).await,
                     None => None,
                 };
-                if canonical_artifact_required && model_projection.is_none() {
+                if (canonical_artifact_required || admission_tracking_required)
+                    && model_projection.is_none()
+                {
                     let err = FunctionCallError::Fatal(format!(
-                        "failed to preserve the fully received result for {} as a canonical artifact",
+                        "failed to preserve and admit the fully received result for {} as a canonical artifact",
                         flat_tool_name(&invocation.tool_name)
                     ));
                     dispatch_trace.record_failed(&err);
                     return Err(err);
                 }
-                let provider_visible = projection_is_provider_visible(&invocation.source);
                 if let Some(projection) = &model_projection {
                     invocation
                         .turn
@@ -1085,7 +1122,7 @@ impl ToolRegistry {
                             projection.omitted_sections,
                             provider_visible,
                         );
-                    if provider_visible && let Some(candidate) = &projection.candidate {
+                    if admission_tracking_enabled && let Some(candidate) = &projection.candidate {
                         invocation
                             .session
                             .register_tool_history_candidate(
@@ -1116,6 +1153,19 @@ fn projection_is_provider_visible(source: &ToolCallSource) -> bool {
     matches!(source, ToolCallSource::Direct)
 }
 
+fn admission_tracking_enabled(source: &ToolCallSource, configured: bool) -> bool {
+    configured && projection_is_provider_visible(source)
+}
+
+fn projection_admission_required(
+    source: &ToolCallSource,
+    tool_name: &ToolName,
+    force_inline_carrier: bool,
+) -> bool {
+    projection_is_provider_visible(source)
+        && !generic_projection_is_exempt(tool_name, force_inline_carrier)
+}
+
 async fn notify_tool_finish_if_unclaimed(
     invocation: &ToolInvocation,
     terminal_outcome_reached: &AtomicBool,
@@ -1136,6 +1186,10 @@ async fn handle_any_tool(
     let _tool_execution_timing_guard =
         matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler)
             .then(|| invocation.turn.turn_timing_state.begin_tool_execution());
+    invocation
+        .turn
+        .turn_timing_state
+        .record_tool_handler_entry(invocation.tool_name.name.as_str());
     mark_tool_handler_entry();
     let output = tool.handle(invocation.clone()).await?;
     if output.contains_external_context()
@@ -1174,7 +1228,10 @@ struct ModelProjectionInput {
     canonical: CanonicalToolResult,
     original_output_sha256: String,
     original_output_tokens: u64,
+    original_output_text: String,
+    invocation_sha256: Option<String>,
     semantic_class: String,
+    source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
     projection_eligible: bool,
     projection_truncated: bool,
     predetermined_ranges: Vec<ToolOutputProjectionRange>,
@@ -1185,6 +1242,7 @@ struct ModelProjectionInput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectionMaterialization {
+    AdmissionOnly,
     CanonicalArtifact,
     InlineCarrier,
 }
@@ -1204,6 +1262,7 @@ fn prepare_model_projection(
     invocation: &ToolInvocation,
     result: &AnyToolResult,
     force_inline_carrier: bool,
+    track_for_admission: bool,
 ) -> Option<ModelProjectionInput> {
     // Exact artifact reads are already bounded and must never recursively spill.
     // Code mode also performs its own coherent outer projection after merging
@@ -1213,11 +1272,21 @@ fn prepare_model_projection(
         return None;
     }
 
-    let metadata = result.result.projection_metadata()?;
-    if metadata.spillable_text.is_empty() {
+    let mut original_response = result
+        .result
+        .to_response_item(&result.call_id, &result.payload);
+    let preserved_content = preserved_non_text_content(&original_response);
+    let producer_metadata = result.result.projection_metadata();
+    let using_admission_fallback = producer_metadata.is_none();
+    let metadata = producer_metadata.or_else(|| {
+        track_for_admission.then(|| {
+            admission_fallback_metadata(&original_response, result.result.outcome_for_logging())
+        })?
+    })?;
+    let spillable_text = metadata.spillable_text.join("\n");
+    if spillable_text.is_empty() && preserved_content.is_empty() && metadata.fragments.is_empty() {
         return None;
     }
-    let spillable_text = metadata.spillable_text.join("\n");
     let outcome = match metadata.outcome {
         ToolOutputOutcome::Success => OutputOutcome::Success,
         ToolOutputOutcome::Failure => OutputOutcome::Failure,
@@ -1236,13 +1305,16 @@ fn prepare_model_projection(
         DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
     );
     let generic_projection = formatted_truncate_text_with_output_limit(&spillable_text, limits);
-    let projection_truncated = generic_projection.was_truncated;
+    let model_output_tokens = approx_token_count(&spillable_text)
+        .saturating_add(non_text_projection_token_cost(&preserved_content));
+    let projection_truncated =
+        generic_projection.was_truncated || model_output_tokens > limits.applied_limit;
     let has_predetermined_selectors = !metadata.predetermined_ranges.is_empty()
         || !metadata.predetermined_json_pointers.is_empty();
     let needs_canonical_artifact = result.result.requires_canonical_artifact()
-        || generic_projection.was_truncated
+        || projection_truncated
         || has_predetermined_selectors;
-    if !needs_canonical_artifact && !force_inline_carrier {
+    if !needs_canonical_artifact && !force_inline_carrier && !track_for_admission {
         return None;
     }
     let materialization = if force_inline_carrier {
@@ -1250,7 +1322,7 @@ fn prepare_model_projection(
     } else if needs_canonical_artifact {
         ProjectionMaterialization::CanonicalArtifact
     } else {
-        ProjectionMaterialization::InlineCarrier
+        ProjectionMaterialization::AdmissionOnly
     };
     // An owner result is the last host boundary for deterministic nested
     // continuations. Give that coherent packet the full model-safe budget so
@@ -1297,24 +1369,26 @@ fn prepare_model_projection(
             select_typed_projection_fragments(&metadata.fragments, applied_token_limit)
         };
 
-    let original_response = result
+    let mut canonical = result
         .result
-        .to_response_item(&result.call_id, &result.payload);
-    let mut canonical = result.result.canonical_result(&result.payload)?;
-    let original_output_text = match &original_response {
-        ResponseInputItem::FunctionCallOutput { output, .. }
-        | ResponseInputItem::CustomToolCallOutput { output, .. } => match &output.body {
-            FunctionCallOutputBody::Text(text) => text,
-            FunctionCallOutputBody::ContentItems(_) => {
-                std::str::from_utf8(&canonical.bytes).ok()?
-            }
-        },
-        ResponseInputItem::McpToolCallOutput { .. } => {
-            std::str::from_utf8(&canonical.bytes).ok()?
-        }
-        _ => return None,
+        .canonical_result(&result.payload)
+        .or_else(|| {
+            using_admission_fallback.then(|| {
+                admission_fallback_canonical_result(
+                    &spillable_text,
+                    &preserved_content,
+                    result.result.code_mode_result(&result.payload),
+                )
+            })
+        })?;
+    let original_output_text = if materialization == ProjectionMaterialization::AdmissionOnly {
+        let (normalized_response, text) = normalize_admission_response(original_response)?;
+        original_response = normalized_response;
+        text
+    } else {
+        history_output_text(&original_response)
+            .unwrap_or_else(|| consolidated_history_output_text(&original_response))
     };
-    let preserved_content = preserved_non_text_content(&original_response);
     canonical.sections = if materialization == ProjectionMaterialization::InlineCarrier {
         Vec::new()
     } else {
@@ -1332,10 +1406,20 @@ fn prepare_model_projection(
     let semantic_class = if validation_material {
         "validation"
     } else {
-        "tool_output"
+        match metadata.outcome {
+            ToolOutputOutcome::Failure => "tool_failure",
+            ToolOutputOutcome::TimedOut => "tool_timeout",
+            ToolOutputOutcome::Success | ToolOutputOutcome::Skipped => "tool_output",
+        }
     };
+    let source_dependencies = crate::tool_history::source_dependencies_for_tool_call(
+        flat_tool_name(&invocation.tool_name).as_ref(),
+        &invocation.payload,
+        invocation.turn.config.cwd.as_path(),
+    );
     let original_output_sha256 = crate::tool_history::sha256(original_output_text.as_bytes());
-    let original_output_tokens = approx_token_count(original_output_text) as u64;
+    let original_output_tokens = model_output_tokens as u64;
+    let invocation_sha256 = canonical_tool_invocation_sha256(&invocation.payload);
     Some(ModelProjectionInput {
         spillable_text,
         outcome: metadata.outcome,
@@ -1351,7 +1435,10 @@ fn prepare_model_projection(
         canonical,
         original_output_sha256,
         original_output_tokens,
+        original_output_text,
+        invocation_sha256,
         semantic_class: semantic_class.to_string(),
+        source_dependencies,
         projection_eligible: true,
         projection_truncated,
         predetermined_ranges: metadata.predetermined_ranges,
@@ -1359,6 +1446,153 @@ fn prepare_model_projection(
         original_response,
         materialization,
     })
+}
+
+fn admission_fallback_metadata(
+    response: &ResponseInputItem,
+    outcome: ToolOutputOutcome,
+) -> Option<ToolOutputProjectionMetadata> {
+    match response {
+        ResponseInputItem::FunctionCallOutput { .. }
+        | ResponseInputItem::CustomToolCallOutput { .. }
+        | ResponseInputItem::McpToolCallOutput { .. } => {}
+        ResponseInputItem::Message { .. } | ResponseInputItem::ToolSearchOutput { .. } => {
+            return None;
+        }
+    }
+    let spillable_text = consolidated_history_output_text(response);
+    if spillable_text.is_empty() && preserved_non_text_content(response).is_empty() {
+        return None;
+    }
+    Some(ToolOutputProjectionMetadata {
+        outcome,
+        diagnostic_class: ToolOutputDiagnosticClass::Normal,
+        fragments: Vec::new(),
+        spillable_text: vec![spillable_text],
+        essential_inline: serde_json::json!({}),
+        requested_limit: None,
+        predetermined_ranges: Vec::new(),
+        predetermined_json_pointers: Vec::new(),
+    })
+}
+
+fn admission_fallback_canonical_result(
+    spillable_text: &str,
+    preserved_content: &[Value],
+    code_mode_result: Value,
+) -> CanonicalToolResult {
+    if preserved_content.is_empty() {
+        CanonicalToolResult::text(spillable_text)
+    } else {
+        CanonicalToolResult::json(code_mode_result)
+    }
+}
+
+fn single_function_text(items: &[FunctionCallOutputContentItem]) -> Option<&str> {
+    let mut texts = items.iter().filter_map(|item| match item {
+        FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+        FunctionCallOutputContentItem::InputImage { .. }
+        | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+    });
+    let text = texts.next()?;
+    texts.next().is_none().then_some(text)
+}
+
+fn normalize_admission_response(
+    original: ResponseInputItem,
+) -> Option<(ResponseInputItem, String)> {
+    if let Some(text) = history_output_text(&original) {
+        return Some((original, text));
+    }
+    let text = consolidated_history_output_text(&original);
+    let normalized =
+        projected_response_item(original, text, /*preserve_non_text_content*/ true);
+    history_output_text(&normalized).map(|normalized_text| (normalized, normalized_text))
+}
+
+fn history_output_text(response: &ResponseInputItem) -> Option<String> {
+    match response {
+        ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. } => {
+            history_output_body_text(&output.body)
+        }
+        ResponseInputItem::McpToolCallOutput { output, .. } => {
+            history_output_body_text(&output.as_function_call_output_payload().body)
+        }
+        _ => None,
+    }
+}
+
+fn history_output_body_text(body: &FunctionCallOutputBody) -> Option<String> {
+    match body {
+        FunctionCallOutputBody::Text(text) => Some(text.clone()),
+        FunctionCallOutputBody::ContentItems(items) => {
+            single_function_text(items).map(str::to_string)
+        }
+    }
+}
+
+fn consolidated_history_output_text(response: &ResponseInputItem) -> String {
+    let body = match response {
+        ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. } => output.body.clone(),
+        ResponseInputItem::McpToolCallOutput { output, .. } => {
+            output.as_function_call_output_payload().body
+        }
+        _ => return String::new(),
+    };
+    match body {
+        FunctionCallOutputBody::Text(text) => text,
+        FunctionCallOutputBody::ContentItems(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(text),
+                FunctionCallOutputContentItem::InputImage { .. }
+                | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn canonical_tool_invocation_sha256(payload: &ToolPayload) -> Option<String> {
+    let value = match payload {
+        ToolPayload::Function { arguments } => serde_json::json!({
+            "kind": "function",
+            "arguments": canonical_json_argument(arguments),
+        }),
+        ToolPayload::ToolSearch { arguments } => serde_json::json!({
+            "kind": "tool_search",
+            "arguments": canonicalize_json(serde_json::to_value(arguments).ok()?),
+        }),
+        ToolPayload::Custom { input } => serde_json::json!({
+            "kind": "custom",
+            "input": canonical_json_argument(input),
+        }),
+    };
+    let bytes = serde_json::to_vec(&canonicalize_json(value)).ok()?;
+    Some(crate::tool_history::sha256(&bytes))
+}
+
+fn canonical_json_argument(value: &str) -> Value {
+    serde_json::from_str(value)
+        .map(canonicalize_json)
+        .unwrap_or_else(|_| Value::String(value.to_string()))
+}
+
+fn canonicalize_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        value => value,
+    }
 }
 
 fn generic_projection_is_exempt(tool_name: &ToolName, force_inline_carrier: bool) -> bool {
@@ -1674,16 +1908,19 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         essential_inline,
         origin_call_id,
         selection_facts,
-        applied_token_limit,
+        mut applied_token_limit,
         projected_text,
-        preserved_content,
+        mut preserved_content,
         codex_home,
         thread_id,
         tool_name,
         canonical,
         original_output_sha256,
         original_output_tokens,
+        original_output_text,
+        invocation_sha256,
         semantic_class,
+        source_dependencies,
         projection_eligible,
         projection_truncated,
         predetermined_ranges,
@@ -1693,6 +1930,25 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
     } = input;
     if !projection_eligible {
         return None;
+    }
+    let total_applied_token_limit = applied_token_limit;
+    let non_text_tokens = non_text_projection_token_cost(&preserved_content);
+    let non_text_bytes = non_text_projection_byte_cost(&preserved_content);
+    let preserve_non_text_content = !preserved_content.is_empty()
+        && non_text_tokens <= applied_token_limit.saturating_sub(MIN_PROJECTION_ENVELOPE_TOKENS);
+    let retained_non_text_tokens = if preserve_non_text_content {
+        non_text_tokens
+    } else {
+        0
+    };
+    let retained_non_text_bytes = if preserve_non_text_content {
+        non_text_bytes
+    } else {
+        0
+    };
+    if preserve_non_text_content {
+        preserved_content.clear();
+        applied_token_limit = applied_token_limit.saturating_sub(non_text_tokens).max(1);
     }
     let outcome = match outcome {
         ToolOutputOutcome::Success => "success",
@@ -1739,17 +1995,20 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         return Some(ModelToolProjection {
             original_response,
             bounded,
+            passthrough_response: false,
+            preserve_non_text_content,
             candidate: None,
-            projected_tokens: approx_token_count(&rendered) as u64,
+            projected_tokens: approx_token_count(&rendered).saturating_add(retained_non_text_tokens)
+                as u64,
             canonical_bytes: canonical.exact_bytes,
             canonical_tokens: canonical.approximate_tokens,
-            model_bytes: rendered.len() as u64,
+            model_bytes: rendered.len().saturating_add(retained_non_text_bytes) as u64,
             artifact_created: false,
             projection_truncated,
             omitted_sections: 0,
             deterministic_continuation_receipt: None,
             deterministic_continuation_content: Vec::new(),
-            applied_token_limit,
+            applied_token_limit: total_applied_token_limit,
         });
     }
     let existing_artifact_id = essential_inline
@@ -1778,6 +2037,51 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
     )
     .await
     .ok()?;
+    let supersession_identity = invocation_sha256
+        .map(|invocation_sha256| format!("{tool_name}:{invocation_sha256}:{}", canonical.sha256));
+    if materialization == ProjectionMaterialization::AdmissionOnly {
+        let bounded = BoundedModelProjection::Fallback {
+            value: serde_json::from_str(&original_output_text)
+                .unwrap_or_else(|_| Value::String(original_output_text.clone())),
+            rendered: original_output_text.clone(),
+        };
+        return Some(ModelToolProjection {
+            original_response,
+            bounded,
+            passthrough_response: true,
+            preserve_non_text_content: true,
+            candidate: Some(crate::tool_history::ToolHistoryCandidate {
+                call_id: origin_call_id,
+                tool_identity: tool_name,
+                semantic_class,
+                source_dependencies,
+                source_dependencies_current: true,
+                artifact_id,
+                artifact_bytes: canonical.exact_bytes,
+                artifact_sha256: canonical.sha256,
+                original_output_sha256,
+                original_tokens: original_output_tokens,
+                preserved_non_text_tokens: non_text_tokens as u64,
+                bounded_model_output: original_output_text.clone(),
+                complete: canonical.complete,
+                projection_eligible,
+                proof_identity: None,
+                supersession_identity,
+                consumed_by_generation: None,
+            }),
+            projected_tokens: approx_token_count(&original_output_text)
+                .saturating_add(non_text_tokens) as u64,
+            canonical_bytes: canonical.exact_bytes,
+            canonical_tokens: canonical.approximate_tokens,
+            model_bytes: original_output_text.len().saturating_add(non_text_bytes) as u64,
+            artifact_created,
+            projection_truncated: false,
+            omitted_sections: 0,
+            deterministic_continuation_receipt: None,
+            deterministic_continuation_content: Vec::new(),
+            applied_token_limit: total_applied_token_limit,
+        });
+    }
     let preserved_content_start = preserved_content.len();
     let result_value = serde_json::json!({
         "essential": essential_inline,
@@ -1864,8 +2168,9 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             serialize_projection_with_limit(base_envelope, &projected_text, applied_token_limit)?;
     }
     let rendered = bounded.rendered().to_string();
-    let projected_tokens = approx_token_count(&rendered) as u64;
-    let model_bytes = rendered.len() as u64;
+    let projected_tokens =
+        approx_token_count(&rendered).saturating_add(retained_non_text_tokens) as u64;
+    let model_bytes = rendered.len().saturating_add(retained_non_text_bytes) as u64;
     let deterministic_continuation_content = if deterministic_continuation_receipt.is_some() {
         drained_content
     } else {
@@ -1874,20 +2179,25 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
     Some(ModelToolProjection {
         original_response,
         bounded,
+        passthrough_response: false,
+        preserve_non_text_content,
         candidate: Some(crate::tool_history::ToolHistoryCandidate {
             call_id: origin_call_id,
             tool_identity: tool_name,
             semantic_class,
+            source_dependencies,
+            source_dependencies_current: true,
             artifact_id,
             artifact_bytes: canonical.exact_bytes,
             artifact_sha256: canonical.sha256,
             original_output_sha256,
             original_tokens: original_output_tokens,
+            preserved_non_text_tokens: retained_non_text_tokens as u64,
             bounded_model_output: rendered,
             complete: canonical.complete,
             projection_eligible,
             proof_identity: None,
-            supersession_identity: None,
+            supersession_identity,
             consumed_by_generation: None,
         }),
         projected_tokens,
@@ -1899,17 +2209,22 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         omitted_sections: omitted_section_count,
         deterministic_continuation_receipt,
         deterministic_continuation_content,
-        applied_token_limit,
+        applied_token_limit: total_applied_token_limit,
     })
 }
 
-fn projected_response_item(original: ResponseInputItem, rendered: String) -> ResponseInputItem {
+fn projected_response_item(
+    original: ResponseInputItem,
+    rendered: String,
+    preserve_non_text_content: bool,
+) -> ResponseInputItem {
     match original {
         ResponseInputItem::FunctionCallOutput {
             call_id,
             mut output,
         } => {
-            output.body = FunctionCallOutputBody::Text(rendered);
+            output.body =
+                projected_function_output_body(output.body, rendered, preserve_non_text_content);
             ResponseInputItem::FunctionCallOutput { call_id, output }
         }
         ResponseInputItem::CustomToolCallOutput {
@@ -1917,7 +2232,8 @@ fn projected_response_item(original: ResponseInputItem, rendered: String) -> Res
             name,
             mut output,
         } => {
-            output.body = FunctionCallOutputBody::Text(rendered);
+            output.body =
+                projected_function_output_body(output.body, rendered, preserve_non_text_content);
             ResponseInputItem::CustomToolCallOutput {
                 call_id,
                 name,
@@ -1928,9 +2244,13 @@ fn projected_response_item(original: ResponseInputItem, rendered: String) -> Res
             call_id,
             mut output,
         } => {
-            output
-                .content
-                .retain(|item| item.get("type").and_then(Value::as_str) != Some("text"));
+            if preserve_non_text_content {
+                output
+                    .content
+                    .retain(|item| item.get("type").and_then(Value::as_str) != Some("text"));
+            } else {
+                output.content.clear();
+            }
             output.content.insert(
                 0,
                 serde_json::json!({
@@ -1943,6 +2263,28 @@ fn projected_response_item(original: ResponseInputItem, rendered: String) -> Res
         }
         original => original,
     }
+}
+
+fn projected_function_output_body(
+    original: FunctionCallOutputBody,
+    rendered: String,
+    preserve_non_text_content: bool,
+) -> FunctionCallOutputBody {
+    if !preserve_non_text_content {
+        return FunctionCallOutputBody::Text(rendered);
+    }
+    let FunctionCallOutputBody::ContentItems(items) = original else {
+        return FunctionCallOutputBody::Text(rendered);
+    };
+    FunctionCallOutputBody::ContentItems(
+        std::iter::once(FunctionCallOutputContentItem::InputText { text: rendered })
+            .chain(
+                items.into_iter().filter(|item| {
+                    !matches!(item, FunctionCallOutputContentItem::InputText { .. })
+                }),
+            )
+            .collect(),
+    )
 }
 
 fn validated_predetermined_ranges(
@@ -2335,10 +2677,7 @@ fn serialize_projection_with_limit(
     loop {
         envelope.result["selected_text"] =
             Value::String(truncate_text_to_token_ceiling(output, output_limit));
-        let first = serde_json::to_string(&envelope).ok()?;
-        envelope.model_bytes = first.len() as u64;
-        envelope.model_approximate_tokens = approx_token_count(&first) as u64;
-        let rendered = serde_json::to_string(&envelope).ok()?;
+        let rendered = serialize_projection_with_exact_metrics(&mut envelope)?;
         let rendered_tokens = approx_token_count(&rendered);
         if rendered_tokens <= effective_limit {
             return Some(BoundedModelProjection::Envelope { envelope, rendered });
@@ -2371,6 +2710,25 @@ fn serialize_projection_with_limit(
     None
 }
 
+fn serialize_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Option<String> {
+    // The metrics are part of the serialized envelope, so updating them can
+    // change the serialization length. Iterate to the fixed point rather than
+    // reporting the size of the preceding serialization.
+    for _ in 0..8 {
+        let rendered = serde_json::to_string(envelope).ok()?;
+        let model_bytes = rendered.len() as u64;
+        let model_approximate_tokens = approx_token_count(&rendered) as u64;
+        if envelope.model_bytes == model_bytes
+            && envelope.model_approximate_tokens == model_approximate_tokens
+        {
+            return Some(rendered);
+        }
+        envelope.model_bytes = model_bytes;
+        envelope.model_approximate_tokens = model_approximate_tokens;
+    }
+    None
+}
+
 fn preserved_non_text_content(response: &ResponseInputItem) -> Vec<Value> {
     let output = match response {
         ResponseInputItem::FunctionCallOutput { output, .. }
@@ -2393,6 +2751,18 @@ fn preserved_non_text_content(response: &ResponseInputItem) -> Vec<Value> {
         .filter(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. }))
         .filter_map(|item| serde_json::to_value(item).ok())
         .collect()
+}
+
+fn non_text_projection_token_cost(content: &[Value]) -> usize {
+    serde_json::to_string(content)
+        .map(|serialized| approx_token_count(&serialized))
+        .unwrap_or(usize::MAX)
+}
+
+fn non_text_projection_byte_cost(content: &[Value]) -> usize {
+    serde_json::to_vec(content)
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX)
 }
 
 fn function_hook_tool_name(invocation: &ToolInvocation) -> HookToolName {

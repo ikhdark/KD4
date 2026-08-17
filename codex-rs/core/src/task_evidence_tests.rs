@@ -1337,6 +1337,7 @@ fn focused_validation_route(covered_paths: Vec<String>) -> ValidationRoute {
                 "codex-core".to_string(),
                 "focused_validation_case".to_string(),
             ],
+            uncertainty: "the focused validation contract remains satisfied".to_string(),
             covered_paths,
             covered_contracts: vec!["focused-validation-v1".to_string()],
             timeout_ms: 30_000,
@@ -1451,6 +1452,99 @@ async fn structured_plan_actions_without_an_active_step_are_outside_plan() {
 }
 
 #[tokio::test]
+async fn read_only_command_is_retained_in_compaction_recovery_state() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
+    ledger
+        .record_command(
+            &["rg".to_string(), "recovery-owner".to_string()],
+            &PathUri::from_abs_path(&cwd),
+            0,
+            false,
+            1,
+            false,
+        )
+        .await;
+
+    let compacted = ledger
+        .compaction_task_state()
+        .await
+        .expect("read-only audit evidence should create recovery state");
+    assert!(compacted.contains("## Evidence"));
+    assert!(compacted.contains("command command-1"));
+    assert!(compacted.contains("exit=0"));
+    assert!(compacted.contains("freshness=unknown"));
+}
+
+#[tokio::test]
+async fn compaction_recovery_marks_command_evidence_stale_after_mutation() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
+    ledger
+        .record_command(
+            &["git".to_string(), "status".to_string()],
+            &PathUri::from_abs_path(&cwd),
+            0,
+            false,
+            1,
+            false,
+        )
+        .await;
+    ledger
+        .record_command(
+            &["write-fixture".to_string()],
+            &PathUri::from_abs_path(&cwd),
+            0,
+            false,
+            1,
+            true,
+        )
+        .await;
+
+    let compacted = ledger
+        .compaction_task_state()
+        .await
+        .expect("compaction task state");
+    let stale_receipt = compacted
+        .lines()
+        .find(|line| line.contains("command command-1"))
+        .expect("first command receipt");
+    assert!(stale_receipt.contains("freshness=stale"));
+}
+
+#[tokio::test]
+async fn legacy_planning_fact_is_rendered_as_unverified_evidence() {
+    let legacy_fact: PlanningFactInput = serde_json::from_value(serde_json::json!({
+        "id": "legacy-owner",
+        "value": "codex-core"
+    }))
+    .expect("legacy planning fact");
+    assert_eq!(legacy_fact.provenance, ResultProvenance::Unverified);
+    assert_eq!(legacy_fact.source, None);
+    assert!(legacy_fact.depends_on_paths.is_empty());
+    assert!(legacy_fact.dependencies_current);
+
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let update = PlanningUpdateInput {
+        tier: Some(PlanningTier::Medium),
+        facts: vec![legacy_fact],
+        plan: vec![plan_item("verify-legacy", StepStatus::InProgress)],
+        ..PlanningUpdateInput::default()
+    };
+    assert_eq!(
+        ledger.record_planning_update(update).await.effect,
+        PlanUpdateEffect::Initial
+    );
+
+    let compacted = ledger
+        .compaction_task_state()
+        .await
+        .expect("compaction task state");
+    assert!(compacted.contains("Recorded facts remain evidence claims"));
+    assert!(compacted.contains("provenance: unverified; source: not recorded"));
+}
+
+#[tokio::test]
 async fn stable_planning_patches_preserve_omissions_and_audit_reasoned_removals() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     let initial = PlanningUpdateInput {
@@ -1458,7 +1552,10 @@ async fn stable_planning_patches_preserve_omissions_and_audit_reasoned_removals(
         facts: vec![PlanningFactInput {
             id: "owner".to_string(),
             value: "codex-core".to_string(),
+            provenance: ResultProvenance::DirectFileRead,
             source: Some("SOURCEMAP.md".to_string()),
+            depends_on_paths: vec!["SOURCEMAP.md".to_string()],
+            dependencies_current: true,
         }],
         plan: vec![plan_item("implement", StepStatus::InProgress)],
         ..PlanningUpdateInput::default()
@@ -1467,6 +1564,14 @@ async fn stable_planning_patches_preserve_omissions_and_audit_reasoned_removals(
         ledger.record_planning_update(initial).await.effect,
         PlanUpdateEffect::Initial
     );
+    let compacted = ledger
+        .compaction_task_state()
+        .await
+        .expect("compaction task state");
+    assert!(compacted.contains("do not treat durable storage as proof"));
+    assert!(compacted.contains("Recorded evidence claims"));
+    assert!(compacted.contains("provenance: direct_file_read; source: SOURCEMAP.md"));
+    assert!(compacted.contains("depends on: SOURCEMAP.md"));
 
     let status_only = PlanningUpdateInput {
         plan: vec![plan_item("implement", StepStatus::Pending)],
@@ -1513,6 +1618,46 @@ async fn stable_planning_patches_preserve_omissions_and_audit_reasoned_removals(
     assert_eq!(document.planning.audit_history.len(), 2);
     assert_eq!(document.planning.counters.fact_removals, 1);
     assert_eq!(document.planning.counters.step_removals, 1);
+}
+
+#[tokio::test]
+async fn planning_facts_invalidate_only_when_dependency_paths_overlap() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let facts = [("foo", "src/foo.rs"), ("bar", "src/bar.rs")]
+        .into_iter()
+        .map(|(id, path)| PlanningFactInput {
+            id: id.to_string(),
+            value: format!("fact from {path}"),
+            provenance: ResultProvenance::DirectFileRead,
+            source: Some(path.to_string()),
+            depends_on_paths: vec![path.to_string()],
+            dependencies_current: true,
+        })
+        .collect();
+    ledger
+        .record_planning_update(PlanningUpdateInput {
+            tier: Some(PlanningTier::Medium),
+            facts,
+            plan: vec![plan_item("implement", StepStatus::InProgress)],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+
+    {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        invalidate_for_mutation(document, Some(&BTreeSet::from(["src/foo.rs".to_string()])));
+        assert!(!document.planning.facts["foo"].dependencies_current);
+        assert!(document.planning.facts["bar"].dependencies_current);
+    }
+
+    let compacted = ledger
+        .compaction_task_state()
+        .await
+        .expect("compaction task state");
+    assert!(compacted.contains("bar: fact from src/bar.rs"));
+    assert!(compacted.contains("foo: stale after a dependency changed"));
+    assert!(compacted.contains("Invalidated evidence claims (not authoritative)"));
 }
 
 #[tokio::test]
@@ -1587,14 +1732,26 @@ async fn explicit_batch_ack_reuses_bound_route_and_survives_only_disjoint_edits(
     tokio::fs::create_dir_all(repo.join("docs"))
         .await
         .expect("docs directory");
+    tokio::fs::create_dir_all(repo.join("tests"))
+        .await
+        .expect("tests directory");
     tokio::fs::write(repo.join("src/step.rs"), "one")
         .await
         .expect("source fixture");
     tokio::fs::write(repo.join("docs/note.md"), "one")
         .await
         .expect("docs fixture");
+    tokio::fs::write(repo.join("tests/stable.rs"), "one")
+        .await
+        .expect("stable test fixture");
 
-    let route = focused_validation_route(vec!["src/step.rs".to_string()]);
+    let mut route = focused_validation_route(vec!["src/step.rs".to_string()]);
+    let mut stable_leaf = route.leaves[0].clone();
+    stable_leaf.argv.pop();
+    stable_leaf.argv.push("stable_validation_case".to_string());
+    stable_leaf.uncertainty = "the stable validation contract remains satisfied".to_string();
+    stable_leaf.covered_paths = vec!["tests/stable.rs".to_string()];
+    route.leaves.push(stable_leaf);
     let mut initial = plan_item("step", StepStatus::InProgress);
     initial.validation_route = Some(route.clone());
     ledger.record_plan_update(&plan_with(vec![initial])).await;
@@ -1662,6 +1819,269 @@ async fn explicit_batch_ack_reuses_bound_route_and_survives_only_disjoint_edits(
         ledger.auto_validation_candidate().await.is_none(),
         "covered mutation must invalidate the acknowledgement"
     );
+
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
+        .await;
+    let after_relevant = ledger
+        .auto_validation_candidate()
+        .await
+        .expect("explicit acknowledgement should rebind the route");
+    assert_ne!(
+        after_relevant.leaf_implementation_identities[0],
+        acknowledged.leaf_implementation_identities[0],
+        "the leaf covering the edited path must receive a fresh identity"
+    );
+    assert_eq!(
+        after_relevant.leaf_implementation_identities[1],
+        acknowledged.leaf_implementation_identities[1],
+        "a leaf covering only an unchanged path must remain reusable"
+    );
+}
+
+#[tokio::test]
+async fn covered_directory_snapshot_detects_descendant_changes_and_rejects_escape() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("src/nested"))
+        .await
+        .expect("covered directory");
+    tokio::fs::write(repo.join("src/nested/step.rs"), "one")
+        .await
+        .expect("covered source fixture");
+
+    let mut step = plan_item("step", StepStatus::InProgress);
+    step.validation_route = Some(focused_validation_route(vec!["src".to_string()]));
+    ledger.record_plan_update(&plan_with(vec![step])).await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
+        .await;
+    assert!(
+        ledger.auto_validation_candidate().await.is_some(),
+        "unchanged covered directory should retain its acknowledgement"
+    );
+
+    tokio::fs::write(repo.join("src/nested/step.rs"), "two")
+        .await
+        .expect("out-of-band descendant edit");
+    assert!(
+        ledger.auto_validation_candidate().await.is_none(),
+        "descendant changes must invalidate a covered directory snapshot"
+    );
+
+    let escaped = snapshot_file(&repo, "../outside.rs").await;
+    assert_eq!(escaped.sha1, None);
+    assert_eq!(escaped.exists, false);
+    assert!(escaped.read_error.is_some());
+}
+
+#[tokio::test]
+async fn direct_validation_identity_ignores_unrelated_changes() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("src"))
+        .await
+        .expect("source directory");
+    tokio::fs::write(repo.join("src/covered.rs"), "one")
+        .await
+        .expect("covered fixture");
+    tokio::fs::write(repo.join("unrelated.md"), "one")
+        .await
+        .expect("unrelated fixture");
+
+    let covered_paths = vec!["src/covered.rs".to_string()];
+    let before = ledger
+        .direct_validation_implementation_identity(&covered_paths)
+        .await
+        .expect("initial direct identity");
+    tokio::fs::write(repo.join("unrelated.md"), "two")
+        .await
+        .expect("unrelated mutation");
+    let after_unrelated = ledger
+        .direct_validation_implementation_identity(&covered_paths)
+        .await
+        .expect("identity after unrelated mutation");
+    assert_eq!(before, after_unrelated);
+
+    tokio::fs::write(repo.join("src/covered.rs"), "two")
+        .await
+        .expect("covered mutation");
+    let after_covered = ledger
+        .direct_validation_implementation_identity(&covered_paths)
+        .await
+        .expect("identity after covered mutation");
+    assert_ne!(before, after_covered);
+}
+
+#[tokio::test]
+async fn multi_leaf_validation_passes_only_after_every_leaf_has_current_proof() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("src"))
+        .await
+        .expect("source directory");
+    tokio::fs::write(repo.join("src/first.rs"), "one")
+        .await
+        .expect("first fixture");
+    tokio::fs::write(repo.join("src/second.rs"), "two")
+        .await
+        .expect("second fixture");
+    tokio::fs::write(repo.join("unrelated.md"), "one")
+        .await
+        .expect("unrelated fixture");
+
+    let mut route = focused_validation_route(vec!["src/first.rs".to_string()]);
+    let mut second_leaf = route.leaves[0].clone();
+    second_leaf.argv.pop();
+    second_leaf.argv.push("second_validation_case".to_string());
+    second_leaf.uncertainty = "the second focused contract remains satisfied".to_string();
+    second_leaf.covered_paths = vec!["src/second.rs".to_string()];
+    route.leaves.push(second_leaf);
+
+    let mut initial = plan_item("step", StepStatus::InProgress);
+    initial.validation_route = Some(route.clone());
+    ledger.record_plan_update(&plan_with(vec![initial])).await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
+        .await;
+    let step_revision = {
+        let guard = ledger.document.lock().await;
+        guard.as_ref().expect("document").plan[0].revision
+    };
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
+    let cwd_uri = PathUri::from_abs_path(&cwd);
+    let repository = repo.to_string_lossy().into_owned();
+    let validation_result = |index: usize, identity: &str| {
+        let leaf_route = ValidationRoute {
+            leaves: vec![route.leaves[index].clone()],
+            ordering: route.ordering,
+        };
+        codex_protocol::validation::ValidationResult {
+            proof_key: codex_protocol::validation::ValidationProofKey {
+                repository: repository.clone(),
+                cwd: repository.clone(),
+                canonical_route_hash: format!("route-{index}"),
+                implementation_identity: identity.to_string(),
+                coverage_identity: format!("coverage-{index}"),
+                environment_identity: "test-environment".to_string(),
+                toolchain_identity: "test-toolchain".to_string(),
+                configuration_identity: "test-configuration".to_string(),
+                validation_contract_version:
+                    codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
+            },
+            route: leaf_route,
+            call_id: format!("validation-{index}"),
+            process_id: None,
+            status: codex_protocol::validation::ValidationTerminalStatus::Succeeded,
+            duration_ms: 1,
+            summary: Some("focused validation succeeded".to_string()),
+            failure_excerpt: None,
+            raw_artifact_ref: None,
+            raw_artifact_sha256: None,
+            freshness: if index == 0 {
+                codex_protocol::validation::ValidationFreshness::Executed
+            } else {
+                codex_protocol::validation::ValidationFreshness::Reused
+            },
+        }
+    };
+
+    ledger
+        .record_command_bound_with_validation_result(
+            &route.leaves[0].argv,
+            &cwd_uri,
+            0,
+            false,
+            1,
+            false,
+            None,
+            None,
+            Some("identity-first"),
+            Some(validation_result(0, "identity-first")),
+            Some(("step", step_revision)),
+        )
+        .await;
+    {
+        let guard = ledger.document.lock().await;
+        let step = &guard.as_ref().expect("document").plan[0];
+        assert_eq!(step.status, StepStatus::Implemented);
+        assert!(step.validation_receipt_id.is_none());
+    }
+
+    ledger
+        .record_command_bound_with_validation_result(
+            &route.leaves[1].argv,
+            &cwd_uri,
+            0,
+            false,
+            1,
+            false,
+            None,
+            None,
+            Some("identity-second"),
+            Some(validation_result(1, "identity-second")),
+            Some(("step", step_revision)),
+        )
+        .await;
+    {
+        let guard = ledger.document.lock().await;
+        let step = &guard.as_ref().expect("document").plan[0];
+        assert_eq!(step.status, StepStatus::Passed);
+        assert!(step.validation_receipt_id.is_some());
+    }
+
+    ledger
+        .record_command_bound_with_validation_result(
+            &["touch".to_string(), "unrelated.md".to_string()],
+            &cwd_uri,
+            0,
+            false,
+            1,
+            true,
+            Some(&BTreeSet::from([repo.join("unrelated.md")])),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert_eq!(document.plan[0].status, StepStatus::Passed);
+        assert!(
+            document
+                .command_receipts
+                .iter()
+                .filter(|receipt| receipt.step_id.as_deref() == Some("step"))
+                .all(|receipt| command_receipt_has_current_proof_identity(document, receipt)),
+            "disjoint edits must retain every leaf receipt for the passed step"
+        );
+    }
+
+    ledger
+        .record_command_bound_with_validation_result(
+            &["touch".to_string(), "src/first.rs".to_string()],
+            &cwd_uri,
+            0,
+            false,
+            1,
+            true,
+            Some(&BTreeSet::from([repo.join("src/first.rs")])),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.plan[0].status, StepStatus::Implemented);
+    assert!(
+        document
+            .command_receipts
+            .iter()
+            .filter(|receipt| receipt.step_id.as_deref() == Some("step"))
+            .all(|receipt| !command_receipt_has_current_proof_identity(document, receipt)),
+        "an overlapping edit must invalidate the step's retained receipts"
+    );
 }
 
 #[tokio::test]
@@ -1693,6 +2113,37 @@ async fn unknown_coverage_acknowledgement_requires_repository_wide_quiescence() 
         .record_edit_result("repository-edit", "completed")
         .await;
     assert!(ledger.auto_validation_candidate().await.is_none());
+}
+
+#[test]
+fn repository_wide_validation_coverage_invalidates_for_disjoint_mutations() {
+    let repository_wide = EvidencePlanStep {
+        id: "step".to_string(),
+        revision: 1,
+        step: "step".to_string(),
+        status: StepStatus::Passed,
+        depends_on: Vec::new(),
+        acceptance_criteria: Vec::new(),
+        runtime_paths: Vec::new(),
+        generated_artifacts: Vec::new(),
+        risks: Vec::new(),
+        requires_desktop_activation: false,
+        validation_route: Some(focused_validation_route(Vec::new())),
+        external_validation_route: None,
+        validation_disposition: ValidationDisposition::Executable,
+        source_owner: None,
+        implementation_surfaces: vec!["src/owned.rs".to_string()],
+        mutation_obligations: Vec::new(),
+        validation_receipt_id: Some("receipt".to_string()),
+        edit_paths: BTreeSet::new(),
+    };
+    let disjoint = BTreeSet::from(["docs/unrelated.md".to_string()]);
+
+    assert!(mutation_can_affect_step(&repository_wide, Some(&disjoint)));
+
+    let mut scoped = repository_wide;
+    scoped.validation_route = Some(focused_validation_route(vec!["src/owned.rs".to_string()]));
+    assert!(!mutation_can_affect_step(&scoped, Some(&disjoint)));
 }
 
 fn command_receipt(id: &str) -> CommandReceipt {
@@ -5053,6 +5504,7 @@ async fn proof_accumulation_changes_dossier_but_not_implementation_identity() {
             1,
             false,
             None,
+            None,
             Some(&before.implementation_identity_hash),
         )
         .await;
@@ -5076,6 +5528,7 @@ async fn proof_accumulation_changes_dossier_but_not_implementation_identity() {
             false,
             1,
             false,
+            None,
             None,
             Some(&before.implementation_identity_hash),
         )

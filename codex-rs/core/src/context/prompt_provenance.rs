@@ -1,6 +1,7 @@
 use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextManifest;
 use codex_extension_api::PromptFragment;
+use codex_extension_api::PromptFragmentKind;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
@@ -21,41 +22,50 @@ pub(crate) enum PromptContextCategory {
     Repository,
     AgentRole,
     Skills,
+    SkillCatalog,
     Plugins,
+    PluginCatalog,
     AppDesktop,
     Collaboration,
     EnvironmentPermissions,
     TaskInput,
     History,
+    Memory,
     OtherInjected,
 }
 
 impl PromptContextCategory {
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::BaseSystem,
         Self::ToolSchemas,
         Self::Repository,
         Self::AgentRole,
         Self::Skills,
+        Self::SkillCatalog,
         Self::Plugins,
+        Self::PluginCatalog,
         Self::AppDesktop,
         Self::Collaboration,
         Self::EnvironmentPermissions,
         Self::TaskInput,
         Self::History,
+        Self::Memory,
         Self::OtherInjected,
     ];
 
-    pub(crate) const FIXED_PREFIX: [Self; 10] = [
+    pub(crate) const FIXED_PREFIX: [Self; 13] = [
         Self::BaseSystem,
         Self::ToolSchemas,
         Self::Repository,
         Self::AgentRole,
         Self::Skills,
+        Self::SkillCatalog,
         Self::Plugins,
+        Self::PluginCatalog,
         Self::AppDesktop,
         Self::Collaboration,
         Self::EnvironmentPermissions,
+        Self::Memory,
         Self::OtherInjected,
     ];
 
@@ -66,14 +76,39 @@ impl PromptContextCategory {
             Self::Repository => "repository",
             Self::AgentRole => "agent_role",
             Self::Skills => "skills",
+            Self::SkillCatalog => "skill_catalog",
             Self::Plugins => "plugins",
+            Self::PluginCatalog => "plugin_catalog",
             Self::AppDesktop => "app_desktop",
             Self::Collaboration => "collaboration",
             Self::EnvironmentPermissions => "environment_permissions",
             Self::TaskInput => "task_input",
             Self::History => "history",
+            Self::Memory => "memory",
             Self::OtherInjected => "other_injected",
         }
+    }
+
+    /// Context deliberately selected by the harness for the current request.
+    /// This is an operational proxy, not a claim about model attention.
+    /// Catalogs, generic extension text, and merely available tool schemas are
+    /// excluded; schemas selected by the model are accounted for after the
+    /// response completes.
+    pub(crate) const fn is_producer_selected_context(self) -> bool {
+        matches!(
+            self,
+            Self::BaseSystem
+                | Self::Repository
+                | Self::AgentRole
+                | Self::Skills
+                | Self::Plugins
+                | Self::AppDesktop
+                | Self::Collaboration
+                | Self::EnvironmentPermissions
+                | Self::TaskInput
+                | Self::History
+                | Self::Memory
+        )
     }
 }
 
@@ -88,10 +123,11 @@ pub(crate) struct CategorizedPromptFragment {
 
 impl CategorizedPromptFragment {
     pub(crate) fn from_extension(fragment: PromptFragment) -> Self {
-        Self {
-            fragment,
-            category: PromptContextCategory::OtherInjected,
-        }
+        let category = match fragment.kind() {
+            PromptFragmentKind::OtherInjected => PromptContextCategory::OtherInjected,
+            PromptFragmentKind::Memory => PromptContextCategory::Memory,
+        };
+        Self { fragment, category }
     }
 
     pub(crate) fn category(&self) -> PromptContextCategory {
@@ -475,18 +511,19 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         StableContextKind::ToolSchemas => PromptContextCategory::ToolSchemas,
         StableContextKind::Repository => PromptContextCategory::Repository,
         StableContextKind::Collaboration => PromptContextCategory::Collaboration,
-        StableContextKind::SkillUsage
-        | StableContextKind::SkillCatalog
-        | StableContextKind::SelectedSkill => PromptContextCategory::Skills,
+        StableContextKind::SkillUsage | StableContextKind::SelectedSkill => {
+            PromptContextCategory::Skills
+        }
+        StableContextKind::SkillCatalog => PromptContextCategory::SkillCatalog,
         StableContextKind::DesktopApp | StableContextKind::AppContext => {
             PromptContextCategory::AppDesktop
         }
-        StableContextKind::Plugins | StableContextKind::RecommendedPlugins => {
-            PromptContextCategory::Plugins
-        }
+        StableContextKind::Plugins => PromptContextCategory::Plugins,
+        StableContextKind::RecommendedPlugins => PromptContextCategory::PluginCatalog,
         StableContextKind::Environment | StableContextKind::EnvironmentPermissions => {
             PromptContextCategory::EnvironmentPermissions
         }
+        StableContextKind::Memory => PromptContextCategory::Memory,
         StableContextKind::RootCoordinator | StableContextKind::MultiAgent => {
             PromptContextCategory::AgentRole
         }
@@ -530,6 +567,15 @@ mod tests {
         let fragment = PromptFragment::new(PromptSlot::DeveloperPolicy, "extension text");
         let categorized = CategorizedPromptFragment::from_extension(fragment.clone());
         assert_eq!(categorized.category(), PromptContextCategory::OtherInjected);
+        assert_eq!(categorized.into_fragment(), fragment);
+    }
+
+    #[test]
+    fn memory_extension_fragments_keep_explicit_provenance() {
+        let fragment =
+            PromptFragment::developer_policy("memory text").with_kind(PromptFragmentKind::Memory);
+        let categorized = CategorizedPromptFragment::from_extension(fragment.clone());
+        assert_eq!(categorized.category(), PromptContextCategory::Memory);
         assert_eq!(categorized.into_fragment(), fragment);
     }
 

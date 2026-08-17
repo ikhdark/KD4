@@ -152,6 +152,27 @@ async fn scoped_shell_validation_clears_only_matching_changed_paths() {
     );
 }
 
+#[test]
+fn direct_shell_mutation_paths_are_exact_and_complex_scripts_fall_back() {
+    let dir = tempdir().expect("tempdir");
+    let exact = command_mutation_paths(&["touch".into(), "src/foo.rs".into()], Some(dir.path()))
+        .expect("direct touch path");
+    assert_eq!(exact, BTreeSet::from([dir.path().join("src/foo.rs")]));
+
+    assert!(
+        command_mutation_paths(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "touch src/foo.rs && touch src/bar.rs".into()
+            ],
+            Some(dir.path()),
+        )
+        .is_none(),
+        "compound scripts must retain conservative unknown invalidation"
+    );
+}
+
 #[tokio::test]
 async fn package_scoped_validation_maps_codex_package_to_its_crate_directory() {
     let dir = tempdir().expect("tempdir");
@@ -349,7 +370,73 @@ fn just_fix_is_a_mutation_and_cannot_validate_its_own_edits() {
 fn read_only_shell_commands_do_not_create_mutation_state() {
     let mut tracker = TurnDiffTracker::new();
     tracker.record_exec_command_end(&["git".into(), "status".into()], 0, false);
+    tracker.record_exec_command_end(&["git".into(), "log".into(), "-1".into()], 0, false);
     assert!(!tracker.has_unvalidated_mutation());
+}
+
+#[test]
+fn arbitrary_script_runners_fail_closed_as_possible_mutations() {
+    for command in [
+        vec!["python".into(), "edit.py".into()],
+        vec!["node".into(), "rewrite.js".into()],
+        vec!["custom-codegen.exe".into()],
+    ] {
+        assert!(
+            command_may_mutate(&command),
+            "unknown executable must fail closed: {command:?}"
+        );
+    }
+
+    assert!(!command_may_mutate(&[
+        "python".into(),
+        "-m".into(),
+        "pytest".into(),
+    ]));
+    assert!(!command_may_mutate(&["cargo".into(), "check".into()]));
+}
+
+#[test]
+fn mutation_boundary_mutating_validation_flags_and_package_scripts_fail_closed() {
+    for command in [
+        vec!["eslint".into(), "--fix".into(), "src".into()],
+        vec!["ruff".into(), "check".into(), "--fix".into()],
+        vec!["npm".into(), "run".into(), "build".into()],
+        vec!["pnpm".into(), "test:update-snapshots".into()],
+        vec!["jest".into(), "-u".into()],
+    ] {
+        assert!(
+            command_may_mutate(&command),
+            "validation writer must advance mutation state: {command:?}"
+        );
+    }
+}
+
+#[test]
+fn mutation_boundary_git_global_options_preserve_read_write_semantics() {
+    for command in [
+        vec!["git".into(), "-C".into(), ".".into(), "log".into()],
+        vec![
+            "git".into(),
+            "-c".into(),
+            "core.pager=cat".into(),
+            "log".into(),
+            "-1".into(),
+        ],
+        vec!["git".into(), "--no-pager".into(), "show".into()],
+    ] {
+        assert!(
+            !command_may_mutate(&command),
+            "history read must remain non-mutating: {command:?}"
+        );
+        assert!(command_reads_repository_history(&command));
+    }
+    assert!(command_may_mutate(&[
+        "git".into(),
+        "-C".into(),
+        ".".into(),
+        "add".into(),
+        "src/lib.rs".into(),
+    ]));
 }
 
 #[tokio::test]

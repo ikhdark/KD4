@@ -1,3 +1,4 @@
+use chrono::DateTime;
 use chrono::Utc;
 use codex_agent_task_store::AdmittedAssignment;
 use codex_agent_task_store::AgentReceipt;
@@ -44,6 +45,7 @@ use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::task_metrics::TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC;
 use super::task_metrics::TaskMetricRuntime;
 use super::task_metrics::terminal_metrics_ready;
 
@@ -195,6 +197,8 @@ impl AgentTaskCoordinator {
         &self,
         attempt_id: AttemptId,
         kind: ObservationKind,
+        task_started_at: &DateTime<Utc>,
+        progress_created_at: &DateTime<Utc>,
         session_telemetry: &SessionTelemetry,
     ) -> bool {
         if !kind.is_meaningful_progress() {
@@ -213,6 +217,11 @@ impl AgentTaskCoordinator {
         session_telemetry.counter(
             "codex.multi_agent.first_meaningful_progress",
             1,
+            &[("kind", observation_metric_label(kind))],
+        );
+        session_telemetry.record_duration(
+            TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC,
+            task_progress_duration(task_started_at, progress_created_at),
             &[("kind", observation_metric_label(kind))],
         );
         true
@@ -839,6 +848,16 @@ fn saturating_active_turns(active: usize) -> u32 {
 
 fn metric_capacity(metrics: &TaskMetricIndex, active_turns: u32) -> u32 {
     metrics.configured_capacity.unwrap_or(1).max(active_turns)
+}
+
+fn task_progress_duration(
+    task_started_at: &DateTime<Utc>,
+    progress_created_at: &DateTime<Utc>,
+) -> std::time::Duration {
+    progress_created_at
+        .signed_duration_since(task_started_at)
+        .to_std()
+        .unwrap_or_default()
 }
 
 const fn observation_metric_label(kind: ObservationKind) -> &'static str {

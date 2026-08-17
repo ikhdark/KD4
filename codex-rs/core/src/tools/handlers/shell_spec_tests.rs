@@ -112,6 +112,7 @@ fn exec_command_tool_matches_expected_spec() {
                     "True runs the shell with -l/-i semantics; false disables them. Defaults to true.".to_string(),
                 )),
         ),
+        ("validation".to_string(), validation_context_schema()),
     ]);
     properties.extend(create_approval_parameters(
         /*exec_permission_approvals_enabled*/ false,
@@ -322,6 +323,7 @@ Examples of valid command strings:
                 "Maximum command runtime. Defaults to 10000 ms.".to_string(),
             )),
         ),
+        ("validation".to_string(), validation_context_schema()),
         (
             "login".to_string(),
             JsonSchema::boolean(Some(
@@ -333,6 +335,12 @@ Examples of valid command strings:
     properties.extend(create_approval_parameters(
         /*exec_permission_approvals_enabled*/ false,
     ));
+    properties.insert(
+        "force_fresh".to_string(),
+        JsonSchema::boolean(Some(
+            "Execute without reusing prior immutable evidence.".to_string(),
+        )),
+    );
 
     assert_eq!(
         tool,

@@ -2,6 +2,7 @@ use crate::function_tool::FunctionCallError;
 use crate::task_evidence::PlanUpdateEffect;
 use crate::task_evidence::PlanningTier;
 use crate::task_evidence::PlanningUpdateInput;
+use crate::task_evidence::ResultProvenance;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -36,33 +37,43 @@ use tokio::sync::Notify;
 pub struct PlanHandler;
 
 pub struct PlanToolOutput {
+    current_plan: UpdatePlanArgs,
     normalized_plan: Option<UpdatePlanArgs>,
+    effect: PlanUpdateEffect,
+    normalization_reason: Option<String>,
     governor_plan: Option<UpdatePlanArgs>,
     unfinished_mutation_obligation: Option<bool>,
     validation_results: Vec<JsonValue>,
 }
 
 const PLAN_UPDATED_MESSAGE: &str = "Plan updated";
+const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 
 impl PlanToolOutput {
-    fn normalized_result(&self) -> Option<JsonValue> {
-        self.normalized_plan
-            .as_ref()
-            .map(|normalized_plan| {
-                serde_json::json!({
-                    "message": PLAN_UPDATED_MESSAGE,
-                    "normalized_plan": normalized_plan,
-                    "validation_results": self.validation_results,
-                })
-            })
-            .or_else(|| {
-                (!self.validation_results.is_empty()).then(|| {
-                    serde_json::json!({
-                        "message": PLAN_UPDATED_MESSAGE,
-                        "validation_results": self.validation_results,
-                    })
-                })
-            })
+    fn response_result(&self) -> JsonValue {
+        let mut result = serde_json::json!({
+            "message": self.message(),
+            "effect": self.effect.as_str(),
+            "no_progress": self.effect == PlanUpdateEffect::NoOp,
+            "current_plan": self.current_plan,
+            "validation_results": self.validation_results,
+        });
+        if let Some(normalized_plan) = &self.normalized_plan {
+            result["normalized_plan"] = serde_json::json!(normalized_plan);
+        }
+        if let Some(reason) = &self.normalization_reason {
+            result["normalization_reason"] = JsonValue::String(reason.clone());
+        }
+        result
+    }
+
+    fn message(&self) -> &'static str {
+        match self.effect {
+            PlanUpdateEffect::NoOp => PLAN_UNCHANGED_MESSAGE,
+            PlanUpdateEffect::Initial
+            | PlanUpdateEffect::StructuralRevision
+            | PlanUpdateEffect::StatusOnly => PLAN_UPDATED_MESSAGE,
+        }
     }
 }
 
@@ -115,7 +126,7 @@ async fn pause_at_plan_commit_boundary(call_id: &str) {
 
 impl ToolOutput for PlanToolOutput {
     fn log_preview(&self) -> String {
-        PLAN_UPDATED_MESSAGE.to_string()
+        self.message().to_string()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -126,15 +137,15 @@ impl ToolOutput for PlanToolOutput {
         Some(serde_json::json!({
             "kind": "plan_update",
             "plan": self.governor_plan,
+            "effect": self.effect.as_str(),
+            "no_progress": self.effect == PlanUpdateEffect::NoOp,
+            "normalization_reason": self.normalization_reason,
             "unfinished_mutation_obligation": self.unfinished_mutation_obligation,
         }))
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
-        let text = self.normalized_result().map_or_else(
-            || PLAN_UPDATED_MESSAGE.to_string(),
-            |result| result.to_string(),
-        );
+        let text = self.response_result().to_string();
         let mut output = FunctionCallOutputPayload::from_text(text);
         output.success = Some(true);
 
@@ -145,8 +156,7 @@ impl ToolOutput for PlanToolOutput {
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        self.normalized_result()
-            .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()))
+        self.response_result()
     }
 }
 
@@ -241,6 +251,8 @@ impl PlanHandler {
             plan: requested_input.plan,
         };
         let normalized_plan = (args != requested_args).then(|| args.clone());
+        let normalization_reason =
+            plan_normalization_reason(&requested_args, &args, outcome.effect);
         session
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args.clone()))
             .await;
@@ -267,12 +279,44 @@ impl PlanHandler {
         };
 
         Ok(boxed_tool_output(PlanToolOutput {
+            current_plan: args.clone(),
             normalized_plan,
+            effect: outcome.effect,
+            normalization_reason,
             governor_plan: outcome.effect.requests_generation().then_some(args),
             unfinished_mutation_obligation: outcome.unfinished_mutation_obligation,
             validation_results,
         }))
     }
+}
+
+fn plan_normalization_reason(
+    requested: &UpdatePlanArgs,
+    current: &UpdatePlanArgs,
+    effect: PlanUpdateEffect,
+) -> Option<String> {
+    if requested == current {
+        return (effect == PlanUpdateEffect::NoOp)
+            .then(|| "request matched the authoritative plan; no plan state changed".to_string());
+    }
+    let status_was_normalized = requested.plan.iter().any(|requested_step| {
+        current.plan.iter().any(|current_step| {
+            let same_step = requested_step
+                .id
+                .as_ref()
+                .zip(current_step.id.as_ref())
+                .is_some_and(|(requested, current)| requested == current)
+                || requested_step.step == current_step.step;
+            same_step && requested_step.status != current_step.status
+        })
+    });
+    Some(if status_was_normalized {
+        "requested status was normalized because completion or validation obligations are not satisfied"
+            .to_string()
+    } else {
+        "the authoritative plan installed or preserved stable plan identifiers and structure"
+            .to_string()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -443,8 +487,9 @@ async fn run_bound_validation_leaf(
         });
     let bound = crate::tools::command_execution::BoundAutoValidationLeaf {
         step_id: candidate.step_id.clone(),
+        step_revision: candidate.step_revision,
         implementation_revision: candidate.implementation_revision,
-        implementation_identity: candidate.implementation_identity.clone(),
+        implementation_identity: candidate.leaf_implementation_identities.get(index)?.clone(),
         repository: repository.to_path_buf(),
         route: candidate.route.clone(),
         leaf_index: index,
@@ -558,6 +603,26 @@ fn parse_update_plan_arguments(arguments: &str) -> Result<PlanningUpdateInput, F
         return Err(FunctionCallError::RespondToModel(
             "focused planning accepts at most one atomic mutation obligation".to_string(),
         ));
+    }
+    for fact in &input.facts {
+        if fact.id.trim().is_empty()
+            || fact.value.trim().is_empty()
+            || fact
+                .source
+                .as_deref()
+                .is_none_or(|source| source.trim().is_empty())
+            || fact.provenance == ResultProvenance::Unverified
+            || fact.depends_on_paths.is_empty()
+            || fact
+                .depends_on_paths
+                .iter()
+                .any(|path| path.trim().is_empty())
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "planning facts require a stable id, non-empty value, explicit provenance, concrete source locator, and at least one dependency path"
+                    .to_string(),
+            ));
+        }
     }
     for removal in input.removed_facts.iter().chain(&input.removed_steps) {
         if removal.id.trim().is_empty() || removal.reason.trim().is_empty() {

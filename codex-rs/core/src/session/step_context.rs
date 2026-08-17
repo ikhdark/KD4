@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::McpRuntimeSnapshot;
@@ -24,15 +25,36 @@ pub(crate) struct StepContext {
     tool_router: OnceLock<Arc<ToolRouter>>,
     /// The canonical AGENTS.md value observed with this environment snapshot.
     pub(crate) loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
+    /// Whether that value came from this step's read or a fallback cache.
+    pub(crate) agents_md_freshness: AgentsMdFreshness,
 }
 
 impl StepContext {
+    #[cfg(test)]
     pub(crate) fn new(
         turn: Arc<TurnContext>,
         environments: TurnEnvironmentSnapshot,
         selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,
         mcp: Arc<McpRuntimeSnapshot>,
         loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
+    ) -> Self {
+        Self::new_with_agents_md_freshness(
+            turn,
+            environments,
+            selected_capability_roots,
+            mcp,
+            loaded_agents_md,
+            AgentsMdFreshness::CachedFallback,
+        )
+    }
+
+    pub(crate) fn new_with_agents_md_freshness(
+        turn: Arc<TurnContext>,
+        environments: TurnEnvironmentSnapshot,
+        selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,
+        mcp: Arc<McpRuntimeSnapshot>,
+        loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
+        agents_md_freshness: AgentsMdFreshness,
     ) -> Self {
         Self {
             turn,
@@ -42,6 +64,7 @@ impl StepContext {
             mcp_tool_snapshot: OnceCell::new(),
             tool_router: OnceLock::new(),
             loaded_agents_md,
+            agents_md_freshness,
         }
     }
 

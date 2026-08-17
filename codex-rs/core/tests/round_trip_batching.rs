@@ -278,6 +278,8 @@ fn orchestrator_prompt_preserves_only_substantive_model_boundaries() {
     for required_guidance in [
         "request them together",
         "default to available parallel tool",
+        "prefer one well-designed `functions.exec` packet",
+        "Run independent nested calls with",
         "validation commands and read-only Git inspection",
         "default Clippy and dead-code validation to the changed packages",
         "covers exactly the same packages, targets, features, toolchain",

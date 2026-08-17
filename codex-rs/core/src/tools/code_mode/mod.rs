@@ -5,7 +5,9 @@ mod response_adapter;
 mod wait_handler;
 pub(crate) mod wait_spec;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -26,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::function_tool::FunctionCallError;
 use crate::original_image_detail::can_request_original_image_detail;
 use crate::original_image_detail::sanitize_original_image_detail as sanitize_image_detail_items;
+use crate::session::reasoning_governor::CodeModeToolResult;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -69,8 +72,32 @@ pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
+    packet_admission: Mutex<CodeModePacketAdmission>,
     shutting_down: AtomicBool,
 }
+
+#[derive(Default)]
+struct CodeModePacketAdmission {
+    cells: HashMap<String, CodeModePacketMetrics>,
+    consecutive_tiny_packets_by_turn: HashMap<String, u8>,
+}
+
+#[derive(Default)]
+struct CodeModePacketMetrics {
+    nested_call_count: usize,
+    batchable_observation_count: usize,
+    result_bytes: usize,
+}
+
+struct CodeModePacketReceipt {
+    nested_call_count: usize,
+    batchable_observation_count: usize,
+    result_bytes: usize,
+    advisory: Option<&'static str>,
+}
+
+const TINY_PACKET_RESULT_BYTES: usize = 1_024;
+const TINY_PACKET_ADVISORY: &str = "Two consecutive small read-only exec packets were observed. If future tool calls are independent, batch them with Promise.all in one exec packet.";
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
@@ -79,6 +106,7 @@ impl CodeModeService {
             session: OnceCell::new(),
             session_provider,
             dispatch_broker,
+            packet_admission: Mutex::new(CodeModePacketAdmission::default()),
             shutting_down: AtomicBool::new(false),
         }
     }
@@ -135,6 +163,51 @@ impl CodeModeService {
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
+    }
+
+    fn record_packet_call(
+        &self,
+        cell_id: &CellId,
+        batchable_observation: bool,
+        result_bytes: usize,
+    ) {
+        let mut admission = self
+            .packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let metrics = admission.cells.entry(cell_id.to_string()).or_default();
+        metrics.nested_call_count = metrics.nested_call_count.saturating_add(1);
+        metrics.batchable_observation_count = metrics
+            .batchable_observation_count
+            .saturating_add(usize::from(batchable_observation));
+        metrics.result_bytes = metrics.result_bytes.saturating_add(result_bytes);
+    }
+
+    fn finish_packet(&self, cell_id: &str, turn_id: &str) -> CodeModePacketReceipt {
+        let mut admission = self
+            .packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let metrics = admission.cells.remove(cell_id).unwrap_or_default();
+        let tiny_read_only_packet = metrics.nested_call_count == 1
+            && metrics.batchable_observation_count == 1
+            && metrics.result_bytes <= TINY_PACKET_RESULT_BYTES;
+        let consecutive = admission
+            .consecutive_tiny_packets_by_turn
+            .entry(turn_id.to_string())
+            .or_default();
+        if tiny_read_only_packet {
+            *consecutive = consecutive.saturating_add(1);
+        } else {
+            *consecutive = 0;
+        }
+        let advisory = (*consecutive == 2).then_some(TINY_PACKET_ADVISORY);
+        CodeModePacketReceipt {
+            nested_call_count: metrics.nested_call_count,
+            batchable_observation_count: metrics.batchable_observation_count,
+            result_bytes: metrics.result_bytes,
+            advisory,
+        }
     }
 
     pub(crate) fn record_owner_drained_continuation(
@@ -223,13 +296,42 @@ pub(super) async fn handle_runtime_response(
         .min(TruncationPolicy::from(exec.turn.model_info.truncation_policy).token_budget());
     let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
-    Ok(format_runtime_response(
+    let cell_id = runtime_response_cell_id(&response);
+    let packet = exec
+        .session
+        .services
+        .code_mode_service
+        .finish_packet(cell_id, exec.turn.sub_id.as_str());
+    tracing::info!(
+        target: "codex.code_mode.packet",
+        cell_id,
+        nested_call_count = packet.nested_call_count,
+        batchable_observation_count = packet.batchable_observation_count,
+        result_bytes = packet.result_bytes,
+        low_density_advisory = packet.advisory.is_some(),
+        "code-mode packet admission receipt"
+    );
+    let mut output = format_runtime_response(
         response,
         max_output_tokens,
         hard_limit,
         original_image_detail_supported,
         started_at,
-    ))
+    );
+    if let Some(advisory) = packet.advisory {
+        output.body.push(FunctionCallOutputContentItem::InputText {
+            text: advisory.to_string(),
+        });
+    }
+    Ok(output)
+}
+
+fn runtime_response_cell_id(response: &RuntimeResponse) -> &str {
+    match response {
+        RuntimeResponse::Yielded { cell_id, .. }
+        | RuntimeResponse::Terminated { cell_id, .. }
+        | RuntimeResponse::Result { cell_id, .. } => cell_id.as_str(),
+    }
 }
 
 fn format_runtime_response(
@@ -278,6 +380,10 @@ fn format_runtime_response(
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
     let mut content_items =
         truncate_code_mode_result(content_items, max_output_tokens, outcome, hard_limit);
+    let semantic_evidence = serde_json::json!({
+        "status": &script_status,
+        "content_items": &content_items,
+    });
     prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
     let typed_outcome = match outcome {
         OutputOutcome::Success => codex_tools::ToolOutputOutcome::Success,
@@ -285,8 +391,14 @@ fn format_runtime_response(
         OutputOutcome::TimedOut => codex_tools::ToolOutputOutcome::TimedOut,
         OutputOutcome::Skipped => codex_tools::ToolOutputOutcome::Skipped,
     };
+    let sampling_request_signal = if success {
+        crate::tools::context::semantic_evidence_sampling_signal(semantic_evidence)
+    } else {
+        crate::tools::context::semantic_failure_sampling_signal(semantic_evidence)
+    };
     FunctionToolOutput::from_content(content_items, Some(success))
         .with_outcome(typed_outcome)
+        .with_sampling_request_signal(sampling_request_signal)
         .with_deterministic_continuation_owner_key(continuation_owner_key)
 }
 
@@ -378,6 +490,7 @@ async fn call_nested_tool(
         Ok(payload) => payload,
         Err(error) => {
             tool_runtime.record_code_mode_failure(
+                cell_id.as_str(),
                 &tool_name,
                 None,
                 nested_failure_fingerprint(&tool_name, &error),
@@ -406,6 +519,7 @@ async fn call_nested_tool(
         Ok(result) => result,
         Err(error) => {
             tool_runtime.record_code_mode_failure(
+                cell_id.as_str(),
                 &tool_name,
                 Some(&payload),
                 nested_failure_fingerprint(&tool_name, &error.to_string()),
@@ -427,16 +541,73 @@ async fn call_nested_tool(
             .record_owner_drained_continuation(&cell_id, continuation);
     }
     let result_value = result.code_mode_result();
+    exec.session.services.code_mode_service.record_packet_call(
+        &cell_id,
+        is_batchable_observation(&tool_name, &payload),
+        serde_json::to_vec(&result_value).map_or(0, |bytes| bytes.len()),
+    );
     tool_runtime.record_code_mode_result(
-        &tool_name,
-        &payload,
-        outcome_context,
-        signal.as_ref(),
-        result_value.clone(),
-        canonical_artifact_required,
+        CodeModeToolResult {
+            cell_id: cell_id.as_str(),
+            tool_name: &tool_name,
+            payload: &payload,
+            source_dependencies: None,
+            outcome_context,
+            signal: signal.as_ref(),
+            result: result_value.clone(),
+            canonical_artifact_required,
+        },
         &receipts,
     );
     Ok(result_value)
+}
+
+fn is_batchable_observation(tool_name: &ToolName, payload: &ToolPayload) -> bool {
+    if tool_name.namespace.is_none()
+        && matches!(tool_name.name.as_str(), "read_tool_output" | "tool_search")
+    {
+        return true;
+    }
+    if tool_name.namespace.is_some()
+        || !matches!(
+            tool_name.name.as_str(),
+            "exec_command" | "shell_command" | "unified_exec"
+        )
+    {
+        return false;
+    }
+    let ToolPayload::Function { arguments } = payload else {
+        return false;
+    };
+    let Ok(arguments) = serde_json::from_str::<JsonValue>(arguments) else {
+        return false;
+    };
+    if arguments.get("kind").and_then(JsonValue::as_str) != Some("argv") {
+        return false;
+    }
+    let program = arguments
+        .get("program")
+        .and_then(JsonValue::as_str)
+        .and_then(|program| program.rsplit(['/', '\\']).next())
+        .unwrap_or_default()
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    if program == "rg" {
+        return true;
+    }
+    if program != "git" {
+        return false;
+    }
+    arguments
+        .get("args")
+        .and_then(JsonValue::as_array)
+        .and_then(|args| args.iter().find_map(JsonValue::as_str))
+        .is_some_and(|subcommand| {
+            matches!(
+                subcommand,
+                "status" | "diff" | "show" | "log" | "rev-parse" | "ls-files" | "grep"
+            )
+        })
 }
 
 fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
@@ -541,9 +712,11 @@ mod tests {
     use super::CodeModeService;
     use super::OutputOutcome;
     use super::build_nested_tool_payload;
+    use super::is_batchable_observation;
     use super::nested_failure_fingerprint;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
+    use codex_code_mode::CellId;
     use codex_code_mode::CodeModeToolKind;
     use codex_code_mode::ExecuteRequest;
     use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
@@ -551,6 +724,64 @@ mod tests {
     use codex_protocol::models::SearchToolCallParams;
     use codex_tools::ToolName;
     use serde_json::json;
+
+    fn test_service() -> CodeModeService {
+        CodeModeService::new(Arc::new(ProcessOwnedCodeModeSessionProvider::default()))
+    }
+
+    #[test]
+    fn repeated_tiny_read_only_packets_produce_one_runtime_advisory() {
+        let service = test_service();
+        let cell = CellId::new("cell".to_string());
+
+        service.record_packet_call(&cell, true, 128);
+        assert!(service.finish_packet("cell", "turn").advisory.is_none());
+        service.record_packet_call(&cell, true, 128);
+        assert!(service.finish_packet("cell", "turn").advisory.is_some());
+        service.record_packet_call(&cell, true, 128);
+        assert!(service.finish_packet("cell", "turn").advisory.is_none());
+
+        for _ in 0..6 {
+            service.record_packet_call(&cell, true, 128);
+        }
+        let batched = service.finish_packet("cell", "turn");
+        assert_eq!(batched.nested_call_count, 6);
+        assert!(batched.advisory.is_none());
+    }
+
+    #[test]
+    fn packet_admission_only_classifies_known_read_only_argv_calls() {
+        let rg = ToolPayload::Function {
+            arguments: json!({"kind": "argv", "program": "rg", "args": ["needle"]}).to_string(),
+        };
+        let git_status = ToolPayload::Function {
+            arguments: json!({"kind": "argv", "program": "git", "args": ["status", "--short"]})
+                .to_string(),
+        };
+        let git_commit = ToolPayload::Function {
+            arguments: json!({"kind": "argv", "program": "git", "args": ["commit"]}).to_string(),
+        };
+        let shell_script = ToolPayload::Function {
+            arguments: json!({"kind": "script", "cmd": "rg needle"}).to_string(),
+        };
+
+        assert!(is_batchable_observation(
+            &ToolName::plain("exec_command"),
+            &rg
+        ));
+        assert!(is_batchable_observation(
+            &ToolName::plain("exec_command"),
+            &git_status
+        ));
+        assert!(!is_batchable_observation(
+            &ToolName::plain("exec_command"),
+            &git_commit
+        ));
+        assert!(!is_batchable_observation(
+            &ToolName::plain("exec_command"),
+            &shell_script
+        ));
+    }
 
     #[test]
     fn build_nested_tool_payload_uses_function_kind() {

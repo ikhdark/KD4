@@ -24,6 +24,7 @@ pub use context::TurnContextContributionInput;
 pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;
 pub use prompt::PromptFragment;
+pub use prompt::PromptFragmentKind;
 pub use prompt::PromptSlot;
 pub use thread_lifecycle::ThreadIdleInput;
 pub use thread_lifecycle::ThreadResumeInput;

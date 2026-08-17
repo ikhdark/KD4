@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_6_prompt_preflights_source_read_paths() {
+    fn gpt_5_6_prompt_reuses_snapshot_scoped_negative_results() {
         let response = crate::bundled_models_response().expect("bundled models should parse");
 
         for slug in GPT_5_6_SLUGS {
@@ -123,16 +123,17 @@ mod tests {
                 .base_instructions;
 
             for rule in [
-                "Before grouped or batch source reads",
+                "Before reading or searching candidate paths",
                 "rg --files",
                 "Repo Atlas",
                 "repository source map",
-                "task-local negative-path cache",
-                "workspace snapshot changes",
+                "task-local negative-result cache",
+                "missing files, symbols, configuration, and tests",
+                "workspace snapshot",
             ] {
                 assert!(
                     prompt.contains(rule),
-                    "{slug} should include source-read preflight rule {rule:?}"
+                    "{slug} should include negative-result reuse rule {rule:?}"
                 );
             }
         }

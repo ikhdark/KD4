@@ -1,5 +1,6 @@
 use super::PreviousSectionState;
 use super::WorldStateSection;
+use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
 use crate::context::ContextualUserFragment;
 use crate::context::UserInstructions;
@@ -15,29 +16,55 @@ const REMOVAL_NOTICE: &str = "The previously provided AGENTS.md instructions no 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AgentsMdState {
     instructions: Option<UserInstructions>,
+    freshness: AgentsMdFreshness,
 }
 
-/// Persisted model-visible AGENTS.md state, without filesystem provenance.
+/// Persisted model-visible AGENTS.md state and the freshness of its filesystem observation.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct AgentsMdSnapshot {
     directory: Option<String>,
     text: Option<String>,
+    #[serde(default)]
+    freshness: AgentsMdFreshness,
 }
 
 impl AgentsMdState {
     #[cfg(test)]
     pub(crate) fn new(loaded: Option<&LoadedAgentsMd>) -> Self {
-        Self {
-            instructions: loaded.map(LoadedAgentsMd::contextual_user_fragment),
-        }
+        Self::from_instructions(
+            loaded.map(LoadedAgentsMd::contextual_user_fragment),
+            AgentsMdFreshness::Refreshed,
+        )
     }
 
-    pub(crate) fn new_cached(loaded: Option<&LoadedAgentsMd>, active_cwd: &PathUri) -> Self {
-        Self {
-            instructions: loaded.map(|loaded| {
+    pub(crate) fn new_cached(
+        loaded: Option<&LoadedAgentsMd>,
+        active_cwd: &PathUri,
+        freshness: AgentsMdFreshness,
+    ) -> Self {
+        Self::from_instructions(
+            loaded.map(|loaded| {
                 let rendered = loaded.stable_context_bundle(active_cwd).rendered;
                 loaded.contextual_user_fragment_with_text(rendered.to_string())
             }),
+            freshness,
+        )
+    }
+
+    fn from_instructions(
+        instructions: Option<UserInstructions>,
+        freshness: AgentsMdFreshness,
+    ) -> Self {
+        Self {
+            instructions: instructions.map(|mut instructions| {
+                instructions.text = format!(
+                    "{}\n\n{}",
+                    freshness.model_visible_description(),
+                    instructions.text
+                );
+                instructions
+            }),
+            freshness,
         }
     }
 }
@@ -51,13 +78,21 @@ impl WorldStateSection for AgentsMdState {
             Some(instructions) => AgentsMdSnapshot {
                 directory: instructions.directory.clone(),
                 text: Some(instructions.text.clone()),
+                freshness: self.freshness,
             },
-            None => AgentsMdSnapshot::default(),
+            None => AgentsMdSnapshot {
+                freshness: self.freshness,
+                ..AgentsMdSnapshot::default()
+            },
         }
     }
 
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "user" && UserInstructions::matches_text(text)
+    }
+
+    fn truncate_when_oversized() -> bool {
+        true
     }
 
     fn render_diff(
@@ -82,7 +117,10 @@ impl WorldStateSection for AgentsMdState {
             (Some(instructions), false) => instructions.clone(),
             (None, true) => UserInstructions {
                 directory: None,
-                text: REMOVAL_NOTICE.to_string(),
+                text: format!(
+                    "{}\n\n{REMOVAL_NOTICE}",
+                    self.freshness.model_visible_description()
+                ),
             },
             (None, false) => return None,
         };

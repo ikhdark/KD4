@@ -1,5 +1,6 @@
 use super::*;
 use crate::session::tests::build_world_state_from_turn_context;
+use codex_context_fragments::ContextualUserFragment;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
 use codex_extension_api::WorldStateSectionContribution;
@@ -84,6 +85,18 @@ fn user_message(text: &str) -> ResponseItem {
     }
 }
 
+fn agent_message(text: &str) -> ResponseItem {
+    ResponseItem::AgentMessage {
+        id: None,
+        author: "worker".to_string(),
+        recipient: "root".to_string(),
+        content: vec![AgentMessageInputContent::InputText {
+            text: text.to_string(),
+        }],
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
 fn compacted_user_message(text: &str) -> CompactedUserMessage {
     CompactedUserMessage {
         content: vec![UserInput::Text {
@@ -152,6 +165,30 @@ fn collect_user_messages_extracts_user_text_only() {
     let collected = collect_user_messages(&items);
 
     assert_eq!(vec![compacted_user_message("first")], collected);
+}
+
+#[test]
+fn collect_unresolved_user_messages_keeps_only_tail_after_model_output() {
+    let items = vec![
+        user_message("consumed request"),
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "completed response".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        user_message("unresolved exact constraint"),
+    ];
+
+    let collected = collect_unresolved_user_messages(&items);
+
+    assert_eq!(
+        collected,
+        vec![compacted_user_message("unresolved exact constraint")]
+    );
 }
 
 #[test]
@@ -241,6 +278,15 @@ fn compacted_history_preserves_mixed_and_image_only_user_requirements() {
 #[test]
 fn compaction_strips_tagged_startup_entries_but_retains_untagged_legacy_text() {
     let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: crate::context::TaskModelGuidance.render(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -381,10 +427,158 @@ fn incremental_compaction_preserves_the_previous_summary_prefix() {
     let summary = bounded_task_state_summary(Some(&previous), "new unresolved item");
 
     assert!(summary.starts_with(&previous));
-    assert_eq!(
-        summary,
-        format!("{previous}\n\nIncremental update:\nnew unresolved item")
+    assert_eq!(summary, format!("{previous}\n\nnew unresolved item"));
+}
+
+#[test]
+fn semantic_summary_truncation_preserves_conversation_state() {
+    let intent = "INTENT-SENTINEL";
+    let unresolved = "UNRESOLVED-SENTINEL";
+    let generated = format!(
+        "{GOAL_HEADING}\n{intent}\n{}\n\n{CURRENT_STATE_HEADING}\nworking\n\n{COMPLETED_WORK_HEADING}\ndone\n\n{UNRESOLVED_WORK_HEADING}\n{unresolved}\n{}\n\n{EVIDENCE_HEADING}\nverified\n\n{NEXT_ACTION_HEADING}\ncontinue",
+        "current detail ".repeat(2_000),
+        "hypothesis detail ".repeat(2_000),
     );
+
+    let summary = bounded_task_state_summary(None, &generated);
+
+    assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    assert!(summary.contains(intent));
+    assert!(summary.contains(unresolved));
+}
+
+#[test]
+fn semantic_summary_truncation_prefers_newest_updates() {
+    let previous = format!(
+        "{SUMMARY_PREFIX}\n{CURRENT_STATE_HEADING}\n{}",
+        "obsolete active state ".repeat(8_000)
+    );
+    let newest = format!(
+        "{CURRENT_STATE_HEADING}\nLATEST-ACTIVE-SENTINEL\n{}",
+        "current detail ".repeat(300)
+    );
+
+    let summary = bounded_task_state_summary(Some(&previous), &newest);
+
+    assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    assert!(summary.contains("LATEST-ACTIVE-SENTINEL"));
+}
+
+#[test]
+fn unstructured_incremental_summary_preserves_the_newest_update() {
+    let previous = format!(
+        "{SUMMARY_PREFIX}\n{CURRENT_STATE_HEADING}\n{}",
+        "obsolete state ".repeat(8_000)
+    );
+
+    let summary = bounded_task_state_summary(
+        Some(&previous),
+        "LATEST-UNSTRUCTURED-SENTINEL unresolved constraint",
+    );
+
+    assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    assert!(summary.contains("LATEST-UNSTRUCTURED-SENTINEL"));
+}
+
+#[test]
+fn inline_heading_mentions_do_not_trigger_structured_summary_budgeting() {
+    let summary = format!(
+        "The phrase `{CURRENT_STATE_HEADING}` is documentation, not a section. {} END-SENTINEL",
+        "detail ".repeat(1_000)
+    );
+
+    let truncated = truncate_compaction_summary(&summary, COMPACT_TASK_STATE_MAX_TOKENS);
+
+    assert!(truncated.contains("END-SENTINEL"));
+    assert!(approx_token_count(&truncated) > 300);
+}
+
+#[test]
+fn generated_compaction_requires_a_complete_nonempty_checkpoint() {
+    let complete = format!(
+        "{GOAL_HEADING}\nfinish recovery\n\n{CURRENT_STATE_HEADING}\nimplementation present\n\n{COMPLETED_WORK_HEADING}\nproducer updated\n\n{UNRESOLVED_WORK_HEADING}\nkeep ambiguity\n\n{EVIDENCE_HEADING}\nfocused evidence\n\n{NEXT_ACTION_HEADING}\nrun focused proof"
+    );
+    assert!(validate_generated_compaction_summary(None, &complete).is_ok());
+
+    let incomplete = format!(
+        "{GOAL_HEADING}\nfinish recovery\n\n{CURRENT_STATE_HEADING}\nimplementation present\n\n{COMPLETED_WORK_HEADING}\nproducer updated\n\n{UNRESOLVED_WORK_HEADING}\nkeep ambiguity\n\n{EVIDENCE_HEADING}\nfocused evidence\n\n{NEXT_ACTION_HEADING}\n"
+    );
+    assert!(validate_generated_compaction_summary(None, &incomplete).is_err());
+    assert!(validate_generated_compaction_summary(Some(&complete), "free-form update").is_err());
+    assert!(
+        validate_generated_compaction_summary(
+            Some(&complete),
+            &format!("{UNRESOLVED_WORK_HEADING}\nnew unresolved item")
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn unresolved_agent_messages_survive_compaction_as_native_items() {
+    let unresolved_agent = agent_message("worker evidence that root has not consumed");
+    let items = vec![
+        user_message("consumed request"),
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "completed response".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        user_message("unresolved request"),
+        unresolved_agent.clone(),
+    ];
+
+    assert_eq!(
+        collect_unresolved_agent_messages(&items),
+        vec![unresolved_agent.clone()]
+    );
+    let (history, _) = build_unresolved_user_history(&items);
+    assert_eq!(
+        history,
+        vec![user_message("unresolved request"), unresolved_agent]
+    );
+}
+
+#[test]
+fn unresolved_user_and_agent_messages_keep_their_original_order() {
+    let unresolved_agent = agent_message("worker result awaiting root review");
+    let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "previous model output".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        unresolved_agent.clone(),
+        user_message("newer user constraint"),
+    ];
+
+    let (history, _) = build_unresolved_user_history(&items);
+
+    assert_eq!(
+        history,
+        vec![unresolved_agent, user_message("newer user constraint")]
+    );
+}
+
+#[test]
+fn newest_section_updates_include_separator_cost_in_their_budget() {
+    let updates = (0..200)
+        .map(|index| vec![format!("update-{index}")])
+        .collect::<Vec<_>>();
+
+    let retained = retain_newest_section_updates(&updates, 32);
+
+    assert!(approx_token_count(&retained) <= 32);
+    assert!(retained.contains("update-199"));
+    assert!(!retained.lines().any(|line| line == "update-0"));
 }
 
 #[test]

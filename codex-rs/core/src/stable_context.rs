@@ -45,6 +45,7 @@ pub(crate) enum StableContextKind {
     RecommendedPlugins,
     Environment,
     EnvironmentPermissions,
+    Memory,
     ModelSwitch,
     Personality,
     Realtime,
@@ -71,6 +72,7 @@ impl StableContextKind {
             Self::RecommendedPlugins => "recommended_plugins",
             Self::Environment => "environment",
             Self::EnvironmentPermissions => "environment_permissions",
+            Self::Memory => "memory",
             Self::ModelSwitch => "model_switch",
             Self::Personality => "personality",
             Self::Realtime => "realtime",
@@ -301,6 +303,7 @@ enum StableContextSlot {
     RecommendedPlugins,
     Environment,
     Permissions,
+    Memory,
     ModelSwitch,
     Personality,
     Realtime,
@@ -322,6 +325,7 @@ impl StableContextSlot {
             Self::RecommendedPlugins => StableContextKind::RecommendedPlugins,
             Self::Environment => StableContextKind::Environment,
             Self::Permissions => StableContextKind::EnvironmentPermissions,
+            Self::Memory => StableContextKind::Memory,
             Self::ModelSwitch => StableContextKind::ModelSwitch,
             Self::Personality => StableContextKind::Personality,
             Self::Realtime => StableContextKind::Realtime,
@@ -343,6 +347,7 @@ impl StableContextSlot {
             Self::RecommendedPlugins => "recommended_plugins",
             Self::Environment => "environment",
             Self::Permissions => "environment_permissions",
+            Self::Memory => "memory",
             Self::ModelSwitch => "model_switch",
             Self::Personality => "personality",
             Self::Realtime => "realtime",
@@ -361,17 +366,18 @@ impl StableContextSlot {
             Self::RootCoordinator => 2,
             Self::MultiAgent => 3,
             Self::Permissions => 4,
-            Self::SkillUsage => 5,
-            Self::SkillCatalog => 6,
-            Self::Apps => 7,
-            Self::Plugins => 8,
-            Self::Personality => 9,
-            Self::SelectedSkill => 10,
-            Self::AppContext => 11,
-            Self::ModelSwitch => 12,
-            Self::Realtime => 13,
-            Self::Environment => 14,
-            Self::RecommendedPlugins => 15,
+            Self::Memory => 5,
+            Self::SkillUsage => 6,
+            Self::SkillCatalog => 7,
+            Self::Apps => 8,
+            Self::Plugins => 9,
+            Self::Personality => 10,
+            Self::SelectedSkill => 11,
+            Self::AppContext => 12,
+            Self::ModelSwitch => 13,
+            Self::Realtime => 14,
+            Self::Environment => 15,
+            Self::RecommendedPlugins => 16,
         }
     }
 
@@ -494,6 +500,12 @@ fn project_items(
         .get(&StableContextSlot::Repository)
         .and_then(|index| occurrences.get(*index))
         .is_some_and(|occurrence| occurrence.text.contains(REPOSITORY_REMOVAL_NOTICE));
+    let recommended_plugins_current = latest_by_slot
+        .get(&StableContextSlot::RecommendedPlugins)
+        .and_then(|index| occurrences.get(*index))
+        .is_some_and(|occurrence| {
+            occurrence_matches_latest_user_turn(occurrence, latest_real_user)
+        });
 
     let mut keep = HashSet::<(usize, usize)>::new();
     let mut replacement_catalog = HashMap::<(usize, usize), String>::new();
@@ -504,6 +516,7 @@ fn project_items(
             StableContextSlot::Collaboration => !collaboration_removed,
             StableContextSlot::SkillUsage => !selected_skills_active,
             StableContextSlot::SkillCatalog => true,
+            StableContextSlot::RecommendedPlugins => recommended_plugins_current,
             _ => true,
         };
         if should_keep {
@@ -626,7 +639,8 @@ fn project_items(
             .any(|candidate| candidate.text != occurrence.text);
         let removed = (slot == StableContextSlot::Repository && repository_removed)
             || (slot == StableContextSlot::Collaboration && collaboration_removed);
-        let gated = matches!(slot, StableContextSlot::SkillUsage) && selected_skills_active;
+        let gated = (matches!(slot, StableContextSlot::SkillUsage) && selected_skills_active)
+            || (slot == StableContextSlot::RecommendedPlugins && !recommended_plugins_current);
         let text = if slot == StableContextSlot::SkillCatalog && selected_skills_active {
             compact_skill_catalog_reference(&occurrence.text)
         } else {
@@ -694,6 +708,20 @@ fn current_selected_skill_indexes(
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+fn occurrence_matches_latest_user_turn(
+    occurrence: &Occurrence,
+    latest_real_user: Option<&(usize, Option<String>)>,
+) -> bool {
+    let Some((_, latest_turn_id)) = latest_real_user else {
+        return false;
+    };
+    match latest_turn_id {
+        Some(turn_id) => occurrence.turn_id.as_ref() == Some(turn_id),
+        // Legacy histories without turn metadata cannot establish expiry safely.
+        None => true,
+    }
 }
 
 fn analyze_unprojected(
@@ -769,6 +797,11 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
             StableContextSlot::Permissions,
         ),
         (
+            "<memory_context>",
+            "</memory_context>",
+            StableContextSlot::Memory,
+        ),
+        (
             MULTI_AGENT_MODE_OPEN_TAG,
             "</multi_agent_mode>",
             StableContextSlot::MultiAgent,
@@ -811,6 +844,7 @@ fn contains_known_open_marker(text: &str) -> bool {
         "<app-context>",
         PLUGINS_INSTRUCTIONS_OPEN_TAG,
         "<permissions instructions>",
+        "<memory_context>",
         MULTI_AGENT_MODE_OPEN_TAG,
         "<model_switch>",
         "<personality_spec>",

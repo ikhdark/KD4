@@ -23,7 +23,15 @@ use tokio_util::sync::CancellationToken;
 #[test]
 fn plan_output_always_signals_mutation_obligation_state() {
     let output = PlanToolOutput {
+        current_plan: UpdatePlanArgs {
+            explanation: None,
+            plan: Vec::new(),
+        },
         normalized_plan: None,
+        effect: PlanUpdateEffect::NoOp,
+        normalization_reason: Some(
+            "request matched the authoritative plan; no plan state changed".to_string(),
+        ),
         governor_plan: None,
         unfinished_mutation_obligation: None,
         validation_results: Vec::new(),
@@ -32,6 +40,8 @@ fn plan_output_always_signals_mutation_obligation_state() {
         .sampling_request_signal()
         .expect("successful status-only and no-op plan updates must emit obligation state");
     assert_eq!(signal["kind"], "plan_update");
+    assert_eq!(signal["effect"], "no_op");
+    assert_eq!(signal["no_progress"], true);
     assert!(signal["unfinished_mutation_obligation"].is_null());
 }
 
@@ -136,7 +146,15 @@ async fn invoke_normalized_plan_update(
 #[test]
 fn unchanged_plan_output_remains_compact() {
     let output = PlanToolOutput {
+        current_plan: UpdatePlanArgs {
+            explanation: None,
+            plan: Vec::new(),
+        },
         normalized_plan: None,
+        effect: PlanUpdateEffect::NoOp,
+        normalization_reason: Some(
+            "request matched the authoritative plan; no plan state changed".to_string(),
+        ),
         governor_plan: Some(UpdatePlanArgs {
             explanation: None,
             plan: Vec::new(),
@@ -154,11 +172,23 @@ fn unchanged_plan_output_remains_compact() {
         panic!("plan update should return function output");
     };
 
+    let response = serde_json::from_str::<serde_json::Value>(
+        response
+            .body
+            .to_text()
+            .as_deref()
+            .expect("plan output text"),
+    )
+    .expect("plan output JSON");
+    assert_eq!(response["message"], PLAN_UNCHANGED_MESSAGE);
+    assert_eq!(response["effect"], "no_op");
+    assert_eq!(response["no_progress"], true);
     assert_eq!(
-        response.body.to_text().as_deref(),
-        Some(PLAN_UPDATED_MESSAGE)
+        response["normalization_reason"],
+        "request matched the authoritative plan; no plan state changed"
     );
-    assert_eq!(output.code_mode_result(&payload), serde_json::json!({}));
+    assert_eq!(response["current_plan"]["plan"], serde_json::json!([]));
+    assert_eq!(output.code_mode_result(&payload), response);
 }
 
 #[test]
@@ -182,6 +212,38 @@ fn generated_artifact_schema_requires_repository_relative_paths() {
 }
 
 #[test]
+fn planning_fact_schema_and_parser_require_explicit_provenance() {
+    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    let required = tool
+        .pointer("/parameters/properties/facts/items/required")
+        .and_then(serde_json::Value::as_array)
+        .expect("planning fact required fields");
+    assert!(required.iter().any(|field| field == "provenance"));
+    assert!(required.iter().any(|field| field == "source"));
+    assert!(required.iter().any(|field| field == "depends_on_paths"));
+
+    let without_provenance = serde_json::json!({
+        "facts": [{"id": "owner", "value": "codex-core", "source": "SOURCEMAP.md"}],
+        "plan": []
+    });
+    assert!(parse_update_plan_arguments(&without_provenance.to_string()).is_err());
+
+    let with_provenance = serde_json::json!({
+        "facts": [{
+            "id": "owner",
+            "value": "codex-core",
+            "provenance": "direct_file_read",
+            "source": "SOURCEMAP.md#planning-architecture-runtime",
+            "depends_on_paths": ["SOURCEMAP.md"]
+        }],
+        "plan": []
+    });
+    let parsed =
+        parse_update_plan_arguments(&with_provenance.to_string()).expect("fact with provenance");
+    assert_eq!(parsed.facts[0].provenance, ResultProvenance::DirectFileRead);
+}
+
+#[test]
 fn validation_route_schema_names_the_supported_direct_programs() {
     let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
     let description = tool["description"].as_str().expect("tool description");
@@ -189,10 +251,15 @@ fn validation_route_schema_names_the_supported_direct_programs() {
         .pointer("/parameters/properties/validation_route/properties/leaves/items/properties/argv/description")
         .and_then(serde_json::Value::as_str)
         .expect("validation argv description");
+    let required = tool
+        .pointer("/parameters/properties/validation_route/properties/leaves/items/required")
+        .and_then(serde_json::Value::as_array)
+        .expect("validation leaf required fields");
 
     assert!(description.contains("only direct cargo, just, python, or python3 leaves"));
     assert!(argv_description.contains("cargo, just, python, or python3"));
     assert!(argv_description.contains("formatting or diff checks are not accepted"));
+    assert!(required.iter().any(|field| field == "uncertainty"));
 }
 
 #[test]
@@ -201,8 +268,9 @@ fn plan_description_requires_one_proven_contract_at_a_time() {
     let description = tool["description"].as_str().expect("tool description");
 
     assert!(description.contains("Complete one coherent contract before starting the next"));
-    assert!(description.contains("compile its owner"));
-    assert!(description.contains("at least one test was selected"));
+    assert!(description.contains("cheapest non-overlapping validation leaves"));
+    assert!(description.contains("Do not run a separate compile or check"));
+    assert!(description.contains("selected at least one test"));
 }
 
 #[test]

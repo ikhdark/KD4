@@ -34,6 +34,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnContextItem;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use image::ImageBuffer;
 use image::ImageFormat;
@@ -82,6 +83,106 @@ fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
     // behavior, not on a specific model's token limit.
     h.record_items(items.iter(), TruncationPolicy::Tokens(10_000));
     h
+}
+
+fn update_plan_pair(
+    call_id: &str,
+    arguments: &str,
+    output: serde_json::Value,
+) -> Vec<ResponseItem> {
+    vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "update_plan".to_string(),
+            namespace: None,
+            arguments: arguments.to_string(),
+            call_id: call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text(output.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]
+}
+
+#[test]
+fn plan_history_projection_keeps_only_the_authoritative_current_plan() {
+    let mut items = update_plan_pair(
+        "plan-1",
+        &"old plan detail ".repeat(500),
+        serde_json::json!({
+            "current_plan": {"explanation": null, "plan": [{"step": "old"}]},
+            "validation_results": []
+        }),
+    );
+    items.extend(update_plan_pair(
+        "plan-2",
+        &"current plan detail ".repeat(500),
+        serde_json::json!({
+            "current_plan": {"explanation": null, "plan": [{"step": "current"}]},
+            "normalized_plan": {"explanation": null, "plan": [{"step": "current"}]},
+            "validation_results": [{"outcome": "failure"}]
+        }),
+    ));
+    let prepared = create_history_with_items(items).prepare_for_prompt(&default_input_modalities());
+    let calls = prepared
+        .items()
+        .iter()
+        .filter(
+            |item| matches!(item, ResponseItem::FunctionCall { name, .. } if name == "update_plan"),
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    let ResponseItem::FunctionCall {
+        call_id, arguments, ..
+    } = calls[0]
+    else {
+        unreachable!();
+    };
+    assert_eq!(call_id, "plan-2");
+    assert!(arguments.contains("authoritative current plan"));
+
+    let output = prepared
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if call_id == "plan-2" => output.body.to_text(),
+            _ => None,
+        })
+        .expect("projected plan output");
+    let output: serde_json::Value = serde_json::from_str(&output).expect("projected JSON");
+    assert_eq!(output["current_plan"]["plan"][0]["step"], "current");
+    assert_eq!(output["superseded_updates"], 1);
+    assert!(output.get("normalized_plan").is_none());
+    assert_eq!(output["validation_results"][0]["outcome"], "failure");
+}
+
+#[test]
+fn plan_history_projection_fails_open_for_legacy_outputs() {
+    let mut items = update_plan_pair(
+        "plan-1",
+        "{}",
+        serde_json::json!({"message": "Plan updated"}),
+    );
+    items.extend(update_plan_pair(
+        "plan-2",
+        "{}",
+        serde_json::json!({"message": "Plan updated"}),
+    ));
+    let prepared = create_history_with_items(items).prepare_for_prompt(&default_input_modalities());
+    assert_eq!(
+        prepared
+            .items()
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::FunctionCall { name, .. } if name == "update_plan"))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -1584,6 +1685,7 @@ fn record_items_truncates_function_call_output_content() {
                 content.contains("tokens truncated"),
                 "expected truncation marker, got {content}"
             );
+            assert!(approx_token_count(content) <= policy.token_budget());
         }
         other => panic!("unexpected history item: {other:?}"),
     }
@@ -1619,6 +1721,7 @@ fn record_items_truncates_custom_tool_call_output_content() {
                 output.contains("tokens truncated") || output.contains("bytes truncated"),
                 "expected truncation marker, got {output}"
             );
+            assert!(approx_token_count(output) <= policy.token_budget());
         }
         other => panic!("unexpected history item: {other:?}"),
     }

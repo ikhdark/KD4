@@ -217,6 +217,16 @@ pub struct ModelPromptContextCategoryTelemetry {
     pub unchanged_from_previous_request: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelToolSchemaTelemetry {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub serialized_bytes: u64,
+    pub approx_tokens: u64,
+    pub selected_by_model: bool,
+}
+
 impl ModelAttemptTransport {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -228,6 +238,11 @@ impl ModelAttemptTransport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelAttemptTelemetry {
+    pub turn_id: Option<String>,
+    pub generation_index: Option<u32>,
+    pub generation_purpose: Option<String>,
+    pub generation_disposition: Option<String>,
+    pub relevant_state_fingerprint: Option<String>,
     pub sampling_request_id: String,
     pub attempt_id: String,
     pub retry_index: u32,
@@ -258,6 +273,12 @@ pub struct ModelAttemptTelemetry {
     pub envelope_overhead_bytes: u64,
     pub reconciliation_residual_bytes: i64,
     pub prompt_context_categories: Vec<ModelPromptContextCategoryTelemetry>,
+    pub producer_selected_context_tokens: u64,
+    pub producer_selected_context_density_bps: u32,
+    pub observed_selected_tool_schema_tokens: u64,
+    pub operational_relevance_proxy_tokens: u64,
+    pub operational_relevance_proxy_density_bps: u32,
+    pub tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
     pub full_prompt_estimated_tokens: u64,
     pub fixed_prefix_reuse_eligible: bool,
     pub logical_context_tokens: i64,
@@ -273,6 +294,7 @@ pub struct ModelAttemptTelemetry {
     pub stream_established_us: Option<u64>,
     pub first_provider_event_us: Option<u64>,
     pub first_model_output_us: Option<u64>,
+    pub first_actionable_output_us: Option<u64>,
     pub first_visible_output_us: Option<u64>,
     pub completed_us: u64,
 }
@@ -1146,6 +1168,8 @@ impl SessionTelemetry {
     pub fn model_attempt_completed(&self, record: &ModelAttemptTelemetry) {
         let prompt_context_categories = serde_json::to_string(&record.prompt_context_categories)
             .unwrap_or_else(|_| "[]".to_string());
+        let tool_schema_breakdown = serde_json::to_string(&record.tool_schema_breakdown)
+            .unwrap_or_else(|_| "[]".to_string());
         let prompt_category_estimated_tokens = record
             .prompt_context_categories
             .iter()
@@ -1174,6 +1198,11 @@ impl SessionTelemetry {
                 target: crate::targets::OTEL_LOG_ONLY_TARGET,
                 tracing::Level::INFO,
                 event.name = "codex.model_attempt",
+                turn_id = record.turn_id.as_deref(),
+                generation_index = record.generation_index,
+                generation_purpose = record.generation_purpose.as_deref(),
+                generation_disposition = record.generation_disposition.as_deref(),
+                relevant_state_fingerprint = record.relevant_state_fingerprint.as_deref(),
                 sampling_request_id = %record.sampling_request_id,
                 attempt_id = %record.attempt_id,
                 retry_index = record.retry_index,
@@ -1209,6 +1238,13 @@ impl SessionTelemetry {
                 prompt_token_accounting_basis = "full_logical_prompt",
                 prompt_context_categories = %prompt_context_categories,
                 prompt_category_estimated_tokens = prompt_category_estimated_tokens,
+                relevance_proxy_basis = "producer_selected_context_plus_observed_tool_calls",
+                producer_selected_context_tokens = record.producer_selected_context_tokens,
+                producer_selected_context_density_bps = record.producer_selected_context_density_bps,
+                observed_selected_tool_schema_tokens = record.observed_selected_tool_schema_tokens,
+                operational_relevance_proxy_tokens = record.operational_relevance_proxy_tokens,
+                operational_relevance_proxy_density_bps = record.operational_relevance_proxy_density_bps,
+                tool_schema_breakdown = %tool_schema_breakdown,
                 full_prompt_estimated_tokens = record.full_prompt_estimated_tokens,
                 local_prompt_reconciliation_residual = local_prompt_reconciliation_residual,
                 provider_prompt_reconciliation_residual = provider_prompt_reconciliation_residual,
@@ -1226,6 +1262,7 @@ impl SessionTelemetry {
                 stream_established_us = record.stream_established_us,
                 first_provider_event_us = record.first_provider_event_us,
                 first_model_output_us = record.first_model_output_us,
+                first_actionable_output_us = record.first_actionable_output_us,
                 first_visible_output_us = record.first_visible_output_us,
                 completed_us = record.completed_us,
         );

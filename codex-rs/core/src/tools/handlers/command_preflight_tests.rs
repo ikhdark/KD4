@@ -7,6 +7,270 @@ fn strings(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn classifies_repository_wide_and_owner_scoped_rg() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("codex-core is nested under the repository root");
+    let scoped = root.join("codex-rs/core/src/tools");
+
+    assert_eq!(
+        classify_rg_search_narrowing(&strings(&["rg", "needle", "."]), None, root, root)
+            .expect("classification")
+            .map(|search| search.breadth),
+        Some(RgSearchBreadth::Broad)
+    );
+    assert_eq!(
+        classify_rg_search_narrowing(
+            &strings(&["rg", "needle", "codex-rs/core/src/tools"]),
+            None,
+            root,
+            root,
+        )
+        .expect("classification")
+        .map(|search| search.breadth),
+        Some(RgSearchBreadth::Narrow)
+    );
+    assert_eq!(
+        classify_rg_search_narrowing(&strings(&["rg", "needle"]), None, &scoped, root)
+            .expect("classification")
+            .map(|search| search.breadth),
+        Some(RgSearchBreadth::Narrow)
+    );
+    assert_eq!(
+        classify_rg_search_narrowing(&strings(&["rg", "--files", "."]), None, root, root)
+            .expect("classification")
+            .map(|search| search.breadth),
+        Some(RgSearchBreadth::Broad)
+    );
+    assert_eq!(
+        classify_rg_search_narrowing(&strings(&["rg", "needle", "codex-rs"]), None, root, root,)
+            .expect("classification")
+            .map(|search| search.breadth),
+        Some(RgSearchBreadth::Broad)
+    );
+    assert_eq!(
+        classify_rg_search_narrowing(&strings(&["rg", "needle", "scripts"]), None, root, root,)
+            .expect("classification")
+            .map(|search| search.breadth),
+        Some(RgSearchBreadth::Narrow)
+    );
+    let compound = classify_rg_search_narrowing(
+        &strings(&[
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "rg needle . | Measure-Object",
+        ]),
+        Some(ShellType::PowerShell),
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("compound rg should still be gated");
+    assert_eq!(compound.breadth, RgSearchBreadth::Broad);
+    assert!(!compound.can_record_miss);
+
+    let narrow = classify_rg_search_narrowing(
+        &strings(&["rg", "-n", "needle", "codex-rs/core/src"]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("narrow rg");
+    let broad =
+        classify_rg_search_narrowing(&strings(&["rg", "-n", "needle", "."]), None, root, root)
+            .expect("classification")
+            .expect("broad rg");
+    assert_eq!(narrow.query_identity, broad.query_identity);
+    let equivalent_narrow = classify_rg_search_narrowing(
+        &strings(&["rg", "-n", "needle", "./codex-rs/core/src"]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("equivalent narrow rg");
+    assert_eq!(narrow.search_identity, equivalent_narrow.search_identity);
+    assert_ne!(narrow.search_identity, broad.search_identity);
+
+    let reordered_targets = classify_rg_search_narrowing(
+        &strings(&[
+            "rg",
+            "-n",
+            "needle",
+            "codex-rs/core/src/session",
+            "codex-rs/core/src/tools",
+        ]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("multi-target rg");
+    let equivalent_targets = classify_rg_search_narrowing(
+        &strings(&[
+            "rg",
+            "-n",
+            "needle",
+            "./codex-rs/core/src/tools",
+            "codex-rs/core/src/missing/../session",
+            "codex-rs/core/src/tools",
+        ]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("equivalent multi-target rg");
+    assert_eq!(
+        reordered_targets.search_identity,
+        equivalent_targets.search_identity
+    );
+
+    let first_pattern = classify_rg_search_narrowing(
+        &strings(&["rg", "--files-with-matches", "first", "codex-rs/core/src"]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("first files-with-matches query");
+    let second_pattern = classify_rg_search_narrowing(
+        &strings(&["rg", "--files-with-matches", "second", "codex-rs/core/src"]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("second files-with-matches query");
+    assert_ne!(first_pattern.query_identity, second_pattern.query_identity);
+}
+
+#[test]
+fn classifies_cross_owner_and_outside_repository_targets_as_broad() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("codex-core is nested under the repository root");
+
+    for command in [
+        strings(&["rg", "needle", ".codex", "scripts", "docs", "packages"]),
+        strings(&["rg", "needle", "codex-rs/core", "codex-rs/protocol"]),
+        strings(&["rg", "needle", ".."]),
+    ] {
+        let search = classify_rg_search_narrowing(&command, None, root, root)
+            .expect("classification")
+            .expect("rg search");
+        assert_eq!(search.breadth, RgSearchBreadth::Broad);
+    }
+}
+
+#[test]
+fn records_only_the_immediate_parent_as_the_next_expansion_scope() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("codex-core is nested under the repository root");
+    let narrow = classify_rg_search_narrowing(
+        &strings(&["rg", "needle", "codex-rs/core/src/tools"]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("narrow rg");
+    let parent = classify_rg_search_narrowing(
+        &strings(&["rg", "needle", "codex-rs/core/src"]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("parent rg");
+    let repository =
+        classify_rg_search_narrowing(&strings(&["rg", "needle", "."]), None, root, root)
+            .expect("classification")
+            .expect("repository rg");
+
+    assert_eq!(
+        narrow.parent_scope_identity.as_deref(),
+        Some(parent.scope_identity.as_str())
+    );
+    assert_ne!(
+        narrow.parent_scope_identity.as_deref(),
+        Some(repository.scope_identity.as_str())
+    );
+}
+
+#[test]
+fn fails_closed_for_unparseable_or_non_native_rg_searches() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("codex-core is nested under the repository root");
+    let dynamic_powershell = strings(&[
+        "pwsh",
+        "-NoProfile",
+        "-Command",
+        "$tool = 'rg'; & $tool needle .",
+    ]);
+
+    assert!(
+        classify_rg_search_narrowing(&dynamic_powershell, Some(ShellType::PowerShell), root, root,)
+            .is_err()
+    );
+    assert!(
+        reject_rg_search_without_native_scope(&strings(&["rg", "needle", "src"]), None).is_err()
+    );
+    assert!(
+        reject_rg_search_without_native_scope(&strings(&["git", "status", "--short"]), None)
+            .is_ok()
+    );
+}
+
+#[test]
+fn ignores_rg_metadata_modes_and_option_values_as_search_paths() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("codex-core is nested under the repository root");
+
+    for command in [
+        ["rg", "--help"].as_slice(),
+        ["rg", "--version"].as_slice(),
+        ["rg", "--type-list"].as_slice(),
+        ["rg", "--pcre2-version"].as_slice(),
+        ["rg", "--generate=complete-powershell"].as_slice(),
+    ] {
+        assert_eq!(
+            classify_rg_search_narrowing(&strings(command), None, root, root),
+            Ok(None)
+        );
+    }
+
+    let search = classify_rg_search_narrowing(
+        &strings(&[
+            "rg",
+            "--max-depth",
+            "3",
+            "--type-add",
+            "source:*.rs",
+            "needle",
+            "codex-rs/core/src/tools",
+        ]),
+        None,
+        root,
+        root,
+    )
+    .expect("classification")
+    .expect("rg search with option value");
+    assert_eq!(search.breadth, RgSearchBreadth::Narrow);
+    assert!(search.query_identity.contains("source:*.rs"));
+}
+
+#[test]
 fn repairs_direct_argv_git_status_to_disable_optional_locks() {
     let invocation = CommandInvocation::Argv {
         program: "git".to_string(),

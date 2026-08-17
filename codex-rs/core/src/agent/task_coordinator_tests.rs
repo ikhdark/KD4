@@ -90,20 +90,28 @@ fn bounded_diagnostics_deduplicate_progress_and_root_evidence_hydration() {
     let coordinator = AgentTaskCoordinator::default();
     let telemetry = test_session_telemetry();
     let attempt_id = AttemptId::new();
+    let task_started_at = Utc::now();
+    let progress_created_at = task_started_at + chrono::Duration::milliseconds(250);
 
     assert!(!coordinator.record_first_meaningful_progress_once(
         attempt_id,
         ObservationKind::Starting,
+        &task_started_at,
+        &progress_created_at,
         &telemetry,
     ));
     assert!(coordinator.record_first_meaningful_progress_once(
         attempt_id,
-        ObservationKind::Reading,
+        ObservationKind::ToolCall,
+        &task_started_at,
+        &progress_created_at,
         &telemetry,
     ));
     assert!(!coordinator.record_first_meaningful_progress_once(
         attempt_id,
         ObservationKind::Mutation,
+        &task_started_at,
+        &progress_created_at,
         &telemetry,
     ));
     assert!(coordinator.record_root_receipt_hydration_once(attempt_id, &telemetry));
@@ -121,8 +129,24 @@ fn bounded_diagnostics_deduplicate_progress_and_root_evidence_hydration() {
     assert!(!coordinator.record_first_meaningful_progress_once(
         AttemptId::new(),
         ObservationKind::Validating,
+        &task_started_at,
+        &progress_created_at,
         &telemetry,
     ));
+}
+
+#[test]
+fn task_progress_duration_uses_source_timestamps_and_clamps_clock_skew() {
+    let task_started_at = Utc::now();
+    let progress_created_at = task_started_at + chrono::Duration::milliseconds(250);
+    assert_eq!(
+        task_progress_duration(&task_started_at, &progress_created_at),
+        std::time::Duration::from_millis(250)
+    );
+    assert_eq!(
+        task_progress_duration(&progress_created_at, &task_started_at),
+        std::time::Duration::ZERO
+    );
 }
 
 #[tokio::test]

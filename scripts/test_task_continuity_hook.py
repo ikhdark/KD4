@@ -71,6 +71,7 @@ def normalize_path(value: str | os.PathLike[str]) -> str:
 
 
 def recovery_context(capsule: dict[str, Any]) -> str | None:
+    task_state = capsule.get("task_state") or {}
     if not any(
         capsule.get(name)
         for name in (
@@ -78,8 +79,21 @@ def recovery_context(capsule: dict[str, Any]) -> str | None:
             "last_assistant_result",
             "predecessor_thread_id",
         )
-    ):
+    ) and not any(task_state.get(name) for name in (
+        "goal",
+        "current_state",
+        "completed_work",
+        "unresolved_work",
+        "evidence",
+        "next_action",
+    )):
         return None
+
+    def bounded(value: Any, maximum: int) -> Any:
+        if not isinstance(value, str) or len(value) <= maximum:
+            return value
+        return value[: maximum - 3] + "..."
+
     semantic = {
         "schema_version": int(capsule["schema_version"]),
         "session_id": capsule["session_id"],
@@ -87,12 +101,23 @@ def recovery_context(capsule: dict[str, Any]) -> str | None:
         "predecessor_thread_id": capsule.get("predecessor_thread_id"),
         "working_directory": capsule["working_directory"],
         "task_label": capsule.get("task_label"),
-        "last_user_request": capsule.get("last_user_request"),
-        "last_assistant_result": capsule.get("last_assistant_result"),
+        "last_user_request": bounded(capsule.get("last_user_request"), 900),
+        "last_assistant_result": bounded(capsule.get("last_assistant_result"), 900),
+        "task_state": {
+            name: bounded(task_state.get(name), 600)
+            for name in (
+                "goal",
+                "current_state",
+                "completed_work",
+                "unresolved_work",
+                "evidence",
+                "next_action",
+            )
+        },
         "repository": {
             "root": capsule["repository"].get("root"),
             "revision": capsule["repository"].get("revision"),
-            "dirty_summary": capsule["repository"].get("dirty_summary"),
+            "dirty_summary": bounded(capsule["repository"].get("dirty_summary"), 600),
         },
         "compaction": {
             "phase": capsule["compaction"]["phase"],
@@ -215,6 +240,21 @@ class HookSandbox:
             value["prompt"] = "Continue the continuity test"
         elif event in {"PreCompact", "PostCompact"}:
             value["trigger"] = "manual"
+            if event == "PostCompact":
+                value["compaction_summary"] = (
+                    "## Goal\n"
+                    "Complete recovery continuity.\n\n"
+                    "## Current state\n"
+                    "The hook is consuming the compacted checkpoint.\n\n"
+                    "## Completed work\n"
+                    "The checkpoint producer emitted all required sections.\n\n"
+                    "## Unresolved work\n"
+                    "Run the focused hook validation.\n\n"
+                    "## Evidence\n"
+                    "The summary reached the PostCompact hook.\n\n"
+                    "## Next action\n"
+                    "Run the focused hook validation."
+                )
         elif event == "SessionStart":
             value["source"] = "startup"
         elif event == "Stop":
@@ -962,6 +1002,7 @@ if ($errors.Count -ne 0) {
                 "task_label",
                 "last_user_request",
                 "last_assistant_result",
+                "task_state",
                 "repository",
                 "compaction",
                 "material_digest",
@@ -972,6 +1013,17 @@ if ($errors.Count -ne 0) {
         self.assertLessEqual(len(capsule["last_user_request"]), 4000)
         self.assertLessEqual(len(capsule["last_assistant_result"]), 4000)
         self.assertLessEqual(len(capsule["task_label"]), 80)
+        self.assertEqual(
+            set(capsule["task_state"]),
+            {
+                "goal",
+                "current_state",
+                "completed_work",
+                "unresolved_work",
+                "evidence",
+                "next_action",
+            },
+        )
         self.assertNotIn("abcdefghijklmno", compact_json(capsule))
         self.assertNotIn("hunter2", compact_json(capsule))
         self.assertEqual(len(capsule["material_digest"]), 64)
@@ -1209,6 +1261,83 @@ if ($errors.Count -ne 0) {
             self.sandbox.payload("SessionStart", session_id, source="compact"),
             session_id,
         )
+
+    def test_post_compaction_reconstructs_complete_task_state_chain(self) -> None:
+        session_id = self.sandbox.session_id()
+        self.invoke_empty(
+            self.sandbox.payload(
+                "UserPromptSubmit", session_id, prompt="Fix recovery continuity"
+            )
+        )
+        self.invoke_empty(self.sandbox.payload("PostCompact", session_id))
+
+        capsule = self.sandbox.capsule(session_id)
+        task_state = capsule["task_state"]
+        self.assertEqual(task_state["goal"], "Fix recovery continuity")
+        self.assertEqual(
+            task_state["current_state"],
+            "The hook is consuming the compacted checkpoint.",
+        )
+        self.assertEqual(
+            task_state["completed_work"],
+            "The checkpoint producer emitted all required sections.",
+        )
+        self.assertEqual(
+            task_state["unresolved_work"],
+            "Run the focused hook validation.",
+        )
+        self.assertEqual(
+            task_state["evidence"],
+            "The summary reached the PostCompact hook.",
+        )
+        self.assertEqual(task_state["next_action"], "Run the focused hook validation.")
+
+        result = self.invoke_injection(
+            self.sandbox.payload("SessionStart", session_id, source="compact"),
+            session_id,
+        )
+        for name in (
+            "goal",
+            "current_state",
+            "completed_work",
+            "unresolved_work",
+            "evidence",
+            "next_action",
+        ):
+            self.assertIn(f'\\"{name}\\"', result.stdout)
+
+    def test_new_prompt_and_stop_replace_stale_task_lifecycle_state(self) -> None:
+        session_id = self.sandbox.session_id()
+        self.invoke_empty(self.sandbox.payload("UserPromptSubmit", session_id))
+        self.invoke_empty(self.sandbox.payload("PostCompact", session_id))
+
+        self.invoke_empty(
+            self.sandbox.payload(
+                "UserPromptSubmit", session_id, prompt="Start a distinct task"
+            )
+        )
+        reset = self.sandbox.capsule(session_id)["task_state"]
+        self.assertEqual(reset["goal"], "Start a distinct task")
+        for name in (
+            "current_state",
+            "completed_work",
+            "unresolved_work",
+            "evidence",
+            "next_action",
+        ):
+            self.assertIsNone(reset[name])
+
+        self.invoke_empty(
+            self.sandbox.payload(
+                "Stop", session_id, last_assistant_message="Distinct task complete"
+            )
+        )
+        stopped = self.sandbox.capsule(session_id)["task_state"]
+        self.assertEqual(stopped["current_state"], "Distinct task complete")
+        self.assertEqual(stopped["completed_work"], "Distinct task complete")
+        self.assertIsNone(stopped["unresolved_work"])
+        self.assertEqual(stopped["evidence"], "Distinct task complete")
+        self.assertEqual(stopped["next_action"], "Await the next user request.")
 
     def test_unchanged_stop_preserves_bytes_and_modification_time(self) -> None:
         session_id = self.sandbox.session_id()

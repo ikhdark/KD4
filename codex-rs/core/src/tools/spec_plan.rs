@@ -8,8 +8,6 @@ use crate::tools::effective_tool_mode;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ApplyPatchHandler;
-use crate::tools::handlers::ArchitectureSliceHandler;
-use crate::tools::handlers::CargoTestHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
 use crate::tools::handlers::CurrentTimeHandler;
@@ -19,12 +17,9 @@ use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
-use crate::tools::handlers::LoadSkillHandler;
 use crate::tools::handlers::McpHandler;
-use crate::tools::handlers::OrchestrationLintHandler;
 use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
-use crate::tools::handlers::ReadSourceBatchHandler;
 use crate::tools::handlers::ReadToolOutputHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
@@ -724,11 +719,6 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
         allow_login_shell,
         exec_permission_approvals_enabled,
     };
-    planned_tools.add_with_exposure(
-        CargoTestHandler::new(shell_command_options),
-        ToolExposure::DirectModelOnly,
-    );
-
     match shell_type_for_model_and_features(&turn_context.model_info, features) {
         ConfigShellToolType::UnifiedExec => {
             planned_tools.add(ExecCommandHandler::new(ExecCommandHandlerOptions {
@@ -789,12 +779,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add(ReadToolOutputHandler);
-    planned_tools.add_with_exposure(LoadSkillHandler, ToolExposure::DirectModelOnly);
-    planned_tools.add_with_exposure(OrchestrationLintHandler, ToolExposure::DirectModelOnly);
-    if environment_mode.has_environment() {
-        planned_tools.add_with_exposure(ArchitectureSliceHandler, ToolExposure::DirectModelOnly);
-        planned_tools.add_with_exposure(ReadSourceBatchHandler, ToolExposure::DirectModelOnly);
-    }
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add(PlanHandler);

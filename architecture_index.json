@@ -1,5 +1,5 @@
 {
-  "manifest_sha256": "5afae3040bdfcba31820ededc1b503feffe89839bad8a573b28b435f7c2829c3",
+  "manifest_sha256": "da089a8e146fb1280e962dba32ddf4959cd68ea283d6d04fb228d44f3fd8c982",
   "omitted": {
     "relationships": 0
   },
@@ -273,7 +273,7 @@
         "codex-rs/core/src/task_evidence.rs"
       ],
       "facet_exclusions": {
-        "configuration_and_gates": "Planning tier and closure behavior are runtime state, not a repository or feature configuration gate.",
+        "configuration_and_gates": "Planning tier and validation behavior are runtime state, not a repository or feature configuration gate.",
         "generated_artifacts": "The update_plan schema is constructed at runtime and has no checked-in generated mirror."
       },
       "generated_artifacts": [],
@@ -283,12 +283,12 @@
           "evidence": [
             {
               "path": "codex-rs/core/src/tools/handlers/plan.rs",
-              "symbol": "architecture_slice_receipt"
+              "symbol": "PlanHandler::handle_call"
             }
           ],
-          "id": "complete-source-closure",
+          "id": "durable-plan-update",
           "kind": "semantic",
-          "statement": "Implementation readiness requires an untruncated, bounded architecture slice with every facet established or explicitly not applicable.",
+          "statement": "Committed plan updates reach durable task evidence before the tool response is emitted; cancellation before the commit boundary emits no plan update.",
           "tests": [
             "codex-rs/core/src/tools/handlers/plan_tests.rs"
           ]
@@ -298,10 +298,6 @@
         {
           "path": "codex-rs/core/src/tools/handlers/plan.rs",
           "symbol": "PlanHandler"
-        },
-        {
-          "path": "codex-rs/core/src/tools/handlers/source_tools.rs",
-          "symbol": "ArchitectureSliceHandler"
         }
       ],
       "roots": [
@@ -322,7 +318,7 @@
             "tools::handlers::plan_tests"
           ],
           "cwd": "codex-rs",
-          "id": "planning-closure-focused",
+          "id": "planning-focused",
           "role": "focused_tests"
         }
       ]
@@ -743,7 +739,7 @@
       "evidence": [
         {
           "path": "codex-rs/core/src/tools/handlers/plan_tests.rs",
-          "symbol": "source_closure_requires_complete_architecture_and_resolved_validation"
+          "symbol": "cancellation_after_plan_commit_boundary_waits_for_durable_update"
         }
       ],
       "kind": "validated_by",
@@ -933,7 +929,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "c475d00ac7cf23a2baf75dc9244cfa6cc5636b41",
+  "repository_revision": "20b728aeb08cece0173eae2520627a0128a3f884",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

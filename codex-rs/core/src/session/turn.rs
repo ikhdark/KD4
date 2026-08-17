@@ -22,7 +22,8 @@ use crate::context::ApprovalPromptContext;
 use crate::context::ContextualUserFragment;
 use crate::context::PermissionsInstructions;
 use crate::context::PromptContextCategory;
-use crate::context::SourceClosureReuseContext;
+use crate::context::RecommendedPluginsInstructions;
+use crate::context::TaskModelGuidance;
 use crate::context_manager::ContextManager;
 use crate::context_manager::PreparedPromptInput;
 use crate::feedback_tags;
@@ -121,6 +122,7 @@ use codex_async_utils::OrCancelExt;
 use codex_config::config_toml::AfterAgentPolicy;
 use codex_context_fragments::ModelContextBudget;
 use codex_context_fragments::RenderedContextFragment;
+use codex_core_plugins::PluginLoadOutcome;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_core_skills::injection::PlannedSkillInjections;
@@ -161,6 +163,7 @@ use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
+use codex_tools::DiscoverableTool;
 use codex_tools::ToolName;
 use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_tools::request_user_input_available_modes;
@@ -187,7 +190,6 @@ use tracing::trace_span;
 use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
-const SOURCE_CLOSURE_REUSE_COUNT_METRIC: &str = "codex.source_closure.reuse";
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -219,20 +221,28 @@ fn ordinary_continuation_cause(
     }
 }
 
-pub(crate) fn prepare_sampling_prompt_for_client(
+pub(crate) async fn prepare_sampling_prompt_for_client(
     history: ContextManager,
     turn_context: &TurnContext,
     _client_session: &ModelClientSession,
+    git_workspace: &crate::git_workspace::GitWorkspaceCache,
 ) -> PreparedPromptInput {
+    let workspace_identity = git_workspace
+        .workspace_evidence_identity(turn_context.config.cwd.as_path())
+        .await;
     if turn_context.config.completed_tool_history_projection {
         history.prepare_for_sampling_prompt_with_completed_tool_projection(
             &turn_context.model_info.input_modalities,
             StableContextTarget::Sampling,
+            workspace_identity.as_ref(),
+            git_workspace,
         )
     } else {
-        history.prepare_for_sampling_prompt(
+        history.prepare_for_sampling_prompt_with_workspace_freshness(
             &turn_context.model_info.input_modalities,
             StableContextTarget::Sampling,
+            workspace_identity.as_ref(),
+            git_workspace,
         )
     }
 }
@@ -436,6 +446,8 @@ pub(crate) async fn run_turn(
                     },
                     sampling: SamplingGenerationDisposition::DecisionBearing,
                     relevant_state_fingerprint: request_baselines.relevant_state_fingerprint(),
+                    failure_fingerprint: None,
+                    terminal_completion_only: false,
                 }
             }
         });
@@ -477,7 +489,9 @@ pub(crate) async fn run_turn(
                     history,
                     turn_context.as_ref(),
                     &client_session,
-                );
+                    sess.services.git_workspace.as_ref(),
+                )
+                .await;
                 drop(normalization_guard);
                 prepared
             }
@@ -534,7 +548,14 @@ pub(crate) async fn run_turn(
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
-                let mut needs_follow_up = model_needs_follow_up || has_pending_input;
+                // A proven loop receives one final, tool-free generation. Once
+                // that generation returns, only newly queued user input may
+                // keep the turn alive.
+                let mut needs_follow_up = generation_needs_follow_up(
+                    &generation_request,
+                    model_needs_follow_up,
+                    has_pending_input,
+                );
                 let progress_kinds =
                     request_signals.progress_kinds(&request_baselines, &settled_state);
                 let convergence_decision = if needs_follow_up && !has_pending_input {
@@ -549,6 +570,10 @@ pub(crate) async fn run_turn(
                 let authoritative_wait_terminal_surface = convergence_decision
                     .as_ref()
                     .and_then(authoritative_wait_terminal_surface);
+                let terminal_completion_required =
+                    convergence_decision.as_ref().is_some_and(|decision| {
+                        decision.continuation == ContinuationDisposition::TerminalCompletionRequired
+                    });
                 if authoritative_wait_terminal_surface.is_some() {
                     needs_follow_up = false;
                 }
@@ -561,6 +586,10 @@ pub(crate) async fn run_turn(
                         server_end_turn_false && !tool_result_continuation && !has_pending_input,
                     )
                 });
+                if terminal_completion_required {
+                    next_generation_request = next_generation_request
+                        .map(GenerationRequestDisposition::require_terminal_completion);
+                }
                 if next_generation_request
                     .as_ref()
                     .is_some_and(|request| request.sampling.is_residual_deterministic())
@@ -580,22 +609,6 @@ pub(crate) async fn run_turn(
                     // generation to rediscover an already-proved action.
                     needs_follow_up = false;
                     next_generation_request = None;
-                }
-                if needs_follow_up
-                    && !has_pending_input
-                    && request_signals.reusable_source_closure(&request_baselines, &settled_state)
-                {
-                    turn_context.session_telemetry.counter(
-                        SOURCE_CLOSURE_REUSE_COUNT_METRIC,
-                        /*inc*/ 1,
-                        &[],
-                    );
-                    let reuse_context = ContextualUserFragment::into(SourceClosureReuseContext);
-                    sess.record_conversation_items(
-                        &turn_context,
-                        std::slice::from_ref(&reuse_context),
-                    )
-                    .await;
                 }
                 turn_context.turn_timing_state.record_generation_outcome(
                     progress_kinds.clone(),
@@ -1071,6 +1084,18 @@ fn authoritative_wait_terminal_surface(
     }
 }
 
+fn generation_needs_follow_up(
+    generation_request: &GenerationRequestDisposition,
+    model_needs_follow_up: bool,
+    has_pending_input: bool,
+) -> bool {
+    if generation_request.terminal_completion_only {
+        has_pending_input
+    } else {
+        model_needs_follow_up || has_pending_input
+    }
+}
+
 async fn record_completion_review_partial_reason(sess: &Session, reason: String) {
     let turn_state = {
         let active_turn = sess.active_turn.lock().await;
@@ -1202,6 +1227,107 @@ enum PendingTurnPlanBuild {
     Ready(Box<PendingTurnPlan>),
 }
 
+fn contains_task_term(task: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+
+    task.match_indices(term).any(|(start, matched)| {
+        let end = start + matched.len();
+        let starts_at_boundary = task[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric());
+        let ends_at_boundary = task[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_alphanumeric());
+        starts_at_boundary && ends_at_boundary
+    })
+}
+
+fn task_relevant_recommended_plugins(
+    user_input: &[ContentItem],
+    candidates: Vec<DiscoverableTool>,
+) -> Vec<DiscoverableTool> {
+    let task = user_input
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            ContentItem::InputImage { .. } | ContentItem::OutputText { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if task.is_empty() {
+        return Vec::new();
+    }
+
+    let names_a_plugin_category = ["plugin", "plugins", "integration", "integrations"]
+        .iter()
+        .any(|term| contains_task_term(&task, term));
+    let requests_recommendations = [
+        "add",
+        "available",
+        "connect",
+        "find",
+        "install",
+        "list",
+        "recommend",
+        "show",
+        "suggest",
+        "use",
+        "what",
+        "which",
+    ]
+    .iter()
+    .any(|term| contains_task_term(&task, term));
+    if names_a_plugin_category && requests_recommendations {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            contains_task_term(&task, &candidate.name().to_lowercase())
+                || contains_task_term(&task, &candidate.id().to_lowercase())
+        })
+        .collect()
+}
+
+async fn build_recommended_plugin_items(
+    sess: &Session,
+    turn_context: &TurnContext,
+    loaded_plugins: &PluginLoadOutcome,
+    user_input: &[ContentItem],
+) -> Vec<ResponseItem> {
+    if !tool_suggest_enabled(turn_context) {
+        return Vec::new();
+    }
+
+    let auth = sess.services.auth_manager.auth().await;
+    let plugins_config = turn_context.config.plugins_config_input();
+    let Some(candidates) = sess
+        .services
+        .plugins_manager
+        .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+            plugins_config: &plugins_config,
+            loaded_plugins,
+            auth: auth.as_ref(),
+            disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
+            app_server_client_name: turn_context.app_server_client_name.as_deref(),
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+    let candidates = task_relevant_recommended_plugins(user_input, candidates);
+    RecommendedPluginsInstructions::from_plugins(candidates)
+        .map(ContextualUserFragment::into)
+        .into_iter()
+        .collect()
+}
+
 #[instrument(level = "trace", skip_all)]
 async fn build_pure_pending_turn_plan(
     sess: &Arc<Session>,
@@ -1288,6 +1414,20 @@ async fn build_pure_pending_turn_plan(
     // plugin mentions can make inventory necessary even when apps are disabled.
     let mentioned_plugins =
         collect_explicit_plugin_mentions(&user_input, loaded_plugins.capability_summaries());
+    let recommended_plugin_input = user_input
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(ContentItem::InputText { text: text.clone() }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let recommended_plugin_items = build_recommended_plugin_items(
+        sess,
+        turn_context,
+        &loaded_plugins,
+        &recommended_plugin_input,
+    )
+    .await;
     let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
     let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
         step_context
@@ -1392,6 +1532,8 @@ async fn build_pure_pending_turn_plan(
         ),
         None => skill_items,
     };
+    injection_items.insert(0, ContextualUserFragment::into(TaskModelGuidance));
+    injection_items.extend(recommended_plugin_items);
     injection_items.extend(plugin_items);
     injection_items.extend(extension_injection_items);
 
@@ -1451,19 +1593,6 @@ async fn stabilize_pending_turn_plan(
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
-    if !turn_context
-        .config
-        .features
-        .enabled(Feature::DeferredExecutor)
-    {
-        // Normal turns freeze their environment selection, so refresh project instructions once
-        // at the turn boundary. Fixed-point retries reuse this published snapshot.
-        sess.services
-            .agents_md_manager
-            .refresh(&turn_context.config, &turn_context.environments)
-            .await;
-    }
-
     let mut check_previous_model_compaction = true;
     let mut incoming_precompaction_completed = false;
     loop {
@@ -1825,11 +1954,14 @@ fn estimate_pending_tokens(
         .saturating_add(injection_bytes)
         .saturating_add(context_update_bytes)
         .saturating_add(tool_bytes);
-    let body_growth_bytes = input_bytes.saturating_add(injection_bytes).saturating_add(
-        (!initial_context)
-            .then_some(context_update_bytes)
-            .unwrap_or_default(),
-    );
+    let context_growth_bytes = if initial_context {
+        0
+    } else {
+        context_update_bytes
+    };
+    let body_growth_bytes = input_bytes
+        .saturating_add(injection_bytes)
+        .saturating_add(context_growth_bytes);
     PendingTokenEstimate {
         total_tokens: i64::try_from(total_bytes.div_ceil(4)).unwrap_or(i64::MAX),
         body_growth_tokens: i64::try_from(body_growth_bytes.div_ceil(4)).unwrap_or(i64::MAX),
@@ -2642,15 +2774,20 @@ async fn run_sampling_request(
         step_context.as_ref(),
         base_instructions.clone(),
     );
+    if generation_request.terminal_completion_only {
+        prompt.tools.clear();
+        prompt.parallel_tool_calls = false;
+    }
     drop(prompt_construction_guard);
     turn_context
         .turn_timing_state
-        .begin_model_generation_with_metadata(
+        .begin_model_generation_with_failure_metadata(
             pending_continuation_cause,
             &turn_context.session_source,
             generation_request.purpose,
             generation_request.timing_disposition(),
             Some(generation_request.relevant_state_fingerprint.clone()),
+            generation_request.failure_fingerprint.clone(),
         );
     loop {
         let err = match try_run_sampling_request(
@@ -2708,8 +2845,13 @@ async fn run_sampling_request(
         turn_context.turn_timing_state.record_sampling_retry();
         if !crate::latency_switches::shared_prompt_input_enabled() {
             let history = sess.clone_history().await;
-            let retry_input =
-                prepare_sampling_prompt_for_client(history, turn_context.as_ref(), client_session);
+            let retry_input = prepare_sampling_prompt_for_client(
+                history,
+                turn_context.as_ref(),
+                client_session,
+                sess.services.git_workspace.as_ref(),
+            )
+            .await;
             prompt = build_projected_prompt(
                 sess.as_ref(),
                 &retry_input,

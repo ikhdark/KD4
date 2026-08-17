@@ -6,6 +6,18 @@ use ts_rs::TS;
 
 pub const VALIDATION_CONTRACT_VERSION: u32 = 1;
 
+/// Model-declared applicability for a validation command launched directly
+/// through a shell tool. The command itself remains owned by the tool call;
+/// this context records why running it is useful and which inputs make an
+/// earlier successful result reusable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationCommandContext {
+    pub uncertainty: String,
+    pub covered_paths: Vec<String>,
+    pub covered_contracts: Vec<String>,
+}
+
 /// Semantic proof applicability. Execution-instance metadata is deliberately
 /// absent so this value can be used for both singleflight and completed reuse.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, TS)]

@@ -1,6 +1,7 @@
 use super::PreviousSectionState;
 use super::WorldStateSection;
 use crate::context::AppsInstructions;
+use crate::context::AppsInstructionsUnavailable;
 use crate::context::ContextualUserFragment;
 
 /// Whether generic Apps usage guidance should be visible to the model.
@@ -39,14 +40,23 @@ impl WorldStateSection for AppsInstructionsState {
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
     ) -> Option<Box<dyn ContextualUserFragment>> {
-        if !self.available
-            || matches!(previous, PreviousSectionState::Known(previous) if *previous)
-            || matches!(previous, PreviousSectionState::Unknown)
-        {
-            return None;
+        if self.available {
+            match previous {
+                PreviousSectionState::Absent => Some(Box::new(AppsInstructions)),
+                PreviousSectionState::Known(previous) if !*previous => {
+                    Some(Box::new(AppsInstructions))
+                }
+                PreviousSectionState::Known(_) | PreviousSectionState::Unknown => None,
+            }
+        } else {
+            match previous {
+                PreviousSectionState::Known(previous) if *previous => {
+                    Some(Box::new(AppsInstructionsUnavailable))
+                }
+                PreviousSectionState::Unknown => Some(Box::new(AppsInstructionsUnavailable)),
+                PreviousSectionState::Absent | PreviousSectionState::Known(_) => None,
+            }
         }
-
-        Some(Box::new(AppsInstructions))
     }
 }
 

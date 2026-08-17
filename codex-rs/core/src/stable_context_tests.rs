@@ -12,6 +12,12 @@ fn text_message(role: &str, text: &str) -> ResponseItem {
     }
 }
 
+fn text_message_for_turn(role: &str, text: &str, turn_id: &str) -> ResponseItem {
+    let mut item = text_message(role, text);
+    item.set_turn_id_if_missing(turn_id);
+    item
+}
+
 fn output_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -334,6 +340,52 @@ fn canonical_projection_places_volatile_context_after_reusable_history_prefix() 
             "current task",
             "current tail",
         ]
+    );
+}
+
+#[test]
+fn recommended_plugins_expire_after_the_requesting_turn() {
+    let plugins = "<recommended_plugins>requested catalog</recommended_plugins>";
+    let projection = project_stable_context(
+        vec![
+            text_message_for_turn("user", plugins, "turn-1"),
+            text_message_for_turn("user", "suggest a plugin", "turn-1"),
+            output_message("prior answer"),
+            text_message_for_turn("user", "fix the parser", "turn-2"),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    assert!(!visible_text(&projection.items).contains(&plugins));
+    let component = projection
+        .manifest
+        .components()
+        .iter()
+        .find(|component| component.kind == StableContextKind::RecommendedPlugins)
+        .expect("recommended plugin component");
+    assert!(!component.active);
+    assert_eq!(component.disposition, StableContextDisposition::Gated);
+}
+
+#[test]
+fn memory_context_has_dedicated_stable_provenance() {
+    let memory = "<memory_context>\nremember this\n</memory_context>";
+    let projection = project_stable_context(
+        vec![
+            text_message("developer", memory),
+            text_message("user", "current task"),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    assert!(
+        projection
+            .manifest
+            .components()
+            .iter()
+            .any(|component| { component.kind == StableContextKind::Memory && component.active })
     );
 }
 

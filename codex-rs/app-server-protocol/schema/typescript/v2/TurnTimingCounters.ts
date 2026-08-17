@@ -31,36 +31,25 @@ residualDeterministicGenerationCount: number,
  */
 ownerDrainedContinuationCount: number,
 /**
- * Exact source projections acknowledged without replaying source text.
+ * Validation commands that executed rather than reusing a proof.
  */
-sourceExactProjectionReuseCount: number,
-/**
- * Physical source reads whose automatically or explicitly supplied
- * conditional identity proved unchanged.
- */
-sourceConditionalUnchangedCount: number,
-/**
- * Coherent overlapping source intervals removed from model-visible text.
- */
-sourceOverlapRangeEliminationCount: bigint,
-/**
- * Requested source ranges that did not require an independent physical
- * read because exact or same-operation coverage was reused.
- */
-sourcePhysicalRangeAvoidedCount: bigint,
-/**
- * Source-specific deterministic continuations drained by the owner.
- */
-sourceHostDrainedContinuationCount: number,
-/**
- * New source evidence fragments actually exposed to a started model
- * generation.
- */
-sourceModelVisibleNewEvidenceCount: bigint,
+executedValidationCount: number,
 /**
  * Validation results served from the authoritative validation ledger.
  */
 reusedValidationCount: number,
+/**
+ * Validation requests identified as duplicates and served from the ledger.
+ */
+duplicateValidationCount: number,
+/**
+ * Executed validation requests that explicitly bypassed reusable proof state.
+ */
+forcedFreshValidationCount: number,
+/**
+ * Total wall-clock nanoseconds spent in validation commands that executed.
+ */
+executedValidationDurationNs: bigint,
 /**
  * Validation tool outputs intentionally suppressed by admission policy.
  */
@@ -80,9 +69,4 @@ completionReviewTerminalPhaseCount: number,
 /**
  * Bounded to the stable purpose enum's cardinality.
  */
-purposeAggregates?: Array<TurnTimingGenerationPurposeAggregate>, samePurposeContinuationCount: number, exactRepeatedWaitCount: number, planningGenerationCount: number, planRevisionGenerationCount: number,
-/**
- * Aggregate-only architecture-comprehension telemetry. These counters do
- * not contain repository paths, symbols, relationship text, or evidence.
- */
-architectureSliceAttemptCount: number, architectureSliceCompleteCount: number, architectureRelationshipCount: bigint, architectureInvariantCount: bigint, architectureMissingRequirementCount: bigint, architectureMaterialUnknownCount: bigint, architectureStaleSnapshotCount: number, architectureToolCallCount: bigint, architectureFilesRead: bigint, architectureBytesRead: bigint, architectureLateRelationshipDiscoveryCount: bigint, planningFixedPointIterationCount: number, planningInvalidationCount: number, planningSemanticEffectCount: number, planningFailureCount: number, failureSignatureCount: number, failureDiagnosisCount: number, attemptsByKind: TurnTimingAttemptKindCounts, modelRequestCount: number, modelRetryCount: number, modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: bigint, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: bigint, toolOutputCanonicalTokenCount: bigint, toolOutputModelByteCount: bigint, toolOutputModelTokenCount: bigint, toolOutputArtifactCreationCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: bigint, toolOutputRecoveryCallCount: number, toolOutputRecoveryRetruncationCount: number, toolOutputRecursiveSpillCount: number, attributableRecoveryGenerationCount: number, truncationInducedContinuationCount: number, invalidTransitionCount: number, clockRegressionCount: number, saturationCount: number, };
+purposeAggregates?: Array<TurnTimingGenerationPurposeAggregate>, samePurposeContinuationCount: number, exactRepeatedWaitCount: number, planningGenerationCount: number, planRevisionGenerationCount: number, planningFixedPointIterationCount: number, planningInvalidationCount: number, planningSemanticEffectCount: number, planningFailureCount: number, failureSignatureCount: number, failureDiagnosisCount: number, attemptsByKind: TurnTimingAttemptKindCounts, modelRequestCount: number, modelRetryCount: number, modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: bigint, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: bigint, toolOutputCanonicalTokenCount: bigint, toolOutputModelByteCount: bigint, toolOutputModelTokenCount: bigint, toolOutputArtifactCreationCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: bigint, toolOutputRecoveryCallCount: number, toolOutputRecoveryRetruncationCount: number, toolOutputRecursiveSpillCount: number, attributableRecoveryGenerationCount: number, truncationInducedContinuationCount: number, invalidTransitionCount: number, clockRegressionCount: number, saturationCount: number, };

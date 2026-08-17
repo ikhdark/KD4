@@ -11,6 +11,7 @@ use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::context::semantic_evidence_for_command_output;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME;
 use crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool;
 use crate::tools::registry::CoreToolRuntime;
@@ -69,6 +70,7 @@ pub struct ReadToolOutputHandler;
 struct ReadToolOutputToolOutput {
     inner: JsonToolOutput,
     exact_recovery: Option<(TurnTimingDeterministicContinuationReceipt, Value)>,
+    semantic_evidence: Vec<String>,
 }
 
 impl ToolOutput for ReadToolOutputToolOutput {
@@ -78,6 +80,13 @@ impl ToolOutput for ReadToolOutputToolOutput {
 
     fn success_for_logging(&self) -> bool {
         self.inner.success_for_logging()
+    }
+
+    fn sampling_request_signal(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "kind": "semantic_evidence",
+            "semantic_evidence": self.semantic_evidence,
+        }))
     }
 
     fn deterministic_continuation_receipts(
@@ -178,6 +187,7 @@ async fn handle_read_tool_output(
 
     let exact_recovery_receipt =
         exact_code_mode_recovery_receipt(code_mode_recovery, &output, action_bounds_hash);
+    let semantic_evidence = read_tool_output_semantic_evidence(&output);
     let output = serde_json::to_value(output).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
@@ -185,7 +195,69 @@ async fn handle_read_tool_output(
     Ok(boxed_tool_output(ReadToolOutputToolOutput {
         inner: JsonToolOutput::new(output),
         exact_recovery,
+        semantic_evidence,
     }))
+}
+
+fn read_tool_output_semantic_evidence(output: &ReadToolOutputResult) -> Vec<String> {
+    let recovered_text = output
+        .results
+        .iter()
+        .filter(|result| result.status == ToolOutputSelectorStatus::Ok)
+        .filter_map(|result| result.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !recovered_text.is_empty() {
+        let mut evidence = semantic_evidence_for_command_output(recovered_text.as_bytes());
+        let supplemental_results = output
+            .results
+            .iter()
+            .filter(|result| {
+                result.status != ToolOutputSelectorStatus::Ok
+                    || !result.complete
+                    || result.text.is_none()
+            })
+            .collect::<Vec<_>>();
+        if !output.complete
+            || !output.unavailable_ranges.is_empty()
+            || !supplemental_results.is_empty()
+        {
+            let supplemental = serde_json::to_vec(&serde_json::json!({
+                "complete": output.complete,
+                "unavailable_ranges": output.unavailable_ranges,
+                "results": supplemental_results,
+            }))
+            .unwrap_or_default();
+            evidence.push(format!(
+                "artifact-recovery-status-v1:{}",
+                crate::tool_history::sha256(&supplemental)
+            ));
+        }
+        return evidence;
+    }
+    let recovered_complete_artifact = output.complete
+        && output.unavailable_ranges.is_empty()
+        && output.results.iter().any(|result| {
+            result.status == ToolOutputSelectorStatus::Ok
+                && result.complete
+                && result
+                    .canonical_range
+                    .is_some_and(|range| range.start == 0 && range.end == output.canonical_bytes)
+        });
+    if recovered_complete_artifact {
+        return vec![format!("canonical-output-v1:{}", output.canonical_sha256)];
+    }
+    let projection = serde_json::to_vec(&serde_json::json!({
+        "canonical_sha256": output.canonical_sha256,
+        "complete": output.complete,
+        "unavailable_ranges": output.unavailable_ranges,
+        "results": output.results,
+    }))
+    .unwrap_or_default();
+    vec![format!(
+        "artifact-projection-v1:{}",
+        crate::tool_history::sha256(&projection)
+    )]
 }
 
 pub(crate) async fn execute_recovery_transaction(
@@ -423,6 +495,75 @@ mod tests {
         assert!(
             exact_code_mode_recovery_receipt(true, &incomplete, "selector-bounds".to_string(),)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn complete_artifact_recovery_reuses_the_producers_canonical_identity() {
+        let mut result = selector_result(ToolOutputSelectorStatus::Ok);
+        result.canonical_range = Some(codex_tools::CanonicalByteRange::new(0, 5));
+        let output = ReadToolOutputResult {
+            artifact_id: "artifact".to_string(),
+            canonical_sha256: "canonical-revision".to_string(),
+            canonical_bytes: 5,
+            retained_bytes: 5,
+            complete: true,
+            unavailable_ranges: Vec::new(),
+            results: vec![result],
+        };
+
+        assert_eq!(
+            read_tool_output_semantic_evidence(&output),
+            vec!["canonical-output-v1:canonical-revision"]
+        );
+    }
+
+    #[test]
+    fn recovered_text_reuses_the_command_fact_identity() {
+        let mut result = selector_result(ToolOutputSelectorStatus::Ok);
+        result.text = Some("src/lib.rs:10:let stable = compute();".to_string());
+        let output = ReadToolOutputResult {
+            artifact_id: "artifact".to_string(),
+            canonical_sha256: "canonical-revision".to_string(),
+            canonical_bytes: 40,
+            retained_bytes: 40,
+            complete: true,
+            unavailable_ranges: Vec::new(),
+            results: vec![result],
+        };
+
+        assert_eq!(
+            read_tool_output_semantic_evidence(&output),
+            semantic_evidence_for_command_output(
+                b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+let stable = compute();"
+            )
+        );
+    }
+
+    #[test]
+    fn recovered_text_preserves_incomplete_selector_status() {
+        let mut recovered = selector_result(ToolOutputSelectorStatus::Ok);
+        recovered.text = Some("src/lib.rs:10:let stable = compute();".to_string());
+        let complete = ReadToolOutputResult {
+            artifact_id: "artifact".to_string(),
+            canonical_sha256: "canonical-revision".to_string(),
+            canonical_bytes: 40,
+            retained_bytes: 40,
+            complete: true,
+            unavailable_ranges: Vec::new(),
+            results: vec![recovered.clone()],
+        };
+        let incomplete = ReadToolOutputResult {
+            results: vec![
+                recovered,
+                selector_result(ToolOutputSelectorStatus::AggregateOmitted),
+            ],
+            ..complete.clone()
+        };
+
+        assert_ne!(
+            read_tool_output_semantic_evidence(&incomplete),
+            read_tool_output_semantic_evidence(&complete)
         );
     }
 

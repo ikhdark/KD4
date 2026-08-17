@@ -32,7 +32,6 @@ use crate::context::MultiAgentModeInstructions;
 use crate::context::NetworkRuleSaved;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
-use crate::context::RecommendedPluginsInstructions;
 use crate::context::SkillsUsageInstructions;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
@@ -417,7 +416,6 @@ use crate::turn_timing::record_turn_ttfm_metric;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_core_plugins::PluginsManager;
-use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_mcp::McpConfig;
 use codex_mcp::compute_auth_statuses;
 use codex_mcp::effective_mcp_servers;
@@ -1076,12 +1074,15 @@ fn push_prompt_fragment(
     separate_developer_sections: &mut Vec<String>,
 ) {
     let categorized = crate::context::CategorizedPromptFragment::from_extension(fragment);
-    debug_assert_eq!(
-        categorized.category(),
-        crate::context::PromptContextCategory::OtherInjected
-    );
+    let category = categorized.category();
     let fragment = categorized.into_fragment();
-    let Some(text) = budget.take(fragment.text()) else {
+    let rendered = match category {
+        crate::context::PromptContextCategory::Memory => {
+            format!("<memory_context>\n{}\n</memory_context>", fragment.text())
+        }
+        _ => fragment.text().to_string(),
+    };
+    let Some(text) = budget.take(&rendered) else {
         return;
     };
     match fragment.slot() {
@@ -3346,10 +3347,11 @@ impl Session {
             .config
             .features
             .enabled(Feature::DeferredExecutor);
-        // Keep the old turn-frozen environment view unless deferred executors are enabled. The
-        // deferred path captures live environments inside AGENTS.md refresh serialization so the
-        // environment snapshot and returned instructions stay ordered as one request-scoped value.
-        let (environments, loaded_agents_md) = if deferred_executor_enabled {
+        // Keep the turn-frozen environment view unless deferred executors are enabled, but refresh
+        // AGENTS.md for every sampling step in either mode. The deferred path captures live
+        // environments inside refresh serialization so the snapshot and returned instructions stay
+        // ordered as one request-scoped value.
+        let (environments, agents_md_observation) = if deferred_executor_enabled {
             self.services
                 .agents_md_manager
                 .refresh_for_step(
@@ -3360,7 +3362,10 @@ impl Session {
         } else {
             (
                 turn_context.environments.clone(),
-                self.services.agents_md_manager.get_loaded().await,
+                self.services
+                    .agents_md_manager
+                    .refresh_and_observe(&turn_context.config, &turn_context.environments)
+                    .await,
             )
         };
         let selected_capability_roots = self
@@ -3373,12 +3378,13 @@ impl Session {
                 &selected_capability_roots,
             )
             .await;
-        Arc::new(StepContext::new(
+        Arc::new(StepContext::new_with_agents_md_freshness(
             turn_context,
             environments,
             selected_capability_roots,
             mcp,
-            loaded_agents_md,
+            agents_md_observation.loaded,
+            agents_md_observation.freshness,
         ))
     }
 
@@ -3897,33 +3903,6 @@ impl Session {
                 developer_sections.push(skills_instructions.render());
             }
         }
-        let loaded_plugins = self
-            .services
-            .plugins_manager
-            .plugins_for_config(&turn_context.config.plugins_config_input())
-            .await;
-        let recommended_plugin_candidates =
-            if crate::tools::spec_plan::tool_suggest_enabled(turn_context) {
-                let auth = self.services.auth_manager.auth().await;
-                let plugins_config = turn_context.config.plugins_config_input();
-                self.services
-                    .plugins_manager
-                    .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
-                        plugins_config: &plugins_config,
-                        loaded_plugins: &loaded_plugins,
-                        auth: auth.as_ref(),
-                        disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
-                        app_server_client_name: turn_context.app_server_client_name.as_deref(),
-                    })
-                    .await
-            } else {
-                None
-            };
-        if let Some(recommended_plugins) =
-            recommended_plugin_candidates.and_then(RecommendedPluginsInstructions::from_plugins)
-        {
-            contextual_user_sections.push(recommended_plugins.render());
-        }
         let mut extension_context_budget = ModelContextBudget::default();
         for fragment in self.poll_thread_context_contributors(estimate).await {
             push_prompt_fragment(
@@ -4212,15 +4191,58 @@ impl Session {
         }
     }
 
-    pub(crate) async fn consumed_tool_outputs_for(
+    pub(crate) async fn register_workspace_evidence(
         &self,
-        tool_identity: &str,
-    ) -> Vec<(String, String)> {
-        self.state
-            .lock()
-            .await
-            .tool_history_state()
-            .consumed_outputs_for_tool(tool_identity)
+        codex_home: &std::path::Path,
+        observation: crate::tool_history::WorkspaceEvidenceObservation,
+    ) {
+        let Some(_tool_history_io_permit) = self.acquire_tool_history_io_permit().await else {
+            return;
+        };
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            state.history.register_workspace_evidence(observation);
+            state.tool_history_state()
+        };
+        if let Err(err) = crate::tool_history::persist_tool_history_state(
+            codex_home,
+            &self.thread_id.to_string(),
+            &snapshot,
+        )
+        .await
+        {
+            tracing::warn!("failed to persist workspace evidence metadata: {err}");
+        }
+    }
+
+    pub(crate) async fn invalidate_tool_history_source_dependencies(
+        &self,
+        codex_home: &std::path::Path,
+        affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
+        current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
+    ) {
+        let Some(_tool_history_io_permit) = self.acquire_tool_history_io_permit().await else {
+            return;
+        };
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            if !state.history.invalidate_tool_history_source_dependencies(
+                affected_paths,
+                current_workspace_identity,
+            ) {
+                return;
+            }
+            state.tool_history_state()
+        };
+        if let Err(err) = crate::tool_history::persist_tool_history_state(
+            codex_home,
+            &self.thread_id.to_string(),
+            &snapshot,
+        )
+        .await
+        {
+            tracing::warn!("failed to persist source-dependency invalidation state: {err}");
+        }
     }
 
     pub(crate) async fn mark_tool_history_consumed(
@@ -4237,22 +4259,9 @@ impl Session {
         };
         let snapshot = {
             let mut state = self.state.lock().await;
-            let before = crate::tools::handlers::source_tools::model_visible_source_evidence_count(
-                &state
-                    .tool_history_state()
-                    .consumed_outputs_for_tool("read_source_batch"),
-            );
             if !state.mark_tool_history_consumed(input, generation) {
                 return;
             }
-            let after = crate::tools::handlers::source_tools::model_visible_source_evidence_count(
-                &state
-                    .tool_history_state()
-                    .consumed_outputs_for_tool("read_source_batch"),
-            );
-            turn_context
-                .turn_timing_state
-                .record_source_model_visible_new_evidence(after.saturating_sub(before));
             state.tool_history_state()
         };
         if let Err(err) = crate::tool_history::persist_tool_history_state(
@@ -4679,6 +4688,7 @@ impl Session {
         input: &[UserInput],
         client_id: Option<String>,
     ) {
+        turn_context.turn_timing_state.record_user_input();
         // Mint the durable user item before history persistence so the private KD4 ledger can
         // bind exact pre-compaction inputs to the same stable item identity.
         let mut user_message_item = UserMessageItem::new(input);

@@ -1003,30 +1003,42 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
     child_session.thread_id = child_thread_id;
     child_turn.session_source = child_source;
     set_turn_config(&mut child_turn, child_config);
-    SubmitAgentReceiptHandlerV2
-        .handle(invocation(
-            Arc::new(child_session),
-            Arc::new(child_turn),
-            "submit_agent_receipt",
-            function_payload(json!({
-                "status": "completed",
-                "summary": "reported bounded evidence",
-                "criterion_results": [{
-                    "criterion_id": "criterion-1",
-                    "status": "passed",
-                    "evidence": validation_call_id.clone()
-                }],
-                "declared_changes": [{
-                    "path": risk_path.clone(),
-                    "summary": "recorded high-risk evidence"
-                }],
-                "validation_call_ids": [validation_call_id.clone()],
-                "blockers": [],
-                "risks": [],
-                "next_action": null
-            })),
-        ))
+    let receipt_gate =
+        crate::workspace_operation_gate::acquire_workspace_operation(&repo_root).await;
+    let receipt_invocation = invocation(
+        Arc::new(child_session),
+        Arc::new(child_turn),
+        "submit_agent_receipt",
+        function_payload(json!({
+            "status": "completed",
+            "summary": "reported bounded evidence",
+            "criterion_results": [{
+                "criterion_id": "criterion-1",
+                "status": "passed",
+                "evidence": validation_call_id.clone()
+            }],
+            "declared_changes": [{
+                "path": risk_path.clone(),
+                "summary": "recorded high-risk evidence"
+            }],
+            "validation_call_ids": [validation_call_id.clone()],
+            "blockers": [],
+            "risks": [],
+            "next_action": null
+        })),
+    );
+    let mut receipt_task =
+        tokio::spawn(async move { SubmitAgentReceiptHandlerV2.handle(receipt_invocation).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut receipt_task)
+            .await
+            .is_err(),
+        "receipt submission must wait for the workspace operation gate"
+    );
+    drop(receipt_gate);
+    receipt_task
         .await
+        .expect("receipt submission task should join")
         .expect("bound attempt should seal a validation-backed risk-gated receipt");
     before_initial_submission.release_one();
     let output = spawn_task

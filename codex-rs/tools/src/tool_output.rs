@@ -788,6 +788,21 @@ impl ToolOutput for JsonToolOutput {
         }
     }
 
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        if self.outcome_for_logging() == ToolOutputOutcome::Success {
+            return None;
+        }
+        self.value
+            .get("failure_signature")
+            .and_then(JsonValue::as_str)
+            .filter(|fingerprint| !fingerprint.is_empty())
+            .map(|fingerprint| {
+                serde_json::json!({
+                    "failure": { "fingerprint": fingerprint },
+                })
+            })
+    }
+
     fn contains_external_context(&self) -> bool {
         self.contains_external_context
     }
@@ -1149,6 +1164,33 @@ mod canonical_tests {
         assert!(metadata.essential_inline.get("valid").is_none());
         assert!(metadata.essential_inline.get("payload").is_none());
         assert!(metadata.essential_inline["nested"].get("items").is_none());
+    }
+
+    #[test]
+    fn failed_json_output_exposes_failure_signature_as_private_sampling_signal() {
+        let output = JsonToolOutput::with_success(
+            serde_json::json!({
+                "failure_signature": "validation-failure-v1:exit-1:stable",
+                "output": "large diagnostic",
+            }),
+            Some(false),
+        );
+
+        assert_eq!(
+            output.sampling_request_signal(),
+            Some(serde_json::json!({
+                "failure": {
+                    "fingerprint": "validation-failure-v1:exit-1:stable",
+                },
+            }))
+        );
+        assert!(
+            JsonToolOutput::new(serde_json::json!({
+                "failure_signature": "ignored-on-success",
+            }))
+            .sampling_request_signal()
+            .is_none()
+        );
     }
 
     #[test]

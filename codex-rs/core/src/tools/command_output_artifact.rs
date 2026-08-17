@@ -1268,6 +1268,26 @@ fn lock_artifact_handle(handle: &Arc<File>, position: SeekFrom) -> std::io::Resu
 }
 
 impl RawOutputArtifact {
+    pub(crate) fn restore_validation(
+        codex_home: &Path,
+        thread_id: &str,
+        artifact_ref: &str,
+    ) -> Option<Self> {
+        let id = ToolOutputArtifactId::from_str(artifact_ref).ok()?;
+        let path = codex_home
+            .join("tool-output")
+            .join(thread_id)
+            .join(format!("{id}.log"));
+        let (handle, bytes) = open_regular_artifact(&path).ok()?;
+        Some(Self::Stored {
+            id,
+            path,
+            bytes,
+            truncated: false,
+            handle: Arc::new(handle),
+        })
+    }
+
     pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self::Failed {
             id: None,
@@ -1363,6 +1383,14 @@ impl RawOutputArtifact {
     /// validation artifact is still retrievable and uncorrupted before reuse.
     /// This is an integrity check, not an artifact-content cache.
     pub(crate) async fn validation_integrity(&self) -> Option<(String, String)> {
+        self.validation_integrity_with_output()
+            .await
+            .map(|(id, sha256, _)| (id, sha256))
+    }
+
+    pub(crate) async fn validation_integrity_with_output(
+        &self,
+    ) -> Option<(String, String, Vec<u8>)> {
         let Self::Stored {
             id, bytes, path, ..
         } = self
@@ -1381,7 +1409,7 @@ impl RawOutputArtifact {
             );
             file.read_to_end(&mut retained).ok()?;
             (u64::try_from(retained.len()).ok()? == expected_bytes)
-                .then(|| (id, format!("{:x}", Sha256::digest(&retained))))
+                .then(|| (id, format!("{:x}", Sha256::digest(&retained)), retained))
         })
         .await
         .ok()?
@@ -3073,10 +3101,10 @@ fn load_validated_logical_snapshot(
     Ok(snapshot)
 }
 
-fn validated_snapshot_range<'a>(
-    snapshot: &'a [u8],
+fn validated_snapshot_range(
+    snapshot: &[u8],
     range: CanonicalByteRange,
-) -> Result<&'a [u8], ReadToolOutputError> {
+) -> Result<&[u8], ReadToolOutputError> {
     let start = usize::try_from(range.start)
         .map_err(|_| ReadToolOutputError::InvalidRange("byte range is too large".to_string()))?;
     let end = usize::try_from(range.end)

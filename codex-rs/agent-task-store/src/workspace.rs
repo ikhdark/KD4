@@ -404,8 +404,10 @@ fn collect_manifest_entries(
     paths: &[String],
 ) -> StoreResult<Vec<WorkspaceManifestEntry>> {
     let mut files = BTreeSet::new();
+    let mut repository_wide = false;
     for path in paths {
         if path == REPOSITORY_WIDE_PATH {
+            repository_wide = true;
             collect_repository_overlay_files(root, &mut files)?;
             continue;
         }
@@ -420,7 +422,27 @@ fn collect_manifest_entries(
     for path in files {
         entries.push(snapshot_file(root, path)?);
     }
+    if repository_wide {
+        entries.push(repository_head_entry(root));
+        entries.sort();
+    }
     Ok(entries)
+}
+
+fn repository_head_entry(root: &Path) -> WorkspaceManifestEntry {
+    let content_hash = repository_overlay_command(root, &["rev-parse", "--verify", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let revision = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (!revision.is_empty()).then_some(revision)
+        });
+    WorkspaceManifestEntry {
+        path: REPOSITORY_WIDE_PATH.to_string(),
+        existed: content_hash.is_some(),
+        content_hash,
+    }
 }
 
 fn collect_repository_overlay_files(root: &Path, files: &mut BTreeSet<String>) -> StoreResult<()> {

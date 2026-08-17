@@ -24,6 +24,7 @@ pub(crate) struct ContinuityCapsule {
     task_label: Option<String>,
     last_user_request: Option<String>,
     last_assistant_result: Option<String>,
+    task_state: ContinuityTaskState,
     repository: ContinuityRepository,
     compaction: ContinuityCompaction,
 }
@@ -33,6 +34,32 @@ struct ContinuityRepository {
     root: Option<String>,
     revision: Option<String>,
     dirty_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ContinuityTaskState {
+    goal: Option<String>,
+    current_state: Option<String>,
+    completed_work: Option<String>,
+    unresolved_work: Option<String>,
+    evidence: Option<String>,
+    next_action: Option<String>,
+}
+
+impl ContinuityTaskState {
+    fn has_recovery_signal(&self) -> bool {
+        [
+            &self.goal,
+            &self.current_state,
+            &self.completed_work,
+            &self.unresolved_work,
+            &self.evidence,
+            &self.next_action,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +179,7 @@ fn capsule_is_complete(capsule: &ContinuityCapsule) -> bool {
     capsule.schema_version == 1
         && !capsule.session_id.trim().is_empty()
         && !capsule.working_directory.trim().is_empty()
+        && capsule.task_state.has_recovery_signal()
         && matches!(capsule.compaction.phase.as_str(), "none" | "pre" | "post")
 }
 
@@ -165,6 +193,7 @@ fn capsule_shape_is_complete(value: &Value) -> bool {
         "task_label",
         "last_user_request",
         "last_assistant_result",
+        "task_state",
         "repository",
         "compaction",
     ];
@@ -191,10 +220,24 @@ fn capsule_shape_is_complete(value: &Value) -> bool {
     let Some(repository) = object.get("repository").and_then(Value::as_object) else {
         return false;
     };
+    let Some(task_state) = object.get("task_state").and_then(Value::as_object) else {
+        return false;
+    };
     let Some(compaction) = object.get("compaction").and_then(Value::as_object) else {
         return false;
     };
-    has_exact_required_fields(repository, &["root", "revision", "dirty_summary"], &[])
+    has_exact_required_fields(
+        task_state,
+        &[
+            "goal",
+            "current_state",
+            "completed_work",
+            "unresolved_work",
+            "evidence",
+            "next_action",
+        ],
+        &[],
+    ) && has_exact_required_fields(repository, &["root", "revision", "dirty_summary"], &[])
         && has_exact_required_fields(compaction, &["phase", "trigger"], &[])
 }
 
@@ -237,7 +280,7 @@ mod tests {
 
     fn capsule(epoch: u64) -> String {
         format!(
-            "{CAPSULE_OPEN}{{\"schema_version\":1,\"session_id\":\"session\",\"continuity_epoch\":{epoch},\"predecessor_thread_id\":null,\"working_directory\":\"repo\",\"task_label\":null,\"last_user_request\":null,\"last_assistant_result\":null,\"repository\":{{\"root\":null,\"revision\":null,\"dirty_summary\":null}},\"compaction\":{{\"phase\":\"none\",\"trigger\":null}},\"timestamp\":\"ignored\",\"semantic_hash\":\"untrusted\"}}{CAPSULE_CLOSE}"
+            "{CAPSULE_OPEN}{{\"schema_version\":1,\"session_id\":\"session\",\"continuity_epoch\":{epoch},\"predecessor_thread_id\":null,\"working_directory\":\"repo\",\"task_label\":null,\"last_user_request\":null,\"last_assistant_result\":null,\"task_state\":{{\"goal\":\"active goal\",\"current_state\":null,\"completed_work\":null,\"unresolved_work\":null,\"evidence\":null,\"next_action\":null}},\"repository\":{{\"root\":null,\"revision\":null,\"dirty_summary\":null}},\"compaction\":{{\"phase\":\"none\",\"trigger\":null}},\"timestamp\":\"ignored\",\"semantic_hash\":\"untrusted\"}}{CAPSULE_CLOSE}"
         )
     }
 
@@ -285,6 +328,15 @@ mod tests {
         );
         assert!(matches!(
             normalize_hook_context(malformed, "root:1"),
+            ContinuityContextNormalization::Invalid
+        ));
+    }
+
+    #[test]
+    fn capsule_without_recovery_state_is_rejected() {
+        let empty = capsule(1).replace("\"goal\":\"active goal\"", "\"goal\":null");
+        assert!(matches!(
+            normalize_hook_context(empty, "root:1"),
             ContinuityContextNormalization::Invalid
         ));
     }

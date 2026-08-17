@@ -7,6 +7,8 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::ShellCommandToolCallParams;
+use codex_protocol::plan_tool::ValidationRouteLeaf;
+use codex_protocol::validation::ValidationCommandContext;
 use pretty_assertions::assert_eq;
 
 use crate::config::PermissionProfileSnapshot;
@@ -20,6 +22,7 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
+use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -36,10 +39,184 @@ use codex_shell_command::powershell::try_find_powershell_executable_blocking;
 use codex_shell_command::powershell::try_find_pwsh_executable_blocking;
 use codex_tools::ToolExecutor;
 use codex_utils_path_uri::PathUri;
+use serde_json::Value as JsonValue;
 use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::parse_shell_command_hook_invocation;
+use super::shell_failure_sampling_signal;
+use super::shell_sampling_signal;
+
+fn structured_cargo_leaf() -> ValidationRouteLeaf {
+    ValidationRouteLeaf {
+        argv: vec![
+            "cargo".into(),
+            "test".into(),
+            "-p".into(),
+            "codex-core".into(),
+            "focused_case".into(),
+        ],
+        uncertainty: "the focused case still satisfies its contract".into(),
+        covered_paths: vec!["core/src/task_evidence.rs".into()],
+        covered_contracts: vec!["focused-validation-v1".into()],
+        timeout_ms: 30_000,
+        semantic_timeout: false,
+    }
+}
+
+#[test]
+fn structured_validation_requires_uncertainty_coverage_and_a_focused_cargo_test() {
+    let repo = std::path::Path::new(".");
+    let valid = structured_cargo_leaf();
+    assert!(super::validate_structured_validation_leaf(&valid, repo).is_ok());
+
+    let mut missing_uncertainty = valid.clone();
+    missing_uncertainty.uncertainty.clear();
+    assert!(
+        super::validate_structured_validation_leaf(&missing_uncertainty, repo)
+            .expect_err("missing uncertainty")
+            .contains("uncertainty")
+    );
+
+    let mut missing_coverage = valid.clone();
+    missing_coverage.covered_paths.clear();
+    assert!(
+        super::validate_structured_validation_leaf(&missing_coverage, repo)
+            .expect_err("missing coverage")
+            .contains("covered_paths")
+    );
+
+    let mut broad = valid;
+    broad.argv = vec!["cargo".into(), "test".into()];
+    assert!(
+        super::validate_structured_validation_leaf(&broad, repo)
+            .expect_err("broad cargo test")
+            .contains("package and a test filter")
+    );
+
+    broad.argv = vec![
+        "cargo".into(),
+        "test".into(),
+        "-p".into(),
+        "codex-core".into(),
+        "--test".into(),
+        "integration".into(),
+    ];
+    assert!(
+        super::validate_structured_validation_leaf(&broad, repo)
+            .expect_err("cargo target is not a libtest filter")
+            .contains("package and a test filter")
+    );
+
+    let mut unsafe_coverage = structured_cargo_leaf();
+    unsafe_coverage.covered_paths = vec!["../outside.rs".into()];
+    assert!(
+        super::validate_structured_validation_leaf(&unsafe_coverage, repo)
+            .expect_err("coverage traversal")
+            .contains("must stay within the repository")
+    );
+
+    let mut broad_check = structured_cargo_leaf();
+    broad_check.argv = vec!["cargo".into(), "check".into()];
+    assert!(
+        super::validate_structured_validation_leaf(&broad_check, repo)
+            .expect_err("workspace-wide cargo check")
+            .contains("must name a package")
+    );
+
+    let mut selectorless_pytest = structured_cargo_leaf();
+    selectorless_pytest.argv = vec!["python".into(), "-m".into(), "pytest".into(), "-q".into()];
+    assert!(
+        super::validate_structured_validation_leaf(&selectorless_pytest, repo)
+            .expect_err("selectorless pytest")
+            .contains("focused test selector")
+    );
+
+    let mut broad_package_lane = structured_cargo_leaf();
+    broad_package_lane.argv = vec![
+        "just".into(),
+        "test-lane-package".into(),
+        "codex-core".into(),
+    ];
+    assert!(
+        super::validate_structured_validation_leaf(&broad_package_lane, repo)
+            .expect_err("package-wide nextest")
+            .contains("must name a test filter")
+    );
+}
+
+#[test]
+fn direct_validation_requires_explicit_uncertainty_and_direct_argv() {
+    let context = ValidationCommandContext {
+        uncertainty: "the focused shell contract remains satisfied".to_string(),
+        covered_paths: vec!["core/src/task_evidence.rs".to_string()],
+        covered_contracts: vec!["direct-validation-v1".to_string()],
+    };
+    let invocation = CommandInvocation::Argv {
+        program: "cargo".to_string(),
+        args: vec![
+            "test".to_string(),
+            "-p".to_string(),
+            "codex-core".to_string(),
+            "direct_validation".to_string(),
+        ],
+    };
+    let route =
+        super::direct_validation_route(&context, &invocation, std::path::Path::new("."), 45_000)
+            .expect("focused direct validation route");
+    assert_eq!(route.leaves.len(), 1);
+    assert_eq!(route.leaves[0].uncertainty, context.uncertainty);
+    assert_eq!(route.leaves[0].covered_paths, context.covered_paths);
+
+    let script =
+        CommandInvocation::Script("cargo test -p codex-core direct_validation".to_string());
+    assert!(
+        super::direct_validation_route(&context, &script, std::path::Path::new("."), 45_000)
+            .expect_err("shell validation must not infer coverage from a script")
+            .contains("direct argv")
+    );
+}
+
+#[test]
+fn shell_failure_sampling_signal_is_stable_and_distinguishes_outcomes() {
+    let key = CommandAttemptKey::new(
+        "shell_command",
+        "local",
+        "C:/repo",
+        &["git".to_string(), "status".to_string()],
+    );
+    let first = shell_failure_sampling_signal(Some(&key), "git status", Some(1))
+        .expect("nonzero exit should carry failure evidence");
+    let repeated = shell_failure_sampling_signal(Some(&key), "git status", Some(1))
+        .expect("repeated nonzero exit should carry failure evidence");
+    let timeout = shell_failure_sampling_signal(Some(&key), "git status", None)
+        .expect("timeout should carry failure evidence");
+
+    assert_eq!(first, repeated);
+    assert_ne!(first, timeout);
+    assert!(
+        first
+            .pointer("/failure/fingerprint")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|fingerprint| fingerprint.starts_with("shell."))
+    );
+    assert!(shell_failure_sampling_signal(Some(&key), "git status", Some(0)).is_none());
+}
+
+#[test]
+fn successful_shell_sampling_signal_uses_canonical_output() {
+    let key = CommandAttemptKey::new(
+        "shell_command",
+        "local",
+        "C:/repo",
+        &["git".to_string(), "status".to_string()],
+    );
+    let first = shell_sampling_signal(Some(&key), "git status", Some(0), Some(b"clean\n"));
+    let repeated = shell_sampling_signal(Some(&key), "git status", Some(0), Some(b"clean\n"));
+
+    assert!(first.is_some());
+    assert_eq!(first, repeated);
+}
 
 #[test]
 fn validation_diagnostic_ranges_are_exact_and_bounded() {
@@ -183,7 +360,7 @@ fn validation_execution_outcome_distinguishes_success_from_not_executed() {
 }
 
 #[test]
-fn legacy_shell_keeps_exact_canonical_bytes_and_one_typed_projection() {
+fn legacy_shell_projection_metadata_keeps_exact_bytes_status_and_context() {
     let raw = vec![b'o', b'k', b'\n', 0xff];
     let output = super::LegacyShellToolOutput {
         inner: FunctionToolOutput::from_text("bounded shell output".to_string(), Some(false)),
@@ -211,6 +388,10 @@ fn legacy_shell_keeps_exact_canonical_bytes_and_one_typed_projection() {
     assert_eq!(projection.essential_inline["call_id"], "shell-call");
     assert!(projection.fragments.iter().any(|fragment| {
         fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ProcessFinalStatus
+    }));
+    assert!(projection.fragments.iter().any(|fragment| {
+        fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ContextualSpillableText
+            && fragment.text == "bounded shell output"
     }));
 }
 
@@ -1011,6 +1192,7 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
         additional_permissions: None,
         prefix_rule: None,
         justification: justification.clone(),
+        validation: None,
         force_fresh: None,
     };
 
@@ -1098,6 +1280,7 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
         additional_permissions: None,
         prefix_rule: None,
         justification: None,
+        validation: None,
         force_fresh: None,
     };
 
@@ -1149,6 +1332,7 @@ async fn shell_command_handler_preserves_structured_argv_shape() {
         additional_permissions: None,
         prefix_rule: None,
         justification: None,
+        validation: None,
         force_fresh: None,
     };
     let invocation = CommandInvocation::from_parts(

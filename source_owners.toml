@@ -194,13 +194,12 @@ role = "focused_tests"
 
 [[owners]]
 id = "planning-architecture-runtime"
-concern_ids = ["planning", "source-closure", "architecture-evidence"]
-aliases = ["update plan runtime", "source closure"]
-phrases = ["architecture evidence before implementation"]
+concern_ids = ["planning", "task-evidence", "validation-route"]
+aliases = ["update plan runtime", "task evidence planning"]
+phrases = ["durable plan state and validation before implementation"]
 roots = ["codex-rs/core/src/tools/handlers", "codex-rs/core/src/session", "codex-rs/core/src/task_evidence.rs"]
 primary_entries = [
     { path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "PlanHandler" },
-    { path = "codex-rs/core/src/tools/handlers/source_tools.rs", symbol = "ArchitectureSliceHandler" },
 ]
 instructions = ["AGENTS.md", "codex-rs/AGENTS.md", "codex-rs/core/AGENTS.md"]
 consumers = ["codex-rs/core/src/session/reasoning_governor.rs"]
@@ -209,7 +208,7 @@ generated_mirrors = []
 tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
 
 [owners.facet_exclusions]
-configuration_and_gates = "Planning tier and closure behavior are runtime state, not a repository or feature configuration gate."
+configuration_and_gates = "Planning tier and validation behavior are runtime state, not a repository or feature configuration gate."
 generated_artifacts = "The update_plan schema is constructed at runtime and has no checked-in generated mirror."
 
 [[owners.relationships]]
@@ -238,17 +237,17 @@ category = "tests_contracts"
 kind = "validated_by"
 target = "path:codex-rs/core/src/tools/handlers/plan_tests.rs"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/src/tools/handlers/plan_tests.rs", symbol = "source_closure_requires_complete_architecture_and_resolved_validation" }]
+evidence = [{ path = "codex-rs/core/src/tools/handlers/plan_tests.rs", symbol = "cancellation_after_plan_commit_boundary_waits_for_durable_update" }]
 
 [[owners.invariants]]
-id = "complete-source-closure"
+id = "durable-plan-update"
 kind = "semantic"
-statement = "Implementation readiness requires an untruncated, bounded architecture slice with every facet established or explicitly not applicable."
-evidence = [{ path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "architecture_slice_receipt" }]
+statement = "Committed plan updates reach durable task evidence before the tool response is emitted; cancellation before the commit boundary emits no plan update."
+evidence = [{ path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "PlanHandler::handle_call" }]
 tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
 
 [[owners.validation]]
-id = "planning-closure-focused"
+id = "planning-focused"
 cwd = "codex-rs"
 argv = ["cargo", "test", "-p", "codex-core", "tools::handlers::plan_tests"]
 role = "focused_tests"

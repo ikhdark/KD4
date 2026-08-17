@@ -118,10 +118,49 @@ pub fn create_update_plan_tool() -> ToolSpec {
                         ),
                         (
                             "source".to_string(),
-                            JsonSchema::string(Some("Fact source or owner.".to_string())),
+                            JsonSchema::string(Some(
+                                "Concrete source locator or bounded observation supporting the fact."
+                                    .to_string(),
+                            )),
+                        ),
+                        (
+                            "provenance".to_string(),
+                            JsonSchema::string_enum(
+                                vec![
+                                    json!("direct_file_read"),
+                                    json!("search_hit"),
+                                    json!("generated_summary"),
+                                    json!("cached_observation"),
+                                    json!("inferred_relationship"),
+                                    json!("test_result"),
+                                ],
+                                Some(
+                                    "Why the fact is believed; durable storage does not strengthen this provenance."
+                                        .to_string(),
+                                ),
+                            ),
+                        ),
+                        (
+                            "depends_on_paths".to_string(),
+                            JsonSchema::array(
+                                JsonSchema::string(Some(
+                                    "Repository-relative or absolute path whose content supports this fact."
+                                        .to_string(),
+                                )),
+                                Some(
+                                    "Concrete file or directory dependencies used to invalidate this fact after mutations."
+                                        .to_string(),
+                                ),
+                            ),
                         ),
                     ]),
-                    Some(vec!["id".to_string(), "value".to_string()]),
+                    Some(vec![
+                        "id".to_string(),
+                        "value".to_string(),
+                        "provenance".to_string(),
+                        "source".to_string(),
+                        "depends_on_paths".to_string(),
+                    ]),
                     Some(false.into()),
                 ),
                 Some("Stable facts to add or patch; omitted facts remain active.".to_string()),
@@ -203,7 +242,7 @@ Use a short evidence-first medium plan for bounded multi-surface work. Use the c
 Internal tier selection never changes collaboration mode. Complexity escalation in Default mode upgrades only this representation. Omitted facts and steps remain active; removals need reasons.
 Stop exploration once owner, call path, affected contract/scope, validation route, and material risks are established. Keep focused work checklist-free and medium plans short.
 At most one step can be in_progress at a time.
-Complete one coherent contract before starting the next: format or lint its changed surface, compile its owner, run its exact focused behavioral test, and record that at least one test was selected.
+Complete one coherent contract before starting the next. State each unresolved uncertainty, then select the cheapest non-overlapping validation leaves that resolve it. Do not run a separate compile or check when the exact behavioral test already compiles the same owner and configuration; add another leaf only when it proves a distinct contract. Record that every focused test leaf selected at least one test.
 Structured validation routes accept only direct cargo, just, python, or python3 leaves; run formatting and diff checks separately outside the route.
 Use stable ids, owners, bounded surfaces, dependencies, obligations, and acceptance criteria. Edits
 record partial obligation progress. Set a step to passed only when applicable fresh proof exists; completion
@@ -329,12 +368,17 @@ fn validation_route_schema() -> JsonSchema {
                 ),
             ),
             (
+                "uncertainty".to_string(),
+                JsonSchema::string(Some(
+                    "Specific uncertainty this command resolves and why this coverage is sufficient."
+                        .to_string(),
+                )),
+            ),
+            (
                 "covered_paths".to_string(),
                 JsonSchema::array(
                     JsonSchema::string(Some("Repository-relative covered path.".to_string())),
-                    Some(
-                        "Explicit covered paths; an empty list means unknown coverage.".to_string(),
-                    ),
+                    Some("Non-empty repository-relative coverage used to scope proof reuse.".to_string()),
                 ),
             ),
             (
@@ -355,6 +399,7 @@ fn validation_route_schema() -> JsonSchema {
         ]),
         Some(vec![
             "argv".to_string(),
+            "uncertainty".to_string(),
             "covered_paths".to_string(),
             "covered_contracts".to_string(),
             "timeout_ms".to_string(),

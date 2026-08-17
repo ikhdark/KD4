@@ -21,6 +21,10 @@ pub enum ValidationRouteOrdering {
 #[serde(deny_unknown_fields)]
 pub struct ValidationRouteLeaf {
     pub argv: Vec<String>,
+    /// The specific uncertainty this command resolves. Older persisted plans
+    /// may omit it, but newly admitted automatic validation requires it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uncertainty: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub covered_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -51,6 +55,8 @@ impl<'de> Deserialize<'de> for ValidationRouteLeaf {
         struct Raw {
             argv: Vec<String>,
             #[serde(default)]
+            uncertainty: String,
+            #[serde(default)]
             covered_paths: Vec<String>,
             #[serde(default)]
             covered_contracts: Vec<String>,
@@ -75,6 +81,7 @@ impl<'de> Deserialize<'de> for ValidationRouteLeaf {
         }
         Ok(Self {
             argv: raw.argv,
+            uncertainty: raw.uncertainty,
             covered_paths: raw.covered_paths,
             covered_contracts: raw.covered_contracts,
             timeout_ms: raw.timeout_ms,

@@ -22,15 +22,35 @@ generationPurpose?: TurnTimingGenerationPurpose, disposition: TurnTimingGenerati
 /**
  * A redacted hash of only the structured state relevant to this request.
  */
-relevantStateFingerprint?: string, progressKinds?: Array<TurnTimingProgressKind>, nextStructuredActionChanged: boolean, unchangedRelevantState: boolean, attemptKind: TurnTimingAttemptKind, isContinuation: boolean,
+relevantStateFingerprint?: string,
+/**
+ * Stable identity shared by every physical provider attempt for this
+ * logical request.
+ */
+samplingRequestId?: string,
+/**
+ * Physical provider attempts observed for this logical request, including
+ * retries and transport fallbacks.
+ */
+physicalAttemptIds?: Array<string>, progressKinds?: Array<TurnTimingProgressKind>, nextStructuredActionChanged: boolean, unchangedRelevantState: boolean, attemptKind: TurnTimingAttemptKind, isContinuation: boolean,
 /**
  * Directly observed model-stream wait for this physical attempt.
  */
 modelStreamWaitNs: bigint,
 /**
+ * Dispatch-to-first-actionable-output latency. This excludes reasoning
+ * deltas and partial tool arguments; missing actionable output stays null.
+ */
+decisionLatencyNs?: number | null,
+/**
  * Tool calls emitted by this generation. Recorded on its primary attempt.
  */
-toolCallCount: number, outputTokens: bigint, reasoningOutputTokens: bigint,
+toolCallCount: number,
+/**
+ * Unioned tool-active duration attributed to this generation. Parallel
+ * tool calls are counted once per wall-clock interval.
+ */
+toolActiveUnionNs: bigint, outputTokens: bigint, reasoningOutputTokens: bigint,
 /**
  * Provider-reported usage for this physical attempt. Missing usage stays
  * null, including failed attempts for which the provider reported none.
@@ -40,4 +60,4 @@ tokenUsage?: TurnTimingProviderTokenUsage,
  * Aggregate-only full logical prompt accounting. No prompt text,
  * repository paths, tool arguments, or hashes are persisted here.
  */
-requestTokenCategories?: TurnTimingRequestTokenCategories, dispatchMs?: number | null, firstModelOutputMs?: number | null, completedMs?: number | null, };
+requestTokenCategories?: TurnTimingRequestTokenCategories, dispatchMs?: number | null, firstModelOutputMs?: number | null, firstActionableOutputMs?: number | null, completedMs?: number | null, };

@@ -8,12 +8,14 @@ use crate::context_manager::normalize;
 use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
+use crate::git_workspace::WorkspaceEvidenceIdentity;
 use crate::session::turn_context::TurnContext;
 use crate::stable_context::StableContextManifest;
 use crate::stable_context::StableContextTarget;
 use crate::stable_context::project_stable_context;
 use crate::tool_history::ModelGenerationId;
 use crate::tool_history::ToolHistoryCandidate;
+use crate::tool_history::ToolHistoryProjection;
 use crate::tool_history::ToolHistoryState;
 use crate::tool_history::ToolHistorySubstitution;
 use base64::Engine;
@@ -50,8 +52,8 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 
-const PREPARED_HISTORY_POLICY_VERSION: u16 = 5;
-const PREPARED_HISTORY_HASH_DOMAIN: &[u8] = b"codex.pending-turn.prepared-history.v5";
+const PREPARED_HISTORY_POLICY_VERSION: u16 = 6;
+const PREPARED_HISTORY_HASH_DOMAIN: &[u8] = b"codex.pending-turn.prepared-history.v6";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedHistoryPolicy {
@@ -276,6 +278,7 @@ impl ContextManager {
     /// Sampling-only preparation entrypoint. Callers must select the target
     /// explicitly so generic and compaction preparation cannot accidentally
     /// enable logical projection.
+    #[cfg(test)]
     pub(crate) fn prepare_for_sampling_prompt(
         self,
         input_modalities: &[InputModality],
@@ -320,6 +323,7 @@ impl ContextManager {
         evict_resolved_reasoning(Arc::make_mut(&mut self.items));
         self.normalize_history(input_modalities);
         crate::continuity::deduplicate_prepared_capsules(Arc::make_mut(&mut self.items));
+        project_update_plan_history(Arc::make_mut(&mut self.items));
         let normalized_items: Arc<[ResponseItem]> = Arc::from(Arc::unwrap_or_clone(self.items));
         let projection = project_stable_context(normalized_items, stable_context_target);
         let items = projection.items;
@@ -358,9 +362,39 @@ impl ContextManager {
         self,
         input_modalities: &[InputModality],
         target: StableContextTarget,
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+        git_workspace: &crate::git_workspace::GitWorkspaceCache,
     ) -> PreparedPromptInput {
         debug_assert_eq!(target, StableContextTarget::Sampling);
-        self.prepare_for_prompt_with_completed_tool_projection_target(input_modalities, target)
+        self.prepare_for_prompt_with_completed_tool_projection_target(
+            input_modalities,
+            target,
+            workspace_identity,
+            Some(git_workspace),
+        )
+    }
+
+    pub(crate) fn prepare_for_sampling_prompt_with_workspace_freshness(
+        self,
+        input_modalities: &[InputModality],
+        target: StableContextTarget,
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+        git_workspace: &crate::git_workspace::GitWorkspaceCache,
+    ) -> PreparedPromptInput {
+        debug_assert_eq!(target, StableContextTarget::Sampling);
+        let tool_history = Arc::clone(&self.tool_history);
+        let prepared = self.prepare_for_prompt_target(input_modalities, target);
+        let projection = tool_history.project_workspace_freshness_with_cache(
+            Arc::clone(&prepared.items),
+            workspace_identity,
+            git_workspace,
+        );
+        let fallback_projection = tool_history.project_workspace_freshness_with_cache(
+            Arc::clone(&prepared.fallback_items),
+            workspace_identity,
+            git_workspace,
+        );
+        apply_tool_history_projection(prepared, projection, fallback_projection)
     }
 
     /// Compaction also benefits from settled, exactly recoverable tool receipts.
@@ -368,10 +402,13 @@ impl ContextManager {
     pub(crate) fn for_compaction_prompt_with_completed_tool_projection(
         self,
         input_modalities: &[InputModality],
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
     ) -> Vec<ResponseItem> {
         self.prepare_for_prompt_with_completed_tool_projection_target(
             input_modalities,
             StableContextTarget::FailOpen,
+            workspace_identity,
+            None,
         )
         .items()
         .to_vec()
@@ -381,32 +418,20 @@ impl ContextManager {
         self,
         input_modalities: &[InputModality],
         target: StableContextTarget,
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+        git_workspace: Option<&crate::git_workspace::GitWorkspaceCache>,
     ) -> PreparedPromptInput {
         let tool_history = Arc::clone(&self.tool_history);
-        let mut prepared = self.prepare_for_prompt_target(input_modalities, target);
-        let projection = tool_history.project(Arc::clone(&prepared.items));
-        let fallback_projection = tool_history.project(Arc::clone(&prepared.fallback_items));
-        prepared.items = projection.items;
-        prepared.unreplaced_items = projection.unreplaced_items;
-        prepared.tool_history_substitutions = projection.substitutions;
-        prepared.fallback_items = fallback_projection.items;
-        prepared.unreplaced_fallback_items = fallback_projection.unreplaced_items;
-        prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
-        prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
-            &prepared.items,
-            &prepared.stable_context_manifest,
-        );
-        prepared.fingerprint = crate::latency_switches::history_identity_enabled()
-            .then(|| {
-                prepared_history_fingerprint(
-                    &prepared.items,
-                    &prepared.stable_context_manifest,
-                    prepared.policy,
-                )
-                .ok()
-            })
-            .flatten();
-        prepared
+        let prepared = self.prepare_for_prompt_target(input_modalities, target);
+        let project = |items| match git_workspace {
+            Some(cache) => {
+                tool_history.project_with_workspace_cache(items, workspace_identity, cache)
+            }
+            None => tool_history.project_with_workspace_identity(items, workspace_identity),
+        };
+        let projection = project(Arc::clone(&prepared.items));
+        let fallback_projection = project(Arc::clone(&prepared.fallback_items));
+        apply_tool_history_projection(prepared, projection, fallback_projection)
     }
 
     pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
@@ -423,6 +448,29 @@ impl ContextManager {
         Arc::make_mut(&mut self.tool_history).register(candidate);
         self.projection_revision = self.projection_revision.saturating_add(1);
         self.invalidate_prepared_history();
+    }
+
+    pub(crate) fn register_workspace_evidence(
+        &mut self,
+        observation: crate::tool_history::WorkspaceEvidenceObservation,
+    ) {
+        Arc::make_mut(&mut self.tool_history).register_workspace_evidence(observation);
+        self.projection_revision = self.projection_revision.saturating_add(1);
+        self.invalidate_prepared_history();
+    }
+
+    pub(crate) fn invalidate_tool_history_source_dependencies(
+        &mut self,
+        affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
+        current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
+    ) -> bool {
+        let changed = Arc::make_mut(&mut self.tool_history)
+            .invalidate_source_dependencies(affected_paths, current_workspace_identity);
+        if changed {
+            self.projection_revision = self.projection_revision.saturating_add(1);
+            self.invalidate_prepared_history();
+        }
+        changed
     }
 
     pub(crate) fn mark_tool_history_consumed(
@@ -727,7 +775,6 @@ impl ContextManager {
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
-        let policy_with_serialization_budget = policy * 1.2;
         match item {
             ResponseItem::FunctionCallOutput {
                 id,
@@ -737,7 +784,7 @@ impl ContextManager {
             } => ResponseItem::FunctionCallOutput {
                 id: id.clone(),
                 call_id: call_id.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
+                output: truncate_function_output_payload(output, policy),
                 internal_chat_message_metadata_passthrough: metadata.clone(),
             },
             ResponseItem::CustomToolCallOutput {
@@ -750,7 +797,7 @@ impl ContextManager {
                 id: id.clone(),
                 call_id: call_id.clone(),
                 name: name.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
+                output: truncate_function_output_payload(output, policy),
                 internal_chat_message_metadata_passthrough: metadata.clone(),
             },
             ResponseItem::AdditionalTools { .. }
@@ -817,6 +864,90 @@ impl ContextManager {
         }
         cut_idx
     }
+}
+
+fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
+    let update_calls = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            ResponseItem::FunctionCall { name, call_id, .. } if name == "update_plan" => {
+                Some((index, call_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some((latest_call_index, latest_call_id)) = update_calls.last() else {
+        return;
+    };
+    let Some((latest_output_index, latest_output)) =
+        items.iter().enumerate().rev().find(|(_, item)| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == latest_call_id
+            )
+        })
+    else {
+        return;
+    };
+    let ResponseItem::FunctionCallOutput { output, .. } = latest_output else {
+        return;
+    };
+    let FunctionCallOutputBody::Text(text) = &output.body else {
+        return;
+    };
+    let Ok(mut authoritative_output) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    if authoritative_output.get("current_plan").is_none() {
+        return;
+    }
+    let Some(output_object) = authoritative_output.as_object_mut() else {
+        return;
+    };
+    output_object.remove("normalized_plan");
+    output_object.insert(
+        "superseded_updates".to_string(),
+        serde_json::json!(update_calls.len().saturating_sub(1)),
+    );
+
+    let mut projected_call = items[*latest_call_index].clone();
+    let ResponseItem::FunctionCall { arguments, .. } = &mut projected_call else {
+        return;
+    };
+    *arguments = serde_json::json!({
+        "projected": "authoritative current plan is in the tool output"
+    })
+    .to_string();
+    let mut projected_output = items[latest_output_index].clone();
+    let ResponseItem::FunctionCallOutput { output, .. } = &mut projected_output else {
+        return;
+    };
+    output.body = FunctionCallOutputBody::Text(authoritative_output.to_string());
+
+    let update_call_ids = update_calls
+        .iter()
+        .map(|(_, call_id)| call_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut projected = Vec::with_capacity(items.len());
+    for (index, item) in items.drain(..).enumerate() {
+        if index == *latest_call_index {
+            projected.push(projected_call.clone());
+            projected.push(projected_output.clone());
+        }
+        let belongs_to_update_plan = matches!(
+            &item,
+            ResponseItem::FunctionCall { name, .. } if name == "update_plan"
+        ) || matches!(
+            &item,
+            ResponseItem::FunctionCallOutput { call_id, .. }
+                if update_call_ids.contains(call_id.as_str())
+        );
+        if !belongs_to_update_plan {
+            projected.push(item);
+        }
+    }
+    *items = projected;
 }
 
 impl ContextManager {
@@ -892,6 +1023,34 @@ impl ContextManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
+}
+
+fn apply_tool_history_projection(
+    mut prepared: PreparedPromptInput,
+    projection: ToolHistoryProjection,
+    fallback_projection: ToolHistoryProjection,
+) -> PreparedPromptInput {
+    prepared.items = projection.items;
+    prepared.unreplaced_items = projection.unreplaced_items;
+    prepared.tool_history_substitutions = projection.substitutions;
+    prepared.fallback_items = fallback_projection.items;
+    prepared.unreplaced_fallback_items = fallback_projection.unreplaced_items;
+    prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
+    prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
+        &prepared.items,
+        &prepared.stable_context_manifest,
+    );
+    prepared.fingerprint = crate::latency_switches::history_identity_enabled()
+        .then(|| {
+            prepared_history_fingerprint(
+                &prepared.items,
+                &prepared.stable_context_manifest,
+                prepared.policy,
+            )
+            .ok()
+        })
+        .flatten();
+    prepared
 }
 
 fn prepared_history_fingerprint(

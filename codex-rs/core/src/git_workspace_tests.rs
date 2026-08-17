@@ -80,6 +80,25 @@ async fn create_clean_git_repo() -> (TempDir, AbsolutePathBuf) {
 }
 
 #[tokio::test]
+async fn workspace_evidence_identity_tracks_unborn_repository_changes() {
+    let temp_dir = TempDir::new().expect("temp git repository");
+    let repo = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute repo");
+    run_git(repo.as_path(), &["init", "-q"]).await;
+
+    let before = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("unborn repository identity");
+    assert_eq!(before.head_identity, None);
+    std::fs::write(repo.join("untracked.txt"), "new evidence\n").expect("write untracked file");
+    let after = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("changed unborn repository identity");
+
+    assert_ne!(before, after);
+    assert_eq!(before.repository_root, after.repository_root);
+}
+
+#[tokio::test]
 async fn environment_generation_advances_only_when_selection_changes() {
     let manager = local_environment_manager().await;
     let root = TempDir::new().expect("temp root");
@@ -246,6 +265,35 @@ async fn namespace_dependencies_refresh_head_and_root_history() {
 }
 
 #[tokio::test]
+async fn missing_project_namespace_is_cached_with_its_dependencies() {
+    let temp_dir = TempDir::new().expect("temp git repository");
+    let repo = AbsolutePathBuf::from_absolute_path(temp_dir.path().to_path_buf())
+        .expect("absolute repository path");
+    run_git(repo.as_path(), &["init", "-q"]).await;
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let source = GitWorkspaceMetadataSource {
+        cwd: repo.clone(),
+        repo_root: repo.clone(),
+        cache: Arc::clone(&cache),
+    };
+
+    assert_eq!(source.project_namespace().await, None);
+    {
+        let mut state = cache.state.lock().await;
+        let entry = state
+            .project_namespaces
+            .get_mut(repo.as_path())
+            .expect("negative namespace cache entry");
+        assert_eq!(entry.namespace, None);
+        entry.namespace = Some("cached-negative-entry".to_string());
+    }
+    assert_eq!(
+        source.project_namespace().await.as_deref(),
+        Some("cached-negative-entry")
+    );
+}
+
+#[tokio::test]
 async fn watcher_generation_rejects_stable_identity_caches() {
     let (_temp_dir, repo) = create_clean_git_repo().await;
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
@@ -268,7 +316,7 @@ async fn watcher_generation_rejects_stable_identity_caches() {
             .project_namespaces
             .get_mut(repo.as_path())
             .expect("namespace cache entry")
-            .namespace = "stale-namespace".to_string();
+            .namespace = Some("stale-namespace".to_string());
     }
     cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
 
@@ -339,6 +387,31 @@ async fn workspace_change_observation_fails_open_on_changes_or_watcher_uncertain
 }
 
 #[tokio::test]
+async fn workspace_evidence_identity_recaptures_despite_unchanged_watcher_generation() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+
+    let first = cache
+        .workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("first identity");
+    let second = cache
+        .workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("recaptured identity");
+    assert_eq!(second, first);
+    assert_eq!(cache.workspace_evidence_capture_count(), 2);
+
+    cache.note_host_workspace_mutation();
+    let refreshed = cache
+        .workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("refreshed identity");
+    assert_eq!(refreshed, first);
+    assert_eq!(cache.workspace_evidence_capture_count(), 3);
+}
+
+#[tokio::test]
 async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
     let root = TempDir::new().expect("source observation root");
     let source = root.path().join("src").join("lib.rs");
@@ -347,7 +420,7 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
 
     let observation = cache
-        .begin_source_path_change_observation(root.path(), &source)
+        .begin_source_path_change_observation(root.path(), &source, false)
         .expect("path observation");
     cache.note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()]);
     assert!(cache.source_path_change_observation_is_current(&observation));
@@ -356,16 +429,31 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
     assert!(!cache.source_path_change_observation_is_current(&observation));
 
     let uncertain = cache
-        .begin_source_path_change_observation(root.path(), &source)
+        .begin_source_path_change_observation(root.path(), &source, false)
         .expect("refreshed path observation");
     cache.note_host_workspace_mutation();
     assert!(!cache.source_path_change_observation_is_current(&uncertain));
 
     let overflowed = cache
-        .begin_source_path_change_observation(root.path(), &source)
+        .begin_source_path_change_observation(root.path(), &source, false)
         .expect("overflow path observation");
     for index in 0..=SOURCE_CHANGE_JOURNAL_CAPACITY {
         cache.note_host_workspace_mutation_paths(root.path(), &[format!("unrelated/{index}.txt")]);
     }
     assert!(!cache.source_path_change_observation_is_current(&overflowed));
+}
+
+#[test]
+fn recursive_source_path_observation_detects_descendant_changes() {
+    let root = TempDir::new().expect("source observation root");
+    let source_root = root.path().join("src");
+    std::fs::create_dir_all(&source_root).expect("create src");
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let observation = cache
+        .begin_source_path_change_observation(root.path(), &source_root, true)
+        .expect("recursive path observation");
+
+    cache.note_host_workspace_mutation_paths(root.path(), &["src/nested/lib.rs".to_string()]);
+
+    assert!(!cache.source_path_change_observation_is_current(&observation));
 }

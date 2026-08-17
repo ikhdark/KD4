@@ -728,9 +728,11 @@ impl ObservationKind {
         matches!(
             self,
             Self::Reading
+                | Self::Editing
                 | Self::Reviewing
                 | Self::Validating
                 | Self::Blocked
+                | Self::ToolCall
                 | Self::Mutation
                 | Self::GateChanged
                 | Self::ReceiptSealed

@@ -27,6 +27,8 @@ const MAX_METRIC_ROWS: usize = 256;
 pub(super) const MAX_RECORDED_EVENTS: usize = 4_096;
 
 const TASK_DURATION_METRIC: &str = "codex.multi_agent.task.duration_ms";
+pub(super) const TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC: &str =
+    "codex.multi_agent.task.first_meaningful_progress.duration_ms";
 const TASK_CRITICAL_PATH_IDLE_DURATION_METRIC: &str =
     "codex.multi_agent.task.critical_path_idle.duration_ms";
 const TASK_CRITICAL_PATH_IDLE_RATIO_METRIC: &str =

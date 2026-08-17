@@ -9,6 +9,17 @@ fn nested_code_mode_projection_is_not_provider_visible() {
         cell_id: "cell".to_string(),
         runtime_tool_call_id: "nested".to_string(),
     }));
+    assert!(admission_tracking_enabled(&ToolCallSource::Direct, true));
+    assert!(!admission_tracking_enabled(&ToolCallSource::Direct, false));
+}
+
+#[test]
+fn direct_output_admission_is_not_config_gated() {
+    let source = ToolCallSource::Direct;
+    let tool_name = ToolName::plain("ordinary_tool");
+
+    assert!(projection_admission_required(&source, &tool_name, false));
+    assert!(!admission_tracking_enabled(&source, false));
 }
 
 #[test]
@@ -102,6 +113,12 @@ fn complete_projection_envelope_respects_applied_limit() {
         BoundedModelProjection::Envelope { .. }
     ));
     assert!(approx_token_count(rendered) <= 64);
+    let envelope = projected.envelope().expect("projection envelope");
+    assert_eq!(envelope.model_bytes, rendered.len() as u64);
+    assert_eq!(
+        envelope.model_approximate_tokens,
+        approx_token_count(rendered) as u64
+    );
     assert_eq!(
         serde_json::from_str::<Value>(rendered).expect("valid JSON projection"),
         projected.value()
@@ -341,7 +358,10 @@ async fn structured_projection_artifact_recovers_original_bytes() {
         canonical,
         original_output_sha256,
         original_output_tokens,
+        original_output_text: String::new(),
+        invocation_sha256: None,
         semantic_class: "test".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
         predetermined_ranges: Vec::new(),
@@ -551,8 +571,11 @@ async fn projection_owner_recovery_drains_exact_json_pointer_in_original_return(
         tool_name: "get_agent_task".to_string(),
         original_output_sha256: canonical.sha256.clone(),
         original_output_tokens: canonical.approximate_tokens,
+        original_output_text: String::new(),
+        invocation_sha256: None,
         canonical,
         semantic_class: "tool_output".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
         predetermined_ranges: Vec::new(),
@@ -624,8 +647,11 @@ async fn one_predetermined_range_is_recovered_in_the_original_return() {
         tool_name: "sample_reader".to_string(),
         original_output_sha256: canonical.sha256.clone(),
         original_output_tokens: canonical.approximate_tokens,
+        original_output_text: String::new(),
+        invocation_sha256: None,
         canonical,
         semantic_class: "test_projection".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
         predetermined_ranges: vec![ToolOutputProjectionRange {
@@ -708,7 +734,10 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
         canonical,
         original_output_sha256,
         original_output_tokens,
+        original_output_text: String::new(),
+        invocation_sha256: None,
         semantic_class: "validation".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
         predetermined_ranges: ranges,
@@ -847,7 +876,10 @@ async fn small_code_mode_owner_result_uses_artifact_free_inline_carrier() {
         canonical: canonical.clone(),
         original_output_sha256: canonical.sha256.clone(),
         original_output_tokens: canonical.approximate_tokens,
+        original_output_text: String::new(),
+        invocation_sha256: None,
         semantic_class: "tool_output".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
         predetermined_ranges: Vec::new(),
@@ -938,7 +970,10 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         canonical: inner_canonical.clone(),
         original_output_sha256: inner_canonical.sha256.clone(),
         original_output_tokens: inner_canonical.approximate_tokens,
+        original_output_text: String::new(),
+        invocation_sha256: None,
         semantic_class: "test_projection".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
         predetermined_ranges: vec![ToolOutputProjectionRange {
@@ -1029,7 +1064,10 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         canonical: outer_canonical.clone(),
         original_output_sha256: outer_canonical.sha256.clone(),
         original_output_tokens: outer_canonical.approximate_tokens,
+        original_output_text: String::new(),
+        invocation_sha256: None,
         semantic_class: "tool_output".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
         predetermined_ranges: Vec::new(),
@@ -1147,7 +1185,10 @@ async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier()
         canonical: outer_canonical.clone(),
         original_output_sha256: outer_canonical.sha256.clone(),
         original_output_tokens: outer_canonical.approximate_tokens,
+        original_output_text: String::new(),
+        invocation_sha256: None,
         semantic_class: "tool_output".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
         predetermined_ranges: Vec::new(),
@@ -1362,7 +1403,7 @@ fn direct_mcp_projection_keeps_error_metadata_and_non_text_modalities() {
         },
     };
 
-    let projected = projected_response_item(original, r#"{"version":1}"#.to_string());
+    let projected = projected_response_item(original, r#"{"version":1}"#.to_string(), true);
     let ResponseInputItem::McpToolCallOutput { call_id, output } = projected else {
         panic!("expected MCP response");
     };
@@ -1376,6 +1417,91 @@ fn direct_mcp_projection_keeps_error_metadata_and_non_text_modalities() {
             serde_json::json!({"type": "text", "text": r#"{"version":1}"#}),
             serde_json::json!({"type": "image", "data": "image-bytes", "mimeType": "image/png"}),
         ],
+    );
+}
+
+#[test]
+fn projected_response_item_drops_oversized_mcp_modalities() {
+    let original = ResponseInputItem::McpToolCallOutput {
+        call_id: "mcp-call".to_string(),
+        output: codex_protocol::mcp::CallToolResult {
+            content: vec![
+                serde_json::json!({"type": "text", "text": "original"}),
+                serde_json::json!({"type": "image", "data": "x".repeat(20_000), "mimeType": "image/png"}),
+            ],
+            structured_content: None,
+            is_error: Some(false),
+            meta: None,
+        },
+    };
+
+    let projected = projected_response_item(original, r#"{"artifact_id":"id"}"#.to_string(), false);
+    let ResponseInputItem::McpToolCallOutput { output, .. } = projected else {
+        panic!("expected MCP response");
+    };
+    assert_eq!(
+        output.content,
+        vec![serde_json::json!({
+            "type": "text",
+            "text": r#"{"artifact_id":"id"}"#,
+        })]
+    );
+}
+
+#[test]
+fn projected_function_response_keeps_small_image_as_one_modality() {
+    let image = FunctionCallOutputContentItem::InputImage {
+        image_url: "data:image/png;base64,AAA".to_string(),
+        detail: None,
+    };
+    let original = ResponseInputItem::FunctionCallOutput {
+        call_id: "function-call".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "large original text".to_string(),
+                },
+                image.clone(),
+            ]),
+            success: Some(true),
+        },
+    };
+
+    let projected = projected_response_item(original, "bounded projection".to_string(), true);
+    let ResponseInputItem::FunctionCallOutput { output, .. } = projected else {
+        panic!("expected function response");
+    };
+    assert_eq!(
+        output.content_items(),
+        Some(
+            vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "bounded projection".to_string(),
+                },
+                image,
+            ]
+            .as_slice()
+        )
+    );
+}
+
+#[test]
+fn non_text_projection_token_cost_counts_small_and_large_content() {
+    let content = vec![serde_json::json!({
+        "type": "image",
+        "data": "image-bytes",
+        "mimeType": "image/png",
+    })];
+    let cost = non_text_projection_token_cost(&content);
+
+    assert!(cost > 0);
+    assert!(cost < 100);
+    assert!(cost <= 1_000usize.saturating_sub(MIN_PROJECTION_ENVELOPE_TOKENS));
+    assert!(
+        non_text_projection_token_cost(&[serde_json::json!({
+            "type": "image",
+            "data": "x".repeat(20_000),
+        })]) > 100
     );
 }
 
@@ -1962,4 +2088,181 @@ fn test_invocation(
             arguments: "{}".to_string(),
         },
     }
+}
+
+#[test]
+fn invocation_identity_is_order_independent_but_action_sensitive() {
+    let first = ToolPayload::Function {
+        arguments: r#"{"path":"a.rs","line":7}"#.to_string(),
+    };
+    let reordered = ToolPayload::Function {
+        arguments: r#"{"line":7,"path":"a.rs"}"#.to_string(),
+    };
+    let different_action = ToolPayload::Function {
+        arguments: r#"{"path":"b.rs","line":7}"#.to_string(),
+    };
+
+    assert_eq!(
+        canonical_tool_invocation_sha256(&first),
+        canonical_tool_invocation_sha256(&reordered)
+    );
+    assert_ne!(
+        canonical_tool_invocation_sha256(&first),
+        canonical_tool_invocation_sha256(&different_action)
+    );
+}
+
+#[test]
+fn admission_normalizes_multi_text_output_without_dropping_non_text_content() {
+    let original = ResponseInputItem::FunctionCallOutput {
+        call_id: "multi-text-call".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "first".to_string(),
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,eA==".to_string(),
+                    detail: None,
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "second".to_string(),
+                },
+            ]),
+            success: Some(true),
+        },
+    };
+
+    assert_eq!(history_output_text(&original), None);
+    let (normalized, text) =
+        normalize_admission_response(original).expect("normalized admission response");
+
+    assert_eq!(text, "first\nsecond");
+    assert_eq!(
+        history_output_text(&normalized).as_deref(),
+        Some("first\nsecond")
+    );
+    assert_eq!(preserved_non_text_content(&normalized).len(), 1);
+}
+
+#[test]
+fn admission_fallback_covers_default_text_and_non_text_outputs() {
+    let text_response = ResponseInputItem::FunctionCallOutput {
+        call_id: "default-text".to_string(),
+        output: FunctionCallOutputPayload::from_text("ordinary result".to_string()),
+    };
+    let text_metadata = admission_fallback_metadata(&text_response, ToolOutputOutcome::Success)
+        .expect("function output fallback metadata");
+    assert_eq!(text_metadata.spillable_text, vec!["ordinary result"]);
+    assert_eq!(text_metadata.outcome, ToolOutputOutcome::Success);
+    let text_canonical = admission_fallback_canonical_result(
+        &text_metadata.spillable_text.join("\n"),
+        &[],
+        serde_json::json!({"unused": true}),
+    );
+    assert_eq!(text_canonical.kind, CanonicalToolResultKind::Text);
+    assert_eq!(text_canonical.bytes.as_slice(), b"ordinary result");
+
+    let image_response = ResponseInputItem::FunctionCallOutput {
+        call_id: "default-image".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,eA==".to_string(),
+                    detail: None,
+                },
+            ]),
+            success: Some(true),
+        },
+    };
+    let image_metadata = admission_fallback_metadata(&image_response, ToolOutputOutcome::Success)
+        .expect("function image fallback metadata");
+    assert_eq!(image_metadata.spillable_text, vec![""]);
+    let preserved = preserved_non_text_content(&image_response);
+    let image_canonical = admission_fallback_canonical_result(
+        &image_metadata.spillable_text.join("\n"),
+        &preserved,
+        serde_json::json!({"image_url": "data:image/png;base64,eA=="}),
+    );
+    assert_eq!(image_canonical.kind, CanonicalToolResultKind::Json);
+    assert_eq!(
+        image_canonical.value,
+        Some(serde_json::json!({"image_url": "data:image/png;base64,eA=="}))
+    );
+}
+
+#[test]
+fn admission_fallback_does_not_retype_structured_tool_search_output() {
+    let response = ResponseInputItem::ToolSearchOutput {
+        call_id: "tool-search".to_string(),
+        status: "completed".to_string(),
+        execution: "client".to_string(),
+        tools: vec![serde_json::json!({"name": "example"})],
+        omitted_result_count: None,
+    };
+
+    assert!(admission_fallback_metadata(&response, ToolOutputOutcome::Success).is_none());
+
+    let empty_response = ResponseInputItem::FunctionCallOutput {
+        call_id: "empty".to_string(),
+        output: FunctionCallOutputPayload::from_text(String::new()),
+    };
+    assert!(admission_fallback_metadata(&empty_response, ToolOutputOutcome::Success).is_none());
+}
+
+#[tokio::test]
+async fn admission_only_projection_preserves_original_response_and_registers_candidate() {
+    let temp = tempfile::tempdir().expect("temporary Codex home");
+    let output = "ordinary inline result".to_string();
+    let canonical = CanonicalToolResult::text(output.clone());
+    let original_response = ResponseInputItem::FunctionCallOutput {
+        call_id: "ordinary-call".to_string(),
+        output: FunctionCallOutputPayload::from_text(output.clone()),
+    };
+    let invocation_sha256 = crate::tool_history::sha256(b"normalized invocation");
+    let projection = project_model_output(ModelProjectionInput {
+        spillable_text: output.clone(),
+        outcome: ToolOutputOutcome::Success,
+        essential_inline: serde_json::json!({}),
+        origin_call_id: "ordinary-call".to_string(),
+        selection_facts: ProjectionSelectionFacts {
+            mode: "generic_fallback",
+            available_fragments: 0,
+            selected_fragments: 0,
+            exact_duplicates_removed: 0,
+            selected_ids: Vec::new(),
+            omitted_inline_ids: Vec::new(),
+            partial_ids: Vec::new(),
+        },
+        applied_token_limit: 1_000,
+        projected_text: output.clone(),
+        preserved_content: Vec::new(),
+        codex_home: temp.path().to_path_buf(),
+        thread_id: "ordinary-thread".to_string(),
+        tool_name: "ordinary_tool".to_string(),
+        original_output_sha256: canonical.sha256.clone(),
+        original_output_tokens: canonical.approximate_tokens,
+        original_output_text: output.clone(),
+        invocation_sha256: Some(invocation_sha256.clone()),
+        canonical,
+        semantic_class: "tool_output".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
+        projection_eligible: true,
+        projection_truncated: false,
+        predetermined_ranges: Vec::new(),
+        predetermined_json_pointers: Vec::new(),
+        original_response: original_response.clone(),
+        materialization: ProjectionMaterialization::AdmissionOnly,
+    })
+    .await
+    .expect("admission-only projection");
+
+    assert_eq!(projection.response(), original_response);
+    let candidate = projection.candidate.expect("admission candidate");
+    assert_eq!(candidate.bounded_model_output, output);
+    assert!(
+        candidate
+            .supersession_identity
+            .is_some_and(|identity| identity.contains(&invocation_sha256))
+    );
 }

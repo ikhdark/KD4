@@ -2,6 +2,7 @@ mod agents_md;
 mod apps_instructions;
 mod environment;
 mod plugins_instructions;
+mod task_evidence;
 
 use crate::context::ContextualUserFragment;
 use codex_context_fragments::ModelContextBudget;
@@ -23,6 +24,8 @@ pub(crate) use agents_md::AgentsMdState;
 pub(crate) use apps_instructions::AppsInstructionsState;
 pub(crate) use environment::EnvironmentsState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
+pub(crate) use task_evidence::TaskEvidenceContext;
+pub(crate) use task_evidence::TaskEvidenceState;
 
 trait ErasedWorldStateSection: Send + Sync {
     fn snapshot(&self) -> Option<Value>;
@@ -32,6 +35,8 @@ trait ErasedWorldStateSection: Send + Sync {
     fn has_retained_fragment_matcher(&self) -> bool;
 
     fn matches_retained_fragment(&self, role: &str, text: &str) -> bool;
+
+    fn truncate_when_oversized(&self) -> bool;
 
     fn render_diff(
         &self,
@@ -73,6 +78,10 @@ impl<S: WorldStateSection> ErasedWorldStateSection for S {
 
     fn matches_retained_fragment(&self, role: &str, text: &str) -> bool {
         S::matches_retained_fragment(role, text)
+    }
+
+    fn truncate_when_oversized(&self) -> bool {
+        S::truncate_when_oversized()
     }
 
     fn render_diff(
@@ -123,6 +132,10 @@ impl ErasedWorldStateSection for ExtensionWorldStateSection {
 
     fn matches_retained_fragment(&self, role: &str, text: &str) -> bool {
         self.0.matches_retained_fragment(role, text)
+    }
+
+    fn truncate_when_oversized(&self) -> bool {
+        false
     }
 
     fn render_diff(
@@ -196,6 +209,12 @@ pub(crate) trait WorldStateSection: Send + Sync + 'static {
 
     /// Recognizes this section's rendered fragment in retained model history.
     fn matches_retained_fragment(_role: &str, _text: &str) -> bool {
+        false
+    }
+
+    /// Whether this section is mandatory enough to admit a bounded rendering instead of
+    /// silently dropping the whole structured fragment when it exceeds the shared budget.
+    fn truncate_when_oversized() -> bool {
         false
     }
 
@@ -358,11 +377,24 @@ impl WorldState {
                 PreviousSectionState::Absent | PreviousSectionState::Unknown => None,
             };
             let fragment = section.render_diff(previous);
-            let admitted = match fragment {
+            let snapshot_advanced = match fragment {
                 Some(fragment) => {
                     let rendered = fragment.render();
                     if !budget.try_take(&rendered) {
-                        false
+                        if section.truncate_when_oversized()
+                            && let Some(rendered) = budget.take(&rendered)
+                        {
+                            tracing::warn!(
+                                section_id = *id,
+                                "mandatory world-state section exceeded its context budget; admitted a bounded rendering"
+                            );
+                            let role = fragment.role();
+                            fragments.push(Box::new(RenderedContextFragment::new(role, rendered))
+                                as Box<dyn ContextualUserFragment>);
+                            false
+                        } else {
+                            false
+                        }
                     } else {
                         let role = fragment.role();
                         fragments.push(Box::new(RenderedContextFragment::new(role, rendered))
@@ -373,7 +405,7 @@ impl WorldState {
                 None => true,
             };
 
-            let snapshot = if admitted {
+            let snapshot = if snapshot_advanced {
                 section.snapshot()
             } else {
                 rejected_snapshot

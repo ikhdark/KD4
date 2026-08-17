@@ -13,13 +13,14 @@ use super::LegacyModelMismatchWarning;
 use super::LegacyUnifiedExecProcessLimitWarning;
 use super::RecommendedPluginsInstructions;
 use super::SkillInstructions;
-use super::SourceClosureReuseContext;
 use super::SubagentNotification;
 use super::TaskCapsuleFragment;
+use super::TaskModelGuidance;
 use super::TurnAborted;
 use super::UserInstructions;
 use super::UserShellCommand;
 use super::world_state::EnvironmentsState;
+use super::world_state::TaskEvidenceContext;
 
 static USER_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<UserInstructions> =
     FragmentRegistrationProxy::new();
@@ -55,7 +56,9 @@ static LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION: FragmentRegistrationProxy<
 > = FragmentRegistrationProxy::new();
 static TASK_CAPSULE_REGISTRATION: FragmentRegistrationProxy<TaskCapsuleFragment> =
     FragmentRegistrationProxy::new();
-static SOURCE_CLOSURE_REUSE_REGISTRATION: FragmentRegistrationProxy<SourceClosureReuseContext> =
+static TASK_MODEL_GUIDANCE_REGISTRATION: FragmentRegistrationProxy<TaskModelGuidance> =
+    FragmentRegistrationProxy::new();
+static TASK_EVIDENCE_STATE_REGISTRATION: FragmentRegistrationProxy<TaskEvidenceContext> =
     FragmentRegistrationProxy::new();
 
 static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
@@ -74,7 +77,8 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &LEGACY_APPLY_PATCH_EXEC_COMMAND_WARNING_REGISTRATION,
     &LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION,
     &TASK_CAPSULE_REGISTRATION,
-    &SOURCE_CLOSURE_REUSE_REGISTRATION,
+    &TASK_MODEL_GUIDANCE_REGISTRATION,
+    &TASK_EVIDENCE_STATE_REGISTRATION,
 ];
 
 static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
@@ -82,6 +86,8 @@ static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &ENVIRONMENT_CONTEXT_REGISTRATION,
     &SKILL_INSTRUCTIONS_REGISTRATION,
     &RECOMMENDED_PLUGINS_REGISTRATION,
+    &TASK_MODEL_GUIDANCE_REGISTRATION,
+    &TASK_EVIDENCE_STATE_REGISTRATION,
 ];
 
 fn is_standard_contextual_user_text(text: &str) -> bool {

@@ -27,6 +27,7 @@ use super::model_attempt_phase_durations;
 use super::new_attempt_id;
 use super::new_attempt_identity;
 use super::new_sampling_request_id;
+use super::selected_tool_schema_breakdown;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -410,6 +411,8 @@ fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
         None,
         measurements.clone(),
         super::ModelAttemptClock::new(),
+        None,
+        None,
     );
     let mut retry = ModelAttemptGuard::new(
         test_session_telemetry(),
@@ -421,6 +424,8 @@ fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
         None,
         measurements,
         super::ModelAttemptClock::new(),
+        None,
+        None,
     );
     assert_eq!(first.sampling_request_id, retry.sampling_request_id);
     assert_ne!(first.attempt_id, retry.attempt_id);
@@ -460,6 +465,74 @@ fn model_request_measurements_count_serialized_tools_independently() {
         i64::try_from(approx_token_count(&serialized_tools)).expect("tool token count fits in i64")
     );
     assert_ne!(measured.tool_token_count, 123_456);
+    let categories = measured.request_token_categories();
+    assert_eq!(measured.tool_schema_breakdown.len(), 1);
+    assert_eq!(measured.tool_schema_breakdown[0].name, "lookup");
+    assert!(measured.tool_schema_breakdown[0].serialized_bytes > 0);
+    assert!(measured.tool_schema_breakdown[0].approx_tokens > 0);
+    assert!(measured.producer_selected_context_tokens() <= categories.logical_total);
+    assert!(measured.density_bps(measured.producer_selected_context_tokens()) <= 10_000);
+}
+
+#[test]
+fn model_request_measurements_flatten_namespaces_and_mark_observed_tool_use() {
+    let mut request = history_test_request(vec![history_test_item("input", None)]);
+    request.tools = Some(vec![json!({
+        "type": "namespace",
+        "name": "agents",
+        "description": "Agent lifecycle tools",
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Spawn one agent",
+                "parameters": {"type": "object"}
+            },
+            {
+                "type": "function",
+                "name": "wait_agent",
+                "description": "Wait for one agent",
+                "parameters": {"type": "object"}
+            }
+        ]
+    })]);
+    let measured = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &history_test_provenance(&request),
+        &request.instructions,
+    )
+    .expect("measure namespaced tools");
+
+    assert_eq!(measured.tool_schema_breakdown.len(), 2);
+    assert!(
+        measured
+            .tool_schema_breakdown
+            .iter()
+            .all(|schema| schema.namespace.as_deref() == Some("agents"))
+    );
+    let selected = selected_tool_schema_breakdown(
+        &measured.tool_schema_breakdown,
+        &[ResponseItem::FunctionCall {
+            id: None,
+            name: "spawn_agent".to_string(),
+            namespace: Some("agents".to_string()),
+            arguments: "{}".to_string(),
+            call_id: "call-1".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }],
+    );
+    assert!(
+        selected
+            .iter()
+            .find(|schema| schema.name == "spawn_agent")
+            .is_some_and(|schema| schema.selected_by_model)
+    );
+    assert!(
+        selected
+            .iter()
+            .find(|schema| schema.name == "wait_agent")
+            .is_some_and(|schema| !schema.selected_by_model)
+    );
 }
 
 #[test]
@@ -634,6 +707,7 @@ fn model_attempt_offsets_require_monotonic_elapsed_values_and_allow_nulls() {
         dispatch_ready_us: 10,
         stream_established_us: Some(20),
         first_provider_event_us: Some(30),
+        first_actionable_output_us: Some(35),
         first_model_output_us: Some(40),
         first_visible_output_us: Some(50),
     };
@@ -879,6 +953,7 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
         prompt_cache_key: Some("stale".to_string()),
         category_hashes: BTreeMap::new(),
         ordered_fixed_hashes: Vec::new(),
+        digests: Default::default(),
     });
     let (sender, receiver) = tokio::sync::oneshot::channel();
     sender

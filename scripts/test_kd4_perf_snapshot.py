@@ -130,6 +130,11 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         def attempt(request_id: str, attempt_id: str, wait: int, **overrides: object) -> dict[str, object]:
             record: dict[str, object] = {
                 "event.name": "codex.model_attempt",
+                "turn_id": "turn-1",
+                "generation_index": 2,
+                "generation_purpose": "implementation",
+                "generation_disposition": "decision_bearing",
+                "relevant_state_fingerprint": "state-1",
                 "sampling_request_id": request_id,
                 "attempt_id": attempt_id,
                 "retry_index": 0,
@@ -138,7 +143,9 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                 "transport": "responses_http",
                 "request_kind": "initial",
                 "dispatch_ready_us": 10,
-                "first_model_output_us": 10 + wait,
+                "first_model_output_us": 11,
+                "first_actionable_output_us": 10 + wait,
+                "completed_us": 10 + wait,
                 "input_token_count": 10,
                 "cached_input_token_count": 4,
                 "uncached_input_token_count": 6,
@@ -160,31 +167,40 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         records = [
             attempt("clean-1", "a", 100),
             attempt("clean-2", "b", 200, cached_input_token_count=5, uncached_input_token_count=5),
-            attempt("retry", "c", 300),
+            attempt("retry", "c", 300, outcome="failed"),
             attempt("retry", "d", 400, retry_index=1),
             attempt("failed", "e", 500, outcome="failed"),
             attempt("cancelled", "f", 600, outcome="cancelled"),
-            attempt("missing", "g", 700, first_model_output_us=None),
+            attempt("missing", "g", 700, first_actionable_output_us=None),
         ]
         analysis = kd4_model_attempt_analysis.analyze(records, {"malformed_json": 1})
 
         self.assertEqual(analysis["totalPhysicalAttempts"], 7)
-        self.assertEqual(analysis["includedLogicalRequests"], 2)
-        self.assertEqual(analysis["outcomeCounts"], {"success": 5, "failed": 1, "cancelled": 1})
-        self.assertEqual(analysis["exclusionCounts"]["multiple_physical_attempts"], 1)
-        self.assertEqual(analysis["exclusionCounts"]["outcome_failed"], 1)
-        self.assertEqual(analysis["exclusionCounts"]["outcome_cancelled"], 1)
-        self.assertEqual(analysis["exclusionCounts"]["missing_first_model_output"], 1)
+        self.assertEqual(analysis["includedPhysicalAttempts"], 4)
+        self.assertEqual(analysis["includedLogicalRequests"], 3)
+        self.assertEqual(analysis["outcomeCounts"], {"success": 4, "failed": 2, "cancelled": 1})
+        self.assertEqual(analysis["exclusionCounts"]["no_terminal_success"], 2)
+        self.assertEqual(
+            analysis["exclusionCounts"]["missing_first_actionable_output_us"], 1
+        )
         group = analysis["groups"][0]
-        self.assertEqual(group["sampleCount"], 2)
-        self.assertEqual(group["firstOutputWaitUs"]["p50"], 150.0)
+        self.assertEqual(group["sampleCount"], 3)
+        self.assertEqual(group["generationPurpose"], "implementation")
+        self.assertEqual(group["generationDisposition"], "decision_bearing")
+        self.assertEqual(group["decisionLatencyUs"]["p50"], 200.0)
         bins = group["predictors"]["cached_input_token_count"]["quantileBins"]
-        self.assertEqual(sum(item["count"] for item in bins), 2)
-        self.assertEqual(analysis["componentReconciliation"]["coveredCount"], 2)
-        self.assertEqual(analysis["componentReconciliation"]["withinToleranceCount"], 2)
+        self.assertEqual(sum(item["count"] for item in bins), 3)
+        self.assertEqual(analysis["componentReconciliation"]["coveredCount"], 3)
+        self.assertEqual(analysis["componentReconciliation"]["withinToleranceCount"], 3)
         self.assertEqual(analysis["componentReconciliation"]["suppliedResidualMismatchCount"], 0)
-        self.assertEqual(len(analysis["rows"]), 2)
-        self.assertEqual(analysis["interpretation"], "observational and non-causal")
+        self.assertEqual(len(analysis["rows"]), 3)
+        retry_row = next(
+            row for row in analysis["rows"] if row["sampling_request_id"] == "retry"
+        )
+        self.assertEqual(retry_row["retry_count"], 1)
+        self.assertEqual(retry_row["retry_overhead_us"], 300.0)
+        self.assertEqual(retry_row["decision_latency_us"], 700.0)
+        self.assertIn("dispatch-to-first-actionable-output", analysis["interpretation"])
         human = kd4_model_attempt_analysis.render(analysis)
         self.assertIn("tokens p50/p95", human)
         self.assertIn("spearman=", human)

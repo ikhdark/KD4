@@ -16,6 +16,10 @@
     "agent_type": {
       "type": "string"
     },
+    "compaction_summary": {
+      "description": "Validated local compaction checkpoint. Remote compaction remains opaque.",
+      "type": "string"
+    },
     "cwd": {
       "type": "string"
     },

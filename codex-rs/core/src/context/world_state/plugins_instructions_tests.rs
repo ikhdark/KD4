@@ -35,9 +35,21 @@ fn renders_only_when_plugins_become_available() {
         Vec::<String>::new()
     );
     assert_eq!(
-        render(unavailable, PreviousSectionState::Known(&true_snapshot)),
-        Vec::<String>::new()
+        render(unavailable, PreviousSectionState::Known(&true_snapshot)).len(),
+        1
     );
+}
+
+#[test]
+fn renders_revocation_when_plugins_become_unavailable() {
+    let true_snapshot = true;
+    let rendered = render(
+        PluginsInstructionsState::new(/*available*/ false),
+        PreviousSectionState::Known(&true_snapshot),
+    );
+
+    assert_eq!(rendered.len(), 1);
+    assert!(rendered[0].contains("Previously provided plugin guidance no longer applies"));
 }
 
 #[test]

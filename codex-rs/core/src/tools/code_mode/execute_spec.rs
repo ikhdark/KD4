@@ -62,7 +62,7 @@ mod tests {
                 &[],
                 &BTreeMap::new(),
                 /*code_mode_only*/ true,
-                &["read_source_batch".to_string()],
+                &["direct_helper".to_string()],
             ),
             ToolSpec::Freeform(FreeformTool {
                 name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
@@ -71,7 +71,7 @@ mod tests {
                     &[],
                     &BTreeMap::new(),
                     /*code_mode_only*/ true,
-                    &["read_source_batch".to_string()],
+                    &["direct_helper".to_string()],
                 ),
                 format: FreeformToolFormat {
                     r#type: "grammar".to_string(),

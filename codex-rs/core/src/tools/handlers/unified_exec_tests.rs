@@ -236,6 +236,64 @@ fn test_get_command_launches_structured_argv_without_shell_wrapping() -> anyhow:
 }
 
 #[tokio::test]
+async fn repeated_rg_miss_is_suppressed_without_a_second_process_launch() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    #[allow(deprecated)]
+    let repo_root = get_git_repo_root(turn.cwd.as_path()).expect("test cwd is in a git repository");
+    let search_target = repo_root.join("codex-rs/core/src/tools/command_execution.rs");
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "rg",
+            "args": [
+                "-n",
+                "__codex_negative_cache_unmatched_probe__",
+                search_target,
+            ],
+        })
+        .to_string(),
+    };
+
+    let ((first, second), launches) =
+        crate::tools::runtimes::unified_exec::test_observation::observe(async {
+            let first = run_exec_command_for_test(
+                &session,
+                &turn,
+                "negative-cache-first-miss",
+                payload.clone(),
+            )
+            .await;
+            let second = ExecCommandHandler::default()
+                .handle(ToolInvocation {
+                    session: Arc::clone(&session),
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    turn: Arc::clone(&turn),
+                    cancellation_token: tokio_util::sync::CancellationToken::new(),
+                    tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                    call_id: "negative-cache-repeated-miss".to_string(),
+                    tool_name: codex_tools::ToolName::plain("exec_command"),
+                    source: ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await;
+            (first, second)
+        })
+        .await;
+
+    assert_eq!(launches.process_launches, 1);
+    assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
+    let second_error = match second {
+        Ok(_) => panic!("the equivalent negative search should be suppressed"),
+        Err(error) => error,
+    };
+    let message = second_error.to_string();
+    assert!(message.contains("equivalent search already produced a negative result"));
+    assert!(message.contains("execution was suppressed"));
+}
+
+#[tokio::test]
 async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches() {
     let (session, turn, rx_event) = make_session_and_context_with_rx().await;
     assert!(

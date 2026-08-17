@@ -37,6 +37,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_utils_output_truncation::approx_token_count;
+use std::collections::HashSet;
 
 #[path = "compact_remote_request.rs"]
 mod request;
@@ -45,6 +46,8 @@ use request::run_remote_compact_attempt;
 
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
+const REMOTE_COMPACTION_TOOL_RECEIPT_MAX_TOKENS: usize = 2_000;
+const REMOTE_COMPACTION_TOOL_RECEIPT_MAX_ITEMS: usize = 32;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -169,7 +172,13 @@ async fn run_remote_compact_task_inner(
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
     if result.is_ok() {
-        let post_compact_outcome = run_post_compact_hooks(sess, turn_context, trigger).await;
+        let recovery_summary = sess
+            .services
+            .task_evidence
+            .compaction_recovery_summary()
+            .await;
+        let post_compact_outcome =
+            run_post_compact_hooks(sess, turn_context, trigger, Some(&recovery_summary)).await;
         if let PostCompactHookOutcome::Stopped { reason } = post_compact_outcome {
             crate::hook_runtime::emit_hook_stop_reason(
                 sess,
@@ -291,7 +300,9 @@ async fn run_remote_compact_task_inner_impl(
 
     let reference_context_item = match &initial_context_injection {
         InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::AtStart(_) | InitialContextInjection::BeforeLastUserMessage(_) => {
+        InitialContextInjection::AtStart(_) => Some(compaction_turn_context.to_turn_context_item()),
+        #[cfg(test)]
+        InitialContextInjection::BeforeLastUserMessage(_) => {
             Some(compaction_turn_context.to_turn_context_item())
         }
     };
@@ -338,7 +349,7 @@ pub(crate) async fn process_compacted_history(
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
 
-    compacted_history.retain(should_keep_compacted_history_item);
+    compacted_history = bounded_remote_compacted_history(compacted_history);
     (
         insert_compaction_initial_context(
             compacted_history,
@@ -354,45 +365,163 @@ pub(crate) async fn process_compacted_history(
 /// Called while processing the model-provided compacted transcript, before we
 /// append fresh canonical context from the current session.
 ///
-/// We drop:
-/// - `developer` messages because remote output can include stale/duplicated
-///   instruction content.
-/// - non-user-content `user` messages (session prefix/instruction wrappers),
-///   while preserving real user messages and persisted hook prompts.
-///
-/// This intentionally keeps:
-/// - `assistant` messages (future remote compaction models may emit them)
-/// - `user`-role warnings that parse as `TurnItem::UserMessage` and compaction-generated summary
-///   messages. Legacy warning fragments are filtered by `parse_turn_item` before they reach this
-///   check.
-/// - tool calls and outputs, because bounded outputs can contain opaque artifact IDs used to
-///   recover exact omitted ranges after compaction.
+/// Raw messages are consumed evidence after the remote endpoint has produced an opaque
+/// compaction item. Only that item and recoverable tool receipts remain eligible; fresh current
+/// instructions and durable task state are injected separately by the caller.
 pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
-    match item {
-        ResponseItem::Message { role, .. } if role == "developer" => false,
-        ResponseItem::Message { role, .. } if role == "user" => {
-            matches!(
-                crate::event_mapping::parse_turn_item(item),
-                Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
-            )
+    matches!(
+        item,
+        ResponseItem::Compaction { .. }
+            | ResponseItem::ContextCompaction { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+    )
+}
+
+fn bounded_remote_compacted_history(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+    let mut retained_indices = HashSet::new();
+    let mut remaining_tokens = REMOTE_COMPACTION_TOOL_RECEIPT_MAX_TOKENS;
+    let mut retained_tool_items = 0usize;
+    let mut retained_compaction = false;
+
+    for (index, item) in items.iter().enumerate().rev() {
+        match item {
+            ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+                if !retained_compaction =>
+            {
+                retained_compaction = true;
+                retained_indices.insert(index);
+            }
+            item if should_keep_compacted_history_item(item) => {
+                let Some(group) = complete_tool_receipt_indices(&items, index) else {
+                    continue;
+                };
+                if !group
+                    .iter()
+                    .any(|index| item_has_recoverable_artifact_reference(&items[*index]))
+                {
+                    continue;
+                }
+                if group.iter().any(|index| retained_indices.contains(index)) {
+                    continue;
+                }
+                if retained_tool_items.saturating_add(group.len())
+                    > REMOTE_COMPACTION_TOOL_RECEIPT_MAX_ITEMS
+                {
+                    continue;
+                }
+                let tokens = group.iter().fold(0usize, |total, index| {
+                    let item_tokens =
+                        usize::try_from(estimate_item_token_count(&items[*index]).max(1))
+                            .unwrap_or(usize::MAX);
+                    total.saturating_add(item_tokens)
+                });
+                if tokens <= remaining_tokens {
+                    retained_tool_items = retained_tool_items.saturating_add(group.len());
+                    remaining_tokens = remaining_tokens.saturating_sub(tokens);
+                    retained_indices.extend(group);
+                }
+            }
+            _ => {}
         }
-        ResponseItem::Message { role, .. } if role == "assistant" => true,
-        ResponseItem::Message { .. } => false,
-        ResponseItem::AgentMessage { .. } => true,
-        ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
-        ResponseItem::CompactionTrigger { .. } => false,
-        ResponseItem::LocalShellCall { .. }
-        | ResponseItem::FunctionCall { .. }
-        | ResponseItem::ToolSearchCall { .. }
-        | ResponseItem::FunctionCallOutput { .. }
-        | ResponseItem::ToolSearchOutput { .. }
-        | ResponseItem::CustomToolCall { .. }
-        | ResponseItem::CustomToolCallOutput { .. }
-        | ResponseItem::WebSearchCall { .. }
-        | ResponseItem::ImageGenerationCall { .. } => true,
-        ResponseItem::AdditionalTools { .. }
-        | ResponseItem::Reasoning { .. }
-        | ResponseItem::Other => false,
+    }
+
+    items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, item)| retained_indices.contains(&index).then_some(item))
+        .collect()
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ToolReceiptKind {
+    Function,
+    Custom,
+    Search,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ToolReceiptSide {
+    Call,
+    Output,
+}
+
+fn complete_tool_receipt_indices(items: &[ResponseItem], index: usize) -> Option<Vec<usize>> {
+    let (kind, side, call_id) = tool_receipt_identity(&items[index])?;
+    let counterpart_side = match side {
+        ToolReceiptSide::Call => ToolReceiptSide::Output,
+        ToolReceiptSide::Output => ToolReceiptSide::Call,
+    };
+    let counterpart = items
+        .iter()
+        .enumerate()
+        .find_map(|(candidate_index, item)| {
+            let (candidate_kind, candidate_side, candidate_call_id) = tool_receipt_identity(item)?;
+            (candidate_kind == kind
+                && candidate_side == counterpart_side
+                && candidate_call_id == call_id)
+                .then_some(candidate_index)
+        })?;
+    let mut group = vec![index, counterpart];
+    group.sort_unstable();
+    group.dedup();
+    Some(group)
+}
+
+fn item_has_recoverable_artifact_reference(item: &ResponseItem) -> bool {
+    let text = match item {
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => output.body.to_text(),
+        _ => None,
+    };
+    text.is_some_and(|text| has_recoverable_artifact_reference(&text))
+}
+
+fn has_recoverable_artifact_reference(text: &str) -> bool {
+    let lowercase = text.to_ascii_lowercase();
+    let has_recovery_cue = lowercase.contains("read_tool_output")
+        || lowercase.contains("raw output artifact:")
+        || lowercase.contains("raw_output_artifact_id")
+        || lowercase.contains("available as artifact")
+        || lowercase.contains("retained as artifact");
+    has_recovery_cue
+        && text
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+            .any(|candidate| uuid::Uuid::parse_str(candidate).is_ok())
+}
+
+fn tool_receipt_identity(item: &ResponseItem) -> Option<(ToolReceiptKind, ToolReceiptSide, &str)> {
+    match item {
+        ResponseItem::LocalShellCall {
+            call_id: Some(call_id),
+            ..
+        }
+        | ResponseItem::FunctionCall { call_id, .. } => {
+            Some((ToolReceiptKind::Function, ToolReceiptSide::Call, call_id))
+        }
+        ResponseItem::FunctionCallOutput { call_id, .. } => {
+            Some((ToolReceiptKind::Function, ToolReceiptSide::Output, call_id))
+        }
+        ResponseItem::CustomToolCall { call_id, .. } => {
+            Some((ToolReceiptKind::Custom, ToolReceiptSide::Call, call_id))
+        }
+        ResponseItem::CustomToolCallOutput { call_id, .. } => {
+            Some((ToolReceiptKind::Custom, ToolReceiptSide::Output, call_id))
+        }
+        ResponseItem::ToolSearchCall {
+            call_id: Some(call_id),
+            ..
+        } => Some((ToolReceiptKind::Search, ToolReceiptSide::Call, call_id)),
+        ResponseItem::ToolSearchOutput {
+            call_id: Some(call_id),
+            ..
+        } => Some((ToolReceiptKind::Search, ToolReceiptSide::Output, call_id)),
+        _ => None,
     }
 }
 

@@ -5565,7 +5565,6 @@
       "enum": [
         "unchanged_wait",
         "artifact_range",
-        "source_projection",
         "agent_event_wait"
       ],
       "type": "string"
@@ -5573,8 +5572,7 @@
     "DeterministicContinuationHostAction": {
       "enum": [
         "await_state_change",
-        "drain_artifact_ranges",
-        "reuse_source_coverage"
+        "drain_artifact_ranges"
       ],
       "type": "string"
     },
@@ -19281,6 +19279,23 @@
           },
           "type": "array"
         },
+        "observationalNonprogressLatency": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingDiagnosticLatencyAggregate"
+            }
+          ],
+          "default": {
+            "decisionLatencyNs": 0,
+            "decisionReadyAttempts": 0,
+            "logicalGenerations": 0,
+            "modelStreamWaitNs": 0,
+            "physicalAttempts": 0,
+            "toolActiveUnionNs": 0,
+            "toolCalls": 0
+          },
+          "description": "Latency observed on the same unchanged-state, unchanged-next-action generations as `observational_nonprogress_tokens`. Model-stream wait remains a model-side wall-clock measurement; `decision_latency_ns` narrows that to dispatch-to-first-actionable-output where observable."
+        },
         "observationalNonprogressTokens": {
           "allOf": [
             {
@@ -19419,73 +19434,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "architectureBytesRead": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureFilesRead": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureInvariantCount": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureLateRelationshipDiscoveryCount": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureMaterialUnknownCount": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureMissingRequirementCount": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureRelationshipCount": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureSliceAttemptCount": {
-          "default": 0,
-          "description": "Aggregate-only architecture-comprehension telemetry. These counters do not contain repository paths, symbols, relationship text, or evidence.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureSliceCompleteCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureStaleSnapshotCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "architectureToolCallCount": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "attemptsByKind": {
           "allOf": [
             {
@@ -19523,9 +19471,30 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "duplicateValidationCount": {
+          "default": 0,
+          "description": "Validation requests identified as duplicates and served from the ledger.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "exactRepeatedWaitCount": {
           "default": 0,
           "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "executedValidationCount": {
+          "default": 0,
+          "description": "Validation commands that executed rather than reusing a proof.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "executedValidationDurationNs": {
+          "default": 0,
+          "description": "Total wall-clock nanoseconds spent in validation commands that executed.",
+          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -19537,6 +19506,13 @@
         },
         "failureSignatureCount": {
           "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "forcedFreshValidationCount": {
+          "default": 0,
+          "description": "Executed validation requests that explicitly bypassed reusable proof state.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -19725,48 +19701,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "sourceConditionalUnchangedCount": {
-          "default": 0,
-          "description": "Physical source reads whose automatically or explicitly supplied conditional identity proved unchanged.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sourceExactProjectionReuseCount": {
-          "default": 0,
-          "description": "Exact source projections acknowledged without replaying source text.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sourceHostDrainedContinuationCount": {
-          "default": 0,
-          "description": "Source-specific deterministic continuations drained by the owner.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sourceModelVisibleNewEvidenceCount": {
-          "default": 0,
-          "description": "New source evidence fragments actually exposed to a started model generation.",
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sourceOverlapRangeEliminationCount": {
-          "default": 0,
-          "description": "Coherent overlapping source intervals removed from model-visible text.",
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sourcePhysicalRangeAvoidedCount": {
-          "default": 0,
-          "description": "Requested source ranges that did not require an independent physical read because exact or same-operation coverage was reused.",
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "suppressedDeterministicContinuationCount": {
           "default": 0,
           "description": "Authoritative number of model boundaries suppressed by accepted deterministic-continuation receipts. A receipt whose `suppressed_continuation_count` is N contributes N, not one. Invalid, rejected, and zero-count receipts contribute nothing. This counter is independent of `generations_by_disposition`.",
@@ -19927,6 +19861,55 @@
         "stateRevision",
         "suppressedContinuationCount",
         "wireIdentity"
+      ],
+      "type": "object"
+    },
+    "TurnTimingDiagnosticLatencyAggregate": {
+      "properties": {
+        "decisionLatencyNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "decisionReadyAttempts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "logicalGenerations": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "modelStreamWaitNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "physicalAttempts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolActiveUnionNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolCalls": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "decisionLatencyNs",
+        "decisionReadyAttempts",
+        "logicalGenerations",
+        "modelStreamWaitNs",
+        "physicalAttempts",
+        "toolActiveUnionNs",
+        "toolCalls"
       ],
       "type": "object"
     },
@@ -20094,6 +20077,19 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "decisionLatencyNs": {
+          "default": 0,
+          "description": "Sum of dispatch-to-first-actionable-output latency for requests where an actionable output was observed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "decisionReadyRequests": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "generations": {
           "format": "uint32",
           "minimum": 0.0,
@@ -20119,6 +20115,13 @@
           "$ref": "#/definitions/TurnTimingGenerationPurpose"
         },
         "reasoningOutputTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolActiveUnionNs": {
+          "default": 0,
+          "description": "Sum of per-generation unioned tool-active durations. Parallel tools within one generation are not double-counted.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -20351,6 +20354,15 @@
     },
     "TurnTimingMilestones": {
       "properties": {
+        "firstActionableOutputMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "firstAgentMessageMs": {
           "default": null,
           "format": "uint64",
@@ -20369,8 +20381,88 @@
             "null"
           ]
         },
+        "firstSuccessfulUsefulActionMs": {
+          "default": null,
+          "description": "Time from turn start until the first non-control tool completes successfully.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstToolAcceptedMs": {
+          "default": null,
+          "description": "Time from turn start until the first tool call is accepted for dispatch.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstToolGateAdmittedMs": {
+          "default": null,
+          "description": "Time from turn start until the first tool call passes the parallel gate.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstToolHandlerEntryMs": {
+          "default": null,
+          "description": "Time from turn start until the first authorized tool handler is entered.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstUsefulActionMs": {
+          "default": null,
+          "description": "Time from turn start until the first authorized non-control tool handler is entered.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstUsefulToolAcceptedMs": {
+          "default": null,
+          "description": "Time from turn start until the first non-control tool is accepted for dispatch.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstUsefulToolGateAdmittedMs": {
+          "default": null,
+          "description": "Time from turn start until the first non-control tool passes the parallel gate.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "firstVisibleOutputMs": {
           "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "userInputRecordedMs": {
+          "default": null,
+          "description": "Time from turn start until the first user input begins durable recording.",
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -20399,6 +20491,15 @@
             "null"
           ]
         },
+        "decisionLatencyNs": {
+          "description": "Dispatch-to-first-actionable-output latency. This excludes reasoning deltas and partial tool arguments; missing actionable output stays null.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "dispatchMs": {
           "format": "uint64",
           "minimum": 0.0,
@@ -20414,6 +20515,14 @@
             }
           ],
           "default": "unknown"
+        },
+        "firstActionableOutputMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "firstModelOutputMs": {
           "format": "uint64",
@@ -20469,6 +20578,13 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "physicalAttemptIds": {
+          "description": "Physical provider attempts observed for this logical request, including retries and transport fallbacks.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "progressKinds": {
           "items": {
             "$ref": "#/definitions/TurnTimingProgressKind"
@@ -20499,6 +20615,13 @@
           ],
           "description": "Aggregate-only full logical prompt accounting. No prompt text, repository paths, tool arguments, or hashes are persisted here."
         },
+        "samplingRequestId": {
+          "description": "Stable identity shared by every physical provider attempt for this logical request.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "tokenUsage": {
           "anyOf": [
             {
@@ -20509,6 +20632,13 @@
             }
           ],
           "description": "Provider-reported usage for this physical attempt. Missing usage stays null, including failed attempts for which the provider reported none."
+        },
+        "toolActiveUnionNs": {
+          "default": 0,
+          "description": "Unioned tool-active duration attributed to this generation. Parallel tool calls are counted once per wall-clock interval.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         },
         "toolCallCount": {
           "default": 0,

@@ -262,6 +262,28 @@ fn mcp_tool_output_response_item_includes_wall_time() {
 }
 
 #[test]
+fn mcp_sampling_identity_excludes_wall_time() {
+    let result = CallToolResult {
+        content: vec![json!({ "type": "text", "text": "done" })],
+        structured_content: None,
+        is_error: Some(false),
+        meta: None,
+    };
+    let output = |wall_time| McpToolOutput {
+        result: result.clone(),
+        tool_input: json!({}),
+        wall_time,
+        original_image_detail_supported: false,
+        truncation_policy: TruncationPolicy::Bytes(1024),
+    };
+
+    assert_eq!(
+        output(std::time::Duration::from_millis(1)).sampling_request_signal(),
+        output(std::time::Duration::from_secs(9)).sampling_request_signal(),
+    );
+}
+
+#[test]
 fn mcp_tool_output_response_item_truncates_large_structured_content() {
     let output = McpToolOutput {
         result: CallToolResult {
@@ -442,6 +464,34 @@ fn custom_tool_calls_can_derive_text_from_content_items() {
         }
         other => panic!("expected CustomToolCallOutput, got {other:?}"),
     }
+}
+
+#[test]
+fn function_output_with_image_uses_complete_json_canonical_result() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let output = FunctionToolOutput::from_content(
+        vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "caption".to_string(),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,AAA".to_string(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+        ],
+        Some(true),
+    );
+
+    let canonical = output
+        .canonical_result(&payload)
+        .expect("canonical function output");
+    let value: serde_json::Value =
+        serde_json::from_slice(&canonical.bytes).expect("canonical JSON");
+
+    assert!(value.to_string().contains("data:image/png;base64,AAA"));
+    assert!(canonical.complete);
 }
 
 #[test]
@@ -656,6 +706,140 @@ fn telemetry_preview_truncates_by_lines() {
 }
 
 #[test]
+fn command_semantic_evidence_normalizes_read_only_presentations() {
+    let source_fact = "let stable = compute();";
+    let presentations = [
+        source_fact.to_string(),
+        format!("src/lib.rs:10:{source_fact}"),
+        format!("SOURCEMAP.md:494:{source_fact}"),
+        format!("diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+{source_fact}"),
+        format!("  --> src/lib.rs:10:1\n10 | {source_fact}\n   | ^^^"),
+    ];
+    let expected = semantic_evidence_for_command_output(presentations[0].as_bytes());
+    for presentation in &presentations[1..] {
+        assert_eq!(
+            semantic_evidence_for_command_output(presentation.as_bytes()),
+            expected
+        );
+        assert_eq!(
+            command_failure_signature(
+                &semantic_evidence_for_command_output(presentation.as_bytes()),
+                Some(1)
+            ),
+            command_failure_signature(&expected, Some(1))
+        );
+    }
+    assert_ne!(
+        semantic_evidence_for_command_output(b"let changed = compute();"),
+        expected
+    );
+}
+
+#[test]
+fn command_semantic_evidence_preserves_diagnostics_and_non_location_numbers() {
+    let source = "10 | let stable = compute();";
+    let first_diagnostic = format!("error[E0001]: first failure\n{source}");
+    let second_diagnostic = format!("error[E0002]: second failure\n{source}");
+    assert_ne!(
+        semantic_evidence_for_command_output(first_diagnostic.as_bytes()),
+        semantic_evidence_for_command_output(second_diagnostic.as_bytes())
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"service-a:8080: healthy"),
+        semantic_evidence_for_command_output(b"service-b:9090: healthy")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"12 failures remain"),
+        semantic_evidence_for_command_output(b"13 failures remain")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"https://service-a:8080: healthy"),
+        semantic_evidence_for_command_output(b"https://service-b:8080: healthy")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"db.example.com:5432: ready"),
+        semantic_evidence_for_command_output(b"cache.example.com:5432: ready")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"src/lib.rs:10:8080: healthy"),
+        semantic_evidence_for_command_output(b"src/lib.rs:10:9090: healthy")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"running 5 workers"),
+        semantic_evidence_for_command_output(b"running 6 workers")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"let value = \"a  b\";"),
+        semantic_evidence_for_command_output(b"let value = \"a b\";")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"10 | legitimate table value"),
+        semantic_evidence_for_command_output(b"legitimate table value")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"fact\n}"),
+        semantic_evidence_for_command_output(b"fact\n]")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"first fact\nsecond fact"),
+        semantic_evidence_for_command_output(b"second fact\nfirst fact")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(b"Ok"),
+        semantic_evidence_for_command_output(b"No")
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(&[0xff, b'a']),
+        semantic_evidence_for_command_output("�a".as_bytes())
+    );
+    assert_ne!(
+        semantic_evidence_for_command_output(
+            b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+same fact\nfatal: first"
+        ),
+        semantic_evidence_for_command_output(
+            b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+same fact\nfatal: second"
+        )
+    );
+}
+
+#[test]
+fn command_semantic_evidence_includes_facts_after_the_old_limit() {
+    let shared = (0..512)
+        .map(|index| format!("shared fact {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let first = format!("{shared}\nfirst tail fact");
+    let second = format!("{shared}\nsecond tail fact");
+    assert_ne!(
+        semantic_evidence_for_command_output(first.as_bytes()),
+        semantic_evidence_for_command_output(second.as_bytes())
+    );
+
+    let long_prefix = "x".repeat(4_096);
+    assert_ne!(
+        semantic_evidence_for_command_output(format!("{long_prefix} first").as_bytes()),
+        semantic_evidence_for_command_output(format!("{long_prefix} second").as_bytes())
+    );
+}
+
+#[test]
+fn command_semantic_evidence_preserves_fact_multiplicity() {
+    assert_ne!(
+        semantic_evidence_for_command_output(b"same fact\nsame fact"),
+        semantic_evidence_for_command_output(b"same fact")
+    );
+}
+
+#[test]
+fn command_failure_signature_preserves_exit_status() {
+    let evidence = semantic_evidence_for_command_output(b"same diagnostic");
+    assert_ne!(
+        command_failure_signature(&evidence, Some(1)),
+        command_failure_signature(&evidence, Some(2))
+    );
+}
+
+#[test]
 fn exec_command_tool_output_formats_truncated_response() {
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -664,12 +848,12 @@ fn exec_command_tool_output_formats_truncated_response() {
         event_call_id: "call-42".to_string(),
         chunk_id: "abc123".to_string(),
         wall_time: std::time::Duration::from_millis(1250),
-        raw_output: b"token one token two token three token four token five".to_vec(),
+        raw_output: vec![b'x'; 400],
         truncation_policy: TruncationPolicy::Tokens(10_000),
-        max_output_tokens: Some(4),
+        max_output_tokens: Some(20),
         process_id: None,
         exit_code: Some(0),
-        original_token_count: Some(10),
+        original_token_count: Some(100),
         hook_command: None,
         raw_output_artifact: None,
         repair_notice: None,
@@ -721,6 +905,29 @@ fn exec_command_projection_applies_hard_limit_and_reports_reduction() {
     assert!(projected.reduced);
     assert!(projected.text.contains("Warning: truncated output"));
     assert!(projected.text.contains("95 tokens truncated"));
+}
+
+#[test]
+fn exec_command_projection_reports_reduction_from_per_call_limit() {
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-per-call-limit".to_string(),
+        chunk_id: "chunk-per-call-limit".to_string(),
+        wall_time: std::time::Duration::from_millis(1),
+        raw_output: b"token one token two token three token four token five".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(4),
+        process_id: None,
+        exit_code: Some(0),
+        original_token_count: Some(10),
+        hook_command: None,
+        raw_output_artifact: None,
+        repair_notice: None,
+    };
+
+    let projected = output.projected_model_output();
+    assert!(projected.reduced);
+    assert!(projected.text.contains("80 tokens truncated"));
+    assert!(!projected.text.contains("0 tokens truncated"));
 }
 
 #[test]

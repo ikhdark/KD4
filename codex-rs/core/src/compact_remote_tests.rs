@@ -27,6 +27,17 @@ fn function_call_output(id: &str, call_id: &str, output: &str) -> ResponseItem {
     }
 }
 
+fn function_call(id: &str, call_id: &str) -> ResponseItem {
+    ResponseItem::FunctionCall {
+        id: Some(ResponseItemId::from_server(id.to_string())),
+        name: "read_tool_output".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
 fn custom_tool_call_output(id: &str, call_id: &str, output: &str) -> ResponseItem {
     ResponseItem::CustomToolCallOutput {
         id: Some(ResponseItemId::from_server(id.to_string())),
@@ -42,16 +53,78 @@ fn custom_tool_call_output(id: &str, call_id: &str, output: &str) -> ResponseIte
 
 #[test]
 fn remote_compaction_keeps_tool_outputs_with_recovery_references() {
-    let artifact_reference = "[output truncated; exact output retained as artifact 019fd974-843a-7601-8624-dc36cd5cc3cd]";
+    let artifact_reference = "[command output reduced; full retained output is available as artifact 019fd974-843a-7601-8624-dc36cd5cc3cd.\nUse read_tool_output with that id.]";
+    let items = vec![
+        function_call("call", "call-1"),
+        function_call_output("output", "call-1", artifact_reference),
+    ];
 
-    assert!(should_keep_compacted_history_item(&function_call_output(
-        "output-1",
-        "call-1",
-        artifact_reference,
-    )));
-    assert!(should_keep_compacted_history_item(
-        &custom_tool_call_output("output-2", "call-2", artifact_reference,)
-    ));
+    assert_eq!(bounded_remote_compacted_history(items.clone()), items);
+}
+
+#[test]
+fn remote_compaction_evicts_raw_messages_and_bounds_tool_receipts() {
+    let compaction = ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "opaque-state".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let items = vec![
+        message(
+            "raw-user",
+            "user",
+            ContentItem::InputText {
+                text: "consumed ".repeat(20_000),
+            },
+        ),
+        function_call("oversized-call", "call-oversized"),
+        function_call_output("oversized", "call-oversized", &"x".repeat(20_000)),
+        function_call("plain-call", "call-plain"),
+        function_call_output("plain", "call-plain", "artifact 123"),
+        function_call("recoverable-call", "call-recoverable"),
+        function_call_output(
+            "recoverable",
+            "call-recoverable",
+            "Raw output artifact: 019fd974-843a-7601-8624-dc36cd5cc3cd (123 bytes retained)",
+        ),
+        compaction.clone(),
+    ];
+
+    let retained = bounded_remote_compacted_history(items);
+
+    assert_eq!(
+        retained,
+        vec![
+            function_call("recoverable-call", "call-recoverable"),
+            function_call_output(
+                "recoverable",
+                "call-recoverable",
+                "Raw output artifact: 019fd974-843a-7601-8624-dc36cd5cc3cd (123 bytes retained)",
+            ),
+            compaction
+        ]
+    );
+}
+
+#[test]
+fn remote_compaction_drops_nonrecoverable_tool_receipts() {
+    let items = vec![
+        function_call("plain-call", "call-plain"),
+        function_call_output("plain", "call-plain", "successful consumed output"),
+    ];
+
+    assert!(bounded_remote_compacted_history(items).is_empty());
+}
+
+#[test]
+fn remote_compaction_drops_orphan_tool_receipts() {
+    let items = vec![function_call_output(
+        "orphan",
+        "call-orphan",
+        "artifact 123",
+    )];
+
+    assert!(bounded_remote_compacted_history(items).is_empty());
 }
 
 #[tokio::test]

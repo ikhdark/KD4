@@ -224,7 +224,13 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
 
     let req = second_mock.single_request();
     let (output_text, _success_flag) = call_output(&req, call_id);
-    assert_eq!(output_text, "Plan updated");
+    let output: serde_json::Value =
+        serde_json::from_str(&output_text).expect("update_plan output should be JSON");
+    assert_eq!(output["message"], "Plan updated");
+    assert_eq!(
+        output["current_plan"]["plan"].as_array().map(Vec::len),
+        Some(2)
+    );
 
     Ok(())
 }

@@ -335,10 +335,11 @@ async fn step_refresh_captures_environments_after_entering_refresh_gate() {
     thread_environments.update_selections(&[]);
     drop(refresh_guard);
 
-    let (environments, loaded) = refresh.await;
+    let (environments, observation) = refresh.await;
     assert_eq!(environments.generation, initial_generation + 1);
     assert!(environments.turn_environments.is_empty());
-    assert!(loaded.is_none());
+    assert!(observation.loaded.is_none());
+    assert_eq!(observation.freshness, AgentsMdFreshness::Refreshed);
     let cache = manager.cache.lock().await;
     assert_eq!(
         cache.key.as_ref().map(|key| key.environment_generation),
@@ -359,17 +360,35 @@ async fn same_key_read_failure_retains_last_successful_instructions_and_recovers
     let environments = environment_snapshot_with_environment(&config.cwd, 12, environment);
     let manager = AgentsMdManager::new(/*user_instructions*/ None);
 
-    manager.refresh(&config, &environments).await;
-    let first = manager.get_loaded().await.expect("first load");
+    let first_observation = manager.refresh_and_observe(&config, &environments).await;
+    assert_eq!(first_observation.freshness, AgentsMdFreshness::Refreshed);
+    let first = first_observation.loaded.expect("first load");
+    let cached_observation = manager.get_cached_observation().await;
+    assert_eq!(
+        cached_observation.freshness,
+        AgentsMdFreshness::CachedFallback
+    );
+    assert!(Arc::ptr_eq(
+        &first,
+        cached_observation.loaded.as_ref().expect("cached load")
+    ));
     filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
-    manager.refresh(&config, &environments).await;
-    let retained = manager.get_loaded().await.expect("retained load");
+    let retained_observation = manager.refresh_and_observe(&config, &environments).await;
+    assert_eq!(
+        retained_observation.freshness,
+        AgentsMdFreshness::CachedFallback
+    );
+    let retained = retained_observation.loaded.expect("retained load");
     assert!(Arc::ptr_eq(&first, &retained));
     assert_eq!(retained.text(), "version one");
 
     fs::write(&agents_path, "version two").expect("write recovered AGENTS.md");
-    manager.refresh(&config, &environments).await;
-    let recovered = manager.get_loaded().await.expect("recovered load");
+    let recovered_observation = manager.refresh_and_observe(&config, &environments).await;
+    assert_eq!(
+        recovered_observation.freshness,
+        AgentsMdFreshness::Refreshed
+    );
+    let recovered = recovered_observation.loaded.expect("recovered load");
     assert!(!Arc::ptr_eq(&retained, &recovered));
     assert_eq!(recovered.text(), "version two");
 }

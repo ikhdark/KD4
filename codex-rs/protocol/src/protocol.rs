@@ -2084,6 +2084,12 @@ pub struct TurnTiming {
     /// diagnostic and is never treated as measured avoidable savings.
     #[serde(default)]
     pub observational_nonprogress_tokens: TurnTimingDiagnosticTokenAggregate,
+    /// Latency observed on the same unchanged-state, unchanged-next-action
+    /// generations as `observational_nonprogress_tokens`. Model-stream wait
+    /// remains a model-side wall-clock measurement; `decision_latency_ns`
+    /// narrows that to dispatch-to-first-actionable-output where observable.
+    #[serde(default)]
+    pub observational_nonprogress_latency: TurnTimingDiagnosticLatencyAggregate,
     /// Bounded, aggregated host-managed continuation receipts. Resource
     /// identities are hashes; raw paths and payloads are never included.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2268,6 +2274,15 @@ pub struct TurnTimingModelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub relevant_state_fingerprint: Option<String>,
+    /// Stable identity shared by every physical provider attempt for this
+    /// logical request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sampling_request_id: Option<String>,
+    /// Physical provider attempts observed for this logical request, including
+    /// retries and transport fallbacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub physical_attempt_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub progress_kinds: Vec<TurnTimingProgressKind>,
     #[serde(default)]
@@ -2280,9 +2295,18 @@ pub struct TurnTimingModelRequest {
     /// Directly observed model-stream wait for this physical attempt.
     #[serde(default)]
     pub model_stream_wait_ns: u64,
+    /// Dispatch-to-first-actionable-output latency. This excludes reasoning
+    /// deltas and partial tool arguments; missing actionable output stays null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub decision_latency_ns: Option<u64>,
     /// Tool calls emitted by this generation. Recorded on its primary attempt.
     #[serde(default)]
     pub tool_call_count: u32,
+    /// Unioned tool-active duration attributed to this generation. Parallel
+    /// tool calls are counted once per wall-clock interval.
+    #[serde(default)]
+    pub tool_active_union_ns: u64,
     #[serde(default)]
     pub output_tokens: u64,
     #[serde(default)]
@@ -2303,6 +2327,9 @@ pub struct TurnTimingModelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub first_model_output_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub first_actionable_output_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub completed_ms: Option<u64>,
@@ -2366,7 +2393,6 @@ pub enum DeterministicContinuationClass {
     UnchangedWait,
     #[serde(alias = "source_bundle", alias = "source_coverage")]
     ArtifactRange,
-    SourceProjection,
     AgentEventWait,
 }
 
@@ -2382,7 +2408,6 @@ pub enum DeterministicContinuationHostAction {
         alias = "read_missing_ranges"
     )]
     DrainArtifactRanges,
-    ReuseSourceCoverage,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
@@ -2466,7 +2491,6 @@ fn derive_continuation_wire_identity(
         match class {
             DeterministicContinuationClass::UnchangedWait => "unchanged_wait",
             DeterministicContinuationClass::ArtifactRange => "artifact_range",
-            DeterministicContinuationClass::SourceProjection => "source_projection",
             DeterministicContinuationClass::AgentEventWait => "agent_event_wait",
         }
     }
@@ -2474,7 +2498,6 @@ fn derive_continuation_wire_identity(
         match action {
             DeterministicContinuationHostAction::AwaitStateChange => "await_state_change",
             DeterministicContinuationHostAction::DrainArtifactRanges => "drain_artifact_ranges",
-            DeterministicContinuationHostAction::ReuseSourceCoverage => "reuse_source_coverage",
         }
     }
     format!(
@@ -2626,6 +2649,19 @@ pub struct TurnTimingDiagnosticTokenAggregate {
     pub total_tokens: u64,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingDiagnosticLatencyAggregate {
+    pub logical_generations: u32,
+    pub physical_attempts: u32,
+    pub model_stream_wait_ns: u64,
+    pub decision_ready_attempts: u32,
+    pub decision_latency_ns: u64,
+    pub tool_calls: u32,
+    pub tool_active_union_ns: u64,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case", export_to = "v2/")]
@@ -2720,7 +2756,17 @@ pub struct TurnTimingGenerationPurposeAggregate {
     pub purpose: TurnTimingGenerationPurpose,
     pub generations: u32,
     pub model_stream_wait_ns: u64,
+    /// Sum of dispatch-to-first-actionable-output latency for requests where
+    /// an actionable output was observed.
+    #[serde(default)]
+    pub decision_latency_ns: u64,
+    #[serde(default)]
+    pub decision_ready_requests: u32,
     pub tool_calls: u32,
+    /// Sum of per-generation unioned tool-active durations. Parallel tools
+    /// within one generation are not double-counted.
+    #[serde(default)]
+    pub tool_active_union_ns: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     #[serde(default)]
@@ -2814,9 +2860,44 @@ pub struct TurnTimingLocal {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingMilestones {
+    /// Time from turn start until the first user input begins durable recording.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub user_input_recorded_ms: Option<u64>,
+    /// Time from turn start until the first tool call is accepted for dispatch.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_tool_accepted_ms: Option<u64>,
+    /// Time from turn start until the first tool call passes the parallel gate.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_tool_gate_admitted_ms: Option<u64>,
+    /// Time from turn start until the first authorized tool handler is entered.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_tool_handler_entry_ms: Option<u64>,
+    /// Time from turn start until the first non-control tool is accepted for dispatch.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_useful_tool_accepted_ms: Option<u64>,
+    /// Time from turn start until the first non-control tool passes the parallel gate.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_useful_tool_gate_admitted_ms: Option<u64>,
+    /// Time from turn start until the first authorized non-control tool handler is entered.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_useful_action_ms: Option<u64>,
+    /// Time from turn start until the first non-control tool completes successfully.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_successful_useful_action_ms: Option<u64>,
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_model_output_ms: Option<u64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_actionable_output_ms: Option<u64>,
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_visible_output_ms: Option<u64>,
@@ -2853,30 +2934,21 @@ pub struct TurnTimingCounters {
     /// Continuations drained and recorded by their code-mode owner.
     #[serde(default)]
     pub owner_drained_continuation_count: u32,
-    /// Exact source projections acknowledged without replaying source text.
+    /// Validation commands that executed rather than reusing a proof.
     #[serde(default)]
-    pub source_exact_projection_reuse_count: u32,
-    /// Physical source reads whose automatically or explicitly supplied
-    /// conditional identity proved unchanged.
-    #[serde(default)]
-    pub source_conditional_unchanged_count: u32,
-    /// Coherent overlapping source intervals removed from model-visible text.
-    #[serde(default)]
-    pub source_overlap_range_elimination_count: u64,
-    /// Requested source ranges that did not require an independent physical
-    /// read because exact or same-operation coverage was reused.
-    #[serde(default)]
-    pub source_physical_range_avoided_count: u64,
-    /// Source-specific deterministic continuations drained by the owner.
-    #[serde(default)]
-    pub source_host_drained_continuation_count: u32,
-    /// New source evidence fragments actually exposed to a started model
-    /// generation.
-    #[serde(default)]
-    pub source_model_visible_new_evidence_count: u64,
+    pub executed_validation_count: u32,
     /// Validation results served from the authoritative validation ledger.
     #[serde(default)]
     pub reused_validation_count: u32,
+    /// Validation requests identified as duplicates and served from the ledger.
+    #[serde(default)]
+    pub duplicate_validation_count: u32,
+    /// Executed validation requests that explicitly bypassed reusable proof state.
+    #[serde(default)]
+    pub forced_fresh_validation_count: u32,
+    /// Total wall-clock nanoseconds spent in validation commands that executed.
+    #[serde(default)]
+    pub executed_validation_duration_ns: u64,
     /// Validation tool outputs intentionally suppressed by admission policy.
     #[serde(default)]
     pub suppressed_validation_output_count: u32,
@@ -2900,30 +2972,6 @@ pub struct TurnTimingCounters {
     pub planning_generation_count: u32,
     #[serde(default)]
     pub plan_revision_generation_count: u32,
-    /// Aggregate-only architecture-comprehension telemetry. These counters do
-    /// not contain repository paths, symbols, relationship text, or evidence.
-    #[serde(default)]
-    pub architecture_slice_attempt_count: u32,
-    #[serde(default)]
-    pub architecture_slice_complete_count: u32,
-    #[serde(default)]
-    pub architecture_relationship_count: u64,
-    #[serde(default)]
-    pub architecture_invariant_count: u64,
-    #[serde(default)]
-    pub architecture_missing_requirement_count: u64,
-    #[serde(default)]
-    pub architecture_material_unknown_count: u64,
-    #[serde(default)]
-    pub architecture_stale_snapshot_count: u32,
-    #[serde(default)]
-    pub architecture_tool_call_count: u64,
-    #[serde(default)]
-    pub architecture_files_read: u64,
-    #[serde(default)]
-    pub architecture_bytes_read: u64,
-    #[serde(default)]
-    pub architecture_late_relationship_discovery_count: u64,
     #[serde(default)]
     pub planning_fixed_point_iteration_count: u32,
     #[serde(default)]
@@ -5667,6 +5715,10 @@ mod tests {
             .as_object_mut()
             .expect("turn timing object")
             .remove("terminalization");
+        value["milestones"]
+            .as_object_mut()
+            .expect("turn timing milestones object")
+            .remove("firstUsefulActionMs");
         let counters = value["counters"]
             .as_object_mut()
             .expect("turn timing counters object");
@@ -5727,6 +5779,7 @@ mod tests {
         value["modelRequests"] = json!([request]);
 
         let decoded: TurnTiming = serde_json::from_value(value)?;
+        assert_eq!(decoded.milestones.first_useful_action_ms, None);
         assert_eq!(decoded.counters.logical_generation_count, 0);
         assert_eq!(
             decoded.counters.generations_by_reason,
@@ -5755,9 +5808,6 @@ mod tests {
         assert_eq!(decoded.counters.completion_review_terminal_phase_count, 0);
         assert_eq!(decoded.counters.no_progress_directive_count, 0);
         assert_eq!(decoded.counters.proven_loop_activation_count, 0);
-        assert_eq!(decoded.counters.architecture_slice_attempt_count, 0);
-        assert_eq!(decoded.counters.architecture_tool_call_count, 0);
-        assert_eq!(decoded.counters.architecture_bytes_read, 0);
         assert_eq!(decoded.counters.tool_output_truncation_count, 0);
         assert_eq!(decoded.counters.tool_output_projected_token_count, 0);
         assert_eq!(decoded.counters.tool_output_artifact_reread_count, 0);
@@ -7805,6 +7855,11 @@ mod tests {
             })
         );
         assert_eq!(counters["suppressedDeterministicContinuationCount"], 0);
+        assert_eq!(counters["executedValidationCount"], 0);
+        assert_eq!(counters["reusedValidationCount"], 0);
+        assert_eq!(counters["duplicateValidationCount"], 0);
+        assert_eq!(counters["forcedFreshValidationCount"], 0);
+        assert_eq!(counters["executedValidationDurationNs"], 0);
         for removed in [
             "continuationsByDisposition",
             "postEditCandidateCount",
@@ -7837,6 +7892,10 @@ mod tests {
 
         let mut historical = current;
         historical["schemaVersion"] = serde_json::json!(9);
+        historical
+            .as_object_mut()
+            .expect("timing object")
+            .remove("observationalNonprogressLatency");
         historical["provablyAvoidableTokens"] = serde_json::json!({
             "logicalGenerations": 1,
             "inputTokens": 2,
@@ -7857,6 +7916,15 @@ mod tests {
         let decoded: TurnTiming =
             serde_json::from_value(historical).expect("historical timing payload");
         assert_eq!(decoded.schema_version, 9);
+        assert_eq!(decoded.model_requests[0].sampling_request_id, None);
+        assert!(decoded.model_requests[0].physical_attempt_ids.is_empty());
+        assert_eq!(decoded.model_requests[0].decision_latency_ns, None);
+        assert_eq!(decoded.model_requests[0].tool_active_union_ns, 0);
+        assert_eq!(decoded.model_requests[0].first_actionable_output_ms, None);
+        assert_eq!(
+            decoded.observational_nonprogress_latency,
+            TurnTimingDiagnosticLatencyAggregate::default()
+        );
         let reserialized = serde_json::to_value(decoded).expect("decoded timing serialization");
         assert!(reserialized.get("provablyAvoidableTokens").is_none());
         assert!(
@@ -7875,6 +7943,33 @@ mod tests {
             request
                 .get("ownerProvedPredeterminedContinuation")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn turn_timing_model_request_round_trips_decision_and_attempt_correlation() {
+        let request = TurnTimingModelRequest {
+            sampling_request_id: Some("sampling-1".to_string()),
+            physical_attempt_ids: vec!["attempt-1".to_string(), "attempt-2".to_string()],
+            decision_latency_ns: Some(123),
+            tool_active_union_ns: 456,
+            first_actionable_output_ms: Some(7),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&request).expect("request serialization");
+        assert_eq!(value["samplingRequestId"], "sampling-1");
+        assert_eq!(
+            value["physicalAttemptIds"],
+            serde_json::json!(["attempt-1", "attempt-2"])
+        );
+        assert_eq!(value["decisionLatencyNs"], 123);
+        assert_eq!(value["toolActiveUnionNs"], 456);
+        assert_eq!(value["firstActionableOutputMs"], 7);
+        assert_eq!(
+            serde_json::from_value::<TurnTimingModelRequest>(value)
+                .expect("request deserialization"),
+            request
         );
     }
 
@@ -7977,27 +8072,6 @@ mod tests {
             serde_json::from_value::<TurnTimingDeterministicContinuationReceipt>(tampered_fields)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn source_projection_receipt_has_a_distinct_compatible_wire_contract() {
-        let receipt = TurnTimingDeterministicContinuationReceipt::new(
-            DeterministicContinuationClass::SourceProjection,
-            "source-resource".to_string(),
-            "source-revision".to_string(),
-            DeterministicContinuationHostAction::ReuseSourceCoverage,
-            "requested-ranges".to_string(),
-            2,
-        );
-        let serialized = serde_json::to_value(&receipt).expect("source receipt serialization");
-
-        assert_eq!(serialized["class"], serde_json::json!("source_projection"));
-        assert_eq!(
-            serialized["hostAction"],
-            serde_json::json!("reuse_source_coverage")
-        );
-        assert_eq!(serialized["suppressedContinuationCount"], 2);
-        assert!(receipt.runtime_identity().is_some());
     }
 
     #[test]

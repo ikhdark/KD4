@@ -301,14 +301,14 @@ def _quantile_bins(rows: Sequence[dict[str, Any]], predictor: str, count: int = 
     for index in range(count):
         chunk = eligible[index * len(eligible) // count : (index + 1) * len(eligible) // count]
         values = [float(row[predictor]) for row in chunk]
-        waits = [float(row["first_output_wait_us"]) for row in chunk]
+        waits = [float(row["decision_latency_us"]) for row in chunk]
         bins.append(
             {
                 "index": index,
                 "count": len(chunk),
                 "predictorMin": min(values),
                 "predictorMax": max(values),
-                "firstOutputWaitUs": _distribution(waits),
+                "decisionLatencyUs": _distribution(waits),
             }
         )
     return bins
@@ -329,22 +329,61 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
         logical.setdefault(request_id, []).append(record)
 
     rows: list[dict[str, Any]] = []
+    included_physical_attempts = 0
     for attempts in logical.values():
         reason: str | None = None
-        record = attempts[0]
-        if len(attempts) != 1:
-            reason = "multiple_physical_attempts"
-        elif record.get("retry_index") != 0:
-            reason = "nonzero_retry_index"
-        elif record.get("outcome") != "success":
-            reason = f"outcome_{record.get('outcome', 'missing')}"
-        elif _number(record.get("first_model_output_us")) is None:
-            reason = "missing_first_model_output"
-        elif _number(record.get("dispatch_ready_us")) is None:
-            reason = "missing_dispatch_ready"
-        elif float(record["first_model_output_us"]) < float(record["dispatch_ready_us"]):
-            reason = "invalid_timing_order"
+        attempts = sorted(
+            attempts,
+            key=lambda attempt: (
+                _number(attempt.get("retry_index"))
+                if _number(attempt.get("retry_index")) is not None
+                else math.inf
+            ),
+        )
+        record = attempts[-1]
+        if record.get("outcome") != "success":
+            reason = "no_terminal_success"
+        elif any(attempt.get("outcome") == "success" for attempt in attempts[:-1]):
+            reason = "success_before_terminal_attempt"
         else:
+            correlation_fields = (
+                "turn_id",
+                "generation_index",
+                "generation_purpose",
+                "generation_disposition",
+                "relevant_state_fingerprint",
+            )
+            if any(
+                attempt.get(field) != record.get(field)
+                for attempt in attempts[:-1]
+                for field in correlation_fields
+            ):
+                reason = "inconsistent_generation_correlation"
+
+        retry_overhead_us = 0.0
+        terminal_decision_latency_us: float | None = None
+        if reason is None:
+            for index, attempt in enumerate(attempts):
+                dispatch_ready_us = _number(attempt.get("dispatch_ready_us"))
+                terminal = index == len(attempts) - 1
+                endpoint_field = "first_actionable_output_us" if terminal else "completed_us"
+                endpoint_us = _number(attempt.get(endpoint_field))
+                if dispatch_ready_us is None:
+                    reason = "missing_dispatch_ready"
+                    break
+                if endpoint_us is None:
+                    reason = f"missing_{endpoint_field}"
+                    break
+                if endpoint_us < dispatch_ready_us:
+                    reason = "invalid_timing_order"
+                    break
+                elapsed_us = endpoint_us - dispatch_ready_us
+                if terminal:
+                    terminal_decision_latency_us = elapsed_us
+                else:
+                    retry_overhead_us += elapsed_us
+
+        if reason is None:
             input_tokens = _number(record.get("input_token_count"))
             cached_tokens = _number(record.get("cached_input_token_count"))
             uncached_tokens = _number(record.get("uncached_input_token_count"))
@@ -359,29 +398,45 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
         row = {
             "sampling_request_id": record["sampling_request_id"],
             "attempt_id": record.get("attempt_id"),
+            "turn_id": record.get("turn_id"),
+            "generation_index": record.get("generation_index"),
+            "generation_purpose": record.get("generation_purpose"),
+            "generation_disposition": record.get("generation_disposition"),
+            "relevant_state_fingerprint": record.get("relevant_state_fingerprint"),
             "model": record.get("model"),
             "transport": record.get("transport"),
             "request_kind": record.get("request_kind"),
             "input_token_count": record["input_token_count"],
             "cached_input_token_count": record["cached_input_token_count"],
             "uncached_input_token_count": record["uncached_input_token_count"],
-            "first_output_wait_us": record["first_model_output_us"] - record["dispatch_ready_us"],
+            "physical_attempt_count": len(attempts),
+            "retry_count": len(attempts) - 1,
+            "retry_overhead_us": retry_overhead_us,
+            "terminal_decision_latency_us": terminal_decision_latency_us,
+            "decision_latency_us": retry_overhead_us + float(terminal_decision_latency_us),
             "reconciliation_residual_bytes": record.get("reconciliation_residual_bytes"),
             "logical_request_bytes": record.get("logical_request_bytes"),
         }
         row.update({field: record.get(field) for field in COMPONENT_FIELDS})
         rows.append(row)
+        included_physical_attempts += len(attempts)
 
-    members_by_group: dict[tuple[Any, Any, Any], list[dict[str, Any]]] = {}
+    members_by_group: dict[tuple[Any, Any, Any, Any, Any], list[dict[str, Any]]] = {}
     for row in rows:
-        key = (row["model"], row["transport"], row["request_kind"])
+        key = (
+            row["model"],
+            row["transport"],
+            row["request_kind"],
+            row["generation_purpose"],
+            row["generation_disposition"],
+        )
         members_by_group.setdefault(key, []).append(row)
     groups: list[dict[str, Any]] = []
     for key, members in sorted(members_by_group.items(), key=lambda item: tuple(str(value) for value in item[0])):
         predictors: dict[str, Any] = {}
         for predictor in PREDICTOR_FIELDS:
             pairs = [
-                (float(row[predictor]), float(row["first_output_wait_us"]))
+                (float(row[predictor]), float(row["decision_latency_us"]))
                 for row in members
                 if _number(row.get(predictor)) is not None
             ]
@@ -395,8 +450,12 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
                 "model": key[0],
                 "transport": key[1],
                 "requestKind": key[2],
+                "generationPurpose": key[3],
+                "generationDisposition": key[4],
                 "sampleCount": len(members),
-                "firstOutputWaitUs": _distribution([float(row["first_output_wait_us"]) for row in members]),
+                "decisionLatencyUs": _distribution([float(row["decision_latency_us"]) for row in members]),
+                "retryOverheadUs": _distribution([float(row["retry_overhead_us"]) for row in members]),
+                "physicalAttemptCount": _distribution([float(row["physical_attempt_count"]) for row in members]),
                 "inputTokens": _distribution([float(row["input_token_count"]) for row in members]),
                 "cachedInputTokens": _distribution([float(row["cached_input_token_count"]) for row in members]),
                 "uncachedInputTokens": _distribution([float(row["uncached_input_token_count"]) for row in members]),
@@ -421,8 +480,13 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
             supplied_residual_mismatches += 1
         row["computed_reconciliation_residual_bytes"] = computed_residual
     return {
-        "interpretation": "observational and non-causal",
+        "interpretation": (
+            "observational and non-causal; logical decision latency is retry overhead "
+            "(dispatch-to-completion for nonterminal attempts) plus terminal "
+            "dispatch-to-first-actionable-output"
+        ),
         "totalPhysicalAttempts": len(records),
+        "includedPhysicalAttempts": included_physical_attempts,
         "totalLogicalRequests": len(logical),
         "includedLogicalRequests": len(rows),
         "outcomeCounts": outcome_counts,
@@ -449,18 +513,21 @@ def analyze(records: Sequence[dict[str, Any]], exclusions: dict[str, int] | None
 
 def render(analysis: dict[str, Any]) -> str:
     lines = [
-        "Model attempt latency analysis (observational and non-causal)",
+        "Model decision latency analysis (observational and non-causal)",
         f"physical attempts: {analysis['totalPhysicalAttempts']}",
+        f"included physical attempts: {analysis['includedPhysicalAttempts']}",
         f"logical requests: {analysis['totalLogicalRequests']}",
         f"clean included requests: {analysis['includedLogicalRequests']}",
         f"outcomes: {json.dumps(analysis['outcomeCounts'], sort_keys=True)}",
         f"exclusions: {json.dumps(analysis['exclusionCounts'], sort_keys=True)}",
     ]
     for group in analysis["groups"]:
-        wait = group["firstOutputWaitUs"]
+        latency = group["decisionLatencyUs"]
         lines.append(
-            f"{group['model']} / {group['transport']} / {group['requestKind']}: "
-            f"n={group['sampleCount']} first-output-wait-us p50={wait['p50']} p95={wait['p95']}"
+            f"{group['model']} / {group['transport']} / {group['requestKind']} / "
+            f"{group['generationPurpose']} / {group['generationDisposition']}: "
+            f"n={group['sampleCount']} decision-latency-us "
+            f"p50={latency['p50']} p95={latency['p95']}"
         )
         lines.append(
             "  tokens p50/p95: "

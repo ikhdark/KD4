@@ -610,43 +610,6 @@ async fn wait_is_registered_only_while_a_code_mode_cell_is_waitable() {
 }
 
 #[tokio::test]
-async fn typed_preflight_helpers_bypass_raw_code_mode_dispatch() {
-    let plan = probe(|turn| {
-        set_features(
-            turn,
-            &[Feature::CodeMode, Feature::CodeModeOnly, Feature::ShellTool],
-        );
-    })
-    .await;
-    let helpers = [
-        "load_skill",
-        "architecture_slice",
-        "read_source_batch",
-        "cargo_test",
-        "lint_tool_calls",
-    ];
-    plan.assert_visible_contains(&helpers);
-    plan.assert_registered_contains(&helpers);
-    for helper in helpers {
-        assert_eq!(plan.exposure(helper), ToolExposure::DirectModelOnly);
-    }
-
-    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
-        panic!("expected code mode exec tool");
-    };
-    for helper in helpers {
-        assert!(
-            !exec.description.contains(&format!("tools.{helper}")),
-            "typed helper `{helper}` must not require JavaScript dispatch"
-        );
-        assert!(
-            exec.description.contains(&format!("`{helper}`")),
-            "direct-only guidance must be generated from the executor projection"
-        );
-    }
-}
-
-#[tokio::test]
 async fn request_user_input_stays_direct_in_code_mode_only() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);

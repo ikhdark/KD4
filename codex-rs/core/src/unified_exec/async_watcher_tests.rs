@@ -61,7 +61,7 @@ async fn published_candidate(
         &repo,
         "git",
         &args,
-        None,
+        known_delta_store::ProjectNamespaceHint::Discover,
         false,
     )
     .await
@@ -81,7 +81,7 @@ async fn published_candidate(
         &repo,
         "git",
         &args,
-        None,
+        known_delta_store::ProjectNamespaceHint::Discover,
         force_fresh,
     )
     .await
@@ -275,7 +275,7 @@ async fn known_delta_background_completion_promotes_only_exact_transcripts() {
         &repo,
         "git",
         &["show".to_string(), blob],
-        None,
+        known_delta_store::ProjectNamespaceHint::Discover,
         false,
     )
     .await
@@ -305,7 +305,7 @@ async fn known_delta_background_completion_skips_lossy_output_and_quarantines_fr
         &omitted_repo,
         "git",
         &["show".to_string(), omitted_blob],
-        None,
+        known_delta_store::ProjectNamespaceHint::Discover,
         false,
     )
     .await
@@ -335,7 +335,7 @@ async fn known_delta_background_completion_skips_lossy_output_and_quarantines_fr
         &lagged_repo,
         "git",
         &["show".to_string(), lagged_blob],
-        None,
+        known_delta_store::ProjectNamespaceHint::Discover,
         false,
     )
     .await
@@ -365,7 +365,7 @@ async fn known_delta_background_completion_skips_lossy_output_and_quarantines_fr
         &fresh_repo,
         "git",
         &["show".to_string(), fresh_blob],
-        None,
+        known_delta_store::ProjectNamespaceHint::Discover,
         false,
     )
     .await

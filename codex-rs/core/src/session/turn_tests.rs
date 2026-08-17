@@ -67,6 +67,104 @@ fn authoritative_wait_result(
     }
 }
 
+fn recommended_plugin_candidate(id: &str, name: &str) -> DiscoverableTool {
+    codex_tools::DiscoverablePluginInfo {
+        id: id.to_string(),
+        remote_plugin_id: None,
+        name: name.to_string(),
+        description: None,
+        has_skills: false,
+        mcp_server_names: Vec::new(),
+        app_connector_ids: Vec::new(),
+    }
+    .into()
+}
+
+#[test]
+fn recommended_plugins_are_not_injected_for_unrelated_tasks() {
+    let selected = task_relevant_recommended_plugins(
+        &[ContentItem::InputText {
+            text: "fix the parser".to_string(),
+        }],
+        vec![recommended_plugin_candidate("figma", "Figma")],
+    );
+
+    assert!(selected.is_empty());
+}
+
+#[test]
+fn named_recommended_plugin_is_the_only_injected_candidate() {
+    let selected = task_relevant_recommended_plugins(
+        &[ContentItem::InputText {
+            text: "use Figma for this mockup".to_string(),
+        }],
+        vec![
+            recommended_plugin_candidate("figma", "Figma"),
+            recommended_plugin_candidate("notion", "Notion"),
+        ],
+    );
+
+    assert_eq!(
+        selected
+            .iter()
+            .map(DiscoverableTool::name)
+            .collect::<Vec<_>>(),
+        vec!["Figma"]
+    );
+}
+
+#[test]
+fn generic_plugin_recommendation_request_injects_the_catalog() {
+    let selected = task_relevant_recommended_plugins(
+        &[ContentItem::InputText {
+            text: "suggest a plugin".to_string(),
+        }],
+        vec![
+            recommended_plugin_candidate("figma", "Figma"),
+            recommended_plugin_candidate("notion", "Notion"),
+        ],
+    );
+
+    assert_eq!(selected.len(), 2);
+}
+
+#[test]
+fn recommended_plugin_catalog_is_bounded_by_rendered_bytes() {
+    let candidates = (0..50)
+        .map(|index| {
+            recommended_plugin_candidate(
+                &format!("plugin-{index}-{}", "x".repeat(180)),
+                &format!("Plugin {index} {}", "y".repeat(180)),
+            )
+        })
+        .collect();
+    let instructions = RecommendedPluginsInstructions::from_plugins(candidates)
+        .expect("at least one bounded plugin entry");
+    let ResponseItem::Message { content, .. } = ContextualUserFragment::into(instructions) else {
+        panic!("expected recommended plugin message");
+    };
+    let ContentItem::InputText { text } = &content[0] else {
+        panic!("expected recommended plugin text");
+    };
+
+    assert!(text.len() <= 4_160);
+    assert!(!text.contains("Plugin 49"));
+}
+
+#[test]
+fn proven_loop_terminal_generation_ends_unless_new_input_arrives() {
+    let request = GenerationRequestDisposition {
+        purpose: Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning),
+        sampling: SamplingGenerationDisposition::DecisionBearing,
+        relevant_state_fingerprint: "state".to_string(),
+        failure_fingerprint: None,
+        terminal_completion_only: true,
+    };
+
+    assert!(!generation_needs_follow_up(&request, true, false));
+    assert!(generation_needs_follow_up(&request, false, true));
+}
+
 #[test]
 fn authoritative_wait_terminal_surface_requires_explicit_owner_projection() {
     let without_projection = SamplingConvergenceDecision {

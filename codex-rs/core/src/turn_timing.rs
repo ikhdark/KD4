@@ -11,7 +11,6 @@ use codex_analytics::TurnProfile;
 use codex_otel::TURN_TTFM_DURATION_METRIC;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
@@ -20,6 +19,7 @@ use codex_protocol::protocol::TurnTimingAttemptKind;
 use codex_protocol::protocol::TurnTimingAttemptKindCounts;
 use codex_protocol::protocol::TurnTimingCounters;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
+use codex_protocol::protocol::TurnTimingDiagnosticLatencyAggregate;
 use codex_protocol::protocol::TurnTimingDiagnosticTokenAggregate;
 use codex_protocol::protocol::TurnTimingExclusive;
 use codex_protocol::protocol::TurnTimingGenerationDisposition;
@@ -44,8 +44,24 @@ use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 15;
+const TIMING_SCHEMA_VERSION: u16 = 20;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
+
+/// Control-only calls can advance orchestration without beginning the user's
+/// requested work. Keep them observable in dispatch milestones and counters,
+/// but do not let them satisfy the first-useful-action contract.
+pub(crate) fn tool_counts_as_useful_first_action(tool_name: &str) -> bool {
+    !matches!(
+        tool_name,
+        "update_plan"
+            | "request_user_input"
+            | "request_permissions"
+            | "wait"
+            | "wait_agent"
+            | "wait_for_environment"
+            | "write_stdin"
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContinuationCause {
@@ -150,6 +166,39 @@ pub(crate) struct TurnTimingSnapshot {
     pub(crate) profile: TurnTimingProfile,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelAttemptGenerationMetadata {
+    pub(crate) generation_index: u32,
+    pub(crate) generation_purpose: Option<TurnTimingGenerationPurpose>,
+    pub(crate) disposition: TurnTimingGenerationDisposition,
+    pub(crate) relevant_state_fingerprint: Option<String>,
+}
+
+impl ModelAttemptGenerationMetadata {
+    pub(crate) fn purpose_label(&self) -> Option<&'static str> {
+        self.generation_purpose.map(|purpose| match purpose {
+            TurnTimingGenerationPurpose::InitialReasoning => "initial",
+            TurnTimingGenerationPurpose::ImplementationDecision => "implementation",
+            TurnTimingGenerationPurpose::Wait => "wait",
+            TurnTimingGenerationPurpose::FailureDiagnosis => "failure_diagnosis",
+            TurnTimingGenerationPurpose::ValidationInterpretation => "validation_interpretation",
+            TurnTimingGenerationPurpose::Repair => "repair",
+            TurnTimingGenerationPurpose::Coordination => "agent_coordination",
+            TurnTimingGenerationPurpose::ArtifactContinuation => "deterministic_tool_continuation",
+            TurnTimingGenerationPurpose::CompactionRecovery => "compaction_recovery",
+            TurnTimingGenerationPurpose::TerminalCompletionReasoning => "terminal",
+        })
+    }
+
+    pub(crate) fn disposition_label(&self) -> &'static str {
+        match self.disposition {
+            TurnTimingGenerationDisposition::Unknown => "unknown",
+            TurnTimingGenerationDisposition::DecisionBearing => "decision_bearing",
+            TurnTimingGenerationDisposition::Deterministic => "deterministic",
+        }
+    }
+}
+
 impl TurnTimingSnapshot {
     pub(crate) fn inclusive_duration(&self) -> Option<Duration> {
         self.profile
@@ -242,9 +291,45 @@ impl TurnTimingSnapshot {
             ),
         };
         let milestones = TurnTimingMilestones {
+            user_input_recorded_ms: profile
+                .milestones
+                .user_input_recorded_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_tool_accepted_ms: profile
+                .milestones
+                .first_tool_accepted_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_tool_gate_admitted_ms: profile
+                .milestones
+                .first_tool_gate_admitted_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_tool_handler_entry_ms: profile
+                .milestones
+                .first_tool_handler_entry_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_useful_tool_accepted_ms: profile
+                .milestones
+                .first_useful_tool_accepted_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_useful_tool_gate_admitted_ms: profile
+                .milestones
+                .first_useful_tool_gate_admitted_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_useful_action_ms: profile
+                .milestones
+                .first_useful_action_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_successful_useful_action_ms: profile
+                .milestones
+                .first_successful_useful_action_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
             first_model_output_ms: profile
                 .milestones
                 .first_model_output_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_actionable_output_ms: profile
+                .milestones
+                .first_actionable_output_ns
                 .map(|value| public_ms(value, &mut saturation_count)),
             first_visible_output_ms: profile
                 .milestones
@@ -318,6 +403,8 @@ impl TurnTimingSnapshot {
                     generation_purpose: request.generation_purpose,
                     disposition: request.disposition,
                     relevant_state_fingerprint: request.relevant_state_fingerprint.clone(),
+                    sampling_request_id: request.sampling_request_id.clone(),
+                    physical_attempt_ids: request.physical_attempt_ids.clone(),
                     progress_kinds: request.progress_kinds.clone(),
                     next_structured_action_changed: request.next_structured_action_changed,
                     unchanged_relevant_state: request.unchanged_relevant_state,
@@ -327,7 +414,14 @@ impl TurnTimingSnapshot {
                         request.model_stream_wait_ns,
                         &mut saturation_count,
                     ),
+                    decision_latency_ns: request
+                        .decision_latency_ns()
+                        .map(|value| public_ns(value, &mut saturation_count)),
                     tool_call_count: request.tool_call_count,
+                    tool_active_union_ns: public_ns(
+                        request.tool_active_union_ns,
+                        &mut saturation_count,
+                    ),
                     output_tokens: request.output_tokens,
                     reasoning_output_tokens: request.reasoning_output_tokens,
                     token_usage: request.token_usage.clone(),
@@ -337,6 +431,9 @@ impl TurnTimingSnapshot {
                         .map(|value| public_ms(value, &mut saturation_count)),
                     first_model_output_ms: request
                         .first_model_output_ns
+                        .map(|value| public_ms(value, &mut saturation_count)),
+                    first_actionable_output_ms: request
+                        .first_actionable_output_ns
                         .map(|value| public_ms(value, &mut saturation_count)),
                     completed_ms: request
                         .completed_ns
@@ -349,13 +446,18 @@ impl TurnTimingSnapshot {
             |request| request.unchanged_relevant_state && !request.next_structured_action_changed,
             /*input_only*/ false,
         );
+        let observational_nonprogress_latency = diagnostic_latency_aggregate(
+            &profile.model_requests,
+            |request| request.unchanged_relevant_state && !request.next_structured_action_changed,
+            &mut saturation_count,
+        );
         let purpose_aggregates = purpose_aggregates(&profile.model_requests, &mut saturation_count);
         let exact_repeated_wait_count = exact_repeated_wait_count(&profile.model_requests);
         let failure_diagnosis_count = primary_generation_count(
             &profile.model_requests,
             TurnTimingGenerationPurpose::FailureDiagnosis,
         );
-        let failure_signature_count = unique_primary_state_count(
+        let failure_signature_count = unique_primary_failure_signature_count(
             &profile.model_requests,
             TurnTimingGenerationPurpose::FailureDiagnosis,
         );
@@ -373,23 +475,11 @@ impl TurnTimingSnapshot {
                 .counters
                 .residual_deterministic_generation_count,
             owner_drained_continuation_count: profile.counters.owner_drained_continuation_count,
-            source_exact_projection_reuse_count: profile
-                .counters
-                .source_exact_projection_reuse_count,
-            source_conditional_unchanged_count: profile.counters.source_conditional_unchanged_count,
-            source_overlap_range_elimination_count: profile
-                .counters
-                .source_overlap_range_elimination_count,
-            source_physical_range_avoided_count: profile
-                .counters
-                .source_physical_range_avoided_count,
-            source_host_drained_continuation_count: profile
-                .counters
-                .source_host_drained_continuation_count,
-            source_model_visible_new_evidence_count: profile
-                .counters
-                .source_model_visible_new_evidence_count,
+            executed_validation_count: profile.counters.executed_validation_count,
             reused_validation_count: profile.counters.reused_validation_count,
+            duplicate_validation_count: profile.counters.duplicate_validation_count,
+            forced_fresh_validation_count: profile.counters.forced_fresh_validation_count,
+            executed_validation_duration_ns: profile.counters.executed_validation_duration_ns,
             suppressed_validation_output_count: profile.counters.suppressed_validation_output_count,
             ready_startup_prewarm_count: profile.counters.ready_startup_prewarm_count,
             completion_review_ready_phase_count: profile
@@ -403,23 +493,6 @@ impl TurnTimingSnapshot {
             exact_repeated_wait_count,
             planning_generation_count: profile.counters.planning_generation_count,
             plan_revision_generation_count: profile.counters.plan_revision_generation_count,
-            architecture_slice_attempt_count: profile.counters.architecture_slice_attempt_count,
-            architecture_slice_complete_count: profile.counters.architecture_slice_complete_count,
-            architecture_relationship_count: profile.counters.architecture_relationship_count,
-            architecture_invariant_count: profile.counters.architecture_invariant_count,
-            architecture_missing_requirement_count: profile
-                .counters
-                .architecture_missing_requirement_count,
-            architecture_material_unknown_count: profile
-                .counters
-                .architecture_material_unknown_count,
-            architecture_stale_snapshot_count: profile.counters.architecture_stale_snapshot_count,
-            architecture_tool_call_count: profile.counters.architecture_tool_call_count,
-            architecture_files_read: profile.counters.architecture_files_read,
-            architecture_bytes_read: profile.counters.architecture_bytes_read,
-            architecture_late_relationship_discovery_count: profile
-                .counters
-                .architecture_late_relationship_discovery_count,
             planning_fixed_point_iteration_count: profile
                 .counters
                 .planning_fixed_point_iteration_count,
@@ -489,6 +562,7 @@ impl TurnTimingSnapshot {
             terminalization: profile.terminalization.clone(),
             model_requests,
             observational_nonprogress_tokens,
+            observational_nonprogress_latency,
             deterministic_continuation_receipts: profile
                 .deterministic_continuation_receipts
                 .clone(),
@@ -528,11 +602,15 @@ pub(crate) struct ModelRequestTiming {
     generation_purpose: Option<TurnTimingGenerationPurpose>,
     disposition: TurnTimingGenerationDisposition,
     relevant_state_fingerprint: Option<String>,
+    failure_fingerprint: Option<String>,
+    sampling_request_id: Option<String>,
+    physical_attempt_ids: Vec<String>,
     progress_kinds: Vec<TurnTimingProgressKind>,
     next_structured_action_changed: bool,
     unchanged_relevant_state: bool,
     attempt_kind: TurnTimingAttemptKind,
     model_stream_wait_ns: u128,
+    tool_active_union_ns: u128,
     tool_call_count: u32,
     output_tokens: u64,
     reasoning_output_tokens: u64,
@@ -540,8 +618,18 @@ pub(crate) struct ModelRequestTiming {
     request_token_categories: Option<TurnTimingRequestTokenCategories>,
     dispatch_ns: Option<u128>,
     first_model_output_ns: Option<u128>,
+    first_actionable_output_ns: Option<u128>,
     completed_ns: Option<u128>,
     is_continuation: bool,
+}
+
+impl ModelRequestTiming {
+    fn decision_latency_ns(&self) -> Option<u128> {
+        Some(
+            self.first_actionable_output_ns?
+                .saturating_sub(self.dispatch_ns?),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -641,7 +729,16 @@ pub(crate) struct LocalTiming {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TimingMilestones {
+    pub(crate) user_input_recorded_ns: Option<u128>,
+    pub(crate) first_tool_accepted_ns: Option<u128>,
+    pub(crate) first_tool_gate_admitted_ns: Option<u128>,
+    pub(crate) first_tool_handler_entry_ns: Option<u128>,
+    pub(crate) first_useful_tool_accepted_ns: Option<u128>,
+    pub(crate) first_useful_tool_gate_admitted_ns: Option<u128>,
+    pub(crate) first_useful_action_ns: Option<u128>,
+    pub(crate) first_successful_useful_action_ns: Option<u128>,
     pub(crate) first_model_output_ns: Option<u128>,
+    pub(crate) first_actionable_output_ns: Option<u128>,
     pub(crate) first_visible_output_ns: Option<u128>,
     pub(crate) first_agent_message_ns: Option<u128>,
 }
@@ -655,13 +752,11 @@ pub(crate) struct TimingCounters {
     pub(crate) suppressed_deterministic_continuation_count: u32,
     pub(crate) residual_deterministic_generation_count: u32,
     pub(crate) owner_drained_continuation_count: u32,
-    pub(crate) source_exact_projection_reuse_count: u32,
-    pub(crate) source_conditional_unchanged_count: u32,
-    pub(crate) source_overlap_range_elimination_count: u64,
-    pub(crate) source_physical_range_avoided_count: u64,
-    pub(crate) source_host_drained_continuation_count: u32,
-    pub(crate) source_model_visible_new_evidence_count: u64,
+    pub(crate) executed_validation_count: u32,
     pub(crate) reused_validation_count: u32,
+    pub(crate) duplicate_validation_count: u32,
+    pub(crate) forced_fresh_validation_count: u32,
+    pub(crate) executed_validation_duration_ns: u64,
     pub(crate) suppressed_validation_output_count: u32,
     pub(crate) ready_startup_prewarm_count: u32,
     pub(crate) completion_review_ready_phase_count: u32,
@@ -670,17 +765,6 @@ pub(crate) struct TimingCounters {
     pub(crate) exact_repeated_wait_count: u32,
     pub(crate) planning_generation_count: u32,
     pub(crate) plan_revision_generation_count: u32,
-    pub(crate) architecture_slice_attempt_count: u32,
-    pub(crate) architecture_slice_complete_count: u32,
-    pub(crate) architecture_relationship_count: u64,
-    pub(crate) architecture_invariant_count: u64,
-    pub(crate) architecture_missing_requirement_count: u64,
-    pub(crate) architecture_material_unknown_count: u64,
-    pub(crate) architecture_stale_snapshot_count: u32,
-    pub(crate) architecture_tool_call_count: u64,
-    pub(crate) architecture_files_read: u64,
-    pub(crate) architecture_bytes_read: u64,
-    pub(crate) architecture_late_relationship_discovery_count: u64,
     pub(crate) planning_fixed_point_iteration_count: u32,
     pub(crate) planning_invalidation_count: u32,
     pub(crate) planning_semantic_effect_count: u32,
@@ -734,6 +818,7 @@ struct TurnTimingStateInner {
     current_generation_purpose: Option<TurnTimingGenerationPurpose>,
     current_generation_disposition: TurnTimingGenerationDisposition,
     current_relevant_state_fingerprint: Option<String>,
+    current_failure_fingerprint: Option<String>,
     next_attempt_kind: TurnTimingAttemptKind,
     legacy: LegacyProfileState,
     completed_snapshot: Option<TurnTimingSnapshot>,
@@ -1003,6 +1088,25 @@ impl TurnTimingState {
         state.start_generation(reason, purpose, disposition, relevant_state_fingerprint);
     }
 
+    pub(crate) fn begin_model_generation_with_failure_metadata(
+        &self,
+        pending: &mut Option<ContinuationCause>,
+        session_source: &SessionSource,
+        purpose: Option<TurnTimingGenerationPurpose>,
+        disposition: TurnTimingGenerationDisposition,
+        relevant_state_fingerprint: Option<String>,
+        failure_fingerprint: Option<String>,
+    ) {
+        self.begin_model_generation_with_metadata(
+            pending,
+            session_source,
+            purpose,
+            disposition,
+            relevant_state_fingerprint,
+        );
+        self.state().current_failure_fingerprint = failure_fingerprint;
+    }
+
     pub(crate) fn begin_compaction_generation(&self) {
         let sample = self.clock.sample();
         let mut state = self.state();
@@ -1021,8 +1125,76 @@ impl TurnTimingState {
         state.next_attempt_kind = TurnTimingAttemptKind::Fallback;
     }
 
-    pub(crate) fn record_tool_call(&self) {
+    pub(crate) fn current_model_attempt_metadata(&self) -> Option<ModelAttemptGenerationMetadata> {
+        let state = self.state();
+        let request = state.model_requests.last()?;
+        Some(ModelAttemptGenerationMetadata {
+            generation_index: request.generation_index,
+            generation_purpose: request.generation_purpose,
+            disposition: request.disposition,
+            relevant_state_fingerprint: request.relevant_state_fingerprint.clone(),
+        })
+    }
+
+    pub(crate) fn record_model_attempt_identity(
+        &self,
+        sampling_request_id: &str,
+        physical_attempt_id: &str,
+    ) {
         let mut state = self.state();
+        let Some(request) = state.model_requests.last_mut() else {
+            state.invalid_transition();
+            return;
+        };
+        let mismatched_sampling_request = match request.sampling_request_id.as_deref() {
+            None => {
+                request.sampling_request_id = Some(sampling_request_id.to_string());
+                false
+            }
+            Some(existing) => existing != sampling_request_id,
+        };
+        if mismatched_sampling_request {
+            state.invalid_transition();
+            return;
+        }
+        if !request
+            .physical_attempt_ids
+            .iter()
+            .any(|existing| existing == physical_attempt_id)
+        {
+            request
+                .physical_attempt_ids
+                .push(physical_attempt_id.to_string());
+        }
+    }
+
+    pub(crate) fn record_user_input(&self) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if state.milestones.user_input_recorded_ns.is_none()
+            && let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
+        {
+            state.milestones.user_input_recorded_ns = Some(elapsed_ns);
+        }
+    }
+
+    pub(crate) fn record_tool_call(&self, tool_name: &str) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) {
+            state
+                .milestones
+                .first_tool_accepted_ns
+                .get_or_insert(elapsed_ns);
+            if tool_counts_as_useful_first_action(tool_name) {
+                state
+                    .milestones
+                    .first_useful_tool_accepted_ns
+                    .get_or_insert(elapsed_ns);
+            }
+        }
         state.counters.tool_call_count = state.counters.tool_call_count.saturating_add(1);
         if let Some(generation_index) = state.current_generation_index
             && let Some(request) = state.model_requests.iter_mut().find(|request| {
@@ -1031,6 +1203,56 @@ impl TurnTimingState {
             })
         {
             request.tool_call_count = request.tool_call_count.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn record_tool_gate_admitted(&self, tool_name: &str) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) {
+            state
+                .milestones
+                .first_tool_gate_admitted_ns
+                .get_or_insert(elapsed_ns);
+            if tool_counts_as_useful_first_action(tool_name) {
+                state
+                    .milestones
+                    .first_useful_tool_gate_admitted_ns
+                    .get_or_insert(elapsed_ns);
+            }
+        }
+    }
+
+    pub(crate) fn record_tool_handler_entry(&self, tool_name: &str) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) {
+            state
+                .milestones
+                .first_tool_handler_entry_ns
+                .get_or_insert(elapsed_ns);
+            if tool_counts_as_useful_first_action(tool_name) {
+                state
+                    .milestones
+                    .first_useful_action_ns
+                    .get_or_insert(elapsed_ns);
+            }
+        }
+    }
+
+    pub(crate) fn record_tool_completion(&self, tool_name: &str, successful: bool) {
+        if !successful || !tool_counts_as_useful_first_action(tool_name) {
+            return;
+        }
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        if state.milestones.first_successful_useful_action_ns.is_none()
+            && let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
+        {
+            state.milestones.first_successful_useful_action_ns = Some(elapsed_ns);
         }
     }
 
@@ -1046,95 +1268,6 @@ impl TurnTimingState {
             .counters
             .plan_revision_generation_count
             .saturating_add(1);
-    }
-
-    pub(crate) fn record_architecture_slice_attempt(&self) {
-        let mut state = self.state();
-        state.counters.architecture_slice_attempt_count = state
-            .counters
-            .architecture_slice_attempt_count
-            .saturating_add(1);
-        state.counters.architecture_tool_call_count = state
-            .counters
-            .architecture_tool_call_count
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_architecture_source_read(&self, bytes_read: u64) {
-        let mut state = self.state();
-        state.counters.architecture_files_read =
-            state.counters.architecture_files_read.saturating_add(1);
-        state.counters.architecture_bytes_read = state
-            .counters
-            .architecture_bytes_read
-            .saturating_add(bytes_read);
-    }
-
-    pub(crate) fn record_source_projection_result(
-        &self,
-        exact_reuse_count: u32,
-        conditional_unchanged_count: u32,
-        overlap_removed_count: u64,
-        physical_range_avoided_count: u64,
-    ) {
-        let mut state = self.state();
-        let counters = &mut state.counters;
-        counters.source_exact_projection_reuse_count = counters
-            .source_exact_projection_reuse_count
-            .saturating_add(exact_reuse_count);
-        counters.source_conditional_unchanged_count = counters
-            .source_conditional_unchanged_count
-            .saturating_add(conditional_unchanged_count);
-        counters.source_overlap_range_elimination_count = counters
-            .source_overlap_range_elimination_count
-            .saturating_add(overlap_removed_count);
-        counters.source_physical_range_avoided_count = counters
-            .source_physical_range_avoided_count
-            .saturating_add(physical_range_avoided_count);
-    }
-
-    pub(crate) fn record_source_model_visible_new_evidence(&self, evidence_count: u64) {
-        let mut state = self.state();
-        state.counters.source_model_visible_new_evidence_count = state
-            .counters
-            .source_model_visible_new_evidence_count
-            .saturating_add(evidence_count);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_architecture_slice_result(
-        &self,
-        complete: bool,
-        relationships: u64,
-        invariants: u64,
-        missing_requirements: u64,
-        material_unknowns: u64,
-        stale_snapshot: bool,
-        late_relationship_discoveries: u64,
-    ) {
-        let mut state = self.state();
-        let counters = &mut state.counters;
-        counters.architecture_slice_complete_count = counters
-            .architecture_slice_complete_count
-            .saturating_add(u32::from(complete));
-        counters.architecture_relationship_count = counters
-            .architecture_relationship_count
-            .saturating_add(relationships);
-        counters.architecture_invariant_count = counters
-            .architecture_invariant_count
-            .saturating_add(invariants);
-        counters.architecture_missing_requirement_count = counters
-            .architecture_missing_requirement_count
-            .saturating_add(missing_requirements);
-        counters.architecture_material_unknown_count = counters
-            .architecture_material_unknown_count
-            .saturating_add(material_unknowns);
-        counters.architecture_stale_snapshot_count = counters
-            .architecture_stale_snapshot_count
-            .saturating_add(u32::from(stale_snapshot));
-        counters.architecture_late_relationship_discovery_count = counters
-            .architecture_late_relationship_discovery_count
-            .saturating_add(late_relationship_discoveries);
     }
 
     pub(crate) fn record_planning_fixed_point_iteration(&self) {
@@ -1202,6 +1335,24 @@ impl TurnTimingState {
         let mut state = self.state();
         state.counters.reused_validation_count =
             state.counters.reused_validation_count.saturating_add(1);
+        state.counters.duplicate_validation_count =
+            state.counters.duplicate_validation_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_executed_validation(&self, duration_ms: u64, force_fresh: bool) {
+        let mut state = self.state();
+        state.counters.executed_validation_count =
+            state.counters.executed_validation_count.saturating_add(1);
+        state.counters.executed_validation_duration_ns = state
+            .counters
+            .executed_validation_duration_ns
+            .saturating_add(duration_ms.saturating_mul(1_000_000));
+        if force_fresh {
+            state.counters.forced_fresh_validation_count = state
+                .counters
+                .forced_fresh_validation_count
+                .saturating_add(1);
+        }
     }
 
     pub(crate) fn record_suppressed_validation_output(&self) {
@@ -1310,12 +1461,6 @@ impl TurnTimingState {
                 .counters
                 .suppressed_deterministic_continuation_count
                 .saturating_add(receipt.suppressed_continuation_count);
-            if receipt.class == DeterministicContinuationClass::SourceProjection {
-                state.counters.source_host_drained_continuation_count = state
-                    .counters
-                    .source_host_drained_continuation_count
-                    .saturating_add(receipt.suppressed_continuation_count);
-            }
             let Some(identity) = receipt.runtime_identity() else {
                 continue;
             };
@@ -1523,6 +1668,7 @@ impl TurnTimingState {
             let generation_purpose = state.current_generation_purpose;
             let disposition = state.current_generation_disposition;
             let relevant_state_fingerprint = state.current_relevant_state_fingerprint.clone();
+            let failure_fingerprint = state.current_failure_fingerprint.clone();
             let attempt_kind = std::mem::take(&mut state.next_attempt_kind);
             state.model_requests.push(ModelRequestTiming {
                 generation_index,
@@ -1530,6 +1676,7 @@ impl TurnTimingState {
                 generation_purpose,
                 disposition,
                 relevant_state_fingerprint,
+                failure_fingerprint,
                 attempt_kind,
                 is_continuation,
                 ..Default::default()
@@ -1602,9 +1749,14 @@ impl TurnTimingState {
         event: &ResponseEvent,
     ) -> Option<Duration> {
         let records_model_output = response_event_records_model_output(event);
+        let records_actionable_output = response_event_records_actionable_output(event);
         let records_visible_output = response_event_records_visible_output(event);
         let records_completion = matches!(event, ResponseEvent::Completed { .. });
-        if !records_model_output && !records_visible_output && !records_completion {
+        if !records_model_output
+            && !records_actionable_output
+            && !records_visible_output
+            && !records_completion
+        {
             return None;
         }
         let sample = self.clock.sample();
@@ -1622,6 +1774,15 @@ impl TurnTimingState {
             && request.first_model_output_ns.is_none()
         {
             request.first_model_output_ns = Some(elapsed_ns);
+        }
+        if records_actionable_output
+            && let Some(request) = state.model_requests.last_mut()
+            && request.first_actionable_output_ns.is_none()
+        {
+            request.first_actionable_output_ns = Some(elapsed_ns);
+        }
+        if records_actionable_output && state.milestones.first_actionable_output_ns.is_none() {
+            state.milestones.first_actionable_output_ns = Some(elapsed_ns);
         }
         if records_model_output && state.milestones.first_model_output_ns.is_none() {
             state.milestones.first_model_output_ns = Some(elapsed_ns);
@@ -1831,6 +1992,7 @@ impl TurnTimingStateInner {
         self.current_generation_purpose = purpose;
         self.current_generation_disposition = disposition;
         self.current_relevant_state_fingerprint = relevant_state_fingerprint;
+        self.current_failure_fingerprint = None;
         self.next_attempt_kind = TurnTimingAttemptKind::Primary;
     }
 
@@ -2019,6 +2181,18 @@ impl TurnTimingStateInner {
                 elapsed_ns,
                 &mut self.counters.saturation_count,
             );
+            if let Some(generation_index) = self.current_generation_index
+                && let Some(request) = self.model_requests.iter_mut().find(|request| {
+                    request.generation_index == generation_index
+                        && request.attempt_kind == TurnTimingAttemptKind::Primary
+                })
+            {
+                add_saturating(
+                    &mut request.tool_active_union_ns,
+                    elapsed_ns,
+                    &mut self.counters.saturation_count,
+                );
+            }
         }
         if self.activity.interactive > 0 {
             add_saturating(
@@ -2145,7 +2319,7 @@ impl TurnTimingStateInner {
             completed_at_unix_ms: started_sample.map(|_| sample.time.wall_unix_ms),
             completed_at_unix_secs: started_sample.map(|_| sample.time.wall_unix_ms / 1_000),
             duration_ms: started_sample.map(|_| u128_to_i64_ms(inclusive_duration_ns)),
-            time_to_first_token_ms: self.milestones.first_visible_output_ns.map(u128_to_i64_ms),
+            time_to_first_token_ms: self.milestones.first_model_output_ns.map(u128_to_i64_ms),
             legacy_profile,
             profile,
         };
@@ -2415,6 +2589,31 @@ pub(crate) fn response_event_records_model_output(event: &ResponseEvent) -> bool
     }
 }
 
+/// Records the point at which the model has produced an executable tool call
+/// or begun a user-facing answer. Reasoning deltas and partial tool arguments
+/// intentionally do not satisfy this milestone.
+pub(crate) fn response_event_records_actionable_output(event: &ResponseEvent) -> bool {
+    match event {
+        ResponseEvent::OutputItemDone(item) => response_item_records_actionable_output(item),
+        ResponseEvent::OutputTextDelta(text) => !text.is_empty(),
+        ResponseEvent::OutputItemAdded(_)
+        | ResponseEvent::ReasoningSummaryDelta { .. }
+        | ResponseEvent::ReasoningContentDelta { .. }
+        | ResponseEvent::ToolCallInputDelta { .. }
+        | ResponseEvent::ReasoningSummaryDone { .. }
+        | ResponseEvent::Created
+        | ResponseEvent::ServerModel(_)
+        | ResponseEvent::ModelVerifications(_)
+        | ResponseEvent::TurnModerationMetadata(_)
+        | ResponseEvent::SafetyBuffering(_)
+        | ResponseEvent::ServerReasoningIncluded(_)
+        | ResponseEvent::Completed { .. }
+        | ResponseEvent::ReasoningSummaryPartAdded { .. }
+        | ResponseEvent::RateLimits(_)
+        | ResponseEvent::ModelsEtag(_) => false,
+    }
+}
+
 pub(crate) fn response_event_records_visible_output(event: &ResponseEvent) -> bool {
     match event {
         ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
@@ -2451,6 +2650,21 @@ fn response_item_records_model_output(item: &ResponseItem) -> bool {
                 | ResponseItem::Compaction { .. }
                 | ResponseItem::ContextCompaction { .. }
         )
+}
+
+fn response_item_records_actionable_output(item: &ResponseItem) -> bool {
+    matches!(
+        item,
+        ResponseItem::LocalShellCall { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::ImageGenerationCall { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::ContextCompaction { .. }
+    ) || matches!(item, ResponseItem::Message { .. })
+        && raw_assistant_output_text_from_item(item).is_some_and(|text| !text.is_empty())
 }
 
 fn response_item_records_visible_output(item: &ResponseItem) -> bool {
@@ -2548,7 +2762,7 @@ fn primary_generation_count(
         .unwrap_or(u32::MAX)
 }
 
-fn unique_primary_state_count(
+fn unique_primary_failure_signature_count(
     requests: &[ModelRequestTiming],
     purpose: TurnTimingGenerationPurpose,
 ) -> u32 {
@@ -2558,7 +2772,7 @@ fn unique_primary_state_count(
             request.attempt_kind == TurnTimingAttemptKind::Primary
                 && request.generation_purpose == Some(purpose)
         })
-        .filter_map(|request| request.relevant_state_fingerprint.as_deref())
+        .filter_map(|request| request.failure_fingerprint.as_deref())
         .collect::<BTreeSet<_>>()
         .len()
         .try_into()
@@ -2615,13 +2829,26 @@ fn purpose_aggregates(
             let wait_ns = matching.iter().fold(0_u128, |total, request| {
                 total.saturating_add(request.model_stream_wait_ns)
             });
+            let decision_latencies = matching
+                .iter()
+                .filter_map(|request| request.decision_latency_ns())
+                .collect::<Vec<_>>();
+            let decision_latency_ns = decision_latencies
+                .iter()
+                .fold(0_u128, |total, value| total.saturating_add(*value));
+            let tool_active_union_ns = matching.iter().fold(0_u128, |total, request| {
+                total.saturating_add(request.tool_active_union_ns)
+            });
             Some(TurnTimingGenerationPurposeAggregate {
                 purpose,
                 generations,
                 model_stream_wait_ns: public_ns(wait_ns, saturation_count),
+                decision_latency_ns: public_ns(decision_latency_ns, saturation_count),
+                decision_ready_requests: decision_latencies.len().try_into().unwrap_or(u32::MAX),
                 tool_calls: matching.iter().fold(0_u32, |total, request| {
                     total.saturating_add(request.tool_call_count)
                 }),
+                tool_active_union_ns: public_ns(tool_active_union_ns, saturation_count),
                 output_tokens: matching.iter().fold(0_u64, |total, request| {
                     total.saturating_add(request.output_tokens)
                 }),
@@ -2701,6 +2928,54 @@ fn diagnostic_token_aggregate(
         }
     }
     aggregate
+}
+
+fn diagnostic_latency_aggregate(
+    requests: &[ModelRequestTiming],
+    includes: impl Fn(&ModelRequestTiming) -> bool,
+    saturation_count: &mut u32,
+) -> TurnTimingDiagnosticLatencyAggregate {
+    let generation_ids = requests
+        .iter()
+        .filter(|request| {
+            request.attempt_kind == TurnTimingAttemptKind::Primary && includes(request)
+        })
+        .map(|request| request.generation_index)
+        .collect::<BTreeSet<_>>();
+    let matching = requests
+        .iter()
+        .filter(|request| generation_ids.contains(&request.generation_index))
+        .collect::<Vec<_>>();
+    let decision_latencies = matching
+        .iter()
+        .filter_map(|request| request.decision_latency_ns())
+        .collect::<Vec<_>>();
+    TurnTimingDiagnosticLatencyAggregate {
+        logical_generations: generation_ids.len().try_into().unwrap_or(u32::MAX),
+        physical_attempts: matching.len().try_into().unwrap_or(u32::MAX),
+        model_stream_wait_ns: public_ns(
+            matching.iter().fold(0_u128, |total, request| {
+                total.saturating_add(request.model_stream_wait_ns)
+            }),
+            saturation_count,
+        ),
+        decision_ready_attempts: decision_latencies.len().try_into().unwrap_or(u32::MAX),
+        decision_latency_ns: public_ns(
+            decision_latencies
+                .iter()
+                .fold(0_u128, |total, value| total.saturating_add(*value)),
+            saturation_count,
+        ),
+        tool_calls: matching.iter().fold(0_u32, |total, request| {
+            total.saturating_add(request.tool_call_count)
+        }),
+        tool_active_union_ns: public_ns(
+            matching.iter().fold(0_u128, |total, request| {
+                total.saturating_add(request.tool_active_union_ns)
+            }),
+            saturation_count,
+        ),
+    }
 }
 
 fn public_ms(nanos: u128, saturation_count: &mut u32) -> u64 {

@@ -111,7 +111,6 @@ pub(crate) struct SessionServices {
     pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
     pub(crate) turn_environments: Arc<ThreadEnvironments>,
     pub(crate) git_workspace: Arc<GitWorkspaceCache>,
-    pub(crate) source_reads: crate::tools::handlers::source_tools::SourceReadCoordinator,
 }
 
 impl SessionServices {

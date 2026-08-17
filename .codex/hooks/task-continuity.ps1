@@ -205,7 +205,12 @@ try {
                         [string]$fastCapsule.repository.dirty_summary -eq [string]$fastDirty
                     )
 
-                    if ($fastRepositoryMatches -and
+                    $fastCarriesSummary = $fastEvent -eq 'PostCompact' -and
+                        $script:FastInput.ContainsKey('compaction_summary') -and
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$script:FastInput.compaction_summary
+                        )
+                    if ($fastRepositoryMatches -and -not $fastCarriesSummary -and
                         $fastEvent -in @('PreCompact', 'PostCompact')) {
                         $fastPhase = if ($fastEvent -eq 'PreCompact') { 'pre' } else { 'post' }
                         if ([string]$fastCapsule.last_event -eq $fastEvent -and
@@ -461,6 +466,83 @@ function New-CompactionState {
     }
 }
 
+function New-TaskState {
+    return [pscustomobject][ordered]@{
+        goal = $null
+        current_state = $null
+        completed_work = $null
+        unresolved_work = $null
+        evidence = $null
+        next_action = $null
+    }
+}
+
+function Get-CheckpointSections {
+    param([string]$Summary)
+
+    $headingToField = [ordered]@{
+        '## Goal' = 'goal'
+        '## Current state' = 'current_state'
+        '## Completed work' = 'completed_work'
+        '## Unresolved work' = 'unresolved_work'
+        '## Evidence' = 'evidence'
+        '## Next action' = 'next_action'
+    }
+    $lines = [ordered]@{
+        goal = New-Object Collections.ArrayList
+        current_state = New-Object Collections.ArrayList
+        completed_work = New-Object Collections.ArrayList
+        unresolved_work = New-Object Collections.ArrayList
+        evidence = New-Object Collections.ArrayList
+        next_action = New-Object Collections.ArrayList
+    }
+    $current = $null
+    foreach ($line in ($Summary -split "`n")) {
+        $trimmed = $line.Trim()
+        if ($headingToField.Contains($trimmed)) {
+            $current = [string]$headingToField[$trimmed]
+            continue
+        }
+        if ($null -ne $current) {
+            [void]$lines[$current].Add($line)
+        }
+    }
+    $result = [ordered]@{}
+    foreach ($field in @('goal', 'current_state', 'completed_work', 'unresolved_work', 'evidence', 'next_action')) {
+        $body = ([string[]]$lines[$field] -join "`n").Trim()
+        $result[$field] = if ([string]::IsNullOrWhiteSpace($body)) {
+            $null
+        }
+        else {
+            Get-RedactedExcerpt -Value $body -MaximumCharacters 1200
+        }
+    }
+    return [pscustomobject]$result
+}
+
+function Update-TaskStateFromSummary {
+    param(
+        [object]$Capsule,
+        [string]$Summary
+    )
+
+    $sections = Get-CheckpointSections -Summary $Summary
+    $goal = if (-not [string]::IsNullOrWhiteSpace([string]$Capsule.last_user_request)) {
+        Get-RedactedExcerpt -Value ([string]$Capsule.last_user_request) -MaximumCharacters 1200
+    }
+    else {
+        $sections.goal
+    }
+    $capsule.task_state = [pscustomobject][ordered]@{
+        goal = $goal
+        current_state = $sections.current_state
+        completed_work = $sections.completed_work
+        unresolved_work = $sections.unresolved_work
+        evidence = $sections.evidence
+        next_action = $sections.next_action
+    }
+}
+
 function New-Capsule {
     param(
         [string]$SessionId,
@@ -493,6 +575,7 @@ function New-Capsule {
         task_label = $null
         last_user_request = $null
         last_assistant_result = $null
+        task_state = New-TaskState
         repository = New-RepositoryState
         compaction = New-CompactionState
         material_digest = $null
@@ -503,6 +586,16 @@ function New-Capsule {
         $capsule.task_label = Get-RedactedExcerpt -Value $Seed.task_label -MaximumCharacters 80
         $capsule.last_user_request = Get-RedactedExcerpt -Value $Seed.last_user_request
         $capsule.last_assistant_result = Get-RedactedExcerpt -Value $Seed.last_assistant_result
+        if (Test-HasProperty -Object $Seed -Name 'task_state') {
+            foreach ($name in @(
+                'goal', 'current_state', 'completed_work', 'unresolved_work',
+                'evidence', 'next_action'
+            )) {
+                $capsule.task_state.$name = Get-RedactedExcerpt `
+                    -Value (Get-OptionalProperty -Object $Seed.task_state -Name $name) `
+                    -MaximumCharacters 1200
+            }
+        }
         if ([string]$Seed.compaction.phase -eq 'post') {
             $capsule.compaction = [pscustomobject][ordered]@{
                 phase = 'post'
@@ -553,6 +646,18 @@ function Assert-Capsule {
     )) {
         [void](Get-OptionalString -Object $Capsule -Name $name)
     }
+    if (-not (Test-HasProperty -Object $Capsule -Name 'task_state')) {
+        $Capsule | Add-Member -NotePropertyName task_state -NotePropertyValue (New-TaskState)
+    }
+    if ($Capsule.task_state -isnot [pscustomobject]) {
+        throw 'capsule task_state is missing or invalid'
+    }
+    foreach ($name in @(
+        'goal', 'current_state', 'completed_work', 'unresolved_work',
+        'evidence', 'next_action'
+    )) {
+        [void](Get-OptionalString -Object $Capsule.task_state -Name $name)
+    }
     if (-not (Test-HasProperty -Object $Capsule -Name 'repository') -or
         $Capsule.repository -isnot [pscustomobject]) {
         throw 'capsule repository state is missing or invalid'
@@ -602,6 +707,7 @@ function Get-MaterialDigest {
         task_label = $Capsule.task_label
         last_user_request = $Capsule.last_user_request
         last_assistant_result = $Capsule.last_assistant_result
+        task_state = $Capsule.task_state
         repository = $Capsule.repository
         compaction = $Capsule.compaction
     }
@@ -777,7 +883,19 @@ function Invoke-Retention {
 function Build-RecoveryContext {
     param([object]$Capsule)
 
-    $hasRecovery = -not [string]::IsNullOrWhiteSpace([string]$Capsule.last_user_request) -or
+    $taskStateValues = @(
+        $Capsule.task_state.goal,
+        $Capsule.task_state.current_state,
+        $Capsule.task_state.completed_work,
+        $Capsule.task_state.unresolved_work,
+        $Capsule.task_state.evidence,
+        $Capsule.task_state.next_action
+    )
+    $hasTaskState = @($taskStateValues | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_)
+    }).Count -gt 0
+    $hasRecovery = $hasTaskState -or
+        -not [string]::IsNullOrWhiteSpace([string]$Capsule.last_user_request) -or
         -not [string]::IsNullOrWhiteSpace([string]$Capsule.last_assistant_result) -or
         -not [string]::IsNullOrWhiteSpace([string]$Capsule.predecessor_thread_id)
     if (-not $hasRecovery) {
@@ -804,12 +922,20 @@ function Build-RecoveryContext {
         last_user_request = if ([string]::IsNullOrWhiteSpace(
             [string]$Capsule.last_user_request
         )) { $null } else {
-            Get-RedactedExcerpt -Value ([string]$Capsule.last_user_request) -MaximumCharacters 2400
+            Get-RedactedExcerpt -Value ([string]$Capsule.last_user_request) -MaximumCharacters 900
         }
         last_assistant_result = if ([string]::IsNullOrWhiteSpace(
             [string]$Capsule.last_assistant_result
         )) { $null } else {
-            Get-RedactedExcerpt -Value ([string]$Capsule.last_assistant_result) -MaximumCharacters 2400
+            Get-RedactedExcerpt -Value ([string]$Capsule.last_assistant_result) -MaximumCharacters 900
+        }
+        task_state = [pscustomobject][ordered]@{
+            goal = Get-RedactedExcerpt -Value $Capsule.task_state.goal -MaximumCharacters 600
+            current_state = Get-RedactedExcerpt -Value $Capsule.task_state.current_state -MaximumCharacters 600
+            completed_work = Get-RedactedExcerpt -Value $Capsule.task_state.completed_work -MaximumCharacters 600
+            unresolved_work = Get-RedactedExcerpt -Value $Capsule.task_state.unresolved_work -MaximumCharacters 600
+            evidence = Get-RedactedExcerpt -Value $Capsule.task_state.evidence -MaximumCharacters 600
+            next_action = Get-RedactedExcerpt -Value $Capsule.task_state.next_action -MaximumCharacters 600
         }
         repository = [pscustomobject][ordered]@{
             root = if ([string]::IsNullOrWhiteSpace([string]$Capsule.repository.root)) {
@@ -823,7 +949,7 @@ function Build-RecoveryContext {
             )) { $null } else {
                 Get-RedactedExcerpt `
                     -Value ([string]$Capsule.repository.dirty_summary) `
-                    -MaximumCharacters 1200
+                    -MaximumCharacters 600
             }
         }
         compaction = [pscustomobject][ordered]@{
@@ -1030,6 +1156,8 @@ function Invoke-TaskContinuity {
             $prompt = Get-RequiredString -Object $InputObject -Name 'prompt' -AllowEmpty
             $capsule.last_user_request = Get-RedactedExcerpt -Value $prompt
             $capsule.task_label = Get-TaskLabel -Prompt $capsule.last_user_request
+            $capsule.task_state = New-TaskState
+            $capsule.task_state.goal = Get-RedactedExcerpt -Value $prompt -MaximumCharacters 1200
             [void](Save-Capsule `
                 -Capsule $capsule `
                 -Path $capsulePath `
@@ -1051,6 +1179,14 @@ function Invoke-TaskContinuity {
         }
         'PostCompact' {
             $trigger = Get-RequiredString -Object $InputObject -Name 'trigger'
+            $compactionSummary = Get-OptionalString `
+                -Object $InputObject `
+                -Name 'compaction_summary'
+            if (-not [string]::IsNullOrWhiteSpace($compactionSummary)) {
+                Update-TaskStateFromSummary `
+                    -Capsule $capsule `
+                    -Summary $compactionSummary
+            }
             $capsule.compaction = [pscustomobject][ordered]@{
                 phase = 'post'
                 trigger = Get-RedactedExcerpt -Value $trigger -MaximumCharacters 100
@@ -1065,6 +1201,19 @@ function Invoke-TaskContinuity {
         'Stop' {
             $assistantResult = Get-OptionalString -Object $InputObject -Name 'last_assistant_message'
             $capsule.last_assistant_result = Get-RedactedExcerpt -Value $assistantResult
+            if (-not [string]::IsNullOrWhiteSpace($assistantResult)) {
+                $capsule.task_state.current_state = Get-RedactedExcerpt `
+                    -Value $assistantResult `
+                    -MaximumCharacters 1200
+                $capsule.task_state.evidence = Get-RedactedExcerpt `
+                    -Value $assistantResult `
+                    -MaximumCharacters 1200
+                $capsule.task_state.completed_work = Get-RedactedExcerpt `
+                    -Value $assistantResult `
+                    -MaximumCharacters 1200
+                $capsule.task_state.unresolved_work = $null
+                $capsule.task_state.next_action = 'Await the next user request.'
+            }
 
             $fastDigest = Get-MaterialDigest -Capsule $capsule
             if ($null -ne $previousDigest -and $fastDigest -eq $previousDigest) {

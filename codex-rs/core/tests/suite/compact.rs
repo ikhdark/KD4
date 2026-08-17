@@ -604,7 +604,7 @@ async fn summarize_context_three_requests_and_instructions() {
         "expected summarize trigger, got `{text2}`"
     );
 
-    // Third request must contain the refreshed instructions, compacted user history, and new user message.
+    // Third request must contain refreshed instructions, the summary, and the new user message.
     let input3 = body3.get("input").and_then(|v| v.as_array()).unwrap();
 
     assert!(
@@ -644,10 +644,10 @@ async fn summarize_context_three_requests_and_instructions() {
         "third request should include the new user message"
     );
     assert!(
-        messages
+        !messages
             .iter()
             .any(|(r, t)| r == "user" && t == "hello world"),
-        "third request should include the original user message"
+        "third request must evict the consumed original user message"
     );
     assert!(
         messages
@@ -2043,7 +2043,9 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
 
     let follow_up_matcher = move |req: &wiremock::Request| {
         let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains(follow_up_user) && body.contains(remote_summary)
+        body.contains(follow_up_user)
+            && body.contains("ENCRYPTED_COMPACTION_SUMMARY")
+            && !body.contains(remote_summary)
     };
     mount_sse_once_match(&server, follow_up_matcher, sse_follow_up).await;
 

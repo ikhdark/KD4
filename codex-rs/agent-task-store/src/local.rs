@@ -3878,21 +3878,14 @@ async fn prepare_validation_call(
             };
             let current =
                 crate::workspace::capture_revision(pool, &context.repo_root, paths).await?;
-            let execution_current = if existing.status == crate::ValidationCallStatus::Running {
-                Some(
-                    crate::workspace::capture_revision(
-                        pool,
-                        &context.repo_root,
-                        vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
-                    )
-                    .await?,
+            let execution_current = Some(
+                crate::workspace::capture_revision(
+                    pool,
+                    &context.repo_root,
+                    vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
                 )
-            } else {
-                None
-            };
-            let execution_discovered_new_epoch = execution_current
-                .as_ref()
-                .is_some_and(|revision| revision.epoch > current.epoch);
+                .await?,
+            );
             let execution_changes = execution_current
                 .as_ref()
                 .zip(existing.evidence.execution_snapshot.as_deref())
@@ -3904,7 +3897,7 @@ async fn prepare_validation_call(
                     )
                 })
                 .unwrap_or_default();
-            let stale_reason = if execution_changes.is_empty() || !execution_discovered_new_epoch {
+            let stale_reason = if execution_changes.is_empty() {
                 validation_stale_reason(
                     pool,
                     &context.repo_root,
@@ -3984,7 +3977,7 @@ async fn prepare_validation_call(
     )
     .await?;
     let covered_input_manifest_hash = revision.manifest_hash.clone();
-    let dependency_manifest_hash = revision.manifest_hash.clone();
+    let dependency_manifest_hash = execution_revision.manifest_hash.clone();
     let normalized_invocation = validation_normalized_invocation(&call)?;
     let coverage_identity =
         validation_coverage_identity(&covered_scopes, &covered_contracts, repository_wide)?;
@@ -4000,7 +3993,7 @@ async fn prepare_validation_call(
         &coverage_identity,
         &features_configuration_identity,
         &revision.manifest_hash,
-        &revision.manifest_hash,
+        &dependency_manifest_hash,
     )?;
     call.evidence = ValidationEvidence {
         candidate_id,
@@ -4412,10 +4405,10 @@ async fn validation_stale_event_reason_tx(
     if current_epoch == evidence_epoch {
         return Ok(None);
     }
-    if call.evidence.repository_wide {
+    if call.evidence.repository_wide || call.evidence.execution_snapshot.is_some() {
         return Ok(Some((
             format!(
-                "repository-wide validation ended at epoch {evidence_epoch} but workspace is at epoch {current_epoch}"
+                "validation dependency snapshot ended at epoch {evidence_epoch} but workspace is at epoch {current_epoch}"
             ),
             current_epoch,
         )));

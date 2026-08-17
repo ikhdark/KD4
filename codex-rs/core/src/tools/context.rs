@@ -110,6 +110,18 @@ impl ToolOutput for McpToolOutput {
         self.result.success()
     }
 
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        serde_json::to_value(&self.result)
+            .ok()
+            .map(|semantic_evidence| {
+                if self.result.success() {
+                    semantic_evidence_sampling_signal(semantic_evidence)
+                } else {
+                    semantic_failure_sampling_signal(semantic_evidence)
+                }
+            })
+    }
+
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
         ToolOutput::projection_metadata(&self.result)
     }
@@ -396,6 +408,29 @@ impl ToolOutput for FunctionToolOutput {
         })
     }
 
+    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        if self
+            .body
+            .iter()
+            .any(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. }))
+        {
+            Some(CanonicalToolResult::json(self.code_mode_result(payload)))
+        } else {
+            let metadata = self.projection_metadata()?;
+            if metadata.spillable_text.len() == 1 {
+                Some(CanonicalToolResult::text(
+                    metadata
+                        .spillable_text
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default(),
+                ))
+            } else {
+                Some(CanonicalToolResult::json(self.code_mode_result(payload)))
+            }
+        }
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         let success = if self.outcome.is_some() || self.skip_disposition.is_some() {
             Some(self.outcome_for_logging() == ToolOutputOutcome::Success)
@@ -561,6 +596,24 @@ impl ToolOutput for ExecCommandToolOutput {
             ToolOutputOutcome::Failure
         } else {
             ToolOutputOutcome::Success
+        }
+    }
+
+    fn sampling_request_signal(&self) -> Option<JsonValue> {
+        let outcome = self.outcome_for_logging();
+        let semantic_evidence = semantic_evidence_for_command_output(&self.raw_output);
+        match outcome {
+            ToolOutputOutcome::Success => Some(serde_json::json!({
+                "kind": "semantic_evidence",
+                "semantic_evidence": semantic_evidence,
+            })),
+            ToolOutputOutcome::Failure => Some(serde_json::json!({
+                "kind": "semantic_evidence",
+                "outcome": "failure",
+                "failure_signature": command_failure_signature(&semantic_evidence, self.exit_code),
+                "semantic_evidence": semantic_evidence,
+            })),
+            ToolOutputOutcome::TimedOut | ToolOutputOutcome::Skipped => None,
         }
     }
 
@@ -746,6 +799,264 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 }
 
+pub(crate) fn semantic_evidence_for_command_output(raw_output: &[u8]) -> Vec<String> {
+    let Ok(output) = std::str::from_utf8(raw_output) else {
+        return canonical_output_evidence(raw_output);
+    };
+    let compiler_framing = output
+        .lines()
+        .any(|line| is_compiler_location_line(&strip_ansi_sequences(line)));
+    let mut facts = Vec::new();
+    let mut in_diff = false;
+    let mut in_diff_hunk = false;
+    for raw_line in output.lines() {
+        let line = strip_ansi_sequences(raw_line);
+        let line = line.trim_end();
+        if line.starts_with("diff --git ") {
+            in_diff = true;
+            in_diff_hunk = false;
+            continue;
+        }
+        if in_diff {
+            if line.starts_with("@@") {
+                in_diff_hunk = true;
+                continue;
+            }
+            if line.starts_with("+++")
+                || line.starts_with("---")
+                || line.starts_with("index ")
+                || (!in_diff_hunk && is_git_diff_metadata(line))
+            {
+                continue;
+            }
+            if in_diff_hunk {
+                if let Some(changed_line) = line.strip_prefix('+') {
+                    if let Some(fact) = normalize_semantic_fact_line(changed_line, false) {
+                        facts.push(crate::tool_history::sha256(fact.as_bytes()));
+                    }
+                    continue;
+                }
+                if line.starts_with([' ', '-', '\\']) {
+                    continue;
+                }
+            }
+            in_diff = false;
+            in_diff_hunk = false;
+        }
+        if let Some(fact) = normalize_semantic_fact_line(line, compiler_framing) {
+            facts.push(crate::tool_history::sha256(fact.as_bytes()));
+        }
+    }
+    if facts.is_empty() {
+        return canonical_output_evidence(raw_output);
+    }
+    vec![format!(
+        "command-facts-v1:{}",
+        crate::tool_history::sha256(facts.join("\n").as_bytes())
+    )]
+}
+
+pub(crate) fn semantic_evidence_sampling_signal(semantic_evidence: JsonValue) -> JsonValue {
+    serde_json::json!({
+        "kind": "semantic_evidence",
+        "semantic_evidence": semantic_evidence,
+    })
+}
+
+pub(crate) fn semantic_failure_sampling_signal(semantic_evidence: JsonValue) -> JsonValue {
+    let failure_signature = format!(
+        "tool-output-v1:{}",
+        crate::tool_history::sha256(
+            serde_json::to_vec(&semantic_evidence)
+                .unwrap_or_default()
+                .as_slice(),
+        )
+    );
+    serde_json::json!({
+        "kind": "semantic_evidence",
+        "outcome": "failure",
+        "failure_signature": failure_signature,
+        "semantic_evidence": semantic_evidence,
+    })
+}
+
+fn canonical_output_evidence(raw_output: &[u8]) -> Vec<String> {
+    vec![format!(
+        "canonical-output-v1:{}",
+        crate::tool_history::sha256(raw_output)
+    )]
+}
+
+fn command_failure_signature(semantic_evidence: &[String], exit_code: Option<i32>) -> String {
+    format!(
+        "command-failure-v1:{}",
+        crate::tool_history::sha256(
+            format!("exit_code={exit_code:?}\n{}", semantic_evidence.join("\n")).as_bytes()
+        )
+    )
+}
+
+fn normalize_semantic_fact_line(line: &str, compiler_framing: bool) -> Option<String> {
+    let mut line = line.trim();
+    if line.is_empty() || (compiler_framing && is_compiler_location_line(line)) {
+        return None;
+    }
+    if compiler_framing
+        && let Some((prefix, body)) = line.split_once('|')
+        && prefix.trim().parse::<u64>().is_ok()
+    {
+        line = body.trim();
+    } else if let Some(body) = strip_location_prefix(line) {
+        line = body.trim();
+    }
+    if line.is_empty() || (compiler_framing && is_compiler_marker_line(line)) {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+fn is_compiler_location_line(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("--> ")
+        .and_then(strip_location_prefix)
+        .is_some()
+}
+
+fn is_compiler_marker_line(line: &str) -> bool {
+    let marker = line.strip_prefix('|').unwrap_or(line).trim();
+    !marker.is_empty()
+        && marker
+            .chars()
+            .all(|character| matches!(character, '^' | '-' | '_' | '~'))
+}
+
+fn strip_location_prefix(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b':' {
+            continue;
+        }
+        let digits_start = index + 1;
+        let digits_end = bytes[digits_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .map(|offset| digits_start + offset)
+            .unwrap_or(bytes.len());
+        if digits_end == digits_start || bytes.get(digits_end) != Some(&b':') {
+            continue;
+        }
+        if !looks_like_source_path(&line[..index]) {
+            continue;
+        }
+        return line.get(digits_end + 1..);
+    }
+    None
+}
+
+fn looks_like_source_path(prefix: &str) -> bool {
+    let prefix = prefix.trim().to_ascii_lowercase();
+    if prefix.contains("://") {
+        return false;
+    }
+    let has_path_separator = prefix.contains('/') || prefix.contains('\\');
+    let file_name = prefix.rsplit(['/', '\\']).next().unwrap_or(&prefix);
+    matches!(file_name, "dockerfile" | "gemfile" | "makefile" | "readme")
+        || file_name.rsplit_once('.').is_some_and(|(stem, extension)| {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= 16
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+                && (has_path_separator || is_common_source_extension(extension))
+        })
+}
+
+fn is_common_source_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "bash"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "cs"
+            | "css"
+            | "cxx"
+            | "fish"
+            | "go"
+            | "h"
+            | "hpp"
+            | "html"
+            | "java"
+            | "js"
+            | "json"
+            | "jsonl"
+            | "jsx"
+            | "kt"
+            | "kts"
+            | "less"
+            | "lock"
+            | "md"
+            | "php"
+            | "proto"
+            | "ps1"
+            | "py"
+            | "rb"
+            | "rs"
+            | "sass"
+            | "scala"
+            | "scss"
+            | "sh"
+            | "sql"
+            | "swift"
+            | "toml"
+            | "ts"
+            | "tsx"
+            | "txt"
+            | "xml"
+            | "yaml"
+            | "yml"
+            | "zsh"
+    )
+}
+
+fn is_git_diff_metadata(line: &str) -> bool {
+    [
+        "Binary files ",
+        "GIT binary patch",
+        "deleted file mode ",
+        "dissimilarity index ",
+        "new file mode ",
+        "new mode ",
+        "old mode ",
+        "rename from ",
+        "rename to ",
+        "similarity index ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn strip_ansi_sequences(line: &str) -> String {
+    let mut stripped = String::with_capacity(line.len());
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        if character != '\u{1b}' {
+            stripped.push(character);
+            continue;
+        }
+        if characters.next() != Some('[') {
+            continue;
+        }
+        for character in characters.by_ref() {
+            if ('@'..='~').contains(&character) {
+                break;
+            }
+        }
+    }
+    stripped
+}
+
 impl ExecCommandToolOutput {
     fn model_output_limits(&self, raw_output: &str) -> OutputLimitResolution {
         resolve_projected_output_limits(
@@ -782,20 +1093,19 @@ impl ExecCommandToolOutput {
             _ => None,
         };
         let content = summarized.as_deref().unwrap_or(raw.as_ref());
-        let truncated = formatted_truncate_text_with_output_limit(
-            content,
-            self.model_output_limits(raw.as_ref()),
-        );
+        let limits = self.model_output_limits(raw.as_ref());
+        let truncated = formatted_truncate_text_with_output_limit(content, limits);
         let was_truncated = truncated.was_truncated;
         let mut projected_text = truncated.text;
         if (summarized.is_some() || was_truncated)
             && let Some(original_tokens) = self.original_token_count
         {
-            let omitted_tokens =
-                original_tokens.saturating_sub(self.truncation_policy.token_budget());
+            let omitted_tokens = original_tokens.saturating_sub(limits.applied_limit);
             let marker = format!("Warning: truncated output\n{omitted_tokens} tokens truncated");
-            let limit = self.model_output_limits(raw.as_ref()).applied_limit;
-            let notice_limit = self.max_output_tokens.unwrap_or(limit).max(limit);
+            let notice_limit = self
+                .max_output_tokens
+                .unwrap_or(limits.applied_limit)
+                .max(limits.applied_limit);
             let candidate = format!("{marker}\n{projected_text}");
             projected_text = if codex_utils_string::approx_token_count(&candidate) <= notice_limit {
                 candidate

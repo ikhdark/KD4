@@ -17,7 +17,9 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::command_preflight::classify_rg_search_narrowing;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_preflight::reject_rg_search_without_native_scope;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
@@ -44,6 +46,7 @@ use crate::validation_admission::ValidationRegistration;
 use crate::validation_admission::admit_validation;
 use crate::validation_admission::register_if_absent;
 use crate::validation_admission::validation_identity;
+use crate::validation_admission::validation_identity_with_scope;
 use codex_features::Feature;
 use codex_git_utils::get_git_repo_root;
 use codex_otel::SessionTelemetry;
@@ -408,12 +411,33 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
-        let repository_key = native_cwd
+        let native_repository = native_cwd
             .as_ref()
-            .map(|cwd| get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf()))
+            .map(|cwd| get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.to_path_buf()));
+        let repository_key = native_repository
+            .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| cwd.to_string());
-        let validation_launch = match admit_validation(
+        let search_narrowing = if let Some(native_cwd) = native_cwd.as_ref() {
+            let repository_root =
+                get_git_repo_root(native_cwd.as_path()).unwrap_or_else(|| native_cwd.to_path_buf());
+            let search = classify_rg_search_narrowing(
+                &resolved_command.safety_command,
+                resolved_command.preflight_shell_type,
+                native_cwd.as_path(),
+                &repository_root,
+            )
+            .map_err(FunctionCallError::RespondToModel)?;
+            search.map(|search| (repository_root.to_string_lossy().into_owned(), search))
+        } else {
+            reject_rg_search_without_native_scope(
+                &resolved_command.safety_command,
+                resolved_command.preflight_shell_type,
+            )
+            .map_err(FunctionCallError::RespondToModel)?;
+            None
+        };
+        let mut validation_launch = match admit_validation(
             &turn.validation_authorization,
             session.services.state_db.as_deref(),
             repository_key.as_bytes(),
@@ -443,7 +467,33 @@ impl ExecCommandHandler {
                 proof_key: None,
                 structured_route: None,
                 validation_call_id: None,
+                turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
+                force_fresh: args.force_fresh,
             }),
+        };
+        let direct_validation_route = if validation_launch.is_some() {
+            let context = args.validation.as_ref().ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "validation commands require `validation` metadata stating the uncertainty, covered_paths, and covered_contracts"
+                        .to_string(),
+                )
+            })?;
+            let repository = native_repository.as_ref().ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "direct validation coverage requires a host-native repository path".to_string(),
+                )
+            })?;
+            Some(
+                super::super::shell::direct_validation_route(
+                    context,
+                    &command_invocation,
+                    repository,
+                    300_000,
+                )
+                .map_err(FunctionCallError::RespondToModel)?,
+            )
+        } else {
+            None
         };
         // Admission authorizes the validation; it does not prove that a nonzero outcome is
         // deterministic. All outcomes remain ordinary retryable command records here.
@@ -575,6 +625,17 @@ impl ExecCommandHandler {
         .with_input_context(&input_context)
         .with_runtime_context(&runtime_context)
         .with_repository_epoch(repository_epoch);
+        let attempt_key = if let Some((repository_identity, search)) = search_narrowing {
+            attempt_key.with_search_narrowing(&turn.sub_id, &repository_identity, Some(search))
+        } else {
+            attempt_key
+        };
+        session
+            .services
+            .command_execution
+            .admit_search_narrowing(&attempt_key)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
         let known_delta = if session.features().enabled(Feature::KnownDeltaStore)
             && !environment_is_remote
             && !tty
@@ -583,21 +644,25 @@ impl ExecCommandHandler {
             && let CommandInvocation::Argv { program, args } = &command_invocation
             && known_delta_store::is_immutable_git_show_candidate(program, args)
         {
-            let project_namespace = if let Some(source) =
-                turn.turn_metadata_state.git_metadata_source()
-                && native_cwd.starts_with(source.repo_root().as_path())
-            {
-                source.project_namespace().await
-            } else {
-                None
+            let metadata_source = turn
+                .turn_metadata_state
+                .git_metadata_source()
+                .filter(|source| native_cwd.starts_with(source.repo_root().as_path()));
+            let project_namespace = match &metadata_source {
+                Some(source) => source.project_namespace().await,
+                None => None,
             };
+            let project_namespace_hint = metadata_source
+                .map_or(known_delta_store::ProjectNamespaceHint::Discover, |_| {
+                    known_delta_store::ProjectNamespaceHint::Resolved(project_namespace.as_deref())
+                });
             known_delta_store::prepare_immutable_git_show(
                 turn.config.codex_home.as_path(),
                 &session.thread_id.to_string(),
                 native_cwd,
                 program,
                 args,
-                project_namespace.as_deref(),
+                project_namespace_hint,
                 force_fresh,
             )
             .await
@@ -624,14 +689,70 @@ impl ExecCommandHandler {
             )
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_default();
-            let identity = validation_identity(
-                repository_key.as_bytes(),
-                cwd.to_string(),
-                &command_invocation,
-                environment,
-                toolchain,
-                observed_mutation_revision,
-            );
+            let identity = if let Some(route) = direct_validation_route.as_ref() {
+                let Some(leaf) = route.leaves.first() else {
+                    return Err(FunctionCallError::RespondToModel(
+                        "direct validation route changed before launch".to_string(),
+                    ));
+                };
+                let implementation_identity = session
+                    .services
+                    .task_evidence
+                    .direct_validation_implementation_identity(&leaf.covered_paths)
+                    .await
+                    .map_err(FunctionCallError::RespondToModel)?;
+                validation_identity_with_scope(
+                    repository_key.as_bytes(),
+                    cwd.to_string(),
+                    &command_invocation,
+                    environment,
+                    toolchain,
+                    format!("features={:?}", turn.config.features.get()),
+                    implementation_identity,
+                    &leaf.uncertainty,
+                    &leaf.covered_paths,
+                    &leaf.covered_contracts,
+                )
+            } else {
+                validation_identity(
+                    repository_key.as_bytes(),
+                    cwd.to_string(),
+                    &command_invocation,
+                    environment,
+                    toolchain,
+                    observed_mutation_revision,
+                )
+            };
+            if !force_fresh
+                && let Some(result) = session
+                    .services
+                    .command_execution
+                    .reusable_validation(&identity)
+                    .await
+            {
+                tracing::info!(
+                    disposition = "reused",
+                    duplicate_of_call_id = %result.call_id,
+                    coverage_identity = %result.proof_key.coverage_identity,
+                    implementation_identity = %result.proof_key.implementation_identity,
+                    "validation proof reused without process execution"
+                );
+                turn.turn_timing_state.record_reused_validation();
+                return Ok(boxed_tool_output(validation_structured_output(
+                    serde_json::json!({
+                        "success": true,
+                        "admission_disposition": "reused",
+                        "validation_result": result,
+                    }),
+                )));
+            }
+            if let (Some(launch), Some(route)) =
+                (validation_launch.as_mut(), direct_validation_route.as_ref())
+            {
+                launch.proof_key = Some(identity.clone());
+                launch.structured_route = Some(route.clone());
+                launch.validation_call_id = Some(call_id.clone());
+            }
             loop {
                 match register_if_absent(
                     &turn.validation_singleflight,

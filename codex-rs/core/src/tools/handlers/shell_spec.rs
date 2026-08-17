@@ -6,6 +6,43 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
+fn validation_context_schema() -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "uncertainty".to_string(),
+                JsonSchema::string(Some(
+                    "Required for any test, check, lint, benchmark, or fuzz command. State the specific uncertainty this command resolves and why its coverage is sufficient."
+                        .to_string(),
+                )),
+            ),
+            (
+                "covered_paths".to_string(),
+                JsonSchema::array(
+                    JsonSchema::string(/*description*/ None),
+                    Some(
+                        "Repository-relative files or directories whose current contents determine whether this proof remains reusable."
+                            .to_string(),
+                    ),
+                ),
+            ),
+            (
+                "covered_contracts".to_string(),
+                JsonSchema::array(
+                    JsonSchema::string(/*description*/ None),
+                    Some("Named behavioral contracts this command proves.".to_string()),
+                ),
+            ),
+        ]),
+        Some(vec![
+            "uncertainty".to_string(),
+            "covered_paths".to_string(),
+            "covered_contracts".to_string(),
+        ]),
+        Some(false.into()),
+    )
+}
+
 const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +130,10 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
                 adaptive_output_budget_description()
             ))),
         ),
+        (
+            "validation".to_string(),
+            validation_context_schema(),
+        ),
     ]);
     if include_shell_parameter {
         properties.insert(
@@ -123,6 +164,12 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     properties.extend(create_approval_parameters(
         options.exec_permission_approvals_enabled,
     ));
+    properties.insert(
+        "force_fresh".to_string(),
+        JsonSchema::boolean(Some(
+            "Execute without reusing prior immutable evidence.".to_string(),
+        )),
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
@@ -239,6 +286,10 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
             JsonSchema::number(Some(
                 "Maximum command runtime. Defaults to 10000 ms.".to_string(),
             )),
+        ),
+        (
+            "validation".to_string(),
+            validation_context_schema(),
         ),
     ]);
     if options.allow_login_shell {

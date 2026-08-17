@@ -149,6 +149,33 @@ pub(crate) struct CandidateDiffCapture {
     pub(crate) raw_diff: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct WorkspaceEvidenceIdentity {
+    #[serde(default)]
+    pub(crate) repository_root: Option<String>,
+    pub(crate) head_identity: Option<String>,
+    pub(crate) index_identity: Option<String>,
+    pub(crate) worktree_identity: Option<String>,
+}
+
+pub(crate) async fn capture_workspace_evidence_identity(
+    cwd: &Path,
+) -> Option<WorkspaceEvidenceIdentity> {
+    let repo_root = get_git_repo_root(cwd)?;
+    let capture = capture_candidate_diff(cwd).await?;
+    Some(WorkspaceEvidenceIdentity {
+        repository_root: Some(
+            dunce::canonicalize(&repo_root)
+                .unwrap_or(repo_root)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        head_identity: capture.head_identity,
+        index_identity: capture.index_identity,
+        worktree_identity: capture.worktree_identity,
+    })
+}
+
 pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCapture> {
     let repo_root = get_git_repo_root(cwd)?;
     let (head, index_diff, worktree_diff, index_paths, worktree_paths, untracked) = tokio::join!(
@@ -168,16 +195,17 @@ pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCa
             &["ls-files", "--others", "--exclude-standard", "-z"],
         ),
     );
-    let head = head?;
     let index_diff = index_diff?;
     let worktree_diff = worktree_diff?;
     let index_paths = index_paths?;
     let worktree_paths = worktree_paths?;
     let untracked = untracked?;
-    let head_identity = String::from_utf8(head)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let head_identity = head.and_then(|head| {
+        String::from_utf8(head)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
     let index_identity = Some(format!("{:x}", Sha256::digest(&index_diff)));
     let untracked_paths = untracked
         .split(|byte| *byte == 0)
@@ -355,7 +383,7 @@ struct MetadataCacheEntry {
 struct ProjectNamespaceCacheEntry {
     dependencies: StableMetadataDependencies,
     watcher_generation: u64,
-    namespace: String,
+    namespace: Option<String>,
     _registration: WatchRegistration,
 }
 
@@ -375,6 +403,8 @@ pub(crate) struct GitWorkspaceCache {
     watcher_subscriber: Option<FileWatcherSubscriber>,
     source_watch_registrations: StdMutex<HashMap<PathBuf, WatchRegistration>>,
     source_change_journal: StdMutex<SourceChangeJournal>,
+    #[cfg(test)]
+    workspace_evidence_capture_count: AtomicU64,
 }
 
 pub(crate) struct WorkspaceChangeObservation {
@@ -389,6 +419,8 @@ pub(crate) struct SourcePathChangeObservation {
     watcher_generation: u64,
     repo_root: PathBuf,
     path: PathBuf,
+    #[serde(default)]
+    recursive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -443,6 +475,8 @@ impl GitWorkspaceCache {
             watcher_subscriber,
             source_watch_registrations: StdMutex::new(HashMap::new()),
             source_change_journal: StdMutex::new(SourceChangeJournal::default()),
+            #[cfg(test)]
+            workspace_evidence_capture_count: AtomicU64::new(0),
         });
         if let Some(mut receiver) = receiver {
             let weak_cache = Arc::downgrade(&cache);
@@ -469,6 +503,28 @@ impl GitWorkspaceCache {
         state.root = None;
         state.metadata.clear();
         state.project_namespaces.clear();
+    }
+
+    /// Returns a freshly captured content-based workspace identity.
+    ///
+    /// Watcher delivery is asynchronous, so a watcher generation cannot prove
+    /// that an external edit has not happened but is still waiting in the
+    /// event queue. Evidence freshness therefore must not reuse the metadata
+    /// caches used by non-authoritative repository discovery.
+    pub(crate) async fn workspace_evidence_identity(
+        &self,
+        cwd: &Path,
+    ) -> Option<WorkspaceEvidenceIdentity> {
+        #[cfg(test)]
+        self.workspace_evidence_capture_count
+            .fetch_add(1, Ordering::AcqRel);
+        capture_workspace_evidence_identity(cwd).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_evidence_capture_count(&self) -> u64 {
+        self.workspace_evidence_capture_count
+            .load(Ordering::Acquire)
     }
 
     pub(crate) async fn snapshot(
@@ -621,11 +677,11 @@ impl GitWorkspaceCache {
                 && self.watcher_reliable.load(Ordering::Acquire)
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
             {
-                return Some(entry.namespace.clone());
+                return entry.namespace.clone();
             }
         }
 
-        let namespace = collect_project_namespace(source.cwd.as_path()).await?;
+        let namespace = collect_project_namespace(source.cwd.as_path()).await;
         if let Some(before_dependencies) = dependencies {
             let after_dependencies = StableMetadataDependencies::capture_project_namespace(source);
             if after_dependencies.as_ref() == Some(&before_dependencies)
@@ -644,7 +700,7 @@ impl GitWorkspaceCache {
                 );
             }
         }
-        Some(namespace)
+        namespace
     }
 
     fn register_dependencies(&self, dependencies: &[DependencyFingerprint]) -> WatchRegistration {
@@ -706,6 +762,7 @@ impl GitWorkspaceCache {
         &self,
         repo_root: &Path,
         path: &Path,
+        recursive: bool,
     ) -> Option<SourcePathChangeObservation> {
         if !self.watcher_reliable.load(Ordering::Acquire) {
             return None;
@@ -740,6 +797,7 @@ impl GitWorkspaceCache {
             watcher_generation,
             repo_root,
             path,
+            recursive,
         })
     }
 
@@ -747,7 +805,9 @@ impl GitWorkspaceCache {
         &self,
         observation: &SourcePathChangeObservation,
     ) -> bool {
-        if observation.watcher_epoch != self.watcher_epoch {
+        if observation.watcher_epoch != self.watcher_epoch
+            || !path_is_same_or_descendant(&observation.path, &observation.repo_root)
+        {
             return false;
         }
         let Some(current_generation) = self.reliable_watcher_generation() else {
@@ -771,9 +831,13 @@ impl GitWorkspaceCache {
             .filter(|event| event.generation > observation.watcher_generation)
             .all(|event| {
                 event.changed_paths.as_ref().is_some_and(|paths| {
-                    paths
-                        .iter()
-                        .all(|changed| !path_is_same_or_descendant(&observation.path, changed))
+                    paths.iter().all(|changed| {
+                        let changed_ancestor =
+                            path_is_same_or_descendant(&observation.path, changed);
+                        let changed_descendant = observation.recursive
+                            && path_is_same_or_descendant(changed, &observation.path);
+                        !changed_ancestor && !changed_descendant
+                    })
                 })
             })
     }

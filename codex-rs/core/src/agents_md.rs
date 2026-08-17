@@ -30,6 +30,8 @@ use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
+use serde::Deserialize;
+use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -76,6 +78,32 @@ fn stable_context_identity_from_structure(
 pub(crate) struct ProjectInstructionsLoad {
     pub(crate) loaded: Option<LoadedAgentsMd>,
     pub(crate) complete: bool,
+}
+
+/// Freshness of the AGENTS.md observation attached to one sampling request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AgentsMdFreshness {
+    Refreshed,
+    IncompleteRead,
+    #[default]
+    CachedFallback,
+}
+
+impl AgentsMdFreshness {
+    pub(crate) const fn model_visible_description(self) -> &'static str {
+        match self {
+            Self::Refreshed => {
+                "Result provenance: direct_file_read; freshness: refreshed_for_this_sampling_step."
+            }
+            Self::IncompleteRead => {
+                "Result provenance: direct_file_read; freshness: incomplete_read_may_omit_instructions."
+            }
+            Self::CachedFallback => {
+                "Result provenance: cached_observation; freshness: cached_may_be_stale."
+            }
+        }
+    }
 }
 
 struct EnvironmentProjectInstructions {

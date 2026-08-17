@@ -4,6 +4,7 @@ use codex_tools::DiscoverableTool;
 const RECOMMENDED_PLUGINS_INTRO: &str =
     "Here is a list of plugins that are available but not installed.";
 const MAX_RECOMMENDED_PLUGINS: usize = 50;
+const MAX_RECOMMENDED_PLUGINS_BODY_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RecommendedPluginsInstructions {
@@ -11,12 +12,21 @@ pub(crate) struct RecommendedPluginsInstructions {
 }
 
 impl RecommendedPluginsInstructions {
-    pub(crate) fn from_plugins(mut plugins: Vec<DiscoverableTool>) -> Option<Self> {
-        if plugins.is_empty() {
-            return None;
-        }
-        plugins.truncate(MAX_RECOMMENDED_PLUGINS);
-        Some(Self { plugins })
+    pub(crate) fn from_plugins(plugins: Vec<DiscoverableTool>) -> Option<Self> {
+        let mut body_bytes = format!("\n{RECOMMENDED_PLUGINS_INTRO}\n\n\n").len();
+        let plugins = plugins
+            .into_iter()
+            .filter(|plugin| {
+                let line_bytes = plugin.name().len() + plugin.id().len() + "-  ()\n".len();
+                if body_bytes.saturating_add(line_bytes) > MAX_RECOMMENDED_PLUGINS_BODY_BYTES {
+                    return false;
+                }
+                body_bytes += line_bytes;
+                true
+            })
+            .take(MAX_RECOMMENDED_PLUGINS)
+            .collect::<Vec<_>>();
+        (!plugins.is_empty()).then_some(Self { plugins })
     }
 }
 

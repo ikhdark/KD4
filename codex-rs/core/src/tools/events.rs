@@ -22,6 +22,7 @@ use codex_shell_command::parse_command::parse_command;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_string::truncate_middle_with_token_budget;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -598,12 +599,6 @@ async fn emit_exec_stage(
 ) {
     match stage {
         ToolEventStage::Begin => {
-            if crate::turn_diff_tracker::command_may_mutate(exec_input.command) {
-                ctx.session
-                    .services
-                    .git_workspace
-                    .note_host_workspace_mutation();
-            }
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -676,14 +671,57 @@ async fn emit_exec_end(
     exec_result: ExecCommandResult,
 ) {
     let possible_mutation = crate::turn_diff_tracker::command_may_mutate(exec_input.command);
+    let native_cwd = exec_input.cwd.to_abs_path().ok();
+    let mutation_paths = possible_mutation
+        .then(|| {
+            crate::turn_diff_tracker::command_mutation_paths(
+                exec_input.command,
+                native_cwd.as_ref().map(AbsolutePathBuf::as_path),
+            )
+        })
+        .flatten();
     if possible_mutation && exec_result.status != ExecCommandStatus::Declined {
+        if let Some(paths) = mutation_paths.as_ref() {
+            let paths = paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            ctx.session
+                .services
+                .git_workspace
+                .note_host_workspace_mutation_paths(
+                    native_cwd
+                        .as_ref()
+                        .map_or_else(|| std::path::Path::new("."), AbsolutePathBuf::as_path),
+                    &paths,
+                );
+        } else {
+            ctx.session
+                .services
+                .git_workspace
+                .note_host_workspace_mutation();
+        }
+        let current_workspace_identity = if mutation_paths.is_some() {
+            match native_cwd.as_ref() {
+                Some(cwd) => {
+                    crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         ctx.session
-            .services
-            .git_workspace
-            .note_host_workspace_mutation();
+            .invalidate_tool_history_source_dependencies(
+                ctx.turn.config.codex_home.as_path(),
+                mutation_paths.as_ref(),
+                current_workspace_identity.as_ref(),
+            )
+            .await;
     }
-    if let Some(tracker) = ctx.turn_diff_tracker {
-        let native_cwd = exec_input.cwd.to_abs_path().ok();
+    if exec_result.status != ExecCommandStatus::Declined
+        && let Some(tracker) = ctx.turn_diff_tracker
+    {
         tracker.lock().await.record_exec_command_end_at(
             exec_input.command,
             exec_result.exit_code,
@@ -738,12 +776,13 @@ async fn emit_exec_end(
             exec_result.timed_out,
             u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
             possible_mutation,
+            mutation_paths.as_ref(),
             provenance.as_ref(),
             implementation_identity_hash.as_deref(),
             validation_result,
             bound_auto_validation
                 .as_ref()
-                .map(|binding| (binding.step_id.as_str(), binding.implementation_revision)),
+                .map(|binding| (binding.step_id.as_str(), binding.step_revision)),
         )
         .await;
     ctx.session
@@ -777,6 +816,45 @@ async fn emit_patch_end(
     status: PatchApplyStatus,
     tracker_update: TurnDiffTrackerUpdate<'_>,
 ) {
+    let evidence_cwd = match &tracker_update {
+        TurnDiffTrackerUpdate::Track { environment_id, .. } => {
+            apply_patch_evidence_cwd(ctx, environment_id.as_deref())
+        }
+        TurnDiffTrackerUpdate::Invalidate | TurnDiffTrackerUpdate::None => {
+            apply_patch_evidence_cwd(ctx, None)
+        }
+    };
+    if status != PatchApplyStatus::Declined {
+        let affected_paths = evidence_cwd.as_ref().map(|cwd| {
+            apply_patch_intent_paths(&changes)
+                .into_iter()
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        cwd.as_path().join(path)
+                    }
+                })
+                .collect::<BTreeSet<_>>()
+        });
+        let current_workspace_identity = if affected_paths.is_some() {
+            match evidence_cwd.as_ref() {
+                Some(cwd) => {
+                    crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        ctx.session
+            .invalidate_tool_history_source_dependencies(
+                ctx.turn.config.codex_home.as_path(),
+                affected_paths.as_ref(),
+                current_workspace_identity.as_ref(),
+            )
+            .await;
+    }
     let outcome = match &status {
         PatchApplyStatus::Completed => "completed",
         PatchApplyStatus::Failed => "failed",
@@ -1041,17 +1119,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejection_output_is_bounded_before_populating_model_and_event() {
+    async fn mutation_boundary_declined_command_does_not_advance_tracker() {
         let (session, turn, rx_event) =
             make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
         let dir = tempdir().expect("tempdir");
         let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
         let emitter = ToolEmitter::shell(
-            vec!["echo".to_string(), "hello".to_string()],
+            vec!["rm".to_string(), "protected.txt".to_string()],
             cwd,
             ExecCommandSource::Agent,
             String::new(),
         );
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let rejection = format!(
             "rejection-head\n{}\nrejection-tail",
             "denied-🙂-".repeat(2_000)
@@ -1059,7 +1138,7 @@ mod tests {
 
         let error = emitter
             .finish(
-                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", None),
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
                 Err(ToolError::Denied(rejection.clone())),
                 None,
             )
@@ -1086,6 +1165,8 @@ mod tests {
         assert_eq!(item.stderr.as_deref(), Some(model_text.as_str()));
         assert_eq!(item.aggregated_output.as_deref(), Some(model_text.as_str()));
         assert_eq!(item.formatted_output.as_deref(), Some(model_text.as_str()));
+        assert_eq!(tracker.lock().await.current_mutation_revision(), 0);
+        assert!(!tracker.lock().await.has_unvalidated_mutation());
     }
 
     #[tokio::test]
