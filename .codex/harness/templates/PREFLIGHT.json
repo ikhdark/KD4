@@ -2,7 +2,7 @@
   "schema_version": 1,
   "assignment_id": "root:<task-id-or-uuidv7-assignment-id>",
   "root_task_id": "<durable-root-task-id>",
-  "repository_root": "../../..",
+  "repository_root": "<repository-root-relative-to-this-manifest>",
   "starting_revision": "auto",
   "path_claims": [
     {

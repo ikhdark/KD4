@@ -3012,10 +3012,6 @@ fn task_is_tracked_for_compaction(document: &TaskEvidenceDocument) -> bool {
 
 fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
     task_is_tracked_for_compaction(document)
-        || document
-            .command_receipts
-            .iter()
-            .any(|receipt| !receipt.possible_mutation)
 }
 
 fn compaction_command_freshness(
@@ -5335,7 +5331,7 @@ impl TaskEvidenceLedger {
             })
             .unwrap_or_default();
         Some(format!(
-            "KD4 task evidence is {status}: {reason_summary}{remaining}.{review_audit}",
+            "KD4 task evidence is {status}: {reason_summary}{remaining}.{review_audit} Before sending a final answer, reconcile durable task state: close completed implementation obligations in the plan, or explicitly state that durable task state remains unresolved. Do not claim completion while active or pending implementation obligations remain.",
             status = completion_status_name(gate.status),
         ))
     }

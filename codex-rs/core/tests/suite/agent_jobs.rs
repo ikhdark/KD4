@@ -325,8 +325,8 @@ async fn spawn_agents_on_csv_runs_and_exports() -> Result<()> {
         .collect::<Vec<_>>();
     assert_eq!(worker_request_bodies.len(), 2);
     for body in worker_request_bodies {
-        assert_eq!(body["model"].as_str(), Some("gpt-5.6-luna"));
-        assert_eq!(body["reasoning"]["effort"].as_str(), Some("max"));
+        assert_eq!(body["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(body["reasoning"]["effort"].as_str(), Some("high"));
     }
 
     let output = fs::read_to_string(&output_path)?;

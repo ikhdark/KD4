@@ -59,7 +59,10 @@ fn named_function_call(call_id: &str, name: &str) -> ResponseItem {
 
 #[test]
 fn live_host_test_tool_observes_workspace() {
+    assert!(tool_observes_workspace("exec_command"));
     assert!(tool_observes_workspace("cargo_test"));
+    assert!(!tool_observes_workspace("exec"));
+    assert!(!tool_observes_workspace("functions.exec"));
 }
 
 fn tool_search_pair(call_id: &str, description_bytes: usize) -> [ResponseItem; 2] {

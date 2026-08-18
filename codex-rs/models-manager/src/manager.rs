@@ -743,7 +743,8 @@ impl ModelsManager for StaticModelsManager {
                 let requested_model = model.as_deref();
 
                 if allow_provider_model_fallback {
-                    if requested_model_is_available(requested_model, &available_models)
+                    if (requested_model_is_available(requested_model, &available_models)
+                        || requested_model_is_sol(requested_model))
                         && let Some(requested_model) = requested_model
                     {
                         return requested_model.to_string();
@@ -822,6 +823,17 @@ fn requested_model_is_available(
         available_models
             .iter()
             .any(|available_model| available_model.model == requested_model)
+    })
+}
+
+fn requested_model_is_sol(requested_model: Option<&str>) -> bool {
+    const SOL_MODEL: &str = "gpt-5.6-sol";
+    requested_model.is_some_and(|requested_model| {
+        requested_model == SOL_MODEL
+            || requested_model
+                .strip_suffix(SOL_MODEL)
+                .and_then(|prefix| prefix.strip_suffix('.'))
+                .is_some_and(|provider| !provider.is_empty())
     })
 }
 

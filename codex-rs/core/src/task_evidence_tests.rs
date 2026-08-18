@@ -1280,7 +1280,7 @@ async fn kd4_repository_retains_completion_mode_behavior() {
 }
 
 #[tokio::test]
-async fn finalization_advisory_surfaces_current_review_audit_details() {
+async fn rollout_workflow_guardrails_require_durable_reconciliation_before_final() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     ledger
         .record_plan_update(&plan_with(vec![plan_item(
@@ -1303,6 +1303,9 @@ async fn finalization_advisory_surfaces_current_review_audit_details() {
     let advisory = ledger.finalization_advisory().await.expect("advisory");
     assert!(advisory.contains("correctness_gate_failed"));
     assert!(advisory.contains("mutation evidence is incomplete"));
+    assert!(advisory.contains("reconcile durable task state"));
+    assert!(advisory.contains("explicitly state that durable task state remains unresolved"));
+    assert!(advisory.contains("Do not claim completion while active or pending"));
 }
 
 fn plan_item(id: &str, status: StepStatus) -> PlanItemArg {
@@ -1452,7 +1455,7 @@ async fn structured_plan_actions_without_an_active_step_are_outside_plan() {
 }
 
 #[tokio::test]
-async fn read_only_command_is_retained_in_compaction_recovery_state() {
+async fn read_only_command_alone_does_not_create_compaction_recovery_state() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
     ledger
@@ -1466,14 +1469,7 @@ async fn read_only_command_is_retained_in_compaction_recovery_state() {
         )
         .await;
 
-    let compacted = ledger
-        .compaction_task_state()
-        .await
-        .expect("read-only audit evidence should create recovery state");
-    assert!(compacted.contains("## Evidence"));
-    assert!(compacted.contains("command command-1"));
-    assert!(compacted.contains("exit=0"));
-    assert!(compacted.contains("freshness=unknown"));
+    assert!(ledger.compaction_task_state().await.is_none());
 }
 
 #[tokio::test]

@@ -276,6 +276,113 @@ class SourceMapCheckTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate rust package inventory"):
             source_map_check.declared_rust_package_roots(markdown)
 
+    def test_sync_tracked_path_snapshot_rewrites_structural_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_map = Path(temp_dir) / "SOURCEMAP.md"
+            source_map.write_text(
+                "\n".join(
+                    (
+                        "# Source Map",
+                        "",
+                        "## Maintenance contract",
+                        "",
+                        source_map_check.TRACKED_PATH_SNAPSHOT_INSERT_AFTER,
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            original_paths = {"AGENTS.md", "src/old_name.rs"}
+            renamed_paths = {"AGENTS.md", "src/new_name.rs"}
+
+            self.assertTrue(
+                source_map_check.sync_tracked_path_snapshot(
+                    source_map,
+                    source_paths=original_paths,
+                )
+            )
+            original = source_map.read_text(encoding="utf-8")
+            original_count, original_digest = source_map_check.tracked_path_snapshot(
+                original_paths
+            )
+            self.assertIn(
+                f"count={original_count} sha256={original_digest}",
+                original,
+            )
+            self.assertFalse(
+                source_map_check.sync_tracked_path_snapshot(
+                    source_map,
+                    source_paths=original_paths,
+                )
+            )
+
+            self.assertTrue(
+                source_map_check.sync_tracked_path_snapshot(
+                    source_map,
+                    source_paths=renamed_paths,
+                )
+            )
+            renamed = source_map.read_text(encoding="utf-8")
+            renamed_count, renamed_digest = source_map_check.tracked_path_snapshot(
+                renamed_paths
+            )
+            self.assertNotEqual(original, renamed)
+            self.assertIn(
+                f"count={renamed_count} sha256={renamed_digest}",
+                renamed,
+            )
+            self.assertEqual(
+                renamed.count(source_map_check.TRACKED_PATH_SNAPSHOT_BEGIN),
+                1,
+            )
+
+    def test_main_synchronizes_snapshot_before_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            (root / "AGENTS.md").write_text("# Policy\n", encoding="utf-8")
+            source_map = root / "SOURCEMAP.md"
+            source_map.write_text(
+                "\n".join(
+                    (
+                        "# Source Map",
+                        "",
+                        "## Maintenance contract",
+                        "",
+                        source_map_check.TRACKED_PATH_SNAPSHOT_INSERT_AFTER,
+                        "",
+                        complete_source_map(
+                            top_level_rows=(
+                                "| `AGENTS.md`, `SOURCEMAP.md` | Policy |",
+                            ),
+                            instruction_rows=("| `AGENTS.md` | Repository |",),
+                        ),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "AGENTS.md", "SOURCEMAP.md"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            self.assertEqual(
+                source_map_check.main([str(source_map), "--repo-root", str(root)]),
+                0,
+            )
+            synchronized = source_map.read_text(encoding="utf-8")
+            self.assertIn(source_map_check.TRACKED_PATH_SNAPSHOT_BEGIN, synchronized)
+            self.assertIn("count=2", synchronized)
+
     def test_repository_source_map_matches_material_inventory(self) -> None:
         self.assertEqual(
             source_map_check.check_source_map(

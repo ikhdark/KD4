@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate SOURCEMAP.md structure and material repository inventories."""
+"""Synchronize and validate SOURCEMAP.md repository inventories."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import subprocess
 import sys
@@ -19,6 +20,11 @@ SECTION_HEADING_RE = re.compile(r"^##\s+")
 CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 TABLE_SEPARATOR_RE = re.compile(r"^:?-{3,}:?$")
 PROJECT_MANIFEST_NAMES = frozenset({"package.json", "pyproject.toml"})
+TRACKED_PATH_SNAPSHOT_BEGIN = "<!-- BEGIN TRACKED PATH SNAPSHOT -->"
+TRACKED_PATH_SNAPSHOT_END = "<!-- END TRACKED PATH SNAPSHOT -->"
+TRACKED_PATH_SNAPSHOT_INSERT_AFTER = (
+    "Update it in the same change whenever the repository materially changes."
+)
 
 
 def normalize_repo_path(path_text: str, *, line_number: int) -> str:
@@ -224,6 +230,62 @@ def repository_tracked_source_paths(repo_root: Path) -> set[str]:
     return git_source_paths(repo_root, tracked_only=True)
 
 
+def tracked_path_snapshot(source_paths: set[str]) -> tuple[int, str]:
+    payload = "".join(f"{path}\n" for path in sorted(source_paths)).encode("utf-8")
+    return len(source_paths), hashlib.sha256(payload).hexdigest()
+
+
+def render_tracked_path_snapshot(source_paths: set[str], *, newline: str) -> str:
+    count, digest = tracked_path_snapshot(source_paths)
+    return newline.join(
+        (
+            TRACKED_PATH_SNAPSHOT_BEGIN,
+            f"Tracked repository path snapshot: `count={count} sha256={digest}`.",
+            TRACKED_PATH_SNAPSHOT_END,
+        )
+    )
+
+
+def sync_tracked_path_snapshot(
+    source_map: Path,
+    *,
+    repo_root: Path | None = None,
+    source_paths: set[str] | None = None,
+) -> bool:
+    root = repo_root if repo_root is not None else source_map.resolve().parent
+    raw_markdown = source_map.read_bytes().decode("utf-8")
+    newline = "\r\n" if "\r\n" in raw_markdown else "\n"
+    sources = (
+        source_paths if source_paths is not None else repository_source_paths(root)
+    )
+    snapshot = render_tracked_path_snapshot(sources, newline=newline)
+    block_re = re.compile(
+        rf"{re.escape(TRACKED_PATH_SNAPSHOT_BEGIN)}.*?"
+        rf"{re.escape(TRACKED_PATH_SNAPSHOT_END)}",
+        flags=re.DOTALL,
+    )
+    matches = list(block_re.finditer(raw_markdown))
+    if len(matches) > 1:
+        raise ValueError("duplicate tracked path snapshot blocks")
+    if matches:
+        updated = block_re.sub(snapshot, raw_markdown, count=1)
+    else:
+        anchor = TRACKED_PATH_SNAPSHOT_INSERT_AFTER
+        if raw_markdown.count(anchor) != 1:
+            raise ValueError(
+                "cannot place tracked path snapshot: maintenance anchor must occur once"
+            )
+        updated = raw_markdown.replace(
+            anchor,
+            f"{anchor}{newline}{newline}{snapshot}",
+            1,
+        )
+    if updated == raw_markdown:
+        return False
+    source_map.write_bytes(updated.encode("utf-8"))
+    return True
+
+
 def owner_has_source(owner: str, source_paths: set[str]) -> bool:
     prefix = f"{owner}/"
     return owner in source_paths or any(
@@ -360,7 +422,8 @@ def check_source_map(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Check SOURCEMAP.md structure and its material repository inventories."
+            "Synchronize SOURCEMAP.md's tracked path snapshot, then check its "
+            "structure and material repository inventories."
         )
     )
     parser.add_argument(
@@ -375,6 +438,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Repository root used to resolve declared inventory paths.",
     )
     args = parser.parse_args(argv)
+    root = (
+        args.repo_root
+        if args.repo_root is not None
+        else args.source_map.resolve().parent
+    )
+    try:
+        sync_tracked_path_snapshot(args.source_map, repo_root=root)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"{args.source_map}: {exc}", file=sys.stderr)
+        return 1
     return check_source_map(args.source_map, repo_root=args.repo_root)
 
 

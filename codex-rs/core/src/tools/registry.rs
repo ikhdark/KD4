@@ -2016,19 +2016,48 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         .and_then(Value::as_str)
         .map(str::to_owned);
     let artifact_created = existing_artifact_id.is_none();
+    let admission_only_fallback = || {
+        let bounded = BoundedModelProjection::Fallback {
+            value: serde_json::from_str(&original_output_text)
+                .unwrap_or_else(|_| Value::String(original_output_text.clone())),
+            rendered: original_output_text.clone(),
+        };
+        ModelToolProjection {
+            original_response: original_response.clone(),
+            bounded,
+            passthrough_response: true,
+            preserve_non_text_content: true,
+            candidate: None,
+            projected_tokens: approx_token_count(&original_output_text)
+                .saturating_add(non_text_tokens) as u64,
+            canonical_bytes: canonical.exact_bytes,
+            canonical_tokens: canonical.approximate_tokens,
+            model_bytes: original_output_text.len().saturating_add(non_text_bytes) as u64,
+            artifact_created: false,
+            projection_truncated: false,
+            omitted_sections: 0,
+            deterministic_continuation_receipt: None,
+            deterministic_continuation_content: Vec::new(),
+            applied_token_limit: total_applied_token_limit,
+        }
+    };
     let artifact = if let Some(artifact_id) = existing_artifact_id {
         attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical).await
     } else {
         create_canonical_output_artifact(&codex_home, &thread_id, &canonical).await
     };
-    let artifact_id = artifact.artifact_id()?;
+    let Some(artifact_id) = artifact.artifact_id() else {
+        return (materialization == ProjectionMaterialization::AdmissionOnly)
+            .then(admission_only_fallback);
+    };
     if !artifact.complete
         || artifact.retained_bytes != canonical.exact_bytes
         || !artifact.unavailable_ranges.is_empty()
     {
-        return None;
+        return (materialization == ProjectionMaterialization::AdmissionOnly)
+            .then(admission_only_fallback);
     }
-    crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+    if crate::tools::command_output_artifact::protect_active_tool_history_artifact(
         &codex_home,
         &thread_id,
         &artifact_id,
@@ -2036,7 +2065,11 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         &canonical.sha256,
     )
     .await
-    .ok()?;
+    .is_err()
+    {
+        return (materialization == ProjectionMaterialization::AdmissionOnly)
+            .then(admission_only_fallback);
+    }
     let supersession_identity = invocation_sha256
         .map(|invocation_sha256| format!("{tool_name}:{invocation_sha256}:{}", canonical.sha256));
     if materialization == ProjectionMaterialization::AdmissionOnly {

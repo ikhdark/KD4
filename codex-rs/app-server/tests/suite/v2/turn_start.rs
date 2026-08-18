@@ -1641,6 +1641,9 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
     assert_eq!(payload["model"].as_str(), Some("mock-model-collab"));
     let payload_text = payload.to_string();
     assert!(payload_text.contains("Use `request_user_input` only when it is available"));
+    assert!(payload_text.contains("ask early instead of spending turns"));
+    assert!(payload_text.contains("exactly four mutually exclusive suggested answers"));
+    assert!(payload_text.contains("a free-text response"));
 
     Ok(())
 }

@@ -13,11 +13,11 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript to orchestrate too
 - Input is JavaScript source, not JSON, quotes, or a Markdown fence. Node, filesystem, network, and console APIs are unavailable.
 - Nested tools are normalized methods on `tools` (for example `await tools.exec_command(...)`); methods accept the documented string or object and return the documented object or string.
 - Only tools listed in `ALL_TOOLS` are callable inside `exec`; direct-only tools stay outside.
-- Choose discovery by expected uncertainty reduction. Run a precise symbol/reference query before broad inventory when it can set scope; use fallback only if unresolved, never in same batch.
-- Batch only calls whose results cannot change another call's necessity or scope; use `Promise.all` for those calls and keep deterministic dependent calls in one script.
-- Do not retry an unchanged nested call after deterministic contract/unsupported-payload failure; emit it and change route next generation.
-- Prefer a complete, bounded packet that keeps useful evidence model-visible; avoid packets likely to truncate it. Use `yield_control()` only when the model must choose the next action.
-- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` defaults to 10000 and sets observation cadence; empty observations stay internal. `max_output_tokens` bounds the formed packet, defaults to 10000, and remains subject to the model limit.
+- For a named symbol/config key, query its exact token and direct consumers before broader inventory; search repo/project names only if unresolved, never in the same batch.
+- Batch independent calls with `Promise.allSettled` or per-call catches so one failure preserves other results; keep dependent calls sequential.
+- After deterministic failure, including a session poll, do not repeat the unchanged call; change route or relevant state.
+- Keep evidence bounded: read relevant config/session tables or line ranges, never whole files; after truncation use a retained-artifact selector. Use `yield_control()` only when the model must choose the next action.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000}`. `yield_time_ms` sets internal observation/progress cadence; empty observations do not cause a model-visible yield or new model generation. `max_output_tokens` defaults to 10000 and bounds output.
 - When evaluation ends, unawaited work is discarded.
 
 Global helpers:
@@ -39,77 +39,12 @@ const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` return
 - New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.
 - If the cell has already finished, `wait` returns the completed result and closes the cell."#;
 // Based off of https://modelcontextprotocol.io/specification/draft/schema#calltoolresult
-const MCP_TYPESCRIPT_PREAMBLE: &str = r#"type Role = "user" | "assistant";
-type MetaObject = Record<string, unknown>;
-type Annotations = {
-  audience?: Role[];
-  priority?: number;
-  lastModified?: string;
+const MCP_TYPESCRIPT_PREAMBLE: &str = r#"type ContentBlock = {
+  type: "text" | "image" | "audio" | "resource_link" | "resource";
+  [key: string]: unknown;
 };
-type Icon = {
-  src: string;
-  mimeType?: string;
-  sizes?: string[];
-  theme?: "light" | "dark";
-};
-type TextResourceContents = {
-  uri: string;
-  mimeType?: string;
-  _meta?: MetaObject;
-  text: string;
-};
-type BlobResourceContents = {
-  uri: string;
-  mimeType?: string;
-  _meta?: MetaObject;
-  blob: string;
-};
-type TextContent = {
-  type: "text";
-  text: string;
-  annotations?: Annotations;
-  _meta?: MetaObject;
-};
-type ImageContent = {
-  type: "image";
-  data: string;
-  mimeType: string;
-  annotations?: Annotations;
-  _meta?: MetaObject;
-};
-type AudioContent = {
-  type: "audio";
-  data: string;
-  mimeType: string;
-  annotations?: Annotations;
-  _meta?: MetaObject;
-};
-type ResourceLink = {
-  icons?: Icon[];
-  name: string;
-  title?: string;
-  uri: string;
-  description?: string;
-  mimeType?: string;
-  annotations?: Annotations;
-  size?: number;
-  _meta?: MetaObject;
-  type: "resource_link";
-};
-type EmbeddedResource = {
-  type: "resource";
-  resource: TextResourceContents | BlobResourceContents;
-  annotations?: Annotations;
-  _meta?: MetaObject;
-};
-type ContentBlock =
-  | TextContent
-  | ImageContent
-  | AudioContent
-  | ResourceLink
-  | EmbeddedResource;
 type CallToolResult<TStructured = { [key: string]: unknown }> = {
-  _meta?: MetaObject;
+  _meta?: Record<string, unknown>;
   content: ContentBlock[];
   isError?: boolean;
   structuredContent?: TStructured;
@@ -301,7 +236,7 @@ pub fn build_exec_tool_description_with_direct_only_tools(
 
         for tool in enabled_tools {
             let name = tool.name.as_str();
-            let nested_description = render_code_mode_sample_for_definition(tool);
+            let nested_description = render_compact_code_mode_sample_for_definition(tool);
             let namespace_description = tool
                 .tool_name
                 .namespace
@@ -408,6 +343,18 @@ pub fn render_code_mode_sample(
 }
 
 fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
+    render_code_mode_sample_for_definition_with_schema_comments(definition, true)
+}
+
+fn render_compact_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
+    render_code_mode_sample_for_definition_with_schema_comments(definition, false)
+}
+
+fn render_code_mode_sample_for_definition_with_schema_comments(
+    definition: &ToolDefinition,
+    include_schema_comments: bool,
+) -> String {
+    let description = definition.description.trim().to_string();
     let input_name = match definition.kind {
         CodeModeToolKind::Function => "args",
         CodeModeToolKind::Freeform => "input",
@@ -416,14 +363,15 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         CodeModeToolKind::Function => definition
             .input_schema
             .as_ref()
-            .map(render_json_schema_to_typescript)
+            .map(|schema| render_tool_schema(schema, include_schema_comments))
             .unwrap_or_else(|| "unknown".to_string()),
         CodeModeToolKind::Freeform => "string".to_string(),
     };
     let output_type = if let Some(structured_content_schema) =
         mcp_structured_content_schema(definition.output_schema.as_ref())
     {
-        let structured_content_type = render_json_schema_to_typescript(structured_content_schema);
+        let structured_content_type =
+            render_tool_schema(structured_content_schema, include_schema_comments);
         if structured_content_type == "unknown" {
             "CallToolResult".to_string()
         } else {
@@ -433,7 +381,7 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         definition
             .output_schema
             .as_ref()
-            .map(render_json_schema_to_typescript)
+            .map(|schema| render_tool_schema(schema, include_schema_comments))
             .unwrap_or_else(|| "unknown".to_string())
     };
     if definition.name == "tool_search" {
@@ -446,18 +394,61 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
                 "CodeModeToolSearchResult".to_string(),
             )
         );
-        return format!(
-            "{}\n\nexec tool declaration:\n```ts\n{declaration}\n```",
-            definition.description
-        );
+        return format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```");
     }
     render_code_mode_sample(
-        &definition.description,
+        &description,
         &definition.name,
         input_name,
         input_type,
         output_type,
     )
+}
+
+fn render_tool_schema(schema: &JsonValue, include_schema_comments: bool) -> String {
+    if include_schema_comments {
+        return render_json_schema_to_typescript(schema);
+    }
+    render_json_schema_to_typescript(&schema_without_descriptions(schema))
+}
+
+fn schema_without_descriptions(schema: &JsonValue) -> JsonValue {
+    match schema {
+        JsonValue::Object(map) => JsonValue::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "description")
+                .map(|(key, value)| {
+                    let value = if matches!(
+                        key.as_str(),
+                        "properties"
+                            | "patternProperties"
+                            | "$defs"
+                            | "definitions"
+                            | "dependentSchemas"
+                    ) {
+                        match value {
+                            JsonValue::Object(named_schemas) => JsonValue::Object(
+                                named_schemas
+                                    .iter()
+                                    .map(|(name, schema)| {
+                                        (name.clone(), schema_without_descriptions(schema))
+                                    })
+                                    .collect(),
+                            ),
+                            value => schema_without_descriptions(value),
+                        }
+                    } else {
+                        schema_without_descriptions(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.iter().map(schema_without_descriptions).collect())
+        }
+        value => value.clone(),
+    }
 }
 
 fn render_code_mode_tool_declaration(
@@ -924,7 +915,7 @@ bar"
     }
 
     #[test]
-    fn common_exec_description_requires_information_gain_aware_batching() {
+    fn rollout_workflow_guardrails_require_precise_bounded_discovery() {
         let description =
             build_exec_tool_description(&[], &[], &BTreeMap::new(), /*code_mode_only*/ false);
 
@@ -935,19 +926,24 @@ bar"
         assert!(description.contains("type: \"image\""));
         assert!(description.contains("type: \"audio\""));
         assert!(description.contains("unawaited work is discarded"));
-        assert!(description.contains("expected uncertainty reduction"));
-        assert!(description.contains("precise symbol/reference query before broad inventory"));
-        assert!(description.contains("never in same batch"));
-        assert!(description.contains("results cannot change another call's necessity or scope"));
-        assert!(description.contains("avoid packets likely to truncate it"));
+        assert!(description.contains("named symbol/config key"));
+        assert!(description.contains("its exact token and direct consumers"));
+        assert!(description.contains("search repo/project names only if unresolved"));
+        assert!(description.contains("never in the same batch"));
+        assert!(description.contains("Batch independent calls"));
+        assert!(description.contains("Promise.allSettled"));
+        assert!(description.contains("read relevant config/session tables or line ranges"));
+        assert!(description.contains("never whole files"));
+        assert!(description.contains("after truncation use a retained-artifact selector"));
         assert!(!description.contains("including six small calls"));
         assert!(!description.contains("group 2-5 independent discovery calls"));
         assert!(
             description.contains("Only tools listed in `ALL_TOOLS` are callable inside `exec`")
         );
-        assert!(description.contains("Do not retry an unchanged nested call"));
-        assert!(description.contains("keep deterministic dependent calls in one script"));
-        assert!(description.contains("Prefer a complete, bounded packet"));
+        assert!(description.contains("including a session poll"));
+        assert!(description.contains("change route or relevant state"));
+        assert!(description.contains("keep dependent calls sequential"));
+        assert!(description.contains("Keep evidence bounded"));
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
@@ -956,6 +952,53 @@ bar"
             EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 85,
             "information-gain-aware batching guidance takes priority over marginal descriptor savings"
         );
+    }
+
+    #[test]
+    fn default_manifest_preserves_tool_contract_and_omits_schema_comments() {
+        let mandatory_tail = "mandatory safety and citation rules";
+        let tool_description = format!("{}\n{mandatory_tail}", "d".repeat(1_250));
+        let description = build_exec_tool_description(
+            &[ToolDefinition {
+                name: "sample_tool".to_string(),
+                tool_name: ToolName::plain("sample_tool"),
+                description: tool_description.clone(),
+                kind: CodeModeToolKind::Function,
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "schema-only property guidance"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "schema-only guidance"
+                        }
+                    },
+                    "required": ["description", "path"],
+                    "additionalProperties": false
+                })),
+                output_schema: None,
+            }],
+            &[],
+            &BTreeMap::new(),
+            /*code_mode_only*/ true,
+        );
+
+        let section = description
+            .split_once("### `sample_tool`\n")
+            .expect("nested tool section")
+            .1;
+        let inline_description = section
+            .split_once("\n\nexec tool declaration:")
+            .expect("nested tool declaration")
+            .0;
+        assert_eq!(inline_description, tool_description);
+        assert!(description.contains("description: string;"));
+        assert!(!description.contains("schema-only guidance"));
+        assert!(!description.contains("schema-only property guidance"));
+        assert!(!description.contains("// schema-only guidance"));
     }
 
     #[test]

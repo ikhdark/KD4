@@ -11,9 +11,11 @@ multi-step harnessed task.
 
 <what changed or what was learned>
 
-## Proven Evidence
+## Evidence
 
-- <command, file, screenshot, or inspection evidence>
+| Claim | Provenance | Source | Freshness | Covered Contract | Status |
+| --- | --- | --- | --- | --- | --- |
+| <claim> | <provenance kind> | <command, file, or observation> | <revision, timestamp, or dependency> | <exact scope> | <current or stale> |
 
 ## Failed Or Rejected Approaches
 
@@ -36,3 +38,7 @@ multi-step harnessed task.
 ## Open Questions
 
 - <question>
+
+## Material Unknowns
+
+- <unknown that must not be treated as an assumption>

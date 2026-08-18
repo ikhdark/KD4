@@ -8,14 +8,23 @@ State the concrete user-facing outcome.
 
 List what this task intentionally will not change.
 
-## Lane
+## Approach
 
-- Selected lane:
-- Why this lane fits:
-- Implementation policy or specialist skill:
+- Why durable planning is useful:
+- Applicable instructions or selected skill:
 - Validation intent:
 
 ## Scope
+
+Owner files and directories to inspect:
+
+- <owner file or directory>
+
+Related call paths, configs, tests, or runtime entrypoints:
+
+- <call path, config, test, or entrypoint>
+
+## Coordination (Delete Unless Active)
 
 Preflight receipt:
 
@@ -30,27 +39,39 @@ Preflight receipt:
 - Cargo target lane:
 - Workspace strategy:
 
-Owner files and directories to inspect:
+## Facts, Hypotheses, And Unknowns
 
-- <owner file or directory>
+| Claim | Kind | Source | Freshness or dependency |
+| --- | --- | --- | --- |
+| <material claim> | <provenance kind> | <file, command, or observation> | <revision, timestamp, or dependency> |
 
-Related call paths, configs, tests, or runtime entrypoints:
-
-- <call path, config, test, or entrypoint>
-
-## Assumptions
-
-- <assumption>
+- Hypotheses to test (maximum three):
+- Material unknowns:
 
 ## Risks
 
 - <risk>
 
+## Performance Contract (Delete Unless Active)
+
+- Exercised hot path:
+- Required quality contract and checks:
+- Benchmark command and workload:
+- Latency metric and acceptance threshold:
+- Token metric and budget:
+- Baseline or comparison build:
+- Candidate build identity:
+- Best known correct build:
+- Candidate selection rule:
+- Required samples/statistic:
+- Quality checks that must remain green:
+
 ## Milestones
 
 - [ ] Inspect owner scope and nearest `AGENTS.md`
-- [ ] Apply root `AGENTS.md` and any active specialist skill when implementation is in scope
+- [ ] Apply root and scoped instructions plus any selected or applicable skill
 - [ ] Inspect call path and validation route
 - [ ] Implement focused changes
 - [ ] Run focused validation
+- [ ] If performance-sensitive, pass the quality gate before latency and token contracts
 - [ ] Summarize evidence and remaining risk

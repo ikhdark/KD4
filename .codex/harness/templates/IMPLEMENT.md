@@ -9,7 +9,7 @@ Keep entries concise and evidence-based.
 - Branch:
 - Date:
 - Owner:
-- Crosscheck skill:
+- Applicable instructions or selected skill:
 
 ## Decisions
 
@@ -23,11 +23,11 @@ Keep entries concise and evidence-based.
 
 - <deviation>
 
-## Validation Evidence
+## Evidence
 
-- Command:
-- Result:
-- Notes:
+| Claim | Provenance | Source or command | Freshness | Covered contract |
+| --- | --- | --- | --- | --- |
+| <claim> | <provenance kind> | <path, command, or observation> | <revision or timestamp> | <exact scope> |
 
 ## Open Items
 

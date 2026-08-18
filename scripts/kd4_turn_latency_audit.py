@@ -6,10 +6,16 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import io
 import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+try:
+    from scripts.rollout_snapshot import read_rollout_snapshot
+except ImportError:
+    from rollout_snapshot import read_rollout_snapshot
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -196,11 +202,14 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
     schema_versions: collections.Counter[str] = collections.Counter()
     line_count = 0
     byte_count = 0
+    snapshots: list[dict[str, str | int]] = []
 
     for file in files:
-        byte_count += file.stat().st_size
+        snapshot = read_rollout_snapshot(file)
+        snapshots.append(snapshot.metadata())
+        byte_count += snapshot.byte_length
         cwd = ""
-        with file.open(encoding="utf-8") as handle:
+        with io.StringIO(snapshot.data.decode("utf-8")) as handle:
             for line_number, line in enumerate(handle, 1):
                 line_count += 1
                 try:
@@ -256,6 +265,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         "files": len(files),
         "lines": line_count,
         "bytes": byte_count,
+        "snapshots": snapshots,
         "parseErrorCount": parse_error_count,
         "parseErrors": parse_errors,
         "uniqueTaskStarts": len(started_turns),

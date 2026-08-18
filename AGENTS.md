@@ -13,6 +13,10 @@
   classification, generated contracts, validation routes, and cross-cutting
   change routes. Consult it before changing or upstream-syncing Rust workspace
   paths.
+- After adding, deleting, moving, or renaming any repository file or directory,
+  run `just source-map-check`. The command automatically rewrites the managed
+  tracked-path snapshot in `SOURCEMAP.md`; this is required even when the
+  ownership narrative and material inventories remain accurate.
 - Known top-level scoped instruction files include `codex-rs/AGENTS.md` and
   `scripts/AGENTS.md`; further nested files apply only where present.
 - `.codex/AGENTS.md` documents workspace routing, `.codex/config.toml` owns
@@ -39,9 +43,6 @@ fall back to the default agents.
 ## Operating defaults
 * Do not publish unless the user explicitly asks.
 * Keep work within the accepted task scope.
-* When deleting or renaming a file, update task-relevant references, ownership
-  records, manifests, generators, and documentation that would otherwise become
-  incorrect.
 * For bug checks, never invent findings, when you find a bug, assume there are more and continue until none are found, do not claim a bug simply because you think there is a "better" version, if the code is functional, do not touch it.
 * Do not turn a directed fix into a broad fix.
 * Avoid blindly overwriting other agents' work, Compare both versions and pick the better version or combine the best compatible behavior.
@@ -51,19 +52,29 @@ fall back to the default agents.
 
 ## First-pass implementation discipline
 
+- Treat deterministic tool rejection as contract discovery: consult the live
+  schema or exact error, change the payload, and do not retry the same invalid
+  request. Cache discovered bounds for the rest of the task.
+- Until a claim is verified by a direct read or an exact behavioral check,
+  report it as a hypothesis or current observation. Reserve definitive wording
+  such as "fixed", "passed", or "complete" for directly observed evidence and
+  name the evidence's actual scope.
 - Before the first edit, establish a bounded closure set: the authoritative
   owner from `SOURCEMAP.md`, direct callers and constructors, the listed
-  cross-cutting route, compatibility boundaries, and the smallest behavioral
-  proof. Stop after those boundaries unless a public, wire, persisted, or
-  generated contract requires expanding the set.
-- Complete one coherent contract before starting the next: format or lint the
-  changed surface, compile its owner, run the exact focused behavioral test, and
-  confirm the filter selected at least one test. A successful command that ran
-  zero relevant tests is not proof.
+  cross-cutting route, compatibility boundaries, hot-path cost, and the smallest
+  behavioral proof. Stop after those boundaries unless a public, wire,
+  persisted, or generated contract requires expanding the set.
+- Complete one coherent contract before starting the next: patch its full
+  representation, format or lint the changed surface, compile its owner when
+  applicable, run the exact focused behavioral test, and confirm the filter
+  selected at least one test. A successful command that ran zero relevant tests
+  is not proof.
 - In a shared workspace, inspect the task-relevant diff and reread the exact
-  target region immediately before patching. If it changed, reconcile the
-  current versions deliberately; do not retry a stale patch or apply duplicate
-  patch blocks to the same file.
+  target region immediately before and after patching. If an overlapping writer
+  is active, coordinate through the durable preflight registry or wait. If the
+  target changed, reconcile the current versions once; do not replay a stale
+  patch or apply duplicate patch blocks.
+
 
 ## Validation failure handling
 
@@ -82,7 +93,10 @@ fall back to the default agents.
 
 # Sessions
 
-- "C:\Users\kuh\Desktop\LOCAL-KD\sessions" contains the rollouts for the fork which are to be used for auditing and diagnosis. Do not use the default "C:\Users\kuh\.codex\sessions" path.
+- "C:\Users\kuh\Desktop\LOCAL-KD\sessions" contains the rollouts for the fork which are to be used for auditing and diagnosis and benchmarking. Do not use the default "C:\Users\kuh\.codex\sessions" path.
+- For a live rollout, use `python scripts/rollout_snapshot.py <path> [--output
+  <snapshot>]`. It opens the exact `.jsonl` path with shared access, reads the
+  fixed length observed at open, and reports its SHA-256 identity.
 
 ## Validation
 
@@ -91,5 +105,40 @@ fall back to the default agents.
 
 # Benchmarking
 
-- Do not label unit-test duration, test-binary startup time, analytical action-count projections, stale compiled binaries, or source-level estimates as runtime benchmarks.
+- Do not label unit-test duration, test-binary startup time, analytical action-count projections, or source-level estimates as runtime benchmarks.
 - "C:\Users\kuh\Desktop\LOCAL-KD\backups" contains previous fork binaries that can be used for A/B comparisons of the previous version to the current version.
+- Optimize in this order: quality first, then latency and token use. Define the
+  required quality contract for the task, including correctness, safety, output
+  fidelity, compatibility, and other user-visible requirements. Reject any
+  candidate that weakens that contract, regardless of latency or token savings.
+  Compare latency and token use only among candidates that pass the same quality
+  checks; do not trade answer or implementation quality for speed or fewer
+  tokens unless the user explicitly changes the quality contract.
+- For an explicit optimization or a change to a known hot path, identify the
+  repository's real workload, quality checks, latency metric and threshold, and
+  token metric or budget before editing.
+  Prefer an existing dedicated subprocess or end-to-end benchmark. If none
+  exists, define a reproducible workload and compare equivalent current and
+  candidate release builds; do not substitute a unit test or build duration.
+- Establish quality first with the narrow behavioral tests and other required
+  quality checks, then measure task-scoped latency and token use. A latency or
+  token-budget miss is a task-local validation failure even when quality checks
+  pass. Treat it as evidence about the exercised hot path: inspect the
+  owner-level work still performed, implement the bounded fix, rerun affected
+  quality checks, and only then rerun the same measurements.
+- Compare every candidate with the recorded baseline or best prior correct
+  candidate under the same benchmark contract. Reject a regression rather than
+  keeping it because correctness tests pass; preserve or reinstate the better
+  correct implementation, then try a bounded owner-level alternative. Keep the
+  best measured correctness-preserving version, but do not call an improvement
+  a pass when it still misses the acceptance threshold.
+- Do not make a failing implementation pass by weakening an established
+  workload, sample count, percentile, or threshold unless the user explicitly
+  changes the performance contract. A benchmark rerun after a relevant code
+  change is a new proof, not an unchanged-command retry under the validation
+  failure rules above.
+- Finish a performance-sensitive task only when the quality gate, latency
+  contract, and token contract all pass, or report `partial` or `blocked` with
+  the measured failure and remaining owner-level bottleneck. Report the actual
+  workload, build identity, sample count, statistic, latency threshold, and
+  token budget; do not generalize beyond the exercised path.

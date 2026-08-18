@@ -34,9 +34,9 @@ inspection of the repository, configuration, schemas, types, manifests, entry
 points, and current implementation.
 
 Before asking a repository or system question, make at least one relevant
-non-mutating exploration pass. This requirement does not apply when no relevant
-environment is available or when the ambiguity is clearly a user preference that
-inspection cannot answer.
+non-mutating exploration pass. Ask immediately instead when no relevant
+environment is available or when the uncertainty concerns intent, context, or a
+preference that only the user can provide.
 
 Stop exploring when additional evidence is unlikely to change the specification,
 implementation approach, risk, or validation plan.
@@ -69,7 +69,7 @@ Treat unknowns as either:
   recommended.
 - **Preferences and tradeoffs:** ask early enough for the answer to shape the
   plan. When `request_user_input` is available and a structured choice fits,
-  offer two to four mutually exclusive options, recommend a defensible default,
+  offer exactly four mutually exclusive options, recommend a defensible default,
   and explain the practical consequences. Otherwise ask one concise direct
   question.
 

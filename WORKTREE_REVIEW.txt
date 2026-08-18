@@ -1,1054 +1,227 @@
 WORKTREE REVIEW LEDGER
 ======================
 
-Repository: C:\Users\kuh\Desktop\kd4
-Branch: main
-Frozen baseline: HEAD 20b728aeb08cece0173eae2520627a0128a3f884 (origin/main matched at inventory time and after final fetch)
-Actionable inventory: 167 paths (159 tracked dirty; 8 non-generated untracked; 0 staged; 2 tracked deletions)
-Excluded inventory: 1,167 untracked generated benchmark-output files under .codex/evals/phase-effort-benchmark/run-* (excluded by the skill's generated-output rule)
-Attribution default: pre-existing user worktree changes; this review preserves them and evaluates the complete frozen set.
-
-INITIAL STATIC VERDICT
-----------------------
-The complete contents of every actionable path (HEAD content for the two deletions) and the full semantic diff were read. No source-backed functional defect was confirmed during the initial static pass. The inventory coherently implements KD4 task-evidence freshness, deterministic continuation, compaction/context changes, model-attempt and turn-latency diagnostics, retained tool-output recovery, plan/validation evidence, and associated protocol/schema/test surfaces.
-
-Findings before analyzers: none.
-Repairs before analyzers: none.
-Analyzer status at initial ledger creation: pending (Clippy --keep-going, cargo-shear, repository dead-code workflow, generated-contract checks, and focused behavioral validation).
-Reconciliation rule: analyzer or validation findings will be appended with source locations, repairs, and fresh proof; the 167 frozen path entries remain exactly once.
-
-PER-PATH REVIEW
+REVIEW METADATA
 ---------------
-001. path=.codex/config.toml
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-002. path=.codex/hooks/task-continuity-fast-compact.ps1
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-003. path=.codex/hooks/task-continuity.ps1
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-004. path=.gitignore
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-005. path=architecture_index.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-006. path=codex-rs/agent-task-store/src/local.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-007. path=codex-rs/agent-task-store/src/model.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-008. path=codex-rs/agent-task-store/src/tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-009. path=codex-rs/agent-task-store/src/workspace.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-010. path=codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-011. path=codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-012. path=codex-rs/app-server-protocol/schema/json/ServerNotification.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-013. path=codex-rs/app-server-protocol/schema/json/v2/ThreadForkResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-014. path=codex-rs/app-server-protocol/schema/json/v2/ThreadListResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-015. path=codex-rs/app-server-protocol/schema/json/v2/ThreadMetadataUpdateResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-016. path=codex-rs/app-server-protocol/schema/json/v2/ThreadReadResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-017. path=codex-rs/app-server-protocol/schema/json/v2/ThreadResumeResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-018. path=codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-019. path=codex-rs/app-server-protocol/schema/json/v2/ThreadStartedNotification.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-020. path=codex-rs/app-server-protocol/schema/json/v2/ThreadStartResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-021. path=codex-rs/app-server-protocol/schema/json/v2/ThreadUnarchiveResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-022. path=codex-rs/app-server-protocol/schema/json/v2/TurnCompletedNotification.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-023. path=codex-rs/app-server-protocol/schema/json/v2/TurnStartedNotification.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-024. path=codex-rs/app-server-protocol/schema/json/v2/TurnStartResponse.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-025. path=codex-rs/app-server-protocol/schema/typescript/v2/DeterministicContinuationClass.ts
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-026. path=codex-rs/app-server-protocol/schema/typescript/v2/DeterministicContinuationHostAction.ts
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-027. path=codex-rs/app-server-protocol/schema/typescript/v2/index.ts
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-028. path=codex-rs/app-server-protocol/schema/typescript/v2/TurnTiming.ts
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-029. path=codex-rs/app-server-protocol/schema/typescript/v2/TurnTimingCounters.ts
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-030. path=codex-rs/app-server-protocol/schema/typescript/v2/TurnTimingDiagnosticLatencyAggregate.ts
-     git_state=?? | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-031. path=codex-rs/app-server-protocol/schema/typescript/v2/TurnTimingGenerationPurposeAggregate.ts
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-032. path=codex-rs/app-server-protocol/schema/typescript/v2/TurnTimingMilestones.ts
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-033. path=codex-rs/app-server-protocol/schema/typescript/v2/TurnTimingModelRequest.ts
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-034. path=codex-rs/code-mode-protocol/src/description.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-035. path=codex-rs/core/Cargo.toml
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-036. path=codex-rs/core/src/agent/task_coordinator_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-037. path=codex-rs/core/src/agent/task_coordinator.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-038. path=codex-rs/core/src/agent/task_metrics_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-039. path=codex-rs/core/src/agent/task_metrics.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-040. path=codex-rs/core/src/agents_md_manager_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-041. path=codex-rs/core/src/agents_md_manager.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-042. path=codex-rs/core/src/agents_md.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-043. path=codex-rs/core/src/client_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-044. path=codex-rs/core/src/client.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-045. path=codex-rs/core/src/compact_remote_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-046. path=codex-rs/core/src/compact_remote_v2_attempt.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-047. path=codex-rs/core/src/compact_remote_v2.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-048. path=codex-rs/core/src/compact_remote.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-049. path=codex-rs/core/src/compact_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-050. path=codex-rs/core/src/compact.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-051. path=codex-rs/core/src/context_manager/history_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-052. path=codex-rs/core/src/context_manager/history.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-053. path=codex-rs/core/src/context/apps_instructions.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-054. path=codex-rs/core/src/context/available_plugins_instructions.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-055. path=codex-rs/core/src/context/contextual_user_message_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-056. path=codex-rs/core/src/context/contextual_user_message.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-057. path=codex-rs/core/src/context/mod.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-058. path=codex-rs/core/src/context/prompt_provenance.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-059. path=codex-rs/core/src/context/recommended_plugins_instructions.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-060. path=codex-rs/core/src/context/source_closure_reuse.rs
-     git_state=D | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-061. path=codex-rs/core/src/context/task_model_guidance.rs
-     git_state=?? | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-062. path=codex-rs/core/src/context/world_state/agents_md_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-063. path=codex-rs/core/src/context/world_state/agents_md.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-064. path=codex-rs/core/src/context/world_state/apps_instructions_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-065. path=codex-rs/core/src/context/world_state/apps_instructions.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-066. path=codex-rs/core/src/context/world_state/mod.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-067. path=codex-rs/core/src/context/world_state/plugins_instructions_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-068. path=codex-rs/core/src/context/world_state/plugins_instructions.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-069. path=codex-rs/core/src/context/world_state/task_evidence.rs
-     git_state=?? | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-070. path=codex-rs/core/src/continuity.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-071. path=codex-rs/core/src/git_workspace_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-072. path=codex-rs/core/src/git_workspace.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-073. path=codex-rs/core/src/hook_runtime.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-074. path=codex-rs/core/src/session_startup_prewarm.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-075. path=codex-rs/core/src/session/mod.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-076. path=codex-rs/core/src/session/reasoning_governor.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-077. path=codex-rs/core/src/session/session.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-078. path=codex-rs/core/src/session/step_context.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-079. path=codex-rs/core/src/session/tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-080. path=codex-rs/core/src/session/turn_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-081. path=codex-rs/core/src/session/turn.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-082. path=codex-rs/core/src/session/world_state.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-083. path=codex-rs/core/src/stable_context_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-084. path=codex-rs/core/src/stable_context.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-085. path=codex-rs/core/src/state/service.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-086. path=codex-rs/core/src/task_evidence_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-087. path=codex-rs/core/src/task_evidence.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-088. path=codex-rs/core/src/tool_history_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-089. path=codex-rs/core/src/tool_history.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-090. path=codex-rs/core/src/tools/code_mode/execute_spec.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-091. path=codex-rs/core/src/tools/code_mode/mod.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-092. path=codex-rs/core/src/tools/code_mode/response_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-093. path=codex-rs/core/src/tools/command_execution.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-094. path=codex-rs/core/src/tools/command_output_artifact.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-095. path=codex-rs/core/src/tools/context_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-096. path=codex-rs/core/src/tools/context.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-097. path=codex-rs/core/src/tools/events.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-098. path=codex-rs/core/src/tools/handlers/command_preflight_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-099. path=codex-rs/core/src/tools/handlers/command_preflight.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-100. path=codex-rs/core/src/tools/handlers/mod.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-101. path=codex-rs/core/src/tools/handlers/multi_agents_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-102. path=codex-rs/core/src/tools/handlers/multi_agents_v2/task.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-103. path=codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-104. path=codex-rs/core/src/tools/handlers/plan_spec.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-105. path=codex-rs/core/src/tools/handlers/plan_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-106. path=codex-rs/core/src/tools/handlers/plan.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-107. path=codex-rs/core/src/tools/handlers/read_tool_output.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-108. path=codex-rs/core/src/tools/handlers/shell_spec_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-109. path=codex-rs/core/src/tools/handlers/shell_spec.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-110. path=codex-rs/core/src/tools/handlers/shell_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-111. path=codex-rs/core/src/tools/handlers/shell.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-112. path=codex-rs/core/src/tools/handlers/shell/shell_command.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-113. path=codex-rs/core/src/tools/handlers/sleep.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-114. path=codex-rs/core/src/tools/handlers/source_tools.rs
-     git_state=D | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-115. path=codex-rs/core/src/tools/handlers/unified_exec_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-116. path=codex-rs/core/src/tools/handlers/unified_exec.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-117. path=codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-118. path=codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-119. path=codex-rs/core/src/tools/known_delta_store.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-120. path=codex-rs/core/src/tools/parallel.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-121. path=codex-rs/core/src/tools/registry_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-122. path=codex-rs/core/src/tools/registry.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-123. path=codex-rs/core/src/tools/spec_plan_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-124. path=codex-rs/core/src/tools/spec_plan.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-125. path=codex-rs/core/src/turn_diff_tracker_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-126. path=codex-rs/core/src/turn_diff_tracker.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-127. path=codex-rs/core/src/turn_timing_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-128. path=codex-rs/core/src/turn_timing.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-129. path=codex-rs/core/src/unified_exec/async_watcher_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-130. path=codex-rs/core/src/validation_admission.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-131. path=codex-rs/core/templates/agents/orchestrator.md
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-132. path=codex-rs/core/tests/round_trip_batching.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-133. path=codex-rs/core/tests/suite/compact.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-134. path=codex-rs/core/tests/suite/completion_review.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-135. path=codex-rs/core/tests/suite/tool_harness.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-136. path=codex-rs/ext/extension-api/src/contributors.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-137. path=codex-rs/ext/extension-api/src/contributors/prompt.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-138. path=codex-rs/ext/extension-api/src/lib.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-139. path=codex-rs/ext/memories/src/extension.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-140. path=codex-rs/ext/memories/src/tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-141. path=codex-rs/hooks/schema/generated/post-compact.command.input.schema.json
-     git_state=M | attribution=pre-existing user worktree change | classification=generated/derived contract
-     behavior=Carries generated protocol, schema, or architecture-index output corresponding to the changed Rust/configuration contract; direct consumers are SDK/schema checks and repository routing tools.
-     closure=Owner source and generator/check route were inspected; matching Rust protocol owners and index exports are included in this inventory.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-142. path=codex-rs/hooks/src/events/compact.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-143. path=codex-rs/hooks/src/schema.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-144. path=codex-rs/models-manager/prompts/gpt-5.6.md
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-145. path=codex-rs/models-manager/src/prompt_overrides.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-146. path=codex-rs/otel/src/events/session_telemetry.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-147. path=codex-rs/otel/src/lib.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-148. path=codex-rs/prompts/src/compact.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-149. path=codex-rs/prompts/templates/compact/incremental_prompt.md
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-150. path=codex-rs/prompts/templates/compact/prompt.md
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-151. path=codex-rs/protocol/src/models.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-152. path=codex-rs/protocol/src/plan_tool_tests.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-153. path=codex-rs/protocol/src/plan_tool.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-154. path=codex-rs/protocol/src/protocol.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-155. path=codex-rs/protocol/src/validation.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-156. path=codex-rs/tools/src/tool_output.rs
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-157. path=docs/schemas/investigation-evidence-v1.schema.json
-     git_state=?? | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-158. path=scripts/kd4_first_useful_action_analysis.py
-     git_state=?? | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-159. path=scripts/kd4_model_attempt_analysis.py
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-160. path=scripts/kd4_perf_snapshot.py
-     git_state=M | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-161. path=scripts/kd4_turn_latency_audit.py
-     git_state=?? | attribution=pre-existing user worktree change | classification=runtime implementation
-     behavior=Implements the reviewed KD4 runtime changes across task evidence, continuity, compaction, timing, tool execution/output recovery, agent coordination, and protocol plumbing.
-     closure=Direct callers/constructors, associated protocol or persisted-state boundaries, tests, and generated representations were included according to SOURCEMAP.md.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-162. path=scripts/test_kd4_first_useful_action_analysis.py
-     git_state=?? | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-163. path=scripts/test_kd4_perf_snapshot.py
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-164. path=scripts/test_kd4_turn_latency_audit.py
-     git_state=?? | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-165. path=scripts/test_task_continuity_hook.py
-     git_state=M | attribution=pre-existing user worktree change | classification=test/supporting evidence
-     behavior=Exercises the neighboring changed contract and records expected behavior for regressions; direct consumers are focused package test binaries or the Python unittest runner.
-     closure=The implementation under test and its focused validation route are included; no standalone persisted or wire boundary is introduced by this file.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-166. path=source_owners.toml
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
-167. path=SOURCEMAP.md
-     git_state=M | attribution=pre-existing user worktree change | classification=configuration/documentation/ownership
-     behavior=Defines fork-local configuration, continuity hooks, ownership/routing, prompts, or public documentation consumed by the runtime and repository workflows.
-     closure=Relevant runtime readers, hook launch paths, source-owner routing, and documentation/schema boundaries were included where applicable.
-     static_findings=none confirmed; implementation is coherent with neighboring changed surfaces read in full.
-     initial_disposition=retain; analyzer and focused-validation proof pending.
+Repository/worktree: C:\Users\kuh\Desktop\kd4
+Branch and baseline: main at df89702c4d03a71ec2ed364c35971c283df1468e; origin/main matched; 0 staged paths.
+Frozen inventory: 82 non-ignored paths (80 tracked: 78 modified and 2 deleted; 2 untracked). Of these, 61 have logical content/structural deltas and 21 are worktree-normalization observations whose clean-filter hashes equal HEAD exactly.
+Attribution: logical deltas are the current task-attributed implementation or supporting documentation/tests unless specifically marked generated; normalization-only paths have uncertain attribution and no semantic delta.
+Instructions read completely: C:\Users\kuh\Desktop\LOCAL-KD\skills\worktree-review\SKILL.md; AGENTS.md; .codex/AGENTS.md; .codex/harness/workflow.md; codex-rs/AGENTS.md; codex-rs/core/AGENTS.md; codex-rs/protocol/AGENTS.md; scripts/AGENTS.md; SOURCEMAP.md.
+Expected analyzers and validation: workspace Clippy with --keep-going across targets/features; just cargo-shear; just rust-dead-code-matrix; focused Rust/Python/hook tests; source-map and generated-contract checks; git diff --check; task-continuity benchmark; publish dry-run and final publish after all quality gates.
 
-PLANNED ANALYZER AND VALIDATION ROUTE
--------------------------------------
-1. cargo fmt --check for the Rust workspace.
-2. cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings.
-3. cargo shear --deny-warnings.
-4. just rust-dead-code-matrix (repository dead-code workflow).
-5. just app-server-schema-check and just source-owners-check.
-6. Focused Rust tests for changed task-evidence, timing, tool-history/output, context/compaction, plan/preflight, agent-store, protocol, hooks, and extension contracts; every filter must select at least one test.
-7. Focused Python unittest modules for changed/new audit and continuity scripts.
-8. git diff --check and final staged inventory reconciliation.
+INITIAL FINDING SUMMARY
+-----------------------
+Initial confirmed bugs: 6. Validation-discovered bugs: 1. Incomplete-wiring findings: 0. Contradiction findings: 1 (generic code-mode truncation conflicts with tool-owned mandatory instructions). Lifecycle/concurrency findings: 1 (workspace evidence cache can outpace asynchronous watcher delivery). Possible findings: 1, resolved as rejected before repair (the exactly-four request_user_input guidance intentionally narrows model behavior while the 2-4 protocol acceptance remains backward compatible).
 
-ANALYZER FINDINGS AND REPAIRS
------------------------------
-1. The repository dead-code workflow identified changed, test-only helpers and one unused projection wrapper in codex-core. Repairs were limited to the owning changed surfaces: test-only APIs and the legacy compaction injection variant were gated with cfg(test), and truly unused wrappers were removed. A fresh `RUSTFLAGS=-Ddead_code cargo check -p codex-core --all-targets` passed.
-2. Focused changed-surface Clippy identified mechanical expression issues, over-wide code-mode result recorder signatures, inferred-invariant panics in direct-validation routes, and a borrowed async read guard in workspace-evidence registration. Repairs introduced one cohesive `CodeModeToolResult` value, preserved the execution-gate contract with an owned read guard, converted validation-route assumptions into model-visible errors, and applied semantics-preserving Clippy fixes. Fresh `cargo clippy -p codex-core --all-targets --no-deps --keep-going -- -D warnings` reached only the unchanged `core/src/workspace_operation_gate.rs:30` expect-used blocker; no changed-surface Clippy finding remained.
-3. Workspace-wide Clippy remains blocked by an external rusty_v8 v149.2.0 archive URL returning 404 and an unchanged `codex-api/src/endpoint/responses_websocket.rs:257` needless-borrow diagnostic. `cargo shear --deny-warnings` remains blocked by the unchanged unlinked `codex-rs/tools/src/function_call_error_tests.rs`. The workspace dead-code matrix proceeds through codex-core after the repairs, then remains blocked by unchanged app-server/app-server-client fixture drift (`memory_citation` and `run_independently`). These unrelated paths were outside the frozen dirty inventory and were not modified.
+F1 HIGH, confidence high: codex-rs/code-mode-protocol/src/description.rs::compact_inline_tool_description truncates every nested description at 1,200 characters. Actual web-search and image-generation descriptions place mandatory browsing, citation, copyright, missing-image, post-generation, and editing rules after that boundary. Trigger: code-mode-only manifest includes either tool. Observable failure: the model loses required safety/behavior instructions. Smallest safe fix: preserve complete tool-owned descriptions while retaining schema-comment compaction. Example: a current-facts or image-edit task in code mode. Disposition before repair: confirmed; fix required.
+F2 HIGH, confidence high: codex-rs/core/src/git_workspace.rs::workspace_evidence_identity reuses a content identity solely from the last delivered watcher generation. File-watcher delivery is asynchronous, so an external edit can occur before its event reaches the receiver. Trigger: external mutation between evidence calls. Observable failure: stale tool output can be marked current and stale completed-tool projection can be reused. Smallest safe fix: restore fresh content capture for authoritative evidence calls; retain non-authoritative metadata caches. Example: another editor changes a file while a read tool is being registered. Disposition before repair: confirmed lifecycle/concurrency regression; fix required.
+F3 HIGH, confidence high: codex-rs/code-mode-protocol/src/description.rs::schema_without_descriptions removes any map key named description, including a real field inside a JSON Schema properties map. Trigger: nested tool has a required input property named description. Observable failure: generated TypeScript omits the callable field while required still names it, increasing invalid calls. Smallest safe fix: strip schema annotation keys but preserve names in properties/definitions-style schema maps, with regression coverage. Example: a create/update tool requiring a description field. Disposition before repair: confirmed; fix required.
+F4 MEDIUM, confidence high: .codex/hooks/task-continuity.ps1::Get-RepositoryState and task-continuity-fast-session.ps1::Test-RepositoryStateMatchesCapsule trust a stored root for an unchanged cwd without verifying the cwd still resolves to that root. Trigger: create or replace a nested repository at the same cwd. Observable failure: a resume can inject continuity state from the old repository and slow-path metadata can combine the old root with the new repository status. Smallest safe fix: resolve and compare the current root before reuse; add focused hook coverage. Example: resume after initializing a nested repository. Disposition before repair: confirmed cross-repository continuity defect; fix required.
+F5 MEDIUM, confidence high: codex-rs/models-manager/src/manager.rs::requested_model_is_sol uses unrestricted ends_with("gpt-5.6-sol"). Trigger: unsupported slug such as notgpt-5.6-sol with provider fallback enabled. Observable failure: fallback is bypassed and the unavailable model is retained. Smallest safe fix: accept the exact slug or a non-empty dot-qualified provider prefix, matching the existing spawn-default convention. Example: malformed model override on a static provider. Disposition before repair: confirmed; fix required.
+F6 MEDIUM, confidence high: codex-rs/core/src/git_workspace.rs::is_generated_codex_eval_path lowercases paths on every platform. Trigger: Linux repository contains .CODEX/evals or another case-distinct source path. Observable failure: real source mutations are ignored as if they were generated .codex/evals state. Smallest safe fix: case-fold only on Windows. Example: edit .CODEX/evals/check.rs on a case-sensitive checkout. Disposition before repair: confirmed cross-platform defect; fix required.
+F7 MEDIUM, confidence high: the modified source-map checker now validates every tracked top-level entry, but SOURCEMAP.md omitted architecture_index.json and docs/. Trigger: run the repository inventory test or just source-map-check. Observable failure: the ownership contract fails its own material-inventory gate and architecture_index.json remains revision-stale. Smallest safe fix: add accurate ownership rows and regenerate the revision-keyed architecture index. Disposition when discovered during validation: confirmed; fix required.
 
-FOCUSED VALIDATION RESULTS
---------------------------
-- Rust formatting: `cargo fmt --all -- --check` passed (nightly-only rustfmt option warnings only).
-- Ownership/architecture: `just source-owners-check` passed, including 12 Python tests and the architecture-comprehension evaluation.
-- Generated contracts: app-server TypeScript and JSON schema fixture tests selected 2 tests and passed; hook schema fixture test selected 1 and passed.
-- codex-core focused tests selected 19 tests and passed across nested code mode, compaction task state/history, workspace serialization/freshness, decision latency, output-artifact recovery, and validation-route schema behavior.
-- Other Rust packages selected 10 tests and passed across agent-task-store, protocol, hooks, tools, prompts, models-manager, and memories-extension contracts.
-- Python audit modules selected 21 tests and passed; task-continuity hook validation selected 2 tests and passed.
-- `git diff --check HEAD` is rerun after this ledger update as the final whitespace proof.
+P1 REJECTED, confidence high: exactly-four request_user_input text versus the protocol's accepted 2-4 choices looked contradictory. Direct read of codex-rs/protocol/src/request_user_input.rs and its compatibility tests shows 2-4 is an intentional wire-compatibility envelope; the new model guidance may safely prefer exactly four without narrowing deserialization. No repair.
 
-FINAL DISPOSITION
------------------
-All 167 frozen actionable paths were reviewed exactly once and are retained as a coherent change set, including the two intentional tracked deletions and eight non-generated untracked source/schema/test files. The 1,167 generated benchmark-output files remain excluded and unstaged. Initial per-path `pending` dispositions are superseded by the analyzer and focused-validation results above. No publish, install, Desktop restart, or runtime activation is part of this review.
+FROZEN INVENTORY PRIMARY ENTRIES
+--------------------------------
+Format: state | attribution | complete-review status | behavior | callers/consumers | findings/possible | unfinished/wiring | correctness/lifecycle/contradiction | publish risk | disposition.
+
+001 .codex/.gitignore
+M | supporting policy | complete | ignores generated eval state | Git and .codex policy | none/P1 rejected | complete | correct; lifecycle n/a; no contradiction | prevents generated publish noise | retain.
+002 .codex/AGENTS.md
+M | supporting policy | complete | classifies .codex/evals as generated | root policy and contributors | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+003 .codex/evals/phase-effort-benchmark/run-20260816-2155/fixture/investigation_cases/clean_control_dispatch.rs
+D | generated runtime-state cleanup | complete HEAD review | removed generated benchmark fixture | ignored eval workflow only; no production reference found | none/none | deletion complete | correct; lifecycle n/a; no contradiction | none; source-map snapshot accounts for deletion | retain deletion.
+004 .codex/evals/phase-effort-benchmark/run-20260816-2155/fixture/investigation_cases/lifecycle_cancelled_child_leak.rs
+D | generated runtime-state cleanup | complete HEAD review | removed generated benchmark fixture | ignored eval workflow only; no production reference found | none/none | deletion complete | correct; lifecycle n/a; no contradiction | none; source-map snapshot accounts for deletion | retain deletion.
+005 .codex/harness/README.md
+M | supporting documentation | complete | durable workflow routing | harness users/templates | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+006 .codex/harness/context-modes.md
+M | supporting documentation | complete | provenance/phase guidance | harness workflow and artifacts | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+007 .codex/harness/templates/EVAL.md
+M | supporting template | complete | benchmark/evidence contract | harness evaluations | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+008 .codex/harness/templates/HANDOFF.md
+M | supporting template | complete | durable handoff evidence | interrupted/resumed tasks | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+009 .codex/harness/templates/HARNESS_AUDIT.md
+M | supporting template | complete | evidence-based harness assessment | harness auditors | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+010 .codex/harness/templates/HARNESS_CHECKLIST.md
+M | supporting template | complete | workflow/performance checklist | harness tasks | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+011 .codex/harness/templates/IMPLEMENT.md
+M | supporting template | complete | implementation evidence log | resumable tasks | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+012 .codex/harness/templates/ORCHESTRATOR.md
+M | supporting template | complete | optional multi-agent coordination | delegated workflows | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+013 .codex/harness/templates/PLAN.md
+M | supporting template | complete | durable plan and performance contract | harness planning | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+014 .codex/harness/templates/PREFLIGHT.json
+M | supporting template | complete | workspace/claim manifest | workflow_preflight | none/none | complete; placeholder is intentional template input | correct; lifecycle n/a; no contradiction | none | retain.
+015 .codex/harness/templates/QA_CHECKLIST.md
+M | supporting template | complete | QA/completion gate | harness verification | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+016 .codex/harness/workflow.md
+M | supporting policy | complete | durable workflow, evidence, performance rules | root workflow and templates | none/none | complete | correct; lifecycle guidance coherent; no contradiction | none | retain.
+017 .codex/hooks/task-continuity-fast-basic.ps1
+M | current implementation | complete | no-change UserPromptSubmit/Stop fast path and safe slow fallback | entry hook and canonical helper | none/none | complete | correct; fallback recursion prevented; no contradiction | hook stdout/startup risk covered by focused tests | retain.
+018 .codex/hooks/task-continuity-fast-compact.ps1
+M | current implementation | complete | compaction no-change fast path and repository match | entry hook and canonical helper | none/none | complete | correct; conservative fallback; no contradiction | hook latency/runtime risk | retain.
+019 .codex/hooks/task-continuity-fast-session.ps1
+M | current implementation | complete | repeated-resume recovery fast path | entry hook, capsule store, Git | F4/none | otherwise complete | stale-root lifecycle/context-isolation defect; no duplicate implementation | blocks publish until repaired/tested | repair F4.
+020 .codex/hooks/task-continuity.ps1
+M | current implementation | complete | canonical capsule lifecycle and Git snapshot | all continuity events and fast helpers | F4/none | otherwise complete | stale-root lifecycle/context-isolation defect; fast/slow outputs otherwise aligned | blocks publish until repaired/tested | repair F4.
+021 AGENTS.md
+M | supporting policy | complete | repository, validation, benchmark, session routing | all contributors and publish flow | none/none | complete | correct; lifecycle n/a; no contradiction | governs publish gates | retain.
+022 SOURCEMAP.md
+M | supporting ownership contract | complete | tracked-path snapshot, runtime and validation routing | source-map checker, contributors, publish flow | F7/none | incomplete until top-level ownership repair | omitted tracked owners fail the expanded checker | blocks source-map gate | repair F7 and resync generated index.
+023 codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+M | supporting public documentation | complete | documents Sol fallback exception | app-server schema/type consumers | none/none | complete; no serialized shape change | correct; lifecycle n/a; no contradiction | schema check required | retain.
+024 codex-rs/app-server/README.md
+M | supporting public documentation | complete | documents provider fallback semantics | app-server users/Desktop integrators | none/none | complete | correct; lifecycle n/a; no contradiction | none | retain.
+025 codex-rs/app-server/tests/suite/v2/turn_start.rs
+M | supporting test | complete | collaboration prompt contract | app-server turn/start test binary | none/none | test wiring complete | correct; lifecycle n/a; no contradiction | focused test required | retain.
+026 codex-rs/code-mode-protocol/src/description.rs
+M | current implementation | complete | exec/nested-tool manifest and TypeScript rendering | core code-mode tool registry and model prompt | F1,F3/none | incomplete until safe compaction repair | safety/contract regressions; F1 contradiction with tool-owned rules | blocks publish | repair F1 and F3.
+027 codex-rs/collaboration-mode-templates/templates/default.md
+M | current prompt contract | complete | Default-mode early clarification guidance | model prompt and app-server turn test | none/P1 rejected | complete | correct; lifecycle n/a; compatibility preserved | prompt regression test required | retain.
+028 codex-rs/collaboration-mode-templates/templates/plan.md
+M | current prompt contract | complete | Plan-mode clarification guidance | model prompt and app-server turn test | none/P1 rejected | complete | correct; lifecycle n/a; compatibility preserved | prompt regression test required | retain.
+029 codex-rs/config/src/config_toml.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | config loader/schema | none/none | n/a | byte-normalized content equals HEAD object | none | preserve; no commit delta expected.
+030 codex-rs/core/src/config/config_tests.rs
+M | supporting test | complete | default reasoning phase efforts | core config loader | none/none | complete | correct; lifecycle n/a; no contradiction | focused config test required | retain.
+031 codex-rs/core/src/config/mod.rs
+M | current implementation | complete | enables/overlays fork reasoning governor defaults | Config consumers and session startup | none/none | complete | semantics intentionally changed and tested; no lifecycle defect | config schema check required | retain.
+032 codex-rs/core/src/git_workspace.rs
+M | current implementation | complete | workspace identities, candidate diffs, watcher journal | sampling, compaction, tool evidence, validation reuse | F2,F6/none | incomplete until freshness/case repair | F2 concurrency race; F6 cross-platform correctness | blocks publish | repair F2 and F6.
+033 codex-rs/core/src/git_workspace_tests.rs
+M | supporting test | complete | evidence cache/eval exclusions | git_workspace test module | F2 test encodes unsafe reuse; F6 missing case-sensitive proof | incomplete until corrected tests | regression test currently contradicts authoritative freshness | blocks publish | repair tests with implementation.
+034 codex-rs/core/src/guardian/mod.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | guardian runtime | none/none | n/a | content equals HEAD object | none | preserve.
+035 codex-rs/core/src/guardian/prompt.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | guardian prompt | none/none | n/a | content equals HEAD object | none | preserve.
+036 codex-rs/core/src/guardian/review.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | guardian review | none/none | n/a | content equals HEAD object | none | preserve.
+037 codex-rs/core/src/guardian/review_session.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | guardian lifecycle | none/none | n/a | content equals HEAD object | none | preserve.
+038 codex-rs/core/src/guardian/tests.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | guardian tests | none/none | n/a | content equals HEAD object | none | preserve.
+039 codex-rs/core/src/session/tests.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | session tests | none/none | n/a | content equals HEAD object | none | preserve.
+040 codex-rs/core/src/session/tests/guardian_tests.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | guardian session tests | none/none | n/a | content equals HEAD object | none | preserve.
+041 codex-rs/core/src/task_evidence.rs
+M | current implementation | complete | compaction tracking and finalization advisory | task ledger, plan/completion flow | none/none | complete | correct; avoids read-only-only recovery state; no lifecycle defect | focused task-evidence tests required | retain.
+042 codex-rs/core/src/task_evidence_tests.rs
+M | supporting test | complete | task-evidence reconciliation/compaction behavior | task_evidence test module | none/none | complete | correct; lifecycle coverage aligned | focused test required | retain.
+043 codex-rs/core/src/tool_history.rs
+M | current implementation | complete | workspace-observing tool classification | parallel dispatch, code-mode nested evidence | none/none | complete; nested code-mode calls own child evidence | correct; no lost direct mutation signal found | focused tests required | retain.
+044 codex-rs/core/src/tool_history_tests.rs
+M | supporting test | complete | workspace tool classification | tool_history test module | none/none | complete | correct | focused test required | retain.
+045 codex-rs/core/src/tools/command_execution.rs
+M | current implementation | complete | command cache persistence, mutation identity, search admission | shell/unified exec, validation reuse | none/none | complete | double-capture prevents external-change rebasing; lock not held across I/O | persistence tests required | retain.
+046 codex-rs/core/src/tools/handlers/multi_agents_common.rs
+M | current implementation | complete | Sol/high spawn defaults | spawn handlers, provider catalogs, child configs | none/none | complete | exact/default model resolution coherent | focused spawn tests required | retain.
+047 codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+M | supporting test | complete | spawn description defaults | multi-agent spec tests | none/none | complete | correct | focused test required | retain.
+048 codex-rs/core/src/tools/handlers/plan_spec.rs
+M | current tool contract | complete | minimal valid update_plan payload guidance | model tool registry | none/none | complete | correct | focused spec test required | retain.
+049 codex-rs/core/src/tools/handlers/plan_tests.rs
+M | supporting test | complete | plan descriptor contract | plan spec test module | none/none | complete | correct | focused test required | retain.
+050 codex-rs/core/src/tools/handlers/request_user_input_spec.rs
+M | current tool contract | complete | early clarification and four-choice preference | protocol deserializer, UI/client | none/P1 rejected | complete; broad wire compatibility intentional | correct; no lifecycle defect | focused protocol/core/app-server test required | retain.
+051 codex-rs/core/src/tools/handlers/request_user_input_spec_tests.rs
+M | supporting test | complete | request-user-input schema/description | core handler test module | none/P1 rejected | complete | direct-struct one-option cases do not bypass production deserialization | focused test required | retain.
+052 codex-rs/core/src/tools/parallel.rs
+M | current implementation | complete | stable failure diagnosis and workspace evidence registration | direct/code-mode dispatch, tool history | none/none | complete apart from upstream F2 dependency | correct locally; F2 affects received identities | publish depends on F2 repair | retain after F2 proof.
+053 codex-rs/core/src/tools/registry.rs
+M | current implementation | complete | admission-only projection fallback on artifact failure | prompt admission, output artifact store | none/none | complete | preserves original response and token accounting; no lifecycle leak | focused registry test required | retain.
+054 codex-rs/core/src/tools/registry_tests.rs
+M | supporting test | complete | artifact-failure fallback | registry test module | none/none | complete | correct | focused test required | retain.
+055 codex-rs/core/src/tools/runtimes/apply_patch.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | apply-patch runtime | none/none | n/a | content equals HEAD object | none | preserve.
+056 codex-rs/core/src/tools/runtimes/shell.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | shell runtime | none/none | n/a | content equals HEAD object | none | preserve.
+057 codex-rs/core/src/tools/runtimes/unified_exec.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | unified exec runtime | none/none | n/a | content equals HEAD object | none | preserve.
+058 codex-rs/core/src/tools/sandboxing.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | sandbox routing | none/none | n/a | content equals HEAD object | none | preserve.
+059 codex-rs/core/src/turn_diff_tracker.rs
+M | current implementation | complete | read-only cmd/PowerShell classification | shell handlers and mutation freshness | none/none | complete | composed mutation cases fail closed | focused classifier tests required | retain.
+060 codex-rs/core/src/turn_diff_tracker_tests.rs
+M | supporting test | complete | direct-read and composed-mutation cases | turn_diff_tracker tests | none/none | complete | correct | focused test required | retain.
+061 codex-rs/core/tests/suite/agent_jobs.rs
+M | supporting integration test | complete | Sol/high agent job defaults | core integration suite | none/none | complete | correct | focused integration test required | retain.
+062 codex-rs/core/tests/suite/auto_review.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | auto-review integration | none/none | n/a | content equals HEAD object | none | preserve.
+063 codex-rs/core/tests/suite/guardian_review.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | guardian integration | none/none | n/a | content equals HEAD object | none | preserve.
+064 codex-rs/core/tests/suite/spawn_agent_description.rs
+M | supporting integration test | complete | spawn model/effort description | core integration suite | none/none | complete | correct | focused integration test required | retain.
+065 codex-rs/core/tests/suite/subagent_notifications.rs
+M | supporting integration test | complete | child defaults and notification lifecycle | multi-agent integration suite | none/none | complete | correct | focused integration test required | retain.
+066 codex-rs/models-manager/src/manager.rs
+M | current implementation | complete | static-catalog fallback and Sol pinning | session/thread manager and app-server | F5/none | incomplete until slug qualification repair | false-positive pinning correctness defect | blocks publish | repair F5.
+067 codex-rs/models-manager/src/manager_tests.rs
+M | supporting test | complete | Sol fallback behavior | models-manager tests | F5 lacks negative suffix case | incomplete until regression test | otherwise correct | blocks publish | repair with F5.
+068 codex-rs/protocol/src/config_types.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | shared config protocol | none/none | n/a | content equals HEAD object | none | preserve.
+069 codex-rs/tui/src/auto_review_denials.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | TUI auto-review UI | none/none | n/a | content equals HEAD object | none | preserve.
+070 codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__auto_review_denials_popup.snap
+M(normalization only) | generated snapshot observation | complete via clean-filter object identity | no semantic delta | TUI snapshot tests | none/none | n/a | content equals HEAD object | none | preserve.
+071 codex-rs/tui/src/chatwidget/tests/guardian.rs
+M(normalization only) | uncertain pre-existing | complete via clean-filter object identity | no semantic delta | TUI guardian tests | none/none | n/a | content equals HEAD object | none | preserve.
+072 justfile
+M | supporting build routing | complete | documents source-map synchronization recipe | contributors/CI | none/none | complete | correct | recipe checks required | retain.
+073 scripts/AGENTS.md
+M | supporting policy | complete | rollout snapshot and source-map ownership | script contributors | none/none | complete | correct | none | retain.
+074 scripts/kd4_first_useful_action_analysis.py
+M | current implementation | complete | fixed-length rollout analysis with identities | audit CLI and tests | none/none | complete | fixed snapshot avoids unbounded live EOF | focused unittest required | retain.
+075 scripts/kd4_turn_latency_audit.py
+M | current implementation | complete | fixed-length latency audit with identities | audit CLI and tests | none/none | complete | fixed snapshot avoids live-file race | focused unittest required | retain.
+076 scripts/source_map_check.py
+M | current implementation | complete | deterministic path snapshot synchronization and inventory validation | just source-map-check and tests | none/none | complete; untracked nonignored paths intentionally represent pre-stage additions | correct/idempotent under same worktree | source-map tests/check required | retain.
+077 scripts/test_source_map_check.py
+M | supporting test | complete | snapshot synchronization/idempotence | Python unittest | none/none | complete | correct | focused unittest required | retain.
+078 sdk/python/src/openai_codex/api.py
+M(normalization only) | generated/SDK uncertain | complete via clean-filter object identity | no semantic delta | Python SDK users | none/none | n/a | content equals HEAD object | none | preserve.
+079 sdk/python/src/openai_codex/generated/notification_registry.py
+M(normalization only) | generated artifact observation | complete via clean-filter object identity | no semantic delta | Python SDK notification registry | none/none | n/a | content equals HEAD object | none | preserve; do not regenerate.
+080 sdk/python/src/openai_codex/generated/v2_all.py
+M(normalization only) | generated artifact observation | complete via clean-filter object identity | no semantic delta | Python SDK v2 models | none/none | n/a | content equals HEAD object | none | preserve; do not regenerate.
+081 scripts/rollout_snapshot.py
+?? | current implementation | complete | shared-open fixed-length checksummed live rollout snapshot | two KD4 analyzers and CLI users | none/none | production wiring complete via imports/docs | correct; read loop detects shrink and bounds growth | new-file/source-map and focused test required | retain/add.
+082 scripts/test_rollout_snapshot.py
+?? | supporting test | complete | snapshot/CLI/analyzer identity coverage | Python unittest runner | none/none | complete | correct | focused unittest required | retain/add.
+
+REPAIR-GENERATED PATHS
+----------------------
+WORKTREE_REVIEW.txt | review ledger replacing the historical ledger | complete | contains all frozen entries, findings, repairs, analyzer dispositions, and final reconciliation.
+architecture_index.json | generated source-owner relationship graph | complete | regenerated after F7; repository_revision now matches df89702c4d03a71ec2ed364c35971c283df1468e.
+scripts/test_task_continuity_hook.py | focused regression test | complete | proves a repeated resume rejects a stored outer root when a nested repository appears at the unchanged cwd.
+
+REPAIR DISPOSITIONS
+-------------------
+F1 fixed: complete nested-tool descriptions are preserved; only schema annotations are compacted. Regression coverage preserves mandatory text beyond 1,200 characters.
+F2 fixed: authoritative workspace evidence always performs a fresh content capture, independent of asynchronous watcher delivery. Regression coverage mutates a tracked file without a watcher event and observes a new identity.
+F3 fixed: description annotations are stripped without deleting named entries in properties, patternProperties, $defs, definitions, or dependentSchemas. Regression coverage retains a required property literally named description.
+F4 fixed: both canonical and fast SessionStart paths resolve the current cwd repository root before accepting stored state. The nested-repository regression passed.
+F5 fixed: Sol pinning accepts only the exact slug or a non-empty dot-qualified provider prefix. Malformed suffix lookalikes now fall back.
+F6 fixed: generated eval paths are case-folded only on Windows; a non-Windows case-sensitivity regression was added.
+F7 fixed: SOURCEMAP.md owns architecture_index.json and docs/, the architecture graph was regenerated, and source-map/source-owner gates pass.
+P1 rejected unchanged: the 2-4 wire envelope remains compatible while prompts prefer exactly four choices.
+
+ANALYZER AND VALIDATION DISPOSITIONS
+------------------------------------
+Workspace Clippy: ran with --workspace --all-targets --all-features --keep-going. One task-local uninlined format argument was repaired. The overall command remains blocked by an unrelated untouched error at codex-rs/codex-api/src/endpoint/responses_websocket.rs:257 (clippy::needless_borrow). A task-focused retry reached the same blocker, so repository policy prohibited further Rust validation builds.
+cargo-shear: blocked by one unrelated untouched warning, unlinked codex-rs/tools/src/function_call_error_tests.rs. No unrelated deletion or manifest suppression was made.
+Dead-code matrix: the all-features workspace command was blocked by unavailable upstream rusty_v8 ptrcomp_sandbox archive v149.2.0 (HTTP 404). The normal release archive is checksum-verified and cached for publish. No cold lane or repeated download was attempted.
+Rust focused tests and schema checks: not run after the same unrelated Clippy blocker appeared twice, as required by AGENTS.md validation-failure handling. This is a validation limitation, not evidence that those contracts passed.
+Python behavioral suite: initial combined run selected 38 tests; 37 passed and F7 failed. The exact failed source-map test passed after repair. Hook, rollout-snapshot, and source-map behaviors otherwise passed.
+Source ownership: just source-map-check passed; 12 source-owner/architecture unit tests passed; architecture evaluation passed 4/4 cases with recall 1.000 and ranked recall 1.000.
+Hook runtime benchmark: byte-exact workload, 20 invocations per event. Medians: UserPromptSubmit 562.610 ms; PreCompact 610.574 ms; PostCompact 724.908 ms; SessionStart 682.844 ms; Stop 558.612 ms. Every median is below the 750 ms contract.
+Static gates: cargo fmt --all -- --check passed; PowerShell parser passed all four hook scripts; Python AST and architecture JSON parsing passed; git diff --check passed.
+Publish dry-run: passed command execution and found the checksum-verified cached release rusty_v8 archive. It correctly reported the existing build stale and prescribed the real publish build; actual publish remains ordered after commit and push per user request.
+
+FINAL RECONCILIATION
+--------------------
+Every frozen inventory path appears exactly once as a numbered primary entry; no directory substitutes an individual path. The three repair-generated paths are listed separately. All seven confirmed findings are repaired, and P1 is rejected with direct compatibility evidence. No unresolved task-local code finding remains after the repair diff review. Analyzer limitations are the exact unrelated Clippy and cargo-shear findings plus the unavailable all-features V8 sandbox artifact stated above; they were not hidden or repaired outside scope. The reviewed change is ready to commit and push, with actual release-build/install/runtime proof pending the requested post-push republish.

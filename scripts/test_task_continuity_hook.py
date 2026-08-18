@@ -1153,6 +1153,79 @@ if ($errors.Count -ne 0) {
         self.assertGreaterEqual(len(repository["revision"]), 40)
         self.assertIsInstance(repository["dirty_summary"], str)
 
+    def test_resume_rejects_stored_root_after_nested_repository_appears(self) -> None:
+        git = shutil.which("git.exe") or shutil.which("git")
+        if git is None:
+            self.skipTest("Git is not available")
+        for args in (
+            ["init"],
+            ["config", "user.email", "continuity@example.invalid"],
+            ["config", "user.name", "Continuity Test"],
+        ):
+            subprocess.run(
+                [git, *args],
+                cwd=self.sandbox.root,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        outer_file = self.sandbox.root / "outer.txt"
+        outer_file.write_text("outer\n", encoding="utf-8")
+        subprocess.run([git, "add", "outer.txt"], cwd=self.sandbox.root, check=True)
+        subprocess.run(
+            [git, "commit", "-m", "outer fixture"],
+            cwd=self.sandbox.root,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
+        nested = self.sandbox.root / "nested"
+        nested.mkdir()
+        session_id = self.sandbox.session_id()
+        self.invoke_empty(
+            self.sandbox.payload(
+                "SessionStart", session_id, source="startup", cwd=str(nested)
+            )
+        )
+        self.assertEqual(
+            normalize_path(self.sandbox.capsule(session_id)["repository"]["root"]),
+            normalize_path(self.sandbox.root),
+        )
+
+        for args in (
+            ["init"],
+            ["config", "user.email", "continuity@example.invalid"],
+            ["config", "user.name", "Continuity Test"],
+        ):
+            subprocess.run(
+                [git, *args],
+                cwd=nested,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        inner_file = nested / "inner.txt"
+        inner_file.write_text("inner\n", encoding="utf-8")
+        subprocess.run([git, "add", "inner.txt"], cwd=nested, check=True)
+        subprocess.run(
+            [git, "commit", "-m", "inner fixture"],
+            cwd=nested,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
+        self.invoke_empty(
+            self.sandbox.payload(
+                "SessionStart", session_id, source="resume", cwd=str(nested)
+            )
+        )
+        self.assertEqual(
+            normalize_path(self.sandbox.capsule(session_id)["repository"]["root"]),
+            normalize_path(nested),
+        )
+
     def test_corrupt_capsule_and_write_failure_emit_exact_empty_object(self) -> None:
         corrupt_id = self.sandbox.session_id()
         self.sandbox.state.mkdir(parents=True)

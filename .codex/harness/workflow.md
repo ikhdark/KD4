@@ -7,12 +7,14 @@ without redefining repository implementation policy.
 ## Ownership Boundaries
 
 - Root `AGENTS.md` owns repository inspection, implementation discipline,
-  validation selection, completion status, and final reporting.
-- `.codex/harness` owns optional durable task artifacts and lifecycle guidance.
-- This file owns delegated-role and architect-lane procedure; load it only when
-  such a workflow is active.
-- Give every mutating root task and subagent a durable identity. Path and
-  named-contract claims are diagnostic coordination metadata and may overlap.
+  validation selection, and final reporting.
+- `.codex/harness` owns optional durable task artifacts, lifecycle guidance, and
+  the completion-status definitions below.
+- This file owns delegated-role and architect-lane procedure; load those sections
+  only when such a workflow is active.
+- Give assignments a durable identity when preflight or multi-agent coordination
+  is active. Path and named-contract claims are diagnostic metadata and may
+  overlap.
 
 ## Phase 1: Intake
 
@@ -32,8 +34,10 @@ non-goals, owner scope, validation intent, risks, and a short milestone list.
 Add `EVAL.md` before implementation when capability or regression criteria need
 to survive later turns.
 
-For concurrent writers or validation lanes, copy `templates/PREFLIGHT.json` and
-resolve it with `just workflow-preflight <manifest> <receipt>`. The
+Before starting concurrent writers or validation lanes, copy
+`templates/PREFLIGHT.json`, replace every `<...>` placeholder, and resolve it
+with
+`just workflow-preflight <manifest> <receipt>`. The
 preflight publishes the receipt into the repository's locked active-receipt
 registry and checks every registered receipt atomically. Use
 `just workflow-preflight-release <assignment-id>` when the assignment becomes
@@ -48,13 +52,16 @@ workspace strategy.
 
 Path, contract, and Cargo-lane overlap is returned in the resolved receipt's
 `advisories` array. Use isolated worktrees when separation is useful, but overlap
-does not block shared-worktree execution.
+does not block shared-worktree execution. If overlap is discovered after work
+starts, stop new mutations, resolve ownership or sequencing, and renew preflight
+before continuing.
 
 ## Phase 3: Implement
 
-Follow root `AGENTS.md` and any active specialist skill. The harness may record
-implementation decisions in `IMPLEMENT.md`, but that artifact does not replace
-owner-path inspection or task-scoped validation.
+Follow root `AGENTS.md`, the nearest scoped instructions, and any explicitly
+selected or clearly applicable skill. The harness may record implementation
+decisions in `IMPLEMENT.md`, but that artifact does not replace owner-path
+inspection or task-scoped validation.
 
 Keep unrelated dirty changes intact. Keep generated output under its owning
 workflow. Do not add logs, screenshots, binaries, or large transcripts to
@@ -62,12 +69,41 @@ reviewable changes unless requested.
 
 Use supporting reads and current file state to reduce accidental overwrites.
 Freshness and ownership mismatches become review risk; they do not reject writes.
+Immediately before and after each patch, reread the exact target region and its
+task-relevant diff. If the target changed, reconcile the current versions once;
+do not replay a stale patch or add duplicate patch blocks.
 
 ## Phase 4: Check
 
 Run the nearest sufficient proof required by root `AGENTS.md`, then record only
-the evidence that matters for resumption or audit. Name skipped checks and their
-reasons.
+the evidence that matters for resumption or audit. For each material claim, keep
+its source, provenance kind, freshness or revision, and exact covered contract.
+Name skipped checks and their reasons. Do not turn a passing narrow check into a
+broader completion claim.
+
+For a performance-sensitive implementation, quality is the first gate; latency
+and token use are secondary optimization dimensions. Record the quality checks,
+benchmark workload, latency metric and threshold, token metric or budget, build
+identity, sample count, and statistic before claiming an improvement. Reject a
+candidate immediately if it weakens correctness, safety, output fidelity,
+compatibility, or another required quality property. Only candidates passing the
+same quality contract may be compared for latency and token use.
+
+Run focused quality checks before the real task-scoped latency and token
+measurements. If either performance dimension misses its contract, keep the
+quality result, mark performance as failed, and use the measurements to narrow
+owner-level work on the exercised hot path. Patch that path, rerun affected
+quality checks, then rerun the same measurements. Do not tune the quality,
+latency, or token contract to the candidate implementation. Each post-change
+measurement is evidence for the new workspace revision, not a retry of
+unchanged state.
+
+Retain the baseline and each candidate result under that unchanged contract. A
+regressing candidate must not replace a better correct implementation. After a
+bounded alternative and its quality-plus-performance sequence, select the best
+measured quality-preserving version using the stated latency and token
+contracts. If that version still misses either contract, keep the performance
+status failed rather than treating relative improvement as completion.
 
 Validation is check-only and bound to the revision and covered path/contract
 manifest. A relevant mutation supersedes the result. Generated-output
@@ -79,8 +115,8 @@ After the first event, reconcile once and run one targeted validation. Repeated
 staleness pauses the task for root and offers an isolated-worktree restart
 instead of beginning another validation loop.
 
-Use the completion-gate status definitions below and the completion discipline
-from root `AGENTS.md`. Use `QA_CHECKLIST.md` for broad verification and
+Use the completion-gate status definitions below and the repository rules from
+root `AGENTS.md`. Use `QA_CHECKLIST.md` for broad verification and
 `HARNESS_AUDIT.md` for harness-policy or skill changes.
 
 ### Completion Gate Status

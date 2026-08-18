@@ -38,6 +38,7 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
+const GENERATED_CODEX_EVAL_PATHSPEC: &str = ":(exclude).codex/evals/**";
 static NEXT_WATCHER_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,17 +183,63 @@ pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCa
         candidate_git_output(&repo_root, &["rev-parse", "--verify", "HEAD"]),
         candidate_git_output(
             &repo_root,
-            &["diff", "--cached", "--binary", "--no-ext-diff"]
+            &[
+                "diff",
+                "--cached",
+                "--binary",
+                "--no-ext-diff",
+                "--",
+                ".",
+                GENERATED_CODEX_EVAL_PATHSPEC,
+            ]
         ),
-        candidate_git_output(&repo_root, &["diff", "--binary", "--no-ext-diff"]),
         candidate_git_output(
             &repo_root,
-            &["diff", "--cached", "--name-only", "-z", "--no-ext-diff"],
+            &[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "--",
+                ".",
+                GENERATED_CODEX_EVAL_PATHSPEC,
+            ]
         ),
-        candidate_git_output(&repo_root, &["diff", "--name-only", "-z", "--no-ext-diff"],),
         candidate_git_output(
             &repo_root,
-            &["ls-files", "--others", "--exclude-standard", "-z"],
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--",
+                ".",
+                GENERATED_CODEX_EVAL_PATHSPEC,
+            ],
+        ),
+        candidate_git_output(
+            &repo_root,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--",
+                ".",
+                GENERATED_CODEX_EVAL_PATHSPEC,
+            ],
+        ),
+        candidate_git_output(
+            &repo_root,
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ".",
+                GENERATED_CODEX_EVAL_PATHSPEC,
+            ],
         ),
     );
     let index_diff = index_diff?;
@@ -733,6 +780,15 @@ impl GitWorkspaceCache {
     }
 
     fn record_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) -> u64 {
+        let changed_paths = changed_paths.map(|paths| {
+            paths
+                .into_iter()
+                .filter(|path| !is_generated_codex_eval_path(path))
+                .collect::<Vec<_>>()
+        });
+        if changed_paths.as_ref().is_some_and(Vec::is_empty) {
+            return self.watcher_generation.load(Ordering::Acquire);
+        }
         let generation = self
             .watcher_generation
             .fetch_add(1, Ordering::AcqRel)
@@ -887,22 +943,37 @@ impl GitWorkspaceCache {
         repo_root: &Path,
         changed_paths: &[String],
     ) {
+        let paths = changed_paths
+            .iter()
+            .map(|path| {
+                let path = Path::new(path);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    repo_root.join(path)
+                }
+            })
+            .filter(|path| !is_generated_codex_eval_path(path))
+            .collect::<Vec<_>>();
+        if paths.is_empty() && !changed_paths.is_empty() {
+            return;
+        }
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
-        let paths = (!changed_paths.is_empty()).then(|| {
-            changed_paths
-                .iter()
-                .map(|path| {
-                    let path = Path::new(path);
-                    if path.is_absolute() {
-                        path.to_path_buf()
-                    } else {
-                        repo_root.join(path)
-                    }
-                })
-                .collect()
-        });
-        self.record_source_change_event(paths);
+        self.record_source_change_event((!paths.is_empty()).then_some(paths));
     }
+}
+
+fn is_generated_codex_eval_path(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    };
+    normalized == ".codex/evals"
+        || normalized.starts_with(".codex/evals/")
+        || normalized.ends_with("/.codex/evals")
+        || normalized.contains("/.codex/evals/")
 }
 
 fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {

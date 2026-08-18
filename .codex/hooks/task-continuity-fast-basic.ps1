@@ -107,7 +107,8 @@ catch {
 
 try {
     & (Join-Path $PSScriptRoot 'task-continuity.ps1') `
-        -TaskContinuityRawInput $TaskContinuityRawInput
+        -TaskContinuityRawInput $TaskContinuityRawInput `
+        -TaskContinuitySkipFastPath
 }
 catch {
     try {

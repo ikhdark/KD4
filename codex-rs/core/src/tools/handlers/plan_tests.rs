@@ -274,6 +274,23 @@ fn plan_description_requires_one_proven_contract_at_a_time() {
 }
 
 #[test]
+fn rollout_workflow_guardrails_describe_a_minimal_valid_plan_payload() {
+    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    let description = tool["description"].as_str().expect("tool description");
+
+    assert!(
+        description.starts_with("Updates the task plan.\nMinimal valid update: send only `plan`.")
+    );
+    assert!(description.contains(
+        "every fact requires `id`, `value`, `provenance`, `source`, and `depends_on_paths`"
+    ));
+    assert!(
+        description
+            .contains("every obligation requires `id` and `description`; `paths` is optional")
+    );
+}
+
+#[test]
 fn focused_plan_arguments_require_one_atomic_work_unit_and_reasoned_removals() {
     let focused = parse_update_plan_arguments(
         &serde_json::json!({

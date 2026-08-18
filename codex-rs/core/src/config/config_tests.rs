@@ -442,6 +442,64 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
 }
 
 #[tokio::test]
+async fn load_config_enables_reasoning_phase_efforts_by_default() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.reasoning_phase_efforts,
+        Some(ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::High),
+            inspect: Some(ReasoningEffort::Low),
+            implement: Some(ReasoningEffort::High),
+            diagnose: Some(ReasoningEffort::High),
+            verify: Some(ReasoningEffort::Low),
+            finalize: Some(ReasoningEffort::Low),
+            deterministic_continuation: Some(ReasoningEffort::Low),
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_overlays_explicit_reasoning_phase_efforts_on_defaults() -> std::io::Result<()>
+{
+    let codex_home = tempdir()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            reasoning_phase_efforts: Some(ReasoningPhaseEfforts {
+                inspect: Some(ReasoningEffort::Medium),
+                verify: Some(ReasoningEffort::High),
+                ..ReasoningPhaseEfforts::default()
+            }),
+            ..ConfigToml::default()
+        },
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.reasoning_phase_efforts,
+        Some(ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::High),
+            inspect: Some(ReasoningEffort::Medium),
+            implement: Some(ReasoningEffort::High),
+            diagnose: Some(ReasoningEffort::High),
+            verify: Some(ReasoningEffort::High),
+            finalize: Some(ReasoningEffort::Low),
+            deterministic_continuation: Some(ReasoningEffort::Low),
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_resolves_code_mode_config() -> std::io::Result<()> {
     let codex_home = tempdir()?;
     let config_toml: ConfigToml = toml::from_str(

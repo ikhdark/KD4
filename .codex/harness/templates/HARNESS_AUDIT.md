@@ -7,13 +7,14 @@
 - Target:
 - Reason:
 
-## Scoring
+## Assessment
 
-Score each category from 0 to 10 using repository evidence. Mark categories
-`N/A` only when the surface truly does not apply.
+Assess each category from repository evidence. Use `N/A` only when the surface
+truly does not apply; otherwise use `strong`, `acceptable`, or `needs-work`. Do
+not invent a numeric score unsupported by a rubric.
 
-| Category | Score | Evidence | Top Fix |
-| --- | ---: | --- | --- |
+| Category | Status | Evidence | Top Fix |
+| --- | --- | --- | --- |
 | Tool Coverage |  |  |  |
 | Context Efficiency |  |  |  |
 | Quality Gates |  |  |  |

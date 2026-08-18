@@ -1247,13 +1247,7 @@ fn output_call_id(item: &ResponseItem) -> Option<&str> {
 pub(crate) fn tool_observes_workspace(tool_identity: &str) -> bool {
     matches!(
         tool_identity,
-        "exec_command"
-            | "shell_command"
-            | "unified_exec"
-            | "write_stdin"
-            | "exec"
-            | "functions.exec"
-            | "cargo_test"
+        "exec_command" | "shell_command" | "unified_exec" | "write_stdin" | "cargo_test"
     )
 }
 

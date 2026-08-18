@@ -2,7 +2,7 @@
 
 This is KD4's lightweight workflow layer for planning, implementing, checking,
 and resuming substantial work without changing product behavior by default.
-[`workflow.md`](workflow.md) owns the lifecycle and completion gate;
+[`workflow.md`](workflow.md) owns the lifecycle and completion-status definitions;
 [`context-modes.md`](context-modes.md) owns phase and compaction guidance.
 
 ## Choose The Smallest Artifact Set
@@ -21,12 +21,17 @@ and resuming substantial work without changing product behavior by default.
 
 [`templates/HARNESS_CHECKLIST.md`](templates/HARNESS_CHECKLIST.md) is the compact
 end-to-end checklist when a single task spans several of these concerns. Delete
-unused placeholder sections instead of filling artifacts for completeness.
+unused placeholder sections instead of filling artifacts for completeness. Start
+with one primary artifact and link to supporting artifacts instead of copying the
+same facts, decisions, or validation results into several files.
 
 Resolve a preflight manifest with
 `just workflow-preflight <manifest> <receipt>`. The command atomically
 checks and publishes against the repository's active-receipt registry. Path,
 named-contract, and Cargo target-lane overlap is reported as advisory metadata.
+After copying the template, replace every `<...>` placeholder; paths in the
+manifest are resolved relative to the copied manifest, not this template
+directory.
 Release it with `just workflow-preflight-release <assignment-id>` when the
 assignment becomes terminal. The resolved receipt captures the
 assignment and root-task identities, repository-lineage and concrete-workspace
@@ -36,12 +41,12 @@ canonical Cargo lane, and workspace strategy.
 
 ## Execution Rules
 
-Choose the task lane and apply the implementation, validation, and completion
-rules from the root [`AGENTS.md`](../../AGENTS.md). The harness records durable
-decisions and evidence; it does not define a second implementation discipline.
-For implementation inside a harnessed task, follow any independently active
-specialist skill. Another skill alone does not require a run directory or
-activate the harness skill.
+Apply the implementation, validation, and completion rules from the root
+[`AGENTS.md`](../../AGENTS.md) and the nearest scoped instructions. The harness
+records durable decisions and evidence; it does not define a second
+implementation discipline. Follow a skill only when it is explicitly selected
+or clearly matches the task. Using a skill alone does not require a harness run
+directory.
 
 Ordinary validation commands are check-only. Generated schemas and mirrors may
 be changed only by their declared generated-output owner through the explicit

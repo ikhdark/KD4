@@ -33,6 +33,7 @@ Durable files include, when present:
 Generated or local runtime state includes:
 
 - `.codex/environments/environment.toml`
+- `.codex/evals/**`
 - `.codex/harness/runs/**`
 - `.codex/harness/runs/task-continuity/v1/**` capsule state
 - `.codex/app-asar-backups/**`

@@ -39,7 +39,7 @@ Choose one:
 - Follow the root and nearest scoped `AGENTS.md`.
 - Do not recurse into more agents unless explicitly approved.
 - Record path, named-contract, and Cargo target-lane overlap as advisories.
-- Route deliberate competing implementations to separate isolated worktrees.
+- Use isolated worktrees when separation is useful; overlap remains advisory.
 - Each agent reports inspected scope, findings, and validation evidence.
 
 ## Integration

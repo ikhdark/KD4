@@ -237,6 +237,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
         description: r#"Updates the task plan.
+Minimal valid update: send only `plan`. When adding facts, every fact requires `id`, `value`, `provenance`, `source`, and `depends_on_paths`. When adding mutation obligations, every obligation requires `id` and `description`; `paths` is optional.
 Use focused only for one atomic owner/scope with no cross-owner contract, one mutation obligation, and one feasible validation route; it uses a stable internal work unit and an empty plan.
 Use a short evidence-first medium plan for bounded multi-surface work. Use the complete complex representation for multi-owner, architectural, generated-contract, migration, high-risk, or dependent-validation work.
 Internal tier selection never changes collaboration mode. Complexity escalation in Default mode upgrades only this representation. Omitted facts and steps remain active; removals need reasons.

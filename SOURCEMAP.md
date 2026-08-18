@@ -48,6 +48,15 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 `SOURCEMAP.md` is a required repository contract, not an optional overview.
 Update it in the same change whenever the repository materially changes.
 
+<!-- BEGIN TRACKED PATH SNAPSHOT -->
+Tracked repository path snapshot: `count=5413 sha256=1cadf9639f6233ce980da20d5169da24d7e0b04d565f897a4e9c87eb5857d208`.
+<!-- END TRACKED PATH SNAPSHOT -->
+
+Every repository file or directory add, delete, move, or rename also requires
+running `just source-map-check`. That workflow automatically rewrites the
+managed tracked-path snapshot below, even when no ownership description needs a
+manual edit. Content-only changes do not alter the snapshot.
+
 A change is material to this map when it does any of the following:
 
 - adds, removes, renames, or repurposes a tracked top-level entry;
@@ -66,11 +75,12 @@ owner and leaves all routes and contracts unchanged is not material to this
 file.
 
 The top-level, instruction, Rust package, and non-Rust project tables below are
-machine-checked against tracked repository files. `just source-map-check`
-validates those inventories, ASCII content, and this table of contents. The
-check intentionally fails when structural drift requires a map decision. Do not
-silence drift by adding a path alone: update the applicable ownership,
-entrypoint, contract, and validation descriptions so the map remains useful.
+machine-checked against tracked repository files. `just source-map-check` first
+rewrites the path snapshot, then validates those inventories, ASCII content, and
+this table of contents. The check intentionally fails when structural drift
+requires a map decision. Do not silence drift by adding a path alone: update the
+applicable ownership, entrypoint, contract, and validation descriptions so the
+map remains useful.
 
 ## How to use this map
 
@@ -143,8 +153,10 @@ below.
 | `.codex/` | Repo-local Codex configuration, environment setup, durable harness material, fork-local skills, and workspace policy |
 | `.devcontainer/` | Development-container image, bootstrap, and container-local Codex installation inputs |
 | `.vscode/` | Checked-in editor and workspace defaults |
+| `architecture_index.json` | Generated, revision-keyed source-owner relationship graph consumed by task-scoped architecture discovery |
 | `codex-cli/` | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs |
 | `codex-rs/` | Primary Rust workspace and nearly all CLI, runtime, app-server, TUI, tool, protocol, state, plugin, extension, and sandbox behavior |
+| `docs/` | Checked-in documentation contracts and schemas, including investigation-evidence interchange |
 | `scripts/` | Build lanes, local publish, package assembly, installers, generated-schema freshness, source-owner generation, workflow preflight, architecture/investigation evaluation, KD4 audit and measurement, runtime binary proof, repository checks, and maintenance tooling |
 | `sdk/` | TypeScript SDK, Python SDK, and Python runtime package |
 | `third_party/` | Checked-in integration or vendored inputs updated only through their owning workflow |

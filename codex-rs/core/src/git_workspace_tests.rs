@@ -387,7 +387,7 @@ async fn workspace_change_observation_fails_open_on_changes_or_watcher_uncertain
 }
 
 #[tokio::test]
-async fn workspace_evidence_identity_recaptures_despite_unchanged_watcher_generation() {
+async fn workspace_evidence_identity_recaptures_without_waiting_for_watcher_delivery() {
     let (_temp, repo) = create_clean_git_repo().await;
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
 
@@ -398,17 +398,47 @@ async fn workspace_evidence_identity_recaptures_despite_unchanged_watcher_genera
     let second = cache
         .workspace_evidence_identity(repo.as_path())
         .await
-        .expect("recaptured identity");
+        .expect("second identity");
     assert_eq!(second, first);
     assert_eq!(cache.workspace_evidence_capture_count(), 2);
 
-    cache.note_host_workspace_mutation();
-    let refreshed = cache
+    std::fs::write(repo.join("README.md"), "external edit\n").expect("write external edit");
+    let after_external_edit = cache
         .workspace_evidence_identity(repo.as_path())
         .await
-        .expect("refreshed identity");
-    assert_eq!(refreshed, first);
+        .expect("identity after external edit");
+    assert_ne!(after_external_edit, first);
     assert_eq!(cache.workspace_evidence_capture_count(), 3);
+}
+
+#[tokio::test]
+async fn workspace_evidence_identity_excludes_codex_eval_artifacts() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let eval_dir = repo.join(".codex").join("evals");
+    std::fs::create_dir_all(&eval_dir).expect("create eval directory");
+    let eval_artifact = eval_dir.join("generated.jsonl");
+    std::fs::write(&eval_artifact, "first\n").expect("write first eval artifact");
+
+    let first = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("first identity");
+    std::fs::write(&eval_artifact, "second\n").expect("write second eval artifact");
+    let second = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("second identity");
+
+    assert_eq!(second, first);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn generated_eval_path_match_is_case_sensitive() {
+    assert!(is_generated_codex_eval_path(Path::new(
+        ".codex/evals/generated.jsonl"
+    )));
+    assert!(!is_generated_codex_eval_path(Path::new(
+        ".CODEX/evals/generated.jsonl"
+    )));
 }
 
 #[tokio::test]

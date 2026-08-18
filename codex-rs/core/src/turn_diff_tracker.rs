@@ -1597,12 +1597,116 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
         return true;
     }
 
+    if is_direct_file_read_command(command, unwrapped) || is_read_only_powershell_command(command) {
+        return false;
+    }
+
     // Mutation freshness must fail closed. The command-safety classifier above
     // proves known inspection commands read-only, and validation commands are
     // separately recognized by their exact runners. Any remaining executable
     // may be an arbitrary script or generator, so treating it as read-only can
     // leave stale source evidence live after an edit.
     !is_validation_command(command)
+}
+
+fn is_direct_file_read_command(command: &[String], unwrapped: &[String]) -> bool {
+    if !matches!(unwrapped, [program, paths @ ..] if program == "type" && !paths.is_empty()) {
+        return false;
+    }
+    let Some(program) = command.first().map(|token| command_basename(token)) else {
+        return false;
+    };
+    if !program.eq_ignore_ascii_case("cmd") {
+        return false;
+    }
+    !command
+        .iter()
+        .any(|token| token.contains(['>', '<', '&', '|', ';', '`', '$']))
+}
+
+fn is_read_only_powershell_command(command: &[String]) -> bool {
+    let Some(program) = command.first().map(|token| command_basename(token)) else {
+        return false;
+    };
+    if !matches!(program.to_ascii_lowercase().as_str(), "powershell" | "pwsh") {
+        return false;
+    }
+    let Some(command_position) = command
+        .iter()
+        .position(|token| matches!(token.to_ascii_lowercase().as_str(), "-command" | "-c"))
+    else {
+        return false;
+    };
+    let script = command[command_position.saturating_add(1)..].join(" ");
+    if script.trim().is_empty()
+        || script.contains(['>', '<', '`', '&', '{', '}', '[', ']'])
+        || script.contains("$(")
+        || script.contains("::")
+    {
+        return false;
+    }
+
+    script
+        .split([';', '|', '\n', '\r'])
+        .filter(|segment| !segment.trim().is_empty())
+        .all(|segment| {
+            let segment = segment.trim();
+            let compact = segment
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if matches!(
+                compact.as_str(),
+                "$erroractionpreference='stop'" | "$erroractionpreference=\"stop\""
+            ) {
+                return true;
+            }
+            if segment.starts_with('$') {
+                return false;
+            }
+
+            let normalized = normalized_command_tokens(&[segment.to_string()]);
+            let Some(program) = normalized.first().map(|token| command_basename(token)) else {
+                return false;
+            };
+            if matches!(
+                program,
+                "compare-object"
+                    | "convertfrom-json"
+                    | "convertto-json"
+                    | "format-list"
+                    | "format-table"
+                    | "get-childitem"
+                    | "get-command"
+                    | "get-content"
+                    | "get-date"
+                    | "get-item"
+                    | "get-location"
+                    | "get-member"
+                    | "get-variable"
+                    | "join-path"
+                    | "measure-object"
+                    | "out-string"
+                    | "resolve-path"
+                    | "select-object"
+                    | "select-string"
+                    | "sort-object"
+                    | "split-path"
+                    | "test-path"
+                    | "write-host"
+                    | "write-information"
+                    | "write-output"
+                    | "write-verbose"
+                    | "write-warning"
+            ) {
+                return true;
+            }
+            if let Some(subcommand) = git_subcommand(&normalized) {
+                return is_read_only_git_subcommand(subcommand);
+            }
+            codex_shell_command::is_safe_command::is_known_safe_command(&normalized)
+        })
 }
 
 pub(crate) fn command_may_mutate(command: &[String]) -> bool {

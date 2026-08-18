@@ -566,7 +566,7 @@ app-server-runtime-check:
     just _app-server-thread-status-tests
     cargo check -p codex-app-server
 
-# Validate the source map and its material repository inventories.
+# Synchronize the tracked-path snapshot, then validate source-map inventories.
 source-map-check:
     {{ python }} "{{ justfile_directory() }}/scripts/source_map_check.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"

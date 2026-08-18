@@ -67,16 +67,6 @@ struct SearchNarrowingScope {
 }
 
 impl SearchNarrowingAttempt {
-    fn scope(&self) -> SearchNarrowingScope {
-        SearchNarrowingScope {
-            turn_id: self.turn_id.clone(),
-            environment_id: self.environment_id.clone(),
-            repository_identity: self.repository_identity.clone(),
-            query_identity: self.query_identity.clone(),
-            scope_identity: self.scope_identity.clone(),
-        }
-    }
-
     fn parent_scope(&self) -> Option<SearchNarrowingScope> {
         Some(SearchNarrowingScope {
             turn_id: self.turn_id.clone(),
@@ -385,6 +375,7 @@ struct CommandExecutionState {
     running: HashMap<i32, RunningCommand>,
     running_order: VecDeque<i32>,
     repository_epoch: u64,
+    observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
     completed_validations: HashMap<ValidationProofKey, CompletedValidationProof>,
     completed_validation_order: VecDeque<ValidationProofKey>,
@@ -427,7 +418,10 @@ impl CommandExecutionLedger {
             cwd: cwd.to_path_buf(),
         };
         let mut ledger = Self {
-            state: Mutex::new(CommandExecutionState::default()),
+            state: Mutex::new(CommandExecutionState {
+                observed_workspace_identity: Some((0, workspace_identity.clone())),
+                ..CommandExecutionState::default()
+            }),
             bound_auto_validations: Mutex::new(HashMap::new()),
             persistence: Some(persistence.clone()),
         };
@@ -445,6 +439,7 @@ impl CommandExecutionLedger {
 
         let mut state = CommandExecutionState {
             repository_epoch: document.repository_epoch,
+            observed_workspace_identity: Some((document.repository_epoch, workspace_identity)),
             ..CommandExecutionState::default()
         };
         for search_miss in document
@@ -499,24 +494,8 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn admit_search_narrowing(
         &self,
-        key: &CommandAttemptKey,
+        _key: &CommandAttemptKey,
     ) -> Result<(), String> {
-        let Some(search) = key.search_narrowing.as_ref() else {
-            return Ok(());
-        };
-        if search.breadth == RgSearchBreadth::Broad
-            && !self
-                .state
-                .lock()
-                .await
-                .allowed_search_expansions
-                .contains(&search.scope())
-        {
-            return Err(
-                "Broad `rg` rejected before owner-scoped discovery. Consult `SOURCEMAP.md`, infer the likely owning module, and search that bounded path first. Expand one parent scope at a time; each broader scope is allowed only after an attributable `rg` miss in its immediate child scope."
-                    .to_string(),
-            );
-        }
         Ok(())
     }
 
@@ -622,17 +601,46 @@ impl CommandExecutionLedger {
         turn_id: &str,
         mutation_revision: u64,
     ) -> u64 {
-        let mut state = self.state.lock().await;
-        let delta = {
-            let observed_revision = state
-                .observed_turn_mutation_revisions
-                .entry(turn_id.to_string())
-                .or_default();
-            let delta = mutation_revision.saturating_sub(*observed_revision);
-            *observed_revision = (*observed_revision).max(mutation_revision);
-            delta
+        let (repository_epoch, refresh_workspace_identity) = {
+            let mut state = self.state.lock().await;
+            let delta = {
+                let observed_revision = state
+                    .observed_turn_mutation_revisions
+                    .entry(turn_id.to_string())
+                    .or_default();
+                let delta = mutation_revision.saturating_sub(*observed_revision);
+                *observed_revision = (*observed_revision).max(mutation_revision);
+                delta
+            };
+            state.repository_epoch = state.repository_epoch.saturating_add(delta);
+            let repository_epoch = state.repository_epoch;
+            let refresh_workspace_identity = delta > 0
+                || state
+                    .observed_workspace_identity
+                    .as_ref()
+                    .is_none_or(|(epoch, _)| *epoch != repository_epoch);
+            if refresh_workspace_identity {
+                state.observed_workspace_identity = None;
+            }
+            (repository_epoch, refresh_workspace_identity)
         };
-        state.repository_epoch = state.repository_epoch.saturating_add(delta);
+
+        if !refresh_workspace_identity {
+            return repository_epoch;
+        }
+        let Some(persistence) = self.persistence.as_ref() else {
+            return repository_epoch;
+        };
+        let Some(workspace_identity) =
+            crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd).await
+        else {
+            return repository_epoch;
+        };
+        let mut state = self.state.lock().await;
+        if state.repository_epoch == repository_epoch && state.observed_workspace_identity.is_none()
+        {
+            state.observed_workspace_identity = Some((repository_epoch, workspace_identity));
+        }
         state.repository_epoch
     }
 
@@ -787,10 +795,11 @@ impl CommandExecutionLedger {
         let Some(persistence) = self.persistence.clone() else {
             return;
         };
-        let (repository_epoch, search_misses, completed_validations) = {
+        let (repository_epoch, observed_workspace_identity, search_misses, completed_validations) = {
             let state = self.state.lock().await;
             (
                 state.repository_epoch,
+                state.observed_workspace_identity.clone(),
                 state.search_miss_order.iter().cloned().collect::<Vec<_>>(),
                 state
                     .completed_validation_order
@@ -802,11 +811,21 @@ impl CommandExecutionLedger {
                     .collect::<Vec<_>>(),
             )
         };
+        let Some((observed_epoch, observed_workspace_identity)) = observed_workspace_identity
+        else {
+            return;
+        };
+        if observed_epoch != repository_epoch {
+            return;
+        }
         let Some(workspace_identity) =
             crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd).await
         else {
             return;
         };
+        if workspace_identity != observed_workspace_identity {
+            return;
+        }
         let document = CommandExecutionCacheDocument {
             schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
             workspace_identity,
@@ -1414,6 +1433,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_before_finish_turn_does_not_rebase_persisted_results() {
+        let temp = tempfile::tempdir().expect("cache fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let thread_id = "mutation-before-persist";
+        let ledger = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            thread_id.to_string(),
+            &repository,
+        )
+        .await;
+        assert_eq!(ledger.observe_repository_revision("turn-a", 1).await, 1);
+        let search = RgSearchNarrowing {
+            breadth: RgSearchBreadth::Narrow,
+            query_identity: "missing".to_string(),
+            search_identity: "missing:src".to_string(),
+            scope_identity: "repo/src".to_string(),
+            parent_scope_identity: Some("repo".to_string()),
+            can_record_miss: true,
+        };
+        let missed = key("rg missing src")
+            .with_repository_epoch(1)
+            .with_search_narrowing("turn-a", "repo", Some(search.clone()));
+        ledger.record_exit(&missed, 1).await;
+
+        let proof_key = validation_proof_key("mutation-before-persist");
+        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home,
+            thread_id,
+            b"running 1 test\ntest persisted_case ... ok\n",
+        )
+        .await;
+        assert!(
+            ledger
+                .publish_completed_validation(
+                    proof_key.clone(),
+                    focused_cargo_route(),
+                    "persisted-call".to_string(),
+                    artifact,
+                    Instant::now(),
+                    0,
+                    None,
+                )
+                .await
+        );
+
+        std::fs::write(repository.join("external-change.txt"), "changed")
+            .expect("mutate repository before persistence");
+        ledger.finish_turn("turn-a").await;
+
+        let reopened =
+            CommandExecutionLedger::load_or_new(codex_home, thread_id.to_string(), &repository)
+                .await;
+        let equivalent = key("rg missing ./src")
+            .with_repository_epoch(1)
+            .with_search_narrowing("turn-b", "repo", Some(search));
+        assert!(
+            reopened
+                .begin_attempt_with_freshness(&equivalent, false, false)
+                .await
+                .is_ok()
+        );
+        assert!(reopened.reusable_validation(&proof_key).await.is_none());
+    }
+
+    #[tokio::test]
     async fn zero_test_cargo_success_is_failed_and_not_reusable() {
         let temp = tempfile::tempdir().expect("artifact directory");
         let ledger = CommandExecutionLedger::default();
@@ -1509,111 +1595,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broad_rg_requires_a_prior_scoped_miss_in_the_same_turn() {
+    async fn broad_rg_is_admitted_without_prior_search_state() {
         let ledger = CommandExecutionLedger::default();
-        let search = |breadth,
-                      query_identity: &str,
-                      scope_identity: &str,
-                      parent_scope_identity: Option<&str>| RgSearchNarrowing {
-            breadth,
-            query_identity: query_identity.to_string(),
-            search_identity: format!("{query_identity}:{scope_identity}"),
-            scope_identity: scope_identity.to_string(),
-            parent_scope_identity: parent_scope_identity.map(ToString::to_string),
-            can_record_miss: true,
-        };
         let broad = key("rg needle .").with_search_narrowing(
             "turn-a",
             "repo-a",
-            Some(search(RgSearchBreadth::Broad, "needle", "repo", None)),
-        );
-        let narrow = key("rg needle core/src/tools").with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(search(
-                RgSearchBreadth::Narrow,
-                "needle",
-                "repo/core/src/tools",
-                Some("repo/core/src"),
-            )),
-        );
-        let owner = key("rg needle core").with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(search(
-                RgSearchBreadth::Narrow,
-                "needle",
-                "repo/core",
-                Some("repo"),
-            )),
-        );
-
-        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
-        let compound_narrow = key("rg needle src/tools; false").with_search_narrowing(
-            "turn-a",
-            "repo-a",
             Some(RgSearchNarrowing {
-                can_record_miss: false,
-                ..search(
-                    RgSearchBreadth::Narrow,
-                    "needle",
-                    "repo/core/src/tools",
-                    Some("repo/core/src"),
-                )
+                breadth: RgSearchBreadth::Broad,
+                query_identity: "needle".to_string(),
+                search_identity: "needle:repo".to_string(),
+                scope_identity: "repo".to_string(),
+                parent_scope_identity: None,
+                can_record_miss: true,
             }),
         );
-        ledger.record_exit(&compound_narrow, 1).await;
-        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
-        ledger.record_exit(&narrow, 0).await;
-        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
-        ledger.record_exit(&narrow, 1).await;
-        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
-        ledger.record_exit(&owner, 1).await;
         assert!(ledger.admit_search_narrowing(&broad).await.is_ok());
-
-        let unrelated = key("rg other .").with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(search(RgSearchBreadth::Broad, "other", "repo", None)),
-        );
-        assert!(ledger.admit_search_narrowing(&unrelated).await.is_err());
-
-        let other_turn = key("rg needle .").with_search_narrowing(
-            "turn-b",
-            "repo-a",
-            Some(search(RgSearchBreadth::Broad, "needle", "repo", None)),
-        );
-        assert!(ledger.admit_search_narrowing(&other_turn).await.is_err());
-        let other_repository = key("rg needle .").with_search_narrowing(
-            "turn-a",
-            "repo-b",
-            Some(search(RgSearchBreadth::Broad, "needle", "repo", None)),
-        );
-        assert!(
-            ledger
-                .admit_search_narrowing(&other_repository)
-                .await
-                .is_err()
-        );
-        let other_environment = CommandAttemptKey::new(
-            "exec_command",
-            "environment-b",
-            ".",
-            &["rg needle .".to_string()],
-        )
-        .with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(search(RgSearchBreadth::Broad, "needle", "repo", None)),
-        );
-        assert!(
-            ledger
-                .admit_search_narrowing(&other_environment)
-                .await
-                .is_err()
-        );
         ledger.finish_turn("turn-a").await;
-        assert!(ledger.admit_search_narrowing(&broad).await.is_err());
+        assert!(ledger.admit_search_narrowing(&broad).await.is_ok());
     }
 
     #[tokio::test]

@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+try:
+    from scripts.rollout_snapshot import read_rollout_snapshot
+except ImportError:
+    from rollout_snapshot import read_rollout_snapshot
 
 
 CANONICAL_TIMING_SCHEMA_VERSION = 20
@@ -110,11 +116,14 @@ def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
     exclusions = {"invalidJsonLines": 0, "invalidTimestamps": 0, "incompleteTurns": 0}
     legacy_rows: list[dict[str, float]] = []
     canonical_rows: list[dict[str, float]] = []
+    snapshots: list[dict[str, str | int]] = []
     completed_turns = 0
 
     for path in files:
+        snapshot = read_rollout_snapshot(path)
+        snapshots.append(snapshot.metadata())
         active: _Turn | None = None
-        with path.open("r", encoding="utf-8") as handle:
+        with io.StringIO(snapshot.data.decode("utf-8")) as handle:
             for raw_line in handle:
                 try:
                     record = json.loads(raw_line)
@@ -242,6 +251,7 @@ def analyze(inputs: Sequence[Path]) -> dict[str, Any]:
             ),
         },
         "sourceFileCount": len(files),
+        "sourceSnapshots": snapshots,
         "completedTurnCount": completed_turns,
         "canonicalTurnCount": len(canonical_rows),
         "legacyReconstructedTurnCount": len(legacy_rows),

@@ -2266,3 +2266,59 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
             .is_some_and(|identity| identity.contains(&invocation_sha256))
     );
 }
+
+#[tokio::test]
+async fn admission_only_projection_preserves_original_response_when_artifact_storage_fails() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let blocked_home = temp.path().join("not-a-directory");
+    tokio::fs::write(&blocked_home, b"blocked")
+        .await
+        .expect("create blocking file");
+    let output = "completed wait result".to_string();
+    let canonical = CanonicalToolResult::text(output.clone());
+    let original_response = ResponseInputItem::FunctionCallOutput {
+        call_id: "wait-call".to_string(),
+        output: FunctionCallOutputPayload::from_text(output.clone()),
+    };
+
+    let projection = project_model_output(ModelProjectionInput {
+        spillable_text: output.clone(),
+        outcome: ToolOutputOutcome::Success,
+        essential_inline: serde_json::json!({}),
+        origin_call_id: "wait-call".to_string(),
+        selection_facts: ProjectionSelectionFacts {
+            mode: "generic_fallback",
+            available_fragments: 0,
+            selected_fragments: 0,
+            exact_duplicates_removed: 0,
+            selected_ids: Vec::new(),
+            omitted_inline_ids: Vec::new(),
+            partial_ids: Vec::new(),
+        },
+        applied_token_limit: 1_000,
+        projected_text: output.clone(),
+        preserved_content: Vec::new(),
+        codex_home: blocked_home,
+        thread_id: "wait-thread".to_string(),
+        tool_name: "wait".to_string(),
+        original_output_sha256: canonical.sha256.clone(),
+        original_output_tokens: canonical.approximate_tokens,
+        original_output_text: output,
+        invocation_sha256: None,
+        canonical,
+        semantic_class: "tool_output".to_string(),
+        source_dependencies: std::collections::BTreeSet::new(),
+        projection_eligible: true,
+        projection_truncated: false,
+        predetermined_ranges: Vec::new(),
+        predetermined_json_pointers: Vec::new(),
+        original_response: original_response.clone(),
+        materialization: ProjectionMaterialization::AdmissionOnly,
+    })
+    .await
+    .expect("admission-only projection should fall back to the received response");
+
+    assert_eq!(projection.response(), original_response);
+    assert!(projection.candidate.is_none());
+    assert!(!projection.artifact_created);
+}

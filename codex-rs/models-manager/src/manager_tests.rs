@@ -603,6 +603,54 @@ async fn static_manager_falls_back_from_unsupported_requested_model_when_allowed
 }
 
 #[tokio::test]
+async fn static_manager_preserves_requested_sol_when_fallback_is_allowed() {
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![remote_model(
+            "provider-default",
+            "Default",
+            /*priority*/ 0,
+        )],
+    });
+
+    for requested_model in ["gpt-5.6-sol", "openai.gpt-5.6-sol"] {
+        let model = manager
+            .get_default_model(
+                &Some(requested_model.to_string()),
+                /*allow_provider_model_fallback*/ true,
+                RefreshStrategy::Offline,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await;
+
+        assert_eq!(model, requested_model);
+    }
+}
+
+#[tokio::test]
+async fn static_manager_falls_back_from_unqualified_sol_suffixes() {
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![remote_model(
+            "provider-default",
+            "Default",
+            /*priority*/ 0,
+        )],
+    });
+
+    for requested_model in ["notgpt-5.6-sol", ".gpt-5.6-sol"] {
+        let model = manager
+            .get_default_model(
+                &Some(requested_model.to_string()),
+                /*allow_provider_model_fallback*/ true,
+                RefreshStrategy::Offline,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await;
+
+        assert_eq!(model, "provider-default");
+    }
+}
+
+#[tokio::test]
 async fn static_manager_preserves_unsupported_requested_model_when_fallback_is_disabled() {
     let manager = static_manager_for_tests(ModelsResponse {
         models: vec![remote_model(

@@ -371,7 +371,80 @@ fn read_only_shell_commands_do_not_create_mutation_state() {
     let mut tracker = TurnDiffTracker::new();
     tracker.record_exec_command_end(&["git".into(), "status".into()], 0, false);
     tracker.record_exec_command_end(&["git".into(), "log".into(), "-1".into()], 0, false);
+    tracker.record_exec_command_end(
+        &["cmd".into(), "/c".into(), "type".into(), "README.md".into()],
+        0,
+        false,
+    );
+    tracker.record_exec_command_end(
+        &[
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "Get-Content README.md".into(),
+        ],
+        0,
+        false,
+    );
+    tracker.record_exec_command_end(
+        &[
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "$ErrorActionPreference = 'Stop'; Write-Output 'owners'; Get-Content README.md -Raw; Select-String -Path README.md -Pattern owner".into(),
+        ],
+        0,
+        false,
+    );
+    tracker.record_exec_command_end(
+        &[
+            "pwsh".into(),
+            "-Command".into(),
+            "Get-ChildItem . | Select-Object -First 1; git status --short".into(),
+        ],
+        0,
+        false,
+    );
     assert!(!tracker.has_unvalidated_mutation());
+}
+
+#[test]
+fn direct_file_read_shells_still_reject_composed_mutations() {
+    for command in [
+        vec![
+            "cmd".into(),
+            "/c".into(),
+            "type".into(),
+            "README.md".into(),
+            ">".into(),
+            "copy.txt".into(),
+        ],
+        vec![
+            "cmd".into(),
+            "/c".into(),
+            "type README.md & del README.md".into(),
+        ],
+        vec![
+            "powershell.exe".into(),
+            "-Command".into(),
+            "Get-Content README.md; Set-Content README.md changed".into(),
+        ],
+        vec![
+            "powershell.exe".into(),
+            "-Command".into(),
+            "Get-Content README.md; & ./rewrite.ps1".into(),
+        ],
+        vec![
+            "powershell.exe".into(),
+            "-Command".into(),
+            "Get-Content README.md; python edit.py".into(),
+        ],
+    ] {
+        assert!(
+            command_may_mutate(&command),
+            "composed shell command must fail closed: {command:?}"
+        );
+    }
 }
 
 #[test]

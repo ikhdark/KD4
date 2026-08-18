@@ -28,10 +28,9 @@
 
 ## Implementation Completion Gate
 
-Use the authoritative completion discipline in repository root
-[`AGENTS.md`](../../../AGENTS.md), the status definitions in
-[`../workflow.md`](../workflow.md#completion-gate-status), and the finish phase
-in [`../workflow.md`](../workflow.md#phase-5-finish).
+Apply the repository rules in root [`AGENTS.md`](../../../AGENTS.md), the status
+definitions in [`../workflow.md`](../workflow.md#completion-gate-status), and the
+finish phase in [`../workflow.md`](../workflow.md#phase-5-finish).
 
 - [ ] Intended runtime path identified:
 - [ ] Changed code is reached from that path:
@@ -42,6 +41,7 @@ in [`../workflow.md`](../workflow.md#phase-5-finish).
 - [ ] New public functions, types, config fields, commands, or workflow entries
       are wired into expected callers
 - [ ] Nearest sufficient validation ran, or skip/not-applicable reason recorded
+- [ ] Evidence names its provenance, freshness, and exact covered contract
 - [ ] Completion gate status recorded: passed | partial | blocked
 - [ ] Final implementation answer includes completion gate status, validation
       run, and remaining unverified risk

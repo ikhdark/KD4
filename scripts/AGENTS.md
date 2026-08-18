@@ -52,10 +52,17 @@ owner crosses script/package boundaries or remains ambiguous.
   `package.json` script names.
 - Repository checks: `format.py`, `asciicheck.py`, `readme_toc.py`,
   `source_map_check.py`, `check_blob_size.py`, and matching tests.
+  `source_map_check.py` rewrites the managed repository-path snapshot before
+  validating inventories; keep that synchronization deterministic and
+  idempotent.
 - PowerShell/script invocation compatibility: `just-shell.py`,
   `run-powershell-script.ps1`, `test_run_powershell_script.py`.
 - Tool-version reporting: `tool_versions.py`; probes must not mutate the machine
   or require network access.
+- Live rollout snapshots and analyzers: `rollout_snapshot.py`,
+  `kd4_first_useful_action_analysis.py`, `kd4_turn_latency_audit.py`, and their
+  tests. Read a growing rollout through a fixed-length, checksummed snapshot;
+  do not stream an active JSONL file to unbounded EOF.
 
 ## High-Risk Surfaces
 

@@ -28,7 +28,7 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
             Some(vec!["label".to_string(), "description".to_string()]),
             Some(false.into()),
         ), Some(
-            "Provide 2-4 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
+            "Provide exactly 4 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
                 .to_string(),
         ));
 
@@ -139,7 +139,7 @@ pub fn normalize_request_user_input_args(
 pub fn request_user_input_tool_description(available_modes: &[ModeKind]) -> String {
     let allowed_modes = format_allowed_modes(available_modes);
     format!(
-        "Request user input for one to three short questions and wait for the response. Set autoResolutionMs, from {MIN_AUTO_RESOLUTION_MS} to {MAX_AUTO_RESOLUTION_MS} milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. This tool is only available in {allowed_modes}."
+        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. Each question must offer exactly four mutually exclusive suggested answers; the client adds a free-text response. Set autoResolutionMs, from {MIN_AUTO_RESOLUTION_MS} to {MAX_AUTO_RESOLUTION_MS} milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. This tool is only available in {allowed_modes}."
     )
 }
 

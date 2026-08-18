@@ -180,6 +180,23 @@ pub(crate) use permissions::resolve_permission_profile;
 pub use resolved_permission_profile::PermissionProfileSnapshot;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
 
+fn effective_reasoning_phase_efforts(
+    configured: Option<ReasoningPhaseEfforts>,
+) -> ReasoningPhaseEfforts {
+    let configured = configured.unwrap_or_default();
+    ReasoningPhaseEfforts {
+        orient: configured.orient.or(Some(ReasoningEffort::High)),
+        inspect: configured.inspect.or(Some(ReasoningEffort::Low)),
+        implement: configured.implement.or(Some(ReasoningEffort::High)),
+        diagnose: configured.diagnose.or(Some(ReasoningEffort::High)),
+        verify: configured.verify.or(Some(ReasoningEffort::Low)),
+        finalize: configured.finalize.or(Some(ReasoningEffort::Low)),
+        deterministic_continuation: configured
+            .deterministic_continuation
+            .or(Some(ReasoningEffort::Low)),
+    }
+}
+
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
 
@@ -1030,8 +1047,8 @@ pub struct Config {
     /// global default").
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
 
-    /// Optional per-logical-request reasoning effort overrides. Table
-    /// presence enables the deterministic sampling governor.
+    /// Per-logical-request reasoning effort overrides. Fork defaults enable
+    /// the deterministic sampling governor even when the table is absent.
     pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
 
     /// Optional value to use for `reasoning.summary` when making a request
@@ -3866,7 +3883,9 @@ impl Config {
             guardian_policy_config,
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
-            reasoning_phase_efforts: cfg.reasoning_phase_efforts,
+            reasoning_phase_efforts: Some(effective_reasoning_phase_efforts(
+                cfg.reasoning_phase_efforts,
+            )),
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_supports_reasoning_summaries: cfg.model_supports_reasoning_summaries,
             model_catalog,

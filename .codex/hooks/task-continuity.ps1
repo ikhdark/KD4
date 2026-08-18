@@ -1,6 +1,7 @@
 param(
     [AllowEmptyString()]
-    [string]$TaskContinuityRawInput
+    [string]$TaskContinuityRawInput,
+    [switch]$TaskContinuitySkipFastPath
 )
 
 Set-StrictMode -Version 2.0
@@ -31,6 +32,7 @@ else {
 }
 $script:FastInput = $null
 $script:FastJsonSerializer = $null
+if (-not $TaskContinuitySkipFastPath) {
 try {
     if ([string]::IsNullOrWhiteSpace($script:RawInput)) {
         throw 'hook stdin was empty'
@@ -230,6 +232,7 @@ try {
 catch {
     # The full path owns validation and diagnostics for every uncertain case.
 }
+}
 
 $script:SlowImplementation = @'
 $script:ParsedInput = $null
@@ -402,7 +405,10 @@ function New-RepositoryState {
 }
 
 function Get-RepositoryState {
-    param([string]$WorkingDirectory)
+    param(
+        [string]$WorkingDirectory,
+        [AllowNull()][string]$KnownRoot
+    )
 
     $empty = New-RepositoryState
     try {
@@ -410,9 +416,16 @@ function Get-RepositoryState {
             throw 'working directory does not exist'
         }
 
-        $rootLines = @(& git.exe -C $WorkingDirectory rev-parse --show-toplevel 2>$null)
+        $rootLines = @(
+            & git.exe -C $WorkingDirectory rev-parse --show-toplevel 2>$null
+        )
         if ($LASTEXITCODE -ne 0 -or $rootLines.Count -eq 0) {
             throw 'working directory is not a Git repository'
+        }
+        $root = ($rootLines -join "`n").Trim()
+        if (-not [string]::IsNullOrWhiteSpace($KnownRoot) -and
+            [string]::Equals($root, $KnownRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            $root = $KnownRoot
         }
         $statusLines = @(
             & git.exe -C $WorkingDirectory status --porcelain=v2 --branch 2>$null
@@ -421,7 +434,6 @@ function Get-RepositoryState {
             throw 'Git status lookup failed'
         }
 
-        $root = ($rootLines -join "`n").Trim()
         $revision = $null
         $dirtyLines = @()
         foreach ($statusLine in $statusLines) {
@@ -1078,13 +1090,23 @@ function Invoke-SessionStart {
     }
 
     $previousDigest = Get-OptionalString -Object $existing -Name 'material_digest'
+    $knownRepositoryRoot = if (
+        [string]$existing.working_directory -eq $WorkingDirectory
+    ) {
+        Get-OptionalString -Object $existing.repository -Name 'root'
+    }
+    else {
+        $null
+    }
     Set-CommonEventFields `
         -Capsule $existing `
         -InputObject $InputObject `
         -EventName 'SessionStart' `
         -WorkingDirectory $WorkingDirectory `
         -TranscriptPath $TranscriptPath
-    $existing.repository = Get-RepositoryState -WorkingDirectory $WorkingDirectory
+    $existing.repository = Get-RepositoryState `
+        -WorkingDirectory $WorkingDirectory `
+        -KnownRoot $knownRepositoryRoot
     [void](Save-Capsule `
         -Capsule $existing `
         -Path $capsulePath `
@@ -1144,6 +1166,14 @@ function Invoke-TaskContinuity {
             -Seed $null
     }
     $previousDigest = Get-OptionalString -Object $capsule -Name 'material_digest'
+    $knownRepositoryRoot = if (
+        [string]$capsule.working_directory -eq $workingDirectory
+    ) {
+        Get-OptionalString -Object $capsule.repository -Name 'root'
+    }
+    else {
+        $null
+    }
     Set-CommonEventFields `
         -Capsule $capsule `
         -InputObject $InputObject `
@@ -1170,7 +1200,9 @@ function Invoke-TaskContinuity {
                 phase = 'pre'
                 trigger = Get-RedactedExcerpt -Value $trigger -MaximumCharacters 100
             }
-            $capsule.repository = Get-RepositoryState -WorkingDirectory $workingDirectory
+            $capsule.repository = Get-RepositoryState `
+                -WorkingDirectory $workingDirectory `
+                -KnownRoot $knownRepositoryRoot
             [void](Save-Capsule `
                 -Capsule $capsule `
                 -Path $capsulePath `
@@ -1191,7 +1223,9 @@ function Invoke-TaskContinuity {
                 phase = 'post'
                 trigger = Get-RedactedExcerpt -Value $trigger -MaximumCharacters 100
             }
-            $capsule.repository = Get-RepositoryState -WorkingDirectory $workingDirectory
+            $capsule.repository = Get-RepositoryState `
+                -WorkingDirectory $workingDirectory `
+                -KnownRoot $knownRepositoryRoot
             [void](Save-Capsule `
                 -Capsule $capsule `
                 -Path $capsulePath `
@@ -1219,7 +1253,9 @@ function Invoke-TaskContinuity {
             if ($null -ne $previousDigest -and $fastDigest -eq $previousDigest) {
                 return $script:EmptyOutput
             }
-            $capsule.repository = Get-RepositoryState -WorkingDirectory $workingDirectory
+            $capsule.repository = Get-RepositoryState `
+                -WorkingDirectory $workingDirectory `
+                -KnownRoot $knownRepositoryRoot
             [void](Save-Capsule `
                 -Capsule $capsule `
                 -Path $capsulePath `

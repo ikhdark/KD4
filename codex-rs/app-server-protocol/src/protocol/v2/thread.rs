@@ -59,7 +59,7 @@ pub struct ThreadStartParams {
     #[ts(optional = nullable)]
     pub model_provider: Option<String>,
     /// Allow a provider with an authoritative static model catalog to replace an unavailable
-    /// requested model with its default.
+    /// requested model with its default. Requested `gpt-5.6-sol` models remain pinned to Sol.
     #[experimental("thread/start.allowProviderModelFallback")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_provider_model_fallback: bool,

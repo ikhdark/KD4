@@ -37,6 +37,26 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 
+fn reused_failure_diagnosis(
+    tool_name: &codex_tools::ToolName,
+    failure_fingerprint: &str,
+) -> String {
+    let next_action = if tool_name.name == "write_stdin" {
+        "Do not poll this session again with unchanged arguments; inspect process state, wait materially longer, or use a different observation route."
+    } else {
+        "Do not repeat this call with unchanged arguments; change the action or relevant state before the next call."
+    };
+    serde_json::json!({
+        "kind": "reused_failure_diagnosis",
+        "failure_fingerprint": failure_fingerprint,
+        "retryable": false,
+        "required_action": "change_route_or_state",
+        "reason": "this exact action already produced the same stable failure against unchanged state; the prior diagnosis remains authoritative",
+        "next_action": next_action,
+    })
+    .to_string()
+}
+
 struct ToolCallTimingGuard {
     timing: Arc<ToolDispatchTiming>,
     conversation_id: String,
@@ -397,14 +417,10 @@ impl ToolCallRuntime {
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.suppressed_failure.as_ref()
             {
-                let mut output = FunctionCallOutputPayload::from_text(
-                    serde_json::json!({
-                        "kind": "reused_failure_diagnosis",
-                        "failure_fingerprint": guard.failure_fingerprint,
-                        "reason": "this exact action already produced the same stable failure against unchanged state; the prior diagnosis remains authoritative, so change the action or relevant state",
-                    })
-                    .to_string(),
-                );
+                let mut output = FunctionCallOutputPayload::from_text(reused_failure_diagnosis(
+                    &call.tool_name,
+                    &guard.failure_fingerprint,
+                ));
                 output.success = Some(false);
                 let response = ResponseInputItem::FunctionCallOutput {
                     call_id: call.call_id.clone(),
@@ -967,10 +983,29 @@ mod tests {
     use crate::tools::registry::ToolExecutor;
     use crate::tools::registry::ToolRegistry;
     use crate::turn_diff_tracker::TurnDiffTracker;
+
     use codex_extension_api::ToolCallOutcome;
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn rollout_workflow_guardrails_change_route_after_reused_session_failure() {
+        let diagnosis: serde_json::Value = serde_json::from_str(&reused_failure_diagnosis(
+            &codex_tools::ToolName::plain("write_stdin"),
+            "stable-failure",
+        ))
+        .expect("valid diagnosis");
+
+        assert_eq!(diagnosis["retryable"], false);
+        assert_eq!(diagnosis["required_action"], "change_route_or_state");
+        assert!(
+            diagnosis["next_action"]
+                .as_str()
+                .expect("next action")
+                .contains("Do not poll this session again with unchanged arguments")
+        );
+    }
     use tokio::sync::Notify;
     use tokio::sync::oneshot;
     use tracing_test::internal::MockWriter;

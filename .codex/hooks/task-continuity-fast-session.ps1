@@ -14,6 +14,123 @@ $stateDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $PSScriptRoot '..\harness\runs\task-continuity\v1')
 )
 
+function Get-BoundedRedactedString {
+    param(
+        [AllowNull()][object]$Value,
+        [int]$MaximumCharacters
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    if ($Value -isnot [string] -or $Value.IndexOf([char]0) -ge 0) {
+        throw 'recovery value was not a safe string'
+    }
+    $text = $Value.Replace("`r`n", "`n").Replace("`r", "`n")
+    $text = [regex]::Replace(
+        $text,
+        '(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+',
+        'Bearer [REDACTED]'
+    )
+    $text = [regex]::Replace(
+        $text,
+        '\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b',
+        '[REDACTED]'
+    )
+    $text = [regex]::Replace(
+        $text,
+        '(?i)(\b(?:api[_-]?key|token|password|secret)\b\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|[^\s,;]+)',
+        '$1[REDACTED]'
+    )
+    if ($text.Length -gt $MaximumCharacters) {
+        return $text.Substring(0, $MaximumCharacters - 3) + '...'
+    }
+    return $text
+}
+
+function ConvertTo-NullableString {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+    if ($Value -isnot [string]) {
+        throw 'recovery value was not a string'
+    }
+    return $Value
+}
+
+function Test-RepositoryStateMatchesCapsule {
+    param(
+        [Collections.IDictionary]$Capsule,
+        [string]$WorkingDirectory
+    )
+
+    $storedRoot = [string]$Capsule.repository.root
+    $matches = $false
+    $savedErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        if ([string]::IsNullOrWhiteSpace($storedRoot)) {
+            [void]@(& git.exe -C $WorkingDirectory rev-parse --show-toplevel 2>$null)
+            $matches = (
+                $LASTEXITCODE -ne 0 -and
+                $null -eq $Capsule.repository.root -and
+                $null -eq $Capsule.repository.revision -and
+                $null -eq $Capsule.repository.dirty_summary
+            )
+        }
+        else {
+            $rootLines = @(
+                & git.exe -C $WorkingDirectory rev-parse --show-toplevel 2>$null
+            )
+            $rootExitCode = $LASTEXITCODE
+            $currentRoot = ($rootLines -join "`n").Trim()
+            $statusExitCode = 1
+            if ($rootExitCode -eq 0 -and
+                [string]::Equals(
+                    $currentRoot,
+                    $storedRoot,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                $statusLines = @(
+                    & git.exe -C $WorkingDirectory status --porcelain=v2 --branch 2>$null
+                )
+                $statusExitCode = $LASTEXITCODE
+            }
+            if ($rootExitCode -eq 0 -and $statusExitCode -eq 0) {
+                $revision = $null
+                $dirtyLines = @()
+                foreach ($statusLine in $statusLines) {
+                    if ($statusLine.StartsWith('# branch.oid ')) {
+                        $revision = $statusLine.Substring(13).Trim()
+                    }
+                    elseif (-not $statusLine.StartsWith('# ')) {
+                        $dirtyLines += $statusLine
+                    }
+                }
+                $dirty = 'clean'
+                if ($dirtyLines.Count -gt 0) {
+                    $dirty = @($dirtyLines | Select-Object -First 50) -join "`n"
+                    if ($dirtyLines.Count -gt 50) {
+                        $dirty += "`n..."
+                    }
+                    $dirty = Get-BoundedRedactedString $dirty 2000
+                }
+                $matches = (
+                    -not [string]::IsNullOrWhiteSpace($revision) -and
+                    [string]$Capsule.repository.revision -eq $revision -and
+                    [string]$Capsule.repository.dirty_summary -eq $dirty
+                )
+            }
+        }
+    }
+    finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    return $matches
+}
+
 try {
     if ([string]::IsNullOrWhiteSpace($TaskContinuityRawInput)) {
         throw 'hook stdin was empty'
@@ -63,6 +180,11 @@ try {
         [string]$capsule.last_event -ne 'SessionStart') {
         throw 'capsule identity did not match'
     }
+    if (-not (Test-RepositoryStateMatchesCapsule `
+        -Capsule $capsule `
+        -WorkingDirectory ([string]$inputObject.cwd))) {
+        throw 'repository state changed'
+    }
 
     [void][System.IO.Directory]::CreateDirectory($stateDirectory)
     $cutoff = [DateTime]::UtcNow.AddDays(-30)
@@ -93,7 +215,16 @@ try {
         }
     }
 
+    $taskState = $capsule.task_state
+    $hasTaskState = $taskState -is [Collections.IDictionary] -and @(@(
+        'goal', 'current_state', 'completed_work', 'unresolved_work',
+        'evidence', 'next_action'
+    ) | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$taskState[$_])
+        }
+    ).Count -gt 0
     $hasRecovery = (
+        $hasTaskState -or
         -not [string]::IsNullOrWhiteSpace([string]$capsule.last_user_request) -or
         -not [string]::IsNullOrWhiteSpace([string]$capsule.last_assistant_result) -or
         -not [string]::IsNullOrWhiteSpace([string]$capsule.predecessor_thread_id)
@@ -103,10 +234,46 @@ try {
         exit 0
     }
 
-    # Recovery output is delegated to the validated implementation. It owns
-    # canonical full-snapshot construction, so slow/fast entrypoints emit the
-    # identical capsule representation.
-    throw 'canonical recovery capsule requires validated path'
+    $semantic = [ordered]@{
+        schema_version = [int]$capsule.schema_version
+        session_id = [string]$capsule.session_id
+        continuity_epoch = [int]$capsule.continuity_epoch
+        predecessor_thread_id = ConvertTo-NullableString $capsule.predecessor_thread_id
+        working_directory = [string]$capsule.working_directory
+        task_label = Get-BoundedRedactedString $capsule.task_label 512
+        last_user_request = Get-BoundedRedactedString $capsule.last_user_request 900
+        last_assistant_result = Get-BoundedRedactedString $capsule.last_assistant_result 900
+        task_state = [ordered]@{
+            goal = Get-BoundedRedactedString $taskState.goal 600
+            current_state = Get-BoundedRedactedString $taskState.current_state 600
+            completed_work = Get-BoundedRedactedString $taskState.completed_work 600
+            unresolved_work = Get-BoundedRedactedString $taskState.unresolved_work 600
+            evidence = Get-BoundedRedactedString $taskState.evidence 600
+            next_action = Get-BoundedRedactedString $taskState.next_action 600
+        }
+        repository = [ordered]@{
+            root = ConvertTo-NullableString $capsule.repository.root
+            revision = ConvertTo-NullableString $capsule.repository.revision
+            dirty_summary = Get-BoundedRedactedString $capsule.repository.dirty_summary 600
+        }
+        compaction = [ordered]@{
+            phase = [string]$capsule.compaction.phase
+            trigger = ConvertTo-NullableString $capsule.compaction.trigger
+        }
+    }
+    $context = '<kd4_continuity_capsule_v1>' + $json.Serialize($semantic) +
+        '</kd4_continuity_capsule_v1>'
+    if ($context.Length -gt 8000) {
+        throw 'canonical continuity capsule exceeded its hard context bound'
+    }
+    $wire = [ordered]@{
+        hookSpecificOutput = [ordered]@{
+            hookEventName = 'SessionStart'
+            additionalContext = $context
+        }
+    }
+    [Console]::Out.Write($json.Serialize($wire))
+    exit 0
 }
 catch {
     # The validated helper owns all ambiguous and changing paths.
@@ -114,7 +281,8 @@ catch {
 
 try {
     & (Join-Path $PSScriptRoot 'task-continuity.ps1') `
-        -TaskContinuityRawInput $TaskContinuityRawInput
+        -TaskContinuityRawInput $TaskContinuityRawInput `
+        -TaskContinuitySkipFastPath
 }
 catch {
     try {

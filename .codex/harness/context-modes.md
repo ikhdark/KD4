@@ -3,6 +3,20 @@
 Use context modes to keep a task's current phase explicit without loading a
 large standing prompt into every turn.
 
+## Working Task Model
+
+Keep one compact task model in conversation or the primary durable artifact.
+Track the objective, active requirements, non-goals, owners and reachable
+consumers, material unknowns, up to three plausible hypotheses, and the smallest
+proof route. Label material claims with exactly one provenance kind:
+`direct_file_read`, `search_hit`, `generated_summary`, `cached_observation`,
+`inferred_relationship`, or `test_result`.
+
+Treat search hits as routing evidence, summaries as lossy, cached observations as
+potentially stale, inferences as hypotheses, and test results as proof only for
+the contract exercised. Revise or invalidate claims when their dependencies
+change; repetition in a durable artifact does not strengthen provenance.
+
 ## Research Mode
 
 Use when the task is discovery, comparison, audit, or recommendation.
@@ -10,6 +24,7 @@ Use when the task is discovery, comparison, audit, or recommendation.
 - Read broadly enough to support the claim.
 - Keep edits out of scope unless the user asks to implement.
 - Return findings first, then recommendations.
+- Keep unknowns explicit; do not promote a hypothesis to a fact.
 - Capture durable findings only when they will matter after compaction.
 
 ## Plan Mode
@@ -17,7 +32,7 @@ Use when the task is discovery, comparison, audit, or recommendation.
 Use when the task is broad, risky, multi-step, or likely to resume later.
 
 - Create or update `PLAN.md`.
-- State non-goals and validation intent.
+- State non-goals, unknowns, and validation intent.
 - Identify owner files, call paths, configs, generated artifacts, and tests.
 - Keep the plan short enough to execute.
 
@@ -36,7 +51,7 @@ Use when checking a patch, PR, or harness artifact.
 
 - Lead with severity-ranked findings.
 - Cite exact files and lines when possible.
-- Separate proven issues from open questions.
+- Separate observed issues, inferred risks, and open questions.
 - Use `QA_CHECKLIST.md` for broad or risky changes.
 
 ## Finish Mode
