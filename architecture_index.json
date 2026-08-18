@@ -929,7 +929,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "df89702c4d03a71ec2ed364c35971c283df1468e",
+  "repository_revision": "manifest:da089a8e146fb1280e962dba32ddf4959cd68ea283d6d04fb228d44f3fd8c982",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

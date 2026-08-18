@@ -328,24 +328,21 @@ evidence = [{ path = "src/lib.rs", symbol = "item" }]
             )
             self.assertGreater(bounded["omitted_relationships"], 0)
 
-    def test_architecture_index_is_revision_keyed_and_deterministic(self) -> None:
+    def test_architecture_index_is_manifest_keyed_and_deterministic(self) -> None:
         manifest, digest = source_owners.load_and_validate(
             source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
         )
 
-        with mock.patch.object(
-            source_owners, "repository_revision", return_value="revision-1"
-        ):
-            first = source_owners.expected_architecture_index(
-                manifest, digest, source_owners.REPO_ROOT
-            )
-            second = source_owners.expected_architecture_index(
-                manifest, digest, source_owners.REPO_ROOT
-            )
+        first = source_owners.expected_architecture_index(
+            manifest, digest, source_owners.REPO_ROOT
+        )
+        second = source_owners.expected_architecture_index(
+            manifest, digest, source_owners.REPO_ROOT
+        )
 
         self.assertEqual(first, second)
         index = json.loads(first)
-        self.assertEqual(index["repository_revision"], "revision-1")
+        self.assertEqual(index["repository_revision"], f"manifest:{digest}")
         self.assertTrue(all("facet_exclusions" in owner for owner in index["owners"]))
 
     def test_unknown_relationship_category_is_rejected(self) -> None:

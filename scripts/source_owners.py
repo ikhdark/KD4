@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 import tempfile
 import tomllib
@@ -441,20 +440,10 @@ def load_and_validate(
     return manifest, digest
 
 
-def repository_revision(root: Path, manifest_digest: str) -> str:
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        revision = completed.stdout.strip()
-        if revision:
-            return revision
-    except (OSError, subprocess.SubprocessError):
-        pass
+def repository_revision(_root: Path, manifest_digest: str) -> str:
+    # A generated file cannot reproducibly embed the commit that contains it:
+    # committing that value creates a new commit and immediately makes the
+    # file stale. Key the graph by its authoritative manifest content instead.
     return f"manifest:{manifest_digest}"
 
 

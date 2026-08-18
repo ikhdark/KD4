@@ -110,7 +110,7 @@ For a clear crate-local or script-local task, use the closest owner instructions
 directly. Use this map when the route crosses boundaries or when a new boundary
 must be placed.
 
-`architecture_index.json` is the machine-readable, revision-keyed relationship
+`architecture_index.json` is the machine-readable, manifest-keyed relationship
 graph generated from `source_owners.toml`. `just source-owners-check` rejects a
 stale graph or managed map block and runs representative architectural recall
 cases. Its evaluator reports insufficient evidence separately from bounded but
@@ -153,7 +153,7 @@ below.
 | `.codex/` | Repo-local Codex configuration, environment setup, durable harness material, fork-local skills, and workspace policy |
 | `.devcontainer/` | Development-container image, bootstrap, and container-local Codex installation inputs |
 | `.vscode/` | Checked-in editor and workspace defaults |
-| `architecture_index.json` | Generated, revision-keyed source-owner relationship graph consumed by task-scoped architecture discovery |
+| `architecture_index.json` | Generated, manifest-keyed source-owner relationship graph consumed by task-scoped architecture discovery |
 | `codex-cli/` | npm-facing `@openai/codex` wrapper, native binary discovery, and npm package inputs |
 | `codex-rs/` | Primary Rust workspace and nearly all CLI, runtime, app-server, TUI, tool, protocol, state, plugin, extension, and sandbox behavior |
 | `docs/` | Checked-in documentation contracts and schemas, including investigation-evidence interchange |
