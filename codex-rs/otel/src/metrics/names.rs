@@ -1,5 +1,7 @@
 pub const TOOL_CALL_COUNT_METRIC: &str = "codex.tool.call";
 pub const TOOL_CALL_DURATION_METRIC: &str = "codex.tool.call.duration_ms";
+/// Duration of low-cardinality phases inside the local tool lifecycle.
+pub const TOOL_LIFECYCLE_PHASE_DURATION_METRIC: &str = "codex.tool.lifecycle_phase.duration_ms";
 pub const TOOL_CALL_UNIFIED_EXEC_METRIC: &str = "codex.tool.unified_exec";
 pub const PROCESS_START_METRIC: &str = "codex.process.start";
 pub const API_CALL_COUNT_METRIC: &str = "codex.api_request";

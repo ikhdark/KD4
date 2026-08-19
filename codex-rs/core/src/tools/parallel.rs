@@ -38,21 +38,16 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 
 fn reused_failure_diagnosis(
-    tool_name: &codex_tools::ToolName,
+    _tool_name: &codex_tools::ToolName,
     failure_fingerprint: &str,
 ) -> String {
-    let next_action = if tool_name.name == "write_stdin" {
-        "Do not poll this session again with unchanged arguments; inspect process state, wait materially longer, or use a different observation route."
-    } else {
-        "Do not repeat this call with unchanged arguments; change the action or relevant state before the next call."
-    };
     serde_json::json!({
         "kind": "reused_failure_diagnosis",
         "failure_fingerprint": failure_fingerprint,
         "retryable": false,
         "required_action": "change_route_or_state",
         "reason": "this exact action already produced the same stable failure against unchanged state; the prior diagnosis remains authoritative",
-        "next_action": next_action,
+        "next_action": "Do not repeat this call with unchanged arguments; change the action or relevant state before the next call.",
     })
     .to_string()
 }
@@ -75,8 +70,12 @@ pub(crate) struct ToolCallRuntime {
     sampling_request_signals: Option<SamplingRequestSignalCollector>,
 }
 
-fn workspace_tool_may_use_parallel_gate(supports_parallel: bool, observes_workspace: bool) -> bool {
-    supports_parallel && !observes_workspace
+fn workspace_tool_may_use_parallel_gate(
+    supports_parallel: bool,
+    proven_read_only: bool,
+    workspace_capable: bool,
+) -> bool {
+    supports_parallel && (!workspace_capable || proven_read_only)
 }
 
 fn guarded_workspace_evidence_is_current(
@@ -84,6 +83,37 @@ fn guarded_workspace_evidence_is_current(
     revision_after: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
 ) -> bool {
     revision_before.is_some() && revision_before == revision_after
+}
+
+enum WorkspaceEvidenceBaseline {
+    Content(Option<crate::git_workspace::WorkspaceEvidenceIdentity>),
+}
+
+async fn capture_workspace_evidence_baseline(
+    cache: &crate::git_workspace::GitWorkspaceCache,
+    cwd: &std::path::Path,
+    _proven_read_only: bool,
+) -> WorkspaceEvidenceBaseline {
+    WorkspaceEvidenceBaseline::Content(cache.workspace_evidence_identity(cwd).await)
+}
+
+async fn finish_workspace_evidence_capture(
+    cache: &crate::git_workspace::GitWorkspaceCache,
+    cwd: &std::path::Path,
+    baseline: &WorkspaceEvidenceBaseline,
+    mutation_advanced: bool,
+) -> (
+    Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+    bool,
+) {
+    match baseline {
+        WorkspaceEvidenceBaseline::Content(identity) => {
+            let revision = cache.workspace_evidence_identity(cwd).await;
+            let captured_current = !mutation_advanced
+                && guarded_workspace_evidence_is_current(identity.as_ref(), revision.as_ref());
+            (revision, captured_current)
+        }
+    }
 }
 
 impl ToolCallRuntime {
@@ -113,8 +143,9 @@ impl ToolCallRuntime {
         &self,
         call: &ToolCall,
         response: &ResponseInputItem,
-        revision_before: Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-        _mutation_advanced: bool,
+        revision_before: Option<WorkspaceEvidenceBaseline>,
+        _proven_read_only: bool,
+        mutation_advanced: bool,
         source_dependencies_override: Option<
             std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
         >,
@@ -131,18 +162,22 @@ impl ToolCallRuntime {
             &call.payload,
             self.step_context.turn.config.cwd.as_path(),
         );
-        let revision = self
-            .session
-            .services
-            .git_workspace
-            .workspace_evidence_identity(&workspace_cwd)
-            .await;
+        let (revision, captured_current) = match revision_before.as_ref() {
+            Some(baseline) => {
+                finish_workspace_evidence_capture(
+                    self.session.services.git_workspace.as_ref(),
+                    &workspace_cwd,
+                    baseline,
+                    mutation_advanced,
+                )
+                .await
+            }
+            None => (None, false),
+        };
         // A mutation revision may belong to a different call that acquired the
         // execution gate before this response could register its evidence.
         // Only matching content identities prove that this output was captured
         // against the revision being recorded.
-        let captured_current =
-            revision_before.is_some_and(|before| before.is_some() && before == revision);
         Self::register_workspace_evidence_observation(
             self.session.as_ref(),
             self.step_context.turn.as_ref(),
@@ -160,8 +195,9 @@ impl ToolCallRuntime {
         turn: &TurnContext,
         call: &ToolCall,
         response: &ResponseInputItem,
-        revision_before: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-        _mutation_advanced: bool,
+        revision_before: WorkspaceEvidenceBaseline,
+        _proven_read_only: bool,
+        mutation_advanced: bool,
     ) {
         if !crate::tool_history::tool_call_observes_workspace(
             call.tool_name.name.as_str(),
@@ -174,13 +210,13 @@ impl ToolCallRuntime {
             &call.payload,
             turn.config.cwd.as_path(),
         );
-        let revision = session
-            .services
-            .git_workspace
-            .workspace_evidence_identity(&workspace_cwd)
-            .await;
-        let captured_current =
-            guarded_workspace_evidence_is_current(revision_before.as_ref(), revision.as_ref());
+        let (revision, captured_current) = finish_workspace_evidence_capture(
+            session.services.git_workspace.as_ref(),
+            &workspace_cwd,
+            &revision_before,
+            mutation_advanced,
+        )
+        .await;
         Self::register_workspace_evidence_observation(
             session,
             turn,
@@ -343,15 +379,20 @@ impl ToolCallRuntime {
                     .as_deref(),
             )
             .flatten();
+        let typed_read = matches!(
+            classify_typed_tool(
+                call.tool_name.namespace.as_deref(),
+                &call.tool_name.name,
+                collaboration_namespace,
+            ),
+            TypedToolClass::ReadSearch
+        );
+        let proven_read_only_shell = crate::tool_history::tool_call_is_proven_read_only(
+            call.tool_name.name.as_str(),
+            &call.payload,
+        );
         let eligible = *earlier_calls_eligible
-            && matches!(
-                classify_typed_tool(
-                    call.tool_name.namespace.as_deref(),
-                    &call.tool_name.name,
-                    collaboration_namespace,
-                ),
-                TypedToolClass::ReadSearch
-            )
+            && (typed_read || proven_read_only_shell)
             && self
                 .step_context
                 .tool_router()
@@ -432,8 +473,10 @@ impl ToolCallRuntime {
                         &guard.failure_fingerprint,
                     );
                 }
-                self.register_workspace_evidence_for_response(&call, &response, None, false, None)
-                    .await;
+                self.register_workspace_evidence_for_response(
+                    &call, &response, None, false, false, None,
+                )
+                .await;
                 return Ok(response);
             }
             if let Some(registration) = signal_registration.as_ref()
@@ -457,8 +500,10 @@ impl ToolCallRuntime {
                         &guard.evidence_identity,
                     );
                 }
-                self.register_workspace_evidence_for_response(&call, &response, None, false, None)
-                    .await;
+                self.register_workspace_evidence_for_response(
+                    &call, &response, None, false, false, None,
+                )
+                .await;
                 return Ok(response);
             }
             if let Some(registration) = signal_registration.as_ref()
@@ -506,19 +551,31 @@ impl ToolCallRuntime {
                 call.tool_name.name.as_str(),
                 &call.payload,
             );
-            let workspace_cwd = crate::tool_history::workspace_evidence_cwd_for_tool_call(
+            let proven_read_only = crate::tool_history::tool_call_is_proven_read_only(
                 call.tool_name.name.as_str(),
                 &call.payload,
-                self.step_context.turn.config.cwd.as_path(),
             );
-            let workspace_revision_before = if observes_workspace {
+            // Proven reads register their authoritative before/after evidence
+            // inside the execution gate below. Avoid duplicating both full Git
+            // captures in this outer direct-call bookkeeping layer.
+            let workspace_revision_before = if observes_workspace && !proven_read_only {
+                let evidence_capture_started = Instant::now();
+                let workspace_cwd = crate::tool_history::workspace_evidence_cwd_for_tool_call(
+                    call.tool_name.name.as_str(),
+                    &call.payload,
+                    self.step_context.turn.config.cwd.as_path(),
+                );
                 Some(
-                    self.session
-                        .services
-                        .git_workspace
-                        .workspace_evidence_identity(&workspace_cwd)
-                        .await,
+                    capture_workspace_evidence_baseline(
+                        self.session.services.git_workspace.as_ref(),
+                        &workspace_cwd,
+                        false,
+                    )
+                    .await,
                 )
+                .inspect(|_| {
+                    timing.record_workspace_evidence_before(evidence_capture_started.elapsed());
+                })
             } else {
                 None
             };
@@ -531,6 +588,7 @@ impl ToolCallRuntime {
             let error_call = call.clone();
             let owner_tool_name = call.tool_name.clone();
             let owner_payload = call.payload.clone();
+            let evidence_timing = Arc::clone(&timing);
             let future = self.clone().handle_tool_call_with_source_and_timing(
                 call,
                 ToolCallSource::Direct,
@@ -574,14 +632,23 @@ impl ToolCallRuntime {
                         })
                     });
                     let response = response.into_response();
-                    self.register_workspace_evidence_for_response(
-                        &error_call,
-                        &response,
-                        workspace_revision_before,
-                        mutation_advanced,
-                        source_dependencies_override,
-                    )
-                    .await;
+                    if !proven_read_only {
+                        let evidence_capture_started = Instant::now();
+                        self.register_workspace_evidence_for_response(
+                            &error_call,
+                            &response,
+                            workspace_revision_before,
+                            proven_read_only,
+                            mutation_advanced,
+                            source_dependencies_override,
+                        )
+                        .await;
+                        if observes_workspace {
+                            evidence_timing.record_workspace_evidence_after(
+                                evidence_capture_started.elapsed(),
+                            );
+                        }
+                    }
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
                         collector.record_direct_wait_owner_result(
                             authoritative_direct_wait,
@@ -630,14 +697,23 @@ impl ToolCallRuntime {
                         );
                     }
                     let response = Self::failure_response(error_call.clone(), other);
-                    self.register_workspace_evidence_for_response(
-                        &error_call,
-                        &response,
-                        workspace_revision_before,
-                        mutation_advanced,
-                        None,
-                    )
-                    .await;
+                    if !proven_read_only {
+                        let evidence_capture_started = Instant::now();
+                        self.register_workspace_evidence_for_response(
+                            &error_call,
+                            &response,
+                            workspace_revision_before,
+                            proven_read_only,
+                            mutation_advanced,
+                            None,
+                        )
+                        .await;
+                        if observes_workspace {
+                            evidence_timing.record_workspace_evidence_after(
+                                evidence_capture_started.elapsed(),
+                            );
+                        }
+                    }
                     Ok(response)
                 }
             }
@@ -699,8 +775,12 @@ impl ToolCallRuntime {
         let dispatch_call = call.clone();
         let dispatch_tool_name = call.tool_name.name.clone();
         let evidence_call = call.clone();
-        let serializes_workspace =
+        let workspace_capable =
             crate::tool_history::tool_observes_workspace(evidence_call.tool_name.name.as_str());
+        let proven_read_only = crate::tool_history::tool_call_is_proven_read_only(
+            evidence_call.tool_name.name.as_str(),
+            &evidence_call.payload,
+        );
         let observes_workspace = crate::tool_history::tool_call_observes_workspace(
             evidence_call.tool_name.name.as_str(),
             &evidence_call.payload,
@@ -720,7 +800,8 @@ impl ToolCallRuntime {
             AbortOnDropHandle::new(tokio::spawn(async move {
                 let _guard = if workspace_tool_may_use_parallel_gate(
                     supports_parallel,
-                    serializes_workspace,
+                    proven_read_only,
+                    workspace_capable,
                 ) {
                     Either::Left(lock.read().await)
                 } else {
@@ -733,16 +814,20 @@ impl ToolCallRuntime {
                     .record_tool_gate_admitted(dispatch_tool_name.as_str());
 
                 let evidence_revision_before = if observes_workspace {
+                    let evidence_capture_started = Instant::now();
                     let workspace_cwd = crate::tool_history::workspace_evidence_cwd_for_tool_call(
                         evidence_call.tool_name.name.as_str(),
                         &evidence_call.payload,
                         turn.config.cwd.as_path(),
                     );
-                    session
-                        .services
-                        .git_workspace
-                        .workspace_evidence_identity(&workspace_cwd)
-                        .await
+                    let revision = capture_workspace_evidence_baseline(
+                        session.services.git_workspace.as_ref(),
+                        &workspace_cwd,
+                        proven_read_only,
+                    )
+                    .await;
+                    timing.record_workspace_evidence_before(evidence_capture_started.elapsed());
+                    Some(revision)
                 } else {
                     None
                 };
@@ -753,7 +838,7 @@ impl ToolCallRuntime {
                 };
 
                 let result = scope_tool_dispatch_timing(
-                    timing,
+                    Arc::clone(&timing),
                     router
                         .dispatch_tool_call_with_terminal_outcome(
                             Arc::clone(&session),
@@ -780,7 +865,10 @@ impl ToolCallRuntime {
                         err.to_string(),
                     )),
                 };
-                if let Some(response) = evidence_response.as_ref() {
+                if let (Some(response), Some(evidence_revision_before)) =
+                    (evidence_response.as_ref(), evidence_revision_before)
+                {
+                    let evidence_capture_started = Instant::now();
                     let mutation_advanced = if let Some(before) = evidence_mutation_revision_before
                     {
                         evidence_tracker.lock().await.current_mutation_revision() > before
@@ -793,9 +881,11 @@ impl ToolCallRuntime {
                         &evidence_call,
                         response,
                         evidence_revision_before,
+                        proven_read_only,
                         mutation_advanced,
                     )
                     .await;
+                    timing.record_workspace_evidence_after(evidence_capture_started.elapsed());
                 }
                 result
             }));
@@ -963,6 +1053,13 @@ impl Drop for ToolCallTimingGuard {
                 .unwrap_or(0),
             dispatch_duration_ms = snapshot.parallel_gate_wait_ms.unwrap_or(0),
             handler_duration_ms = snapshot.handler_duration_ms.unwrap_or(0),
+            workspace_evidence_before_ms = snapshot.workspace_evidence_before_ms.unwrap_or(0),
+            workspace_evidence_after_ms = snapshot.workspace_evidence_after_ms.unwrap_or(0),
+            pre_tool_hook_ms = snapshot.pre_tool_hook_ms.unwrap_or(0),
+            post_tool_hook_ms = snapshot.post_tool_hook_ms.unwrap_or(0),
+            output_projection_ms = snapshot.output_projection_ms.unwrap_or(0),
+            history_persistence_ms = snapshot.history_persistence_ms.unwrap_or(0),
+            post_handler_ms = snapshot.post_handler_ms.unwrap_or(0),
             total_duration_ms = snapshot.total_duration_ms.unwrap_or(0),
             "tool call completed"
         );
@@ -990,9 +1087,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn rollout_workflow_guardrails_change_route_after_reused_session_failure() {
+    fn reused_stable_failures_require_a_changed_action_or_state() {
         let diagnosis: serde_json::Value = serde_json::from_str(&reused_failure_diagnosis(
-            &codex_tools::ToolName::plain("write_stdin"),
+            &codex_tools::ToolName::plain("read_tool_output"),
             "stable-failure",
         ))
         .expect("valid diagnosis");
@@ -1003,7 +1100,7 @@ mod tests {
             diagnosis["next_action"]
                 .as_str()
                 .expect("next action")
-                .contains("Do not poll this session again with unchanged arguments")
+                .contains("Do not repeat this call with unchanged arguments")
         );
     }
     use tokio::sync::Notify;
@@ -1021,8 +1118,10 @@ mod tests {
 
     #[test]
     fn workspace_observers_are_serialized_and_external_drift_is_stale() {
-        assert!(!workspace_tool_may_use_parallel_gate(true, true));
-        assert!(workspace_tool_may_use_parallel_gate(true, false));
+        assert!(workspace_tool_may_use_parallel_gate(true, true, false));
+        assert!(!workspace_tool_may_use_parallel_gate(true, false, true));
+        assert!(workspace_tool_may_use_parallel_gate(true, false, false));
+        assert!(!workspace_tool_may_use_parallel_gate(false, true, true));
 
         let before = workspace_identity("before");
         let after = workspace_identity("after");
@@ -1376,13 +1475,14 @@ mod tests {
             step_context,
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
         );
-        let call = |name: &str| ToolCall {
+        let call_with_arguments = |name: &str, arguments: &str| ToolCall {
             tool_name: codex_tools::ToolName::plain(name),
             call_id: format!("{name}-call"),
             payload: ToolPayload::Function {
-                arguments: "{}".to_string(),
+                arguments: arguments.to_string(),
             },
         };
+        let call = |name: &str| call_with_arguments(name, "{}");
 
         let mut eager_prefix_open = true;
         assert!(
@@ -1390,15 +1490,22 @@ mod tests {
         );
         assert!(eager_prefix_open);
 
-        // Parallel capability alone cannot admit an ExecShell-classified tool.
-        assert!(
-            !runtime.take_eager_read_eligibility(&call("shell_command"), &mut eager_prefix_open)
-        );
+        let read_oriented_shell =
+            call_with_arguments("shell_command", r#"{"program":"rg","args":["--files"]}"#);
+        // Command-name heuristics do not prove that launching a process is
+        // side-effect-free without an enforced read-only sandbox.
+        assert!(!runtime.take_eager_read_eligibility(&read_oriented_shell, &mut eager_prefix_open));
         assert!(!eager_prefix_open);
+
         // Once a deferred call appears, a later otherwise-eligible read cannot overtake it.
         assert!(
             !runtime.take_eager_read_eligibility(&call("read_tool_output"), &mut eager_prefix_open)
         );
+
+        let mut shell_prefix = true;
+        // Parallel capability alone cannot admit an unclassified shell payload.
+        assert!(!runtime.take_eager_read_eligibility(&call("shell_command"), &mut shell_prefix));
+        assert!(!shell_prefix);
 
         let mut serial_prefix = true;
         // ReadSearch classification alone cannot admit a serial registered handler.

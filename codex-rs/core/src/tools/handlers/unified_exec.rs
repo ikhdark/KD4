@@ -112,7 +112,7 @@ struct ExecCommandEnvironmentArgs {
 }
 
 fn default_exec_yield_time_ms() -> u64 {
-    10_000
+    2_000
 }
 
 fn default_write_stdin_yield_time_ms() -> u64 {

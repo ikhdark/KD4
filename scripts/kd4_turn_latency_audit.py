@@ -9,8 +9,10 @@ import datetime as dt
 import io
 import json
 import os
+import re
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 try:
     from scripts.rollout_snapshot import read_rollout_snapshot
@@ -18,7 +20,12 @@ except ImportError:
     from rollout_snapshot import read_rollout_snapshot
 
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 3
+
+_NANOSECONDS_PER_SECOND = 1_000_000_000
+_CHILD_WALL_TIME_PATTERN = re.compile(
+    r'"wall_time_seconds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'
+)
 
 
 def _path_key(path: str | os.PathLike[str]) -> str:
@@ -36,6 +43,58 @@ def _population(cwd: str, repo_root: str) -> str:
     if cwd_key.startswith(f"{root_key}/.codex/evals/"):
         return "eval"
     return "other"
+
+
+def _timestamp_ns(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(parsed.timestamp() * _NANOSECONDS_PER_SECOND)
+
+
+def _tool_output_text(payload: dict[str, Any]) -> str:
+    output = payload.get("output")
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return ""
+    return "\n".join(
+        str(item.get("text", ""))
+        for item in output
+        if isinstance(item, dict) and item.get("text") is not None
+    )
+
+
+def _command_orchestration_report(records: list[dict[str, Any]]) -> dict[str, Any]:
+    covered = [record for record in records if record["reportedChildCalls"] > 0]
+    round_trip_ns = sum(record["roundTripNs"] for record in covered)
+    reported_child_work_ns = sum(record["reportedChildWorkNs"] for record in covered)
+    orchestration_gap_lower_bound_ns = sum(
+        record["orchestrationGapLowerBoundNs"] for record in covered
+    )
+    orchestration_gap_upper_bound_ns = sum(
+        record["orchestrationGapUpperBoundNs"] for record in covered
+    )
+    return {
+        "pairedToolCalls": len(records),
+        "reportedChildRuntimeCalls": len(covered),
+        "coverage": len(covered) / len(records) if records else None,
+        "roundTripNs": round_trip_ns,
+        "reportedChildWorkNs": reported_child_work_ns,
+        "orchestrationGapLowerBoundNs": orchestration_gap_lower_bound_ns,
+        "orchestrationGapUpperBoundNs": orchestration_gap_upper_bound_ns,
+        "orchestrationShareLowerBound": orchestration_gap_lower_bound_ns / round_trip_ns
+        if round_trip_ns
+        else None,
+        "orchestrationShareUpperBound": orchestration_gap_upper_bound_ns / round_trip_ns
+        if round_trip_ns
+        else None,
+        "reportedChildCalls": sum(record["reportedChildCalls"] for record in covered),
+        "parallelBatches": sum(record["reportedChildCalls"] > 1 for record in covered),
+    }
 
 
 def _terminal_record(
@@ -79,11 +138,17 @@ def _request_metric(
     return {
         "logicalGenerations": len(generation_ids),
         "physicalAttempts": len(matching),
-        "modelStreamWaitNs": sum(int(request.get("modelStreamWaitNs", 0)) for request in matching),
+        "modelStreamWaitNs": sum(
+            int(request.get("modelStreamWaitNs", 0)) for request in matching
+        ),
         "decisionReadyAttempts": len(decision_ready),
-        "decisionLatencyNs": sum(int(request["decisionLatencyNs"]) for request in decision_ready),
+        "decisionLatencyNs": sum(
+            int(request["decisionLatencyNs"]) for request in decision_ready
+        ),
         "toolCalls": sum(int(request.get("toolCallCount", 0)) for request in matching),
-        "toolActiveUnionNs": sum(int(request.get("toolActiveUnionNs", 0)) for request in matching),
+        "toolActiveUnionNs": sum(
+            int(request.get("toolActiveUnionNs", 0)) for request in matching
+        ),
     }
 
 
@@ -132,10 +197,14 @@ def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
         )
         request_count += len(requests)
         decision_ready = [
-            request for request in requests if request.get("decisionLatencyNs") is not None
+            request
+            for request in requests
+            if request.get("decisionLatencyNs") is not None
         ]
         decision_ready_attempts += len(decision_ready)
-        decision_latency_ns += sum(int(request["decisionLatencyNs"]) for request in decision_ready)
+        decision_latency_ns += sum(
+            int(request["decisionLatencyNs"]) for request in decision_ready
+        )
 
         recorded_nonprogress = timing.get("observationalNonprogressLatency")
         if isinstance(recorded_nonprogress, dict):
@@ -145,16 +214,20 @@ def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
                 nonprogress,
                 _request_metric(
                     requests,
-                    lambda request: bool(request.get("unchangedRelevantState"))
-                    and not bool(request.get("nextStructuredActionChanged")),
+                    lambda request: (
+                        bool(request.get("unchangedRelevantState"))
+                        and not bool(request.get("nextStructuredActionChanged"))
+                    ),
                 ),
             )
         _sum_metric(
             deterministic,
             _request_metric(
                 requests,
-                lambda request: request.get("generationPurpose")
-                == "deterministic_tool_continuation",
+                lambda request: (
+                    request.get("generationPurpose")
+                    == "deterministic_tool_continuation"
+                ),
             ),
         )
 
@@ -181,7 +254,9 @@ def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
         "decisionLatency": {
             "physicalAttempts": request_count,
             "decisionReadyAttempts": decision_ready_attempts,
-            "coverage": decision_ready_attempts / request_count if request_count else None,
+            "coverage": decision_ready_attempts / request_count
+            if request_count
+            else None,
             "totalNs": decision_latency_ns,
         },
         "observationalNonprogressLatency": nonprogress,
@@ -203,8 +278,10 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
     line_count = 0
     byte_count = 0
     snapshots: list[dict[str, str | int]] = []
+    command_orchestration_records: list[dict[str, Any]] = []
 
     for file in files:
+        pending_tool_calls: dict[str, tuple[int, str]] = {}
         snapshot = read_rollout_snapshot(file)
         snapshots.append(snapshot.metadata())
         byte_count += snapshot.byte_length
@@ -218,13 +295,63 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
                     parse_error_count += 1
                     if len(parse_errors) < 100:
                         parse_errors.append(
-                            {"file": str(file), "line": line_number, "error": str(error)}
+                            {
+                                "file": str(file),
+                                "line": line_number,
+                                "error": str(error),
+                            }
                         )
                     continue
                 payload = item.get("payload") or {}
                 if item.get("type") == "session_meta":
                     cwd = str(payload.get("cwd") or cwd)
                 payload_type = payload.get("type")
+                if item.get("type") == "response_item" and payload_type in (
+                    "custom_tool_call",
+                    "function_call",
+                ):
+                    call_id = payload.get("call_id")
+                    timestamp_ns = _timestamp_ns(item.get("timestamp"))
+                    if call_id and timestamp_ns is not None:
+                        pending_tool_calls[str(call_id)] = (timestamp_ns, cwd)
+                elif item.get("type") == "response_item" and payload_type in (
+                    "custom_tool_call_output",
+                    "function_call_output",
+                ):
+                    call_id = payload.get("call_id")
+                    timestamp_ns = _timestamp_ns(item.get("timestamp"))
+                    pending = pending_tool_calls.pop(str(call_id), None)
+                    if pending is not None and timestamp_ns is not None:
+                        started_ns, call_cwd = pending
+                        round_trip_ns = max(0, timestamp_ns - started_ns)
+                        child_wall_seconds = [
+                            float(value)
+                            for value in _CHILD_WALL_TIME_PATTERN.findall(
+                                _tool_output_text(payload)
+                            )
+                        ]
+                        reported_child_work_ns = int(
+                            sum(child_wall_seconds) * _NANOSECONDS_PER_SECOND
+                        )
+                        reported_child_critical_path_ns = int(
+                            max(child_wall_seconds, default=0.0)
+                            * _NANOSECONDS_PER_SECOND
+                        )
+                        command_orchestration_records.append(
+                            {
+                                "cwd": call_cwd,
+                                "roundTripNs": round_trip_ns,
+                                "reportedChildCalls": len(child_wall_seconds),
+                                "reportedChildWorkNs": reported_child_work_ns,
+                                "orchestrationGapLowerBoundNs": max(
+                                    0, round_trip_ns - reported_child_work_ns
+                                ),
+                                "orchestrationGapUpperBoundNs": max(
+                                    0,
+                                    round_trip_ns - reported_child_critical_path_ns,
+                                ),
+                            }
+                        )
                 turn_id = payload.get("turn_id")
                 if payload_type == "task_started" and turn_id:
                     started_turns.add(str(turn_id))
@@ -303,6 +430,9 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         "source": str(source.resolve()),
         "repoRoot": str(repo_root.resolve()),
         "coverage": coverage,
+        "commandOrchestration": _command_orchestration_report(
+            command_orchestration_records
+        ),
         "populations": {
             name: _population_report(population_records)
             for name, population_records in populations.items()
@@ -323,6 +453,17 @@ def render_report(report: dict[str, Any]) -> str:
             f"{coverage['parseErrorCount']} parse errors"
         ),
     ]
+    orchestration = report["commandOrchestration"]
+    if orchestration["reportedChildRuntimeCalls"]:
+        lines.append(
+            "command orchestration: "
+            f"{orchestration['reportedChildRuntimeCalls']}/"
+            f"{orchestration['pairedToolCalls']} paired calls with child runtime; "
+            f"round-trip={orchestration['roundTripNs'] / 1e9:.1f}s "
+            f"child-work={orchestration['reportedChildWorkNs'] / 1e9:.1f}s "
+            f"gap={orchestration['orchestrationGapLowerBoundNs'] / 1e9:.1f}-"
+            f"{orchestration['orchestrationGapUpperBoundNs'] / 1e9:.1f}s"
+        )
     for name in ("all", "eval", "repository_root", "other"):
         population = report["populations"][name]
         if not population["turns"]:
@@ -345,14 +486,18 @@ def render_report(report: dict[str, Any]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", type=Path, help="Rollout JSONL file or session directory")
+    parser.add_argument(
+        "source", type=Path, help="Rollout JSONL file or session directory"
+    )
     parser.add_argument(
         "--repo-root",
         type=Path,
         default=Path.cwd(),
         help="Repository root used for workload population segmentation",
     )
-    parser.add_argument("--json", action="store_true", help="Emit the complete JSON report")
+    parser.add_argument(
+        "--json", action="store_true", help="Emit the complete JSON report"
+    )
     args = parser.parse_args()
     if not args.source.exists():
         parser.error(f"source does not exist: {args.source}")

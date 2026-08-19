@@ -10,6 +10,7 @@ use super::emit_turn_network_proxy_metric;
 use super::merge_completion_review_partial;
 use super::pending_terminal_recovery_state;
 use super::protocol_terminalization_receipt;
+use super::select_terminal_authority;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
 use crate::state::SamplingAdmission;
@@ -402,6 +403,18 @@ fn terminal_analytics_claim_converges_across_in_process_recovery() {
         .try_claim()
         .expect("fail-safe terminal claimant");
     assert!(!recovery.try_claim_analytics_emission());
+}
+
+#[test]
+fn terminal_authority_selection_preserves_candidate_until_durable_recovery() {
+    let (selected, durable) = select_terminal_authority(None, "exact candidate");
+    assert_eq!(selected, "exact candidate");
+    assert!(!durable);
+
+    let (selected, durable) =
+        select_terminal_authority(Some("durable authority"), "later candidate");
+    assert_eq!(selected, "durable authority");
+    assert!(durable);
 }
 
 #[test]

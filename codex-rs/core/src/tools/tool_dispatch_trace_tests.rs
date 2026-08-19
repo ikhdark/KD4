@@ -41,6 +41,9 @@ async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boun
     tokio::time::advance(std::time::Duration::from_millis(40)).await;
     timing.mark_handler_entry();
     tokio::time::advance(std::time::Duration::from_millis(10)).await;
+    timing.mark_handler_exit();
+    timing.record_workspace_evidence_before(std::time::Duration::from_millis(3));
+    timing.record_workspace_evidence_after(std::time::Duration::from_millis(4));
 
     let snapshot = timing.snapshot(tokio::time::Instant::now());
     assert!(snapshot.eager);
@@ -48,8 +51,10 @@ async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boun
     assert_eq!(snapshot.parallel_gate_wait_ms, Some(30));
     assert_eq!(snapshot.authorization_state_coordination_ms, Some(17));
     assert_eq!(snapshot.first_poll_to_handler_entry_ms, Some(70));
-    // Compatibility fields keep their prior boundaries.
-    assert_eq!(snapshot.handler_duration_ms, Some(50));
+    assert_eq!(snapshot.handler_duration_ms, Some(10));
+    assert_eq!(snapshot.workspace_evidence_before_ms, Some(3));
+    assert_eq!(snapshot.workspace_evidence_after_ms, Some(4));
+    assert_eq!(snapshot.post_handler_ms, Some(0));
     assert_eq!(snapshot.total_duration_ms, Some(80));
 }
 

@@ -3,8 +3,6 @@ use crate::task_evidence::PlanUpdateEffect;
 use crate::task_evidence::PlanningTier;
 use crate::task_evidence::PlanningUpdateInput;
 use crate::task_evidence::ResultProvenance;
-use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -16,13 +14,9 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::plan_tool::UpdatePlanArgs;
-use codex_protocol::plan_tool::ValidationRouteLeaf;
-use codex_protocol::plan_tool::ValidationRouteOrdering;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::validation::ValidationTerminalStatus;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
-use codex_tools::shell_command_backend_for_features;
 use serde_json::Value as JsonValue;
 #[cfg(test)]
 use std::collections::HashMap;
@@ -182,11 +176,11 @@ impl PlanHandler {
         let ToolInvocation {
             session,
             turn,
-            step_context,
+            step_context: _,
             cancellation_token,
-            tracker,
+            tracker: _,
             call_id: _call_id,
-            source,
+            source: _,
             payload,
             ..
         } = invocation;
@@ -250,30 +244,38 @@ impl PlanHandler {
             explanation: requested_input.explanation,
             plan: requested_input.plan,
         };
+        let validation_candidate = session
+            .services
+            .task_evidence
+            .auto_validation_candidate()
+            .await;
         let normalized_plan = (args != requested_args).then(|| args.clone());
-        let normalization_reason =
-            plan_normalization_reason(&requested_args, &args, outcome.effect);
+        let normalization_reason = plan_normalization_reason(
+            &requested_args,
+            &args,
+            outcome.effect,
+            validation_candidate
+                .as_ref()
+                .map(|candidate| candidate.step_id.as_str()),
+        );
         session
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args.clone()))
             .await;
 
-        let validation_results = if let Some(candidate) = session
-            .services
-            .task_evidence
-            .auto_validation_candidate()
-            .await
-        {
-            run_bound_validation_route(
-                session.clone(),
-                turn.clone(),
-                step_context,
-                tracker,
-                cancellation_token.clone(),
-                source,
-                &_call_id,
-                candidate,
-            )
-            .await
+        let validation_results = if let Some(candidate) = validation_candidate {
+            let unsupported_runner = candidate.route.leaves.iter().find_map(|leaf| {
+                super::shell::validate_structured_validation_leaf(leaf, &repository).err()
+            });
+            vec![serde_json::json!({
+                "missing_proof": {
+                    "step_id": candidate.step_id,
+                    "implementation_identity": candidate.implementation_identity,
+                },
+                "stale_epoch": serde_json::Value::Null,
+                "unsupported_runner": unsupported_runner,
+                "validation_route": candidate.route,
+                "runner_dispatch": "not_started",
+            })]
         } else {
             Vec::new()
         };
@@ -294,294 +296,45 @@ fn plan_normalization_reason(
     requested: &UpdatePlanArgs,
     current: &UpdatePlanArgs,
     effect: PlanUpdateEffect,
+    missing_proof_step: Option<&str>,
 ) -> Option<String> {
     if requested == current {
         return (effect == PlanUpdateEffect::NoOp)
             .then(|| "request matched the authoritative plan; no plan state changed".to_string());
     }
-    let status_was_normalized = requested.plan.iter().any(|requested_step| {
-        current.plan.iter().any(|current_step| {
-            let same_step = requested_step
-                .id
-                .as_ref()
-                .zip(current_step.id.as_ref())
-                .is_some_and(|(requested, current)| requested == current)
-                || requested_step.step == current_step.step;
-            same_step && requested_step.status != current_step.status
+    let normalized_steps = requested
+        .plan
+        .iter()
+        .filter_map(|requested_step| {
+            current.plan.iter().find_map(|current_step| {
+                let same_step = requested_step
+                    .id
+                    .as_ref()
+                    .zip(current_step.id.as_ref())
+                    .is_some_and(|(requested, current)| requested == current)
+                    || requested_step.step == current_step.step;
+                (same_step && requested_step.status != current_step.status).then(|| {
+                    current_step
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| current_step.step.clone())
+                })
+            })
         })
-    });
-    Some(if status_was_normalized {
-        "requested status was normalized because completion or validation obligations are not satisfied"
-            .to_string()
+        .collect::<Vec<_>>();
+    Some(if let Some(step_id) = missing_proof_step {
+        format!(
+            "only the missing validation obligation [{step_id}] was normalized to in_progress; already proven steps were preserved"
+        )
+    } else if !normalized_steps.is_empty() {
+        format!(
+            "only unresolved obligation(s) [{}] were normalized; already proven steps were preserved",
+            normalized_steps.join(", ")
+        )
     } else {
         "the authoritative plan installed or preserved stable plan identifiers and structure"
             .to_string()
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_bound_validation_route(
-    session: Arc<crate::session::session::Session>,
-    turn: Arc<crate::session::turn_context::TurnContext>,
-    step_context: Arc<crate::session::step_context::StepContext>,
-    tracker: SharedTurnDiffTracker,
-    cancellation_token: tokio_util::sync::CancellationToken,
-    source: ToolCallSource,
-    parent_call_id: &str,
-    candidate: crate::task_evidence::AutoValidationCandidate,
-) -> Vec<JsonValue> {
-    let repository = turn.config.cwd.to_path_buf();
-    let repository = codex_git_utils::get_git_repo_root(&repository).unwrap_or(repository);
-
-    let mut results = Vec::with_capacity(candidate.route.leaves.len());
-    let route_started_at = std::time::Instant::now();
-    if candidate.route.ordering == ValidationRouteOrdering::RunAll {
-        let executions = candidate
-            .route
-            .leaves
-            .iter()
-            .enumerate()
-            .map(|(index, leaf)| {
-                run_bound_validation_leaf(
-                    session.clone(),
-                    turn.clone(),
-                    step_context.clone(),
-                    tracker.clone(),
-                    cancellation_token.clone(),
-                    source.clone(),
-                    parent_call_id,
-                    &repository,
-                    &candidate,
-                    index,
-                    leaf,
-                )
-            });
-        results.extend(
-            futures::future::join_all(executions)
-                .await
-                .into_iter()
-                .flatten(),
-        );
-    } else {
-        for (index, leaf) in candidate.route.leaves.iter().enumerate() {
-            let Some(result) = run_bound_validation_leaf(
-                session.clone(),
-                turn.clone(),
-                step_context.clone(),
-                tracker.clone(),
-                cancellation_token.clone(),
-                source.clone(),
-                parent_call_id,
-                &repository,
-                &candidate,
-                index,
-                leaf,
-            )
-            .await
-            else {
-                break;
-            };
-            let success = super::shell::ValidationExecutionOutcome::from_value(&result)
-                == Some(super::shell::ValidationExecutionOutcome::ExecutedSuccess);
-            results.push(result);
-            if !success {
-                break;
-            }
-        }
-    }
-    if !results.is_empty() {
-        let aggregate_outcome = if results.iter().any(|result| {
-            super::shell::ValidationExecutionOutcome::from_value(result)
-                == Some(super::shell::ValidationExecutionOutcome::ExecutedFailure)
-        }) {
-            super::shell::ValidationExecutionOutcome::ExecutedFailure
-        } else if results.iter().all(|result| {
-            super::shell::ValidationExecutionOutcome::from_value(result)
-                == Some(super::shell::ValidationExecutionOutcome::ExecutedSuccess)
-        }) {
-            super::shell::ValidationExecutionOutcome::ExecutedSuccess
-        } else {
-            super::shell::ValidationExecutionOutcome::NotExecuted
-        };
-        let completed_leaf_count = results.len();
-        results.push(serde_json::json!({
-            "step_id": candidate.step_id,
-            "aggregate": true,
-            "ordering": candidate.route.ordering,
-            "declared_leaf_count": candidate.route.leaves.len(),
-            "completed_leaf_count": completed_leaf_count,
-            "success": aggregate_outcome.success(),
-            "execution_outcome": aggregate_outcome.as_str(),
-            "command_was_executed": aggregate_outcome != super::shell::ValidationExecutionOutcome::NotExecuted,
-            "duration_ms": u64::try_from(route_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-        }));
-    }
-    results
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_bound_validation_leaf(
-    session: Arc<crate::session::session::Session>,
-    turn: Arc<crate::session::turn_context::TurnContext>,
-    step_context: Arc<crate::session::step_context::StepContext>,
-    tracker: SharedTurnDiffTracker,
-    cancellation_token: tokio_util::sync::CancellationToken,
-    source: ToolCallSource,
-    parent_call_id: &str,
-    repository: &std::path::Path,
-    candidate: &crate::task_evidence::AutoValidationCandidate,
-    index: usize,
-    leaf: &ValidationRouteLeaf,
-) -> Option<JsonValue> {
-    if cancellation_token.is_cancelled() {
-        return None;
-    }
-    // Re-read the exact route immediately before every start/join. A newer
-    // edit or plan change supersedes the pending launch without rediscovery.
-    let current = session
-        .services
-        .task_evidence
-        .auto_validation_candidate()
-        .await;
-    if current.as_ref().is_none_or(|current| {
-        current.step_id != candidate.step_id
-            || current.implementation_identity != candidate.implementation_identity
-            || current.route != candidate.route
-    }) {
-        tracing::info!(step_id = %candidate.step_id, "auto-validation launch superseded");
-        return None;
-    }
-    if let Err(reason) = super::shell::validate_structured_validation_leaf(leaf, repository) {
-        tracing::info!(%reason, step_id = %candidate.step_id, "auto-validation fresh admission rejected");
-        return None;
-    }
-    let (program, argv) = leaf.argv.split_first()?;
-    let synthetic_call_id = format!("{parent_call_id}:validation:{index}");
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "kind": "argv",
-            "program": program,
-            "args": argv,
-            "timeout_ms": leaf.timeout_ms,
-            "workdir": repository,
-        })
-        .to_string(),
-    };
-    let started_at = std::time::Instant::now();
-    let invocation = ToolInvocation {
-        session: session.clone(),
-        turn: turn.clone(),
-        step_context: step_context.clone(),
-        cancellation_token: cancellation_token.clone(),
-        tracker: tracker.clone(),
-        call_id: synthetic_call_id.clone(),
-        tool_name: ToolName::plain("shell_command"),
-        source: source.clone(),
-        payload: payload.clone(),
-    };
-    let handler =
-        super::shell::ShellCommandHandler::new(super::shell::ShellCommandHandlerOptions {
-            backend_config: shell_command_backend_for_features(turn.config.features.get()),
-            allow_login_shell: false,
-            exec_permission_approvals_enabled: false,
-        });
-    let bound = crate::tools::command_execution::BoundAutoValidationLeaf {
-        step_id: candidate.step_id.clone(),
-        step_revision: candidate.step_revision,
-        implementation_revision: candidate.implementation_revision,
-        implementation_identity: candidate.leaf_implementation_identities.get(index)?.clone(),
-        repository: repository.to_path_buf(),
-        route: candidate.route.clone(),
-        leaf_index: index,
-    };
-    if !session
-        .services
-        .command_execution
-        .bind_auto_validation_leaf(synthetic_call_id.clone(), bound)
-        .await
-    {
-        tracing::warn!(%synthetic_call_id, "duplicate auto-validation call binding");
-        return None;
-    }
-    let result = handler.handle_call(invocation).await;
-    session
-        .services
-        .command_execution
-        .clear_auto_validation_leaf(&synthetic_call_id)
-        .await;
-    let current = session
-        .services
-        .task_evidence
-        .auto_validation_candidate()
-        .await;
-    let superseded = current.as_ref().is_none_or(|current| {
-        current.step_id != candidate.step_id
-            || current.implementation_identity != candidate.implementation_identity
-            || current.route != candidate.route
-    });
-    let settled = if superseded {
-        session
-            .services
-            .command_execution
-            .supersede_validation_result_for_call(&synthetic_call_id)
-            .await
-    } else {
-        session
-            .services
-            .command_execution
-            .validation_result_for_call(&synthetic_call_id)
-            .await
-    };
-    let (execution_outcome, output) = match result {
-        Ok(output) => {
-            if let Some(settled) = settled {
-                let execution_outcome = match settled.status {
-                    ValidationTerminalStatus::Succeeded => {
-                        super::shell::ValidationExecutionOutcome::ExecutedSuccess
-                    }
-                    ValidationTerminalStatus::Superseded => {
-                        super::shell::ValidationExecutionOutcome::NotExecuted
-                    }
-                    ValidationTerminalStatus::Failed => {
-                        super::shell::ValidationExecutionOutcome::ExecutedFailure
-                    }
-                };
-                (
-                    execution_outcome,
-                    serde_json::json!({ "validation_result": settled }),
-                )
-            } else {
-                let execution_outcome = match output.outcome_context().outcome {
-                    codex_tools::ToolOutputOutcome::Success => {
-                        super::shell::ValidationExecutionOutcome::ExecutedSuccess
-                    }
-                    codex_tools::ToolOutputOutcome::Failure
-                    | codex_tools::ToolOutputOutcome::TimedOut => {
-                        super::shell::ValidationExecutionOutcome::ExecutedFailure
-                    }
-                    codex_tools::ToolOutputOutcome::Skipped => {
-                        super::shell::ValidationExecutionOutcome::NotExecuted
-                    }
-                };
-                (execution_outcome, output.code_mode_result(&payload))
-            }
-        }
-        Err(error) => (
-            super::shell::ValidationExecutionOutcome::ExecutedFailure,
-            serde_json::json!({ "error": error.to_string() }),
-        ),
-    };
-    Some(serde_json::json!({
-        "step_id": candidate.step_id,
-        "leaf_index": index,
-        "call_id": synthetic_call_id,
-        "freshness": "executed_or_shared",
-        "success": execution_outcome.success(),
-        "execution_outcome": execution_outcome.as_str(),
-        "command_was_executed": execution_outcome != super::shell::ValidationExecutionOutcome::NotExecuted,
-        "duration_ms": u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "output": output,
-    }))
 }
 
 impl CoreToolRuntime for PlanHandler {

@@ -569,6 +569,55 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn parses_command_output_assignment_and_bare_read() {
+        let commands = parse_powershell_command_into_plain_commands(&[
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "$files = rg --files -g '*.rs'; $files; git status --short".to_string(),
+        ])
+        .expect("parse");
+
+        assert_eq!(
+            commands,
+            vec![
+                vec![
+                    "rg".to_string(),
+                    "--files".to_string(),
+                    "-g".to_string(),
+                    "*.rs".to_string(),
+                ],
+                vec![
+                    "git".to_string(),
+                    "status".to_string(),
+                    "--short".to_string()
+                ],
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_dynamic_uses_of_command_output_assignment() {
+        for script in [
+            "$files = rg --files; & $files",
+            "$files = rg --files; Write-Output $files",
+        ] {
+            assert_eq!(
+                parse_powershell_command_into_plain_commands(&[
+                    "powershell.exe".to_string(),
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    script.to_string(),
+                ]),
+                None,
+                "dynamic use should remain unsupported: {script}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn direct_candidate_contains_semantic_native_argument_values() {
         let Some(pwsh) = try_find_pwsh_executable_blocking() else {
             return;

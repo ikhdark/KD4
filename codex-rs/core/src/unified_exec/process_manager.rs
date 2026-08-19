@@ -1924,7 +1924,11 @@ impl UnifiedExecProcessManager {
         let mut lagged_chunks = 0_u64;
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
-        let mut early_yield_deadline: Option<Instant> = None;
+        // A silent initial process should return a live session promptly instead
+        // of consuming the full requested yield. Meaningful output resets this
+        // adaptive deadline so a burst can still be collected to quiescence.
+        let mut early_yield_deadline =
+            quiet_period.map(|period| (Instant::now() + period).min(deadline));
         loop {
             Self::extend_deadlines_while_paused(
                 &mut pause_state,

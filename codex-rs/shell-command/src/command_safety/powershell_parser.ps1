@@ -74,13 +74,25 @@ function Invoke-ParseRequest {
     # Anything more dynamic than that becomes "unsupported" instead of being guessed at.
     $commands = [System.Collections.ArrayList]::new()
     $localConstants = @{}
+    $commandOutputVariables = @{}
 
     foreach ($statement in $ast.EndBlock.Statements) {
         if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {
-            if (-not (Add-LocalScalarConstant $statement $localConstants)) {
-                $commands = $null
-                break
+            if (Add-LocalScalarConstant $statement $localConstants) {
+                $name = $statement.Left.VariablePath.UserPath.ToLowerInvariant()
+                $null = $commandOutputVariables.Remove($name)
+                continue
             }
+
+            if (Add-CommandOutputAssignment $statement $commands $localConstants $commandOutputVariables) {
+                continue
+            }
+
+            $commands = $null
+            break
+        }
+
+        if (Test-IsBareCommandOutputRead $statement $commandOutputVariables) {
             continue
         }
 
@@ -272,6 +284,61 @@ function Add-LocalScalarConstant {
 
     $localConstants[$name.ToLowerInvariant()] = $value[0]
     return $true
+}
+
+function Add-CommandOutputAssignment {
+    param($assignment, $commands, $localConstants, $commandOutputVariables)
+
+    if (
+        -not ($assignment.Left -is [System.Management.Automation.Language.VariableExpressionAst]) -or
+        $assignment.Left.Splatted -or
+        -not $assignment.Left.VariablePath.IsUnscopedVariable
+    ) {
+        return $false
+    }
+
+    $name = $assignment.Left.VariablePath.UserPath
+    if ([string]::IsNullOrEmpty($name) -or $name.Contains(':')) {
+        return $false
+    }
+
+    if (-not (Add-CommandsFromPipelineBase $assignment.Right $commands $localConstants)) {
+        return $false
+    }
+
+    $key = $name.ToLowerInvariant()
+    $null = $localConstants.Remove($key)
+    $commandOutputVariables[$key] = $true
+    return $true
+}
+
+function Test-IsBareCommandOutputRead {
+    param($statement, $commandOutputVariables)
+
+    if (
+        -not ($statement -is [System.Management.Automation.Language.PipelineAst]) -or
+        $statement.PipelineElements.Count -ne 1
+    ) {
+        return $false
+    }
+
+    $element = $statement.PipelineElements[0]
+    if (
+        -not ($element -is [System.Management.Automation.Language.CommandExpressionAst]) -or
+        $element.Redirections.Count -gt 0 -or
+        -not ($element.Expression -is [System.Management.Automation.Language.VariableExpressionAst]) -or
+        $element.Expression.Splatted -or
+        -not $element.Expression.VariablePath.IsUnscopedVariable
+    ) {
+        return $false
+    }
+
+    $name = $element.Expression.VariablePath.UserPath
+    if ([string]::IsNullOrEmpty($name) -or $name.Contains(':')) {
+        return $false
+    }
+
+    return $commandOutputVariables.ContainsKey($name.ToLowerInvariant())
 }
 
 function Convert-CommandElement {

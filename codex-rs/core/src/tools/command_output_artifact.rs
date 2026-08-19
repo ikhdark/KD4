@@ -48,6 +48,7 @@ const EVIDENCE_PROTECTION_MARKER_BYTES: &[u8; 34] = b"KD4_EXTERNAL_EVIDENCE_ARTI
 const ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION: &str = "active-tool-history";
 const ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES: &[u8] = b"KD4_ACTIVE_TOOL_HISTORY_ARTIFACT_V1\n";
 const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RETENTION_INDEX_ROOTS: usize = 4;
@@ -64,6 +65,8 @@ pub(crate) const ARTIFACT_SEARCH_MAX_CONTEXT_LINES: usize = 20;
 pub(crate) const ARTIFACT_SEARCH_MAX_QUERY_BYTES: usize = 1_024;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
 const MAX_DETERMINISTIC_RECOVERY_CACHE_ENTRIES: usize = 128;
+const MAX_VALIDATED_SNAPSHOT_CACHE_ENTRIES: usize = 16;
+const MAX_VALIDATED_SNAPSHOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct DeterministicRecoveryCache {
@@ -73,6 +76,33 @@ struct DeterministicRecoveryCache {
 
 static DETERMINISTIC_RECOVERY_CACHE: OnceLock<StdMutex<DeterministicRecoveryCache>> =
     OnceLock::new();
+
+#[derive(Default)]
+struct ValidatedSnapshotCache {
+    entries: BTreeMap<String, Arc<Vec<u8>>>,
+    insertion_order: VecDeque<String>,
+    retained_bytes: usize,
+}
+
+static VALIDATED_SNAPSHOT_CACHE: OnceLock<StdMutex<ValidatedSnapshotCache>> = OnceLock::new();
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ValidatedSnapshotFileIdentity {
+    segment_index: u32,
+    bytes: u64,
+    modified: Option<(u64, u32)>,
+    created: Option<(u64, u32)>,
+    stable_id: StableArtifactFileIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StableArtifactFileIdentity {
+    #[cfg(windows)]
+    Windows { volume: u64, index: [u8; 16] },
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -966,6 +996,10 @@ impl FromStr for ToolOutputArtifactId {
 
 #[derive(Debug, Clone)]
 pub(crate) enum RawOutputArtifact {
+    Pending {
+        codex_home: PathBuf,
+        thread_id: String,
+    },
     Stored {
         id: ToolOutputArtifactId,
         path: PathBuf,
@@ -984,6 +1018,16 @@ pub(crate) enum RawOutputArtifact {
 impl PartialEq for RawOutputArtifact {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (
+                Self::Pending {
+                    codex_home: left_home,
+                    thread_id: left_thread,
+                },
+                Self::Pending {
+                    codex_home: right_home,
+                    thread_id: right_thread,
+                },
+            ) => left_home == right_home && left_thread == right_thread,
             (
                 Self::Stored {
                     id: left_id,
@@ -1040,12 +1084,32 @@ pub(crate) struct RawOutputArtifactWriter {
     handle: Option<Arc<File>>,
     retention_token: Option<RetentionIndexToken>,
     lifecycle_completed: bool,
+    pending_target: Option<(PathBuf, String)>,
+    pending_output: Vec<u8>,
 }
 
 impl RawOutputArtifactWriter {
     pub(crate) async fn open(state: Option<&Arc<Mutex<RawOutputArtifact>>>) -> Option<Self> {
         let state = state?;
         let artifact = state.lock().await.clone();
+        if let RawOutputArtifact::Pending {
+            codex_home,
+            thread_id,
+        } = artifact
+        {
+            return Some(Self {
+                id: None,
+                path: None,
+                file: None,
+                bytes: 0,
+                truncated: false,
+                handle: None,
+                retention_token: None,
+                lifecycle_completed: false,
+                pending_target: Some((codex_home, thread_id)),
+                pending_output: Vec::new(),
+            });
+        }
         let RawOutputArtifact::Stored {
             id,
             path,
@@ -1063,6 +1127,8 @@ impl RawOutputArtifactWriter {
                 handle: None,
                 retention_token: None,
                 lifecycle_completed: true,
+                pending_target: None,
+                pending_output: Vec::new(),
             });
         };
         let retention_token =
@@ -1080,6 +1146,8 @@ impl RawOutputArtifactWriter {
                         handle: Some(handle),
                         retention_token: Some(retention_token),
                         lifecycle_completed: false,
+                        pending_target: None,
+                        pending_output: Vec::new(),
                     }),
                     Err(err) => {
                         reject_stale_delta(&retention_token);
@@ -1103,6 +1171,8 @@ impl RawOutputArtifactWriter {
                             handle: Some(handle),
                             retention_token: Some(retention_token),
                             lifecycle_completed: true,
+                            pending_target: None,
+                            pending_output: Vec::new(),
                         })
                     }
                 }
@@ -1125,6 +1195,8 @@ impl RawOutputArtifactWriter {
                     handle: Some(handle),
                     retention_token: Some(retention_token),
                     lifecycle_completed: true,
+                    pending_target: None,
+                    pending_output: Vec::new(),
                 })
             }
         }
@@ -1135,6 +1207,23 @@ impl RawOutputArtifactWriter {
         state: Option<&Arc<Mutex<RawOutputArtifact>>>,
         output: &[u8],
     ) {
+        if let Some((codex_home, thread_id)) = self.pending_target.clone() {
+            // Keep small output inline and defer all artifact I/O until this buffer grows.
+            self.pending_output.extend_from_slice(output);
+            if self.pending_output.len() <= LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
+                return;
+            }
+            let artifact =
+                create_raw_output_artifact(codex_home.as_path(), &thread_id, &self.pending_output)
+                    .await;
+            if let Some(state) = state {
+                *state.lock().await = artifact;
+                if let Some(opened) = Self::open(Some(state)).await {
+                    *self = opened;
+                }
+            }
+            return;
+        }
         let (Some(state), Some(id), Some(path)) = (state, self.id, self.path.clone()) else {
             return;
         };
@@ -1188,6 +1277,10 @@ impl RawOutputArtifactWriter {
     }
 
     pub(crate) async fn finish(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
+        if self.pending_target.is_some() {
+            self.lifecycle_completed = true;
+            return;
+        }
         let (Some(state), Some(path), Some(mut file)) =
             (state, self.path.clone(), self.file.take())
         else {
@@ -1268,6 +1361,17 @@ fn lock_artifact_handle(handle: &Arc<File>, position: SeekFrom) -> std::io::Resu
 }
 
 impl RawOutputArtifact {
+    pub(crate) fn pending(codex_home: &Path, thread_id: &str) -> Self {
+        Self::Pending {
+            codex_home: codex_home.to_path_buf(),
+            thread_id: thread_id.to_string(),
+        }
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+
     pub(crate) fn restore_validation(
         codex_home: &Path,
         thread_id: &str,
@@ -1299,6 +1403,7 @@ impl RawOutputArtifact {
 
     pub(crate) fn render_for_model(&self) -> String {
         match self {
+            Self::Pending { .. } => String::new(),
             Self::Stored {
                 id,
                 bytes,
@@ -1325,6 +1430,7 @@ impl RawOutputArtifact {
         &self,
     ) -> (Option<ToolOutputArtifactId>, Option<u64>, Option<String>) {
         match self {
+            Self::Pending { .. } => (None, None, None),
             Self::Stored { id, bytes, .. } => (Some(*id), Some(*bytes), None),
             Self::Failed { .. } => (
                 None,
@@ -1359,6 +1465,7 @@ impl RawOutputArtifact {
 
     pub(crate) fn retained_bytes(&self) -> Option<u64> {
         match self {
+            Self::Pending { .. } => None,
             Self::Stored { bytes, .. } => Some(*bytes),
             Self::Failed { .. } => None,
         }
@@ -1530,6 +1637,117 @@ fn logical_segment_path(path: &Path, index: u32) -> PathBuf {
     }
 }
 
+struct StagedLogicalSegment {
+    index: u32,
+    range: CanonicalByteRange,
+    path: PathBuf,
+}
+
+struct StagedLogicalSegmentCleanup(Vec<PathBuf>);
+
+impl StagedLogicalSegmentCleanup {
+    fn new(segments: &[StagedLogicalSegment]) -> Self {
+        Self(
+            segments
+                .iter()
+                .map(|segment| segment.path.clone())
+                .collect(),
+        )
+    }
+}
+
+impl Drop for StagedLogicalSegmentCleanup {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn staged_logical_segment_path(directory: &Path, id: ToolOutputArtifactId, index: u32) -> PathBuf {
+    directory.join(format!(".{id}.segment-{index:06}.pending"))
+}
+
+async fn remove_staged_logical_segments(segments: &[StagedLogicalSegment]) {
+    for segment in segments {
+        let _ = tokio::fs::remove_file(&segment.path).await;
+    }
+}
+
+async fn stage_logical_segments(
+    directory: &Path,
+    id: ToolOutputArtifactId,
+    bytes: &[u8],
+    canonical_start: u64,
+    first_index: u32,
+) -> Result<Vec<StagedLogicalSegment>, (u64, PathBuf, std::io::Error)> {
+    let mut staged = Vec::new();
+    for (offset, chunk) in bytes.chunks(MAX_RAW_OUTPUT_ARTIFACT_BYTES).enumerate() {
+        let index = first_index + offset as u32;
+        let start = canonical_start + offset as u64 * MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
+        let path = staged_logical_segment_path(directory, id, index);
+        if let Err(err) = tokio::fs::write(&path, chunk).await {
+            remove_staged_logical_segments(&staged).await;
+            return Err((start, path, err));
+        }
+        staged.push(StagedLogicalSegment {
+            index,
+            range: CanonicalByteRange::new(start, start + chunk.len() as u64),
+            path,
+        });
+    }
+    if bytes.is_empty() && first_index == 0 {
+        let path = staged_logical_segment_path(directory, id, 0);
+        if let Err(err) = tokio::fs::write(&path, []).await {
+            return Err((canonical_start, path, err));
+        }
+        staged.push(StagedLogicalSegment {
+            index: 0,
+            range: CanonicalByteRange::new(canonical_start, canonical_start),
+            path,
+        });
+    }
+    Ok(staged)
+}
+
+async fn install_staged_logical_segments(
+    final_path: &Path,
+    staged: Vec<StagedLogicalSegment>,
+    retained_bytes: u64,
+) -> Result<Vec<LogicalArtifactSegment>, (u64, PathBuf, std::io::Error)> {
+    let mut installed = Vec::new();
+    for segment in staged {
+        if segment.range.start >= retained_bytes && !segment.range.is_empty() {
+            let _ = tokio::fs::remove_file(&segment.path).await;
+            continue;
+        }
+        let end = segment.range.end.min(retained_bytes);
+        if end < segment.range.end {
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&segment.path)
+                .await
+            {
+                Ok(file) => {
+                    if let Err(err) = file.set_len(end.saturating_sub(segment.range.start)).await {
+                        return Err((segment.range.start, segment.path, err));
+                    }
+                }
+                Err(err) => return Err((segment.range.start, segment.path, err)),
+            }
+        }
+        let destination = logical_segment_path(final_path, segment.index);
+        if let Err(err) = tokio::fs::rename(&segment.path, &destination).await {
+            return Err((segment.range.start, segment.path, err));
+        }
+        installed.push(LogicalArtifactSegment {
+            index: segment.index,
+            range: CanonicalByteRange::new(segment.range.start, end),
+        });
+    }
+    Ok(installed)
+}
+
 fn logical_artifact_family_exists(path: &Path) -> std::io::Result<bool> {
     let Some(directory) = path.parent() else {
         return Ok(false);
@@ -1699,7 +1917,6 @@ async fn create_canonical_output_artifact_with_id(
     id: ToolOutputArtifactId,
 ) -> CanonicalOutputArtifact {
     let directory = codex_home.join("tool-output").join(thread_id);
-    let _retention_permit = retention_sweep_permit().await;
     if let Err(err) = tokio::fs::create_dir_all(&directory).await {
         return CanonicalOutputArtifact {
             id: None,
@@ -1709,13 +1926,42 @@ async fn create_canonical_output_artifact_with_id(
             error: Some(format!("failed to create `{}`: {err}", directory.display())),
         };
     }
+    let max_staged_bytes = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+        .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL)
+        .min(canonical.exact_bytes) as usize;
+    let staged_bytes = &canonical.bytes[..canonical.bytes.len().min(max_staged_bytes)];
+    let staged_segments = match stage_logical_segments(&directory, id, staged_bytes, 0, 0).await {
+        Ok(segments) => segments,
+        Err((start, staged_path, err)) => {
+            return CanonicalOutputArtifact {
+                id: Some(id),
+                retained_bytes: start,
+                complete: false,
+                unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
+                error: Some(format!(
+                    "failed to stage `{}`: {err}",
+                    staged_path.display()
+                )),
+            };
+        }
+    };
+    let _staged_cleanup = StagedLogicalSegmentCleanup::new(&staged_segments);
+
+    // Bulk output writes use per-artifact staging paths. Hold the process-wide
+    // permit only while admitting the retained bytes and installing the staged
+    // family, so independent tool completions can persist their output in
+    // parallel without racing retention accounting.
+    let _retention_permit = retention_sweep_permit().await;
     let path = directory.join(format!("{id}.log"));
     enforce_retention_locked(&directory, &path, canonical.exact_bytes, 1).await;
     let usage = retention_usage_locked(&directory).await;
     let available = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
         .saturating_sub(usage.thread_bytes)
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes));
-    let retained_bytes = canonical.exact_bytes.min(available);
+    let retained_bytes = canonical
+        .exact_bytes
+        .min(available)
+        .min(staged_bytes.len() as u64);
     let retention_token = capture_retention_token(&directory);
     let complete = canonical.complete && retained_bytes == canonical.exact_bytes;
     let unavailable_ranges = if retained_bytes < canonical.exact_bytes {
@@ -1727,48 +1973,23 @@ async fn create_canonical_output_artifact_with_id(
         canonical.unavailable_ranges.clone()
     };
     let retained = &canonical.bytes[..retained_bytes as usize];
-    let mut segments = Vec::new();
-    for (index, bytes) in retained.chunks(MAX_RAW_OUTPUT_ARTIFACT_BYTES).enumerate() {
-        let start = (index * MAX_RAW_OUTPUT_ARTIFACT_BYTES) as u64;
-        let end = start + bytes.len() as u64;
-        let segment_path = logical_segment_path(&path, index as u32);
-        if let Err(err) = tokio::fs::write(&segment_path, bytes).await {
-            rollback_logical_artifact_creation(&retention_token, &path);
-            return CanonicalOutputArtifact {
-                id: Some(id),
-                retained_bytes: start,
-                complete: false,
-                unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
-                error: Some(format!(
-                    "failed to write `{}`: {err}",
-                    segment_path.display()
-                )),
-            };
-        }
-        segments.push(LogicalArtifactSegment {
-            index: index as u32,
-            range: CanonicalByteRange::new(start, end),
-        });
-    }
-    // Preserve a regular anchor file for an empty canonical result.
-    if segments.is_empty()
-        && let Err(err) = tokio::fs::write(&path, []).await
-    {
-        rollback_logical_artifact_creation(&retention_token, &path);
-        return CanonicalOutputArtifact {
-            id: Some(id),
-            retained_bytes: 0,
-            complete: false,
-            unavailable_ranges: Vec::new(),
-            error: Some(format!("failed to create `{}`: {err}", path.display())),
+    let segments =
+        match install_staged_logical_segments(&path, staged_segments, retained_bytes).await {
+            Ok(segments) => segments,
+            Err((start, staged_path, err)) => {
+                rollback_logical_artifact_creation(&retention_token, &path);
+                return CanonicalOutputArtifact {
+                    id: Some(id),
+                    retained_bytes: start,
+                    complete: false,
+                    unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
+                    error: Some(format!(
+                        "failed to install staged artifact segment `{}`: {err}",
+                        staged_path.display()
+                    )),
+                };
+            }
         };
-    }
-    if segments.is_empty() {
-        segments.push(LogicalArtifactSegment {
-            index: 0,
-            range: CanonicalByteRange::new(0, 0),
-        });
-    }
 
     let mut metadata = LogicalArtifactMetadata {
         version: LOGICAL_ARTIFACT_METADATA_VERSION,
@@ -1878,6 +2099,33 @@ pub(crate) async fn attach_canonical_output_artifact(
             error: Some("existing artifact does not match the canonical byte prefix".to_string()),
         };
     }
+    let max_staged_total = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+        .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL)
+        .min(canonical.exact_bytes) as usize;
+    let staged_end = canonical.bytes.len().min(max_staged_total);
+    let staged_additional = canonical
+        .bytes
+        .get(existing.len()..staged_end)
+        .unwrap_or_default();
+    let staged_segments =
+        match stage_logical_segments(&directory, id, staged_additional, existing.len() as u64, 1)
+            .await
+        {
+            Ok(segments) => segments,
+            Err((start, staged_path, err)) => {
+                return CanonicalOutputArtifact {
+                    id: Some(id),
+                    retained_bytes: start,
+                    complete: false,
+                    unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
+                    error: Some(format!(
+                        "failed to stage artifact segment `{}`: {err}",
+                        staged_path.display()
+                    )),
+                };
+            }
+        };
+    let _staged_cleanup = StagedLogicalSegmentCleanup::new(&staged_segments);
     let _retention_permit = retention_sweep_permit().await;
     enforce_retention_locked(
         &directory,
@@ -1892,35 +2140,29 @@ pub(crate) async fn attach_canonical_output_artifact(
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes));
     let retained_bytes = canonical
         .exact_bytes
-        .min(existing.len() as u64 + additional_available);
+        .min(existing.len() as u64 + additional_available)
+        .min(existing.len() as u64 + staged_additional.len() as u64);
     let retention_token = capture_retention_token(&directory);
     let retained = &canonical.bytes[..retained_bytes as usize];
     let mut segments = vec![LogicalArtifactSegment {
         index: 0,
         range: CanonicalByteRange::new(0, existing.len() as u64),
     }];
-    for (offset, bytes) in retained[existing.len()..]
-        .chunks(MAX_RAW_OUTPUT_ARTIFACT_BYTES)
-        .enumerate()
-    {
-        let index = offset as u32 + 1;
-        let start = existing.len() as u64 + offset as u64 * MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
-        let end = start + bytes.len() as u64;
-        let segment_path = logical_segment_path(&path, index);
-        if let Err(err) = tokio::fs::write(&segment_path, bytes).await {
+    match install_staged_logical_segments(&path, staged_segments, retained_bytes).await {
+        Ok(additional_segments) => segments.extend(additional_segments),
+        Err((start, staged_path, err)) => {
             reject_stale_delta(&retention_token);
             return CanonicalOutputArtifact {
                 id: Some(id),
                 retained_bytes: start,
                 complete: false,
                 unavailable_ranges: vec![CanonicalByteRange::new(start, canonical.exact_bytes)],
-                error: Some(format!("failed to write artifact segment: {err}")),
+                error: Some(format!(
+                    "failed to install staged artifact segment `{}`: {err}",
+                    staged_path.display()
+                )),
             };
         }
-        segments.push(LogicalArtifactSegment {
-            index,
-            range: CanonicalByteRange::new(start, end),
-        });
     }
     let complete = canonical.complete && retained_bytes == canonical.exact_bytes;
     let unavailable_ranges = if complete {
@@ -2814,6 +3056,17 @@ pub(crate) async fn replace_raw_output_artifact(
     artifact: &RawOutputArtifact,
     output: &[u8],
 ) -> RawOutputArtifact {
+    if let RawOutputArtifact::Pending {
+        codex_home,
+        thread_id,
+    } = artifact
+    {
+        return if output.len() > LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
+            create_raw_output_artifact(codex_home, thread_id, output).await
+        } else {
+            artifact.clone()
+        };
+    }
     let RawOutputArtifact::Stored {
         id,
         path,
@@ -3099,6 +3352,152 @@ fn load_validated_logical_snapshot(
         ));
     }
     Ok(snapshot)
+}
+
+fn load_cached_validated_logical_snapshot(
+    path: &Path,
+    metadata: &LogicalArtifactMetadata,
+) -> Result<Arc<Vec<u8>>, ReadToolOutputError> {
+    let Some(file_identities) = validated_snapshot_file_identities(path, metadata)? else {
+        return load_validated_logical_snapshot(path, metadata).map(Arc::new);
+    };
+    let identity = serde_json::to_vec(&(path.to_string_lossy(), metadata, &file_identities))
+        .map_err(|err| {
+            ReadToolOutputError::Io(format!("failed to encode artifact cache identity: {err}"))
+        })?;
+    let key = format!("{:x}", Sha256::digest(identity));
+    if let Some(snapshot) = VALIDATED_SNAPSHOT_CACHE
+        .get_or_init(|| StdMutex::new(ValidatedSnapshotCache::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .get(&key)
+        .cloned()
+    {
+        return Ok(snapshot);
+    }
+
+    let snapshot = Arc::new(load_validated_logical_snapshot(path, metadata)?);
+    if validated_snapshot_file_identities(path, metadata)?.as_ref() != Some(&file_identities) {
+        return Err(ReadToolOutputError::Io(
+            "artifact files changed while validating the immutable snapshot".to_string(),
+        ));
+    }
+    let mut cache = VALIDATED_SNAPSHOT_CACHE
+        .get_or_init(|| StdMutex::new(ValidatedSnapshotCache::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    insert_validated_snapshot_cache_entry(
+        &mut cache,
+        key,
+        Arc::clone(&snapshot),
+        MAX_VALIDATED_SNAPSHOT_CACHE_ENTRIES,
+        MAX_VALIDATED_SNAPSHOT_CACHE_BYTES,
+    );
+    Ok(snapshot)
+}
+
+fn insert_validated_snapshot_cache_entry(
+    cache: &mut ValidatedSnapshotCache,
+    key: String,
+    snapshot: Arc<Vec<u8>>,
+    max_entries: usize,
+    max_bytes: usize,
+) {
+    let snapshot_bytes = snapshot.len();
+    if snapshot_bytes > max_bytes {
+        return;
+    }
+    if let Some(previous) = cache.entries.insert(key.clone(), snapshot) {
+        cache.retained_bytes = cache.retained_bytes.saturating_sub(previous.len());
+    } else {
+        cache.insertion_order.push_back(key);
+    }
+    cache.retained_bytes = cache.retained_bytes.saturating_add(snapshot_bytes);
+    while cache.entries.len() > max_entries || cache.retained_bytes > max_bytes {
+        let Some(expired) = cache.insertion_order.pop_front() else {
+            break;
+        };
+        if let Some(removed) = cache.entries.remove(&expired) {
+            cache.retained_bytes = cache.retained_bytes.saturating_sub(removed.len());
+        }
+    }
+}
+
+fn validated_snapshot_file_identities(
+    path: &Path,
+    metadata: &LogicalArtifactMetadata,
+) -> Result<Option<Vec<ValidatedSnapshotFileIdentity>>, ReadToolOutputError> {
+    let mut identities = Vec::with_capacity(metadata.segments.len());
+    for segment in &metadata.segments {
+        let segment_path = logical_segment_path(path, segment.index);
+        let (file, bytes) = open_regular_artifact(&segment_path)?;
+        let file_metadata = file.metadata().map_err(|err| {
+            ReadToolOutputError::Io(format!("failed to inspect artifact segment: {err}"))
+        })?;
+        let Some(stable_id) = stable_artifact_file_identity(&file) else {
+            return Ok(None);
+        };
+        identities.push(ValidatedSnapshotFileIdentity {
+            segment_index: segment.index,
+            bytes,
+            modified: file_metadata.modified().ok().and_then(system_time_identity),
+            created: file_metadata.created().ok().and_then(system_time_identity),
+            stable_id,
+        });
+    }
+    Ok(Some(identities))
+}
+
+fn system_time_identity(time: std::time::SystemTime) -> Option<(u64, u32)> {
+    let elapsed = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((elapsed.as_secs(), elapsed.subsec_nanos()))
+}
+
+#[cfg(windows)]
+fn stable_artifact_file_identity(file: &File) -> Option<StableArtifactFileIdentity> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO;
+    use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+
+    let mut info = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as isize,
+            FileIdInfo,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if success == 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let index = info.FileId.Identifier;
+    (info.VolumeSerialNumber != 0 || index.iter().any(|byte| *byte != 0)).then_some(
+        StableArtifactFileIdentity::Windows {
+            volume: info.VolumeSerialNumber,
+            index,
+        },
+    )
+}
+
+#[cfg(unix)]
+fn stable_artifact_file_identity(file: &File) -> Option<StableArtifactFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().ok()?;
+    Some(StableArtifactFileIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn stable_artifact_file_identity(_file: &File) -> Option<StableArtifactFileIdentity> {
+    None
 }
 
 fn validated_snapshot_range(
@@ -3743,24 +4142,32 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     if id.to_string() != artifact_id {
         return Err(ReadToolOutputError::InvalidArtifactId);
     }
+    let path = codex_home
+        .join("tool-output")
+        .join(thread_id)
+        .join(format!("{id}.log"));
+    let validation_path = path.clone();
+    let (metadata, snapshot) = tokio::task::spawn_blocking(move || {
+        open_regular_artifact(&validation_path)?;
+        let metadata = load_logical_metadata(&validation_path, id)?;
+        let snapshot = load_cached_validated_logical_snapshot(&validation_path, &metadata)?;
+        Ok::<_, ReadToolOutputError>((metadata, snapshot))
+    })
+    .await
+    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
+    let artifact_identity = metadata.canonical_sha256.clone();
     let request_cache_key = deterministic_recovery_cache_key(
         codex_home,
         thread_id,
         artifact_id,
+        &artifact_identity,
         &selectors,
         token_ceiling,
     );
     if let Some(result) = deterministic_recovery_cache_get(&request_cache_key) {
         return Ok((result, true));
     }
-    let path = codex_home
-        .join("tool-output")
-        .join(thread_id)
-        .join(format!("{id}.log"));
     let (result, normalized_selectors) = tokio::task::spawn_blocking(move || {
-        open_regular_artifact(&path)?;
-        let metadata = load_logical_metadata(&path, id)?;
-        let snapshot = load_validated_logical_snapshot(&path, &metadata)?;
         let selectors = normalize_tool_output_selectors(selectors, &metadata);
         let mut response = ReadToolOutputResult {
             artifact_id: id.to_string(),
@@ -3774,14 +4181,14 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
         for selector in &selectors {
             let mut selected = select_logical_artifact(
                 &metadata,
-                &snapshot,
+                snapshot.as_ref(),
                 selector.clone(),
                 token_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
                 token_ceiling,
             );
             if selected.status == ToolOutputSelectorStatus::SelectorTooLarge
                 && let Some(completed) =
-                    internally_drain_exact_subdivisions(&metadata, &snapshot, &selected)
+                    internally_drain_exact_subdivisions(&metadata, snapshot.as_ref(), &selected)
             {
                 let mut candidate = response.clone();
                 candidate.results.push(completed.clone());
@@ -3851,17 +4258,16 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     })
     .await
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))??;
-    if deterministic_recovery_result_is_reusable(&result) {
-        let normalized_cache_key = deterministic_recovery_cache_key(
-            codex_home,
-            thread_id,
-            artifact_id,
-            &normalized_selectors,
-            token_ceiling,
-        );
-        deterministic_recovery_cache_insert(normalized_cache_key, result.clone());
-        deterministic_recovery_cache_insert(request_cache_key, result.clone());
-    }
+    let normalized_cache_key = deterministic_recovery_cache_key(
+        codex_home,
+        thread_id,
+        artifact_id,
+        &artifact_identity,
+        &normalized_selectors,
+        token_ceiling,
+    );
+    deterministic_recovery_cache_insert(normalized_cache_key, result.clone());
+    deterministic_recovery_cache_insert(request_cache_key, result.clone());
     Ok((result, false))
 }
 
@@ -3869,6 +4275,7 @@ fn deterministic_recovery_cache_key(
     codex_home: &Path,
     thread_id: &str,
     artifact_id: &str,
+    artifact_identity: &str,
     selectors: &[ToolOutputSelector],
     token_ceiling: usize,
 ) -> String {
@@ -3876,6 +4283,7 @@ fn deterministic_recovery_cache_key(
         "codex_home": codex_home.to_string_lossy(),
         "thread_id": thread_id,
         "artifact_id": artifact_id,
+        "artifact_identity": artifact_identity,
         "selectors": selectors,
         "token_ceiling": token_ceiling,
     });
@@ -3909,16 +4317,6 @@ fn deterministic_recovery_cache_insert(key: String, result: ReadToolOutputResult
         };
         cache.entries.remove(&expired);
     }
-}
-
-fn deterministic_recovery_result_is_reusable(result: &ReadToolOutputResult) -> bool {
-    result.complete
-        && result.unavailable_ranges.is_empty()
-        && result.results.iter().all(|selected| {
-            selected.status == ToolOutputSelectorStatus::Ok
-                && selected.complete
-                && selected.continuation.is_none()
-        })
 }
 
 #[cfg(test)]
@@ -5368,6 +5766,41 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn validated_snapshot_cache_enforces_entry_and_byte_limits() {
+        let mut cache = ValidatedSnapshotCache::default();
+        insert_validated_snapshot_cache_entry(
+            &mut cache,
+            "first".to_string(),
+            Arc::new(vec![0; 4]),
+            2,
+            6,
+        );
+        insert_validated_snapshot_cache_entry(
+            &mut cache,
+            "second".to_string(),
+            Arc::new(vec![0; 4]),
+            2,
+            6,
+        );
+
+        assert_eq!(
+            cache.entries.keys().cloned().collect::<Vec<_>>(),
+            vec!["second".to_string()]
+        );
+        assert_eq!(cache.retained_bytes, 4);
+
+        insert_validated_snapshot_cache_entry(
+            &mut cache,
+            "oversized".to_string(),
+            Arc::new(vec![0; 7]),
+            2,
+            6,
+        );
+        assert!(!cache.entries.contains_key("oversized"));
+        assert_eq!(cache.retained_bytes, 4);
+    }
 
     #[tokio::test]
     async fn artifact_retains_exact_bytes_across_chunks() {

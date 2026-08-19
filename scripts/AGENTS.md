@@ -1,64 +1,41 @@
 # Scripts Policy
 
-This file applies inside `scripts/`. It inherits the repository-wide policy from
-the root `AGENTS.md`.
-
-Keep this file focused on script editing, ownership, and validation. Put long
-background or usage examples in README files or script help text.
-
-## Scoped Policy
-
-Known scoped instruction files include:
-
-- `codex_package/AGENTS.md`: canonical package directory/archive builder for CLI
-  and app-server artifacts.
-- `install/AGENTS.md`: standalone shell and PowerShell installer entrypoints.
-
-Do not assume other nested `AGENTS.md` files exist unless they are present in the
-working tree.
+Keep background and usage examples in READMEs/help. Read nested policies in
+`codex_package/` and `install/` when working there.
 
 ## Ownership
 
-- Python utilities own repository maintenance, package staging, README/table
-  checks, blob-size checks, mock Responses WebSocket serving, local package
-  assembly, script test coverage, and tooling metadata.
-- PowerShell utilities own Windows local-build lanes, local publish flows,
-  PowerShell invocation wrappers, Rust performance environment setup, install
-  routing, and target cleanup helpers.
-- Shell utilities own Unix install, debug, remote-environment, and helper launch
-  paths.
+- Python owns maintenance, package staging, checks, mock servers, assembly, and
+  script tests; PowerShell owns Windows build/publish lanes, wrappers, Rust perf
+  setup, install routing, and target cleanup; shell owns Unix install/debug and
+  remote/helper launch paths.
 - `codex_package/` owns the canonical Codex package directory/archive builder for
   CLI and app-server artifacts.
 - `install/` owns platform install entrypoints for shell and PowerShell install
   flows.
-- `.venv/`, `__pycache__/`, and `*.pyc` are local generated state, not source.
+- `.venv/`, `__pycache__/`, and `*.pyc` are generated state, not source.
 
 ## Fast Routing
 
-Use this section first. Read [`../SOURCEMAP.md`](../SOURCEMAP.md) only when the
-owner crosses script/package boundaries or remains ambiguous.
+Read [`../SOURCEMAP.md`](../SOURCEMAP.md) only for ambiguous or cross-boundary
+ownership.
 
 - Local Codex binary publish/replacement proof: `publish-local-codex.ps1`,
   `test_publish_local_codex.py`.
 - Rust lanes, target cleanup, and build diagnostics: `cargo-lane.ps1`,
   `cargo-lane-trash-cleanup.ps1`, `rust_build_status.py`, `common-rust-env.ps1`,
   `invoke-rust-perf-env.ps1`, `sccache-perf.ps1`.
-- Package assembly and npm staging: `build_codex_package.py`,
-  `stage_npm_packages.py`, `codex_package/`; read
-  `codex_package/AGENTS.md` for package-contract work.
-- Platform install flows: `install/install.sh`, `install/install.ps1`; read
-  `install/AGENTS.md` for installer-contract work.
+- Package/npm staging: `build_codex_package.py`, `stage_npm_packages.py`,
+  `codex_package/`.
+- Install flows: `install/install.sh`, `install/install.ps1`.
 - Root maintenance commands: `root_maintenance.py`, synchronized with root
   `package.json` script names.
 - Repository checks: `format.py`, `asciicheck.py`, `readme_toc.py`,
-  `source_map_check.py`, `check_blob_size.py`, and matching tests.
-  `source_map_check.py` rewrites the managed repository-path snapshot before
-  validating inventories; keep that synchronization deterministic and
-  idempotent.
+  `source_map_check.py`, `check_blob_size.py`. Keep source-map rewriting
+  deterministic and idempotent.
 - PowerShell/script invocation compatibility: `just-shell.py`,
   `run-powershell-script.ps1`, `test_run_powershell_script.py`.
-- Tool-version reporting: `tool_versions.py`; probes must not mutate the machine
-  or require network access.
+- Tool versions: `tool_versions.py`; probes must not mutate or require network.
 - Live rollout snapshots and analyzers: `rollout_snapshot.py`,
   `kd4_first_useful_action_analysis.py`, `kd4_turn_latency_audit.py`, and their
   tests. Read a growing rollout through a fixed-length, checksummed snapshot;
@@ -66,60 +43,44 @@ owner crosses script/package boundaries or remains ambiguous.
 
 ## High-Risk Surfaces
 
-- The publish script must preserve dry-run, backup, rollback, doctor,
-  hash/version proof, process detection, process-closing protections, and the
-  optimized `release` profile for the sole public publish recipe,
-  `just publish-local-codex-final`.
+- Publish must preserve dry-run, backup, rollback, doctor, hash/version proof,
+  process guards, and the `release` profile for `publish-local-codex-final`.
 - Cargo lane scripts must preserve stop-parsing, argument forwarding, isolated
   target directories, and active-process checks before cleanup.
 - Package staging must keep generated package layout aligned with
   `scripts/codex_package/`.
-- Install scripts must preserve release resolution, digest verification,
-  standalone layout metadata, install locking, PATH updates, old-install
-  migration, and conflicting package-manager detection. Keep shell and
-  PowerShell installer behavior aligned where they share a contract.
+- Installers must preserve release/digest resolution, layout metadata, locking,
+  PATH updates, migration, package-manager conflict checks, and shared behavior.
 - Script wrappers such as `just-shell.py` and `run-powershell-script.ps1` treat
   quoting, argument forwarding, and exit-code propagation as compatibility
   surfaces.
-- Mock websocket server and repository-check
-  output/schema changes are contract changes for their callers/tests.
+- Mock-server and repository-check output/schema changes are caller contracts.
 
 ## Editing Rules
 
-- Keep script changes narrow and path-owned. Do not mix publish tooling, package
-  staging, formatter, install, and maintenance behavior unless one change truly
-  requires the other.
+- Keep changes path-owned; do not mix publish, packaging, formatting, install,
+  and maintenance behavior without a real dependency.
 - For review, recommendation, agreement, reasons, or `what would you fix`
   requests, stay non-mutating unless the request explicitly asks for edits.
-- Do not hand-edit generated files or locks. Treat `uv.lock` as generated
-  dependency metadata; leave `.venv/`, `__pycache__/`, and `*.pyc` as regenerated
-  local state.
+- Do not hand-edit generated files/locks, including `uv.lock`, or local caches.
 - Preserve cross-platform behavior. If a script has PowerShell and shell/Python
   siblings, check whether the same behavior needs a matching update.
 - Prefer structured parsers and existing helper modules over ad hoc text
   manipulation for manifests, TOML, JSON, archives, and package metadata.
-- For local publish tooling, do not weaken backup, rollback, dry-run, doctor, or
-  running-process guardrails unless the request explicitly targets that safety
-  surface.
+- Do not weaken publish safety guardrails unless explicitly requested.
 
 ## Validation
 
-- If the request says no tests, do not run test commands. Use focused non-test
-  checks such as syntax checks, read-back proof, dry-run proof, or command/path
-  existence checks, and report skipped tests.
+- If tests are waived, use focused syntax/read-back/dry-run/path checks and
+  report the skip.
 - For Python script changes, run the closest `python -m unittest
   scripts.test_<name>` or package-local test when tests are not waived.
-- For PowerShell scripts, prefer parse/syntax checks and the closest dry-run or
-  unit test. Do not run process-closing publish commands unless the task is a
-  publish/update flow and selected proof gates have passed.
+- For PowerShell, prefer parser checks and the closest dry-run/unit test. Do not
+  close processes unless an authorized publish/update flow has passed its gates.
 - For packaging changes under `codex_package/`, validate with focused package
   tests before broader packaging proof when tests are allowed.
 - Desktop-visible publish changes require the root local publish/restart proof
   chain before claiming the running desktop app sees the change.
 
-## Reporting
-
-- Report changed scripts, selected proof, skipped tests, and any platform path not
-  validated.
-- Separate unrelated dirty paths or pre-existing tooling blockers from task-owned
-  script failures.
+Report changed scripts, proof, skipped tests/platforms, and separate unrelated
+dirty paths or blockers from task failures.

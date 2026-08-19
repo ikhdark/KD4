@@ -599,6 +599,27 @@ async fn emit_exec_stage(
 ) {
     match stage {
         ToolEventStage::Begin => {
+            let native_cwd = exec_input.cwd.to_abs_path().ok();
+            if matches!(
+                crate::turn_diff_tracker::command_mutation(
+                    exec_input.command,
+                    native_cwd.as_ref().map(AbsolutePathBuf::as_path),
+                ),
+                crate::turn_diff_tracker::CommandMutation::Uncertain
+            ) {
+                let baseline = match native_cwd.as_ref() {
+                    Some(cwd) => {
+                        crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path())
+                            .await
+                    }
+                    None => None,
+                };
+                ctx.session
+                    .services
+                    .command_execution
+                    .record_uncertain_command_baseline(ctx.call_id, baseline)
+                    .await;
+            }
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -670,18 +691,41 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) {
-    let possible_mutation = crate::turn_diff_tracker::command_may_mutate(exec_input.command);
     let native_cwd = exec_input.cwd.to_abs_path().ok();
-    let mutation_paths = possible_mutation
-        .then(|| {
-            crate::turn_diff_tracker::command_mutation_paths(
-                exec_input.command,
-                native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-            )
-        })
-        .flatten();
+    let mut mutation = crate::turn_diff_tracker::command_mutation(
+        exec_input.command,
+        native_cwd.as_ref().map(AbsolutePathBuf::as_path),
+    );
+    if matches!(
+        mutation,
+        crate::turn_diff_tracker::CommandMutation::Uncertain
+    ) {
+        let baseline = ctx
+            .session
+            .services
+            .command_execution
+            .take_uncertain_command_baseline(ctx.call_id)
+            .await;
+        mutation = if exec_result.status == ExecCommandStatus::Declined {
+            crate::turn_diff_tracker::CommandMutation::ReadOnly
+        } else {
+            let current = match native_cwd.as_ref() {
+                Some(cwd) => {
+                    crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
+                }
+                None => None,
+            };
+            let workspace_changed = match (baseline, current) {
+                (Some(Some(before)), Some(after)) => Some(before != after),
+                _ => None,
+            };
+            crate::turn_diff_tracker::resolve_uncertain_command_observation(workspace_changed)
+        };
+    }
+    let possible_mutation = mutation.may_have_mutated();
+    let mutation_paths = mutation.paths();
     if possible_mutation && exec_result.status != ExecCommandStatus::Declined {
-        if let Some(paths) = mutation_paths.as_ref() {
+        if let Some(paths) = mutation_paths {
             let paths = paths
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -714,7 +758,7 @@ async fn emit_exec_end(
         ctx.session
             .invalidate_tool_history_source_dependencies(
                 ctx.turn.config.codex_home.as_path(),
-                mutation_paths.as_ref(),
+                mutation_paths,
                 current_workspace_identity.as_ref(),
             )
             .await;
@@ -722,15 +766,17 @@ async fn emit_exec_end(
     if exec_result.status != ExecCommandStatus::Declined
         && let Some(tracker) = ctx.turn_diff_tracker
     {
-        tracker.lock().await.record_exec_command_end_at(
-            exec_input.command,
-            exec_result.exit_code,
-            exec_result.timed_out,
-            exec_input.environment_id,
-            native_cwd
-                .as_ref()
-                .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
-        );
+        tracker
+            .lock()
+            .await
+            .record_exec_command_end_with_mutation_at(
+                exec_input.command,
+                exec_result.exit_code,
+                exec_result.timed_out,
+                exec_input.environment_id,
+                native_cwd.as_ref().map(AbsolutePathBuf::as_path),
+                mutation.clone(),
+            );
     }
     let bound_auto_validation = ctx
         .session
@@ -775,8 +821,8 @@ async fn emit_exec_end(
             exec_result.exit_code,
             exec_result.timed_out,
             u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
-            possible_mutation,
-            mutation_paths.as_ref(),
+            mutation,
+            mutation_paths,
             provenance.as_ref(),
             implementation_identity_hash.as_deref(),
             validation_result,

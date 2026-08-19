@@ -28,6 +28,13 @@ pub(crate) struct ToolDispatchTimingSnapshot {
     pub authorization_state_coordination_ms: Option<u64>,
     pub first_poll_to_handler_entry_ms: Option<u64>,
     pub handler_duration_ms: Option<u64>,
+    pub workspace_evidence_before_ms: Option<u64>,
+    pub workspace_evidence_after_ms: Option<u64>,
+    pub pre_tool_hook_ms: Option<u64>,
+    pub post_tool_hook_ms: Option<u64>,
+    pub output_projection_ms: Option<u64>,
+    pub history_persistence_ms: Option<u64>,
+    pub post_handler_ms: Option<u64>,
     pub total_duration_ms: Option<u64>,
     pub parallel_gate_admitted: bool,
     pub eager: bool,
@@ -40,6 +47,13 @@ pub(crate) struct ToolDispatchTiming {
     parallel_gate_admitted_at: OnceLock<Instant>,
     authorization_state_coordination: OnceLock<Duration>,
     handler_entry_at: OnceLock<Instant>,
+    handler_exit_at: OnceLock<Instant>,
+    workspace_evidence_before: OnceLock<Duration>,
+    workspace_evidence_after: OnceLock<Duration>,
+    pre_tool_hook: OnceLock<Duration>,
+    post_tool_hook: OnceLock<Duration>,
+    output_projection: OnceLock<Duration>,
+    history_persistence: OnceLock<Duration>,
     eager: bool,
 }
 
@@ -51,6 +65,13 @@ impl ToolDispatchTiming {
             parallel_gate_admitted_at: OnceLock::new(),
             authorization_state_coordination: OnceLock::new(),
             handler_entry_at: OnceLock::new(),
+            handler_exit_at: OnceLock::new(),
+            workspace_evidence_before: OnceLock::new(),
+            workspace_evidence_after: OnceLock::new(),
+            pre_tool_hook: OnceLock::new(),
+            post_tool_hook: OnceLock::new(),
+            output_projection: OnceLock::new(),
+            history_persistence: OnceLock::new(),
             eager,
         }
     }
@@ -71,10 +92,43 @@ impl ToolDispatchTiming {
         let _ = self.handler_entry_at.set(Instant::now());
     }
 
+    pub(crate) fn mark_handler_exit(&self) {
+        let _ = self.handler_exit_at.set(Instant::now());
+    }
+
+    fn record_phase(target: &OnceLock<Duration>, duration: Duration) {
+        let _ = target.set(duration);
+    }
+
+    pub(crate) fn record_workspace_evidence_before(&self, duration: Duration) {
+        Self::record_phase(&self.workspace_evidence_before, duration);
+    }
+
+    pub(crate) fn record_workspace_evidence_after(&self, duration: Duration) {
+        Self::record_phase(&self.workspace_evidence_after, duration);
+    }
+
+    pub(crate) fn record_pre_tool_hook(&self, duration: Duration) {
+        Self::record_phase(&self.pre_tool_hook, duration);
+    }
+
+    pub(crate) fn record_post_tool_hook(&self, duration: Duration) {
+        Self::record_phase(&self.post_tool_hook, duration);
+    }
+
+    pub(crate) fn record_output_projection(&self, duration: Duration) {
+        Self::record_phase(&self.output_projection, duration);
+    }
+
+    pub(crate) fn record_history_persistence(&self, duration: Duration) {
+        Self::record_phase(&self.history_persistence, duration);
+    }
+
     pub(crate) fn snapshot(&self, completed_at: Instant) -> ToolDispatchTimingSnapshot {
         let first_poll_at = self.first_poll_at.get().copied();
         let parallel_gate_admitted_at = self.parallel_gate_admitted_at.get().copied();
         let handler_entry_at = self.handler_entry_at.get().copied();
+        let handler_exit_at = self.handler_exit_at.get().copied();
         ToolDispatchTimingSnapshot {
             item_to_first_poll_ms: first_poll_at
                 .and_then(|at| duration_ms(at.saturating_duration_since(self.item_accepted_at))),
@@ -95,11 +149,31 @@ impl ToolDispatchTiming {
                     duration_ms(handler_entry_at.saturating_duration_since(first_poll_at))
                 },
             ),
-            // Preserve the established event meanings: handler duration begins at
-            // gate admission, and total duration begins at the first dispatch poll.
-            handler_duration_ms: parallel_gate_admitted_at.and_then(|admitted_at| {
-                duration_ms(completed_at.saturating_duration_since(admitted_at))
-            }),
+            handler_duration_ms: handler_entry_at.zip(handler_exit_at).and_then(
+                |(handler_entry_at, handler_exit_at)| {
+                    duration_ms(handler_exit_at.saturating_duration_since(handler_entry_at))
+                },
+            ),
+            workspace_evidence_before_ms: self
+                .workspace_evidence_before
+                .get()
+                .copied()
+                .and_then(duration_ms),
+            workspace_evidence_after_ms: self
+                .workspace_evidence_after
+                .get()
+                .copied()
+                .and_then(duration_ms),
+            pre_tool_hook_ms: self.pre_tool_hook.get().copied().and_then(duration_ms),
+            post_tool_hook_ms: self.post_tool_hook.get().copied().and_then(duration_ms),
+            output_projection_ms: self.output_projection.get().copied().and_then(duration_ms),
+            history_persistence_ms: self
+                .history_persistence
+                .get()
+                .copied()
+                .and_then(duration_ms),
+            post_handler_ms: handler_exit_at
+                .and_then(|at| duration_ms(completed_at.saturating_duration_since(at))),
             total_duration_ms: first_poll_at
                 .and_then(|at| duration_ms(completed_at.saturating_duration_since(at))),
             parallel_gate_admitted: parallel_gate_admitted_at.is_some(),
@@ -131,6 +205,31 @@ pub(crate) fn record_authorization_state_coordination(duration: Duration) {
 pub(crate) fn mark_tool_handler_entry() {
     let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.mark_handler_entry());
 }
+
+pub(crate) fn mark_tool_handler_exit() {
+    let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.mark_handler_exit());
+}
+
+macro_rules! record_phase {
+    ($name:ident, $method:ident) => {
+        pub(crate) fn $name(duration: Duration) {
+            let _ = ACTIVE_TOOL_DISPATCH_TIMING.try_with(|timing| timing.$method(duration));
+        }
+    };
+}
+
+record_phase!(
+    record_workspace_evidence_before,
+    record_workspace_evidence_before
+);
+record_phase!(
+    record_workspace_evidence_after,
+    record_workspace_evidence_after
+);
+record_phase!(record_pre_tool_hook, record_pre_tool_hook);
+record_phase!(record_post_tool_hook, record_post_tool_hook);
+record_phase!(record_output_projection, record_output_projection);
+record_phase!(record_history_persistence, record_history_persistence);
 use crate::tools::context::ToolPayload;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::ToolDispatchInvocation;
@@ -170,11 +269,25 @@ impl ToolDispatchTrace {
             return;
         };
         let status = execution_status_for_outcome(result.outcome_context());
-        self.context.record_completed(status, result_payload);
+        let context = self.context.clone();
+        defer_trace_recording(move || context.record_completed(status, result_payload));
     }
 
     pub(crate) fn record_failed(&self, error: &FunctionCallError) {
-        self.context.record_failed(error);
+        if !self.context.is_enabled() {
+            return;
+        }
+        let context = self.context.clone();
+        let error = error.to_string();
+        defer_trace_recording(move || context.record_failed(error));
+    }
+}
+
+fn defer_trace_recording(record: impl FnOnce() + Send + 'static) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        drop(runtime.spawn_blocking(record));
+    } else {
+        record();
     }
 }
 

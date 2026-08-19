@@ -214,7 +214,10 @@ impl UnifiedExecProcess {
 
     pub(super) async fn raw_output_artifact(&self) -> Option<RawOutputArtifact> {
         match &self.raw_output_artifact {
-            Some(artifact) => Some(artifact.lock().await.clone()),
+            Some(artifact) => {
+                let artifact = artifact.lock().await.clone();
+                (!artifact.is_pending()).then_some(artifact)
+            }
             None => None,
         }
     }

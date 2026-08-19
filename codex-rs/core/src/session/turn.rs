@@ -2501,6 +2501,60 @@ pub(super) fn collect_explicit_app_ids_from_skill_items(
     connector_ids
 }
 
+fn compact_acknowledged_tool_search_outputs(input: Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
+    let last_index = input.len().saturating_sub(1);
+    if !input.iter().take(last_index).any(
+        |item| matches!(item, ResponseItem::ToolSearchOutput { tools, .. } if !tools.is_empty()),
+    ) {
+        return input;
+    }
+
+    input
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let mut item = item.clone();
+            if index < last_index
+                && let ResponseItem::ToolSearchOutput { tools, .. } = &mut item
+            {
+                *tools = tools
+                    .iter()
+                    .map(compact_tool_search_tool_identity)
+                    .collect();
+            }
+            item
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn compact_tool_search_tool_identity(tool: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = tool.as_object() else {
+        return tool.clone();
+    };
+    let Some(name) = object.get("name") else {
+        return tool.clone();
+    };
+
+    let mut identity = serde_json::Map::new();
+    if let Some(kind) = object.get("type") {
+        identity.insert("type".to_string(), kind.clone());
+    }
+    identity.insert("name".to_string(), name.clone());
+    if let Some(tools) = object.get("tools").and_then(serde_json::Value::as_array) {
+        identity.insert(
+            "tools".to_string(),
+            serde_json::Value::Array(
+                tools
+                    .iter()
+                    .map(compact_tool_search_tool_identity)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(identity)
+}
+
 #[instrument(level = "trace", skip_all)]
 pub(crate) fn build_prompt(
     input: impl Into<Arc<[ResponseItem]>>,
@@ -2508,7 +2562,7 @@ pub(crate) fn build_prompt(
     turn_context: &TurnContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
-    let input = input.into();
+    let input = compact_acknowledged_tool_search_outputs(input.into());
     Prompt {
         input: Arc::clone(&input),
         stable_context_fallback_input: Arc::clone(&input),
@@ -2519,7 +2573,7 @@ pub(crate) fn build_prompt(
         stable_context_manifest: Default::default(),
         prompt_provenance: Default::default(),
         digests: PromptDigests::default(),
-        tools: router.model_visible_specs(),
+        tools: router.model_visible_specs_for_turn(turn_context),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
@@ -2536,11 +2590,13 @@ pub(crate) fn build_projected_prompt(
     step_context: &StepContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
-    let input = prepared.shared_items();
-    let fallback_input = prepared.shared_fallback_items();
-    let tool_history_fallback_input = prepared.shared_unreplaced_items();
-    let stable_context_tool_history_fallback_input = prepared.shared_unreplaced_fallback_items();
-    let tools = router.model_visible_specs();
+    let input = compact_acknowledged_tool_search_outputs(prepared.shared_items());
+    let fallback_input = compact_acknowledged_tool_search_outputs(prepared.shared_fallback_items());
+    let tool_history_fallback_input =
+        compact_acknowledged_tool_search_outputs(prepared.shared_unreplaced_items());
+    let stable_context_tool_history_fallback_input =
+        compact_acknowledged_tool_search_outputs(prepared.shared_unreplaced_fallback_items());
+    let tools = router.model_visible_specs_for_turn(&step_context.turn);
     let tool_bytes = serde_json::to_vec(&tools).unwrap_or_default();
     let input_bytes = serde_json::to_vec(&input).unwrap_or_default();
     let mut manifest = prepared.stable_context_manifest().with_repository_identity(

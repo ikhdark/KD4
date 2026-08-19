@@ -164,6 +164,36 @@ impl ValidationFreshnessStatus {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CommandMutation {
+    ReadOnly,
+    KnownMutation { paths: Option<BTreeSet<PathBuf>> },
+    Uncertain,
+}
+
+impl CommandMutation {
+    pub(crate) fn may_have_mutated(&self) -> bool {
+        !matches!(self, Self::ReadOnly)
+    }
+
+    pub(crate) fn paths(&self) -> Option<&BTreeSet<PathBuf>> {
+        match self {
+            Self::KnownMutation { paths } => paths.as_ref(),
+            Self::ReadOnly | Self::Uncertain => None,
+        }
+    }
+}
+
+impl From<bool> for CommandMutation {
+    fn from(possible_mutation: bool) -> Self {
+        if possible_mutation {
+            Self::KnownMutation { paths: None }
+        } else {
+            Self::ReadOnly
+        }
+    }
+}
+
 /// Tracks the net text diff for the current turn from committed apply_patch
 /// mutations, without rereading the workspace filesystem.
 pub struct TurnDiffTracker {
@@ -267,16 +297,36 @@ impl TurnDiffTracker {
         environment_id: &str,
         cwd: Option<&Path>,
     ) {
+        let mutation = command_mutation(command, cwd);
+        self.record_exec_command_end_with_mutation_at(
+            command,
+            exit_code,
+            timed_out,
+            environment_id,
+            cwd,
+            mutation,
+        );
+    }
+
+    pub(crate) fn record_exec_command_end_with_mutation_at(
+        &mut self,
+        command: &[String],
+        exit_code: i32,
+        timed_out: bool,
+        environment_id: &str,
+        cwd: Option<&Path>,
+        mutation: CommandMutation,
+    ) {
         let was_post_mutation = self.has_unvalidated_mutation();
         let is_validation = is_validation_command(command);
         let format_only = is_format_only_command(command);
         let broad_filter = is_broad_validation_filter_command(command);
-        let possible_mutation = looks_like_mutating_command(command);
+        let possible_mutation = mutation.may_have_mutated();
 
         // A command can write before failing or timing out, so known mutators
         // always invalidate exact diff/freshness state.
-        if possible_mutation {
-            if let Some(paths) = command_mutation_paths(command, cwd) {
+        match mutation {
+            CommandMutation::KnownMutation { paths: Some(paths) } => {
                 self.record_mutation(
                     paths
                         .iter()
@@ -284,9 +334,11 @@ impl TurnDiffTracker {
                         .collect(),
                 );
                 self.invalidate();
-            } else {
+            }
+            CommandMutation::KnownMutation { paths: None } | CommandMutation::Uncertain => {
                 self.record_unknown_mutation();
             }
+            CommandMutation::ReadOnly => {}
         }
 
         let is_post_mutation = was_post_mutation || self.has_unvalidated_mutation();
@@ -1639,7 +1691,7 @@ fn is_read_only_powershell_command(command: &[String]) -> bool {
     };
     let script = command[command_position.saturating_add(1)..].join(" ");
     if script.trim().is_empty()
-        || script.contains(['>', '<', '`', '&', '{', '}', '[', ']'])
+        || script.contains(['>', '<', '`', '&'])
         || script.contains("$(")
         || script.contains("::")
     {
@@ -1649,68 +1701,284 @@ fn is_read_only_powershell_command(command: &[String]) -> bool {
     script
         .split([';', '|', '\n', '\r'])
         .filter(|segment| !segment.trim().is_empty())
-        .all(|segment| {
-            let segment = segment.trim();
-            let compact = segment
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>()
-                .to_ascii_lowercase();
-            if matches!(
-                compact.as_str(),
-                "$erroractionpreference='stop'" | "$erroractionpreference=\"stop\""
-            ) {
-                return true;
-            }
-            if segment.starts_with('$') {
-                return false;
-            }
+        .all(powershell_segment_is_read_only)
+}
 
-            let normalized = normalized_command_tokens(&[segment.to_string()]);
-            let Some(program) = normalized.first().map(|token| command_basename(token)) else {
-                return false;
-            };
-            if matches!(
-                program,
-                "compare-object"
-                    | "convertfrom-json"
-                    | "convertto-json"
-                    | "format-list"
-                    | "format-table"
-                    | "get-childitem"
-                    | "get-command"
-                    | "get-content"
-                    | "get-date"
-                    | "get-item"
-                    | "get-location"
-                    | "get-member"
-                    | "get-variable"
-                    | "join-path"
-                    | "measure-object"
-                    | "out-string"
-                    | "resolve-path"
-                    | "select-object"
-                    | "select-string"
-                    | "sort-object"
-                    | "split-path"
-                    | "test-path"
-                    | "write-host"
-                    | "write-information"
-                    | "write-output"
-                    | "write-verbose"
-                    | "write-warning"
-            ) {
-                return true;
-            }
-            if let Some(subcommand) = git_subcommand(&normalized) {
-                return is_read_only_git_subcommand(subcommand);
-            }
-            codex_shell_command::is_safe_command::is_known_safe_command(&normalized)
+fn powershell_segment_is_read_only(segment: &str) -> bool {
+    let segment = segment
+        .trim()
+        .trim_matches(|ch| matches!(ch, '{' | '}'))
+        .trim();
+    if segment.is_empty() {
+        return true;
+    }
+    if let Some((header, body)) = segment.split_once('{') {
+        return powershell_control_header_is_read_only(header)
+            && powershell_segment_is_read_only(body);
+    }
+    let compact = segment
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if matches!(
+        compact.as_str(),
+        "$erroractionpreference='stop'" | "$erroractionpreference=\"stop\""
+    ) {
+        return true;
+    }
+
+    if segment.starts_with('$') {
+        let Some((binding, expression)) = segment.split_once('=') else {
+            // Indexing, slicing, and emitting already-populated variables are
+            // process-local reads. File and process invocation syntax is rejected above.
+            return powershell_variable_expression_is_read_only(segment);
+        };
+        if !powershell_local_variable_binding_is_read_only(binding) {
+            return false;
+        }
+        let expression = expression.trim();
+        if expression.is_empty() {
+            return false;
+        }
+        if expression.starts_with(['\'', '"'])
+            || expression
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit() || ch == '-')
+        {
+            return true;
+        }
+        if expression.starts_with('$') {
+            return powershell_variable_expression_is_read_only(expression);
+        }
+        if expression.starts_with("@(") && expression.ends_with(')') {
+            return expression.chars().all(|ch| {
+                ch.is_ascii_digit()
+                    || ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        '@' | '$' | '(' | ')' | '[' | ']' | ',' | '.' | '-' | '\'' | '"'
+                    )
+            });
+        }
+        if expression.starts_with('(') && expression.ends_with(')') {
+            return powershell_invocation_is_read_only(&expression[1..expression.len() - 1]);
+        }
+        return powershell_invocation_is_read_only(expression);
+    }
+
+    if matches!(
+        segment
+            .split_ascii_whitespace()
+            .next()
+            .map(|word| word.to_ascii_lowercase())
+            .as_deref(),
+        Some("else" | "exit")
+    ) {
+        return true;
+    }
+    powershell_invocation_is_read_only(segment)
+}
+
+fn powershell_local_variable_binding_is_read_only(binding: &str) -> bool {
+    let Some(name) = binding.trim().strip_prefix('$') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn powershell_variable_expression_is_read_only(expression: &str) -> bool {
+    let expression = expression.trim();
+    expression.starts_with('$')
+        && !expression.contains('(')
+        && expression.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || byte.is_ascii_whitespace()
+                || matches!(byte, b'$' | b'_' | b':' | b'.' | b'[' | b']' | b'-')
         })
 }
 
+fn powershell_control_header_is_read_only(header: &str) -> bool {
+    let header = header.trim();
+    let Some(inner) = header
+        .strip_prefix("foreach")
+        .or_else(|| header.strip_prefix("ForEach"))
+        .map(str::trim)
+        .and_then(|value| value.strip_prefix('('))
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let Some((binding, collection)) = inner.split_once(" in ") else {
+        return false;
+    };
+    binding.trim().starts_with('$')
+        && powershell_segment_is_read_only(&format!("$collection = {}", collection.trim()))
+}
+
+fn powershell_invocation_is_read_only(invocation: &str) -> bool {
+    let normalized = normalized_command_tokens(&[invocation.to_string()]);
+    let Some(program) = normalized.first().map(|token| command_basename(token)) else {
+        return false;
+    };
+    if matches!(
+        program,
+        "compare-object"
+            | "convertfrom-json"
+            | "convertto-json"
+            | "format-list"
+            | "format-table"
+            | "get-childitem"
+            | "get-command"
+            | "get-content"
+            | "get-date"
+            | "get-item"
+            | "get-location"
+            | "get-member"
+            | "get-variable"
+            | "join-path"
+            | "measure-object"
+            | "out-string"
+            | "resolve-path"
+            | "select-object"
+            | "select-string"
+            | "sort-object"
+            | "split-path"
+            | "test-path"
+            | "write-host"
+            | "write-information"
+            | "write-output"
+            | "write-verbose"
+            | "write-warning"
+    ) {
+        return true;
+    }
+    if let Some(subcommand) = git_subcommand(&normalized) {
+        return is_read_only_git_subcommand(subcommand);
+    }
+    codex_shell_command::is_safe_command::is_known_safe_command(&normalized)
+}
+
 pub(crate) fn command_may_mutate(command: &[String]) -> bool {
-    looks_like_mutating_command(command)
+    command_mutation(command, None).may_have_mutated()
+}
+
+pub(crate) fn command_mutation(command: &[String], cwd: Option<&Path>) -> CommandMutation {
+    if !looks_like_mutating_command(command) {
+        return CommandMutation::ReadOnly;
+    }
+    let paths = command_mutation_paths(command, cwd);
+    if paths.is_some() || is_known_mutating_command(command) {
+        CommandMutation::KnownMutation { paths }
+    } else {
+        CommandMutation::Uncertain
+    }
+}
+
+pub(crate) fn resolve_uncertain_command_observation(
+    workspace_changed: Option<bool>,
+) -> CommandMutation {
+    match workspace_changed {
+        Some(false) => CommandMutation::ReadOnly,
+        Some(true) => CommandMutation::KnownMutation { paths: None },
+        None => CommandMutation::Uncertain,
+    }
+}
+
+fn is_known_mutating_command(command: &[String]) -> bool {
+    let normalized = normalized_command_tokens(command);
+    let unwrapped = unwrap_command_tokens(&normalized);
+    if validation_command_may_mutate(unwrapped)
+        || (is_format_only_command(command) && !unwrapped.iter().any(|token| token == "--check"))
+        || matches!(
+            unwrapped,
+            [first, second, ..]
+                if first == "just"
+                    && matches!(second.as_str(), "fix" | "fix-lane" | "fix-workspace" | "fmt")
+        )
+    {
+        return true;
+    }
+    if matches!(
+        git_subcommand(unwrapped),
+        Some(
+            "add"
+                | "apply"
+                | "checkout"
+                | "clean"
+                | "commit"
+                | "merge"
+                | "mv"
+                | "rebase"
+                | "reset"
+                | "restore"
+                | "rm"
+                | "switch"
+        )
+    ) {
+        return true;
+    }
+    let tokens = shell_filter_tokens(&command.join(" ").to_ascii_lowercase());
+    if tokens.iter().any(|token| {
+        matches!(
+            command_basename(token),
+            "apply_patch"
+                | "add-content"
+                | "chmod"
+                | "chown"
+                | "chgrp"
+                | "copy-item"
+                | "cp"
+                | "dd"
+                | "del"
+                | "erase"
+                | "md"
+                | "mkdir"
+                | "move-item"
+                | "mv"
+                | "new-item"
+                | "ni"
+                | "out-file"
+                | "patch"
+                | "rd"
+                | "reg"
+                | "remove-item"
+                | "ren"
+                | "rename-item"
+                | "rm"
+                | "rmdir"
+                | "rsync"
+                | "set-content"
+                | "set-item"
+                | "set-itemproperty"
+                | "tee"
+                | "tee-object"
+                | "touch"
+                | "truncate"
+        )
+    }) || command.join(" ").contains(['>', '`'])
+    {
+        return true;
+    }
+    matches!(
+        unwrapped.first().map(|token| command_basename(token)),
+        Some(
+            "bash"
+                | "cmd"
+                | "node"
+                | "perl"
+                | "powershell"
+                | "pwsh"
+                | "python"
+                | "python3"
+                | "ruby"
+                | "sh"
+        )
+    )
 }
 
 pub(crate) fn command_reads_repository_history(command: &[String]) -> bool {

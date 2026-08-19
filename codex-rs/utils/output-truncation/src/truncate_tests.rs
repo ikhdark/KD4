@@ -348,7 +348,7 @@ fn byte_count_conversion_clamps_non_positive_values() {
 
 #[test]
 fn optimization_priority_coherent_packet_defaults_precede_trimming() {
-    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
+    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 4_000);
     assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
     assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
     assert_eq!(

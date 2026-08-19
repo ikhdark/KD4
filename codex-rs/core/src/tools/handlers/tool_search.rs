@@ -20,7 +20,8 @@ use codex_tools::ToolName;
 use codex_tools::ToolSearchEntry;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
-use codex_tools::coalesce_loadable_tool_specs;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -31,12 +32,16 @@ use tracing::instrument;
 const MAX_TOOL_SEARCH_HANDLER_CACHE: usize = 4;
 const MAX_TOOL_SEARCH_RESULT_CACHE: usize = 32;
 const MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES: usize = 256 * 1024;
-const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 32 * 1024;
+// Tool-search outputs stay in model-visible history. Keep each serialized
+// result near a 768-token projection (using the core's 4 bytes/token estimate)
+// while exact-name recovery preserves a callable schema for oversized tools.
+const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 3 * 1024;
 const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 
 pub struct ToolSearchHandler {
+    inventory_fingerprint: [u8; 32],
     search_infos: Vec<ToolSearchInfo>,
     spec: ToolSpec,
     search_engine: SearchEngine<usize>,
@@ -64,6 +69,102 @@ struct ToolSearchCacheEntry {
 struct ToolSearchResult {
     tools: Vec<LoadableToolSpec>,
     omitted_result_count: usize,
+}
+
+struct ToolSearchResultBuilder {
+    tools: Vec<LoadableToolSpec>,
+    // Maintain the exact compact JSON size incrementally; an empty array is two bytes.
+    encoded_len: usize,
+}
+
+impl ToolSearchResultBuilder {
+    fn new() -> Self {
+        Self {
+            tools: Vec::new(),
+            encoded_len: 2,
+        }
+    }
+
+    fn try_push(&mut self, candidate: &LoadableToolSpec) -> bool {
+        match candidate {
+            LoadableToolSpec::Function(_) => {
+                let Ok(encoded) = serde_json::to_vec(candidate) else {
+                    return false;
+                };
+                let separator = usize::from(!self.tools.is_empty());
+                let Some(next_len) = self
+                    .encoded_len
+                    .checked_add(separator)
+                    .and_then(|len| len.checked_add(encoded.len()))
+                else {
+                    return false;
+                };
+                if next_len > MAX_TOOL_SEARCH_RESULT_BYTES {
+                    return false;
+                }
+                self.tools.push(candidate.clone());
+                self.encoded_len = next_len;
+                true
+            }
+            LoadableToolSpec::Namespace(namespace) => {
+                let existing_index = self.tools.iter().position(|tool| {
+                    matches!(tool, LoadableToolSpec::Namespace(existing) if existing.name == namespace.name)
+                });
+                let Some(existing_index) = existing_index else {
+                    let Ok(encoded) = serde_json::to_vec(candidate) else {
+                        return false;
+                    };
+                    let separator = usize::from(!self.tools.is_empty());
+                    let Some(next_len) = self
+                        .encoded_len
+                        .checked_add(separator)
+                        .and_then(|len| len.checked_add(encoded.len()))
+                    else {
+                        return false;
+                    };
+                    if next_len > MAX_TOOL_SEARCH_RESULT_BYTES {
+                        return false;
+                    }
+                    self.tools.push(candidate.clone());
+                    self.encoded_len = next_len;
+                    return true;
+                };
+
+                let LoadableToolSpec::Namespace(existing) = &self.tools[existing_index] else {
+                    unreachable!("namespace index must point to a namespace");
+                };
+                let mut next_len = self.encoded_len;
+                let mut has_tools = !existing.tools.is_empty();
+                for tool in &namespace.tools {
+                    let Ok(encoded) = serde_json::to_vec(tool) else {
+                        return false;
+                    };
+                    let separator = usize::from(has_tools);
+                    let Some(updated) = next_len
+                        .checked_add(separator)
+                        .and_then(|len| len.checked_add(encoded.len()))
+                    else {
+                        return false;
+                    };
+                    next_len = updated;
+                    has_tools = true;
+                }
+                if next_len > MAX_TOOL_SEARCH_RESULT_BYTES {
+                    return false;
+                }
+                let LoadableToolSpec::Namespace(existing) = &mut self.tools[existing_index] else {
+                    unreachable!("namespace index must point to a namespace");
+                };
+                existing.tools.extend(namespace.tools.iter().cloned());
+                self.encoded_len = next_len;
+                true
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<LoadableToolSpec> {
+        self.tools
+    }
 }
 
 struct ByteBudgetWriter {
@@ -96,11 +197,14 @@ impl Write for ByteBudgetWriter {
 impl ToolSearchHandlerCache {
     #[instrument(level = "trace", skip_all, fields(search_info_count = search_infos.len()))]
     pub(crate) fn get_or_build(&self, search_infos: Vec<ToolSearchInfo>) -> Arc<ToolSearchHandler> {
+        // Hash the inventory before taking the cache mutex so lookup cost is
+        // constant in both inventory count and schema size while contended.
+        let inventory_fingerprint = tool_search_inventory_fingerprint(&search_infos);
         {
             let mut cached = self.cached();
             if let Some(index) = cached
                 .iter()
-                .position(|handler| handler.search_infos == search_infos)
+                .position(|handler| handler.inventory_fingerprint == inventory_fingerprint)
                 && let Some(handler) = cached.remove(index)
             {
                 cached.push_back(Arc::clone(&handler));
@@ -113,12 +217,14 @@ impl ToolSearchHandlerCache {
             }
         }
 
-        let handler = Arc::new(ToolSearchHandler::new(search_infos));
+        let handler = Arc::new(ToolSearchHandler::new_with_fingerprint(
+            search_infos,
+            inventory_fingerprint,
+        ));
         let mut cached = self.cached();
-        if let Some(index) = cached
-            .iter()
-            .position(|cached_handler| cached_handler.search_infos == handler.search_infos)
-            && let Some(cached_handler) = cached.remove(index)
+        if let Some(index) = cached.iter().position(|cached_handler| {
+            cached_handler.inventory_fingerprint == handler.inventory_fingerprint
+        }) && let Some(cached_handler) = cached.remove(index)
         {
             cached.push_back(Arc::clone(&cached_handler));
             tracing::trace!(
@@ -159,6 +265,14 @@ impl ToolSearchHandler {
         fields(search_info_count = search_infos.len())
     )]
     pub(crate) fn new(search_infos: Vec<ToolSearchInfo>) -> Self {
+        let inventory_fingerprint = tool_search_inventory_fingerprint(&search_infos);
+        Self::new_with_fingerprint(search_infos, inventory_fingerprint)
+    }
+
+    fn new_with_fingerprint(
+        search_infos: Vec<ToolSearchInfo>,
+        inventory_fingerprint: [u8; 32],
+    ) -> Self {
         let has_unnamed_tools = search_infos
             .iter()
             .any(|search_info| search_info.source_info.is_none());
@@ -181,12 +295,45 @@ impl ToolSearchHandler {
             SearchEngineBuilder::<usize>::with_documents(Language::English, documents).build();
 
         Self {
+            inventory_fingerprint,
             search_infos,
             spec,
             search_engine,
             result_cache: Mutex::new(VecDeque::new()),
         }
     }
+}
+
+fn tool_search_inventory_fingerprint(search_infos: &[ToolSearchInfo]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for search_info in search_infos {
+        update_fingerprint_field(&mut hasher, search_info.entry.search_text.as_bytes());
+        for tool_name in &search_info.entry.tool_names {
+            update_fingerprint_field(&mut hasher, tool_name.as_bytes());
+        }
+        if let Some(source_info) = &search_info.source_info {
+            hasher.update([1]);
+            update_fingerprint_field(&mut hasher, source_info.name.as_bytes());
+            if let Some(description) = &source_info.description {
+                hasher.update([1]);
+                update_fingerprint_field(&mut hasher, description.as_bytes());
+            } else {
+                hasher.update([0]);
+            }
+        } else {
+            hasher.update([0]);
+        }
+        if let Ok(encoded) = serde_json::to_vec(&search_info.entry.output) {
+            update_fingerprint_field(&mut hasher, &encoded);
+        }
+        hasher.update([0xff]);
+    }
+    hasher.finalize().into()
+}
+
+fn update_fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 impl ToolExecutor<ToolInvocation> for ToolSearchHandler {
@@ -331,44 +478,18 @@ impl ToolSearchHandler {
         results: impl IntoIterator<Item = &'a ToolSearchEntry>,
         exact_query: Option<&str>,
     ) -> Result<ToolSearchResult, FunctionCallError> {
-        let mut retained_outputs = Vec::new();
-        let mut retained_tools = Vec::new();
+        let mut retained = ToolSearchResultBuilder::new();
         let mut omitted_result_count = 0usize;
         for result in results {
-            let tools = coalesce_loadable_tool_specs(
-                retained_outputs
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(result.output.clone())),
-            );
-            if tool_search_result_fits_budget(&tools) {
-                retained_outputs.push(result.output.clone());
-                retained_tools = tools;
+            if retained.try_push(&result.output) {
             } else if let Some(recovery) =
                 exact_query.and_then(|query| compact_exact_match_recovery(&result.output, query))
             {
-                let tools = coalesce_loadable_tool_specs(
-                    retained_outputs
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once(recovery.clone())),
-                );
-                if tool_search_result_fits_budget(&tools) {
-                    retained_outputs.push(recovery);
-                    retained_tools = tools;
+                if retained.try_push(&recovery) {
                 } else if let Some(minimal_recovery) = exact_query
                     .and_then(|query| minimal_exact_match_recovery(&result.output, query))
                 {
-                    let tools = coalesce_loadable_tool_specs(
-                        retained_outputs
-                            .iter()
-                            .cloned()
-                            .chain(std::iter::once(minimal_recovery.clone())),
-                    );
-                    if tool_search_result_fits_budget(&tools) {
-                        retained_outputs.push(minimal_recovery);
-                        retained_tools = tools;
-                    } else {
+                    if !retained.try_push(&minimal_recovery) {
                         omitted_result_count = omitted_result_count.saturating_add(1);
                     }
                 } else {
@@ -379,7 +500,7 @@ impl ToolSearchHandler {
             }
         }
         Ok(ToolSearchResult {
-            tools: retained_tools,
+            tools: retained.finish(),
             omitted_result_count,
         })
     }
@@ -641,11 +762,6 @@ fn tool_search_cache_entry_fits_budget(
         return false;
     };
     let mut writer = ByteBudgetWriter::new(tool_budget);
-    serde_json::to_writer(&mut writer, tools).is_ok()
-}
-
-fn tool_search_result_fits_budget(tools: &[LoadableToolSpec]) -> bool {
-    let mut writer = ByteBudgetWriter::new(MAX_TOOL_SEARCH_RESULT_BYTES);
     serde_json::to_writer(&mut writer, tools).is_ok()
 }
 

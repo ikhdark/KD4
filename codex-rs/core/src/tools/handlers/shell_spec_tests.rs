@@ -96,7 +96,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
-                    "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.".to_string(),
+                    "Wait before yielding output. Defaults to 2000 ms; effective range is 250-30000 ms.".to_string(),
                 )),
         ),
         (

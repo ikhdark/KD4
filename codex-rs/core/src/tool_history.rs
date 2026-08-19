@@ -1268,6 +1268,17 @@ pub(crate) fn tool_call_observes_workspace(tool_identity: &str, payload: &ToolPa
         && !crate::turn_diff_tracker::command_reads_repository_history(&command)
 }
 
+/// Returns whether a workspace-capable process call has an independently
+/// enforced read-only execution boundary and may use the shared gate.
+pub(crate) fn tool_call_is_proven_read_only(_tool_identity: &str, _payload: &ToolPayload) -> bool {
+    // A command-name mutation heuristic cannot prove that launching a process
+    // is side-effect-free: validation commands can run build scripts and an
+    // otherwise read-oriented executable can be replaced or configured to
+    // write. Keep workspace-capable process calls behind the exclusive gate
+    // until admission is backed by an independently enforced read-only sandbox.
+    false
+}
+
 pub(crate) fn source_dependencies_for_tool_call(
     tool_identity: &str,
     payload: &ToolPayload,

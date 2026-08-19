@@ -460,7 +460,7 @@ impl ShellCommandHandler {
                     ));
                 };
                 let configuration = format!(
-                    "features={:?};semantic_timeout={}",
+                    "repository_epoch={repository_epoch};features={:?};semantic_timeout={}",
                     turn.config.features.get(),
                     if leaf.semantic_timeout {
                         leaf.timeout_ms.to_string()
@@ -492,7 +492,10 @@ impl ShellCommandHandler {
                     .direct_validation_implementation_identity(&leaf.covered_paths)
                     .await
                     .map_err(FunctionCallError::RespondToModel)?;
-                let configuration = format!("features={:?}", turn.config.features.get());
+                let configuration = format!(
+                    "repository_epoch={repository_epoch};features={:?}",
+                    turn.config.features.get()
+                );
                 validation_identity_with_scope(
                     repository_key.as_bytes(),
                     exec_params.cwd.to_string_lossy(),

@@ -1288,7 +1288,7 @@ pub(crate) fn validate_structured_validation_leaf(
         && !cargo_test_has_package_and_filter(args)
     {
         return Err(
-            "auto-validation cargo test routes must name both a package and a test filter"
+            "auto-validation cargo test routes must name a package, one exact test ID, and pass `-- --exact`"
                 .to_string(),
         );
     }
@@ -1298,27 +1298,31 @@ pub(crate) fn validate_structured_validation_leaf(
     {
         return Err("auto-validation cargo check routes must name a package".to_string());
     }
-    if program == "just"
-        && matches!(
-            args.first().map(String::as_str),
-            Some("test-fast" | "test-compile" | "test-lane-main")
-        )
-    {
-        return Err("auto-validation just routes must name a focused lane or package".to_string());
-    }
     if program == "just" {
         match args.first().map(String::as_str) {
+            Some("test-fast") if !nextest_args_have_package_and_filter(&args[1..]) => {
+                return Err(
+                    "auto-validation just test-fast routes must name a package and use an exact `-E test(=...)` selector"
+                        .to_string(),
+                );
+            }
+            Some("test-compile" | "test-lane-main") => {
+                return Err(
+                    "auto-validation just routes must name a focused lane or package".to_string(),
+                );
+            }
             Some("test-lane" | "test-lane-fast")
                 if !nextest_args_have_package_and_filter(&args[2..]) =>
             {
                 return Err(
-                    "auto-validation just test lanes must name both a package and a test filter"
+                    "auto-validation just test lanes must name a package and use an exact `-E test(=...)` selector"
                         .to_string(),
                 );
             }
             Some("test-lane-package") if !nextest_args_have_filter(&args[2..]) => {
                 return Err(
-                    "auto-validation just package lanes must name a test filter".to_string()
+                    "auto-validation just package lanes must use an exact `-E test(=...)` selector"
+                        .to_string(),
                 );
             }
             _ => {}
@@ -1370,11 +1374,15 @@ fn cargo_args_have_package(args: &[String]) -> bool {
 
 fn cargo_test_has_package_and_filter(args: &[String]) -> bool {
     let has_package = cargo_args_have_package(args);
-    let mut has_filter = false;
+    let mut filters = Vec::new();
+    let mut harness_exact = false;
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
         if arg == "--" {
+            harness_exact = args[index + 1..]
+                .iter()
+                .any(|argument| argument == "--exact");
             break;
         }
         if matches!(arg.as_str(), "-p" | "--package") {
@@ -1386,11 +1394,14 @@ fn cargo_test_has_package_and_filter(args: &[String]) -> bool {
             continue;
         }
         if !arg.starts_with("--package=") && !arg.starts_with('-') {
-            has_filter = true;
+            filters.push(arg.as_str());
         }
         index += 1;
     }
-    has_package && has_filter
+    has_package
+        && harness_exact
+        && filters.len() == 1
+        && filters.first().is_some_and(|filter| exact_test_id(filter))
 }
 
 fn nextest_args_have_package_and_filter(args: &[String]) -> bool {
@@ -1411,20 +1422,38 @@ fn nextest_args_have_filter(args: &[String]) -> bool {
         let (option, inline_value) = split_option(arg);
         match option {
             "-E" | "--filterset" | "--filter-expr" => {
-                if inline_value.is_some_and(|value| !value.is_empty())
-                    || args.get(index + 1).is_some_and(|value| !value.is_empty())
+                if inline_value.is_some_and(exact_nextest_test_expression)
+                    || args
+                        .get(index + 1)
+                        .is_some_and(|value| exact_nextest_test_expression(value))
                 {
                     return true;
                 }
                 index += 1;
             }
             "-p" | "--package" | "--features" => index += usize::from(inline_value.is_none()),
-            _ if !arg.starts_with('-') => return true,
             _ => {}
         }
         index += 1;
     }
     false
+}
+
+fn exact_nextest_test_expression(value: &str) -> bool {
+    let Some(test_id) = value
+        .strip_prefix("test(=")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+    exact_test_id(test_id)
+}
+
+fn exact_test_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 fn cargo_option_takes_value(arg: &str) -> bool {
@@ -1560,7 +1589,12 @@ fn validate_nextest_forwarded_args(args: &[String]) -> Result<(), String> {
                 }
             }
             "-E" | "--filterset" | "--filter-expr" => {
-                require_nonempty_option_value(args, &mut index, inline_value, option)?;
+                let value = take_option_value(args, &mut index, inline_value, option)?;
+                if !exact_nextest_test_expression(value) {
+                    return Err(format!(
+                        "nextest {option} must select one exact test with `test(=...)`"
+                    ));
+                }
             }
             "--features" => {
                 let value = take_option_value(args, &mut index, inline_value, option)?;
@@ -1587,10 +1621,11 @@ fn validate_nextest_forwarded_args(args: &[String]) -> Result<(), String> {
             _ if arg.starts_with('-') => {
                 return Err(format!("nextest forwarded option is not admitted: {arg}"));
             }
-            _ if !safe_nextest_filter(arg) => {
-                return Err(format!("nextest test filter is not admitted: {arg}"));
+            _ => {
+                return Err(format!(
+                    "unrecognized raw nextest module path `{arg}`; use `-E test(=...)`"
+                ));
             }
-            _ => {}
         }
         index += 1;
     }
@@ -1639,18 +1674,6 @@ fn safe_feature_list(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b',' | b'/')
         })
-}
-
-fn safe_nextest_filter(value: &str) -> bool {
-    !value.is_empty()
-        && !value.starts_with('@')
-        && !matches!(
-            value,
-            "archive" | "extract" | "remap" | "metadata" | "rerun" | "output"
-        )
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 fn validate_python_validation(args: &[String], repo_root: &Path) -> Result<(), String> {

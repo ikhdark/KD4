@@ -203,7 +203,6 @@ impl CodeModeWaitHandler {
                     args.max_tokens,
                     started_at,
                 )
-                .await
                 .map_err(FunctionCallError::RespondToModel)?;
                 output =
                     attach_drained_wait_evidence(&exec, output, &cell_id, drained_observations);

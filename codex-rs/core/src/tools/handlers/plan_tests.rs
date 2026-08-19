@@ -192,6 +192,39 @@ fn unchanged_plan_output_remains_compact() {
 }
 
 #[test]
+fn recommended_fixes_normalization_identifies_only_changed_steps() {
+    let requested = UpdatePlanArgs {
+        explanation: None,
+        plan: vec![
+            PlanItemArg {
+                id: Some("proven".to_string()),
+                step: "proven".to_string(),
+                status: StepStatus::Passed,
+                ..Default::default()
+            },
+            PlanItemArg {
+                id: Some("missing".to_string()),
+                step: "missing".to_string(),
+                status: StepStatus::Passed,
+                ..Default::default()
+            },
+        ],
+    };
+    let mut current = requested.clone();
+    current.plan[1].status = StepStatus::InProgress;
+
+    let reason = plan_normalization_reason(
+        &requested,
+        &current,
+        PlanUpdateEffect::StatusOnly,
+        Some("missing"),
+    )
+    .expect("one status was normalized");
+    assert!(reason.contains("[missing]"));
+    assert!(!reason.contains("[proven]"));
+}
+
+#[test]
 fn generated_artifact_schema_requires_repository_relative_paths() {
     let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
     let artifact_schema = tool

@@ -616,6 +616,13 @@ struct TerminalInteractionMilestone {
     cleared_active_turn: bool,
 }
 
+fn select_terminal_authority<T>(durable: Option<T>, candidate: T) -> (T, bool) {
+    match durable {
+        Some(authority) => (authority, true),
+        None => (candidate, false),
+    }
+}
+
 async fn seal_terminal_final_proof(
     session: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -1290,7 +1297,7 @@ impl Session {
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
                 self.services
                     .task_evidence
-                    .commit_terminal_decision_and_claim(claim),
+                    .commit_terminal_decision_and_claim(claim.clone()),
             )
             .await;
         let mut candidate_rollout_fallback_allowed = true;
@@ -1384,9 +1391,7 @@ impl Session {
             }
         }
 
-        let authority = if let Some(authority) = authority {
-            authority
-        } else if !candidate_rollout_fallback_allowed {
+        if authority.is_none() && !candidate_rollout_fallback_allowed {
             if let Some(permit) = finalization.permit.as_ref() {
                 permit.mark_durable_commit(true);
             }
@@ -1396,68 +1401,23 @@ impl Session {
                 live_delivered: false,
                 cleared_active_turn,
             };
-        } else {
-            let reason = "terminalization failed before an authoritative terminal event could be durably established";
-            warn!(turn_id = %turn_context.sub_id, reason);
-            let degraded = EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: turn_context.sub_id.clone(),
-                last_agent_message: Some(reason.to_string()),
-                surfaced_result: None,
-                error: Some(ErrorEvent {
-                    message: reason.to_string(),
-                    codex_error_info: Some(CodexErrorInfo::InternalServerError),
-                }),
-                completion: Some(TaskCompletionGate {
-                    status: TaskCompletionStatus::Partial,
-                    reasons: vec![reason.to_string()],
-                    evidence_path: None,
-                }),
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                timing: None,
-            });
-            let Some(fingerprint) = terminal_event_fingerprint(&degraded) else {
-                warn!(
-                    turn_id = %turn_context.sub_id,
-                    "failed to fingerprint the degraded terminal event"
-                );
-                if let Some(permit) = finalization.permit.as_ref() {
-                    permit.mark_durable_commit(false);
-                }
-                let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-                return TerminalInteractionMilestone {
-                    live_attempted: false,
-                    live_delivered: false,
-                    cleared_active_turn,
-                };
-            };
-            let degraded_authority = AuthoritativeTerminalEventV1 {
-                version: 1,
-                terminal_identity: terminal_identity.clone(),
-                turn_id: turn_context.sub_id.clone(),
-                event: degraded,
-                fingerprint,
-                semantic_outcome: "terminalization_failed".to_string(),
-                final_proof_identity: None,
-            };
-            if let Some(existing) = self
-                .reconcile_terminal_authority_from_rollout(&degraded_authority)
-                .await
-            {
-                rollout_mirrored = true;
-                existing
-            } else {
-                rollout_mirrored = self
-                    .ensure_terminal_authority_mirrored_in_rollout(&degraded_authority)
-                    .await;
-                degraded_authority
-            }
-        };
+        }
+        let (authority, foreground_durable_authority) =
+            select_terminal_authority(authority, candidate_authority);
+        if !foreground_durable_authority {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                "terminal authority persistence missed the foreground deadline; preserving the exact candidate and scheduling durable recovery"
+            );
+            self.schedule_terminal_authority_persistence(authority.clone(), claim);
+        }
 
         *event = authority.event.clone();
         let mut permit_delivery_claimed = false;
         if let Some(permit) = finalization.permit.as_ref() {
+            // This exact candidate now owns the process-local terminal slot. Treat the
+            // terminal milestone as committed so fail-safe cleanup does not invalidate the
+            // valid result while the background task mirrors that same authority durably.
             permit.mark_durable_commit(true);
             permit_delivery_claimed = permit.mark_delivery_claimed();
         }
@@ -1673,6 +1633,57 @@ impl Session {
                         break;
                     }
                 }
+            }
+        });
+    }
+
+    fn schedule_terminal_authority_persistence(
+        self: &Arc<Self>,
+        authority: AuthoritativeTerminalEventV1,
+        claim: TerminalDecisionClaim,
+    ) {
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            let retry_interval = Duration::from_millis(500);
+            loop {
+                if session.shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+                let claim_matches = match session
+                    .services
+                    .task_evidence
+                    .commit_terminal_decision_and_claim(claim.clone())
+                    .await
+                {
+                    TerminalClaimResult::Claimed(existing)
+                    | TerminalClaimResult::AlreadyClaimed(existing) => {
+                        existing.fingerprint == authority.fingerprint
+                    }
+                    TerminalClaimResult::Conflict {
+                        authoritative: Some(existing),
+                        ..
+                    } => {
+                        if existing.fingerprint != authority.fingerprint {
+                            warn!(
+                                turn_id = %authority.turn_id,
+                                "durable terminal recovery found a conflicting authoritative event"
+                            );
+                        }
+                        return;
+                    }
+                    TerminalClaimResult::Conflict {
+                        authoritative: None,
+                        ..
+                    } => return,
+                    TerminalClaimResult::Failed => false,
+                };
+                let rollout_mirrored = session
+                    .ensure_terminal_authority_mirrored_in_rollout(&authority)
+                    .await;
+                if claim_matches && rollout_mirrored {
+                    return;
+                }
+                tokio::time::sleep(retry_interval).await;
             }
         });
     }

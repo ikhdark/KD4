@@ -163,7 +163,67 @@ pub(crate) async fn capture_workspace_evidence_identity(
     cwd: &Path,
 ) -> Option<WorkspaceEvidenceIdentity> {
     let repo_root = get_git_repo_root(cwd)?;
-    let capture = capture_candidate_diff(cwd).await?;
+    let (head, index_diff, worktree_diff, untracked) = tokio::join!(
+        candidate_git_output(&repo_root, &["rev-parse", "--verify", "HEAD"]),
+        candidate_git_output(
+            &repo_root,
+            &[
+                "diff",
+                "--cached",
+                "--binary",
+                "--no-ext-diff",
+                "--",
+                ".",
+                GENERATED_CODEX_EVAL_PATHSPEC,
+            ],
+        ),
+        candidate_git_output(
+            &repo_root,
+            &[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "--",
+                ".",
+                GENERATED_CODEX_EVAL_PATHSPEC,
+            ],
+        ),
+        candidate_git_output(
+            &repo_root,
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ".",
+                GENERATED_CODEX_EVAL_PATHSPEC,
+            ],
+        ),
+    );
+    let index_diff = index_diff?;
+    let worktree_diff = worktree_diff?;
+    let untracked = untracked?;
+    let head_identity = head.and_then(|head| {
+        String::from_utf8(head)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let untracked_paths = untracked
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(std::str::from_utf8)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let untracked_manifest = candidate_untracked_manifest(
+        repo_root.clone(),
+        untracked_paths.into_iter().map(str::to_string).collect(),
+    )
+    .await?;
+    let mut worktree_hasher = Sha256::new();
+    worktree_hasher.update(&worktree_diff);
+    worktree_hasher.update(&untracked_manifest);
     Some(WorkspaceEvidenceIdentity {
         repository_root: Some(
             dunce::canonicalize(&repo_root)
@@ -171,9 +231,9 @@ pub(crate) async fn capture_workspace_evidence_identity(
                 .to_string_lossy()
                 .into_owned(),
         ),
-        head_identity: capture.head_identity,
-        index_identity: capture.index_identity,
-        worktree_identity: capture.worktree_identity,
+        head_identity,
+        index_identity: Some(format!("{:x}", Sha256::digest(&index_diff))),
+        worktree_identity: Some(format!("{:x}", worktree_hasher.finalize())),
     })
 }
 
@@ -554,10 +614,10 @@ impl GitWorkspaceCache {
 
     /// Returns a freshly captured content-based workspace identity.
     ///
-    /// Watcher delivery is asynchronous, so a watcher generation cannot prove
-    /// that an external edit has not happened but is still waiting in the
-    /// event queue. Evidence freshness therefore must not reuse the metadata
-    /// caches used by non-authoritative repository discovery.
+    /// Watcher delivery is asynchronous, so an unchanged watcher generation
+    /// cannot prove that an external edit is not still waiting in the event
+    /// queue. Authoritative evidence therefore never reuses watcher-backed
+    /// metadata caches.
     pub(crate) async fn workspace_evidence_identity(
         &self,
         cwd: &Path,

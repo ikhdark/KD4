@@ -1,45 +1,39 @@
 # Core runtime policy
 
-This file applies inside `codex-rs/core` and inherits `codex-rs/AGENTS.md`.
-
 ## Core boundary
 
 - Keep `codex-core` focused on session and turn orchestration, model-request and
   context assembly, tool execution flow, approvals and sandbox flow, and runtime
   event handling.
-- Before adding an independent concept or public API to core, follow the owner in
-  [`../../SOURCEMAP.md`](../../SOURCEMAP.md). Shared wire types, app-server
-  behavior, configuration, tool contracts, and persisted state normally belong
-  to their existing crates rather than core.
+- Follow [`../../SOURCEMAP.md`](../../SOURCEMAP.md) before adding concepts or
+  public APIs. Shared wire types, app-server behavior, config, tool contracts,
+  and persisted state normally stay in their existing crates.
 
 ## Model-visible context invariants
 
-- Build history incrementally, preserve cache-friendly stable prefixes, and
-  hard-bound every injected item. No individual item may exceed 10K tokens;
-  treat a new item that can exceed 1K tokens as P0 review scope.
+- Build history incrementally with stable prefixes and hard bounds. No injected
+  item may exceed 10K tokens; new items above 1K are P0 review scope.
 - Define injected fragments under `src/context` as structs implementing
   `ContextualUserFragment`.
 - Pre-sampling estimates must cover every item that will become model-visible
   before the request and must not consume state, mutate history, emit warnings,
   or advance extension state.
-- Concurrent context contributors must still apply fragments in registration
-  order. Estimate mode stays side-effect-free; runtime mutation must synchronize
-  shared state.
-- Keep startup prewarm and the first normal turn on the same versioned stable
-  prompt-prefix cache key, preserve guardian/review overrides, and never reuse
-  response IDs or turn-scoped transport state across turns.
+- Apply concurrent fragments in registration order; estimates stay
+  side-effect-free and runtime mutations synchronize shared state.
+- Keep prewarm and the first turn on the same versioned prompt-prefix key,
+  preserve guardian/review overrides, and never reuse turn-scoped response or
+  transport state.
 - Telemetry-only readiness or exploration work must remain behavior-neutral and
   model-invisible unless the accepted task explicitly changes steering or
   control flow.
-- Tool-search breadth changes must preserve requested limits, result schemas,
-  deterministic ordering, and permission, sandbox, approval, patching, and
-  execution-safety behavior.
+- Tool-search changes must preserve limits, schemas, deterministic ordering,
+  permissions, sandboxing, approvals, patching, and execution safety.
 
 ## Diagnostics and compatibility
 
-- Request diagnostics may record identifiers, endpoint or transport names,
-  status and auth error codes, retry actions, and correlation IDs. Never record
-  prompts, response bodies, tool payloads, secrets, tokens, or raw auth headers.
+- Diagnostics may record identifiers, endpoint/transport names, status/auth
+  codes, retry actions, and correlation IDs—never prompts, bodies, payloads,
+  secrets, tokens, or raw auth headers.
 - Record retry or fallback cause and action where the decision occurs. Runtime
   behavior must not depend on telemetry or rollout-trace export succeeding.
 - Trace core changes through app-server APIs, CLI parameters, configuration, and
@@ -47,10 +41,8 @@ This file applies inside `codex-rs/core` and inherits `codex-rs/AGENTS.md`.
 
 ## Core validation delta
 
-- Agent-logic changes require focused integration coverage for major behavior.
-  Prefer the existing `core/suite` and `test_codex` helpers; keep unit tests in
-  dedicated `*_tests.rs` files when integration coverage is not the right level.
+- Major agent-logic changes require focused integration coverage. Prefer
+  `core/suite` and `test_codex`; otherwise use dedicated `*_tests.rs` files.
 - Prefer `core_test_support::responses` and structured request assertions over
   manual JSON digging in core end-to-end coverage.
-- Core behavior intended for Codex Desktop still requires the root publish and
-  restart proof; Rust tests alone are insufficient.
+- Desktop behavior still requires root publish/restart proof.

@@ -492,6 +492,7 @@ struct SamplingRequestSignalState {
     deterministic_continuation_receipts: BTreeSet<String>,
     registered_count: usize,
     wait_call_count: usize,
+    process_monitor_count: usize,
     saw_artifact_read: bool,
     saw_canonical_artifact_requirement: bool,
     saw_validation: bool,
@@ -556,6 +557,7 @@ impl SamplingRequestSignalCollector {
     ) -> SamplingToolCallRegistration {
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
         let wait = is_wait_tool(tool_name);
+        let live_process_poll = tool_name_matches(tool_name, "write_stdin");
         let direct_code_mode_exec = crate::tools::code_mode::is_exec_tool_name(tool_name);
         let action_identity = deterministic_action_identity(tool_name, payload);
         let structured_action = structured_action_identity(tool_name, payload);
@@ -609,6 +611,9 @@ impl SamplingRequestSignalCollector {
         state.registered_count = state.registered_count.saturating_add(1);
         if wait {
             state.wait_call_count = state.wait_call_count.saturating_add(1);
+        }
+        if live_process_poll {
+            state.process_monitor_count = state.process_monitor_count.saturating_add(1);
         }
         if direct_code_mode_exec {
             state.direct_code_mode_exec_count = state.direct_code_mode_exec_count.saturating_add(1);
@@ -1063,6 +1068,14 @@ impl SamplingRequestSignalCollector {
                 repeated_failure: repeated_action_identity
                     .map(|action_identity| (action_identity, failure_fingerprint)),
             });
+        }
+        // A successful `write_stdin` result is monitoring state for a process
+        // that is still owned by the executor. It may remain byte-for-byte
+        // unchanged until output or termination, so it is not a failed or
+        // no-progress reasoning attempt. Actual write/poll errors were handled
+        // by the failure branch above and remain eligible for deduplication.
+        if state.process_monitor_count == state.registered_count {
+            return None;
         }
         let incomplete_code_mode_outcomes = code_mode_owned
             && (outcomes.len() != state.code_mode_nested_tool_count
@@ -1993,6 +2006,8 @@ impl SamplingReasoningGovernor {
         }
 
         if let Some(observation) = collector.authoritative_wait_observation() {
+            // Monitoring polls report owner/process state; they are not failed
+            // attempts and must not advance the failure/no-progress breaker.
             self.clear_broad_source_pass_gate();
             let fingerprint = format!(
                 "{:x}",
@@ -2139,13 +2154,20 @@ impl SamplingReasoningGovernor {
         self.last_cycle = Some(cycle.key.clone());
         self.last_state_revision = Some(settled_revision.clone());
 
-        if self.consecutive_no_progress < 3 && self.consecutive_obligation_no_progress < 3 {
+        let repeated_failure = repeated_cycle
+            && matches!(
+                cycle.kind,
+                DeterministicCycleKind::ToolFailure | DeterministicCycleKind::NestedToolFailure
+            );
+        let threshold = if repeated_failure { 2 } else { 3 };
+        if self.consecutive_no_progress < threshold
+            && self.consecutive_obligation_no_progress < threshold
+        {
             return SamplingConvergenceDecision::default();
         }
 
-        let proven_loop_activated = self.directive_issued
-            && repeated_cycle
-            && cycle_is_nonempty
+        let proven_loop_activated = (repeated_failure
+            || self.directive_issued && repeated_cycle && cycle_is_nonempty)
             && !self.proven_loop_active;
         if proven_loop_activated {
             self.proven_loop_active = true;
@@ -2164,9 +2186,10 @@ impl SamplingReasoningGovernor {
             "Convergence enforced: an ordered deterministic action/result cycle repeated after the convergence directive against identical state. No further tools are available for this turn. Provide the final response now using existing evidence, truthfully reporting any blocker or incomplete validation."
         } else if cycle.kind == DeterministicCycleKind::BroadSourcePass {
             "Convergence required: the broad source pass repeated against the same obligation and returned the same evidence for the same action. An equivalent pass is now suppressed. Before another broad source pass, change the active obligation, provide a new evidence identity, or choose a materially different action; otherwise synthesize the result, begin implementation, or truthfully complete."
-        } else if self.consecutive_no_progress == 3 || self.consecutive_obligation_no_progress == 3
+        } else if self.consecutive_no_progress == threshold
+            || self.consecutive_obligation_no_progress == threshold
         {
-            "Convergence required: the last three generations repeated the same deterministic evidence without obligation-level state progress. Use a new hypothesis, a state-changing action, a narrower observation, or truthfully complete."
+            "Convergence required: repeated deterministic evidence produced no obligation-level state progress. Synthesize from existing evidence, take a state-changing action, or truthfully complete instead of exploring again."
         } else if self.proven_loop_active {
             "Convergence escalation: an ordered deterministic action/result cycle has repeated after the convergence directive against identical state. Do not repeat it. Change the hypothesis or state, narrow the observation, or truthfully complete; existing task lifecycle rules still govern termination."
         } else {
@@ -4536,8 +4559,42 @@ mod tests {
                     .is_some_and(|key| key.starts_with("ToolFailure:io.locked:"))
             );
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation == 3);
+            assert_eq!(decision.directive.is_some(), generation == 2);
+            assert_eq!(decision.proven_loop_activated, generation == 2);
         }
+    }
+
+    #[test]
+    fn write_stdin_stable_failures_remain_suppressed() {
+        let governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let collector = governor.collector(&baselines);
+        let tool_name = ToolName::plain("write_stdin");
+        let payload = ToolPayload::Function {
+            arguments: r#"{"session_id":7,"chars":"","yield_time_ms":30000}"#.to_string(),
+        };
+        let action_identity = structured_action_identity(&tool_name, &payload)
+            .expect("write_stdin is deterministic")
+            .identity;
+        collector
+            .dispatch_ledger
+            .as_ref()
+            .expect("governor collector has a dispatch ledger")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .repeated_failure_gate = Some(RepeatedFailureGate {
+            state_revision: collector.request_state_revision.clone(),
+            action_identity,
+            failure_fingerprint: "prior.poll.failure".to_string(),
+        });
+
+        assert_eq!(
+            collector
+                .register_deterministic_tool_call(&tool_name, &payload, "poll-again")
+                .suppressed_failure
+                .map(|guard| guard.failure_fingerprint),
+            Some("prior.poll.failure".to_string())
+        );
     }
 
     #[test]

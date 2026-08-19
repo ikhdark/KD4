@@ -95,7 +95,7 @@ impl WriteStdinHandler {
             })?;
 
         let mut internally_drained_polls = 0u32;
-        while should_hold_empty_poll(&args.chars, &response, poll_started_at.elapsed()) {
+        while should_hold_background_poll(&args.chars, &response, poll_started_at.elapsed()) {
             let next = session
                 .services
                 .unified_exec_manager
@@ -164,7 +164,7 @@ impl WriteStdinHandler {
     }
 }
 
-fn should_hold_empty_poll(
+fn should_hold_background_poll(
     chars: &str,
     response: &ExecCommandToolOutput,
     elapsed: Duration,
@@ -235,25 +235,29 @@ mod tests {
     }
 
     #[test]
-    fn empty_unchanged_poll_is_owner_drained_until_actionable() {
+    fn recommended_fixes_empty_poll_is_drained_through_progress_until_completion() {
         let pending = response(b"\r\n", Some(7));
-        assert!(should_hold_empty_poll("", &pending, Duration::from_secs(1)));
-        assert!(!should_hold_empty_poll(
+        assert!(should_hold_background_poll(
+            "",
+            &pending,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_hold_background_poll(
             "input",
             &pending,
             Duration::from_secs(1)
         ));
-        assert!(!should_hold_empty_poll(
+        assert!(!should_hold_background_poll(
             "",
             &response(b"ready", Some(7)),
             Duration::from_secs(1)
         ));
-        assert!(!should_hold_empty_poll(
+        assert!(!should_hold_background_poll(
             "",
             &response(b"", None),
             Duration::from_secs(1)
         ));
-        assert!(!should_hold_empty_poll(
+        assert!(!should_hold_background_poll(
             "",
             &pending,
             Duration::from_millis(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)

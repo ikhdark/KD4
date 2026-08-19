@@ -9,10 +9,10 @@ use codex_utils_string::truncate_middle_with_token_budget;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 
-/// Coherent-packet model-projection defaults. Formation happens before token
+/// Conservative coherent-packet model-projection defaults. Formation happens before token
 /// minimization, and explicit requests remain bounded by the caller-supplied
 /// model hard limit.
-pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 10_000;
+pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 4_000;
 pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 10_000;
 pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
 

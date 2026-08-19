@@ -377,6 +377,8 @@ struct CommandExecutionState {
     repository_epoch: u64,
     observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
+    uncertain_command_baselines:
+        HashMap<String, Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
     completed_validations: HashMap<ValidationProofKey, CompletedValidationProof>,
     completed_validation_order: VecDeque<ValidationProofKey>,
     validation_results_by_call: HashMap<String, ValidationResult>,
@@ -524,6 +526,29 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn clear_auto_validation_leaf(&self, call_id: &str) {
         self.bound_auto_validations.lock().await.remove(call_id);
+    }
+
+    pub(crate) async fn record_uncertain_command_baseline(
+        &self,
+        call_id: &str,
+        baseline: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+    ) {
+        self.state
+            .lock()
+            .await
+            .uncertain_command_baselines
+            .insert(call_id.to_string(), baseline);
+    }
+
+    pub(crate) async fn take_uncertain_command_baseline(
+        &self,
+        call_id: &str,
+    ) -> Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>> {
+        self.state
+            .lock()
+            .await
+            .uncertain_command_baselines
+            .remove(call_id)
     }
 
     pub(crate) async fn reusable_validation(
@@ -1027,10 +1052,13 @@ impl CommandExecutionLedger {
         else {
             return false;
         };
-        let selected_no_cargo_tests = exit_code == 0
-            && validation_route_is_cargo_test(&route)
-            && !cargo_test_output_selected_at_least_one(&retained_output);
-        let succeeded = exit_code == 0 && !selected_no_cargo_tests;
+        let selected_test_count = validation_route_is_test(&route)
+            .then(|| selected_test_count(&retained_output))
+            .flatten();
+        let missing_selected_tests = exit_code == 0
+            && validation_route_is_test(&route)
+            && selected_test_count.is_none_or(|count| count == 0);
+        let succeeded = exit_code == 0 && !missing_selected_tests;
         let result = ValidationResult {
             proof_key: proof_key.clone(),
             route,
@@ -1047,16 +1075,19 @@ impl CommandExecutionLedger {
                     .as_millis(),
             )
             .unwrap_or(u64::MAX),
-            summary: Some(if selected_no_cargo_tests {
-                "focused cargo validation selected zero tests".to_string()
+            summary: Some(if missing_selected_tests {
+                "focused validation did not prove a nonzero selected-test count".to_string()
             } else if succeeded {
-                "focused validation succeeded".to_string()
+                selected_test_count.map_or_else(
+                    || "focused validation succeeded".to_string(),
+                    |count| format!("focused validation succeeded with {count} selected tests"),
+                )
             } else {
                 format!("focused validation exited with code {exit_code}")
             }),
             failure_excerpt: (!succeeded).then(|| {
-                if selected_no_cargo_tests {
-                    "cargo validation exited successfully but selected zero tests; exact output is retained in the immutable artifact"
+                if missing_selected_tests {
+                    "test validation exited successfully without a positive selected-test count; exact output is retained in the immutable artifact"
                         .to_string()
                 } else {
                     format!(
@@ -1249,23 +1280,41 @@ fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttempt
     state.running.values().any(|running| running.key == *key)
 }
 
-fn validation_route_is_cargo_test(route: &ValidationRoute) -> bool {
+fn validation_route_is_test(route: &ValidationRoute) -> bool {
     route.leaves.as_slice().first().is_some_and(|leaf| {
         matches!(
             leaf.argv.as_slice(),
             [program, subcommand, ..] if program == "cargo" && subcommand == "test"
+        ) || matches!(
+            leaf.argv.as_slice(),
+            [program, recipe, ..]
+                if program == "just"
+                    && matches!(
+                        recipe.as_str(),
+                        "test-fast" | "test-lane" | "test-lane-fast" | "test-lane-package"
+                    )
         )
     })
 }
 
-fn cargo_test_output_selected_at_least_one(output: &[u8]) -> bool {
-    String::from_utf8_lossy(output).lines().any(|line| {
+fn selected_test_count(output: &[u8]) -> Option<u64> {
+    let output = String::from_utf8_lossy(output);
+    let cargo_count = output.lines().filter_map(|line| {
         line.trim()
             .strip_prefix("running ")
             .and_then(|summary| summary.split_whitespace().next())
             .and_then(|count| count.parse::<u64>().ok())
-            .is_some_and(|count| count > 0)
-    })
+    });
+    let nextest_count = output.lines().filter_map(|line| {
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        words.windows(3).find_map(|window| {
+            matches!(window[1], "test" | "tests")
+                .then(|| window[0].parse::<u64>().ok())
+                .flatten()
+                .filter(|_| window[2].starts_with("run"))
+        })
+    });
+    cargo_count.chain(nextest_count).max()
 }
 
 #[cfg(test)]

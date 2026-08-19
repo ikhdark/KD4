@@ -142,6 +142,28 @@ impl ToolRouter {
         self.model_visible_specs.clone()
     }
 
+    pub(crate) fn model_visible_specs_for_turn(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+    ) -> Vec<ToolSpec> {
+        let activated = turn.activated_deferred_tools();
+        if activated.is_empty() {
+            return self.model_visible_specs();
+        }
+
+        let mut visible = self.model_visible_specs();
+        for (_, exposure, spec) in self.registry.manifest_entries() {
+            if exposure != crate::tools::registry::ToolExposure::Deferred {
+                continue;
+            }
+            let Some(spec) = filter_activated_deferred_spec(&spec, &activated) else {
+                continue;
+            };
+            merge_visible_tool_spec(&mut visible, spec);
+        }
+        visible
+    }
+
     pub(crate) fn deferred_tool_capability_revisions(&self) -> HashMap<ToolName, String> {
         let exposure_identity = serde_json::to_value(&self.exposure_identity).unwrap_or_default();
         self.registry
@@ -332,10 +354,22 @@ impl ToolRouter {
                 .turn
                 .deferred_tool_is_activated(&call.tool_name)
         {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "tool `{}` is deferred; select it with tool_search during this turn before calling it",
-                call.tool_name
-            )));
+            // An exact router match is already unambiguous. Activate it in the
+            // same dispatch transaction so callers avoid a separate discovery
+            // round trip. TurnContext only records the activation
+            // when the current capability revision is still registered.
+            step_context
+                .turn
+                .activate_deferred_tools(std::iter::once(call.tool_name.clone()));
+            if !step_context
+                .turn
+                .deferred_tool_is_activated(&call.tool_name)
+            {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "tool `{}` is deferred but its current capability revision is unavailable; refresh tool discovery",
+                    call.tool_name
+                )));
+            }
         }
         let external_mutation_intent = if self
             .proven_read_only_external_tools
@@ -398,6 +432,66 @@ impl ToolRouter {
         self.registry
             .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
             .await
+    }
+}
+
+fn filter_activated_deferred_spec(
+    spec: &ToolSpec,
+    activated: &HashSet<ToolName>,
+) -> Option<ToolSpec> {
+    match spec {
+        ToolSpec::Namespace(namespace) => {
+            let mut namespace = namespace.clone();
+            let namespace_name = namespace.name.clone();
+            namespace.tools.retain(|tool| match tool {
+                codex_tools::ResponsesApiNamespaceTool::Function(tool) => activated.contains(
+                    &ToolName::namespaced(namespace_name.clone(), tool.name.clone()),
+                ),
+            });
+            (!namespace.tools.is_empty()).then_some(ToolSpec::Namespace(namespace))
+        }
+        ToolSpec::Function(tool) => activated
+            .contains(&ToolName::plain(tool.name.clone()))
+            .then(|| spec.clone()),
+        ToolSpec::Freeform(tool) => activated
+            .contains(&ToolName::plain(tool.name.clone()))
+            .then(|| spec.clone()),
+        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => activated
+            .contains(&ToolName::plain(spec.name()))
+            .then(|| spec.clone()),
+    }
+}
+
+fn merge_visible_tool_spec(visible: &mut Vec<ToolSpec>, spec: ToolSpec) {
+    let mut namespace = match spec {
+        ToolSpec::Namespace(namespace) => namespace,
+        spec => {
+            if !visible
+                .iter()
+                .any(|existing| existing.name() == spec.name())
+            {
+                visible.push(spec);
+            }
+            return;
+        }
+    };
+
+    if let Some(ToolSpec::Namespace(existing)) = visible
+        .iter_mut()
+        .find(|existing| existing.name() == namespace.name.as_str())
+    {
+        for tool in namespace.tools.drain(..) {
+            let codex_tools::ResponsesApiNamespaceTool::Function(candidate) = &tool;
+            let duplicate = existing.tools.iter().any(|existing_tool| {
+                let codex_tools::ResponsesApiNamespaceTool::Function(existing_tool) = existing_tool;
+                existing_tool.name == candidate.name
+            });
+            if !duplicate {
+                existing.tools.push(tool);
+            }
+        }
+    } else {
+        visible.push(ToolSpec::Namespace(namespace));
     }
 }
 

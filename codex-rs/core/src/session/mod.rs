@@ -2920,6 +2920,8 @@ impl Session {
         call_id: String,
         args: RequestUserInputArgs,
     ) -> Option<RequestUserInputResponse> {
+        let decision_call_id = call_id.clone();
+        let decision_questions = args.questions.clone();
         let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
         let (tx_response, rx_response) = oneshot::channel();
@@ -2951,7 +2953,19 @@ impl Session {
         let _interactive_wait_guard = turn_context
             .turn_timing_state
             .begin_interactive_wait(InteractiveWaitKind::UserInput);
-        rx_response.await.ok()
+        let response = rx_response.await.ok()?;
+        if !response.interrupted {
+            self.services
+                .task_evidence
+                .record_locked_user_decisions(
+                    &decision_call_id,
+                    &turn_context.sub_id,
+                    &decision_questions,
+                    &response,
+                )
+                .await;
+        }
+        Some(response)
     }
 
     #[expect(

@@ -153,6 +153,22 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
         .remove("handler_duration_ms")
         .and_then(|duration| duration.as_u64())
         .context("handler_duration_ms must be a nonnegative integer")?;
+    let phase_durations = [
+        "workspace_evidence_before_ms",
+        "workspace_evidence_after_ms",
+        "pre_tool_hook_ms",
+        "post_tool_hook_ms",
+        "output_projection_ms",
+        "history_persistence_ms",
+        "post_handler_ms",
+    ]
+    .map(|field| {
+        fields
+            .remove(field)
+            .and_then(|duration| duration.as_u64())
+            .with_context(|| format!("{field} must be a nonnegative integer"))
+    });
+    let phase_durations = phase_durations.into_iter().collect::<Result<Vec<_>>>()?;
     let total_duration_ms = fields
         .remove("total_duration_ms")
         .and_then(|duration| duration.as_u64())
@@ -172,6 +188,12 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
         .into_iter()
         .all(|duration| duration <= total_duration_ms),
         "each correlated timing segment must fit within total duration"
+    );
+    anyhow::ensure!(
+        phase_durations
+            .into_iter()
+            .all(|duration| duration <= total_duration_ms),
+        "each detailed timing phase must fit within total duration"
     );
 
     assert_eq!(

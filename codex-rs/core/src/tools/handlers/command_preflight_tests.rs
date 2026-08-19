@@ -71,6 +71,22 @@ fn classifies_repository_wide_and_owner_scoped_rg() {
     assert_eq!(compound.breadth, RgSearchBreadth::Broad);
     assert!(!compound.can_record_miss);
 
+    let inventory = classify_rg_search_narrowing(
+        &strings(&[
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "$files = rg --files -g 'SOURCEMAP.md' -g 'AGENTS.md' -g '*terminal*' -g '*bench*' -g '*rollout*' -g '*eval*' -g '*prompt*'; Write-Output '---FILES---'; $files; Write-Output '---STATUS---'; git status --short; Write-Output '---ROOT---'; Get-Content -Path AGENTS.md -TotalCount 260; Write-Output '---SOURCEMAP MATCHES---'; rg -n -i 'terminal|benchmark|rollout|prompt|agent loop|tool' SOURCEMAP.md | Select-Object -First 180",
+        ]),
+        Some(ShellType::PowerShell),
+        root,
+        root,
+    )
+    .expect("inventory classification")
+    .expect("inventory rg should still be gated");
+    assert_eq!(inventory.breadth, RgSearchBreadth::Broad);
+    assert!(!inventory.can_record_miss);
+
     let narrow = classify_rg_search_narrowing(
         &strings(&["rg", "-n", "needle", "codex-rs/core/src"]),
         None,

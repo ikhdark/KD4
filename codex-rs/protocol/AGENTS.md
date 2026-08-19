@@ -1,15 +1,12 @@
 # Protocol Policy
 
-This file applies inside `codex-rs/protocol`. It inherits `codex-rs/AGENTS.md`.
-
 ## Ownership
 
 This crate owns shared protocol types used across CLI, TUI, core, app-server,
 app-server-protocol, SDK-facing adapters, rollouts, and stored sessions.
 
-Keep this crate type-focused with minimal dependencies. Avoid material business
-logic here unless it is required for serialization, compatibility, formatting, or
-small type helpers.
+Keep it type-focused with minimal dependencies; allow only serialization,
+compatibility, formatting, and small type-helper logic.
 
 ## Editing Rules
 
@@ -23,12 +20,11 @@ small type helpers.
   API shape belongs in `app-server-protocol`.
 - When changing shared item or event types, check legacy event conversion and
   downstream CLI, TUI, app-server, and app-server-protocol consumers.
-- Keep dependencies minimal; do not add runtime-heavy dependencies for behavior
-  that belongs in a consuming crate.
+- Do not add runtime-heavy dependencies for consumer behavior.
 
 ## Validation
 
-- For local type behavior, run `cargo nextest run -p codex-protocol`.
+- Run `cargo nextest run -p codex-protocol` for local type behavior.
 - For shared wire-shape changes consumed by app-server protocol, run
   `just app-server-schema-check` and focused `codex-app-server-protocol` tests.
 - For stored-session or rollout compatibility changes, add or update serde

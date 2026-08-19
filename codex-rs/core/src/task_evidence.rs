@@ -14,6 +14,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnTimingTerminalization;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_protocol::validation::ValidationResult;
 use codex_utils_output_truncation::approx_token_count;
@@ -43,8 +45,10 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::terminal_event_fingerprint;
+use crate::turn_diff_tracker::CommandMutation;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 11;
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 12;
+const FROZEN_TASK_EVIDENCE_V11_SCHEMA_VERSION: u32 = 11;
 const FROZEN_TASK_EVIDENCE_V10_SCHEMA_VERSION: u32 = 10;
 const FROZEN_TASK_EVIDENCE_V9_SCHEMA_VERSION: u32 = 9;
 const FROZEN_TASK_EVIDENCE_V8_SCHEMA_VERSION: u32 = 8;
@@ -62,6 +66,7 @@ const MAX_EXTERNAL_EVIDENCE_RECEIPTS: usize = 256;
 const MAX_COMPLETION_REVIEW_RECEIPTS: usize = 256;
 const MAX_ATTRIBUTED_WORKSPACE_EVENTS: usize = 256;
 const MAX_TERMINALIZATION_RECEIPTS: usize = 64;
+const MAX_LOCKED_USER_DECISIONS: usize = 256;
 const MAX_PLANNING_AUDIT_ENTRIES: usize = 512;
 const MAX_OUTSIDE_PLAN_ACTIONS: usize = 256;
 const MAX_COMPLETION_CHECKPOINT_HUNK_BYTES: usize = 16 * 1024;
@@ -812,8 +817,24 @@ struct TaskEvidenceDocument {
     #[serde(default)]
     terminalization_receipts: Vec<TerminalizationReceipt>,
     #[serde(default)]
+    locked_user_decisions: Vec<LockedUserDecision>,
+    #[serde(default)]
     final_proof: FinalProofStateV1,
     completion: Option<TaskCompletionGate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LockedUserDecision {
+    decision_id: String,
+    call_id: String,
+    turn_id: String,
+    question_id: String,
+    header: String,
+    question: String,
+    answers: Vec<String>,
+    recorded_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supersedes: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2132,6 +2153,8 @@ struct CommandReceipt {
     duration_ms: u64,
     possible_mutation: bool,
     #[serde(default)]
+    observed_mutation: bool,
+    #[serde(default)]
     host_mutation_revision: Option<u64>,
     #[serde(default)]
     manifest_revision: Option<u64>,
@@ -2901,12 +2924,33 @@ fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
         document
             .risks
             .iter()
-            .filter(|risk| !risk.resolved)
-            .map(|risk| {
-                let blocking = if risk.blocking { "blocking " } else { "" };
-                format!("- {blocking}risk {}: {}", risk.id, risk.description)
-            }),
+            .filter(|risk| !risk.resolved && risk.blocking)
+            .map(|risk| format!("- blocking risk {}: {}", risk.id, risk.description)),
     );
+    let warnings = document
+        .risks
+        .iter()
+        .filter(|risk| !risk.resolved && !risk.blocking)
+        .map(|risk| format!("- risk {}: {}", risk.id, risk.description))
+        .collect::<Vec<_>>();
+    let locked_decisions = document
+        .locked_user_decisions
+        .iter()
+        .filter(|decision| {
+            !document.locked_user_decisions.iter().any(|candidate| {
+                candidate.supersedes.as_deref() == Some(decision.decision_id.as_str())
+            })
+        })
+        .map(|decision| {
+            format!(
+                "- {}: {} (question: {}; turn: {})",
+                decision.header,
+                decision.answers.join(", "),
+                decision.question,
+                decision.turn_id
+            )
+        })
+        .collect::<Vec<_>>();
 
     let mut evidence = vec![
         "- Recorded facts remain evidence claims; do not treat durable storage as proof."
@@ -2972,7 +3016,9 @@ fn render_compaction_task_state(document: &TaskEvidenceDocument) -> String {
         bounded_compaction_section("## Goal", goal, 250),
         bounded_compaction_section("## Current state", current_state, 400),
         bounded_compaction_section("## Completed work", completed_work, 300),
+        bounded_compaction_section("## Locked decisions", locked_decisions, 300),
         bounded_compaction_section("## Unresolved work", unresolved_work, 400),
+        bounded_compaction_section("## Warnings", warnings, 200),
         bounded_compaction_section("## Evidence", evidence, 350),
         bounded_compaction_section("## Next action", next_action, 150),
     ];
@@ -2997,11 +3043,12 @@ fn empty_compaction_task_state() -> String {
 
 fn task_is_tracked_for_compaction(document: &TaskEvidenceDocument) -> bool {
     !document.plan.is_empty()
+        || !document.locked_user_decisions.is_empty()
         || !document.edit_receipts.is_empty()
         || document
             .command_receipts
             .iter()
-            .any(|receipt| receipt.possible_mutation)
+            .any(|receipt| receipt.observed_mutation)
         || document.risks.iter().any(|risk| {
             matches!(
                 risk.source.as_str(),
@@ -3181,6 +3228,7 @@ impl TaskEvidenceLedger {
                 completion_review_v2: Some(new_completion_review_ledger(&thread_id_text)),
                 source_classification_cache: Vec::new(),
                 terminalization_receipts: Vec::new(),
+                locked_user_decisions: Vec::new(),
                 final_proof: FinalProofStateV1::default(),
                 completion: None,
             }
@@ -4799,6 +4847,75 @@ impl TaskEvidenceLedger {
             .await;
     }
 
+    pub(crate) async fn record_locked_user_decisions(
+        &self,
+        call_id: &str,
+        turn_id: &str,
+        questions: &[RequestUserInputQuestion],
+        response: &RequestUserInputResponse,
+    ) {
+        if !self.allows_kd4_completion() || response.interrupted {
+            return;
+        }
+        let decisions = questions
+            .iter()
+            .filter(|question| !question.is_secret)
+            .filter_map(|question| {
+                response.answers.get(&question.id).map(|answer| {
+                    (
+                        question.clone(),
+                        answer.answers.clone(),
+                        format!("{call_id}:{}", question.id),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if decisions.is_empty() {
+            return;
+        }
+
+        let Some((_, snapshot)) = self
+            .update_document(|document| {
+                for (question, answers, decision_id) in decisions {
+                    let supersedes = document
+                        .locked_user_decisions
+                        .iter()
+                        .rev()
+                        .find(|decision| {
+                            decision.question_id == question.id
+                                && decision.header == question.header
+                                && decision.question == question.question
+                                && decision.decision_id != decision_id
+                        })
+                        .map(|decision| decision.decision_id.clone());
+                    document
+                        .locked_user_decisions
+                        .retain(|decision| decision.decision_id != decision_id);
+                    document.locked_user_decisions.push(LockedUserDecision {
+                        decision_id,
+                        call_id: call_id.to_string(),
+                        turn_id: turn_id.to_string(),
+                        question_id: question.id,
+                        header: question.header,
+                        question: question.question,
+                        answers,
+                        recorded_at: timestamp(),
+                        supersedes,
+                    });
+                }
+                trim_to_last(
+                    &mut document.locked_user_decisions,
+                    MAX_LOCKED_USER_DECISIONS,
+                );
+                document.updated_at = timestamp();
+            })
+            .await
+        else {
+            return;
+        };
+        self.persist_document(&snapshot).await;
+    }
+
     pub(crate) async fn record_edit_intent_with_provenance(
         &self,
         call_id: &str,
@@ -5116,22 +5233,28 @@ impl TaskEvidenceLedger {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn record_command_bound_with_validation_result(
+    pub(crate) async fn record_command_bound_with_validation_result<M>(
         &self,
         command: &[String],
         cwd: &PathUri,
         exit_code: i32,
         timed_out: bool,
         duration_ms: u64,
-        possible_mutation: bool,
+        mutation: M,
         mutation_paths: Option<&BTreeSet<PathBuf>>,
         provenance: Option<&ChildEvidenceProvenance>,
         implementation_identity_hash: Option<&str>,
         validation_result: Option<ValidationResult>,
         bound_plan_step: Option<(&str, u64)>,
-    ) {
+    ) where
+        M: Into<CommandMutation>,
+    {
+        let mutation = mutation.into();
+        let possible_mutation = mutation.may_have_mutated();
+        let observed_mutation = matches!(&mutation, CommandMutation::KnownMutation { .. });
+        let mutation_paths = mutation.paths().or(mutation_paths);
         if self.mode == TaskEvidenceMode::EvidenceOnly {
-            if possible_mutation {
+            if observed_mutation {
                 self.record_host_mutation().await;
             }
             return;
@@ -5160,7 +5283,7 @@ impl TaskEvidenceLedger {
                     .unwrap_or_else(|| {
                         current_action_attribution(document, "command", &action_id)
                     });
-                if possible_mutation {
+                if observed_mutation {
                     let normalized_paths = mutation_paths.map(|paths| {
                         paths
                             .iter()
@@ -5181,7 +5304,7 @@ impl TaskEvidenceLedger {
                             EvidenceRisk {
                                 id: format!("unknown-command-mutation-{epoch}"),
                                 description:
-                                    "a command may have mutated files without exact path/hash attribution"
+                                    "the workspace changed during a command without exact path/hash attribution"
                                         .to_string(),
                                 source: "command".to_string(),
                                 blocking: false,
@@ -5190,6 +5313,21 @@ impl TaskEvidenceLedger {
                             },
                         );
                     }
+                } else if matches!(&mutation, CommandMutation::Uncertain) {
+                    let epoch = document.evidence_epoch;
+                    upsert_risk(
+                        document,
+                        EvidenceRisk {
+                            id: format!("uninspected-command-mutation-{epoch}"),
+                            description:
+                                "workspace state could not be inspected before and after an uncertain command; mutation was not observed"
+                                    .to_string(),
+                            source: "command_observation".to_string(),
+                            blocking: false,
+                            resolved: false,
+                            epoch,
+                        },
+                    );
                 }
                 let receipt_id = next_receipt_id(
                     "command",
@@ -5210,6 +5348,7 @@ impl TaskEvidenceLedger {
                     timed_out,
                     duration_ms,
                     possible_mutation,
+                    observed_mutation,
                     host_mutation_revision: Some(document.host_mutation_revision),
                     manifest_revision: contract_binding
                         .as_ref()
@@ -5224,7 +5363,7 @@ impl TaskEvidenceLedger {
                     source_thread_id: provenance.map(|value| value.source_thread_id.clone()),
                     source_agent_path: provenance.map(|value| value.source_agent_path.clone()),
                 };
-                if command_succeeded && !possible_mutation {
+                if command_succeeded && matches!(&mutation, CommandMutation::ReadOnly) {
                     accept_matching_command_proof(document, &receipt);
                 }
                 document.command_receipts.push(receipt);
@@ -9272,8 +9411,10 @@ fn current_final_proof_observations(
     let mut validation_process_ns = 0_u64;
     for step in &plan.steps {
         let Some(receipt) = document.command_receipts.iter().rev().find(|receipt| {
-            receipt.command == step.argv
-                && receipt.exit_code == 0
+            crate::validation_admission::validation_argv_semantically_covers(
+                &receipt.command,
+                &step.argv,
+            ) && receipt.exit_code == 0
                 && !receipt.timed_out
                 && !receipt.possible_mutation
                 && command_receipt_has_current_proof_identity(document, receipt)
@@ -11740,6 +11881,7 @@ async fn load_existing_document_with_supported_version(
             | FROZEN_TASK_EVIDENCE_V8_SCHEMA_VERSION
             | FROZEN_TASK_EVIDENCE_V9_SCHEMA_VERSION
             | FROZEN_TASK_EVIDENCE_V10_SCHEMA_VERSION
+            | FROZEN_TASK_EVIDENCE_V11_SCHEMA_VERSION
             | TASK_EVIDENCE_SCHEMA_VERSION
     ) && let Err(reason) = validate_v5_completion_review(&document)
     {
@@ -13592,7 +13734,12 @@ fn command_receipt_is_retained_by_path_scoped_proof(
                     && step.status == StepStatus::Passed
                     && step.validation_receipt_id.is_some()
                     && step.validation_route.as_ref().is_some_and(|route| {
-                        route.leaves.iter().any(|leaf| leaf.argv == receipt.command)
+                        route.leaves.iter().any(|leaf| {
+                            crate::validation_admission::validation_argv_semantically_covers(
+                                &receipt.command,
+                                &leaf.argv,
+                            )
+                        })
                     })
             })
         });
@@ -13606,7 +13753,12 @@ fn command_receipt_is_retained_by_path_scoped_proof(
                     work_unit.id == work_unit_id
                         && work_unit.validation_receipt_id.is_some()
                         && work_unit.validation_route.as_ref().is_some_and(|route| {
-                            route.leaves.iter().any(|leaf| leaf.argv == receipt.command)
+                            route.leaves.iter().any(|leaf| {
+                                crate::validation_admission::validation_argv_semantically_covers(
+                                    &receipt.command,
+                                    &leaf.argv,
+                                )
+                            })
                         })
                 })
         })
@@ -13698,12 +13850,23 @@ fn validation_route_has_current_command_proofs(
                     _ => false,
                 };
                 attribution_matches
-                    && candidate.command == leaf.argv
+                    && crate::validation_admission::validation_argv_semantically_covers(
+                        &candidate.command,
+                        &leaf.argv,
+                    )
                     && command_receipt_has_current_proof_identity(document, candidate)
                     && candidate
                         .validation_result
                         .as_ref()
-                        .is_some_and(|validation| validation.route == leaf_route)
+                        .is_some_and(|validation| {
+                            validation.route == leaf_route
+                                || validation.route.leaves.iter().any(|executed_leaf| {
+                                    crate::validation_admission::validation_argv_semantically_covers(
+                                        &executed_leaf.argv,
+                                        &leaf.argv,
+                                    )
+                                })
+                        })
             })
     })
 }
@@ -14327,13 +14490,13 @@ fn derive_completion_gate(
             snapshot.path
         ));
     }
-    for risk in document.risks.iter().filter(|risk| !risk.resolved) {
-        if risk.blocking {
-            blocked.push(risk.description.clone());
-        } else if risk.source != "plan" {
-            partial.push(risk.description.clone());
-        }
-    }
+    blocked.extend(
+        document
+            .risks
+            .iter()
+            .filter(|risk| !risk.resolved && risk.blocking)
+            .map(|risk| risk.description.clone()),
+    );
     blocked.sort();
     blocked.dedup();
     partial.sort();
@@ -15288,6 +15451,153 @@ mod tests {
         assert!(state.contains("## Completed work"));
         assert!(state.contains("implement [passed]: Implement the runtime path"));
         assert!(state.contains("validation receipt:"));
+    }
+
+    #[tokio::test]
+    async fn non_blocking_runtime_risk_is_a_warning_not_a_completion_failure() {
+        let (_temp, ledger) = ledger_fixture().await;
+        ledger
+            .record_plan_update(&plan(StepStatus::Completed))
+            .await;
+        {
+            let mut guard = ledger.document.lock().await;
+            let document = guard.as_mut().expect("document");
+            upsert_risk(
+                document,
+                EvidenceRisk {
+                    id: "advisory-risk".to_string(),
+                    description: "read-only command could not be classified".to_string(),
+                    source: "command".to_string(),
+                    blocking: false,
+                    resolved: false,
+                    epoch: document.evidence_epoch,
+                },
+            );
+        }
+
+        let gate = ledger.completion_gate().await.expect("gate");
+        assert_eq!(gate.status, TaskCompletionStatus::Passed);
+        assert!(gate.reasons.is_empty());
+
+        let state = ledger
+            .compaction_task_state()
+            .await
+            .expect("compaction task state");
+        assert!(state.contains("## Warnings\n- risk advisory-risk"));
+        let unresolved = state
+            .split("## Unresolved work")
+            .nth(1)
+            .and_then(|tail| tail.split("## Warnings").next())
+            .expect("unresolved work section");
+        assert!(!unresolved.contains("advisory-risk"));
+    }
+
+    #[tokio::test]
+    async fn locked_user_decisions_persist_supersession_and_omit_secrets() {
+        use codex_protocol::request_user_input::RequestUserInputAnswer;
+        use std::collections::HashMap;
+
+        let (_temp, ledger) = ledger_fixture().await;
+        let question = RequestUserInputQuestion {
+            id: "deployment".to_string(),
+            header: "Deployment".to_string(),
+            question: "Where should this run?".to_string(),
+            is_other: false,
+            is_secret: false,
+            options: None,
+        };
+        let secret = RequestUserInputQuestion {
+            id: "token".to_string(),
+            header: "Token".to_string(),
+            question: "What is the token?".to_string(),
+            is_other: false,
+            is_secret: true,
+            options: None,
+        };
+        let response = |deployment: &str| RequestUserInputResponse {
+            answers: HashMap::from([
+                (
+                    "deployment".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec![deployment.to_string()],
+                    },
+                ),
+                (
+                    "token".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["do-not-store".to_string()],
+                    },
+                ),
+            ]),
+            interrupted: false,
+        };
+
+        ledger
+            .record_locked_user_decisions(
+                "call-1",
+                "turn-1",
+                &[question.clone(), secret.clone()],
+                &response("staging"),
+            )
+            .await;
+        ledger
+            .record_locked_user_decisions(
+                "call-2",
+                "turn-2",
+                &[question.clone(), secret.clone()],
+                &response("production"),
+            )
+            .await;
+        let unrelated_question = RequestUserInputQuestion {
+            id: "deployment".to_string(),
+            header: "Region".to_string(),
+            question: "Which region should be used?".to_string(),
+            is_other: false,
+            is_secret: false,
+            options: None,
+        };
+        ledger
+            .record_locked_user_decisions(
+                "call-3",
+                "turn-3",
+                &[unrelated_question, secret],
+                &response("us-east"),
+            )
+            .await;
+
+        let guard = ledger.document.lock().await;
+        let decisions = &guard.as_ref().expect("document").locked_user_decisions;
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(
+            decisions[1].supersedes.as_deref(),
+            Some("call-1:deployment")
+        );
+        assert_eq!(decisions[2].supersedes, None);
+        drop(guard);
+
+        let persisted: TaskEvidenceDocument = serde_json::from_slice(
+            &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
+                .await
+                .expect("persisted evidence"),
+        )
+        .expect("persisted evidence document");
+        assert_eq!(persisted.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
+        assert_eq!(persisted.locked_user_decisions.len(), 3);
+        assert!(
+            persisted
+                .locked_user_decisions
+                .iter()
+                .all(|decision| decision.question_id != "token")
+        );
+
+        let state = ledger
+            .compaction_task_state()
+            .await
+            .expect("compaction task state");
+        assert!(state.contains("## Locked decisions\n- Deployment: production"));
+        assert!(state.contains("- Region: us-east"));
+        assert!(!state.contains("staging"));
+        assert!(!state.contains("do-not-store"));
     }
 
     fn repair_finding(id: &str, requirement_ids: &[&str]) -> CompletionReviewFindingReceipt {

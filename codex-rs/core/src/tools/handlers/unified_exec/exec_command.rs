@@ -707,7 +707,10 @@ impl ExecCommandHandler {
                     &command_invocation,
                     environment,
                     toolchain,
-                    format!("features={:?}", turn.config.features.get()),
+                    format!(
+                        "repository_epoch={repository_epoch};features={:?}",
+                        turn.config.features.get()
+                    ),
                     implementation_identity,
                     &leaf.uncertainty,
                     &leaf.covered_paths,
@@ -881,12 +884,14 @@ impl ExecCommandHandler {
             }
         }
 
-        let raw_output_artifact = create_raw_output_artifact(
+        // Carry only an in-memory target through launch. The output task
+        // materializes durable storage only after output exceeds the inline
+        // projection threshold, so process startup never waits on artifact
+        // creation, fsync, directory sync, or retention enforcement.
+        let raw_output_artifact = crate::tools::command_output_artifact::RawOutputArtifact::pending(
             turn.config.codex_home.as_path(),
             &session.thread_id.to_string(),
-            b"",
-        )
-        .await;
+        );
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         let process_id_reservation = manager.reserve_process_id().await;
         let process_id = process_id_reservation.process_id();

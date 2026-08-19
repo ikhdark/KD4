@@ -25,8 +25,14 @@ use crate::tools::lifecycle::notify_tool_finish;
 use crate::tools::lifecycle::notify_tool_start;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::tools::tool_dispatch_trace::mark_tool_handler_entry;
+use crate::tools::tool_dispatch_trace::mark_tool_handler_exit;
+use crate::tools::tool_dispatch_trace::record_history_persistence;
+use crate::tools::tool_dispatch_trace::record_output_projection;
+use crate::tools::tool_dispatch_trace::record_post_tool_hook;
+use crate::tools::tool_dispatch_trace::record_pre_tool_hook;
 use crate::util::error_or_panic;
 use codex_extension_api::ToolCallOutcome;
+use codex_otel::TOOL_LIFECYCLE_PHASE_DURATION_METRIC;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -69,10 +75,27 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 use tracing::instrument;
 
 pub(crate) type ToolTelemetryTags = Vec<(&'static str, String)>;
 const MIN_PROJECTION_ENVELOPE_TOKENS: usize = 64;
+
+fn record_lifecycle_phase(invocation: &ToolInvocation, phase: &'static str, started: Instant) {
+    let tool_name = flat_tool_name(&invocation.tool_name);
+    let elapsed = started.elapsed();
+    invocation.turn.session_telemetry.record_duration(
+        TOOL_LIFECYCLE_PHASE_DURATION_METRIC,
+        elapsed,
+        &[("phase", phase), ("tool", tool_name.as_ref())],
+    );
+    match phase {
+        "pre_hooks" => record_pre_tool_hook(elapsed),
+        "post_hooks" => record_post_tool_hook(elapsed),
+        "projection" => record_output_projection(elapsed),
+        _ => {}
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ToolExecutionTiming {
@@ -897,18 +920,22 @@ impl ToolRegistry {
             return Err(err);
         }
 
+        let phase_started = Instant::now();
         notify_tool_start(&invocation).await;
+        record_lifecycle_phase(&invocation, "notify_start", phase_started);
 
         if let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation) {
-            match run_pre_tool_use_hooks(
+            let phase_started = Instant::now();
+            let pre_tool_use_result = run_pre_tool_use_hooks(
                 &invocation.session,
                 &invocation.turn,
                 invocation.call_id.clone(),
                 &pre_tool_use_payload.tool_name,
                 &pre_tool_use_payload.tool_input,
             )
-            .await
-            {
+            .await;
+            record_lifecycle_phase(&invocation, "pre_hooks", phase_started);
+            match pre_tool_use_result {
                 PreToolUseHookResult::Blocked(message) => {
                     let err = FunctionCallError::RespondToModel(message);
                     dispatch_trace.record_failed(&err);
@@ -949,6 +976,7 @@ impl ToolRegistry {
         let invocation_for_tool = invocation.clone();
         let log_payload = invocation.payload.log_payload();
 
+        let phase_started = Instant::now();
         let result = otel
             .log_tool_result_with_tags(
                 tool_name_flat.as_ref(),
@@ -974,6 +1002,7 @@ impl ToolRegistry {
                 },
             )
             .await;
+        record_lifecycle_phase(&invocation, "handler", phase_started);
         let success = match &result {
             Ok((_, success)) => *success,
             Err(_) => false,
@@ -988,28 +1017,31 @@ impl ToolRegistry {
             None
         };
         let post_tool_use_outcome = if let Some(post_tool_use_payload) = post_tool_use_payload {
-            Some(
-                run_post_tool_use_hooks(
-                    &invocation.session,
-                    &invocation.turn,
-                    post_tool_use_payload.tool_use_id,
-                    post_tool_use_payload.tool_name.name().to_string(),
-                    post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
-                    post_tool_use_payload.tool_input,
-                    post_tool_use_payload.tool_response,
-                )
-                .await,
+            let phase_started = Instant::now();
+            let outcome = run_post_tool_use_hooks(
+                &invocation.session,
+                &invocation.turn,
+                post_tool_use_payload.tool_use_id,
+                post_tool_use_payload.tool_name.name().to_string(),
+                post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
+                post_tool_use_payload.tool_input,
+                post_tool_use_payload.tool_response,
             )
+            .await;
+            record_lifecycle_phase(&invocation, "post_hooks", phase_started);
+            Some(outcome)
         } else {
             None
         };
         if let Some(outcome) = &post_tool_use_outcome {
+            let phase_started = Instant::now();
             record_additional_contexts(
                 &invocation.session,
                 &invocation.turn,
                 outcome.additional_contexts.clone(),
             )
             .await;
+            record_lifecycle_phase(&invocation, "additional_context", phase_started);
         }
 
         // A PostToolUse block rejects the result, not the already-completed tool execution.
@@ -1033,12 +1065,14 @@ impl ToolRegistry {
                 handler_executed: true,
             },
         };
+        let phase_started = Instant::now();
         notify_tool_finish_if_unclaimed(
             &invocation,
             terminal_outcome_reached.as_ref(),
             lifecycle_outcome,
         )
         .await;
+        record_lifecycle_phase(&invocation, "notify_finish", phase_started);
 
         match result {
             Ok(_) => {
@@ -1086,6 +1120,7 @@ impl ToolRegistry {
                     &invocation.source,
                     invocation.turn.config.completed_tool_history_projection,
                 );
+                let phase_started = Instant::now();
                 let projection_input = prepare_model_projection(
                     &invocation,
                     &result,
@@ -1098,6 +1133,7 @@ impl ToolRegistry {
                     Some(input) => project_model_output(input).await,
                     None => None,
                 };
+                record_lifecycle_phase(&invocation, "projection", phase_started);
                 if (canonical_artifact_required || admission_tracking_required)
                     && model_projection.is_none()
                 {
@@ -1123,6 +1159,7 @@ impl ToolRegistry {
                             provider_visible,
                         );
                     if admission_tracking_enabled && let Some(candidate) = &projection.candidate {
+                        let phase_started = Instant::now();
                         invocation
                             .session
                             .register_tool_history_candidate(
@@ -1130,6 +1167,7 @@ impl ToolRegistry {
                                 candidate.clone(),
                             )
                             .await;
+                        record_history_persistence(phase_started.elapsed());
                     }
                 }
                 result.model_projection = model_projection;
@@ -1191,7 +1229,9 @@ async fn handle_any_tool(
         .turn_timing_state
         .record_tool_handler_entry(invocation.tool_name.name.as_str());
     mark_tool_handler_entry();
-    let output = tool.handle(invocation.clone()).await?;
+    let output = tool.handle(invocation.clone()).await;
+    mark_tool_handler_exit();
+    let output = output?;
     if output.contains_external_context()
         && invocation.turn.config.memories.disable_on_external_context
     {
@@ -1305,8 +1345,16 @@ fn prepare_model_projection(
         DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
     );
     let generic_projection = formatted_truncate_text_with_output_limit(&spillable_text, limits);
-    let model_output_tokens = approx_token_count(&spillable_text)
-        .saturating_add(non_text_projection_token_cost(&preserved_content));
+    let non_text_tokens = non_text_projection_token_cost(&preserved_content);
+    // Truncation already proves the canonical text exceeds the applied budget.
+    // Avoid a second full-buffer token scan on the large-output path; the
+    // canonical producer remains the accounting source for the artifact.
+    let model_output_tokens = if generic_projection.was_truncated {
+        limits.applied_limit.saturating_add(1)
+    } else {
+        approx_token_count(&spillable_text)
+    }
+    .saturating_add(non_text_tokens);
     let projection_truncated =
         generic_projection.was_truncated || model_output_tokens > limits.applied_limit;
     let has_predetermined_selectors = !metadata.predetermined_ranges.is_empty()
@@ -1418,7 +1466,13 @@ fn prepare_model_projection(
         invocation.turn.config.cwd.as_path(),
     );
     let original_output_sha256 = crate::tool_history::sha256(original_output_text.as_bytes());
-    let original_output_tokens = model_output_tokens as u64;
+    let original_output_tokens = if generic_projection.was_truncated {
+        canonical
+            .approximate_tokens
+            .saturating_add(non_text_tokens as u64)
+    } else {
+        model_output_tokens as u64
+    };
     let invocation_sha256 = canonical_tool_invocation_sha256(&invocation.payload);
     Some(ModelProjectionInput {
         spillable_text,
@@ -1932,6 +1986,43 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         return None;
     }
     let total_applied_token_limit = applied_token_limit;
+    // Make the canonical artifact durable before spending time on the inline
+    // projection. If projection later fails or is cancelled, recovery still
+    // has the complete canonical output to work from.
+    let persisted_artifact = if materialization == ProjectionMaterialization::InlineCarrier {
+        None
+    } else {
+        let existing_artifact_id = essential_inline
+            .get("raw_output_artifact_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let artifact_created = existing_artifact_id.is_none();
+        let artifact = if let Some(artifact_id) = existing_artifact_id {
+            attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical)
+                .await
+        } else {
+            create_canonical_output_artifact(&codex_home, &thread_id, &canonical).await
+        };
+        let artifact_id = artifact.artifact_id();
+        if let Some(artifact_id) = artifact_id
+            && artifact.complete
+            && artifact.retained_bytes == canonical.exact_bytes
+            && artifact.unavailable_ranges.is_empty()
+            && crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+                &codex_home,
+                &thread_id,
+                &artifact_id,
+                canonical.exact_bytes,
+                &canonical.sha256,
+            )
+            .await
+            .is_ok()
+        {
+            Some((artifact, artifact_id, artifact_created))
+        } else {
+            None
+        }
+    };
     let non_text_tokens = non_text_projection_token_cost(&preserved_content);
     let non_text_bytes = non_text_projection_byte_cost(&preserved_content);
     let preserve_non_text_content = !preserved_content.is_empty()
@@ -2011,11 +2102,6 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             applied_token_limit: total_applied_token_limit,
         });
     }
-    let existing_artifact_id = essential_inline
-        .get("raw_output_artifact_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let artifact_created = existing_artifact_id.is_none();
     let admission_only_fallback = || {
         let bounded = BoundedModelProjection::Fallback {
             value: serde_json::from_str(&original_output_text)
@@ -2041,35 +2127,10 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             applied_token_limit: total_applied_token_limit,
         }
     };
-    let artifact = if let Some(artifact_id) = existing_artifact_id {
-        attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical).await
-    } else {
-        create_canonical_output_artifact(&codex_home, &thread_id, &canonical).await
-    };
-    let Some(artifact_id) = artifact.artifact_id() else {
+    let Some((artifact, artifact_id, artifact_created)) = persisted_artifact else {
         return (materialization == ProjectionMaterialization::AdmissionOnly)
             .then(admission_only_fallback);
     };
-    if !artifact.complete
-        || artifact.retained_bytes != canonical.exact_bytes
-        || !artifact.unavailable_ranges.is_empty()
-    {
-        return (materialization == ProjectionMaterialization::AdmissionOnly)
-            .then(admission_only_fallback);
-    }
-    if crate::tools::command_output_artifact::protect_active_tool_history_artifact(
-        &codex_home,
-        &thread_id,
-        &artifact_id,
-        canonical.exact_bytes,
-        &canonical.sha256,
-    )
-    .await
-    .is_err()
-    {
-        return (materialization == ProjectionMaterialization::AdmissionOnly)
-            .then(admission_only_fallback);
-    }
     let supersession_identity = invocation_sha256
         .map(|invocation_sha256| format!("{tool_name}:{invocation_sha256}:{}", canonical.sha256));
     if materialization == ProjectionMaterialization::AdmissionOnly {

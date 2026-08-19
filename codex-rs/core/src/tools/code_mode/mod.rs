@@ -283,7 +283,7 @@ impl CodeModeService {
     }
 }
 
-pub(super) async fn handle_runtime_response(
+pub(super) fn handle_runtime_response(
     exec: &ExecContext,
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,

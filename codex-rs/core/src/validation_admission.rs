@@ -1027,7 +1027,8 @@ pub(crate) fn validation_identity_with_scope(
     covered_paths: &[String],
     covered_contracts: &[String],
 ) -> InFlightValidationKey {
-    let canonical_route = serde_json::to_vec(&invocation.hook_input()).unwrap_or_default();
+    let canonical_route = canonical_test_proof_route(invocation)
+        .unwrap_or_else(|| serde_json::to_vec(&invocation.hook_input()).unwrap_or_default());
     let canonical_route_hash = format!("{:x}", Sha256::digest(canonical_route));
     let mut paths = covered_paths.to_vec();
     paths.sort();
@@ -1055,6 +1056,181 @@ pub(crate) fn validation_identity_with_scope(
         configuration_identity: configuration.into(),
         validation_contract_version: codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
     }
+}
+
+/// Canonicalizes runner spelling away from a focused test proof. Cargo and
+/// nextest receipts are equivalent only when package, features, and exact test
+/// IDs are identical; environment, toolchain, configuration, and repository
+/// epoch remain separate `ValidationProofKey` dimensions.
+fn canonical_test_proof_route(invocation: &CommandInvocation) -> Option<Vec<u8>> {
+    let CommandInvocation::Argv { program, args } = invocation else {
+        return None;
+    };
+    let (forwarded, package_fallback) = match (program.as_str(), args.first()?.as_str()) {
+        ("cargo", "test") => (&args[1..], None),
+        ("just", "test-fast") => (&args[1..], None),
+        ("just", "test-lane" | "test-lane-fast") => (&args[2..], None),
+        ("just", "test-lane-package") => (&args[2..], args.get(1).map(String::as_str)),
+        _ => return None,
+    };
+    let mut package = package_fallback.map(str::to_string);
+    let mut features = Vec::new();
+    let mut test_ids = Vec::new();
+    let mut target_selectors = Vec::new();
+    let mut target_flags = Vec::new();
+    let mut harness_args = Vec::new();
+    let mut all_features = false;
+    let mut no_default_features = false;
+    let mut cargo_exact = program != "cargo";
+    let mut index = 0;
+    while index < forwarded.len() {
+        let argument = &forwarded[index];
+        if program == "cargo" && argument == "--" {
+            let harness = &forwarded[index + 1..];
+            cargo_exact = harness.iter().any(|argument| argument == "--exact");
+            harness_args.extend(
+                harness
+                    .iter()
+                    .filter(|argument| argument.as_str() != "--exact")
+                    .cloned(),
+            );
+            break;
+        }
+        let (option, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(option, value)| {
+                (option, Some(value))
+            });
+        match option {
+            "-p" | "--package" => {
+                package = inline
+                    .or_else(|| forwarded.get(index + 1).map(String::as_str))
+                    .map(str::to_string);
+                index += usize::from(inline.is_none());
+            }
+            "--features" => {
+                let value = inline.or_else(|| forwarded.get(index + 1).map(String::as_str))?;
+                features.extend(
+                    value
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                );
+                index += usize::from(inline.is_none());
+            }
+            "--all-features" => all_features = true,
+            "--no-default-features" => no_default_features = true,
+            "-E" | "--filterset" | "--filter-expr" => {
+                let expression = inline.or_else(|| forwarded.get(index + 1).map(String::as_str))?;
+                let test_id = expression.strip_prefix("test(=")?.strip_suffix(')')?;
+                if !exact_test_id(test_id) {
+                    return None;
+                }
+                test_ids.push(test_id.to_string());
+                index += usize::from(inline.is_none());
+            }
+            "--test" | "--bin" | "--example" | "--bench" | "--manifest-path" | "--target"
+                if program == "cargo" =>
+            {
+                let value = inline.or_else(|| forwarded.get(index + 1).map(String::as_str))?;
+                target_selectors.push(format!("{option}={value}"));
+                index += usize::from(inline.is_none());
+            }
+            "--target-dir" | "-j" | "--jobs" if program == "cargo" => {
+                if inline.is_none() {
+                    forwarded.get(index + 1)?;
+                    index += 1;
+                }
+            }
+            "--lib" | "--bins" | "--tests" | "--benches" | "--all-targets" | "--doc" => {
+                target_flags.push(option.to_string());
+            }
+            _ if program == "cargo" && !argument.starts_with('-') && exact_test_id(argument) => {
+                test_ids.push(argument.clone());
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if package.as_deref().is_none_or(str::is_empty) || test_ids.is_empty() || !cargo_exact {
+        return None;
+    }
+    features.sort();
+    features.dedup();
+    test_ids.sort();
+    test_ids.dedup();
+    target_selectors.sort();
+    target_selectors.dedup();
+    target_flags.sort();
+    target_flags.dedup();
+    serde_json::to_vec(&serde_json::json!({
+        "operation": "test",
+        "package": package,
+        "features": features,
+        "all_features": all_features,
+        "no_default_features": no_default_features,
+        "selected_test_ids": test_ids,
+        "target_selectors": target_selectors,
+        "target_flags": target_flags,
+        "harness_args": harness_args,
+    }))
+    .ok()
+}
+
+fn exact_test_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+pub(crate) fn validation_argv_semantically_covers(
+    executed: &[String],
+    required: &[String],
+) -> bool {
+    let invocation = |argv: &[String]| {
+        let (program, args) = argv.split_first()?;
+        Some(CommandInvocation::Argv {
+            program: program.clone(),
+            args: args.to_vec(),
+        })
+    };
+    let Some(executed_invocation) = invocation(executed) else {
+        return false;
+    };
+    let Some(required_invocation) = invocation(required) else {
+        return false;
+    };
+    let Some(executed_route) = canonical_test_proof_route(&executed_invocation) else {
+        return executed == required;
+    };
+    let Some(required_route) = canonical_test_proof_route(&required_invocation) else {
+        return false;
+    };
+    let Ok(executed): Result<serde_json::Value, _> = serde_json::from_slice(&executed_route) else {
+        return false;
+    };
+    let Ok(required): Result<serde_json::Value, _> = serde_json::from_slice(&required_route) else {
+        return false;
+    };
+    executed["package"] == required["package"]
+        && executed["features"] == required["features"]
+        && executed["all_features"] == required["all_features"]
+        && executed["no_default_features"] == required["no_default_features"]
+        && executed["target_selectors"] == required["target_selectors"]
+        && executed["target_flags"] == required["target_flags"]
+        && executed["harness_args"] == required["harness_args"]
+        && required["selected_test_ids"]
+            .as_array()
+            .is_some_and(|required_ids| {
+                executed["selected_test_ids"]
+                    .as_array()
+                    .is_some_and(|executed_ids| {
+                        required_ids
+                            .iter()
+                            .all(|test_id| executed_ids.contains(test_id))
+                    })
+            })
 }
 
 fn cheaper_alternatives(descriptor: &ValidationCommandDescriptor) -> Vec<String> {
@@ -1896,5 +2072,76 @@ mod tests {
         ] {
             assert_ne!(scoped, mismatch);
         }
+    }
+
+    #[test]
+    fn recommended_fixes_combined_nextest_covers_equivalent_cargo_obligations() {
+        let combined = vec![
+            "just".to_string(),
+            "test-fast".to_string(),
+            "-p".to_string(),
+            "codex-core".to_string(),
+            "-E".to_string(),
+            "test(=alpha)".to_string(),
+            "-E".to_string(),
+            "test(=beta)".to_string(),
+        ];
+        let alpha = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "-p".to_string(),
+            "codex-core".to_string(),
+            "alpha".to_string(),
+            "--".to_string(),
+            "--exact".to_string(),
+        ];
+        let unrelated = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "-p".to_string(),
+            "codex-core".to_string(),
+            "gamma".to_string(),
+            "--".to_string(),
+            "--exact".to_string(),
+        ];
+
+        assert!(validation_argv_semantically_covers(&combined, &alpha));
+        assert!(!validation_argv_semantically_covers(&alpha, &combined));
+        assert!(!validation_argv_semantically_covers(&combined, &unrelated));
+    }
+
+    #[test]
+    fn focused_validation_identity_preserves_cargo_target_selectors() {
+        let integration_a = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "-p".to_string(),
+            "codex-core".to_string(),
+            "--test".to_string(),
+            "integration_a".to_string(),
+            "focused_validation".to_string(),
+            "--".to_string(),
+            "--exact".to_string(),
+        ];
+        let integration_b = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "-p".to_string(),
+            "codex-core".to_string(),
+            "--test".to_string(),
+            "integration_b".to_string(),
+            "focused_validation".to_string(),
+            "--".to_string(),
+            "--exact".to_string(),
+        ];
+
+        assert!(validation_argv_semantically_covers(
+            &integration_a,
+            &integration_a
+        ));
+        assert!(!validation_argv_semantically_covers(
+            &integration_a,
+            &integration_b
+        ));
     }
 }

@@ -405,6 +405,16 @@ fn read_only_shell_commands_do_not_create_mutation_state() {
         0,
         false,
     );
+    tracker.record_exec_command_end(
+        &[
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "$path = 'README.md'; $lines = Get-Content -LiteralPath $path; foreach ($range in @(@(0, 5), @(10, 15))) { $start = $range[0]; $end = $range[1]; $lines[$start..$end] }".into(),
+        ],
+        0,
+        false,
+    );
     assert!(!tracker.has_unvalidated_mutation());
 }
 
@@ -439,6 +449,26 @@ fn direct_file_read_shells_still_reject_composed_mutations() {
             "-Command".into(),
             "Get-Content README.md; python edit.py".into(),
         ],
+        vec![
+            "powershell.exe".into(),
+            "-Command".into(),
+            "$result = (python edit.py)".into(),
+        ],
+        vec![
+            "powershell.exe".into(),
+            "-Command".into(),
+            "$file.Delete()".into(),
+        ],
+        vec![
+            "powershell.exe".into(),
+            "-Command".into(),
+            "$result = $file.Delete()".into(),
+        ],
+        vec![
+            "powershell.exe".into(),
+            "-Command".into(),
+            "$file.IsReadOnly = $false".into(),
+        ],
     ] {
         assert!(
             command_may_mutate(&command),
@@ -466,6 +496,114 @@ fn arbitrary_script_runners_fail_closed_as_possible_mutations() {
         "pytest".into(),
     ]));
     assert!(!command_may_mutate(&["cargo".into(), "check".into()]));
+}
+
+#[test]
+fn mutation_classification_separates_known_mutators_from_uncertain_commands() {
+    assert!(matches!(
+        command_mutation(
+            &[
+                "powershell.exe".into(),
+                "-Command".into(),
+                "Set-Content out.txt changed".into()
+            ],
+            None,
+        ),
+        CommandMutation::KnownMutation { .. }
+    ));
+    assert!(matches!(
+        command_mutation(&["python".into(), "edit.py".into()], None),
+        CommandMutation::KnownMutation { .. }
+    ));
+    assert_eq!(
+        command_mutation(&["custom-codegen.exe".into()], None),
+        CommandMutation::Uncertain
+    );
+}
+
+#[test]
+fn unchanged_uncertain_command_does_not_invalidate_validation() {
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_exec_command_end_with_mutation_at(
+        &["custom-inspector.exe".into()],
+        0,
+        false,
+        "local",
+        None,
+        resolve_uncertain_command_observation(Some(false)),
+    );
+
+    assert!(!tracker.has_unvalidated_mutation());
+}
+
+#[test]
+fn failed_and_timed_out_known_mutators_still_invalidate_immediately() {
+    for (exit_code, timed_out) in [(1, false), (124, true)] {
+        let mut tracker = TurnDiffTracker::new();
+        let command = [
+            "powershell.exe".into(),
+            "-Command".into(),
+            "Set-Content out.txt changed".into(),
+        ];
+        let mutation = command_mutation(&command, None);
+        tracker.record_exec_command_end_with_mutation_at(
+            &command, exit_code, timed_out, "local", None, mutation,
+        );
+        assert!(tracker.has_unvalidated_mutation());
+    }
+}
+
+#[tokio::test]
+async fn uncertain_command_observation_detects_tracked_and_untracked_changes() {
+    let dir = tempdir().expect("tempdir");
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .expect("run git init")
+            .success()
+    );
+    fs::write(dir.path().join("tracked.txt"), "before\n").expect("seed tracked file");
+    assert!(
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git add tracked file")
+            .success()
+    );
+
+    let before_tracked = crate::git_workspace::capture_workspace_evidence_identity(dir.path())
+        .await
+        .expect("tracked baseline");
+    fs::write(dir.path().join("tracked.txt"), "after\n").expect("change tracked file");
+    let after_tracked = crate::git_workspace::capture_workspace_evidence_identity(dir.path())
+        .await
+        .expect("tracked result");
+    assert!(matches!(
+        resolve_uncertain_command_observation(Some(before_tracked != after_tracked)),
+        CommandMutation::KnownMutation { .. }
+    ));
+
+    let before_untracked = after_tracked;
+    fs::write(dir.path().join("untracked.txt"), "new\n").expect("create untracked file");
+    let after_untracked = crate::git_workspace::capture_workspace_evidence_identity(dir.path())
+        .await
+        .expect("untracked result");
+    let observed = resolve_uncertain_command_observation(Some(before_untracked != after_untracked));
+    assert!(matches!(observed, CommandMutation::KnownMutation { .. }));
+
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_exec_command_end_with_mutation_at(
+        &["custom-codegen.exe".into()],
+        0,
+        false,
+        "local",
+        None,
+        observed,
+    );
+    assert!(tracker.has_unvalidated_mutation());
 }
 
 #[test]

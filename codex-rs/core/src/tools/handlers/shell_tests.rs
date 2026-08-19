@@ -55,6 +55,8 @@ fn structured_cargo_leaf() -> ValidationRouteLeaf {
             "-p".into(),
             "codex-core".into(),
             "focused_case".into(),
+            "--".into(),
+            "--exact".into(),
         ],
         uncertainty: "the focused case still satisfies its contract".into(),
         covered_paths: vec!["core/src/task_evidence.rs".into()],
@@ -65,7 +67,7 @@ fn structured_cargo_leaf() -> ValidationRouteLeaf {
 }
 
 #[test]
-fn structured_validation_requires_uncertainty_coverage_and_a_focused_cargo_test() {
+fn recommended_fixes_structured_validation_rejects_zero_test_selectors() {
     let repo = std::path::Path::new(".");
     let valid = structured_cargo_leaf();
     assert!(super::validate_structured_validation_leaf(&valid, repo).is_ok());
@@ -91,7 +93,7 @@ fn structured_validation_requires_uncertainty_coverage_and_a_focused_cargo_test(
     assert!(
         super::validate_structured_validation_leaf(&broad, repo)
             .expect_err("broad cargo test")
-            .contains("package and a test filter")
+            .contains("one exact test ID")
     );
 
     broad.argv = vec![
@@ -105,7 +107,7 @@ fn structured_validation_requires_uncertainty_coverage_and_a_focused_cargo_test(
     assert!(
         super::validate_structured_validation_leaf(&broad, repo)
             .expect_err("cargo target is not a libtest filter")
-            .contains("package and a test filter")
+            .contains("one exact test ID")
     );
 
     let mut unsafe_coverage = structured_cargo_leaf();
@@ -143,6 +145,20 @@ fn structured_validation_requires_uncertainty_coverage_and_a_focused_cargo_test(
             .expect_err("package-wide nextest")
             .contains("must name a test filter")
     );
+
+    let mut raw_nextest_selector = structured_cargo_leaf();
+    raw_nextest_selector.argv = vec![
+        "just".into(),
+        "test-fast".into(),
+        "-p".into(),
+        "codex-core".into(),
+        "module::case".into(),
+    ];
+    assert!(
+        super::validate_structured_validation_leaf(&raw_nextest_selector, repo)
+            .expect_err("raw nextest selector must be rejected before launch")
+            .contains("exact `-E test(=...)` selector")
+    );
 }
 
 #[test]
@@ -159,6 +175,8 @@ fn direct_validation_requires_explicit_uncertainty_and_direct_argv() {
             "-p".to_string(),
             "codex-core".to_string(),
             "direct_validation".to_string(),
+            "--".to_string(),
+            "--exact".to_string(),
         ],
     };
     let route =
@@ -537,7 +555,16 @@ fn focused_validation_accepts_closed_cargo_just_and_python_forms() {
         ),
         validation_argv("just", &["source-map-check"]),
         validation_argv("just", &["fmt-check"]),
-        validation_argv("just", &["test-fast", "-p", "codex-core"]),
+        validation_argv(
+            "just",
+            &[
+                "test-fast",
+                "-p",
+                "codex-core",
+                "-E",
+                "test(=focused_validation)",
+            ],
+        ),
         validation_argv(
             "just",
             &[
@@ -545,19 +572,50 @@ fn focused_validation_accepts_closed_cargo_just_and_python_forms() {
                 "-p",
                 "codex-core",
                 "-E",
-                "test(focused_validation)",
+                "test(=focused_validation)",
             ],
         ),
         validation_argv(
             "just",
-            &["test-lane", "typed-validation", "-p", "codex-core"],
+            &[
+                "test-lane",
+                "typed-validation",
+                "-p",
+                "codex-core",
+                "-E",
+                "test(=focused_validation)",
+            ],
         ),
         validation_argv(
             "just",
-            &["test-lane-fast", "typed-validation", "-p", "codex-core"],
+            &[
+                "test-lane-fast",
+                "typed-validation",
+                "-p",
+                "codex-core",
+                "-E",
+                "test(=focused_validation)",
+            ],
         ),
-        validation_argv("just", &["test-lane-main", "-p", "codex-core"]),
-        validation_argv("just", &["test-lane-package", "codex-core"]),
+        validation_argv(
+            "just",
+            &[
+                "test-lane-main",
+                "-p",
+                "codex-core",
+                "-E",
+                "test(=focused_validation)",
+            ],
+        ),
+        validation_argv(
+            "just",
+            &[
+                "test-lane-package",
+                "codex-core",
+                "-E",
+                "test(=focused_validation)",
+            ],
+        ),
         validation_argv(
             "just",
             &["check-lane", "codex-core", "--features", "test-support"],
