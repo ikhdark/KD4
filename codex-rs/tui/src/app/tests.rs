@@ -4700,7 +4700,6 @@ fn agent_message_delta_notification(
         item_id: item_id.to_string(),
         delta: delta.to_string(),
         memory_citation: None,
-        memory_citation: None,
     })
 }
 

@@ -5,7 +5,6 @@ use codex_protocol::models::ShellCommandToolCallParams;
 use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path_uri::PathUri;
 
 use crate::agent::task_capabilities::is_independent_review_source;
 use crate::exec::ExecCapturePolicy;
@@ -299,50 +298,6 @@ impl ShellCommandHandler {
         let git_repository = get_git_repo_root(cwd.as_path());
         let repository = git_repository.clone().unwrap_or_else(|| cwd.to_path_buf());
         let repository_key = repository.to_string_lossy();
-        let bound_auto_validation = session
-            .services
-            .command_execution
-            .auto_validation_leaf(&call_id)
-            .await;
-        if let Some(binding) = bound_auto_validation.as_ref() {
-            let Some(leaf) = binding.leaf() else {
-                return Err(FunctionCallError::RespondToModel(
-                    "bound auto-validation leaf no longer exists".to_string(),
-                ));
-            };
-            if repository != binding.repository {
-                return Err(FunctionCallError::RespondToModel(
-                    "bound auto-validation cwd is no longer repository-confined".to_string(),
-                ));
-            }
-            let leaf_matches = matches!(
-                &command_invocation,
-                CommandInvocation::Argv { program, args }
-                    if leaf.argv.first() == Some(program)
-                        && leaf.argv.get(1..) == Some(args.as_slice())
-            );
-            if !leaf_matches {
-                return Err(FunctionCallError::RespondToModel(
-                    "bound auto-validation command changed before fresh admission".to_string(),
-                ));
-            }
-            super::validate_structured_validation_leaf(leaf, &repository)
-                .map_err(FunctionCallError::RespondToModel)?;
-            let current = session
-                .services
-                .task_evidence
-                .auto_validation_candidate()
-                .await;
-            if current.as_ref().is_none_or(|current| {
-                current.step_id != binding.step_id
-                    || current.implementation_revision != binding.implementation_revision
-                    || current.route != binding.route
-            }) {
-                return Err(FunctionCallError::RespondToModel(
-                    "bound auto-validation was superseded before fresh admission".to_string(),
-                ));
-            }
-        }
         let validation_admission = admit_validation(
             &turn.validation_authorization,
             session.services.state_db.as_deref(),
@@ -377,9 +332,7 @@ impl ShellCommandHandler {
                 force_fresh: params.force_fresh.unwrap_or(false),
             }),
         };
-        let direct_validation_route = if validation_launch.is_some()
-            && bound_auto_validation.is_none()
-        {
+        let direct_validation_route = if validation_launch.is_some() {
             let context = params.validation.as_ref().ok_or_else(|| {
                 FunctionCallError::RespondToModel(
                     "validation commands require `validation` metadata stating the uncertainty, covered_paths, and covered_contracts"
@@ -453,34 +406,7 @@ impl ShellCommandHandler {
             let toolchain = super::child_env_value(&exec_params.env, "RUSTUP_TOOLCHAIN")
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let identity = if let Some(binding) = bound_auto_validation.as_ref() {
-                let Some(leaf) = binding.leaf() else {
-                    return Err(FunctionCallError::RespondToModel(
-                        "bound validation route changed before launch".to_string(),
-                    ));
-                };
-                let configuration = format!(
-                    "repository_epoch={repository_epoch};features={:?};semantic_timeout={}",
-                    turn.config.features.get(),
-                    if leaf.semantic_timeout {
-                        leaf.timeout_ms.to_string()
-                    } else {
-                        "nonsemantic".to_string()
-                    }
-                );
-                validation_identity_with_scope(
-                    repository_key.as_bytes(),
-                    exec_params.cwd.to_string_lossy(),
-                    &command_invocation,
-                    environment,
-                    toolchain,
-                    configuration,
-                    binding.implementation_identity.clone(),
-                    &leaf.uncertainty,
-                    &leaf.covered_paths,
-                    &leaf.covered_contracts,
-                )
-            } else if let Some(route) = direct_validation_route.as_ref() {
+            let identity = if let Some(route) = direct_validation_route.as_ref() {
                 let Some(leaf) = route.leaves.first() else {
                     return Err(FunctionCallError::RespondToModel(
                         "direct validation route changed before launch".to_string(),
@@ -525,35 +451,6 @@ impl ShellCommandHandler {
                     .reusable_validation(&identity)
                     .await
             {
-                if let Some(binding) = bound_auto_validation.as_ref() {
-                    let Some(leaf) = binding.leaf() else {
-                        return Err(FunctionCallError::RespondToModel(
-                            "bound validation route changed before proof reuse".to_string(),
-                        ));
-                    };
-                    let cwd_uri = PathUri::from_host_native_path(&repository).map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "bound auto-validation cwd could not be recorded: {error}"
-                        ))
-                    })?;
-                    session
-                        .services
-                        .task_evidence
-                        .record_command_bound_with_validation_result(
-                            &leaf.argv,
-                            &cwd_uri,
-                            0,
-                            false,
-                            0,
-                            false,
-                            None,
-                            None,
-                            Some(&result.proof_key.implementation_identity),
-                            Some(result.clone()),
-                            Some((binding.step_id.as_str(), binding.step_revision)),
-                        )
-                        .await;
-                }
                 tracing::info!(
                     disposition = "reused",
                     duplicate_of_call_id = %result.call_id,
@@ -570,13 +467,7 @@ impl ShellCommandHandler {
                     }),
                 )));
             }
-            if let (Some(launch), Some(binding)) =
-                (validation_launch.as_mut(), bound_auto_validation.as_ref())
-            {
-                launch.proof_key = Some(identity.clone());
-                launch.structured_route = binding.leaf_route();
-                launch.validation_call_id = Some(call_id.clone());
-            } else if let (Some(launch), Some(route)) =
+            if let (Some(launch), Some(route)) =
                 (validation_launch.as_mut(), direct_validation_route.as_ref())
             {
                 launch.proof_key = Some(identity.clone());

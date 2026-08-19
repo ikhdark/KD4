@@ -267,8 +267,8 @@ async fn namespace_dependencies_refresh_head_and_root_history() {
 #[tokio::test]
 async fn missing_project_namespace_is_cached_with_its_dependencies() {
     let temp_dir = TempDir::new().expect("temp git repository");
-    let repo = AbsolutePathBuf::from_absolute_path(temp_dir.path().to_path_buf())
-        .expect("absolute repository path");
+    let repo =
+        AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute repository path");
     run_git(repo.as_path(), &["init", "-q"]).await;
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
     let source = GitWorkspaceMetadataSource {

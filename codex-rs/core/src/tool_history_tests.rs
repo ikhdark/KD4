@@ -315,13 +315,14 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
 fn workspace_evidence_invalidates_only_overlapping_source_dependencies() {
     let call_id = "call-1";
     let output = text_output(call_id, "search result".to_string());
-    let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
+    let canonical: Arc<[ResponseItem]> =
+        Arc::from([named_function_call(call_id, "exec_command"), output.clone()]);
     let foo = PathBuf::from("/repo/src/foo.rs");
     let captured = workspace_identity("captured");
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
         WorkspaceEvidenceObservation::from_response_item(
-            Some(captured.clone()),
+            Some(captured),
             &output,
             BTreeSet::from([SourceDependencyV1::new(&foo, false)]),
         )

@@ -15565,15 +15565,16 @@ mod tests {
             )
             .await;
 
-        let guard = ledger.document.lock().await;
-        let decisions = &guard.as_ref().expect("document").locked_user_decisions;
-        assert_eq!(decisions.len(), 3);
-        assert_eq!(
-            decisions[1].supersedes.as_deref(),
-            Some("call-1:deployment")
-        );
-        assert_eq!(decisions[2].supersedes, None);
-        drop(guard);
+        {
+            let guard = ledger.document.lock().await;
+            let decisions = &guard.as_ref().expect("document").locked_user_decisions;
+            assert_eq!(decisions.len(), 3);
+            assert_eq!(
+                decisions[1].supersedes.as_deref(),
+                Some("call-1:deployment")
+            );
+            assert_eq!(decisions[2].supersedes, None);
+        }
 
         let persisted: TaskEvidenceDocument = serde_json::from_slice(
             &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))

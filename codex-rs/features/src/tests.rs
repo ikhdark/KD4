@@ -875,42 +875,41 @@ enable_fanout = true
 
 #[test]
 fn unstable_warning_event_resolves_legacy_aliases_to_canonical_keys() {
-    for (alias, feature) in [("telepathy", Feature::Chronicle)] {
-        let mut configured_features = Table::new();
-        configured_features.insert(alias.to_string(), TomlValue::Boolean(true));
+    let (alias, feature) = ("telepathy", Feature::Chronicle);
+    let mut configured_features = Table::new();
+    configured_features.insert(alias.to_string(), TomlValue::Boolean(true));
 
-        let mut features = Features::with_defaults();
-        features.enable(feature);
+    let mut features = Features::with_defaults();
+    features.enable(feature);
 
-        let warning = unstable_features_warning_event(
-            Some(&configured_features),
-            /*suppress_unstable_features_warning*/ false,
-            &features,
-            "/tmp/config.toml",
-        )
-        .expect("warning event");
-        let EventMsg::Warning(WarningEvent { message }) = warning.msg else {
-            panic!("expected warning event");
-        };
-        let expected = format!(
-            "Under-development features enabled: {}. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/config.toml.",
-            feature.key()
-        );
-        assert_eq!(message, expected);
+    let warning = unstable_features_warning_event(
+        Some(&configured_features),
+        /*suppress_unstable_features_warning*/ false,
+        &features,
+        "/tmp/config.toml",
+    )
+    .expect("warning event");
+    let EventMsg::Warning(WarningEvent { message }) = warning.msg else {
+        panic!("expected warning event");
+    };
+    let expected = format!(
+        "Under-development features enabled: {}. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/config.toml.",
+        feature.key()
+    );
+    assert_eq!(message, expected);
 
-        configured_features.insert(feature.key().to_string(), TomlValue::Boolean(true));
-        let warning = unstable_features_warning_event(
-            Some(&configured_features),
-            /*suppress_unstable_features_warning*/ false,
-            &features,
-            "/tmp/config.toml",
-        )
-        .expect("warning event");
-        let EventMsg::Warning(WarningEvent { message }) = warning.msg else {
-            panic!("expected warning event");
-        };
-        assert_eq!(message, expected);
-    }
+    configured_features.insert(feature.key().to_string(), TomlValue::Boolean(true));
+    let warning = unstable_features_warning_event(
+        Some(&configured_features),
+        /*suppress_unstable_features_warning*/ false,
+        &features,
+        "/tmp/config.toml",
+    )
+    .expect("warning event");
+    let EventMsg::Warning(WarningEvent { message }) = warning.msg else {
+        panic!("expected warning event");
+    };
+    assert_eq!(message, expected);
 }
 
 #[test]

@@ -778,28 +778,16 @@ async fn emit_exec_end(
                 mutation.clone(),
             );
     }
-    let bound_auto_validation = ctx
+    let (ledger, provenance) = ctx
         .session
         .services
-        .command_execution
-        .auto_validation_leaf(ctx.call_id)
+        .agent_control
+        .completion_evidence_target(
+            &ctx.turn.session_source,
+            ctx.session.thread_id,
+            &ctx.session.services.task_evidence,
+        )
         .await;
-    let (ledger, provenance) = if bound_auto_validation.is_some() {
-        // The bound route belongs to this session's acknowledged plan.  An untyped
-        // non-root session otherwise forwards generic command evidence to the root,
-        // which would strand its own Implemented step without the focused receipt.
-        (ctx.session.services.task_evidence.clone(), None)
-    } else {
-        ctx.session
-            .services
-            .agent_control
-            .completion_evidence_target(
-                &ctx.turn.session_source,
-                ctx.session.thread_id,
-                &ctx.session.services.task_evidence,
-            )
-            .await
-    };
     let validation_result = ctx
         .session
         .services
@@ -822,13 +810,11 @@ async fn emit_exec_end(
             exec_result.timed_out,
             u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
             mutation,
-            mutation_paths,
+            None,
             provenance.as_ref(),
             implementation_identity_hash.as_deref(),
             validation_result,
-            bound_auto_validation
-                .as_ref()
-                .map(|binding| (binding.step_id.as_str(), binding.step_revision)),
+            None,
         )
         .await;
     ctx.session

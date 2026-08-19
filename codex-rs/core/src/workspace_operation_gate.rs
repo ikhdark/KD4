@@ -6,12 +6,12 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
 
-use tokio::sync::OwnedSemaphorePermit;
-use tokio::sync::Semaphore;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OwnedMutexGuard;
 
-static WORKSPACE_GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<Semaphore>>>> = OnceLock::new();
+static WORKSPACE_GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>> = OnceLock::new();
 
-pub(crate) async fn acquire_workspace_operation(root: &Path) -> OwnedSemaphorePermit {
+pub(crate) async fn acquire_workspace_operation(root: &Path) -> OwnedMutexGuard<()> {
     let identity = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let gate = {
         let mut gates = WORKSPACE_GATES
@@ -22,14 +22,12 @@ pub(crate) async fn acquire_workspace_operation(root: &Path) -> OwnedSemaphorePe
         if let Some(gate) = gates.get(&identity).and_then(Weak::upgrade) {
             gate
         } else {
-            let gate = Arc::new(Semaphore::new(1));
+            let gate = Arc::new(AsyncMutex::new(()));
             gates.insert(identity, Arc::downgrade(&gate));
             gate
         }
     };
-    gate.acquire_owned()
-        .await
-        .expect("workspace operation gate is never closed")
+    gate.lock_owned().await
 }
 
 #[cfg(test)]

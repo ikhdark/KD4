@@ -692,6 +692,7 @@ async fn local_output_artifact_is_flushed_and_unlocked_before_output_closed() {
     assert!(output_closed.load(Ordering::Acquire));
     let (path, handle) = match &*artifact.lock().await {
         RawOutputArtifact::Stored { path, handle, .. } => (path.clone(), Arc::clone(handle)),
+        RawOutputArtifact::Pending { .. } => panic!("artifact remained pending"),
         RawOutputArtifact::Failed { message, .. } => panic!("artifact failed: {message}"),
     };
     assert_eq!(

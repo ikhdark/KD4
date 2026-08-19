@@ -37,7 +37,7 @@ const MAX_AGGREGATE_LINES: usize = 2_000;
 // A nested result is serialized into a code-mode cell and then into the outer
 // exec result. Reserve enough space for that outer envelope so a fitting exact
 // recovery cannot be recursively truncated into another artifact.
-const CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS: usize = 4_000;
+const CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS: usize = 1_000;
 const CODE_MODE_RECOVERY_TOKEN_CEILING: usize =
     codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS
         .saturating_sub(CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS);
@@ -573,7 +573,7 @@ mod tests {
             CODE_MODE_RECOVERY_TOKEN_CEILING + CODE_MODE_RECOVERY_WRAPPER_RESERVE_TOKENS,
             codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
         );
-        assert_eq!(CODE_MODE_RECOVERY_TOKEN_CEILING, 6_000);
+        assert_eq!(CODE_MODE_RECOVERY_TOKEN_CEILING, 3_000);
     }
 
     #[test]

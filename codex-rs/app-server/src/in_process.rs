@@ -1033,7 +1033,6 @@ mod tests {
                         item_id: "item-1".to_string(),
                         delta: "hello".to_string(),
                         memory_citation: None,
-                        memory_citation: None,
                     }),
                 )
                 .await;
@@ -1109,7 +1108,6 @@ mod tests {
                         turn_id: "turn-1".to_string(),
                         item_id: "item-1".to_string(),
                         delta: "hello".to_string(),
-                        memory_citation: None,
                         memory_citation: None,
                     }),
                 )

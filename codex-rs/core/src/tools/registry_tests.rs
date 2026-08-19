@@ -1176,7 +1176,7 @@ async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier()
             omitted_inline_ids: Vec::new(),
             partial_ids: Vec::new(),
         },
-        applied_token_limit: 1_000,
+        applied_token_limit: codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
         projected_text: outer_text.clone(),
         preserved_content: Vec::new(),
         codex_home: codex_home.path().to_path_buf(),
@@ -1220,8 +1220,10 @@ async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier()
         }]);
     assert_eq!(accepted, vec![receipt]);
     assert!(!outer_projection.artifact_created);
-    let rendered = outer_projection.bounded.value().to_string();
-    assert!(rendered.contains(&text));
+    assert_eq!(
+        outer_projection.bounded.value()["result"]["preserved_content"],
+        serde_json::json!([serde_json::to_value(&recovered).expect("serialize exact recovery")])
+    );
 
     let log_count = std::fs::read_dir(codex_home.path().join("tool-output").join(thread_id))
         .expect("fresh corpus artifact directory")
@@ -1246,7 +1248,7 @@ async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier()
         "expected_secondary_model_boundaries": 0,
         "maximum_secondary_model_boundaries": 2,
     });
-    println!("FRESH_CORPUS_REPORT={report}");
+    tracing::info!(%report, "fresh corpus report");
     assert_eq!(report["silent_truncations"], 0);
     assert_eq!(report["false_success_results"], 0);
     assert_eq!(report["recursive_spills"], 0);

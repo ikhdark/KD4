@@ -254,7 +254,7 @@ impl ResponsesWebsocketConnection {
         let models_etag = self.models_etag.clone();
         let server_model = self.server_model.clone();
         let telemetry = self.telemetry.clone();
-        let request_text = serialize_websocket_request(&request)?;
+        let request_text = serialize_websocket_request(request)?;
         let (tx_send_complete, rx_send_complete) = oneshot::channel();
         queue_started();
 

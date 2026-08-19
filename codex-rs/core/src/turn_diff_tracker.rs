@@ -289,6 +289,7 @@ impl TurnDiffTracker {
         self.invalidate();
     }
 
+    #[cfg(test)]
     pub(crate) fn record_exec_command_end_at(
         &mut self,
         command: &[String],
@@ -1772,7 +1773,7 @@ fn powershell_segment_is_read_only(segment: &str) -> bool {
         segment
             .split_ascii_whitespace()
             .next()
-            .map(|word| word.to_ascii_lowercase())
+            .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("else" | "exit")
     ) {

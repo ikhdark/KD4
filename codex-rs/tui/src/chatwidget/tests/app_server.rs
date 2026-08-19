@@ -1242,7 +1242,6 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
                 item_id: "item-1".to_string(),
                 delta: "hello".to_string(),
                 memory_citation: None,
-                memory_citation: None,
             },
         ),
         /*replay_kind*/ None,

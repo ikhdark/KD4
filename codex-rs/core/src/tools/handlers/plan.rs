@@ -20,6 +20,7 @@ use codex_tools::ToolSpec;
 use serde_json::Value as JsonValue;
 #[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::LazyLock;

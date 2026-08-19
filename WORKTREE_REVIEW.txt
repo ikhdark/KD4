@@ -137,3 +137,36 @@ Checks not run: focused Rust tests for the twelve repairs and any broader Rust/f
 Final inventory: 57 frozen tracked paths, each represented exactly once above, plus review-generated WORKTREE_REVIEW.txt = 58 modified tracked paths. No additions, deletions, renames, copies, type changes, submodule changes, or untracked files. Since no repository path changed identity, just source-map-check was not required.
 
 Publish readiness: source review findings are repaired and non-building checks pass, but Rust validation and a new-binary build are not proven because of the unrelated Clippy failure and repeated V8 archive 404. Commit/push is authorized by the user and skill. Republish remains blocked under validation-failure policy until a build can run without violating the post-repeat non-building restriction.
+
+POST-COMMIT CORRECTION AFTER PUBLISH CHECK
+------------------------------------------
+The first publish attempt exposed two worktree-attributable diagnostics that the earlier workspace Clippy run had not reached because codex-api failed first: an unused non-test Arc import in plan.rs and a CommandMutation move while mutation_paths still borrowed it in events.rs. The import is now test-only, and events passes the owned mutation as the sole path authority without the redundant borrowed fallback.
+
+At the user's direction, every diagnostic subsequently exposed by focused Clippy was repaired. The codex-api needless borrow was removed. The obsolete auto-validation binding type, map, methods, and unreachable shell/events branches left behind by F2 were deleted. Test-only constructors/helpers are cfg(test). Unused workspace-evidence timing wrappers were removed. The PowerShell redundant closure and validation canonicalizer collapsible match were corrected. The workspace operation gate now uses an infallible owned Tokio mutex guard instead of expecting on semaphore acquisition.
+
+The cargo-shear finding was also resolved: codex-rs/tools/src/function_call_error_tests.rs was an unlinked obsolete test for ToolFailureDiagnostic and ToolFailureClass, APIs no longer present in codex-tools, so it was deleted. Required source-map reconciliation passed and updated SOURCEMAP.md from 5,413 to 5,412 tracked paths.
+
+Correction validation:
+- cargo clippy -p codex-api -p codex-core --lib --keep-going: passed with zero warnings and zero errors.
+- cargo fmt --all -- --check: passed.
+- just cargo-shear: passed with no issues.
+- just source-map-check: passed.
+
+The historical analyzer narrative above records the first review attempt. This correction section is authoritative for the repaired state and supersedes its Clippy, cargo-shear, and publish-readiness conclusions.
+
+FULL-SUITE CLIPPY AND FINAL RECONCILIATION
+------------------------------------------
+The user explicitly expanded the correction scope to every diagnostic found by the complete Clippy suite. The authoritative command was cargo clippy --workspace --all-targets --all-features --keep-going. Its initial passes exposed additional all-target fixture drift and denied lints in codex-app-server, codex-app-server-client, codex-core, codex-features, and codex-tui. All exposed diagnostics were repaired: fixtures now match the current protocol fields, exhaustive RawOutputArtifact handling includes Pending, test target selectors and diagnostics retain the exact equality contract, the task-evidence lock is dropped before await, redundant ownership and output/debug constructs were removed, and the code-mode recovery reserve is compatible with the 4,000-token success-output budget. No Clippy finding was suppressed.
+
+The all-features v8 build required the ptrcomp+sandbox archive and generated binding from the official OpenAI rusty-v8 v149.2.0 release. Those locations were supplied only as process-local environment variables; no repository dependency or machine-wide configuration was changed. The final authoritative Clippy command passed for the entire workspace, all targets, and all features with zero warnings and zero errors.
+
+Final analyzer and proof results:
+- cargo clippy --workspace --all-targets --all-features --keep-going: passed.
+- just cargo-shear: passed with no issues; the sole stale unlinked test file was deleted rather than suppressed.
+- just rust-dead-code-matrix: passed across the complete workspace/all targets with -D dead_code. The only emitted notice was a future-incompatibility warning for dependency proc-macro-error2 v2.0.1, not a source or dead-code finding.
+- Targeted nextest proof: 18 of 18 selected codex-core/codex-features tests passed, 3,906 tests were filtered out, run ID 56fb32e0-e96a-49fe-a739-fa377185dad4.
+- cargo fmt --all -- --check: passed.
+- just source-map-check: passed after the stale file deletion and retained the corrected 5,412-path inventory.
+- git diff --check: passed; Git emitted only configured LF-to-CRLF worktree notices.
+
+Correction inventory at final reconciliation: 27 review-owned modified/deleted paths, plus the user's separate unstaged AGENTS.md edit. The AGENTS.md edit is deliberately excluded from this correction commit. All analyzer, compile-contract, and targeted-test findings encountered during the correction were fixed; unresolved confirmed or possible findings: 0. Publish readiness: clean full-suite Clippy, clean dead-code and dependency analyzers, clean formatting/diff/source-map checks, and 18/18 targeted tests. Commit, push, and republish remain the authorized final actions.

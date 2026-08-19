@@ -1321,7 +1321,7 @@ pub(crate) fn validate_structured_validation_leaf(
             }
             Some("test-lane-package") if !nextest_args_have_filter(&args[2..]) => {
                 return Err(
-                    "auto-validation just package lanes must use an exact `-E test(=...)` selector"
+                    "auto-validation just package lanes must name a test filter using an exact `-E test(=...)` selector"
                         .to_string(),
                 );
             }
@@ -1623,7 +1623,7 @@ fn validate_nextest_forwarded_args(args: &[String]) -> Result<(), String> {
             }
             _ => {
                 return Err(format!(
-                    "unrecognized raw nextest module path `{arg}`; use `-E test(=...)`"
+                    "unrecognized raw nextest module path `{arg}`; use an exact `-E test(=...)` selector"
                 ));
             }
         }

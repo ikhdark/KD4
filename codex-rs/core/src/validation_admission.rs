@@ -1137,10 +1137,8 @@ fn canonical_test_proof_route(invocation: &CommandInvocation) -> Option<Vec<u8>>
                 index += usize::from(inline.is_none());
             }
             "--target-dir" | "-j" | "--jobs" if program == "cargo" => {
-                if inline.is_none() {
-                    forwarded.get(index + 1)?;
-                    index += 1;
-                }
+                let _ = inline.or_else(|| forwarded.get(index + 1).map(String::as_str))?;
+                index += usize::from(inline.is_none());
             }
             "--lib" | "--bins" | "--tests" | "--benches" | "--all-targets" | "--doc" => {
                 target_flags.push(option.to_string());

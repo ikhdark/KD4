@@ -317,30 +317,6 @@ pub(crate) struct RunningCommand {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct BoundAutoValidationLeaf {
-    pub(crate) step_id: String,
-    pub(crate) step_revision: u64,
-    pub(crate) implementation_revision: u64,
-    pub(crate) implementation_identity: String,
-    pub(crate) repository: PathBuf,
-    pub(crate) route: ValidationRoute,
-    pub(crate) leaf_index: usize,
-}
-
-impl BoundAutoValidationLeaf {
-    pub(crate) fn leaf(&self) -> Option<&codex_protocol::plan_tool::ValidationRouteLeaf> {
-        self.route.leaves.get(self.leaf_index)
-    }
-
-    pub(crate) fn leaf_route(&self) -> Option<ValidationRoute> {
-        self.leaf().cloned().map(|leaf| ValidationRoute {
-            leaves: vec![leaf],
-            ordering: self.route.ordering,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
 struct CompletedValidationProof {
     result: ValidationResult,
     artifact: RawOutputArtifact,
@@ -390,7 +366,6 @@ struct CommandExecutionState {
 
 pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
-    bound_auto_validations: Mutex<HashMap<String, BoundAutoValidationLeaf>>,
     persistence: Option<CommandExecutionPersistence>,
 }
 
@@ -398,7 +373,6 @@ impl Default for CommandExecutionLedger {
     fn default() -> Self {
         Self {
             state: Mutex::new(CommandExecutionState::default()),
-            bound_auto_validations: Mutex::new(HashMap::new()),
             persistence: None,
         }
     }
@@ -424,7 +398,6 @@ impl CommandExecutionLedger {
                 observed_workspace_identity: Some((0, workspace_identity.clone())),
                 ..CommandExecutionState::default()
             }),
-            bound_auto_validations: Mutex::new(HashMap::new()),
             persistence: Some(persistence.clone()),
         };
         let Ok(bytes) = tokio::fs::read(&persistence.cache_path).await else {
@@ -501,33 +474,6 @@ impl CommandExecutionLedger {
         Ok(())
     }
 
-    pub(crate) async fn bind_auto_validation_leaf(
-        &self,
-        call_id: String,
-        binding: BoundAutoValidationLeaf,
-    ) -> bool {
-        self.bound_auto_validations
-            .lock()
-            .await
-            .insert(call_id, binding)
-            .is_none()
-    }
-
-    pub(crate) async fn auto_validation_leaf(
-        &self,
-        call_id: &str,
-    ) -> Option<BoundAutoValidationLeaf> {
-        self.bound_auto_validations
-            .lock()
-            .await
-            .get(call_id)
-            .cloned()
-    }
-
-    pub(crate) async fn clear_auto_validation_leaf(&self, call_id: &str) {
-        self.bound_auto_validations.lock().await.remove(call_id);
-    }
-
     pub(crate) async fn record_uncertain_command_baseline(
         &self,
         call_id: &str,
@@ -596,29 +542,6 @@ impl CommandExecutionLedger {
             .validation_results_by_call
             .get(call_id)
             .cloned()
-    }
-
-    pub(crate) async fn supersede_validation_result_for_call(
-        &self,
-        call_id: &str,
-    ) -> Option<ValidationResult> {
-        let mut state = self.state.lock().await;
-        let proof_key = state
-            .validation_results_by_call
-            .get(call_id)?
-            .proof_key
-            .clone();
-        state.completed_validations.remove(&proof_key);
-        state
-            .completed_validation_order
-            .retain(|entry| entry != &proof_key);
-        let result = state.validation_results_by_call.get_mut(call_id)?;
-        result.status = ValidationTerminalStatus::Superseded;
-        result.freshness = ValidationFreshness::Superseded;
-        result.summary = Some(
-            "focused validation was superseded by a newer relevant implementation".to_string(),
-        );
-        Some(result.clone())
     }
 
     pub(crate) async fn observe_repository_revision(

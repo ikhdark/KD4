@@ -218,14 +218,6 @@ macro_rules! record_phase {
     };
 }
 
-record_phase!(
-    record_workspace_evidence_before,
-    record_workspace_evidence_before
-);
-record_phase!(
-    record_workspace_evidence_after,
-    record_workspace_evidence_after
-);
 record_phase!(record_pre_tool_hook, record_pre_tool_hook);
 record_phase!(record_post_tool_hook, record_post_tool_hook);
 record_phase!(record_output_projection, record_output_projection);

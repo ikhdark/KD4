@@ -2605,6 +2605,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             environments: None,
             thread_id: thread.id.clone(),
             client_user_message_id: None,
+            run_independently: None,
             input: vec![V2UserInput::Text {
                 text: "first turn".to_string(),
                 text_elements: Vec::new(),
@@ -2650,6 +2651,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             environments: None,
             thread_id: thread.id.clone(),
             client_user_message_id: None,
+            run_independently: None,
             input: vec![V2UserInput::Text {
                 text: "second turn".to_string(),
                 text_elements: Vec::new(),

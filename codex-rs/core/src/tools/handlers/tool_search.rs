@@ -259,6 +259,7 @@ impl ToolSearchHandlerCache {
 }
 
 impl ToolSearchHandler {
+    #[cfg(test)]
     #[instrument(
         level = "trace",
         skip_all,
