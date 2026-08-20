@@ -283,7 +283,7 @@ impl ExecProcess for BlockingTerminateExecProcess {
 }
 
 async fn blocking_terminate_unified_process(
-    process_id: i32,
+    process_id: u32,
     terminate_started: watch::Sender<bool>,
     allow_terminate: Arc<Notify>,
 ) -> anyhow::Result<Arc<UnifiedExecProcess>> {
@@ -305,7 +305,7 @@ async fn blocking_terminate_unified_process(
 
 async fn write_stdin(
     session: &Arc<Session>,
-    process_id: i32,
+    process_id: u32,
     input: &str,
     yield_time_ms: u64,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {

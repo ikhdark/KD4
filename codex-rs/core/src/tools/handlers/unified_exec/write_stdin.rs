@@ -25,7 +25,7 @@ use super::post_unified_exec_tool_use_payload;
 #[derive(Debug, Deserialize)]
 struct WriteStdinArgs {
     // The model is trained on `session_id`.
-    session_id: i32,
+    session_id: u32,
     #[serde(default)]
     chars: String,
     #[serde(default = "super::default_write_stdin_yield_time_ms")]
@@ -217,7 +217,7 @@ mod tests {
     use super::*;
     use codex_utils_output_truncation::TruncationPolicy;
 
-    fn response(raw_output: &[u8], process_id: Option<i32>) -> ExecCommandToolOutput {
+    fn response(raw_output: &[u8], process_id: Option<u32>) -> ExecCommandToolOutput {
         ExecCommandToolOutput {
             event_call_id: "call".to_string(),
             chunk_id: "chunk".to_string(),
@@ -232,6 +232,15 @@ mod tests {
             raw_output_artifact: None,
             repair_notice: None,
         }
+    }
+
+    #[test]
+    fn accepts_full_unsigned_session_id_range() {
+        let args: WriteStdinArgs =
+            serde_json::from_str(r#"{"session_id":2374420115,"chars":"","yield_time_ms":1000}"#)
+                .expect("session id returned by exec_command should deserialize");
+
+        assert_eq!(args.session_id, 2_374_420_115);
     }
 
     #[test]

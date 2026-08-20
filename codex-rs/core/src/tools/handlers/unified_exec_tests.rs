@@ -926,8 +926,8 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
         arguments: "{}".to_string(),
     });
     let process_id = code_mode["session_id"]
-        .as_i64()
-        .and_then(|value| i32::try_from(value).ok())
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
         .expect("numeric background process id");
     let attempt_key = session
         .services

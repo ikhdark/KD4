@@ -3420,7 +3420,7 @@ impl Session {
         self.services.unified_exec_manager.list_processes().await
     }
 
-    pub(crate) async fn terminate_background_terminal(&self, process_id: i32) -> bool {
+    pub(crate) async fn terminate_background_terminal(&self, process_id: u32) -> bool {
         self.services
             .unified_exec_manager
             .terminate_process(process_id)

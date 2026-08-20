@@ -215,20 +215,19 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let mut expected_tools_names = if cfg!(windows) {
-        vec!["shell_command"]
-    } else {
-        vec!["exec_command", "write_stdin"]
-    };
-    expected_tools_names.extend([
+    let expected_tools_names = vec![
+        "exec",
+        "exec_command",
+        "write_stdin",
         "read_tool_output",
+        "read_turn_timing",
         "update_plan",
         "request_user_input",
+        "request_permissions",
         "apply_patch",
         "view_image",
-        "tool_search",
         "web_search",
-    ]);
+    ];
     let body0 = req1.single_request().body_json();
 
     let expected_instructions = if expected_tools_names.contains(&"apply_patch") {

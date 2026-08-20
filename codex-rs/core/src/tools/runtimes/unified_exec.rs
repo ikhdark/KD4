@@ -120,7 +120,7 @@ pub struct UnifiedExecRequest {
     pub raw_output_artifact: RawOutputArtifact,
     pub shell_type: ShellType,
     pub hook_command: String,
-    pub process_id: i32,
+    pub process_id: u32,
     pub cwd: PathUri,
     pub sandbox_cwd: PathUri,
     pub turn_environment: TurnEnvironment,

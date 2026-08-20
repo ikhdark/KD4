@@ -211,7 +211,7 @@ pub(crate) fn spawn_exit_watcher(
     command: Vec<String>,
     cwd: PathUri,
     environment_id: String,
-    process_id: i32,
+    process_id: u32,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     tracker: Option<SharedTurnDiffTracker>,

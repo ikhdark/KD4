@@ -199,7 +199,7 @@ fn exec_server_env_for_request(
 }
 
 fn exec_server_params_for_request(
-    process_id: i32,
+    process_id: u32,
     request: &ExecRequest,
     tty: bool,
 ) -> codex_exec_server::ExecParams {
@@ -238,7 +238,7 @@ struct PreparedProcessHandles {
     network_approval: Option<DeferredNetworkApproval>,
     call_id: String,
     hook_command: String,
-    process_id: i32,
+    process_id: u32,
     tty: bool,
 }
 
@@ -256,7 +256,7 @@ pub(super) struct PendingProcessRegistration {
     process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
     session: Arc<crate::session::session::Session>,
     attempt_key: crate::tools::command_execution::CommandAttemptKey,
-    process_id: i32,
+    process_id: u32,
     pending_spawns: PendingSpawnRegistration,
     primary_process: Option<Arc<UnifiedExecProcess>>,
     network_approval: Option<DeferredNetworkApproval>,
@@ -269,7 +269,7 @@ struct PendingProcessCleanup {
     process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
     session: Arc<crate::session::session::Session>,
     attempt_key: crate::tools::command_execution::CommandAttemptKey,
-    process_id: i32,
+    process_id: u32,
     processes: Vec<PendingProcessToTerminate>,
     primary_process: Option<Arc<UnifiedExecProcess>>,
     network_approval: Option<DeferredNetworkApproval>,
@@ -286,7 +286,7 @@ impl PendingProcessRegistration {
         process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
         context: &UnifiedExecContext,
         attempt_key: crate::tools::command_execution::CommandAttemptKey,
-        process_id: i32,
+        process_id: u32,
     ) -> Self {
         Self {
             process_store,
@@ -664,19 +664,15 @@ impl UnifiedExecProcessManager {
         build_unified_exec_environment(context).0
     }
 
-    async fn allocate_process_id_value(&self) -> i32 {
+    async fn allocate_process_id_value(&self) -> u32 {
         loop {
             let mut store = self.process_store.lock().await;
 
             let process_id = if should_use_deterministic_process_ids() {
                 // test or deterministic mode
-                store
-                    .reserved_process_ids
-                    .iter()
-                    .copied()
-                    .max()
-                    .map(|m| std::cmp::max(m, 999) + 1)
-                    .unwrap_or(1000)
+                (1_000..=u32::MAX)
+                    .find(|candidate| !store.reserved_process_ids.contains(candidate))
+                    .expect("process id space exhausted")
             } else {
                 // production mode → random
                 rand::rng().random_range(1_000..100_000)
@@ -708,11 +704,11 @@ impl UnifiedExecProcessManager {
     }
 
     #[cfg(test)]
-    pub(crate) async fn allocate_process_id(&self) -> i32 {
+    pub(crate) async fn allocate_process_id(&self) -> u32 {
         self.allocate_process_id_value().await
     }
 
-    pub(crate) async fn release_process_id(&self, process_id: i32) {
+    pub(crate) async fn release_process_id(&self, process_id: u32) {
         let removed = {
             let mut store = self.process_store.lock().await;
             store.remove(process_id)
@@ -1323,7 +1319,7 @@ impl UnifiedExecProcessManager {
         Ok(response)
     }
 
-    async fn refresh_process_state(&self, process_id: i32) -> ProcessStatus {
+    async fn refresh_process_state(&self, process_id: u32) -> ProcessStatus {
         let mut store = self.process_store.lock().await;
         let Some(entry) = store.processes.get_mut(&process_id) else {
             return ProcessStatus::Unknown;
@@ -1351,7 +1347,7 @@ impl UnifiedExecProcessManager {
 
     async fn prepare_process_handles(
         &self,
-        process_id: i32,
+        process_id: u32,
         expected_process: &Arc<UnifiedExecProcess>,
     ) -> Result<PreparedProcessHandles, UnifiedExecError> {
         let mut store = self.process_store.lock().await;
@@ -1404,7 +1400,7 @@ impl UnifiedExecProcessManager {
         environment_id: String,
         started_at: Instant,
         validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
-        process_id: i32,
+        process_id: u32,
         process_id_reservation: &mut ProcessIdReservation,
         tty: bool,
         attempt_key: crate::tools::command_execution::CommandAttemptKey,
@@ -1500,7 +1496,7 @@ impl UnifiedExecProcessManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_session_with_exec_env(
         &self,
-        process_id: i32,
+        process_id: u32,
         command: SandboxCommand,
         options: ExecOptions,
         attempt: &SandboxAttempt<'_>,
@@ -1544,7 +1540,7 @@ impl UnifiedExecProcessManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_session_with_prepared_exec_env(
         &self,
-        process_id: i32,
+        process_id: u32,
         request: &ExecRequest,
         tty: bool,
         mut spawn_lifecycle: SpawnLifecycleHandle,
@@ -1981,8 +1977,10 @@ impl UnifiedExecProcessManager {
 
                 if exit_signal_received {
                     let now = Instant::now();
-                    let close_wait_deadline =
-                        *post_exit_deadline.get_or_insert_with(|| now + remaining);
+                    let close_wait_deadline = *post_exit_deadline.get_or_insert_with(|| {
+                        let period = quiet_period.unwrap_or(INITIAL_OUTPUT_QUIET_PERIOD);
+                        (now + period).min(deadline)
+                    });
                     let close_wait_remaining = close_wait_deadline.saturating_duration_since(now);
                     if close_wait_remaining == Duration::ZERO {
                         break;
@@ -2011,6 +2009,9 @@ impl UnifiedExecProcessManager {
                 continue;
             }
 
+            let output_arrived = !drained_chunks.is_empty()
+                || drained_omitted_bytes > 0
+                || drained_lagged_chunks > 0;
             let meaningful_output_arrived = quiet_period.is_some()
                 && drained_chunks
                     .iter()
@@ -2025,6 +2026,12 @@ impl UnifiedExecProcessManager {
             }
 
             exit_signal_received |= cancellation_token.is_cancelled();
+            if exit_signal_received && output_arrived {
+                // Pipe closure can lag process exit on Windows. Give each
+                // post-exit output burst one quiet period, rather than falling
+                // back to the caller's full initial yield deadline.
+                post_exit_deadline = None;
+            }
             let effective_deadline = if exit_signal_received {
                 deadline
             } else {
@@ -2088,7 +2095,7 @@ impl UnifiedExecProcessManager {
             return None;
         }
 
-        let mut meta: Vec<(i32, Instant, bool)> = store
+        let mut meta: Vec<(u32, Instant, bool)> = store
             .processes
             .iter()
             .map(|(id, entry)| (*id, entry.last_used, entry.process.has_exited()))
@@ -2111,7 +2118,7 @@ impl UnifiedExecProcessManager {
     }
 
     // Centralized pruning policy so we can easily swap strategies later.
-    fn process_id_to_prune_from_meta(meta: &[(i32, Instant, bool)]) -> Option<i32> {
+    fn process_id_to_prune_from_meta(meta: &[(u32, Instant, bool)]) -> Option<u32> {
         if meta.is_empty() {
             return None;
         }
@@ -2166,7 +2173,7 @@ impl UnifiedExecProcessManager {
             .collect()
     }
 
-    pub(crate) async fn terminate_process(&self, process_id: i32) -> bool {
+    pub(crate) async fn terminate_process(&self, process_id: u32) -> bool {
         let (process, already_exited) = {
             let store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
@@ -2205,7 +2212,7 @@ enum ProcessStatus {
     Alive {
         exit_code: Option<i32>,
         call_id: String,
-        process_id: i32,
+        process_id: u32,
     },
     Exited {
         exit_code: Option<i32>,

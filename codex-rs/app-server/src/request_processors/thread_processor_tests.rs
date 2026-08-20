@@ -127,6 +127,22 @@ mod background_terminal_pagination_tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn paginates_process_ids_above_the_signed_integer_limit() {
+        let terminals = vec![
+            terminal("2374420114"),
+            terminal("2374420115"),
+            terminal("4294967295"),
+        ];
+
+        let (data, next_cursor) =
+            paginate_background_terminals(&terminals, Some("2374420114".to_string()), Some(1))
+                .expect("full unsigned process id cursor is valid");
+
+        assert_eq!(data, vec![terminal("2374420115")]);
+        assert_eq!(next_cursor, Some("2374420115".to_string()));
+    }
 }
 
 mod failed_fork_cleanup_tests {

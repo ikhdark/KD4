@@ -578,6 +578,9 @@ impl UnifiedExecProcess {
                         } else {
                             state
                         });
+                        if exited {
+                            cancellation_token.cancel();
+                        }
                     }
                     if closed {
                         break;
@@ -618,6 +621,7 @@ impl UnifiedExecProcess {
                         let mut state = state_tx.borrow().clone();
                         state.sandbox_denied |= sandbox_denied.unwrap_or(false);
                         let _ = state_tx.send_replace(state.exited(Some(exit_code)));
+                        cancellation_token.cancel();
                     }
                     ExecProcessEvent::Closed { seq } => {
                         if seq <= last_seq {

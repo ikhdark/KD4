@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts import kd4_turn_latency_audit
@@ -71,6 +75,180 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
 
 
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_uuid_cli_resolves_snapshot_and_emits_bounded_execution_loop(self) -> None:
+        session_id = "01a018c7-a357-7c11-a7ca-9248dd075f22"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            codex_home = Path(temp) / "codex-home"
+            sessions = codex_home / "sessions" / "2026" / "08" / "19"
+            root.mkdir()
+            sessions.mkdir(parents=True)
+            rollout = sessions / f"rollout-2026-08-19T01-48-56-{session_id}.jsonl"
+            rollout.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event(
+                            {"type": "task_started", "turn_id": "turn"},
+                            "2026-08-17T00:00:00Z",
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-08-17T00:00:01Z",
+                                "type": "sampling_boundary",
+                                "payload": {"turn_id": "turn"},
+                            }
+                        ),
+                        _response(
+                            {"type": "custom_tool_call", "call_id": "call-1"},
+                            "2026-08-17T00:00:03Z",
+                        ),
+                        _response(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call-1",
+                                "output": "done",
+                            },
+                            "2026-08-17T00:00:05Z",
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-08-17T00:00:06Z",
+                                "type": "sampling_boundary",
+                                "payload": {"turn_id": "turn"},
+                            }
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "turn",
+                                "timing": _timing(),
+                            },
+                            "2026-08-17T00:00:10Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}),
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = kd4_turn_latency_audit.main(
+                    [session_id, "--repo-root", str(root), "--summary-json"]
+                )
+
+        output = stdout.getvalue()
+        report = json.loads(output)
+        self.assertEqual(exit_code, 0)
+        self.assertLess(len(output.encode("utf-8")), 16 * 1024)
+        self.assertEqual(report["source"], str(rollout.resolve()))
+        self.assertEqual(
+            report["coverage"]["snapshots"][0]["path"], str(rollout.resolve())
+        )
+        self.assertEqual(report["executionLoop"]["samplingPasses"], 2)
+        self.assertEqual(report["executionLoop"]["toolCalls"], 1)
+        self.assertEqual(report["executionLoop"]["pairedToolCalls"], 1)
+        self.assertEqual(
+            report["executionLoop"]["samplingToFirstToolCallNs"], 2_000_000_000
+        )
+        self.assertEqual(
+            report["executionLoop"]["pairedToolRoundTripNs"], 2_000_000_000
+        )
+        self.assertEqual(report["executionLoop"]["postToolHandoffNs"], 1_000_000_000)
+        self.assertEqual(report["executionLoop"]["taskElapsedNs"], 10_000_000_000)
+
+    def test_emits_bounded_slow_calls_and_finalize_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            lines = [
+                _meta(str(root)),
+                _event(
+                    {"type": "task_started", "turn_id": "slow-audit"},
+                    "2026-08-17T00:00:00Z",
+                ),
+            ]
+            for ordinal in range(10):
+                started_second = ordinal * 5
+                completed_second = started_second + 6
+                lines.extend(
+                    [
+                        _response(
+                            {
+                                "type": "custom_tool_call",
+                                "call_id": f"call-{ordinal}",
+                                "name": "exec",
+                                "input": (
+                                    "const result = await tools.exec_command({"
+                                    'command: "private command"});'
+                                ),
+                            },
+                            f"2026-08-17T00:00:{started_second:02d}Z",
+                        ),
+                        _response(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": f"call-{ordinal}",
+                                "output": [
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            "Script completed\n"
+                                            "Wall time 6.0 seconds\n"
+                                            "Output:\nprivate output"
+                                        ),
+                                    }
+                                ],
+                            },
+                            f"2026-08-17T00:00:{completed_second:02d}Z",
+                        ),
+                    ]
+                )
+            timing = _timing()
+            timing["inclusiveDurationNs"] = 100_000_000_000
+            timing["exclusive"] = {
+                "orchestrationNs": 70_000_000_000,
+                "modelOnlyNs": 20_000_000_000,
+                "toolOnlyNs": 10_000_000_000,
+                "modelPlusToolNs": 0,
+            }
+            lines.append(
+                _event(
+                    {
+                        "type": "task_complete",
+                        "turn_id": "slow-audit",
+                        "timing": timing,
+                    },
+                    "2026-08-17T00:00:59Z",
+                )
+            )
+            session.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        orchestration = report["commandOrchestration"]
+        self.assertEqual(orchestration["slowToolCallCount"], 10)
+        self.assertEqual(len(orchestration["topSlowToolCalls"]), 8)
+        self.assertEqual(orchestration["omittedSlowToolCalls"], 2)
+        self.assertEqual(
+            orchestration["topSlowToolCalls"][0]["tool"], "exec>exec_command"
+        )
+        self.assertEqual(
+            orchestration["topSlowToolCalls"][0]["reportedExecWallNs"],
+            6_000_000_000,
+        )
+        self.assertNotIn("private command", json.dumps(report))
+        self.assertNotIn("private output", json.dumps(report))
+        self.assertEqual(report["auditDecision"]["dominantPhase"], "orchestration")
+        self.assertTrue(report["auditDecision"]["readyToFinalize"])
+        rendered = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("audit decision: finalize", rendered)
+        self.assertIn("Stop rollout inspection and answer from this report.", rendered)
+
     def test_separates_reported_child_runtime_from_tool_orchestration_gap(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"
@@ -116,12 +294,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(orchestration["parallelBatches"], 1)
         self.assertEqual(orchestration["roundTripNs"], 3_000_000_000)
         self.assertEqual(orchestration["reportedChildWorkNs"], 1_000_000_000)
-        self.assertEqual(
-            orchestration["orchestrationGapLowerBoundNs"], 2_000_000_000
-        )
-        self.assertEqual(
-            orchestration["orchestrationGapUpperBoundNs"], 2_250_000_000
-        )
+        self.assertEqual(orchestration["orchestrationGapLowerBoundNs"], 2_000_000_000)
+        self.assertEqual(orchestration["orchestrationGapUpperBoundNs"], 2_250_000_000)
         self.assertEqual(orchestration["orchestrationShareLowerBound"], 2 / 3)
         self.assertEqual(orchestration["orchestrationShareUpperBound"], 3 / 4)
         rendered = kd4_turn_latency_audit.render_report(report)

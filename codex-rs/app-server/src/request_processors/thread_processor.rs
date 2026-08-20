@@ -2138,7 +2138,7 @@ impl ThreadRequestProcessor {
             thread_id,
             process_id,
         } = params;
-        let process_id = process_id.parse::<i32>().map_err(|err| {
+        let process_id = process_id.parse::<u32>().map_err(|err| {
             invalid_request(format!("invalid background terminal process id: {err}"))
         })?;
 
@@ -5005,14 +5005,14 @@ fn paginate_background_terminals(
     let start = match cursor {
         Some(cursor) => {
             let cursor = cursor
-                .parse::<i32>()
+                .parse::<u32>()
                 .map_err(|err| invalid_request(format!("invalid cursor: {err}")))?;
             terminals
                 .iter()
                 .position(|terminal| {
                     terminal
                         .process_id
-                        .parse::<i32>()
+                        .parse::<u32>()
                         .is_ok_and(|process_id| process_id > cursor)
                 })
                 .unwrap_or(terminals.len())

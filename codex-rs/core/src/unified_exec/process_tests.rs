@@ -181,7 +181,7 @@ async fn store_process_for_test(
     manager: &UnifiedExecProcessManager,
     session: &Arc<Session>,
     turn: &TurnContext,
-    process_id: i32,
+    process_id: u32,
     process: Arc<UnifiedExecProcess>,
 ) {
     #[allow(deprecated)]
@@ -207,7 +207,7 @@ fn write_stdin_invocation(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
     call_id: &str,
-    process_id: i32,
+    process_id: u32,
 ) -> ToolInvocation {
     ToolInvocation {
         session,

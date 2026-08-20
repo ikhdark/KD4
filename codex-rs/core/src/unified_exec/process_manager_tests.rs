@@ -246,6 +246,92 @@ async fn initial_output_quiet_yield_is_clamped_to_hard_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn initial_output_post_exit_uses_quiet_deadline_instead_of_full_yield() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    output_buffer.lock().await.push_chunk(b"done\n".to_vec());
+    cancellation_token.cancel();
+
+    let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(collected, b"done\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_poll_post_exit_does_not_inherit_the_five_second_poll_deadline() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    cancellation_token.cancel();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(collected.is_empty());
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_output_post_exit_quiet_deadline_resets_after_tail_output() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    cancellation_token.cancel();
+    let tail_buffer = Arc::clone(&output_buffer);
+    let tail_notify = Arc::clone(&output_notify);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tail_buffer.lock().await.push_chunk(b"tail\n".to_vec());
+        tail_notify.notify_waiters();
+    });
+
+    let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(collected, b"tail\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(450));
+}
+
+#[tokio::test(start_paused = true)]
 async fn initial_output_without_meaningful_bytes_waits_for_hard_deadline() {
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
     let output_notify = Arc::new(Notify::new());

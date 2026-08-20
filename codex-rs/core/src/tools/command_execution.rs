@@ -348,8 +348,8 @@ struct CommandExecutionCacheDocument {
 struct CommandExecutionState {
     attempts: HashMap<CommandAttemptKey, AttemptEntry>,
     insertion_order: VecDeque<CommandAttemptKey>,
-    running: HashMap<i32, RunningCommand>,
-    running_order: VecDeque<i32>,
+    running: HashMap<u32, RunningCommand>,
+    running_order: VecDeque<u32>,
     repository_epoch: u64,
     observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
@@ -689,7 +689,7 @@ impl CommandExecutionLedger {
     #[cfg(test)]
     pub(crate) async fn track_running_process(
         &self,
-        process_id: i32,
+        process_id: u32,
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
     ) {
@@ -706,7 +706,7 @@ impl CommandExecutionLedger {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn track_running_process_with_validation_contract(
         &self,
-        process_id: i32,
+        process_id: u32,
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
         validation_launch: Option<ValidationLaunchPlan>,
@@ -730,7 +730,7 @@ impl CommandExecutionLedger {
         );
     }
 
-    pub(crate) async fn running_process(&self, process_id: i32) -> Option<RunningCommand> {
+    pub(crate) async fn running_process(&self, process_id: u32) -> Option<RunningCommand> {
         self.state.lock().await.running.get(&process_id).cloned()
     }
 
@@ -811,7 +811,7 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn update_running_artifact(
         &self,
-        process_id: i32,
+        process_id: u32,
         artifact: RawOutputArtifact,
     ) {
         {
@@ -838,7 +838,7 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn mark_running_process_completed(
         &self,
-        process_id: i32,
+        process_id: u32,
         exit_code: i32,
     ) -> bool {
         {
@@ -857,7 +857,7 @@ impl CommandExecutionLedger {
         true
     }
 
-    async fn publish_completed_validation_if_ready(&self, process_id: i32) {
+    async fn publish_completed_validation_if_ready(&self, process_id: u32) {
         let candidate = {
             let state = self.state.lock().await;
             let Some(running) = state.running.get(&process_id) else {
@@ -1074,7 +1074,7 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn finish_running_process(
         &self,
-        process_id: i32,
+        process_id: u32,
         exit_code: Option<i32>,
     ) -> bool {
         {
@@ -2038,7 +2038,7 @@ mod tests {
             ledger.begin_attempt(key, false).await.expect("attempt");
             ledger
                 .track_running_process(
-                    process_id as i32,
+                    process_id as u32,
                     key.clone(),
                     RawOutputArtifact::unavailable("fixture"),
                 )

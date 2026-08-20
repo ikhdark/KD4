@@ -123,7 +123,7 @@ pub(crate) struct ExecCommandRequest {
     pub raw_output_artifact: RawOutputArtifact,
     pub shell_type: ShellType,
     pub hook_command: String,
-    pub process_id: i32,
+    pub process_id: u32,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub cwd: PathUri,
@@ -180,7 +180,7 @@ impl PendingSpawnRegistration {
 
 #[derive(Debug)]
 pub(crate) struct WriteStdinRequest<'a> {
-    pub process_id: i32,
+    pub process_id: u32,
     pub input: &'a str,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
@@ -189,27 +189,27 @@ pub(crate) struct WriteStdinRequest<'a> {
 
 #[derive(Default)]
 pub(crate) struct ProcessStore {
-    processes: HashMap<i32, ProcessEntry>,
-    reserved_process_ids: HashSet<i32>,
+    processes: HashMap<u32, ProcessEntry>,
+    reserved_process_ids: HashSet<u32>,
 }
 
 /// Owns a reserved process id until it is atomically transferred into the
 /// process store. Dropping the transfer sender before then wakes the manager's
 /// cleanup task, including when the calling future is cancelled.
 pub(crate) struct ProcessIdReservation {
-    process_id: i32,
+    process_id: u32,
     transfer_sender: Option<oneshot::Sender<()>>,
 }
 
 impl ProcessIdReservation {
-    fn new(process_id: i32, transfer_sender: oneshot::Sender<()>) -> Self {
+    fn new(process_id: u32, transfer_sender: oneshot::Sender<()>) -> Self {
         Self {
             process_id,
             transfer_sender: Some(transfer_sender),
         }
     }
 
-    pub(crate) fn process_id(&self) -> i32 {
+    pub(crate) fn process_id(&self) -> u32 {
         self.process_id
     }
 
@@ -221,7 +221,7 @@ impl ProcessIdReservation {
 }
 
 impl ProcessStore {
-    fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
+    fn remove(&mut self, process_id: u32) -> Option<ProcessEntry> {
         self.reserved_process_ids.remove(&process_id);
         self.processes.remove(&process_id)
     }
@@ -265,7 +265,7 @@ impl Default for UnifiedExecProcessManager {
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
     call_id: String,
-    process_id: i32,
+    process_id: u32,
     cwd: PathUri,
     initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
     hook_command: String,

@@ -572,7 +572,7 @@ pub struct ExecCommandToolOutput {
     pub raw_output: Vec<u8>,
     pub truncation_policy: TruncationPolicy,
     pub max_output_tokens: Option<usize>,
-    pub process_id: Option<i32>,
+    pub process_id: Option<u32>,
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
@@ -731,7 +731,7 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             exit_code: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            session_id: Option<i32>,
+            session_id: Option<u32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
             #[serde(skip_serializing_if = "Option::is_none")]

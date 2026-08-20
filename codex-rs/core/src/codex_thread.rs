@@ -591,7 +591,7 @@ impl CodexThread {
         self.codex.session.list_background_terminals().await
     }
 
-    pub async fn terminate_background_terminal(&self, process_id: i32) -> bool {
+    pub async fn terminate_background_terminal(&self, process_id: u32) -> bool {
         self.codex
             .session
             .terminate_background_terminal(process_id)

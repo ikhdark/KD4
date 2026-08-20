@@ -40,7 +40,7 @@ agent issues.
 - Ask when intent materially changes the solution; otherwise avoid
   over-engineering.
 - Read any user-provided or user-named file in full.
-- Do not run broad tests, do not run codex-rs/core full tests, only narrow tests on the active implementation is allowed unless told otherwise.
+- Do not run broad tests.
 
 
 ## Validation failure handling
@@ -60,6 +60,15 @@ agent issues.
 - For a live rollout, use `python scripts/rollout_snapshot.py <path> [--output
   <snapshot>]`. It opens the exact `.jsonl` path with shared access, reads the
   fixed length observed at open, and reports its SHA-256 identity.
+- For a session or turn latency audit, run
+  `python scripts/kd4_turn_latency_audit.py <session-uuid-or-path>
+  --sessions-root C:\Users\kuh\Desktop\LOCAL-KD\sessions --repo-root <repo>` as
+  the single lookup and analysis pass. The analyzer resolves an exact UUID and
+  performs the required fixed-length snapshot internally; do not precede or
+  follow it with file searches or ad hoc JSONL parsers.
+- Treat `audit decision: finalize` / `auditDecision.readyToFinalize=true` as the
+  audit stop condition. Answer from that report unless contradictory evidence
+  is already present; continue inspection only for the report's blocker codes.
 
 ## Validation
 
