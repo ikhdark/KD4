@@ -1107,8 +1107,17 @@ function Get-LiveProcessesById {
                 continue
             }
             try {
+                if ($process.HasExited) {
+                    continue
+                }
                 $processPath = $process.Path
                 $processStartTimeUtcTicks = $process.StartTime.ToUniversalTime().Ticks
+                if ([string]::IsNullOrWhiteSpace($processPath)) {
+                    if ($process.HasExited) {
+                        continue
+                    }
+                    throw "Process executable path is unavailable."
+                }
                 if (
                     [string]::Equals(
                         [System.IO.Path]::GetFullPath($processPath),
@@ -1122,6 +1131,13 @@ function Get-LiveProcessesById {
                 }
             }
             catch {
+                try {
+                    if ($process.HasExited) {
+                        continue
+                    }
+                }
+                catch {
+                }
                 throw "Could not revalidate process identity for pid=$($candidate.Id): $($_.Exception.Message)"
             }
             finally {

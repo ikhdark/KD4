@@ -122,6 +122,84 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         self.assertIn('"ls-files", "-z"', publish_script)
         self.assertIn('"status", "--porcelain=v1", "-z"', publish_script)
 
+    def test_process_revalidation_ignores_a_process_that_exited_before_path_read(
+        self,
+    ) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+
+        command = rf"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{SCRIPT}', [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) {{
+    throw "Failed to parse publish script: $($errors[0].Message)"
+}}
+$functionAst = $ast.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-LiveProcessesById'
+}}, $true)
+if (@($functionAst).Count -ne 1) {{
+    throw 'Get-LiveProcessesById was not found exactly once.'
+}}
+Invoke-Expression $functionAst[0].Extent.Text
+$script:disposed = $false
+function Get-Process {{
+    [CmdletBinding()]
+    param([int]$Id)
+    $fake = [pscustomobject]@{{
+        Id = $Id
+        HasExited = $true
+        Path = $null
+        StartTime = [DateTime]::UtcNow
+    }}
+    $fake | Add-Member -MemberType ScriptMethod -Name Dispose -Value {{
+        $script:disposed = $true
+    }}
+    return $fake
+}}
+$candidate = [pscustomobject]@{{
+    Id = 29448
+    Path = 'C:\\valid\\codex.exe'
+    StartTimeUtcTicks = 1
+}}
+$live = @(Get-LiveProcessesById -Processes @($candidate))
+if ($live.Count -ne 0) {{
+    throw "Expected an exited process to be ignored; found $($live.Count)."
+}}
+if (-not $script:disposed) {{
+    throw 'Expected the exited process handle to be disposed.'
+}}
+"ok"
+"""
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            cwd=SCRIPT.parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("ok", result.stdout)
+
     def test_user_path_edits_preserve_expandable_registry_values(self) -> None:
         publish_script = publish_source_text()
 
